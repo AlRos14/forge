@@ -173,7 +173,54 @@ migrations, rename Forge, or create cross-model synchronization.
   ledger describe the target contract. The branch is published for human review;
   PR12 is not merged.
 
+- **Fix pass — public authorization and Review UI: PASS.** REST Project lists
+  now filter before pagination so counts and cursors cover only visible Projects;
+  Project update, hooks, pause, resume, and delete use the same owner/member
+  visibility as reads. Repo/integration resources and Project-scoped MCP
+  configuration resolve their owning Project;
+  Task, Workspace, Execution, dependency, external-link, and collaboration
+  resources resolve the exact parent Task before read or mutation. Notification
+  lists/counts and per-row mutations use caller-visible Projects, including
+  database-filtered pagination; SSE filters exact Project/Task scopes and limits
+  operations status hints to admins. REST/MCP Agent rosters and provider
+  runtime projections filter private Agents/Daemons before pagination or
+  serialization.
+  MCP requires the authenticated Human for tools, filters
+  user/local Project listings, checks Project and exact parent Task for
+  resource IDs, binds Project-scoped calls to that Project, checks Agent
+  visibility for list/start/follow-up, records Project creation ownership, and
+  limits daemon IDs and sensitive Agent configuration to safe projections.
+  An independent audit also moved MCP Agent visibility into the database query
+  before pagination, so private Agent rows do not affect visible cursors or
+  `has_more` metadata. Historical Release snapshot reads now reuse the shared
+  Project visibility helper, including the existing ownerless-public rule.
+  ReviewReport submission is shown only for a running formal Review Execution
+  owned by the current Human with no existing report. No schema or migration
+  changes; PR13 storage cleanup and PR14 naming work remain excluded.
+
 ## Validation record
+
+### Fix pass — 2026-10-11
+
+- `cargo test -p api --test pr12_public_surface --locked --offline` (12 passed;
+  test phase 80.62s; compile 69s).
+- `cargo test -p api --lib routes::events:: --locked --offline` (5 passed;
+  test phase 7.81s; compile 27.83s).
+- `cargo test -p mcp-server user_scoped_mcp_isolates_projects_and_derived_resources --locked --offline`
+  (1 passed; test phase 9.94s; incremental compile 17.03s).
+- `cargo test -p mcp-server --locked --offline` (38 passed; test phase 229.02s;
+  compile 11.97s; doc-tests 0).
+- `pnpm --dir web exec vitest run src/pages/TaskDetailPage.test.tsx`
+  (4 passed; 7.31s).
+- `pnpm --dir web typecheck` (passed; no diagnostics).
+- `cargo fmt --all -- --check` and `git diff --check` (passed).
+
+Workspace-wide Cargo tests/build/clippy, full web Vitest, and Playwright E2E
+remain intentionally unrun. No migration, generated-type output, `cargo clean`,
+or workspace-wide build was used for this fix pass. Reused `target/` measured
+36 GB after the focused crate tests; the filesystem retained 70 GB free.
+
+### Initial PR12 implementation checks
 
 Focused checks passed:
 

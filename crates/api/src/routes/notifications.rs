@@ -7,7 +7,11 @@ use axum::{
 use db::{NotificationListQuery, NotificationRepo, PageRequest, SortBy, SortOrder};
 use serde::Deserialize;
 
-use crate::{errors::ApiResult, routes::paginated, state::AppState};
+use crate::{
+    errors::ApiResult,
+    routes::{auth::AuthenticatedUser, paginated},
+    state::AppState,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListNotificationsParams {
@@ -25,10 +29,15 @@ pub struct CountParams {
 
 pub async fn list_notifications(
     State(state): State<AppState>,
+    user: AuthenticatedUser,
     Query(params): Query<ListNotificationsParams>,
 ) -> ApiResult<Json<PaginatedResponse<NotificationResponse>>> {
-    let page = NotificationRepo::list(
+    if let Some(project_id) = params.project_id.as_deref() {
+        crate::routes::projects::require_project_visible(&state, project_id, &user.user_id).await?;
+    }
+    let page = NotificationRepo::list_visible_to_user(
         &*state.db,
+        &user.user_id,
         NotificationListQuery {
             project_id: params.project_id,
             read: params.read,
@@ -48,33 +57,53 @@ pub async fn list_notifications(
 
 pub async fn get_unread_count(
     State(state): State<AppState>,
+    user: AuthenticatedUser,
     Query(params): Query<CountParams>,
 ) -> ApiResult<Json<UnreadCountResponse>> {
-    let count = NotificationRepo::unread_count(&*state.db, params.project_id.as_deref()).await?;
+    if let Some(project_id) = params.project_id.as_deref() {
+        crate::routes::projects::require_project_visible(&state, project_id, &user.user_id).await?;
+    }
+    let count = NotificationRepo::unread_count_visible_to_user(
+        &*state.db,
+        &user.user_id,
+        params.project_id.as_deref(),
+    )
+    .await?;
     Ok(Json(UnreadCountResponse { count }))
 }
 
 pub async fn mark_read(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<NotificationResponse>> {
-    let item = NotificationRepo::mark_read(&*state.db, &id).await?;
+    let item = NotificationRepo::mark_read_for_user(&*state.db, &id, &user.user_id).await?;
     Ok(Json(notification_response(item)))
 }
 
 pub async fn mark_all_read(
     State(state): State<AppState>,
+    user: AuthenticatedUser,
     Query(params): Query<CountParams>,
 ) -> ApiResult<StatusCode> {
-    NotificationRepo::mark_all_read(&*state.db, params.project_id.as_deref()).await?;
+    if let Some(project_id) = params.project_id.as_deref() {
+        crate::routes::projects::require_project_visible(&state, project_id, &user.user_id).await?;
+    }
+    NotificationRepo::mark_all_read_visible_to_user(
+        &*state.db,
+        &user.user_id,
+        params.project_id.as_deref(),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn delete_notification(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<StatusCode> {
-    NotificationRepo::delete(&*state.db, &id).await?;
+    NotificationRepo::delete_for_user(&*state.db, &id, &user.user_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

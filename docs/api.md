@@ -51,6 +51,25 @@ the maximum is 100.
 | `GET /projects/{id}/integration`, `POST /projects/{id}/integration`, `PATCH /projects/{id}/integration`, `POST /projects/{id}/integration/sync` | Manage the Project's external issue integration. Create accepts and GET/PATCH return `credential_env_var`, the environment variable name Forge reads during sync; the credential value is never returned or stored. Optional `default_implementer` is an exact `ActorRef`; imported issues create ordinary Tasks and, when configured, an `implementer` TaskRole with that Actor as a RoleMembership. Sync fails closed if the configured Actor is not valid for the Project. Lifecycle begins at the normal Task creation state; legacy `default_task_state` and singular assignment fields are rejected. |
 | `GET /projects/{id}/members`, `POST /projects/{id}/members`, `PATCH /projects/{id}/members/{user_id}`, `DELETE /projects/{id}/members/{user_id}` | Manage Project membership. |
 
+Project reads and mutations require the authenticated user to own the Project or
+have a `project_member` row. Existing ownerless system Projects remain public.
+Invisible Project reads and mutations return the normal `404 not_found` response.
+Project lists filter by this visibility rule before pagination and report counts
+only for the caller's visible Projects. MCP applies the same rule in user/local
+mode; a Project-scoped MCP connection also pins every Project-derived tool to
+its selected Project. Creating a Project through REST or MCP records the
+authenticated Human as owner and creates the owner's membership row.
+
+Repo and integration endpoints resolve the owning Project before access. Task,
+Workspace, Execution, dependency, external-link, Review, ValidationRun,
+Evidence, Gate, and collaboration endpoints resolve their exact parent Task
+and apply the same Project visibility rule before reads or mutations. A known
+resource UUID does not grant access to another user's Project. Project-scoped
+MCP configuration also checks visibility before reading or writing repo config.
+REST and MCP Agent rosters filter private identities before pagination, so
+cursors and page metadata do not reveal other users' Agents. Provider runtime
+projections include only visible Agents and Daemons.
+
 Project media remains a Project resource. The retired Task comment/media
 attachment surface is not part of this API. Ordinary Task creation does not
 inherit role assignments from historical Project settings; create exact
@@ -175,7 +194,7 @@ TaskLifecycle state and TaskRole membership do not imply running work.
 | `GET /settings`, `PUT /settings` | Read or update supported server settings. |
 | `GET /config/mcp`, `POST /config/mcp` | Read or update MCP connection configuration. |
 | `GET /operations/status`, `POST /operations/refresh` | Read or refresh operational health. Blocked Tasks carry TaskLifecycle state/version and an exact transition ID when a current receipt exists. Retry pressure lists exact immutable retry receipts and source/receipt DomainEvent IDs; it does not count legacy transition-log rows or read Task status. Active Executions expose only their exact `harness_session_id`. |
-| `GET /notifications`, `GET /notifications/unread-count`, `POST /notifications/mark-all-read`, `PATCH /notifications/{id}/read`, `DELETE /notifications/{id}` | Read and manage notifications. |
+| `GET /notifications`, `GET /notifications/unread-count`, `POST /notifications/mark-all-read`, `PATCH /notifications/{id}/read`, `DELETE /notifications/{id}` | Read and manage notifications for visible Projects. Unscoped lists/counts and mark-all-read operate only on the caller's visible Project set; an explicit invisible Project or another user's notification returns `404`. |
 | `GET /fs/list`, `GET /fs/branches` | Inspect supported local filesystem paths and branches. |
 | `POST /tasks/{id}/terminals`, `GET /tasks/{id}/terminals`, `GET /tasks/{id}/terminals/availability`, `GET /terminals/{id}`, `POST /terminals/{id}/attach-token`, `POST /terminals/{id}/resize`, `POST /terminals/{id}/terminate`, `GET /terminals/{id}/ws` | Manage a terminal bound to a Task workspace and its exact active lease. |
 | `GET /tasks/{id}/external-links`, `POST /tasks/{id}/external-links`, `DELETE /tasks/{id}/external-links/{link_id}` | Manage generic external Task links. |
@@ -190,7 +209,9 @@ OAuth endpoints for MCP clients are `/oauth/register`, `/oauth/authorize`,
 `GET /projects/{id}/milestones/{milestone_id}/releases` read stored immutable
 ProjectRelease snapshots and pinned references. They do not recompute
 readiness, create or mutate a Release, or authorize current Gate or Task work.
-These are `HISTORICAL_READ_ONLY`; physical Release storage remains for PR13.
+These are `HISTORICAL_READ_ONLY` and use the normal Project owner/member
+visibility rule, including public ownerless system Projects; physical Release
+storage remains for PR13.
 
 ## Server-Sent Events
 
@@ -219,6 +240,10 @@ Runtime hint names are `project.created`, `project.updated`, `project.deleted`,
 gap. Agent Chat, Attention, old workflow transitions, `task.status`, and
 legacy Review-row events are not public event types.
 
+SSE requires authentication and filters Project- and Task-scoped events through
+the same owner/member visibility rule as REST. Operations status hints are
+limited to administrators; resync hints carry no Project data.
+
 ## MCP
 
 The MCP server advertises only registered target tools. The current groups are
@@ -231,7 +256,15 @@ not forwarded to a different tool.
 
 `tools/list` is authoritative for the deployed descriptor set. Tools that
 start work require an exact Actor or explicit Agent identity and do not infer a
-current member or latest Execution.
+current member or latest Execution. In user/local mode, Project lists contain
+only visible Projects and Task, Execution, Gate, Review, ValidationRun,
+Evidence, Artifact, and collaboration tools resolve their exact parent Task
+and Project before reading or mutating. Project-scoped connections reject
+cross-Project IDs even when the user can access that other Project separately.
+Agent lists contain global and caller-owned identities with visibility applied
+before pagination; MCP registration binds the new Agent to the authenticated
+Human. Only admins may pin an Agent to a daemon, and non-admin Agent projections
+omit daemon IDs and redact sensitive configuration values.
 
 ## Related references
 

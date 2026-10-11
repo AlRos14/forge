@@ -170,6 +170,11 @@ pub trait AgentRepo: Send + Sync {
     ) -> Result<Agent>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Agent>>;
     async fn list(&self, query: AgentListQuery) -> Result<Page<Agent>>;
+    async fn list_visible_to_user(
+        &self,
+        user_id: &str,
+        query: AgentListQuery,
+    ) -> Result<Page<Agent>>;
     async fn update(&self, input: UpdateAgent) -> Result<Agent>;
     async fn set_paused(&self, id: &str, paused: bool) -> Result<()>;
     async fn duplicate_agent(
@@ -1659,6 +1664,8 @@ pub trait ProjectRepo: Send + Sync {
     async fn create(&self, input: CreateProject) -> Result<Project>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Project>>;
     async fn list(&self, page: PageRequest) -> Result<Page<Project>>;
+    async fn list_visible_to_user(&self, user_id: &str, page: PageRequest)
+        -> Result<Page<Project>>;
     async fn update(&self, input: UpdateProject) -> Result<Project>;
     async fn update_at_version(
         &self,
@@ -1776,10 +1783,27 @@ pub trait SkillRepo: Send + Sync {
 pub trait NotificationRepo: Send + Sync {
     async fn create(&self, input: CreateNotification) -> Result<Notification>;
     async fn list(&self, query: NotificationListQuery) -> Result<Page<Notification>>;
+    async fn list_visible_to_user(
+        &self,
+        user_id: &str,
+        query: NotificationListQuery,
+    ) -> Result<Page<Notification>>;
     async fn unread_count(&self, project_id: Option<&str>) -> Result<i64>;
+    async fn unread_count_visible_to_user(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<i64>;
     async fn mark_read(&self, id: &str) -> Result<Notification>;
+    async fn mark_read_for_user(&self, id: &str, user_id: &str) -> Result<Notification>;
     async fn mark_all_read(&self, project_id: Option<&str>) -> Result<u64>;
+    async fn mark_all_read_visible_to_user(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<u64>;
     async fn delete(&self, id: &str) -> Result<()>;
+    async fn delete_for_user(&self, id: &str, user_id: &str) -> Result<()>;
 }
 
 #[async_trait]

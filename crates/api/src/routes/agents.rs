@@ -92,8 +92,9 @@ pub async fn list_agents(
         .filter(|item| !item.trim().is_empty())
         .map(|item| item.trim().to_owned())
         .collect();
-    let page = AgentRepo::list(
+    let page = AgentRepo::list_visible_to_user(
         &*state.db,
+        &user.user_id,
         AgentListQuery {
             status,
             executor_type: params.executor_type.clone(),
@@ -106,9 +107,6 @@ pub async fn list_agents(
     let has_more = page.next_cursor.is_some();
     let mut items = Vec::with_capacity(page.items.len());
     for agent in page.items {
-        if !can_view_agent(&agent, &user) {
-            continue;
-        }
         let active_execution_count =
             AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
         items.push(

@@ -12,16 +12,6 @@ pub(crate) fn execution_page_value(page: Page<Execution>) -> Value {
     })
 }
 
-pub(crate) fn agent_page_value(page: Page<Agent>) -> Value {
-    let has_more = page.next_cursor.is_some();
-    json!({
-        "items": page.items.into_iter().map(agent_value).collect::<Vec<_>>(),
-        "next_cursor": page.next_cursor,
-        "has_more": has_more,
-        "total_count": page.total_count,
-    })
-}
-
 pub(crate) fn project_page_value(page: Page<Project>) -> Result<Value, crate::error::McpToolError> {
     let has_more = page.next_cursor.is_some();
     let items = page
@@ -37,7 +27,7 @@ pub(crate) fn project_page_value(page: Page<Project>) -> Result<Value, crate::er
     }))
 }
 
-pub(crate) fn agent_value(agent: Agent) -> Value {
+pub(crate) fn agent_value(agent: Agent, is_admin: bool) -> Value {
     json!({
         "id": agent.id,
         "name": agent.name,
@@ -49,9 +39,9 @@ pub(crate) fn agent_value(agent: Agent) -> Value {
         "reasoning_effort": agent.reasoning_effort,
         "permission_policy": agent.permission_policy,
         "capabilities": safe_json(&agent.capabilities_json),
-        "config_json": safe_json(&agent.config_json),
+        "config_json": redact_sensitive_config(parsed_json(&agent.config_json)),
         "credential_handle_id": agent.credential_ref,
-        "daemon_id": agent.daemon_id,
+        "daemon_id": if is_admin { agent.daemon_id } else { None },
         "max_concurrent_tasks": agent.max_concurrent_tasks,
         "heartbeat_interval_seconds": agent.heartbeat_interval_seconds,
         "max_missed_heartbeats": agent.max_missed_heartbeats,
@@ -62,6 +52,42 @@ pub(crate) fn agent_value(agent: Agent) -> Value {
         "created_at": agent.created_at,
         "updated_at": agent.updated_at,
     })
+}
+
+pub(crate) fn redact_sensitive_config(value: Value) -> Value {
+    match value {
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| {
+                    let normalized = key.to_ascii_lowercase().replace('-', "_");
+                    let sensitive = [
+                        "api_key",
+                        "token",
+                        "secret",
+                        "password",
+                        "authorization",
+                        "credential",
+                        "private_key",
+                    ]
+                    .iter()
+                    .any(|candidate| normalized.contains(candidate));
+                    (
+                        key,
+                        if sensitive {
+                            Value::String("[redacted]".to_owned())
+                        } else {
+                            redact_sensitive_config(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(redact_sensitive_config).collect())
+        }
+        value => value,
+    }
 }
 
 pub(crate) fn project_value(project: Project) -> Result<Value, crate::error::McpToolError> {
@@ -90,8 +116,8 @@ pub(crate) fn agent_profile_value(profile: AgentProfile) -> Value {
         "permission_policy": profile.permission_policy,
         "system_prompt": profile.prompt_template,
         "capabilities": safe_json(&profile.capabilities_json),
-        "tool_policy": safe_json(&profile.tool_policy_json),
-        "config": safe_json(&profile.config_json),
+        "tool_policy": redact_sensitive_config(parsed_json(&profile.tool_policy_json)),
+        "config": redact_sensitive_config(parsed_json(&profile.config_json)),
         "credential_handle_id": profile.credential_ref,
         "version": profile.version,
         "created_at": profile.created_at,
@@ -123,8 +149,11 @@ pub(crate) fn execution_value(execution: Execution) -> Value {
 }
 
 fn safe_json(value: &str) -> Value {
-    let parsed = serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()));
-    redact_sensitive(parsed)
+    redact_sensitive(parsed_json(value))
+}
+
+fn parsed_json(value: &str) -> Value {
+    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()))
 }
 
 fn redact_sensitive(value: Value) -> Value {

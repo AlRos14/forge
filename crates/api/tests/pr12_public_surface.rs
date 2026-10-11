@@ -1,11 +1,16 @@
 mod common;
 
 use api_types::{
-    ActorRef, ErrorResponse, ExecutionResponse, IntegrationResponse, ProjectResponse, RepoResponse,
-    TaskLifecycleState, TaskLifecycleTransitionResponse, TaskResponse,
+    ActorRef, AuthResponse, ErrorResponse, ExecutionResponse, IntegrationResponse, ProjectResponse,
+    RepoResponse, TaskLifecycleState, TaskLifecycleTransitionResponse, TaskResponse,
 };
-use axum::http::{Method, StatusCode};
+use axum::{
+    body::Body,
+    http::{header, Method, Request, StatusCode},
+    Router,
+};
 use serde_json::json;
+use tower::ServiceExt;
 
 #[tokio::test]
 async fn project_and_task_creation_are_ordinary_v2_operations() {
@@ -82,6 +87,705 @@ async fn project_and_task_creation_are_ordinary_v2_operations() {
             .expect("count retired setup rows");
         assert_eq!(count, 0, "normal creation leaves {table} empty");
     }
+}
+
+#[tokio::test]
+async fn project_repo_and_integration_routes_enforce_user_visibility() {
+    let workspace = common::TestDir::new("pr12-project-route-visibility");
+    let harness = common::test_app(workspace.path(), "pr12-project-route-visibility").await;
+    let token_a = common::test_jwt();
+    let token_b = common::test_jwt_for_user("user-b", "user-b@example.com", false);
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*harness.state.db,
+        &db::User {
+            id: "user-b".to_owned(),
+            email: "user-b@example.com".to_owned(),
+            password_hash: "$2b$04$placeholder".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("seed second user");
+
+    let project_a: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &token_a,
+        json!({"name": "Private A"}),
+        StatusCode::OK,
+    )
+    .await;
+    let project_b: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &token_b,
+        json!({"name": "Private B"}),
+        StatusCode::OK,
+    )
+    .await;
+    let repo_a: RepoResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project_a.id),
+        &token_a,
+        json!({"remote_url": "https://example.com/a/repo.git"}),
+        StatusCode::OK,
+    )
+    .await;
+    let integration_a: IntegrationResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/integration", project_a.id),
+        &token_a,
+        json!({
+            "platform": "github",
+            "base_url": "https://api.github.com",
+            "owner": "owner-a",
+            "repo": "repo-a",
+            "credential_env_var": "GITHUB_TOKEN"
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    let visible_to_a: api_types::PaginatedResponse<ProjectResponse> =
+        common::empty_request_with_bearer(
+            &harness.app,
+            Method::GET,
+            "/api/v1/projects",
+            &token_a,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        visible_to_a
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![project_a.id.as_str()]
+    );
+    let visible_to_b: api_types::PaginatedResponse<ProjectResponse> =
+        common::empty_request_with_bearer(
+            &harness.app,
+            Method::GET,
+            "/api/v1/projects",
+            &token_b,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        visible_to_b
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![project_b.id.as_str()]
+    );
+
+    for (method, path, body) in [
+        (
+            Method::POST,
+            format!("/api/v1/projects/{}/repos", project_a.id),
+            Some(json!({"remote_url": "https://example.com/b/forbidden.git"})),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/projects/{}/repos", project_a.id),
+            None,
+        ),
+        (Method::GET, format!("/api/v1/repos/{}", repo_a.id), None),
+        (
+            Method::PATCH,
+            format!("/api/v1/repos/{}", repo_a.id),
+            Some(json!({"name": "cross-user-change"})),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/repos/{}/sync", repo_a.id),
+            None,
+        ),
+        (Method::DELETE, format!("/api/v1/repos/{}", repo_a.id), None),
+        (
+            Method::POST,
+            format!("/api/v1/projects/{}/integration", project_a.id),
+            Some(json!({
+                "platform": "github",
+                "base_url": "https://api.github.com",
+                "owner": "attacker",
+                "repo": "forbidden",
+                "credential_env_var": "GITHUB_TOKEN"
+            })),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/projects/{}/integration", project_a.id),
+            None,
+        ),
+        (
+            Method::PATCH,
+            format!("/api/v1/projects/{}/integration", project_a.id),
+            Some(json!({"repo": "cross-user-change"})),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/projects/{}/integration/sync", project_a.id),
+            None,
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/projects/{}/integration", project_a.id),
+            None,
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/projects/{}/project_hook_runs", project_a.id),
+            None,
+        ),
+        (
+            Method::PATCH,
+            format!("/api/v1/projects/{}", project_a.id),
+            Some(json!({"version": project_a.version, "name": "cross-user-change"})),
+        ),
+        (
+            Method::GET,
+            format!(
+                "/api/v1/config/mcp?agent=claude&scope=project&project_id={}",
+                project_a.id
+            ),
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/config/mcp".to_owned(),
+            Some(json!({
+                "agent": "claude",
+                "scope": "project",
+                "project_id": project_a.id,
+                "action": "install"
+            })),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/projects/{}/pause", project_a.id),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/projects/{}/resume", project_a.id),
+            None,
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/projects/{}", project_a.id),
+            None,
+        ),
+    ] {
+        let status = request_status(&harness.app, method, &path, &token_b, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "cross-user request {path}");
+    }
+
+    let repo_after: RepoResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/repos/{}", repo_a.id),
+        &token_a,
+        StatusCode::OK,
+    )
+    .await;
+    assert_ne!(repo_after.name, "cross-user-change");
+    let integration_after: Option<IntegrationResponse> = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}/integration", project_a.id),
+        &token_a,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        integration_after.expect("integration retained").id,
+        integration_a.id
+    );
+}
+
+#[tokio::test]
+async fn task_and_execution_routes_enforce_project_visibility() {
+    let workspace = common::TestDir::new("pr12-task-route-visibility");
+    let harness = common::test_app(workspace.path(), "pr12-task-route-visibility").await;
+    let token_a = common::test_jwt();
+    let token_b = common::test_jwt_for_user("user-b", "user-b@example.com", false);
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*harness.state.db,
+        &db::User {
+            id: "user-b".to_owned(),
+            email: "user-b@example.com".to_owned(),
+            password_hash: "$2b$04$placeholder".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("seed second user");
+
+    let project_a: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &token_a,
+        json!({"name": "Private A"}),
+        StatusCode::OK,
+    )
+    .await;
+    let project_b: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &token_b,
+        json!({"name": "Private B"}),
+        StatusCode::OK,
+    )
+    .await;
+    let repo_a: RepoResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project_a.id),
+        &token_a,
+        json!({"remote_url": "https://example.com/a/repo.git"}),
+        StatusCode::OK,
+    )
+    .await;
+    let task_a: TaskResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project_a.id),
+        &token_a,
+        json!({"title": "Task A"}),
+        StatusCode::OK,
+    )
+    .await;
+    let task_b: TaskResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project_b.id),
+        &token_b,
+        json!({"title": "Task B"}),
+        StatusCode::OK,
+    )
+    .await;
+    let workspace_id = db::new_uuid_v4();
+    db::WorkspaceRepo::create(
+        &*harness.state.db,
+        db::CreateWorkspace {
+            id: workspace_id.clone(),
+            task_id: task_a.id.clone(),
+            repo_id: repo_a.id,
+            worktree_path: workspace
+                .path()
+                .join("worktree")
+                .to_string_lossy()
+                .into_owned(),
+            branch: "task-a".to_owned(),
+            status: db::WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: db::now_rfc3339(),
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("create task workspace fixture");
+    let execution_id = db::new_uuid_v4();
+    db::ExecutionRepo::create(
+        &*harness.state.db,
+        db::CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_a.id.clone(),
+            agent_id: None,
+            actor_ref: Some(db::ActorRef::Human("test-user-id".to_owned())),
+            role: "reviewer".to_owned(),
+            purpose: Some(db::ExecutionPurpose::Review),
+            status: db::ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("historical review fixture".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: db::now_rfc3339(),
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("create execution fixture");
+
+    for (method, path, body) in [
+        (Method::GET, format!("/api/v1/tasks/{}", task_a.id), None),
+        (
+            Method::POST,
+            format!("/api/v1/projects/{}/tasks", project_a.id),
+            Some(json!({"title": "forbidden create"})),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/projects/{}/tasks", project_a.id),
+            None,
+        ),
+        (
+            Method::PATCH,
+            format!("/api/v1/tasks/{}", task_a.id),
+            Some(json!({"version": task_a.version, "title": "forbidden update"})),
+        ),
+        (Method::DELETE, format!("/api/v1/tasks/{}", task_a.id), None),
+        (
+            Method::POST,
+            format!("/api/v1/tasks/{}/dependencies", task_a.id),
+            Some(json!({"depends_on_id": task_b.id})),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/tasks/{}/dependencies", task_a.id),
+            None,
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/tasks/{}/workspace", task_a.id),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/tasks/{}/workspace/reset", task_a.id),
+            None,
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/tasks/{}/diff", task_a.id),
+            None,
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/tasks/{}/executions", task_a.id),
+            None,
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/tasks/{}/usage", task_a.id),
+            None,
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/executions/{execution_id}"),
+            None,
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/executions/{execution_id}/logs"),
+            None,
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/executions/{execution_id}/hook-logs"),
+            None,
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/executions/{execution_id}/usage"),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/executions/{execution_id}/follow-up"),
+            Some(json!({"agent_id": "agent-any", "message": "continue"})),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/executions/{execution_id}/cancel"),
+            None,
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/workspaces/{workspace_id}/diff"),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/tasks/{}/external-links", task_a.id),
+            Some(json!({"remote_issue_number": 10})),
+        ),
+    ] {
+        let status = request_status(&harness.app, method, &path, &token_b, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "cross-user request {path}");
+    }
+
+    let task_after: TaskResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task_a.id),
+        &token_a,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(task_after.title, "Task A");
+}
+
+#[tokio::test]
+async fn notification_reads_and_mutations_are_limited_to_visible_projects() {
+    let workspace = common::TestDir::new("pr12-notification-visibility");
+    let harness = common::test_app(workspace.path(), "pr12-notification-visibility").await;
+    let token_a = common::test_jwt();
+    let token_b = common::test_jwt_for_user("user-b", "user-b@example.com", false);
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*harness.state.db,
+        &db::User {
+            id: "user-b".to_owned(),
+            email: "user-b@example.com".to_owned(),
+            password_hash: "$2b$04$placeholder".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("seed second user");
+    let project_a: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &token_a,
+        json!({"name": "Private A"}),
+        StatusCode::OK,
+    )
+    .await;
+    let project_b: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &token_b,
+        json!({"name": "Private B"}),
+        StatusCode::OK,
+    )
+    .await;
+    let notification_a = db::NotificationRepo::create(
+        &*harness.state.db,
+        db::CreateNotification {
+            id: db::new_uuid_v4(),
+            project_id: project_a.id.clone(),
+            task_id: None,
+            event_type: "test.event".to_owned(),
+            title: "A only".to_owned(),
+            body: None,
+            read: false,
+            created_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("create Project A notification");
+    let notification_b = db::NotificationRepo::create(
+        &*harness.state.db,
+        db::CreateNotification {
+            id: db::new_uuid_v4(),
+            project_id: project_b.id.clone(),
+            task_id: None,
+            event_type: "test.event".to_owned(),
+            title: "B only".to_owned(),
+            body: Some("private notification body".to_owned()),
+            read: false,
+            created_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("create Project B notification");
+
+    let visible: api_types::PaginatedResponse<api_types::NotificationResponse> =
+        common::empty_request_with_bearer(
+            &harness.app,
+            Method::GET,
+            "/api/v1/notifications?include_total=true",
+            &token_a,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(visible.items.len(), 1);
+    assert_eq!(visible.items[0].id, notification_a.id);
+    assert_eq!(visible.total_count, Some(1));
+    let unread: api_types::UnreadCountResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        "/api/v1/notifications/unread-count",
+        &token_a,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(unread.count, 1);
+
+    for (method, path, body) in [
+        (
+            Method::GET,
+            format!("/api/v1/notifications?project_id={}", project_b.id),
+            None,
+        ),
+        (
+            Method::GET,
+            format!(
+                "/api/v1/notifications/unread-count?project_id={}",
+                project_b.id
+            ),
+            None,
+        ),
+        (
+            Method::POST,
+            format!(
+                "/api/v1/notifications/mark-all-read?project_id={}",
+                project_b.id
+            ),
+            None,
+        ),
+        (
+            Method::PATCH,
+            format!("/api/v1/notifications/{}/read", notification_b.id),
+            None,
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/notifications/{}", notification_b.id),
+            None,
+        ),
+    ] {
+        let status = request_status(&harness.app, method, &path, &token_a, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "cross-user request {path}");
+    }
+
+    let status = request_status(
+        &harness.app,
+        Method::POST,
+        "/api/v1/notifications/mark-all-read",
+        &token_a,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let notification_b_read: i64 = sqlx::query_scalar("SELECT read FROM notification WHERE id = ?")
+        .bind(&notification_b.id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .expect("read B notification state");
+    assert_eq!(notification_b_read, 0);
+
+    let visible_to_b: api_types::PaginatedResponse<api_types::NotificationResponse> =
+        common::empty_request_with_bearer(
+            &harness.app,
+            Method::GET,
+            "/api/v1/notifications",
+            &token_b,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(visible_to_b.items.len(), 1);
+    assert_eq!(visible_to_b.items[0].id, notification_b.id);
+}
+
+#[tokio::test]
+async fn agent_roster_filters_private_agents_before_pagination() {
+    let workspace = common::TestDir::new("pr12-agent-roster-visibility");
+    let harness = common::test_app(workspace.path(), "pr12-agent-roster-visibility").await;
+    let token_a = common::test_jwt();
+    let token_b = common::test_jwt_for_user("user-b", "user-b@example.com", false);
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*harness.state.db,
+        &db::User {
+            id: "user-b".to_owned(),
+            email: "user-b@example.com".to_owned(),
+            password_hash: "$2b$04$placeholder".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("seed second user");
+    let private_agent =
+        common::create_harness_agent(&harness.app, &token_b, "User B private Agent")
+            .await
+            .agent;
+
+    let visible_to_a: api_types::PaginatedResponse<api_types::AgentResponse> =
+        common::empty_request_with_bearer(
+            &harness.app,
+            Method::GET,
+            "/api/v1/agents?limit=100&include_total=true",
+            &token_a,
+            StatusCode::OK,
+        )
+        .await;
+    assert!(visible_to_a
+        .items
+        .iter()
+        .all(|agent| agent.id != private_agent.id));
+    assert_eq!(
+        visible_to_a.total_count,
+        Some(visible_to_a.items.len() as u64),
+        "count metadata must cover the visible roster only"
+    );
+
+    let visible_to_b: api_types::PaginatedResponse<api_types::AgentResponse> =
+        common::empty_request_with_bearer(
+            &harness.app,
+            Method::GET,
+            "/api/v1/agents?limit=100&include_total=true",
+            &token_b,
+            StatusCode::OK,
+        )
+        .await;
+    assert!(visible_to_b
+        .items
+        .iter()
+        .any(|agent| agent.id == private_agent.id));
+}
+
+async fn request_status(
+    app: &Router,
+    method: Method,
+    path: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> StatusCode {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
+    let body = match body {
+        Some(body) => {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            Body::from(serde_json::to_string(&body).expect("serialize request body"))
+        }
+        None => Body::empty(),
+    };
+    app.clone()
+        .oneshot(builder.body(body).expect("build request"))
+        .await
+        .expect("router response")
+        .status()
 }
 
 #[tokio::test]
@@ -531,6 +1235,172 @@ async fn lifecycle_mutations_return_exact_transition_identity_and_history() {
     .await;
     assert_eq!(cancelled.lifecycle.state, TaskLifecycleState::Cancelled);
     assert!(cancelled.transition_id.is_some());
+}
+
+#[tokio::test]
+async fn project_reads_and_mutations_require_project_visibility() {
+    let workspace = common::TestDir::new("pr12-project-authorization");
+    let harness = common::test_app(workspace.path(), "pr12-project-authorization").await;
+    let token_a = common::test_jwt();
+    let auth_b: AuthResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/auth/register",
+        json!({"email":"pr12-user-b@example.com","password":"password-for-user-b"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let project_a: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &token_a,
+        json!({"name":"Private Project A"}),
+        StatusCode::OK,
+    )
+    .await;
+    let project_b: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &auth_b.access_token,
+        json!({"name":"Private Project B"}),
+        StatusCode::OK,
+    )
+    .await;
+
+    let visible_to_a: api_types::PaginatedResponse<ProjectResponse> =
+        common::empty_request_with_bearer(
+            &harness.app,
+            Method::GET,
+            "/api/v1/projects?limit=100&include_total=true",
+            &token_a,
+            StatusCode::OK,
+        )
+        .await;
+    assert!(visible_to_a
+        .items
+        .iter()
+        .any(|item| item.id == project_a.id));
+    assert!(!visible_to_a
+        .items
+        .iter()
+        .any(|item| item.id == project_b.id));
+    assert_eq!(visible_to_a.total_count, Some(1));
+
+    let not_visible: serde_json::Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}", project_a.id),
+        &auth_b.access_token,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(not_visible["code"], "not_found");
+
+    for (method, path, body) in [
+        (
+            Method::PATCH,
+            format!("/api/v1/projects/{}", project_a.id),
+            json!({"version":project_a.version,"name":"Stolen name"}),
+        ),
+        (
+            Method::PATCH,
+            format!("/api/v1/projects/{}", project_a.id),
+            json!({"version":project_a.version,"project_hooks":[]}),
+        ),
+    ] {
+        let error: serde_json::Value = common::json_request_with_bearer(
+            &harness.app,
+            method,
+            &path,
+            &auth_b.access_token,
+            body,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_eq!(error["code"], "not_found", "{path}");
+    }
+    for suffix in ["pause", "resume"] {
+        let error: serde_json::Value = common::json_request_with_bearer(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/projects/{}/{suffix}", project_a.id),
+            &auth_b.access_token,
+            json!({}),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_eq!(error["code"], "not_found");
+    }
+    assert_eq!(
+        project_delete_status(&harness.app, &project_a.id, &auth_b.access_token).await,
+        StatusCode::NOT_FOUND,
+        "a non-member cannot delete another user's Project"
+    );
+
+    let unchanged: ProjectResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}", project_a.id),
+        &token_a,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(unchanged.name, "Private Project A");
+    assert!(!unchanged.paused);
+    assert_eq!(unchanged.version, project_a.version);
+
+    let updated: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{}", project_a.id),
+        &token_a,
+        json!({"version":project_a.version,"name":"Updated Project A","project_hooks":[]}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(updated.name, "Updated Project A");
+    assert!(updated.project_hooks.is_empty());
+
+    let paused: ProjectResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/pause", project_a.id),
+        &token_a,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(paused.paused);
+    let resumed: ProjectResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/resume", project_a.id),
+        &token_a,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(!resumed.paused);
+    assert_eq!(
+        project_delete_status(&harness.app, &project_a.id, &token_a).await,
+        StatusCode::NO_CONTENT,
+        "the owner can delete their Project"
+    );
+}
+
+async fn project_delete_status(app: &Router, project_id: &str, token: &str) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/v1/projects/{project_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("build Project delete request"),
+        )
+        .await
+        .expect("Project delete response")
+        .status()
 }
 
 #[tokio::test]

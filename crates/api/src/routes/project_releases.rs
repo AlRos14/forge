@@ -3,7 +3,6 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use db::{ProjectMemberRepo, ProjectRepo};
 use serde::Deserialize;
 use services::MilestoneRuntime;
 
@@ -65,17 +64,9 @@ pub async fn list_releases(
 }
 
 async fn ensure_project_access(state: &AppState, project_id: &str, user_id: &str) -> ApiResult<()> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.as_deref() != Some(user_id)
-        && ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-            .await?
-            .is_none()
-    {
-        return Err(ApiError::not_found("project", project_id.to_owned()));
-    }
-    Ok(())
+    crate::routes::projects::require_project_visible(state, project_id, user_id)
+        .await
+        .map(|_| ())
 }
 
 fn encode_cursor(revision: &str, id: &str) -> String {

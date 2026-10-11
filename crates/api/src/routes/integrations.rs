@@ -7,15 +7,14 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use db::{
-    CreateProjectIntegration, DbError, IntegrationRepo, ProjectRepo, UpdateProjectIntegration,
-};
+use db::{CreateProjectIntegration, DbError, IntegrationRepo, UpdateProjectIntegration};
 use serde_json::{json, Value};
 use services::IntegrationService;
 
 use crate::{
     errors::{ApiError, ApiResult},
     middleware,
+    routes::auth::AuthenticatedUser,
     state::AppState,
 };
 
@@ -49,17 +48,15 @@ fn integration_response(model: db::ProjectIntegration) -> IntegrationResponse {
 pub async fn create_integration(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    user: AuthenticatedUser,
     Json(body): Json<CreateIntegrationRequest>,
 ) -> ApiResult<(StatusCode, Json<IntegrationResponse>)> {
+    crate::routes::projects::require_project_visible(&state, &project_id, &user.user_id).await?;
     let platform = body
         .platform
         .parse::<db::IntegrationPlatform>()
         .map_err(|_| ApiError::bad_request("invalid platform"))?;
     let (default_assignee_type, default_assignee_id) = storage_actor(body.default_implementer);
-
-    ProjectRepo::get_by_id(&*state.db, &project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
 
     let now = db::now_rfc3339();
     let model = CreateProjectIntegration {
@@ -91,7 +88,9 @@ pub async fn create_integration(
 pub async fn get_integration(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<Option<IntegrationResponse>>> {
+    crate::routes::projects::require_project_visible(&state, &project_id, &user.user_id).await?;
     let row = IntegrationRepo::get_by_project_id(&*state.db, &project_id).await?;
 
     Ok(Json(row.map(integration_response)))
@@ -100,8 +99,10 @@ pub async fn get_integration(
 pub async fn update_integration(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    user: AuthenticatedUser,
     Json(body): Json<PatchIntegrationRequest>,
 ) -> ApiResult<Json<IntegrationResponse>> {
+    crate::routes::projects::require_project_visible(&state, &project_id, &user.user_id).await?;
     let existing = IntegrationRepo::get_by_project_id(&*state.db, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("integration", project_id.clone()))?;
@@ -157,7 +158,9 @@ fn storage_actor(actor: Option<ActorRef>) -> (Option<String>, Option<String>) {
 pub async fn delete_integration(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<StatusCode> {
+    crate::routes::projects::require_project_visible(&state, &project_id, &user.user_id).await?;
     let existing = IntegrationRepo::get_by_project_id(&*state.db, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("integration", project_id))?;
@@ -170,7 +173,9 @@ pub async fn delete_integration(
 pub async fn trigger_sync(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Response> {
+    crate::routes::projects::require_project_visible(&state, &project_id, &user.user_id).await?;
     let existing = IntegrationRepo::get_by_project_id(&*state.db, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("integration", project_id))?;

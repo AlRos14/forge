@@ -422,6 +422,7 @@ export function TaskDetailPage({
             <ReviewExecutionCard
               key={execution.id}
               review={{ execution, report }}
+              currentUserId={userId}
               validations={validations}
               form={reportForm[execution.id]}
               onFormChange={(form) => setReportForm((current) => ({ ...current, [execution.id]: form }))}
@@ -464,8 +465,9 @@ export function TaskDetailPage({
   )
 }
 
-function ReviewExecutionCard({
+export function ReviewExecutionCard({
   review,
+  currentUserId,
   validations,
   form,
   onFormChange,
@@ -473,6 +475,7 @@ function ReviewExecutionCard({
   submitting,
 }: {
   review: ReviewExecutionResponse
+  currentUserId: string | undefined
   validations: import('@/types/generated').ValidationRunResponse[]
   form: SubmitReviewReportRequest | undefined
   onFormChange: (form: SubmitReviewReportRequest) => void
@@ -480,8 +483,12 @@ function ReviewExecutionCard({
   submitting: boolean
 }) {
   const { execution, report } = review
-  const ownsExecution = execution.actor_ref?.kind === 'human'
-  const canSubmit = ownsExecution && execution.status === 'running' && !report
+  const isFormalReview = execution.role === 'reviewer' && execution.purpose === 'review'
+  const ownsExecution =
+    execution.actor_ref?.kind === 'human' &&
+    currentUserId !== undefined &&
+    execution.actor_ref.id === currentUserId
+  const canSubmit = isFormalReview && ownsExecution && execution.status === 'running' && !report
   const currentForm = form ?? {
     verdict: 'pass',
     summary: '',

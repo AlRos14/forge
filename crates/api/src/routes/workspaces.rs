@@ -7,13 +7,20 @@ use services::{DiffService, ServiceError};
 
 use crate::{
     errors::{ApiError, ApiResult},
+    routes::{auth::AuthenticatedUser, tasks::require_task_visible},
     state::AppState,
 };
+use db::WorkspaceRepo;
 
 pub async fn get_workspace_diff(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<DiffEnvelope>> {
+    let workspace = WorkspaceRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("workspace", id.clone()))?;
+    require_task_visible(&state, &workspace.task_id, &user).await?;
     let diff = DiffService::new(std::sync::Arc::clone(&state.db))
         .workspace_diff(&id)
         .await

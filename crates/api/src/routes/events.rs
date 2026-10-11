@@ -5,14 +5,15 @@ use axum::{
     extract::State,
     response::sse::{Event, KeepAlive, Sse},
 };
-use db::{DomainEvent, DomainEventRepo};
+use db::{DomainEvent, DomainEventRepo, ProjectMemberRepo, ProjectRepo, SqliteDb, TaskRepo};
 use serde_json::{json, Map, Value};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
-use crate::state::AppState;
+use crate::{routes::auth::AuthenticatedUser, state::AppState};
 
 pub async fn stream_events(
     State(state): State<AppState>,
+    user: AuthenticatedUser,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let mut shutdown = state.shutdown_signal.subscribe();
     let shutdown_requested = async move {
@@ -28,8 +29,11 @@ pub async fn stream_events(
     };
 
     let db = Arc::clone(&state.db);
+    let user_id = user.user_id;
+    let is_admin = user.is_admin;
     let stream = BroadcastStream::new(state.event_bus.subscribe()).then(move |result| {
         let db = Arc::clone(&db);
+        let user_id = user_id.clone();
         async move {
             let public_event = match result {
                 Ok(hint) if hint.event_type == "domain_event.committed" => {
@@ -56,7 +60,12 @@ pub async fn stream_events(
                     })
                 }
             };
-            public_event.map(to_sse_event).map(Ok)
+            match public_event {
+                Some(event) if public_event_is_visible(&db, &user_id, is_admin, &event).await => {
+                    Some(Ok(to_sse_event(event)))
+                }
+                _ => None,
+            }
         }
     });
     let stream = stream.filter_map(|event| event);
@@ -145,6 +154,43 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
         scope_id: Some(event.scope_id.clone()),
         payload: Some(payload),
     })
+}
+
+async fn public_event_is_visible(
+    db: &SqliteDb,
+    user_id: &str,
+    is_admin: bool,
+    event: &PublicEventEnvelope,
+) -> bool {
+    match event.event_type {
+        PublicEventType::EventsResyncRequired => true,
+        PublicEventType::OperationsStatusChanged => is_admin,
+        _ => match (event.scope_type.as_deref(), event.scope_id.as_deref()) {
+            (Some("project"), Some(project_id)) => {
+                project_is_visible(db, project_id, user_id).await
+            }
+            (Some("task"), Some(task_id)) => {
+                let Ok(Some(task)) = TaskRepo::get_by_id(db, task_id, false).await else {
+                    return false;
+                };
+                project_is_visible(db, &task.project_id, user_id).await
+            }
+            _ => false,
+        },
+    }
+}
+
+async fn project_is_visible(db: &SqliteDb, project_id: &str, user_id: &str) -> bool {
+    let Ok(Some(project)) = ProjectRepo::get_by_id(db, project_id).await else {
+        return false;
+    };
+    if project.owner_id.is_none() || project.owner_id.as_deref() == Some(user_id) {
+        return true;
+    }
+    matches!(
+        ProjectMemberRepo::get_member(db, project_id, user_id).await,
+        Ok(Some(_))
+    )
 }
 
 fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
@@ -240,6 +286,23 @@ fn project_runtime_hint(event: &events::ForgeEvent) -> Option<PublicEventEnvelop
         _ => return None,
     };
 
+    let (scope_type, scope_id) = match &event.context {
+        events::EventContext::ProjectCreated { .. }
+        | events::EventContext::ProjectUpdated {}
+        | events::EventContext::ProjectDeleted {}
+        | events::EventContext::ProjectPaused { .. }
+        | events::EventContext::ProjectResumed {} => {
+            (Some("project".to_owned()), Some(event.entity_id.clone()))
+        }
+        events::EventContext::ProjectHookRunChanged { project_id, .. } => {
+            (Some("project".to_owned()), Some(project_id.clone()))
+        }
+        events::EventContext::NotificationCreated { project_id, .. } => {
+            (Some("project".to_owned()), Some(project_id.clone()))
+        }
+        _ => (None, None),
+    };
+
     Some(PublicEventEnvelope {
         event_type,
         entity_id: event.entity_id.clone(),
@@ -247,8 +310,8 @@ fn project_runtime_hint(event: &events::ForgeEvent) -> Option<PublicEventEnvelop
         event_id: None,
         sequence: None,
         entity_type: None,
-        scope_type: None,
-        scope_id: None,
+        scope_type,
+        scope_id,
         payload: Some(payload),
     })
 }
@@ -349,5 +412,81 @@ mod tests {
             payload,
             json!({"project_id":"project-1","run_id":"run-1","status":"succeeded"})
         );
+    }
+
+    #[tokio::test]
+    async fn public_project_and_task_events_are_filtered_by_user_visibility() {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        db::run_migrations(&pool).await.expect("migrations");
+        let db = SqliteDb::new(pool);
+        let now = db::now_rfc3339();
+        db::ProjectRepo::create(
+            &db,
+            db::CreateProject {
+                id: "private-project".to_owned(),
+                name: "Private".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: Some("owner-a".to_owned()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("create private Project");
+        db::TaskRepo::create(
+            &db,
+            db::CreateTask {
+                id: "private-task".to_owned(),
+                project_id: "private-project".to_owned(),
+                repo_id: None,
+                parent_task_id: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: "Private Task".to_owned(),
+                description: None,
+                task_type: "implementation".to_owned(),
+                status: "todo".to_owned(),
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                task_state_config: None,
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("create private Task");
+
+        let project_event = PublicEventEnvelope {
+            event_type: PublicEventType::ProjectUpdated,
+            entity_id: "private-project".to_owned(),
+            timestamp: "2026-10-11T00:00:00Z".to_owned(),
+            event_id: None,
+            sequence: None,
+            entity_type: None,
+            scope_type: Some("project".to_owned()),
+            scope_id: Some("private-project".to_owned()),
+            payload: Some(json!({})),
+        };
+        let task_event = PublicEventEnvelope {
+            event_type: PublicEventType::TaskLifecycleChanged,
+            entity_id: "private-task".to_owned(),
+            timestamp: "2026-10-11T00:00:00Z".to_owned(),
+            event_id: None,
+            sequence: None,
+            entity_type: Some("task".to_owned()),
+            scope_type: Some("task".to_owned()),
+            scope_id: Some("private-task".to_owned()),
+            payload: Some(json!({})),
+        };
+        assert!(public_event_is_visible(&db, "owner-a", false, &project_event).await);
+        assert!(!public_event_is_visible(&db, "owner-b", false, &project_event).await);
+        assert!(public_event_is_visible(&db, "owner-a", false, &task_event).await);
+        assert!(!public_event_is_visible(&db, "owner-b", false, &task_event).await);
     }
 }

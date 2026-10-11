@@ -30,6 +30,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   from historical Project rows. Legacy state-driven lifecycle hook scripts and
   their EventBus emitter no longer run or block new Executions; their stored
   settings remain intact, and generic durable Project hooks remain supported.
+  REST and MCP Project lists now filter before pagination, and Project reads,
+  mutations, and derived MCP resources enforce the authenticated user's existing
+  owner/member visibility. MCP-created Projects record that Human as owner;
+  Project-scoped MCP calls cannot cross into a different Project. MCP Agent
+  registration binds the Agent to its caller, daemon pinning requires an admin,
+  and non-admin Agent output omits daemon IDs and redacts sensitive config.
+  REST repository/integration paths resolve their Project before access, Task
+  and Execution paths resolve through the authorized Project, and notification
+  reads/mutations plus Project-scoped MCP configuration use the same
+  visible-Project set. Authenticated SSE
+  streams now filter Project/Task events by caller visibility; operational
+  status hints are admin-only. Historical Release snapshot reads share the
+  Project visibility rule, including existing public ownerless Projects.
+  REST and MCP Agent rosters filter private Agents before pagination and page
+  metadata; provider runtime projections also filter private Agents and Daemons
+  before returning items or counts.
   Operator health now reports blocked state from TaskLifecycle, retry pressure
   from exact immutable retry receipts, and HarnessSession only from an
   Execution's explicit reference; it no longer projects transition-log retry

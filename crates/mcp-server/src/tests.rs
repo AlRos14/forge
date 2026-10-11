@@ -2,10 +2,11 @@ use std::{future::Future, sync::Arc};
 
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, Agent, AgentRepo, AgentStatus,
-    AssigneeKind, CreateAgent, CreateExecution, CreateProject, CreateRepo, CreateTask,
-    CreateTaskRoleAssignment, DaemonRepo, DaemonStatus, ExecutionPurpose, ExecutionRepo,
-    ExecutionStatus, ProjectRepo, RepoRepo, SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo,
-    UpdateProject, UpdateTask, UpsertDaemon,
+    AssigneeKind, CreateAgent, CreateExecution, CreateProject, CreateProjectMember, CreateRepo,
+    CreateTask, CreateTaskRoleAssignment, CreateWorkspace, DaemonRepo, DaemonStatus,
+    ExecutionPurpose, ExecutionRepo, ExecutionStatus, ProjectMemberRepo, ProjectRepo, RepoRepo,
+    SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpdateTask, UpsertDaemon,
+    User, UserRepo, ValidationRunRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::EventBus;
 use serde_json::{json, Value};
@@ -29,7 +30,38 @@ async fn sqlite_state() -> AppState {
         .await
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
-    AppState::new(Arc::new(SqliteDb::new(pool)), Arc::new(EventBus::new(16)))
+    let db = Arc::new(SqliteDb::new(pool));
+    let now = now_rfc3339();
+    UserRepo::create_user(
+        &*db,
+        &User {
+            id: "test-user".to_owned(),
+            email: "test-user@example.com".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("test user creates");
+    let admin_now = now_rfc3339();
+    UserRepo::create_user(
+        &*db,
+        &User {
+            id: "test-admin".to_owned(),
+            email: "test-admin@example.com".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: true,
+            created_at: admin_now.clone(),
+            updated_at: admin_now,
+        },
+    )
+    .await
+    .expect("test admin creates");
+    AppState::new(db, Arc::new(EventBus::new(16)))
 }
 
 async fn seed_project_repo(state: &AppState) -> (String, String) {
@@ -79,6 +111,209 @@ async fn seed_project_repo(state: &AppState) -> (String, String) {
     .await
     .expect("project primary repo updates");
     (project.id, repo.id)
+}
+
+async fn add_user(state: &AppState, user_id: &str) {
+    let now = now_rfc3339();
+    UserRepo::create_user(
+        &*state.db,
+        &User {
+            id: user_id.to_owned(),
+            email: format!("{user_id}@example.com"),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("user creates");
+}
+
+fn user_mcp_context(user_id: &str) -> McpContext {
+    McpContext {
+        project_id: None,
+        user_id: Some(user_id.to_owned()),
+        is_admin: false,
+    }
+}
+
+async fn seed_private_project_repo(
+    state: &AppState,
+    owner_id: &str,
+    name: &str,
+) -> (String, String) {
+    let now = now_rfc3339();
+    let project = ProjectRepo::create(
+        &*state.db,
+        CreateProject {
+            id: new_uuid_v4(),
+            name: name.to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some(owner_id.to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("private project creates");
+    let repo = RepoRepo::create(
+        &*state.db,
+        CreateRepo {
+            id: new_uuid_v4(),
+            project_id: project.id.clone(),
+            name: "repo".to_owned(),
+            local_path: None,
+            remote_url: "https://example.com/private.git".to_owned(),
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("private project repo creates");
+    ProjectRepo::update(
+        &*state.db,
+        UpdateProject {
+            id: project.id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(repo.id.clone())),
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("private project repo becomes primary");
+    (project.id, repo.id)
+}
+
+async fn seed_private_agent(state: &AppState, owner_id: &str) -> String {
+    let now = now_rfc3339();
+    let agent = AgentRepo::create(
+        &*state.db,
+        CreateAgent {
+            id: new_uuid_v4(),
+            name: "private harness".to_owned(),
+            description: None,
+            executor_type: "shell".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: r#"{"api_key":"private-value","nested":{"password":"nested-value"},"safe":"visible"}"#.to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some(owner_id.to_owned()),
+            visibility: "account".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("private Agent creates");
+    agent.id
+}
+
+async fn seed_validation_run_and_evidence(state: &AppState, task: &Task) -> (String, String) {
+    let now = now_rfc3339();
+    let workspace_id = new_uuid_v4();
+    WorkspaceRepo::create(
+        &*state.db,
+        CreateWorkspace {
+            id: workspace_id.clone(),
+            task_id: task.id.clone(),
+            repo_id: task.repo_id.clone().expect("fixture task has a repo"),
+            worktree_path: format!("/tmp/forge-test/{}", task.id),
+            branch: format!("test/{}", task.id),
+            status: WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("workspace creates");
+
+    let run_id = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO validation_run
+            (id, task_id, check_identity, command, config_summary_json, config_digest,
+             workspace_id, commit_sha, workspace_snapshot_digest, idempotency_key, status,
+             started_at, created_at, updated_at)
+         VALUES (?, ?, 'ci:test', 'true', '{}', ?, ?, '1234567', ?, ?, 'running', ?, ?, ?)",
+    )
+    .bind(&run_id)
+    .bind(&task.id)
+    .bind("a".repeat(64))
+    .bind(&workspace_id)
+    .bind("b".repeat(64))
+    .bind(format!("validation-{run_id}"))
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(state.db.pool())
+    .await
+    .expect("ValidationRun fixture inserts");
+
+    let evidence_id = new_uuid_v4();
+    let evidence_content = json!({
+        "validation_run_id": run_id,
+        "task_id": task.id,
+        "check_identity": "ci:test",
+        "command": "true",
+        "config_digest": "a".repeat(64),
+        "workspace_id": workspace_id,
+        "commit_sha": "1234567",
+        "workspace_snapshot_digest": "b".repeat(64),
+    })
+    .to_string();
+    let mut transaction = state
+        .db
+        .pool()
+        .begin()
+        .await
+        .expect("fixture transaction begins");
+    sqlx::query(
+        "INSERT INTO evidence_validation_run_producer
+            (evidence_id, validation_run_id, task_id, evidence_key)
+         VALUES (?, ?, ?, 'test:evidence')",
+    )
+    .bind(&evidence_id)
+    .bind(&run_id)
+    .bind(&task.id)
+    .execute(&mut *transaction)
+    .await
+    .expect("Evidence producer inserts");
+    sqlx::query(
+        "INSERT INTO evidence (id, task_id, kind, content_json, digest, created_at)
+         VALUES (?, ?, 'deterministic_check_output', ?, ?, ?)",
+    )
+    .bind(&evidence_id)
+    .bind(&task.id)
+    .bind(evidence_content)
+    .bind("c".repeat(64))
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await
+    .expect("Evidence fixture inserts");
+    transaction
+        .commit()
+        .await
+        .expect("fixture transaction commits");
+    (run_id, evidence_id)
 }
 
 async fn seed_task(state: &AppState) -> Task {
@@ -349,6 +584,60 @@ async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Value {
     serde_json::from_str(text).expect("tool text content is JSON")
 }
 
+fn admin_mcp_context() -> McpContext {
+    McpContext {
+        project_id: None,
+        user_id: Some("test-admin".to_owned()),
+        is_admin: true,
+    }
+}
+
+async fn call_tool_as(
+    state: &AppState,
+    context: &McpContext,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    let result = dispatch_with_context(
+        state,
+        context,
+        "tools/call",
+        json!({
+            "name": name,
+            "arguments": arguments,
+        }),
+    )
+    .await
+    .expect("tool succeeds");
+    let text = result["content"][0]["text"]
+        .as_str()
+        .expect("tool result includes text content");
+    serde_json::from_str(text).expect("tool text content is JSON")
+}
+
+async fn call_tool_error_as(
+    state: &AppState,
+    context: &McpContext,
+    name: &str,
+    arguments: Value,
+) -> crate::protocol::McpError {
+    let error = dispatch_with_context(
+        state,
+        context,
+        "tools/call",
+        json!({
+            "name": name,
+            "arguments": arguments,
+        }),
+    )
+    .await
+    .expect_err("tool call should fail");
+    error
+        .into_response(json!(1))
+        .error
+        .expect("error response has error")
+}
+
 async fn call_tool_scoped(
     state: &AppState,
     project_id: &str,
@@ -359,7 +648,8 @@ async fn call_tool_scoped(
         state,
         &McpContext {
             project_id: Some(project_id.to_owned()),
-            user_id: None,
+            user_id: Some("test-user".to_owned()),
+            is_admin: false,
         },
         "tools/call",
         json!({
@@ -484,8 +774,9 @@ fn task_role_membership_tools_require_identity_and_keep_exact_actor_ref() {
             "role": "implementer",
             "coordination_mode": "independent"
         });
-        let unauthenticated = dispatch(
+        let unauthenticated = dispatch_with_context(
             &state,
+            &McpContext::default(),
             "tools/call",
             json!({
                 "name": "forge_create_task_role",
@@ -499,6 +790,7 @@ fn task_role_membership_tools_require_identity_and_keep_exact_actor_ref() {
         let context = McpContext {
             project_id: None,
             user_id: Some("user-1".to_owned()),
+            is_admin: false,
         };
         let created = dispatch_with_context(
             &state,
@@ -685,7 +977,8 @@ fn scoped_tools_list_marks_project_id_optional() {
             &state,
             &McpContext {
                 project_id: Some("project-1".to_owned()),
-                user_id: None,
+                user_id: Some("test-user".to_owned()),
+                is_admin: false,
             },
             "tools/list",
             json!({}),
@@ -727,8 +1020,9 @@ fn unknown_method_returns_method_not_found() {
 fn embedded_read_tools_require_authenticated_server_identity() {
     run_async(async {
         let state = sqlite_state().await;
-        let error = dispatch(
+        let error = dispatch_with_context(
             &state,
+            &McpContext::default(),
             "tools/call",
             json!({
                 "name": "forge_list_agent_profiles",
@@ -986,7 +1280,8 @@ fn scoped_mcp_rejects_mismatched_project_id() {
             &state,
             &McpContext {
                 project_id: Some(project_id),
-                user_id: None,
+                user_id: Some("test-user".to_owned()),
+                is_admin: false,
             },
             "tools/call",
             json!({
@@ -1034,7 +1329,8 @@ fn scoped_mcp_rejects_task_id_tool_for_other_project() {
             &state,
             &McpContext {
                 project_id: Some(scoped_project_id),
-                user_id: None,
+                user_id: Some("test-user".to_owned()),
+                is_admin: false,
             },
             "tools/call",
             json!({
@@ -1062,7 +1358,8 @@ fn scoped_mcp_rejects_parent_task_id_tool_for_other_project() {
             &state,
             &McpContext {
                 project_id: Some(scoped_project_id),
-                user_id: None,
+                user_id: Some("test-user".to_owned()),
+                is_admin: false,
             },
             "tools/call",
             json!({
@@ -1095,7 +1392,8 @@ fn scoped_mcp_rejects_execution_id_tool_for_other_project() {
             &state,
             &McpContext {
                 project_id: Some(scoped_project_id),
-                user_id: None,
+                user_id: Some("test-user".to_owned()),
+                is_admin: false,
             },
             "tools/call",
             json!({
@@ -1110,6 +1408,367 @@ fn scoped_mcp_rejects_execution_id_tool_for_other_project() {
         .expect_err("cross-project execution handle errors");
 
         assert_eq!(error.code, -32602);
+    });
+}
+
+#[test]
+fn user_scoped_mcp_isolates_projects_and_derived_resources() {
+    run_async(async {
+        let state = sqlite_state().await;
+        add_user(&state, "user-b").await;
+        let (project_a, _) = seed_private_project_repo(&state, "test-user", "Project A").await;
+        let (project_b, _) = seed_private_project_repo(&state, "user-b", "Project B").await;
+        let task_a = seed_task_in_project(&state, project_a.clone()).await;
+        let task_b = seed_task_in_project(&state, project_b.clone()).await;
+        let execution_b = seed_execution(&state, task_b.id.clone()).await;
+        let agent_b = seed_private_agent(&state, "user-b").await;
+        let global_agent = seed_agent(&state, "global harness").await;
+        let (validation_run_b, evidence_b) =
+            seed_validation_run_and_evidence(&state, &task_b).await;
+        let user_a = user_mcp_context("test-user");
+        let user_b = user_mcp_context("user-b");
+
+        let unauthenticated = dispatch_with_context(
+            &state,
+            &McpContext::default(),
+            "tools/call",
+            json!({ "name": "forge_create_project", "arguments": { "name": "No owner" } }),
+        )
+        .await
+        .expect_err("Project creation requires an authenticated Human");
+        assert_eq!(unauthenticated.code, -32003);
+
+        let projects = call_tool_as(
+            &state,
+            &user_a,
+            "forge_list_projects",
+            json!({ "limit": 100 }),
+        )
+        .await;
+        let listed_project_ids = projects["items"]
+            .as_array()
+            .expect("project items")
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(listed_project_ids.contains(&project_a.as_str()));
+        assert!(!listed_project_ids.contains(&project_b.as_str()));
+        assert!(projects["total_count"].is_null());
+
+        let agents_a = call_tool_as(
+            &state,
+            &user_a,
+            "forge_list_agents",
+            json!({ "limit": 100 }),
+        )
+        .await;
+        let agent_items_a = agents_a["items"].as_array().unwrap();
+        assert!(!agent_items_a.iter().any(|item| item["id"] == agent_b));
+        let global_agent_a = agent_items_a
+            .iter()
+            .find(|item| item["id"] == global_agent.id)
+            .expect("global Agent remains visible");
+        assert!(global_agent_a["daemon_id"].is_null());
+        let first_agent_page =
+            call_tool_as(&state, &user_a, "forge_list_agents", json!({ "limit": 1 })).await;
+        assert_eq!(first_agent_page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(first_agent_page["has_more"], false);
+        assert!(first_agent_page["next_cursor"].is_null());
+        let agents_b = call_tool_as(
+            &state,
+            &user_b,
+            "forge_list_agents",
+            json!({ "limit": 100 }),
+        )
+        .await;
+        let private_agent_b = agents_b["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == agent_b)
+            .expect("owner sees private Agent");
+        assert_eq!(private_agent_b["config_json"]["api_key"], "[redacted]");
+        assert_eq!(
+            private_agent_b["config_json"]["nested"]["password"],
+            "[redacted]"
+        );
+        assert_eq!(private_agent_b["config_json"]["safe"], "visible");
+
+        let updated_project = call_tool_as(
+            &state,
+            &user_a,
+            "forge_update_project",
+            json!({ "project_id": project_a, "name": "Project A updated" }),
+        )
+        .await;
+        assert_eq!(updated_project["name"], "Project A updated");
+        let updated_task = call_tool_as(
+            &state,
+            &user_a,
+            "forge_update_task",
+            json!({
+                "task_id": task_a.id,
+                "version": task_a.version,
+                "title": "Task A updated"
+            }),
+        )
+        .await;
+        assert_eq!(updated_task["title"], "Task A updated");
+
+        let error = call_tool_error_as(
+            &state,
+            &user_a,
+            "forge_get_project",
+            json!({ "project_id": project_b }),
+        )
+        .await;
+        assert_eq!(error.code, -32001);
+        let error = call_tool_error_as(
+            &state,
+            &user_a,
+            "forge_update_project",
+            json!({ "project_id": project_b, "name": "cross-user write" }),
+        )
+        .await;
+        assert_eq!(error.code, -32001);
+        let error = call_tool_error_as(
+            &state,
+            &user_a,
+            "forge_update_project_hooks",
+            json!({ "project_id": project_b, "version": 1, "project_hooks": [] }),
+        )
+        .await;
+        assert_eq!(error.code, -32001);
+        let project_b_after = ProjectRepo::get_by_id(&*state.db, &project_b)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(project_b_after.name, "Project B");
+
+        for (name, arguments) in [
+            ("forge_get_task", json!({ "task_id": task_b.id })),
+            (
+                "forge_update_task",
+                json!({ "task_id": task_b.id, "version": task_b.version, "title": "cross-user" }),
+            ),
+            (
+                "forge_transition_task_lifecycle",
+                json!({ "task_id": task_b.id, "to_state": "active", "expected_lifecycle_version": 1, "idempotency_key": "cross-user" }),
+            ),
+            (
+                "forge_create_task_role",
+                json!({ "task_id": task_b.id, "role": "reviewer", "coordination_mode": "independent" }),
+            ),
+            (
+                "forge_create_task_gate",
+                json!({ "task_id": task_b.id, "gate_kind": "cross-user", "policy": { "schema_version": 1, "validations": [] } }),
+            ),
+            (
+                "forge_get_review_execution",
+                json!({ "execution_id": execution_b }),
+            ),
+            (
+                "forge_get_validation_run",
+                json!({ "validation_run_id": validation_run_b }),
+            ),
+            ("forge_get_evidence", json!({ "evidence_id": evidence_b })),
+        ] {
+            let error = call_tool_error_as(&state, &user_a, name, arguments).await;
+            assert_eq!(error.code, -32001, "{name}");
+        }
+
+        for name in [
+            "forge_list_task_dependencies",
+            "forge_list_executions",
+            "forge_get_task_lifecycle",
+            "forge_list_task_lifecycle_transitions",
+            "forge_list_task_roles",
+            "forge_list_task_review_executions",
+            "forge_list_validation_runs",
+            "forge_list_task_artifacts",
+            "forge_list_task_messages",
+            "forge_list_task_handoffs",
+            "forge_list_task_proposals",
+            "forge_list_task_decisions",
+        ] {
+            let error =
+                call_tool_error_as(&state, &user_a, name, json!({ "task_id": task_b.id })).await;
+            assert_eq!(error.code, -32001, "{name}");
+        }
+
+        let validation_run = ValidationRunRepo::get_validation_run(&*state.db, &validation_run_b)
+            .await
+            .unwrap()
+            .unwrap();
+        let gate_b = call_tool_as(
+            &state,
+            &user_b,
+            "forge_create_task_gate",
+            json!({
+                "task_id": task_b.id,
+                "gate_kind": "authorization-fixture",
+                "policy": {
+                    "schema_version": 1,
+                    "validations": [{
+                        "validation_run_id": validation_run_b,
+                        "evidence_id": evidence_b,
+                        "evidence_digest": "c".repeat(64),
+                        "check_identity": validation_run.check_identity,
+                        "config_digest": validation_run.config_digest,
+                        "workspace_id": validation_run.workspace_id,
+                        "commit_sha": validation_run.commit_sha,
+                        "workspace_snapshot_digest": validation_run.workspace_snapshot_digest,
+                        "required_outcome": "passed"
+                    }]
+                }
+            }),
+        )
+        .await;
+        let gate_id = gate_b["gate"]["id"].as_str().unwrap().to_owned();
+        let evaluation_b = call_tool_as(
+            &state,
+            &user_b,
+            "forge_evaluate_gate",
+            json!({ "gate_id": gate_id }),
+        )
+        .await;
+        let evaluation_id = evaluation_b["id"].as_str().unwrap().to_owned();
+        for (name, arguments) in [
+            ("forge_get_gate", json!({ "gate_id": gate_id })),
+            ("forge_evaluate_gate", json!({ "gate_id": gate_id })),
+            (
+                "forge_revise_gate_policy",
+                json!({ "gate_id": gate_id, "expected_active_revision": 1, "policy": { "schema_version": 1 } }),
+            ),
+            (
+                "forge_get_gate_evaluation",
+                json!({ "evaluation_id": evaluation_id }),
+            ),
+        ] {
+            let error = call_tool_error_as(&state, &user_a, name, arguments).await;
+            assert_eq!(error.code, -32001, "{name}");
+        }
+
+        let error = call_tool_error_as(
+            &state,
+            &user_a,
+            "forge_start_execution",
+            json!({
+                "task_id": task_a.id,
+                "agent_id": agent_b,
+                "role": "implementer",
+                "purpose": "implement",
+                "prompt": "must not use another user's private Agent"
+            }),
+        )
+        .await;
+        assert_eq!(error.code, -32004);
+        let execution_a = seed_execution(&state, task_a.id.clone()).await;
+        let error = call_tool_error_as(
+            &state,
+            &user_a,
+            "forge_follow_up_execution",
+            json!({
+                "execution_id": execution_a,
+                "message": "continue",
+                "agent_id": agent_b
+            }),
+        )
+        .await;
+        assert_eq!(error.code, -32004);
+
+        let task_a_read = call_tool_as(
+            &state,
+            &McpContext {
+                project_id: Some(project_a.clone()),
+                ..user_a.clone()
+            },
+            "forge_get_task",
+            json!({ "task_id": task_a.id }),
+        )
+        .await;
+        assert_eq!(task_a_read["id"], task_a.id);
+        let error = call_tool_error_as(
+            &state,
+            &McpContext {
+                project_id: Some(project_a.clone()),
+                ..user_b.clone()
+            },
+            "forge_get_project",
+            json!({ "project_id": project_a }),
+        )
+        .await;
+        assert_eq!(error.code, -32001);
+
+        ProjectMemberRepo::add_member(
+            &*state.db,
+            CreateProjectMember {
+                id: new_uuid_v4(),
+                project_id: project_b.clone(),
+                user_id: "test-user".to_owned(),
+                role: "member".to_owned(),
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("User A becomes a Project B member");
+        let member_task_read = call_tool_as(
+            &state,
+            &user_a,
+            "forge_get_task",
+            json!({ "task_id": task_b.id }),
+        )
+        .await;
+        assert_eq!(member_task_read["id"], task_b.id);
+        let error = call_tool_error_as(
+            &state,
+            &McpContext {
+                project_id: Some(project_a.clone()),
+                ..user_a.clone()
+            },
+            "forge_get_task",
+            json!({ "task_id": task_b.id }),
+        )
+        .await;
+        assert_eq!(error.code, -32602);
+
+        let created_project = call_tool_as(
+            &state,
+            &user_a,
+            "forge_create_project",
+            json!({ "name": "MCP-owned" }),
+        )
+        .await;
+        let created_project_id = created_project["id"].as_str().unwrap();
+        let created = ProjectRepo::get_by_id(&*state.db, created_project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(created.owner_id.as_deref(), Some("test-user"));
+        let owner_membership =
+            ProjectMemberRepo::get_member(&*state.db, created_project_id, "test-user")
+                .await
+                .unwrap()
+                .expect("owner membership exists");
+        assert_eq!(owner_membership.role, "owner");
+        let error = call_tool_error_as(
+            &state,
+            &user_b,
+            "forge_get_project",
+            json!({ "project_id": created_project_id }),
+        )
+        .await;
+        assert_eq!(error.code, -32001);
+
+        let own_task = call_tool_as(
+            &state,
+            &user_b,
+            "forge_get_task",
+            json!({ "task_id": task_b.id }),
+        )
+        .await;
+        assert_eq!(own_task["id"], task_b.id);
     });
 }
 
@@ -1165,8 +1824,9 @@ fn forge_transition_task_lifecycle_requires_exact_identity_and_returns_authority
     run_async(async {
         let state = sqlite_state().await;
         let task = seed_task(&state).await;
-        let unauthenticated = dispatch(
+        let unauthenticated = dispatch_with_context(
             &state,
+            &McpContext::default(),
             "tools/call",
             json!({
                 "name": "forge_transition_task_lifecycle",
@@ -1187,6 +1847,7 @@ fn forge_transition_task_lifecycle_requires_exact_identity_and_returns_authority
             &McpContext {
                 project_id: None,
                 user_id: Some("human-actor".to_owned()),
+                is_admin: false,
             },
             "tools/call",
             json!({
@@ -1209,6 +1870,7 @@ fn forge_transition_task_lifecycle_requires_exact_identity_and_returns_authority
             &McpContext {
                 project_id: None,
                 user_id: Some("human-actor".to_owned()),
+                is_admin: false,
             },
             "tools/call",
             json!({
@@ -1242,8 +1904,9 @@ fn forge_register_agent_registers_agent() {
     run_async(async {
         let state = sqlite_state().await;
         let (executor_type, daemon_id) = seed_agent_registration_deps(&state).await;
-        let result = call_tool(
+        let result = call_tool_as(
             &state,
+            &admin_mcp_context(),
             "forge_register_agent",
             json!({
                 "name": "codex",
@@ -1265,8 +1928,9 @@ fn forge_list_agents_returns_paginated_agents() {
     run_async(async {
         let state = sqlite_state().await;
         let (executor_type, daemon_id) = seed_agent_registration_deps(&state).await;
-        call_tool(
+        call_tool_as(
             &state,
+            &admin_mcp_context(),
             "forge_register_agent",
             json!({
                 "name": "codex",
@@ -1276,8 +1940,9 @@ fn forge_list_agents_returns_paginated_agents() {
         )
         .await;
 
-        let result = call_tool(
+        let result = call_tool_as(
             &state,
+            &admin_mcp_context(),
             "forge_list_agents",
             json!({
                 "status": "idle",

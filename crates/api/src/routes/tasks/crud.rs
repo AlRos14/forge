@@ -3,8 +3,10 @@ use super::*;
 pub async fn create_task(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    user: AuthenticatedUser,
     Json(body): Json<Value>,
 ) -> ApiResult<Json<TaskResponse>> {
+    crate::routes::projects::require_project_visible(&state, &project_id, &user.user_id).await?;
     let request: CreateTaskRequest = serde_json::from_value(body)?;
     let task_type = request.task_type.map(|t| {
         match t {
@@ -36,8 +38,10 @@ pub async fn create_task(
 pub async fn list_tasks(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    user: AuthenticatedUser,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<TasksResponse>> {
+    crate::routes::projects::require_project_visible(&state, &project_id, &user.user_id).await?;
     if params.status.is_some() {
         return Err(ApiError::bad_request(
             "Task status filters were retired; use lifecycle_state",
@@ -114,8 +118,10 @@ pub async fn get_task(
 pub async fn update_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
     Json(request): Json<UpdateTaskRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
+    require_task_visible(&state, &id, &user).await?;
     TaskRepo::update(
         &*state.db,
         UpdateTask {
@@ -144,7 +150,9 @@ pub async fn update_task(
 pub async fn delete_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<StatusCode> {
+    require_task_visible(&state, &id, &user).await?;
     let task = state.task_service.soft_delete(id).await?;
     super::media::delete_task_media_for_task(&state, &task.id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -153,8 +161,10 @@ pub async fn delete_task(
 pub async fn reorder_subtasks(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
+    user: AuthenticatedUser,
     Json(request): Json<ReorderSubtasksRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
+    require_task_visible(&state, &task_id, &user).await?;
     state
         .task_service
         .reorder_subtasks(task_id.clone(), request.ordered_ids)

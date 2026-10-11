@@ -78,22 +78,14 @@ pub async fn list_projects(
     user: AuthenticatedUser,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<ProjectResponse>>> {
-    let page = ProjectRepo::list(&*state.db, page_request(&params)?).await?;
+    let page = ProjectRepo::list_visible_to_user(&*state.db, &user.user_id, page_request(&params)?)
+        .await?;
     let has_more = page.next_cursor.is_some();
     let next_cursor = page.next_cursor;
     let total_count = page.total_count.and_then(|count| u64::try_from(count).ok());
-    // Owner visibility is canonical even if a legacy/direct-create row was
-    // left without its best-effort membership row.  Membership additionally
-    // grants visibility to collaborators; owner_id = NULL denotes a public
-    // system Project.
-    let mut visible_items = Vec::new();
-    for project in page.items {
-        if project_is_visible(&state, &project, &user.user_id).await? {
-            visible_items.push(project);
-        }
-    }
     let response = PaginatedResponse {
-        items: visible_items
+        items: page
+            .items
             .into_iter()
             .map(project_response)
             .collect::<ApiResult<Vec<_>>>()?,
@@ -149,8 +141,10 @@ pub async fn list_project_hook_runs(
 
 pub async fn delete_project(
     State(state): State<AppState>,
+    user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    require_project_visible(&state, &id, &user.user_id).await?;
     services::project_deletion::delete_project(
         state.db.clone(),
         state.cleanup_scheduler.workspace_root(),
@@ -168,11 +162,10 @@ pub async fn delete_project(
 
 pub async fn pause_project(
     State(state): State<AppState>,
+    user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProjectResponse>> {
-    let project = ProjectRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
+    let project = require_project_visible(&state, &id, &user.user_id).await?;
     if project.paused_at.is_some() {
         return Ok(Json(project_response(project)?));
     }
@@ -195,11 +188,10 @@ pub async fn pause_project(
 
 pub async fn resume_project(
     State(state): State<AppState>,
+    user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProjectResponse>> {
-    let project = ProjectRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
+    let project = require_project_visible(&state, &id, &user.user_id).await?;
     if project.paused_at.is_none() {
         return Ok(Json(project_response(project)?));
     }
@@ -221,10 +213,11 @@ pub async fn resume_project(
 
 pub async fn update_project(
     State(state): State<AppState>,
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<UpdateProjectRequest>,
 ) -> ApiResult<Json<ProjectResponse>> {
+    require_project_visible(&state, &id, &user.user_id).await?;
     let UpdateProjectRequest {
         name,
         paused,
@@ -265,7 +258,7 @@ pub async fn update_project(
     Ok(Json(project_response(project)?))
 }
 
-async fn require_project_visible(
+pub(super) async fn require_project_visible(
     state: &AppState,
     project_id: &str,
     user_id: &str,

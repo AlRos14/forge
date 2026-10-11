@@ -15,15 +15,17 @@ use db::{
 use crate::{
     errors::{ApiError, ApiResult},
     path_input::canonical_directory,
-    routes::{page_request, repo_response, ListParams},
+    routes::{auth::AuthenticatedUser, page_request, repo_response, ListParams},
     state::AppState,
 };
 
 pub async fn create_repo(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    user: AuthenticatedUser,
     Json(request): Json<CreateRepoRequest>,
 ) -> ApiResult<Json<RepoResponse>> {
+    crate::routes::projects::require_project_visible(&state, &project_id, &user.user_id).await?;
     if request.pr_provider.is_none() && request.pr_provider_config.is_some() {
         return Err(ApiError::bad_request_with_code(
             "repo.pr_provider_required",
@@ -110,8 +112,10 @@ pub async fn create_repo(
 pub async fn list_repos(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    user: AuthenticatedUser,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<RepoResponse>>> {
+    crate::routes::projects::require_project_visible(&state, &project_id, &user.user_id).await?;
     let page = RepoRepo::list_by_project(&*state.db, &project_id, page_request(&params)?).await?;
     let mut items = Vec::with_capacity(page.items.len());
     for repo in page.items {
@@ -128,19 +132,20 @@ pub async fn list_repos(
 pub async fn get_repo(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<RepoResponse>> {
-    let repo = RepoRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("repo", id))?;
+    let repo = require_repo_visible(&state, &id, &user).await?;
     Ok(Json(repo_with_provider(&*state.db, repo).await?))
 }
 
 pub async fn update_repo(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
     Json(request): Json<UpdateRepoRequest>,
 ) -> ApiResult<Json<RepoResponse>> {
     let db = &*state.db;
+    require_repo_visible(&state, &id, &user).await?;
     let UpdateRepoRequest {
         name,
         remote_url,
@@ -280,7 +285,9 @@ async fn update_pr_provider_config(
 pub async fn delete_repo(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<StatusCode> {
+    require_repo_visible(&state, &id, &user).await?;
     RepoRepo::delete(&*state.db, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -288,10 +295,9 @@ pub async fn delete_repo(
 pub async fn sync_repo(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<RepoSyncResponse>> {
-    let repo = RepoRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("repo", id.clone()))?;
+    let repo = require_repo_visible(&state, &id, &user).await?;
     let local_path = repo.local_path.ok_or_else(|| {
         ApiError::bad_request_with_code(
             "repo.no_local_path",
@@ -311,6 +317,19 @@ pub async fn sync_repo(
         pull_output,
         push_output,
     }))
+}
+
+async fn require_repo_visible(
+    state: &AppState,
+    repo_id: &str,
+    user: &AuthenticatedUser,
+) -> ApiResult<Repo> {
+    let repo = RepoRepo::get_by_id(&*state.db, repo_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("repo", repo_id.to_owned()))?;
+    crate::routes::projects::require_project_visible(state, &repo.project_id, &user.user_id)
+        .await?;
+    Ok(repo)
 }
 
 fn git_sync_error(error: git::GitError) -> ApiError {

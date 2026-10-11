@@ -36,7 +36,7 @@ use crate::{
     protocol::McpContext,
     state::AppState,
     values::{
-        agent_page_value, agent_profile_value, agent_value, execution_page_value, execution_value,
+        agent_profile_value, agent_value, execution_page_value, execution_value,
         project_page_value, project_value,
     },
 };
@@ -349,16 +349,8 @@ pub(super) async fn forge_start_execution(
     let project = ProjectRepo::get_by_id(&*state.db, &task.project_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("project", task.project_id.clone()))?;
-    if project
-        .owner_id
-        .as_deref()
-        .is_some_and(|owner_id| owner_id != user_id)
-        && db::ProjectMemberRepo::get_member(&*state.db, &project.id, user_id)
-            .await?
-            .is_none()
-    {
-        return Err(McpToolError::not_found("task", params.task_id));
-    }
+    require_project_access(state, &project.id, user_id).await?;
+    require_agent_visible(state, context, &params.agent_id).await?;
     if params.role.trim().is_empty() || params.prompt.trim().is_empty() {
         return Err(McpToolError::new(
             -32602,
@@ -418,8 +410,16 @@ pub(super) async fn forge_update_task(
 pub(super) async fn forge_register_agent(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let params: RegisterAgentParams = parse_params(params)?;
+    let owner_id = authenticated_user(context)?.to_owned();
+    if params.daemon_id.is_some() && !context.is_admin {
+        return Err(McpToolError::new(
+            -32003,
+            "admin access is required to pin an Agent to a daemon",
+        ));
+    }
     let agent = state
         .agent_service
         .register(
@@ -438,20 +438,23 @@ pub(super) async fn forge_register_agent(
             None,
             None,
             false,
-            None,
-            None,
+            Some(owner_id),
+            Some("account".to_owned()),
         )
         .await?;
-    Ok(agent_value(agent))
+    Ok(agent_value(agent, context.is_admin))
 }
 
 pub(super) async fn forge_list_agents(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
     let params: ListAgentsParams = parse_params(params)?;
-    let page = AgentRepo::list(
+    let page = AgentRepo::list_visible_to_user(
         &*state.db,
+        user_id,
         AgentListQuery {
             status: params.status.map(Into::into),
             executor_type: None,
@@ -461,23 +464,53 @@ pub(super) async fn forge_list_agents(
         },
     )
     .await?;
-    Ok(agent_page_value(page))
+    let visible = page
+        .items
+        .into_iter()
+        .map(|agent| agent_value(agent, context.is_admin))
+        .collect::<Vec<_>>();
+    let has_more = page.next_cursor.is_some();
+    Ok(json!({
+        "items": visible,
+        "next_cursor": page.next_cursor,
+        "has_more": has_more,
+        "total_count": null,
+    }))
 }
 
 pub(super) async fn forge_list_projects(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
     let params: ListProjectsParams = parse_params(params)?;
-    let page =
-        ProjectRepo::list(&*state.db, page_request(params.cursor, params.limit, None)?).await?;
+    if let Some(project_id) = context.project_id.as_deref() {
+        let project = ProjectRepo::get_by_id(&*state.db, project_id)
+            .await?
+            .ok_or_else(|| McpToolError::not_found("project", project_id.to_owned()))?;
+        require_project_access(state, project_id, user_id).await?;
+        return project_page_value(db::Page {
+            items: vec![project],
+            next_cursor: None,
+            total_count: Some(1),
+        });
+    }
+    let page = ProjectRepo::list_visible_to_user(
+        &*state.db,
+        user_id,
+        page_request(params.cursor, params.limit, None)?,
+    )
+    .await?;
     project_page_value(page)
 }
 
 pub(super) async fn forge_create_project(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?.to_owned();
     let params: CreateProjectParams = parse_params(params)?;
     if params.name.trim().is_empty() {
         return Err(McpToolError::new(-32602, "name must not be empty"));
@@ -491,12 +524,24 @@ pub(super) async fn forge_create_project(
             settings: "{}".to_owned(),
             workflow_definition: "{}".to_string(),
             primary_repo_id: None,
-            owner_id: None,
+            owner_id: Some(user_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await?;
+    let _ = ProjectMemberRepo::add_member(
+        &*state.db,
+        db::CreateProjectMember {
+            id: new_uuid_v4(),
+            project_id: project.id.clone(),
+            user_id,
+            role: "owner".to_owned(),
             created_at: now.clone(),
             updated_at: now,
         },
     )
-    .await?;
+    .await;
     project_value(project)
 }
 
@@ -567,7 +612,9 @@ pub(super) async fn forge_update_project_hooks(
 pub(super) async fn forge_follow_up_execution(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
     let params = params
         .as_object()
         .ok_or_else(|| McpToolError::new(-32602, "params must be an object"))?;
@@ -575,6 +622,12 @@ pub(super) async fn forge_follow_up_execution(
     let message = required_string_param(params, "message")?;
     let agent_id = required_string_param(params, "agent_id")?;
     let overrides = optional_overrides_param(params, "overrides")?;
+
+    require_agent_visible(state, context, &agent_id).await?;
+    let execution = ExecutionRepo::get_by_id(&*state.db, &execution_id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("execution", execution_id.to_owned()))?;
+    require_task_access(state, &execution.task_id, user_id).await?;
 
     let launched = state
         .task_service
@@ -1002,7 +1055,39 @@ fn task_role_value(
     }))
 }
 
-async fn require_task_access(
+pub(crate) async fn require_project_access(
+    state: &AppState,
+    project_id: &str,
+    user_id: &str,
+) -> Result<(), McpToolError> {
+    let project = ProjectRepo::get_by_id(&*state.db, project_id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("project", project_id.to_owned()))?;
+    if project_is_visible_to_user(state, &project, user_id).await? {
+        Ok(())
+    } else {
+        Err(McpToolError::new(-32001, "project not accessible"))
+    }
+}
+
+async fn project_is_visible_to_user(
+    state: &AppState,
+    project: &db::Project,
+    user_id: &str,
+) -> Result<bool, McpToolError> {
+    // REST treats ownerless rows as public system Projects. Keep that
+    // established visibility rule for user/local and Project-scoped MCP.
+    if project.owner_id.is_none() || project.owner_id.as_deref() == Some(user_id) {
+        return Ok(true);
+    }
+    Ok(
+        ProjectMemberRepo::get_member(&*state.db, &project.id, user_id)
+            .await?
+            .is_some(),
+    )
+}
+
+pub(crate) async fn require_task_access(
     state: &AppState,
     task_id: &str,
     user_id: &str,
@@ -1010,20 +1095,26 @@ async fn require_task_access(
     let task = TaskRepo::get_by_id(&*state.db, task_id, false)
         .await?
         .ok_or_else(|| McpToolError::not_found("task", task_id.to_owned()))?;
-    let project = ProjectRepo::get_by_id(&*state.db, &task.project_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("project", task.project_id.clone()))?;
-    if project
-        .owner_id
-        .as_deref()
-        .is_some_and(|owner_id| owner_id != user_id)
-        && ProjectMemberRepo::get_member(&*state.db, &project.id, user_id)
-            .await?
-            .is_none()
-    {
-        return Err(McpToolError::new(-32001, "project not accessible"));
-    }
+    require_project_access(state, &task.project_id, user_id).await?;
     Ok(task)
+}
+
+async fn require_agent_visible(
+    state: &AppState,
+    context: &McpContext,
+    agent_id: &str,
+) -> Result<db::Agent, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    let agent = AgentRepo::get_by_id(&*state.db, agent_id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("agent", agent_id.to_owned()))?;
+    if agent.backend_kind == "native"
+        || agent.executor_type == "embedded"
+        || (agent.visibility != "global" && agent.owner_id.as_deref() != Some(user_id))
+    {
+        return Err(McpToolError::not_found("agent", agent_id.to_owned()));
+    }
+    Ok(agent)
 }
 
 fn gate_value(

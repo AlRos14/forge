@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::{error::McpToolError, protocol::McpContext, state::AppState};
 
 pub(crate) use descriptors::tool_descriptors;
+pub(crate) use handlers::{require_project_access, require_task_access};
 
 pub(crate) async fn dispatch_tool(
     state: &AppState,
@@ -29,16 +30,18 @@ pub(crate) async fn dispatch_tool(
         "forge_list_executions" => handlers::forge_list_executions(state, arguments).await,
         "forge_start_execution" => handlers::forge_start_execution(state, arguments, context).await,
         "forge_update_task" => handlers::forge_update_task(state, arguments).await,
-        "forge_register_agent" => handlers::forge_register_agent(state, arguments).await,
-        "forge_list_agents" => handlers::forge_list_agents(state, arguments).await,
-        "forge_list_projects" => handlers::forge_list_projects(state, arguments).await,
+        "forge_register_agent" => handlers::forge_register_agent(state, arguments, context).await,
+        "forge_list_agents" => handlers::forge_list_agents(state, arguments, context).await,
+        "forge_list_projects" => handlers::forge_list_projects(state, arguments, context).await,
         "forge_get_project" => handlers::forge_get_project(state, arguments).await,
-        "forge_create_project" => handlers::forge_create_project(state, arguments).await,
+        "forge_create_project" => handlers::forge_create_project(state, arguments, context).await,
         "forge_update_project" => handlers::forge_update_project(state, arguments).await,
         "forge_update_project_hooks" => {
             handlers::forge_update_project_hooks(state, arguments).await
         }
-        "forge_follow_up_execution" => handlers::forge_follow_up_execution(state, arguments).await,
+        "forge_follow_up_execution" => {
+            handlers::forge_follow_up_execution(state, arguments, context).await
+        }
         "forge_list_agent_profiles" => {
             handlers::forge_list_agent_profiles(state, arguments, context).await
         }

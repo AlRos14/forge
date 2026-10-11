@@ -347,14 +347,18 @@ pub fn admin_jwt() -> String {
 }
 
 fn test_jwt_with_admin(is_admin: bool) -> String {
+    test_jwt_for_user("test-user-id", "test@example.com", is_admin)
+}
+
+pub fn test_jwt_for_user(user_id: &str, email: &str, is_admin: bool) -> String {
     use jsonwebtoken::{Algorithm, EncodingKey, Header};
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let claims = serde_json::json!({
-        "sub": "test-user-id",
-        "email": "test@example.com",
+        "sub": user_id,
+        "email": email,
         "is_admin": is_admin,
         "iat": now,
         "exp": now + 900,

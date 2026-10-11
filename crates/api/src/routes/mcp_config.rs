@@ -28,6 +28,9 @@ pub async fn get_mcp_config(
 ) -> ApiResult<Json<McpConfigResponse>> {
     let agent = parse_agent(&params.agent)?;
     let scope = parse_scope(params.scope.as_deref())?;
+    if let Some(project_id) = params.project_id.as_deref() {
+        crate::routes::projects::require_project_visible(&state, project_id, &user.user_id).await?;
+    }
     let config_path =
         resolve_config_path(&state, &agent, &scope, params.project_id.as_deref()).await?;
     let expected_url = mcp_url_for_scope_from_request(
@@ -61,6 +64,9 @@ pub async fn update_mcp_config(
     let agent = parse_agent(&body.agent)?;
     let scope = parse_scope(body.scope.as_deref())?;
     let action = parse_action(&body.action)?;
+    if let Some(project_id) = body.project_id.as_deref() {
+        crate::routes::projects::require_project_visible(&state, project_id, &user.user_id).await?;
+    }
     let config_path =
         resolve_config_path(&state, &agent, &scope, body.project_id.as_deref()).await?;
     let expected_url = mcp_url_for_scope_from_request(

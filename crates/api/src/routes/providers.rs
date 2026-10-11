@@ -63,7 +63,7 @@ pub async fn list_providers(
             entry_response(handle, usage)
         })
         .collect();
-    let cli_runtimes = cli_runtime_entries(&state).await?;
+    let cli_runtimes = cli_runtime_entries(&state, &user.user_id).await?;
     Ok(Json(ProviderEntriesResponse {
         items,
         cli_runtimes,
@@ -287,10 +287,13 @@ fn cli_login_hint(kind: &str) -> Option<&'static str> {
     }
 }
 
-async fn cli_runtime_entries(state: &AppState) -> ApiResult<Vec<CliRuntimeEntryResponse>> {
-    let daemons = all_daemons(state).await?;
+async fn cli_runtime_entries(
+    state: &AppState,
+    user_id: &str,
+) -> ApiResult<Vec<CliRuntimeEntryResponse>> {
+    let daemons = all_daemons(state, user_id).await?;
     let mut used_by: HashMap<String, Vec<ProviderEntryAgentRef>> = HashMap::new();
-    for agent in all_agents(state).await? {
+    for agent in all_agents(state, user_id).await? {
         if agent.backend_kind != "cli" || agent.credential_ref.is_some() {
             continue;
         }
@@ -323,12 +326,13 @@ async fn cli_runtime_entries(state: &AppState) -> ApiResult<Vec<CliRuntimeEntryR
     Ok(items)
 }
 
-async fn all_daemons(state: &AppState) -> ApiResult<Vec<Daemon>> {
+async fn all_daemons(state: &AppState, user_id: &str) -> ApiResult<Vec<Daemon>> {
     let mut daemons = Vec::new();
     let mut cursor = None;
     loop {
-        let page = DaemonRepo::list(
+        let page = DaemonRepo::list_visible(
             &*state.db,
+            Some(user_id),
             PageRequest {
                 cursor,
                 limit: 500,
@@ -347,12 +351,13 @@ async fn all_daemons(state: &AppState) -> ApiResult<Vec<Daemon>> {
     Ok(daemons)
 }
 
-async fn all_agents(state: &AppState) -> ApiResult<Vec<db::Agent>> {
+async fn all_agents(state: &AppState, user_id: &str) -> ApiResult<Vec<db::Agent>> {
     let mut agents = Vec::new();
     let mut cursor = None;
     loop {
-        let page = AgentRepo::list(
+        let page = AgentRepo::list_visible_to_user(
             &*state.db,
+            user_id,
             AgentListQuery {
                 status: None,
                 executor_type: None,

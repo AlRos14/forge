@@ -11,8 +11,9 @@ use services::ServiceError;
 use crate::{
     errors::{ApiError, ApiResult},
     routes::{
-        execution_response, execution_response_with_usage, execution_usage_response, page_request,
-        paginated, task_usage_summary_response, ListParams,
+        auth::AuthenticatedUser, execution_response, execution_response_with_usage,
+        execution_usage_response, page_request, paginated, task_usage_summary_response,
+        tasks::require_task_visible, ListParams,
     },
     state::AppState,
 };
@@ -20,8 +21,10 @@ use crate::{
 pub async fn list_executions(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
+    user: AuthenticatedUser,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<ExecutionResponse>>> {
+    require_task_visible(&state, &task_id, &user).await?;
     let page = ExecutionRepo::list_by_task(&*state.db, &task_id, page_request(&params)?).await?;
     Ok(Json(paginated(page, execution_response)))
 }
@@ -68,10 +71,9 @@ pub async fn start_task_execution(
 pub async fn get_execution(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<ExecutionResponse>> {
-    let execution = ExecutionRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("execution", id))?;
+    let execution = require_execution_visible(&state, &id, &user).await?;
     Ok(Json(
         execution_response_with_usage(&state.db, execution).await?,
     ))
@@ -90,11 +92,10 @@ const MAX_LOG_LIMIT: usize = 1_000;
 pub async fn get_logs(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
     Query(params): Query<LogsQuery>,
 ) -> ApiResult<Json<api_types::ExecutionLogsResponse>> {
-    let execution = ExecutionRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("execution", id.clone()))?;
+    let execution = require_execution_visible(&state, &id, &user).await?;
 
     let Some(path) = execution.logs_path else {
         return Ok(Json(api_types::ExecutionLogsResponse {
@@ -173,10 +174,9 @@ fn execution_log_response(entry: executors::LogEntry) -> api_types::ExecutionLog
 pub async fn get_hook_logs(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<Vec<serde_json::Value>>> {
-    let execution = ExecutionRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("execution", id.clone()))?;
+    let execution = require_execution_visible(&state, &id, &user).await?;
     let Some(logs_path) = execution.logs_path.as_deref() else {
         return Ok(Json(Vec::new()));
     };
@@ -210,8 +210,11 @@ pub async fn get_hook_logs(
 pub async fn follow_up_execution(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
     Json(request): Json<FollowUpRequest>,
 ) -> ApiResult<Json<ExecutionResponse>> {
+    let execution = require_execution_visible(&state, &id, &user).await?;
+    require_task_visible(&state, &execution.task_id, &user).await?;
     let overrides = request.overrides.map(|overrides| ExecutionOverrides {
         model_id: overrides.model_id,
         reasoning_effort: overrides.reasoning_effort,
@@ -233,7 +236,9 @@ pub async fn follow_up_execution(
 pub async fn cancel_execution(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<ExecutionResponse>> {
+    require_execution_visible(&state, &id, &user).await?;
     let execution = state
         .task_service
         .cancel_execution(id, "cancelled by user".to_owned())
@@ -265,10 +270,9 @@ fn map_follow_up_error(error: ServiceError) -> ApiError {
 pub async fn get_execution_usage(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<Vec<api_types::ExecutionUsageResponse>>> {
-    let _ = ExecutionRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("execution", id.clone()))?;
+    require_execution_visible(&state, &id, &user).await?;
     let usage = ExecutionUsageRepo::list_by_execution(&*state.db, &id).await?;
     Ok(Json(
         usage.into_iter().map(execution_usage_response).collect(),
@@ -278,7 +282,21 @@ pub async fn get_execution_usage(
 pub async fn get_task_usage(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<api_types::TaskUsageSummaryResponse>> {
+    require_task_visible(&state, &task_id, &user).await?;
     let summary = ExecutionUsageRepo::get_task_usage_summary(&*state.db, &task_id).await?;
     Ok(Json(task_usage_summary_response(summary)))
+}
+
+async fn require_execution_visible(
+    state: &AppState,
+    execution_id: &str,
+    user: &AuthenticatedUser,
+) -> ApiResult<db::Execution> {
+    let execution = ExecutionRepo::get_by_id(&*state.db, execution_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("execution", execution_id.to_owned()))?;
+    require_task_visible(state, &execution.task_id, user).await?;
+    Ok(execution)
 }
