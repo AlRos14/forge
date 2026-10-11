@@ -279,10 +279,20 @@ Project authority boundary.
 ### INV-039 — Task parent links stay inside one Project
 
 Whenever `Task.parent_task_id` is non-null, the parent and child Tasks belong to
-the same exact Project. TaskService validates this on creation and reparenting,
-rejects absent parents, self-parenting, cycles, and unsupported nested parents,
-and performs structural validation before the Task write. No router or MCP
-scope check substitutes for this service invariant.
+the same exact Project. Forge supports one subtask level: a parent is a root,
+and a Task with live children cannot itself become a subtask. TaskService
+rejects absent parents, cross-Project links, self-parenting, cycles, nested
+parents, and moving a Task that has children. No router or MCP scope check
+substitutes for this service invariant.
+
+Every parent-backed create, batch subtask create, attach, reparent, and detach
+validates and writes inside one SQLite `BEGIN IMMEDIATE` transaction. This
+reserves SQLite's single writer before hierarchy reads, so competing
+structural requests revalidate serially. `parent_task_id` and `subtask_order`
+change together: attach and moves to another parent append to the destination
+sibling order, and detach clears both fields. An ordinary Task update leaves
+both fields untouched. This PR does not rewrite legacy rows; any historical
+root with a non-null `subtask_order` remains a PR13 cleanup item if found.
 
 ## Current repository baseline
 

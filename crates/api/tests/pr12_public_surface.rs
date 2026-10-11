@@ -1763,6 +1763,24 @@ async fn task_parent_links_stay_inside_the_same_project_on_create_and_reparent()
         StatusCode::OK,
     )
     .await;
+    let childless_root: TaskResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project_a.id),
+        &token,
+        json!({"title":"Childless root"}),
+        StatusCode::OK,
+    )
+    .await;
+    let reparent_target: TaskResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project_a.id),
+        &token,
+        json!({"title":"Reparent target"}),
+        StatusCode::OK,
+    )
+    .await;
 
     let child_a: TaskResponse = common::json_request_with_bearer(
         &harness.app,
@@ -1778,6 +1796,23 @@ async fn task_parent_links_stay_inside_the_same_project_on_create_and_reparent()
         child_a.parent_task_id.as_deref(),
         Some(parent_a.id.as_str())
     );
+    let attached: TaskResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/tasks/{}", childless_root.id),
+        &token,
+        json!({
+            "version":childless_root.version,
+            "parent_task_id":parent_a.id
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        attached.parent_task_id.as_deref(),
+        Some(parent_a.id.as_str())
+    );
+    assert_eq!(attached.subtask_order, Some(1));
 
     let before_failed_creates: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
@@ -1827,15 +1862,50 @@ async fn task_parent_links_stay_inside_the_same_project_on_create_and_reparent()
             .expect("Task count after failed creates");
     assert_eq!(after_failed_creates, before_failed_creates);
 
-    let _moved: serde_json::Value = common::json_request_with_bearer(
-        &harness.app,
-        Method::PATCH,
-        &format!("/api/v1/tasks/{}", parent_a.id),
-        &token,
-        json!({"version":parent_a.version,"title":"Root A","parent_task_id":parent_b.id}),
-        StatusCode::NOT_FOUND,
-    )
-    .await;
+    let before_rejected_move = db::TaskRepo::get_by_id(&*harness.state.db, &parent_a.id, false)
+        .await
+        .expect("parent A loads before rejected move")
+        .expect("parent A exists");
+    let rejected_move = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/api/v1/tasks/{}", parent_a.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(
+                    json!({
+                        "version":parent_a.version,
+                        "parent_task_id":reparent_target.id
+                    })
+                    .to_string(),
+                ))
+                .expect("nested move request builds"),
+        )
+        .await
+        .expect("nested move response");
+    assert!(
+        matches!(
+            rejected_move.status(),
+            StatusCode::BAD_REQUEST | StatusCode::CONFLICT
+        ),
+        "a Task with children cannot become a subtask"
+    );
+    let after_rejected_move = db::TaskRepo::get_by_id(&*harness.state.db, &parent_a.id, false)
+        .await
+        .expect("parent A loads after rejected move")
+        .expect("parent A remains");
+    assert_eq!(
+        after_rejected_move.parent_task_id,
+        before_rejected_move.parent_task_id
+    );
+    assert_eq!(
+        after_rejected_move.subtask_order,
+        before_rejected_move.subtask_order
+    );
+    assert_eq!(after_rejected_move.version, before_rejected_move.version);
     let self_parent = harness
         .app
         .clone()

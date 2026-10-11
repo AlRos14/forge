@@ -11,10 +11,26 @@ pub trait TaskRepo: Send + Sync {
         input: CreateTask,
     ) -> Result<Task>;
     async fn get_by_id(&self, id: &str, include_deleted: bool) -> Result<Option<Task>>;
+    async fn get_by_id_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        include_deleted: bool,
+    ) -> Result<Option<Task>>;
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>>;
     async fn list_by_executing_agent(&self, query: AgentTaskListQuery) -> Result<Page<Task>>;
     async fn list_subtasks_ordered(&self, parent_task_id: &str) -> Result<Vec<Task>>;
     async fn next_subtask_order(&self, parent_task_id: &str) -> Result<i64>;
+    async fn next_subtask_order_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        parent_task_id: &str,
+    ) -> Result<i64>;
+    async fn count_live_children_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+    ) -> Result<i64>;
     async fn reorder_subtasks(
         &self,
         parent_task_id: &str,
@@ -22,6 +38,12 @@ pub trait TaskRepo: Send + Sync {
         updated_at: &str,
     ) -> Result<()>;
     async fn update(&self, input: UpdateTask) -> Result<Task>;
+    async fn update_parent_structure_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: UpdateTask,
+        subtask_order: Option<i64>,
+    ) -> Result<Task>;
     async fn archive(&self, input: ArchiveTask) -> Result<Task>;
     async fn soft_delete(&self, input: SoftDeleteTask) -> Result<Task>;
     async fn set_review_passed_at(
@@ -32,6 +54,13 @@ pub trait TaskRepo: Send + Sync {
     ) -> Result<Task>;
     async fn set_metadata_json(
         &self,
+        id: &str,
+        metadata_json: Option<String>,
+        updated_at: &str,
+    ) -> Result<()>;
+    async fn set_metadata_json_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
         id: &str,
         metadata_json: Option<String>,
         updated_at: &str,

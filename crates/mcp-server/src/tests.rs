@@ -1992,11 +1992,33 @@ fn forge_update_task_updates_mutable_fields() {
     run_async(async {
         let state = sqlite_state().await;
         let task = seed_task(&state).await;
+        let parent = call_tool(
+            &state,
+            "forge_create_task",
+            json!({
+                "project_id": task.project_id,
+                "title": "MCP parent"
+            }),
+        )
+        .await;
+        let created_child = call_tool(
+            &state,
+            "forge_create_task",
+            json!({
+                "project_id": task.project_id,
+                "title": "MCP created child",
+                "parent_task_id": parent["id"],
+            }),
+        )
+        .await;
+        assert_eq!(created_child["parent_task_id"], parent["id"]);
+        assert_eq!(created_child["subtask_order"], 0);
         let result = call_tool(
             &state,
             "forge_update_task",
             json!({
                 "task_id": task.id,
+                "parent_task_id": parent["id"],
                 "title": "Updated MCP",
                 "description": "changed",
                 "priority": 9,
@@ -2008,8 +2030,22 @@ fn forge_update_task_updates_mutable_fields() {
         assert_eq!(result["title"], "Updated MCP");
         assert_eq!(result["description"], "changed");
         assert_eq!(result["priority"], 9);
+        assert_eq!(result["parent_task_id"], parent["id"]);
+        assert_eq!(result["subtask_order"], 1);
         assert!(result.get("plan").is_none());
         assert_eq!(result["version"], 2);
+        let detached = call_tool(
+            &state,
+            "forge_update_task",
+            json!({
+                "task_id": task.id,
+                "parent_task_id": null,
+                "version": result["version"],
+            }),
+        )
+        .await;
+        assert!(detached["parent_task_id"].is_null());
+        assert!(detached["subtask_order"].is_null());
         let legacy_plan = dispatch(
             &state,
             "tools/call",
@@ -2018,7 +2054,7 @@ fn forge_update_task_updates_mutable_fields() {
                 "arguments": {
                     "task_id": task.id,
                     "plan": "test it",
-                    "version": 2,
+                    "version": detached["version"],
                 },
             }),
         )

@@ -399,7 +399,7 @@ pub(super) async fn forge_update_task(
             blocked_json: None,
             failed_json: None,
             task_state_config: None,
-            parent_task_id: None,
+            parent_task_id: params.parent_task_id,
             updated_at: now_rfc3339(),
         })
         .await?;

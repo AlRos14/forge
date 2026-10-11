@@ -13,24 +13,28 @@ impl TaskService {
         items: Vec<NewSubtaskInput>,
     ) -> Result<Vec<Task>> {
         validate_required("parent_task_id", &parent_task_id)?;
-        let parent = TaskRepo::get_by_id(&*self.db, &parent_task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", parent_task_id.clone()))?;
-        if parent.parent_task_id.is_some() {
-            return Err(ServiceError::nested_subtask_unsupported());
-        }
-
         for item in &items {
             validate_required("title", &item.title)?;
         }
 
-        let mut transaction = self.db.pool().begin().await?;
-        let start_order = sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(MAX(subtask_order) + 1, 0) FROM task WHERE parent_task_id = ? AND deleted_at IS NULL",
+        // Take SQLite's writer reservation before reading the parent, so this
+        // batch serializes with reparenting and single-child creation.
+        let mut transaction = self.db.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let candidate =
+            TaskRepo::get_by_id_in_tx(&*self.db, &mut transaction, &parent_task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", parent_task_id.clone()))?;
+        let parent = super::subtask::validate_parent_placement_in_tx(
+            &self.db,
+            &mut transaction,
+            None,
+            &candidate.project_id,
+            &parent_task_id,
         )
-        .bind(&parent_task_id)
-        .fetch_one(&mut *transaction)
         .await?;
+        let start_order =
+            TaskRepo::next_subtask_order_in_tx(&*self.db, &mut transaction, &parent_task_id)
+                .await?;
 
         let mut task_ids = Vec::with_capacity(items.len());
         for (offset, item) in items.into_iter().enumerate() {

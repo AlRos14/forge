@@ -122,9 +122,13 @@ unchanged for PR13, but do not control newly imported Tasks.
 | `GET /tasks/{id}/task-roles`, `POST /tasks/{id}/task-roles`, `PATCH /tasks/{id}/task-roles/{role}` | Read or update TaskRole definitions. |
 | `POST /tasks/{id}/task-roles/{role}/members`, `PATCH /tasks/{id}/task-roles/{role}/members/{membership_id}` | Add or update an exact RoleMembership. Memberships name a Human or Agent Actor. |
 
-When present, `parent_task_id` must identify a root Task in the same Project.
-TaskService enforces this on creation and reparenting, rejects missing parents,
-self-parenting, cycles, and unsupported nested parents before the Task write.
+When present, `parent_task_id` must identify a root Task in the same Project;
+only one subtask level is supported, and a Task with children cannot itself
+become a subtask. TaskService enforces parent-backed create, batch create,
+attach, reparent, and detach in one SQLite `BEGIN IMMEDIATE` transaction.
+New attachments and reparents append at the next destination `subtask_order`;
+detach clears both parent fields. An ordinary Task update leaves the existing
+structure untouched.
 
 TaskLifecycle is aggregate progress. The database `task.status` column remains
 only as a one-way storage projection pending PR13; REST lists, filters, task
@@ -294,6 +298,10 @@ Agent lists contain global and caller-owned identities with visibility applied
 before pagination; MCP registration binds the new Agent to the authenticated
 Human. Only admins may pin an Agent to a daemon, and non-admin Agent projections
 omit daemon IDs and redact sensitive configuration values.
+
+`forge_update_task` accepts an optional `parent_task_id`; omitting the field
+preserves the current parent, while explicit `null` detaches the Task. Both
+forms use the same TaskService structural transaction as REST.
 
 ## Related references
 

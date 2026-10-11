@@ -124,7 +124,16 @@ pub(crate) struct UpdateTaskParams {
     pub(crate) title: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) priority: Option<i64>,
+    #[serde(default, deserialize_with = "nullable_string_if_present")]
+    pub(crate) parent_task_id: Option<Option<String>>,
     pub(crate) version: i64,
+}
+
+fn nullable_string_if_present<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
