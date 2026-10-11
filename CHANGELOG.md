@@ -31,8 +31,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   their EventBus emitter no longer run or block new Executions; their stored
   settings remain intact, and generic durable Project hooks remain supported.
   REST and MCP Project lists now filter before pagination, and Project reads,
-  mutations, and derived MCP resources enforce the authenticated user's existing
-  owner/member visibility. MCP-created Projects record that Human as owner;
+  mutations, and derived MCP resources enforce the authenticated user's
+  Project authority. Reads retain owner/member/viewer visibility and public
+  ownerless visibility; ordinary writes require owner/admin/member, while
+  Project administration and sensitive configuration require owner/admin.
+  MCP-created Projects record that Human as owner;
   Project-scoped MCP calls cannot cross into a different Project. MCP Agent
   registration binds the Agent to its caller, daemon pinning requires an admin,
   and non-admin Agent output omits daemon IDs and redacts sensitive config.
@@ -43,6 +46,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   streams now filter Project/Task events by caller visibility; operational
   status hints are admin-only. Historical Release snapshot reads share the
   Project visibility rule, including existing public ownerless Projects.
+  Public visibility never grants write authority. Task creation and reparenting
+  reject missing, cross-Project, self, cyclic, or unsupported nested parents
+  before writing. Project deletion snapshots its exact authorized recipients
+  before teardown and emits per-user invalidation hints without exposing
+  membership data.
   REST and MCP Agent rosters filter private Agents before pagination and page
   metadata; provider runtime projections also filter private Agents and Daemons
   before returning items or counts.

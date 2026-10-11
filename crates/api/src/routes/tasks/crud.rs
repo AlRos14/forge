@@ -6,7 +6,7 @@ pub async fn create_task(
     user: AuthenticatedUser,
     Json(body): Json<Value>,
 ) -> ApiResult<Json<TaskResponse>> {
-    crate::routes::projects::require_project_visible(&state, &project_id, &user.user_id).await?;
+    crate::routes::projects::require_project_mutable(&state, &project_id, &user.user_id).await?;
     let request: CreateTaskRequest = serde_json::from_value(body)?;
     let task_type = request.task_type.map(|t| {
         match t {
@@ -121,10 +121,10 @@ pub async fn update_task(
     user: AuthenticatedUser,
     Json(request): Json<UpdateTaskRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
-    require_task_visible(&state, &id, &user).await?;
-    TaskRepo::update(
-        &*state.db,
-        UpdateTask {
+    require_task_mutable(&state, &id, &user).await?;
+    state
+        .task_service
+        .update_task(UpdateTask {
             id: id.clone(),
             expected_version: request.version,
             title: request.title,
@@ -137,9 +137,8 @@ pub async fn update_task(
             task_state_config: None,
             parent_task_id: request.parent_task_id,
             updated_at: now_rfc3339(),
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     let task = TaskRepo::get_by_id(&*state.db, &id, false)
         .await?
@@ -152,7 +151,7 @@ pub async fn delete_task(
     Path(id): Path<String>,
     user: AuthenticatedUser,
 ) -> ApiResult<StatusCode> {
-    require_task_visible(&state, &id, &user).await?;
+    require_task_mutable(&state, &id, &user).await?;
     let task = state.task_service.soft_delete(id).await?;
     super::media::delete_task_media_for_task(&state, &task.id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -164,7 +163,7 @@ pub async fn reorder_subtasks(
     user: AuthenticatedUser,
     Json(request): Json<ReorderSubtasksRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
-    require_task_visible(&state, &task_id, &user).await?;
+    require_task_mutable(&state, &task_id, &user).await?;
     state
         .task_service
         .reorder_subtasks(task_id.clone(), request.ordered_ids)

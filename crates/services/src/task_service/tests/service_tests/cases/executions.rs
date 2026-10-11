@@ -1406,6 +1406,39 @@ async fn pr8_completed_human_report_retry_survives_later_membership_change() {
 }
 
 #[tokio::test]
+async fn pr8_human_review_report_rejects_a_different_human_actor() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let (assigned_human, _) = add_human_reviewer(&db, &service, &task).await;
+    let execution = service
+        .start_human_review_execution(&task.id, &assigned_human, None)
+        .await
+        .expect("active Human starts exact Review Execution");
+
+    let result = service
+        .submit_human_review_report(
+            &execution.id,
+            "different-human",
+            human_review_request("Unauthorized report", Vec::new(), Vec::new()),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(ServiceError::AuthorizationDenied { .. })
+    ));
+    assert!(db::CollaborationRepo::get_execution_artifact_output(
+        &*db,
+        &execution.id,
+        db::ArtifactKind::ReviewReport,
+    )
+    .await
+    .expect("ReviewReport lookup")
+    .is_none());
+}
+
+#[tokio::test]
 async fn pr8_running_human_report_reconciles_after_membership_and_workspace_change() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)))

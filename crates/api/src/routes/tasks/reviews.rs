@@ -6,7 +6,7 @@ pub async fn trigger_review(
     Path(task_id): Path<String>,
     Json(request): Json<api_types::StartReviewExecutionRequest>,
 ) -> ApiResult<Json<api_types::ReviewExecutionResponse>> {
-    let _task = super::require_task_visible(&state, &task_id, &user).await?;
+    let _task = super::require_task_mutable(&state, &task_id, &user).await?;
     let workspace_id = match request.workspace_id {
         Some(workspace_id) => Some(workspace_id),
         None => WorkspaceRepo::get_by_task_id(&*state.db, &task_id)

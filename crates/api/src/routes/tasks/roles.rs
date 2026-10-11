@@ -18,7 +18,7 @@ pub async fn create_task_role_model(
     Path(id): Path<String>,
     Json(request): Json<CreateTaskRoleRequest>,
 ) -> ApiResult<Json<TaskRoleResponse>> {
-    ensure_task_role_access(&state.db, &id, &user.user_id).await?;
+    super::require_task_mutable(&state, &id, &user).await?;
     let policy_json =
         serde_json::to_string(&request.policy.unwrap_or_else(|| serde_json::json!({})))?;
     let mode = to_db_coordination_mode(request.coordination_mode);
@@ -41,7 +41,7 @@ pub async fn update_task_role_model(
     Path((id, role)): Path<(String, String)>,
     Json(request): Json<UpdateTaskRoleRequest>,
 ) -> ApiResult<Json<TaskRoleResponse>> {
-    ensure_task_role_access(&state.db, &id, &user.user_id).await?;
+    super::require_task_mutable(&state, &id, &user).await?;
     let mode = request.coordination_mode.map(to_db_coordination_mode);
     let policy_json = request
         .policy
@@ -67,8 +67,14 @@ pub async fn add_task_role_member(
     Path((id, role)): Path<(String, String)>,
     Json(request): Json<AddRoleMembershipRequest>,
 ) -> ApiResult<Json<RoleMembershipResponse>> {
-    let project_id = ensure_task_role_access(&state.db, &id, &user.user_id).await?;
-    validate_actor_request(&state.db, &project_id, &user.user_id, &request.actor_ref).await?;
+    let task = super::require_task_mutable(&state, &id, &user).await?;
+    validate_actor_request(
+        &state.db,
+        &task.project_id,
+        &user.user_id,
+        &request.actor_ref,
+    )
+    .await?;
     let membership = state
         .task_service
         .add_task_role_member(&id, &role, request.actor_ref)
@@ -83,7 +89,7 @@ pub async fn update_task_role_member(
     Path((id, membership_id)): Path<(String, String)>,
     Json(request): Json<UpdateRoleMembershipRequest>,
 ) -> ApiResult<Json<RoleMembershipResponse>> {
-    ensure_task_role_access(&state.db, &id, &user.user_id).await?;
+    super::require_task_mutable(&state, &id, &user).await?;
     let status = match request.status {
         api_types::RoleMembershipStatus::Active => db::RoleMembershipStatus::Active,
         api_types::RoleMembershipStatus::Suspended => db::RoleMembershipStatus::Suspended,
@@ -95,29 +101,6 @@ pub async fn update_task_role_member(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(crate::routes::role_membership_response(membership)))
-}
-
-async fn ensure_task_role_access(
-    db: &db::SqliteDb,
-    task_id: &str,
-    user_id: &str,
-) -> ApiResult<String> {
-    let task = TaskRepo::get_by_id(db, task_id, false)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task", task_id.to_owned()))?;
-    let project = ProjectRepo::get_by_id(db, &task.project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", task.project_id.clone()))?;
-    if project.owner_id.is_none() || project.owner_id.as_deref() == Some(user_id) {
-        return Ok(project.id);
-    }
-    if db::ProjectMemberRepo::get_member(db, &project.id, user_id)
-        .await?
-        .is_none()
-    {
-        return Err(ApiError::not_found("task", task_id.to_owned()));
-    }
-    Ok(project.id)
 }
 
 async fn validate_actor_request(

@@ -55,6 +55,7 @@ mod review;
 mod roles;
 mod subtask;
 mod transition;
+mod update;
 mod validation;
 pub(crate) mod workspace;
 

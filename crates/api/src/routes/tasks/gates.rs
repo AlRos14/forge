@@ -55,7 +55,7 @@ pub async fn transition_task_lifecycle(
     user: crate::routes::auth::AuthenticatedUser,
     Json(request): Json<TransitionTaskLifecycleRequest>,
 ) -> ApiResult<Json<TaskLifecycleTransitionResponse>> {
-    super::require_task_visible(&state, &task_id, &user).await?;
+    super::require_task_mutable(&state, &task_id, &user).await?;
     let task = TaskRepo::get_by_id(&*state.db, &task_id, false)
         .await?
         .ok_or_else(|| ApiError::not_found("task", task_id.clone()))?;
@@ -224,7 +224,7 @@ pub async fn create_task_gate(
     user: crate::routes::auth::AuthenticatedUser,
     Json(request): Json<CreateTaskGateRequest>,
 ) -> ApiResult<Json<GateResponse>> {
-    require_task_visible(&state, &task_id, &user).await?;
+    require_task_mutable(&state, &task_id, &user).await?;
     let policy = serde_json::from_value(request.policy)
         .map_err(|error| ApiError::bad_request(format!("invalid Gate policy: {error}")))?;
     let engine = GateEngine::new(Arc::clone(&state.db), Arc::clone(&state.event_bus));
@@ -295,7 +295,7 @@ pub async fn revise_gate_policy(
     let gate = GateRepo::get_gate(&*state.db, &gate_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Gate", gate_id.clone()))?;
-    require_task_visible(&state, &gate.task_id, &user).await?;
+    require_task_mutable(&state, &gate.task_id, &user).await?;
     let policy = serde_json::from_value(request.policy)
         .map_err(|error| ApiError::bad_request(format!("invalid Gate policy: {error}")))?;
     let revision = GateEngine::new(Arc::clone(&state.db), Arc::clone(&state.event_bus))
@@ -313,7 +313,7 @@ pub async fn evaluate_gate(
     let gate = GateRepo::get_gate(&*state.db, &gate_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Gate", gate_id.clone()))?;
-    require_task_visible(&state, &gate.task_id, &user).await?;
+    require_task_mutable(&state, &gate.task_id, &user).await?;
     let evaluation = GateEngine::new(Arc::clone(&state.db), Arc::clone(&state.event_bus))
         .evaluate_active(&gate_id)
         .await
@@ -343,7 +343,7 @@ pub async fn merge_after_gate(
     user: crate::routes::auth::AuthenticatedUser,
     Json(request): Json<MergeAfterGateRequest>,
 ) -> ApiResult<Json<MergeAfterGateResponse>> {
-    require_task_visible(&state, &task_id, &user).await?;
+    require_task_mutable(&state, &task_id, &user).await?;
     let outcome = state
         .merge_service
         .merge_after_gate(task_id, &request.gate_evaluation_id)

@@ -17,7 +17,7 @@ pub async fn reset_task_workspace(
     Path(id): Path<String>,
     user: AuthenticatedUser,
 ) -> ApiResult<Json<WorkspaceResponse>> {
-    require_task_visible(&state, &id, &user).await?;
+    require_task_mutable(&state, &id, &user).await?;
     let workspace = state.task_service.reset_task_workspace(&id).await?;
     Ok(Json(workspace_response(workspace)))
 }

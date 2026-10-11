@@ -282,7 +282,9 @@ impl CollaborationService {
         source: CollaborationActorSource,
         input: CreateArtifactInput,
     ) -> Result<Artifact> {
-        let (_, actor) = self.authorize_source(&input.task_id, &source).await?;
+        let (_, actor) = self
+            .authorize_mutation_source(&input.task_id, &source)
+            .await?;
         validate_artifact_storage(
             input.storage_kind,
             input.content.as_deref(),
@@ -383,7 +385,7 @@ impl CollaborationService {
         user_id: &str,
     ) -> Result<db::Execution> {
         let source = CollaborationActorSource::Human(user_id.to_owned());
-        let (task, actor) = self.authorize_source(task_id, &source).await?;
+        let (task, actor) = self.authorize_mutation_source(task_id, &source).await?;
         if !self
             .has_role_name_membership(&task.id, &actor, "planner")
             .await?
@@ -449,7 +451,8 @@ impl CollaborationService {
             });
         }
         let source = CollaborationActorSource::Human(user_id.to_owned());
-        self.authorize_source(&execution.task_id, &source).await?;
+        self.authorize_mutation_source(&execution.task_id, &source)
+            .await?;
         let artifact = self
             .create_plan_artifact_from_execution(execution_id, markdown)
             .await?;
@@ -971,7 +974,9 @@ impl CollaborationService {
         input: CreateMessageInput,
         id: String,
     ) -> Result<db::Message> {
-        let (task, sender) = self.authorize_source(&input.task_id, &source).await?;
+        let (task, sender) = self
+            .authorize_mutation_source(&input.task_id, &source)
+            .await?;
         if input.body.trim().is_empty() {
             return Err(invalid("Message body must not be empty"));
         }
@@ -1077,7 +1082,9 @@ impl CollaborationService {
         input: CreateHandoffInput,
         id: String,
     ) -> Result<Handoff> {
-        let (task, created_by) = self.authorize_source(&input.task_id, &source).await?;
+        let (task, created_by) = self
+            .authorize_mutation_source(&input.task_id, &source)
+            .await?;
         self.validate_target(&task, &input.target).await?;
         self.validate_work_unit_context(&task, input.work_unit_id.as_deref())
             .await?;
@@ -1240,7 +1247,7 @@ impl CollaborationService {
             .await?
             .ok_or_else(|| not_found("handoff", id.to_owned()))?;
         let (_, actor) = self
-            .authorize_source(&task_id, &source)
+            .authorize_mutation_source(&task_id, &source)
             .await
             .map_err(|_| not_found("handoff", id.to_owned()))?;
         let existing = CollaborationRepo::get_handoff(&*self.db, id)
@@ -1310,7 +1317,9 @@ impl CollaborationService {
         input: CreateProposalInput,
         id: String,
     ) -> Result<Proposal> {
-        let (task, proposer) = self.authorize_source(&input.task_id, &source).await?;
+        let (task, proposer) = self
+            .authorize_mutation_source(&input.task_id, &source)
+            .await?;
         if input.action.trim().is_empty() {
             return Err(invalid("Proposal action must not be empty"));
         }
@@ -1429,7 +1438,7 @@ impl CollaborationService {
             .await?
             .ok_or_else(|| not_found("proposal", id.to_owned()))?;
         let (_, actor) = self
-            .authorize_source(&task_id, &source)
+            .authorize_mutation_source(&task_id, &source)
             .await
             .map_err(|_| not_found("proposal", id.to_owned()))?;
         let existing = CollaborationRepo::get_proposal(&*self.db, id)
@@ -1475,7 +1484,9 @@ impl CollaborationService {
         let mut actors = Vec::with_capacity(deciders.len());
         let mut identities = HashSet::new();
         for source in &deciders {
-            let (_, actor) = self.authorize_source(&input.task_id, source).await?;
+            let (_, actor) = self
+                .authorize_mutation_source(&input.task_id, source)
+                .await?;
             if identities.insert((actor.kind().to_string(), actor.id().to_owned())) {
                 actors.push(actor);
             }
@@ -1631,6 +1642,27 @@ impl CollaborationService {
                 actor
             }
         };
+        Ok((task, actor))
+    }
+
+    pub(crate) async fn authorize_mutation_source(
+        &self,
+        task_id: &str,
+        source: &CollaborationActorSource,
+    ) -> Result<(Task, ActorRef)> {
+        let (task, actor) = self.authorize_source(task_id, source).await?;
+        if let ActorRef::Human(user_id) = &actor {
+            let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                .await?
+                .ok_or_else(|| not_found("task", task_id.to_owned()))?;
+            if !crate::project_authority::user_can_write_project(&self.db, &project, user_id)
+                .await?
+            {
+                return Err(ServiceError::AuthorizationDenied {
+                    message: "Project write access is required".to_owned(),
+                });
+            }
+        }
         Ok((task, actor))
     }
 

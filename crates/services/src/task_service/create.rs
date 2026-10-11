@@ -55,6 +55,9 @@ impl TaskService {
             let parent = TaskRepo::get_by_id(&*self.db, parent_id, false)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("task", parent_id.to_owned()))?;
+            if parent.project_id != project_id {
+                return Err(ServiceError::not_found("task", parent_id.to_owned()));
+            }
             if parent.parent_task_id.is_some() {
                 return Err(ServiceError::nested_subtask_unsupported());
             }

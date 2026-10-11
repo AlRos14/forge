@@ -264,6 +264,26 @@ and Agent Chat contexts do not escape through SSE. `events.resync_required`
 remains a notification after subscriber lag. The EventBus remains a wake and
 delivery mechanism, never lifecycle or Gate authority.
 
+### INV-038 — Visibility is not mutation authority
+
+Project read visibility and write authority are separate checks. Owners and
+all explicit Project members, including viewers, retain the current read rule;
+ownerless system Projects retain public reads. Ordinary Project-derived
+mutations require an owner or explicit owner/admin/member membership.
+Administrative operations require owner/admin authority. Ownerless visibility
+never grants write access, and MCP Project scope only narrows the exact resource
+scope; the authenticated Human remains the authority source. Every mutable
+Project-derived REST and MCP resource must pass the same operation-appropriate
+Project authority boundary.
+
+### INV-039 — Task parent links stay inside one Project
+
+Whenever `Task.parent_task_id` is non-null, the parent and child Tasks belong to
+the same exact Project. TaskService validates this on creation and reparenting,
+rejects absent parents, self-parenting, cycles, and unsupported nested parents,
+and performs structural validation before the Task write. No router or MCP
+scope check substitutes for this service invariant.
+
 ## Current repository baseline
 
 The Plan PR0 audit was performed against the actual clean local checkout:

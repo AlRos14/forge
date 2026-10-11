@@ -294,10 +294,12 @@ fn project_runtime_hint(event: &events::ForgeEvent) -> Option<PublicEventEnvelop
         | events::EventContext::ProjectResumed {} => {
             (Some("project".to_owned()), Some(event.entity_id.clone()))
         }
-        events::EventContext::ProjectDeleted { actor_user_id } => {
-            // The Project no longer exists, so the exact authenticated actor
-            // who completed deletion is the only verifiable recipient.
-            (Some("user".to_owned()), Some(actor_user_id.clone()))
+        events::EventContext::ProjectDeleted {
+            recipient_user_id, ..
+        } => {
+            // Recipients were snapshotted before deletion. Do not consult the
+            // removed Project or expose the recipient snapshot in the payload.
+            (Some("user".to_owned()), Some(recipient_user_id.clone()))
         }
         events::EventContext::ProjectHookRunChanged { project_id, .. } => {
             (Some("project".to_owned()), Some(project_id.clone()))
@@ -496,7 +498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_deleted_hint_is_scoped_to_the_authenticated_actor() {
+    async fn project_deleted_hints_are_scoped_to_each_snapshotted_recipient() {
         let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
             .expect("in-memory database");
@@ -508,12 +510,26 @@ mod tests {
             timestamp: "2026-10-11T00:00:00Z".to_owned(),
             context: events::EventContext::ProjectDeleted {
                 actor_user_id: "owner-a".to_owned(),
+                recipient_user_id: "owner-a".to_owned(),
             },
         };
         let public_event = project_runtime_hint(&hint).expect("allowlisted Project deletion hint");
         assert_eq!(public_event.scope_type.as_deref(), Some("user"));
         assert_eq!(public_event.scope_id.as_deref(), Some("owner-a"));
+        assert_eq!(public_event.payload, Some(json!({})));
         assert!(public_event_is_visible(&db, "owner-a", false, &public_event).await);
-        assert!(!public_event_is_visible(&db, "user-b", false, &public_event).await);
+
+        let member_hint = events::ForgeEvent {
+            context: events::EventContext::ProjectDeleted {
+                actor_user_id: "owner-a".to_owned(),
+                recipient_user_id: "member-b".to_owned(),
+            },
+            ..hint
+        };
+        let member_event =
+            project_runtime_hint(&member_hint).expect("snapshotted Project member hint");
+        assert_eq!(member_event.scope_id.as_deref(), Some("member-b"));
+        assert!(public_event_is_visible(&db, "member-b", false, &member_event).await);
+        assert!(!public_event_is_visible(&db, "outsider-c", false, &member_event).await);
     }
 }

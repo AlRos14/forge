@@ -6,7 +6,10 @@ use crate::{
     params::{parse_params, ToolCallParams},
     protocol::McpContext,
     state::AppState,
-    tools::{dispatch_tool, require_project_access, require_task_access, tool_descriptors},
+    tools::{
+        dispatch_tool, require_project_access, require_project_admin_access,
+        require_project_write_access, require_task_access, tool_descriptors,
+    },
 };
 
 #[cfg(test)]
@@ -107,6 +110,11 @@ async fn apply_project_scope(
             return Ok(arguments);
         }
         require_project_access(state, project_id, user_id).await?;
+        if project_admin_tool(tool_name) {
+            require_project_admin_access(state, project_id, user_id).await?;
+        } else if project_mutation_tool(tool_name) {
+            require_project_write_access(state, project_id, user_id).await?;
+        }
         if tool_name == "forge_create_task" {
             if let Some(parent_task_id) = object.get("parent_task_id").and_then(Value::as_str) {
                 let parent = require_task_access(state, parent_task_id, user_id).await?;
@@ -122,6 +130,9 @@ async fn apply_project_scope(
         let task_id = required_string_arg(object, field_name)?;
         let task = require_task_access(state, task_id, user_id).await?;
         assert_task_scope(&task, scoped_project_id, task_id)?;
+        if task_mutation_tool(tool_name) {
+            require_project_write_access(state, &task.project_id, user_id).await?;
+        }
         if matches!(
             tool_name,
             "forge_add_task_dependency" | "forge_remove_task_dependency"
@@ -153,6 +164,13 @@ async fn apply_project_scope(
     ) {
         let execution_id = required_string_arg(object, "execution_id")?;
         assert_execution_access(state, execution_id, user_id, scoped_project_id).await?;
+        if tool_name == "forge_follow_up_execution" {
+            let execution = ExecutionRepo::get_by_id(&*state.db, execution_id)
+                .await?
+                .ok_or_else(|| McpToolError::not_found("execution", execution_id.to_owned()))?;
+            let task = require_task_access(state, &execution.task_id, user_id).await?;
+            require_project_write_access(state, &task.project_id, user_id).await?;
+        }
     }
     if matches!(
         tool_name,
@@ -164,6 +182,12 @@ async fn apply_project_scope(
             .ok_or_else(|| McpToolError::not_found("Gate", id.to_owned()))?;
         let task = require_task_access(state, &gate.task_id, user_id).await?;
         assert_task_scope(&task, scoped_project_id, &gate.task_id)?;
+        if matches!(
+            tool_name,
+            "forge_revise_gate_policy" | "forge_evaluate_gate"
+        ) {
+            require_project_write_access(state, &task.project_id, user_id).await?;
+        }
     }
     if tool_name == "forge_get_gate_evaluation" {
         let id = required_string_arg(object, "evaluation_id")?;
@@ -191,6 +215,32 @@ async fn apply_project_scope(
     }
 
     Ok(arguments)
+}
+
+fn project_mutation_tool(tool_name: &str) -> bool {
+    tool_name == "forge_create_task"
+}
+
+fn project_admin_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "forge_update_project" | "forge_update_project_hooks"
+    )
+}
+
+fn task_mutation_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "forge_create_sub_tasks"
+            | "forge_update_task"
+            | "forge_start_execution"
+            | "forge_add_task_dependency"
+            | "forge_remove_task_dependency"
+            | "forge_transition_task_lifecycle"
+            | "forge_create_task_role"
+            | "forge_add_task_role_member"
+            | "forge_create_task_gate"
+    )
 }
 
 fn tool_accepts_project_id(tool_name: &str) -> bool {

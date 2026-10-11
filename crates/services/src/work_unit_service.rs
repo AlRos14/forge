@@ -102,7 +102,7 @@ impl WorkUnitService {
         } = input;
         let (task, actor) = self
             .collaboration
-            .authorize_source(&task_id, &source)
+            .authorize_mutation_source(&task_id, &source)
             .await?;
         if let Some(existing) = WorkUnitRepo::get_by_id(&*self.db, &id).await? {
             if existing.task_id == task_id
@@ -1273,9 +1273,12 @@ impl WorkUnitService {
             .await?
             .ok_or_else(|| not_found("work_unit", id))?;
         self.collaboration
-            .authorize_source(&task_id, source)
+            .authorize_mutation_source(&task_id, source)
             .await
-            .map_err(|_| not_found("work_unit", id))
+            .map_err(|error| match error {
+                ServiceError::AuthorizationDenied { .. } => error,
+                _ => not_found("work_unit", id),
+            })
     }
 
     async fn ensure_work_unit_in_task(&self, task: &Task, id: &str) -> Result<WorkUnit> {

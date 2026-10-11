@@ -60,15 +60,23 @@ pub(super) async fn require_task_visible(
         .await?
         .ok_or_else(|| ApiError::not_found("task", task_id.to_owned()))?;
 
-    if project.owner_id.is_none() || project.owner_id.as_deref() == Some(user.user_id.as_str()) {
-        return Ok(task);
-    }
-
-    let member = db::ProjectMemberRepo::get_member(&*state.db, &project.id, &user.user_id).await?;
-    if member.is_none() {
+    if !services::project_authority::user_can_read_project(&state.db, &project, &user.user_id)
+        .await?
+    {
         return Err(ApiError::not_found("task", task_id.to_owned()));
     }
 
+    Ok(task)
+}
+
+pub(super) async fn require_task_mutable(
+    state: &AppState,
+    task_id: &str,
+    user: &AuthenticatedUser,
+) -> ApiResult<db::Task> {
+    let task = require_task_visible(state, task_id, user).await?;
+    crate::routes::projects::require_project_mutable(state, &task.project_id, &user.user_id)
+        .await?;
     Ok(task)
 }
 

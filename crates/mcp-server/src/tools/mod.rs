@@ -6,7 +6,10 @@ use serde_json::Value;
 use crate::{error::McpToolError, protocol::McpContext, state::AppState};
 
 pub(crate) use descriptors::tool_descriptors;
-pub(crate) use handlers::{require_project_access, require_task_access};
+pub(crate) use handlers::{
+    require_project_access, require_project_admin_access, require_project_write_access,
+    require_task_access,
+};
 
 pub(crate) async fn dispatch_tool(
     state: &AppState,

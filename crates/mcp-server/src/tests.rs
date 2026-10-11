@@ -74,7 +74,7 @@ async fn seed_project_repo(state: &AppState) -> (String, String) {
             settings: "{}".to_owned(),
             workflow_definition: "{}".to_string(),
             primary_repo_id: None,
-            owner_id: None,
+            owner_id: Some("test-user".to_owned()),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -1769,6 +1769,221 @@ fn user_scoped_mcp_isolates_projects_and_derived_resources() {
         )
         .await;
         assert_eq!(own_task["id"], task_b.id);
+    });
+}
+
+#[test]
+fn mcp_project_visibility_does_not_grant_mutation_authority() {
+    run_async(async {
+        let state = sqlite_state().await;
+        for user_id in ["owner-a", "admin-a", "member-a", "viewer-a", "user-b"] {
+            add_user(&state, user_id).await;
+        }
+        let (project_a, _) = seed_private_project_repo(&state, "owner-a", "Project A").await;
+        let (project_b, _) = seed_private_project_repo(&state, "user-b", "Project B").await;
+        for (user_id, role) in [
+            ("admin-a", "admin"),
+            ("member-a", "member"),
+            ("viewer-a", "viewer"),
+        ] {
+            ProjectMemberRepo::add_member(
+                &*state.db,
+                CreateProjectMember {
+                    id: new_uuid_v4(),
+                    project_id: project_a.clone(),
+                    user_id: user_id.to_owned(),
+                    role: role.to_owned(),
+                    created_at: now_rfc3339(),
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await
+            .expect("Project role membership creates");
+        }
+
+        let owner = user_mcp_context("owner-a");
+        let admin = user_mcp_context("admin-a");
+        let member = user_mcp_context("member-a");
+        let viewer = user_mcp_context("viewer-a");
+        let outsider = user_mcp_context("user-b");
+        let owner_task = call_tool_as(
+            &state,
+            &owner,
+            "forge_create_task",
+            json!({"project_id":project_a,"title":"Owner task"}),
+        )
+        .await;
+        let member_task = call_tool_as(
+            &state,
+            &member,
+            "forge_create_task",
+            json!({"project_id":project_a,"title":"Member task"}),
+        )
+        .await;
+        let admin_task = call_tool_as(
+            &state,
+            &admin,
+            "forge_create_task",
+            json!({"project_id":project_a,"title":"Admin task"}),
+        )
+        .await;
+        assert_eq!(owner_task["project_id"], project_a);
+        assert_eq!(member_task["project_id"], project_a);
+        assert_eq!(admin_task["project_id"], project_a);
+
+        let project_read = call_tool_as(
+            &state,
+            &viewer,
+            "forge_get_project",
+            json!({"project_id":project_a}),
+        )
+        .await;
+        assert_eq!(project_read["id"], project_a);
+        let task_read = call_tool_as(
+            &state,
+            &viewer,
+            "forge_get_task",
+            json!({"task_id":owner_task["id"]}),
+        )
+        .await;
+        assert_eq!(task_read["id"], owner_task["id"]);
+
+        let updated = call_tool_as(
+            &state,
+            &admin,
+            "forge_update_project",
+            json!({"project_id":project_a,"name":"Admin Project update"}),
+        )
+        .await;
+        assert_eq!(updated["name"], "Admin Project update");
+        for (context, name, arguments) in [
+            (
+                &viewer,
+                "forge_create_task",
+                json!({"project_id":project_a,"title":"Viewer task"}),
+            ),
+            (
+                &viewer,
+                "forge_update_task",
+                json!({"task_id":owner_task["id"],"version":owner_task["version"],"title":"Viewer update"}),
+            ),
+            (
+                &member,
+                "forge_update_project",
+                json!({"project_id":project_a,"name":"Member Project update"}),
+            ),
+            (
+                &viewer,
+                "forge_update_project",
+                json!({"project_id":project_a,"name":"Viewer Project update"}),
+            ),
+        ] {
+            let error = call_tool_error_as(&state, context, name, arguments).await;
+            assert_eq!(error.code, -32003, "{name} requires write/admin authority");
+        }
+        let foreign_read = call_tool_error_as(
+            &state,
+            &outsider,
+            "forge_get_project",
+            json!({"project_id":project_a}),
+        )
+        .await;
+        assert_eq!(foreign_read.code, -32001);
+        let foreign_write = call_tool_error_as(
+            &state,
+            &outsider,
+            "forge_create_task",
+            json!({"project_id":project_a,"title":"Foreign task"}),
+        )
+        .await;
+        assert_eq!(foreign_write.code, -32001);
+
+        let foreign_parent = call_tool_as(
+            &state,
+            &outsider,
+            "forge_create_task",
+            json!({"project_id":project_b,"title":"Foreign parent"}),
+        )
+        .await;
+        let local_foreign_parent = call_tool_error_as(
+            &state,
+            &owner,
+            "forge_create_task",
+            json!({"project_id":project_a,"title":"Rejected local child","parent_task_id":foreign_parent["id"]}),
+        )
+        .await;
+        assert_eq!(local_foreign_parent.code, -32001);
+        let project_scoped = McpContext {
+            project_id: Some(project_a.clone()),
+            ..owner.clone()
+        };
+        let scoped_foreign_parent = call_tool_error_as(
+            &state,
+            &project_scoped,
+            "forge_create_task",
+            json!({"title":"Rejected scoped child","parent_task_id":foreign_parent["id"]}),
+        )
+        .await;
+        assert_eq!(scoped_foreign_parent.code, -32001);
+        let project_a_task_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
+                .bind(&project_a)
+                .fetch_one(state.db.pool())
+                .await
+                .expect("Project A Task count");
+        assert_eq!(
+            project_a_task_count, 3,
+            "failed MCP creates leave no partial Task"
+        );
+
+        let now = now_rfc3339();
+        let ownerless = ProjectRepo::create(
+            &*state.db,
+            CreateProject {
+                id: new_uuid_v4(),
+                name: "System Project".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("ownerless Project creates");
+        let public_read = call_tool_as(
+            &state,
+            &outsider,
+            "forge_get_project",
+            json!({"project_id":ownerless.id}),
+        )
+        .await;
+        assert_eq!(public_read["id"], ownerless.id);
+        for context in [
+            outsider.clone(),
+            McpContext {
+                project_id: Some(ownerless.id.clone()),
+                ..outsider.clone()
+            },
+        ] {
+            let error = call_tool_error_as(
+                &state,
+                &context,
+                "forge_create_task",
+                json!({"project_id":ownerless.id,"title":"World writable"}),
+            )
+            .await;
+            assert_eq!(error.code, -32003);
+        }
+        let ownerless_update = call_tool_error_as(
+            &state,
+            &outsider,
+            "forge_update_project",
+            json!({"project_id":ownerless.id,"name":"World writable"}),
+        )
+        .await;
+        assert_eq!(ownerless_update.code, -32003);
     });
 }
 

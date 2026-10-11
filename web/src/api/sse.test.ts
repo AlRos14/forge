@@ -73,6 +73,26 @@ describe('routeSsePayload', () => {
     )
   })
 
+  it('invalidates Project detail and list after an authorized deletion hint', () => {
+    const { queryClient, invalidateQueries } = createMocks()
+    routeSsePayload(
+      event('project.deleted', {
+        entity_id: 'project-1',
+        scope_type: 'user',
+        scope_id: 'member-b',
+        payload: {},
+      }),
+      queryClient,
+      { dispatch: vi.fn() },
+    )
+    expect(invalidateQueries.mock.calls).toEqual(
+      expect.arrayContaining([
+        [{ queryKey: ['projects', 'project-1'] }],
+        [{ queryKey: ['projects'] }],
+      ]),
+    )
+  })
+
   it('keeps retired status, Agent Chat, and legacy Review events out of UI projections', () => {
     for (const event_type of ['task.status_changed', 'agent_chat.message_created', 'review.passed']) {
       const { queryClient, invalidateQueries, dispatch } = createMocks()

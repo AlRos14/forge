@@ -77,6 +77,222 @@ async fn create_task_assigns_subtask_order_and_rejects_nested_subtask() {
 }
 
 #[tokio::test]
+async fn create_task_rejects_foreign_and_missing_parents_before_writing() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_a, _repo_a, _) = seed_project_repo(&db).await;
+    let (project_b, _repo_b, _) = seed_project_repo(&db).await;
+    let parent = service
+        .create_task(
+            project_a,
+            "Foreign parent",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("parent creates");
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
+        .bind(&project_b)
+        .fetch_one(db.pool())
+        .await
+        .expect("Project B Task count");
+
+    for parent_id in [parent.id.as_str(), "missing-parent"] {
+        let result = service
+            .create_task(
+                project_b.clone(),
+                "Rejected child",
+                None,
+                Some(parent_id.to_owned()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ServiceError::NotFound { entity: "task", .. })
+        ));
+    }
+
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
+        .bind(&project_b)
+        .fetch_one(db.pool())
+        .await
+        .expect("Project B Task count");
+    assert_eq!(
+        after, before,
+        "failed parent validation leaves no child row"
+    );
+}
+
+#[tokio::test]
+async fn update_task_parent_rejects_foreign_self_nested_and_cyclic_links_atomically() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _, _) = seed_project_repo(&db).await;
+    let (other_project_id, _, _) = seed_project_repo(&db).await;
+    let root_a = service
+        .create_task(
+            project_id.clone(),
+            "Root A",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Root A creates");
+    let root_b = service
+        .create_task(
+            project_id.clone(),
+            "Root B",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Root B creates");
+    let child_a = service
+        .create_task(
+            project_id.clone(),
+            "Child A",
+            None,
+            Some(root_a.id.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Child A creates");
+    let child_a = service
+        .update_task(task_update(&child_a, None))
+        .await
+        .expect("ordinary update revalidates the existing parent link");
+    let root_c = service
+        .create_task(
+            project_id.clone(),
+            "Root C",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Root C creates");
+    let child_c = service
+        .create_task(
+            project_id,
+            "Child C",
+            None,
+            Some(root_c.id.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Child C creates");
+    let foreign_parent = service
+        .create_task(
+            other_project_id,
+            "Foreign root",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Foreign root creates");
+
+    let valid_reparent = service
+        .update_task(task_update(&root_a, Some(Some(root_b.id.clone()))))
+        .await
+        .expect("root Task reparents under a same-Project root");
+    assert_eq!(
+        valid_reparent.parent_task_id.as_deref(),
+        Some(root_b.id.as_str())
+    );
+
+    let cases = [
+        (
+            &child_a,
+            foreign_parent.id.clone(),
+            "foreign Project parent",
+        ),
+        (&root_b, "missing-parent".to_owned(), "missing parent"),
+        (&root_b, root_b.id.clone(), "self parent"),
+        (&root_b, root_a.id.clone(), "cycle through a descendant"),
+        (&root_b, child_c.id.clone(), "nested subtask parent"),
+    ];
+    for (task, parent_id, description) in cases {
+        let before = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("Task read")
+            .expect("Task exists");
+        let result = service
+            .update_task(task_update(&before, Some(Some(parent_id))))
+            .await;
+        assert!(result.is_err(), "{description} must be rejected");
+        let after = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("Task read")
+            .expect("Task remains");
+        assert_eq!(after.project_id, before.project_id, "{description}");
+        assert_eq!(after.repo_id, before.repo_id, "{description}");
+        assert_eq!(after.parent_task_id, before.parent_task_id, "{description}");
+        assert_eq!(after.subtask_order, before.subtask_order, "{description}");
+        assert_eq!(after.version, before.version, "{description}");
+    }
+
+    let cleared = service
+        .update_task(task_update(&valid_reparent, Some(None)))
+        .await
+        .expect("clearing an existing parent is supported");
+    assert!(cleared.parent_task_id.is_none());
+}
+
+fn task_update(task: &Task, parent_task_id: Option<Option<String>>) -> db::UpdateTask {
+    db::UpdateTask {
+        id: task.id.clone(),
+        expected_version: task.version,
+        title: None,
+        description: None,
+        priority: None,
+        merge_config: None,
+        error_annotation: None,
+        blocked_json: None,
+        failed_json: None,
+        task_state_config: None,
+        parent_task_id,
+        updated_at: now_rfc3339(),
+    }
+}
+
+#[tokio::test]
 async fn create_subtasks_preserves_input_order_and_rejects_different_assignee_atomically() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

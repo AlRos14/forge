@@ -175,8 +175,8 @@ migrations, rename Forge, or create cross-model synchronization.
 
 - **Fix pass — public authorization and Review UI: PASS.** REST Project lists
   now filter before pagination so counts and cursors cover only visible Projects;
-  Project update, hooks, pause, resume, and delete use the same owner/member
-  visibility as reads. Repo/integration resources and Project-scoped MCP
+  reads use Project visibility while writes use operation-appropriate Project
+  authority. Repo/integration resources and Project-scoped MCP
   configuration resolve their owning Project;
   Task, Workspace, Execution, dependency, external-link, and collaboration
   resources resolve the exact parent Task before read or mutation. Notification
@@ -194,11 +194,21 @@ migrations, rename Forge, or create cross-model synchronization.
   before pagination, so private Agent rows do not affect visible cursors or
   `has_more` metadata. Historical Release snapshot reads now reuse the shared
   Project visibility helper, including the existing ownerless-public rule.
-  `project.deleted` remains scoped to the exact authenticated actor who
-  completed deletion; the deleted Project row is no longer consulted.
+  `project.deleted` recipients are captured from the exact owner/member set
+  before deletion and scoped per user after teardown; the deleted Project row
+  is not consulted to authorize delivery.
   ReviewReport submission is shown only for a running formal Review Execution
   owned by the current Human with no existing report. No schema or migration
   changes; PR13 storage cleanup and PR14 naming work remain excluded.
+
+- **Authorization, parent boundary, and deletion hint repair: PASS.**
+  Visibility is read-only authority; owner/admin/member write semantics,
+  ownerless fail-closed writes, Task parent same-Project validation, and exact
+  pre-delete Project event recipients are covered by focused adversarial tests.
+  The member ordinary-write rule preserves the pre-PR12 handlers that already
+  allowed any visible Project member to create/update Tasks, while the existing
+  ProjectMemberService, Project administration, sensitive configuration, and
+  media disposition paths retain owner/admin checks.
 
 ## Validation record
 
@@ -224,6 +234,39 @@ Workspace-wide Cargo tests/build/clippy, full web Vitest, and Playwright E2E
 remain intentionally unrun. No migration, generated-type output, `cargo clean`,
 or workspace-wide build was used for this fix pass. Reused `target/` measured
 37 GB after the focused crate tests; the filesystem retained 70 GB free.
+
+### Independent review findings repair — 2026-10-11
+
+- `cargo test -p api --test pr12_public_surface --locked --offline` (15 passed).
+- `cargo test -p api --test pr12_public_surface project_visibility_is_separate_from_project_and_task_write_authority --locked --offline`
+  (1 passed with explicit viewer update/delete denials and TaskRole Human Actor
+  validation).
+- `cargo test -p api --test pr12_public_surface task_parent_links_stay_inside_the_same_project_on_create_and_reparent --locked --offline`
+  (1 passed; same-Project create/reparent, foreign/missing/self/cyclic/nested
+  rejection, and no partial create).
+- `cargo test -p api --test pr12_public_surface project_deleted_hint_targets_only_pre_delete_recipients --locked --offline`
+  (1 passed; only the owner/member snapshot receives the hint).
+- `cargo test -p api --lib routes::events:: --locked --offline` (6 passed).
+- `cargo test -p api --test happy_path --locked --offline` (2 passed).
+- `cargo test -p mcp-server mcp_project_visibility_does_not_grant_mutation_authority --locked --offline`
+  (passed; owner/admin/member/viewer/outsider and ownerless Project matrix,
+  including user/local and Project-scoped parent checks).
+- `cargo test -p mcp-server user_scoped_mcp_isolates_projects_and_derived_resources --locked --offline`
+  (1 passed).
+- `cargo test -p services --lib task_service::tests::service_tests::cases::subtasks:: --locked --offline`
+  (6 passed after the final update-service validation change).
+- `cargo test -p services --lib project_member_service::tests:: --locked --offline`
+  (3 passed).
+- `cargo test -p services --lib pr8_human_review_report_rejects_a_different_human_actor --locked --offline`
+  (1 passed).
+- `pnpm --dir web exec vitest run src/api/sse.test.ts src/pages/TaskDetailPage.test.tsx`
+  (9 passed across 2 files); `pnpm --dir web typecheck` (passed).
+- `cargo fmt --all` and `cargo fmt --all -- --check` (passed);
+  `git diff --check` (passed).
+
+Not run for this findings repair: workspace-wide Cargo tests/build/clippy, the
+full DB suite, full web Vitest, Playwright, `cargo clean`, and any migration or
+schema change. The existing `target/` was reused.
 
 ### Initial PR12 implementation checks
 

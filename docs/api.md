@@ -51,14 +51,35 @@ the maximum is 100.
 | `GET /projects/{id}/integration`, `POST /projects/{id}/integration`, `PATCH /projects/{id}/integration`, `POST /projects/{id}/integration/sync` | Manage the Project's external issue integration. Create accepts and GET/PATCH return `credential_env_var`, the environment variable name Forge reads during sync; the credential value is never returned or stored. Optional `default_implementer` is an exact `ActorRef`; imported issues create ordinary Tasks and, when configured, an `implementer` TaskRole with that Actor as a RoleMembership. Sync fails closed if the configured Actor is not valid for the Project. Lifecycle begins at the normal Task creation state; legacy `default_task_state` and singular assignment fields are rejected. |
 | `GET /projects/{id}/members`, `POST /projects/{id}/members`, `PATCH /projects/{id}/members/{user_id}`, `DELETE /projects/{id}/members/{user_id}` | Manage Project membership. |
 
-Project reads and mutations require the authenticated user to own the Project or
-have a `project_member` row. Existing ownerless system Projects remain public.
-Invisible Project reads and mutations return the normal `404 not_found` response.
-Project lists filter by this visibility rule before pagination and report counts
-only for the caller's visible Projects. MCP applies the same rule in user/local
-mode; a Project-scoped MCP connection also pins every Project-derived tool to
-its selected Project. Creating a Project through REST or MCP records the
-authenticated Human as owner and creates the owner's membership row.
+Project reads require the authenticated user to own the Project or have a
+`project_member` row; every membership role, including `viewer`, can read, and
+ownerless system Projects retain public read behavior. Invisible reads return
+the normal `404 not_found` response. Project lists filter by this read rule
+before pagination and report counts only for the caller's visible Projects.
+
+Visibility does not grant mutation authority. Ordinary Project-derived work
+requires the owner or an explicit `owner`, `admin`, or `member` membership;
+the member write rule follows the earlier Task/resource handlers, which used
+the same owner-or-membership visibility check for ordinary writes. Project
+membership add/update/remove already requires owner/admin in
+`ProjectMemberService`. Viewers retain reads but no longer inherit writes from
+visibility. Project administration and
+sensitive configuration, including Project update/delete/pause/resume, generic
+hooks, Repo/PR provider configuration, and integrations, require owner/admin.
+Membership administration keeps its existing owner/admin checks. Ownerless
+Projects remain readable, but are writable only through an explicit membership
+with the role required for that operation; public visibility does not select or
+create an owner. Media upload and evidence attachment use ordinary write
+authority; redaction and purge keep the existing media owner/admin disposition
+check. Foreign private Project reads continue to return `404`; visible callers
+without write authority receive `403`.
+
+MCP uses the authenticated `McpContext.user_id` for the same read, write, and
+admin rules as REST. `McpContext.project_id` only narrows resource scope. A
+Project-scoped call cannot gain authority from its scope, and user/local calls
+still authorize each exact resource. Creating a Project through REST or MCP
+records the authenticated Human as owner and creates the owner's membership
+row.
 
 Repo and integration endpoints resolve the owning Project before access. Task,
 Workspace, Execution, dependency, external-link, Review, ValidationRun,
@@ -100,6 +121,10 @@ unchanged for PR13, but do not control newly imported Tasks.
 | `POST /tasks/{id}/merge` | Request merge admission using the exact satisfied GateEvaluation. The service rechecks its current policy and input identities under the Task integration lock. |
 | `GET /tasks/{id}/task-roles`, `POST /tasks/{id}/task-roles`, `PATCH /tasks/{id}/task-roles/{role}` | Read or update TaskRole definitions. |
 | `POST /tasks/{id}/task-roles/{role}/members`, `PATCH /tasks/{id}/task-roles/{role}/members/{membership_id}` | Add or update an exact RoleMembership. Memberships name a Human or Agent Actor. |
+
+When present, `parent_task_id` must identify a root Task in the same Project.
+TaskService enforces this on creation and reparenting, rejects missing parents,
+self-parenting, cycles, and unsupported nested parents before the Task write.
 
 TaskLifecycle is aggregate progress. The database `task.status` column remains
 only as a one-way storage projection pending PR13; REST lists, filters, task
@@ -241,10 +266,12 @@ gap. Agent Chat, Attention, old workflow transitions, `task.status`, and
 legacy Review-row events are not public event types.
 
 SSE requires authentication and filters Project- and Task-scoped events through
-the same owner/member visibility rule as REST. Since a deleted Project cannot
-be resolved after teardown, `project.deleted` is scoped only to the authenticated
-user who completed that deletion. Operations status hints are limited to
-administrators; resync hints carry no Project data.
+the same read visibility rule as REST. Before deleting a Project, Forge captures
+the exact owner and Project member recipients. After teardown it sends a
+per-user `project.deleted` invalidation hint to that snapshot. The public payload
+contains no recipient list, outsider streams receive no hint, and recipient
+authorization does not query the deleted Project. Operations status hints are
+limited to administrators; resync hints carry no Project data.
 
 ## MCP
 

@@ -35,7 +35,7 @@ pub async fn start_task_execution(
     user: crate::routes::auth::AuthenticatedUser,
     Json(request): Json<StartExecutionRequest>,
 ) -> ApiResult<Json<ExecutionResponse>> {
-    crate::routes::tasks::require_task_visible(&state, &task_id, &user).await?;
+    crate::routes::tasks::require_task_mutable(&state, &task_id, &user).await?;
     if request.role.trim().is_empty() || request.prompt.trim().is_empty() {
         return Err(ApiError::bad_request(
             "role and prompt must be non-empty for an Execution",
@@ -214,7 +214,7 @@ pub async fn follow_up_execution(
     Json(request): Json<FollowUpRequest>,
 ) -> ApiResult<Json<ExecutionResponse>> {
     let execution = require_execution_visible(&state, &id, &user).await?;
-    require_task_visible(&state, &execution.task_id, &user).await?;
+    crate::routes::tasks::require_task_mutable(&state, &execution.task_id, &user).await?;
     let overrides = request.overrides.map(|overrides| ExecutionOverrides {
         model_id: overrides.model_id,
         reasoning_effort: overrides.reasoning_effort,
@@ -238,7 +238,8 @@ pub async fn cancel_execution(
     Path(id): Path<String>,
     user: AuthenticatedUser,
 ) -> ApiResult<Json<ExecutionResponse>> {
-    require_execution_visible(&state, &id, &user).await?;
+    let execution = require_execution_visible(&state, &id, &user).await?;
+    crate::routes::tasks::require_task_mutable(&state, &execution.task_id, &user).await?;
     let execution = state
         .task_service
         .cancel_execution(id, "cancelled by user".to_owned())

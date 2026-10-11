@@ -8,7 +8,10 @@ use db::{now_rfc3339, CreateTaskExternalLink, ExternalLinkRepo, IntegrationRepo}
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::{auth::AuthenticatedUser, tasks::require_task_visible},
+    routes::{
+        auth::AuthenticatedUser,
+        tasks::{require_task_mutable, require_task_visible},
+    },
     state::AppState,
 };
 
@@ -31,7 +34,7 @@ pub async fn create_external_link(
     user: AuthenticatedUser,
     Json(request): Json<CreateExternalLinkRequest>,
 ) -> ApiResult<(StatusCode, Json<ExternalLinkResponse>)> {
-    let task = require_task_visible(&state, &id, &user).await?;
+    let task = require_task_mutable(&state, &id, &user).await?;
     let integration = IntegrationRepo::get_by_project_id(&*state.db, &task.project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project has no integration", task.project_id))?;
@@ -80,7 +83,7 @@ pub async fn delete_external_link(
     Path((id, link_id)): Path<(String, String)>,
     user: AuthenticatedUser,
 ) -> ApiResult<StatusCode> {
-    require_task_visible(&state, &id, &user).await?;
+    require_task_mutable(&state, &id, &user).await?;
     let link = ExternalLinkRepo::get_by_id(&*state.db, &link_id)
         .await?
         .ok_or_else(|| ApiError::not_found("external link", link_id.clone()))?;

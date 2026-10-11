@@ -1388,6 +1388,617 @@ async fn project_reads_and_mutations_require_project_visibility() {
     );
 }
 
+#[tokio::test]
+async fn project_visibility_is_separate_from_project_and_task_write_authority() {
+    let workspace = common::TestDir::new("pr12-project-write-authority");
+    let harness = common::test_app(workspace.path(), "pr12-project-write-authority").await;
+    let owner_token = common::test_jwt_for_user("owner-a", "owner-a@example.com", false);
+    let admin_token = common::test_jwt_for_user("admin-a", "admin-a@example.com", false);
+    let member_token = common::test_jwt_for_user("member-a", "member-a@example.com", false);
+    let viewer_token = common::test_jwt_for_user("viewer-a", "viewer-a@example.com", false);
+    let outsider_token = common::test_jwt_for_user("user-b", "user-b@example.com", false);
+
+    for (user_id, email) in [
+        ("owner-a", "owner-a@example.com"),
+        ("admin-a", "admin-a@example.com"),
+        ("member-a", "member-a@example.com"),
+        ("viewer-a", "viewer-a@example.com"),
+        ("user-b", "user-b@example.com"),
+    ] {
+        let now = db::now_rfc3339();
+        db::UserRepo::create_user(
+            &*harness.state.db,
+            &db::User {
+                id: user_id.to_owned(),
+                email: email.to_owned(),
+                password_hash: "$2b$04$placeholder".to_owned(),
+                display_name: None,
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("Project participant user creates");
+    }
+
+    let project: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &owner_token,
+        json!({"name":"Project A"}),
+        StatusCode::OK,
+    )
+    .await;
+    let project_b: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &outsider_token,
+        json!({"name":"Project B"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_ne!(project.id, project_b.id);
+    for (user_id, role) in [
+        ("admin-a", "admin"),
+        ("member-a", "member"),
+        ("viewer-a", "viewer"),
+    ] {
+        let now = db::now_rfc3339();
+        db::ProjectMemberRepo::add_member(
+            &*harness.state.db,
+            db::CreateProjectMember {
+                id: db::new_uuid_v4(),
+                project_id: project.id.clone(),
+                user_id: user_id.to_owned(),
+                role: role.to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("Project role membership creates");
+    }
+
+    let visible_project: ProjectResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}", project.id),
+        &viewer_token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(visible_project.id, project.id);
+    let invisible_project: serde_json::Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}", project.id),
+        &outsider_token,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(invisible_project["code"], "not_found");
+    let invisible_project_b: serde_json::Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}", project_b.id),
+        &owner_token,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(invisible_project_b["code"], "not_found");
+
+    let owner_task: TaskResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        &owner_token,
+        json!({"title":"Owner task"}),
+        StatusCode::OK,
+    )
+    .await;
+    let _: serde_json::Value = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/task-roles", owner_task.id),
+        &owner_token,
+        json!({"role":"implementer","coordination_mode":"independent"}),
+        StatusCode::OK,
+    )
+    .await;
+    let _foreign_actor: serde_json::Value = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!(
+            "/api/v1/tasks/{}/task-roles/implementer/members",
+            owner_task.id
+        ),
+        &owner_token,
+        json!({"actor_ref":{"kind":"human","id":"user-b"}}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    let member_task: TaskResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        &member_token,
+        json!({"title":"Member task"}),
+        StatusCode::OK,
+    )
+    .await;
+    let visible_task: TaskResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", owner_task.id),
+        &viewer_token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(visible_task.id, owner_task.id);
+
+    let _viewer_denied: serde_json::Value = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        &viewer_token,
+        json!({"title":"Viewer task"}),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    let _viewer_update_denied: serde_json::Value = common::json_request_with_bearer(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/tasks/{}", owner_task.id),
+        &viewer_token,
+        json!({"version":owner_task.version,"title":"Viewer write"}),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    let member_update: TaskResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/tasks/{}", member_task.id),
+        &member_token,
+        json!({"version":member_task.version,"title":"Member update"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(member_update.title, "Member update");
+
+    let _member_admin_denied: serde_json::Value = common::json_request_with_bearer(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{}", project.id),
+        &member_token,
+        json!({"version":project.version,"name":"Member project write"}),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    let _viewer_admin_denied: serde_json::Value = common::json_request_with_bearer(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{}", project.id),
+        &viewer_token,
+        json!({"version":project.version,"name":"Viewer project write"}),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    let admin_project: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{}", project.id),
+        &admin_token,
+        json!({"version":project.version,"name":"Admin project update"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(admin_project.name, "Admin project update");
+
+    let _member_repo_denied: serde_json::Value = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        &member_token,
+        json!({"remote_url":"https://example.com/member.git"}),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    let repo: RepoResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        &admin_token,
+        json!({"remote_url":"https://example.com/admin.git"}),
+        StatusCode::OK,
+    )
+    .await;
+    let _viewer_repo_read: RepoResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/repos/{}", repo.id),
+        &viewer_token,
+        StatusCode::OK,
+    )
+    .await;
+
+    let integration_body = json!({
+        "platform":"github",
+        "base_url":"https://api.github.com",
+        "owner":"owner-a",
+        "repo":"repo-a",
+        "credential_env_var":"GITHUB_TOKEN"
+    });
+    let _member_integration_denied: serde_json::Value = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/integration", project.id),
+        &member_token,
+        integration_body.clone(),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    common::json_request_with_bearer::<IntegrationResponse>(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/integration", project.id),
+        &admin_token,
+        integration_body,
+        StatusCode::CREATED,
+    )
+    .await;
+
+    let now = db::now_rfc3339();
+    let ownerless = db::ProjectRepo::create(
+        &*harness.state.db,
+        db::CreateProject {
+            id: db::new_uuid_v4(),
+            name: "Public system Project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("ownerless Project creates");
+    common::empty_request_with_bearer::<ProjectResponse>(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}", ownerless.id),
+        &outsider_token,
+        StatusCode::OK,
+    )
+    .await;
+    for (method, path, body) in [
+        (
+            Method::PATCH,
+            format!("/api/v1/projects/{}", ownerless.id),
+            json!({"version":ownerless.version,"name":"World writable"}),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/projects/{}/pause", ownerless.id),
+            json!({}),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/projects/{}/repos", ownerless.id),
+            json!({"remote_url":"https://example.com/ownerless.git"}),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/projects/{}/tasks", ownerless.id),
+            json!({"title":"World writable task"}),
+        ),
+    ] {
+        let response = common::json_request_with_bearer::<serde_json::Value>(
+            &harness.app,
+            method,
+            &path,
+            &outsider_token,
+            body,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+        let expected_code = if path.ends_with("/tasks") {
+            "project_write_forbidden"
+        } else {
+            "project_admin_required"
+        };
+        assert_eq!(response["code"], expected_code, "{path}");
+    }
+    assert_eq!(
+        project_delete_status(&harness.app, &ownerless.id, &outsider_token).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        project_delete_status(&harness.app, &project.id, &viewer_token).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn task_parent_links_stay_inside_the_same_project_on_create_and_reparent() {
+    let workspace = common::TestDir::new("pr12-task-parent-project-boundary");
+    let harness = common::test_app(workspace.path(), "pr12-task-parent-project-boundary").await;
+    let token = common::test_jwt();
+    let project_a: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &token,
+        json!({"name":"Project A"}),
+        StatusCode::OK,
+    )
+    .await;
+    let project_b: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &token,
+        json!({"name":"Project B"}),
+        StatusCode::OK,
+    )
+    .await;
+    let parent_a: TaskResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project_a.id),
+        &token,
+        json!({"title":"Parent A"}),
+        StatusCode::OK,
+    )
+    .await;
+    let parent_b: TaskResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project_b.id),
+        &token,
+        json!({"title":"Parent B"}),
+        StatusCode::OK,
+    )
+    .await;
+
+    let child_a: TaskResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project_a.id),
+        &token,
+        json!({"title":"Child A","parent_task_id":parent_a.id}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(child_a.project_id, project_a.id);
+    assert_eq!(
+        child_a.parent_task_id.as_deref(),
+        Some(parent_a.id.as_str())
+    );
+
+    let before_failed_creates: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
+            .bind(&project_a.id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("Task count before failed creates");
+    for parent_task_id in [parent_b.id.as_str(), "missing-parent"] {
+        let _response = common::json_request_with_bearer::<serde_json::Value>(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/projects/{}/tasks", project_a.id),
+            &token,
+            json!({"title":"Rejected child","parent_task_id":parent_task_id}),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+    }
+    let nested_response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/projects/{}/tasks", project_a.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(
+                    json!({"title":"Nested child","parent_task_id":child_a.id}).to_string(),
+                ))
+                .expect("nested Task request builds"),
+        )
+        .await
+        .expect("nested Task response");
+    assert!(
+        matches!(
+            nested_response.status(),
+            StatusCode::BAD_REQUEST | StatusCode::CONFLICT
+        ),
+        "nested parent is rejected with current API validation status"
+    );
+    let after_failed_creates: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
+            .bind(&project_a.id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("Task count after failed creates");
+    assert_eq!(after_failed_creates, before_failed_creates);
+
+    let _moved: serde_json::Value = common::json_request_with_bearer(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/tasks/{}", parent_a.id),
+        &token,
+        json!({"version":parent_a.version,"title":"Root A","parent_task_id":parent_b.id}),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    let self_parent = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/api/v1/tasks/{}", parent_a.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(
+                    json!({"version":parent_a.version,"parent_task_id":parent_a.id}).to_string(),
+                ))
+                .expect("self-parent request builds"),
+        )
+        .await
+        .expect("self-parent response");
+    assert!(
+        matches!(
+            self_parent.status(),
+            StatusCode::BAD_REQUEST | StatusCode::CONFLICT
+        ),
+        "self-parent is rejected"
+    );
+
+    let cycle = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/api/v1/tasks/{}", parent_a.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(
+                    json!({"version":parent_a.version,"parent_task_id":child_a.id}).to_string(),
+                ))
+                .expect("cycle request builds"),
+        )
+        .await
+        .expect("cycle response");
+    assert!(
+        matches!(
+            cycle.status(),
+            StatusCode::BAD_REQUEST | StatusCode::CONFLICT
+        ),
+        "reparenting a root below its child is rejected as a cycle"
+    );
+}
+
+#[tokio::test]
+async fn project_deleted_hint_targets_only_pre_delete_recipients() {
+    let workspace = common::TestDir::new("pr12-project-deleted-recipients");
+    let harness = common::test_app(workspace.path(), "pr12-project-deleted-recipients").await;
+    let owner_token = common::test_jwt();
+    let member_token = common::test_jwt_for_user("member-b", "member-b@example.com", false);
+    let outsider_token = common::test_jwt_for_user("outsider-c", "outsider-c@example.com", false);
+    for (user_id, email) in [
+        ("member-b", "member-b@example.com"),
+        ("outsider-c", "outsider-c@example.com"),
+    ] {
+        let now = db::now_rfc3339();
+        db::UserRepo::create_user(
+            &*harness.state.db,
+            &db::User {
+                id: user_id.to_owned(),
+                email: email.to_owned(),
+                password_hash: "$2b$04$placeholder".to_owned(),
+                display_name: None,
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("Project recipient user creates");
+    }
+    let now = db::now_rfc3339();
+    let project = db::ProjectRepo::create(
+        &*harness.state.db,
+        db::CreateProject {
+            id: db::new_uuid_v4(),
+            name: "Deleted Project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some("test-user-id".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("private Project creates");
+    db::ProjectMemberRepo::add_member(
+        &*harness.state.db,
+        db::CreateProjectMember {
+            id: db::new_uuid_v4(),
+            project_id: project.id.clone(),
+            user_id: "member-b".to_owned(),
+            role: "member".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("member B joins Project");
+    let mut events = harness.state.event_bus.subscribe();
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/v1/projects/{}", project.id))
+                .header(header::AUTHORIZATION, format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .expect("Project delete request builds"),
+        )
+        .await
+        .expect("Project delete response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(db::ProjectRepo::get_by_id(&*harness.state.db, &project.id)
+        .await
+        .expect("deleted Project lookup")
+        .is_none());
+
+    let mut recipients = std::collections::BTreeSet::new();
+    while let Ok(event) = events.try_recv() {
+        if event.event_type == "project.deleted" && event.entity_id == project.id {
+            if let events::EventContext::ProjectDeleted {
+                recipient_user_id, ..
+            } = event.context
+            {
+                recipients.insert(recipient_user_id);
+            }
+        }
+    }
+    assert_eq!(
+        recipients,
+        ["member-b".to_owned(), "test-user-id".to_owned()].into()
+    );
+    assert!(!recipients.contains("outsider-c"));
+
+    // Deleted Projects no longer grant owner/member visibility, and their
+    // deletion notifications are invalidation-only, not membership data.
+    let _: serde_json::Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}", project.id),
+        &member_token,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    let _: serde_json::Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}", project.id),
+        &outsider_token,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
 async fn project_delete_status(app: &Router, project_id: &str, token: &str) -> StatusCode {
     app.clone()
         .oneshot(

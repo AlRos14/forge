@@ -25,7 +25,7 @@ pub async fn create_repo(
     user: AuthenticatedUser,
     Json(request): Json<CreateRepoRequest>,
 ) -> ApiResult<Json<RepoResponse>> {
-    crate::routes::projects::require_project_visible(&state, &project_id, &user.user_id).await?;
+    crate::routes::projects::require_project_admin(&state, &project_id, &user.user_id).await?;
     if request.pr_provider.is_none() && request.pr_provider_config.is_some() {
         return Err(ApiError::bad_request_with_code(
             "repo.pr_provider_required",
@@ -145,7 +145,7 @@ pub async fn update_repo(
     Json(request): Json<UpdateRepoRequest>,
 ) -> ApiResult<Json<RepoResponse>> {
     let db = &*state.db;
-    require_repo_visible(&state, &id, &user).await?;
+    require_repo_admin(&state, &id, &user).await?;
     let UpdateRepoRequest {
         name,
         remote_url,
@@ -287,7 +287,7 @@ pub async fn delete_repo(
     Path(id): Path<String>,
     user: AuthenticatedUser,
 ) -> ApiResult<StatusCode> {
-    require_repo_visible(&state, &id, &user).await?;
+    require_repo_admin(&state, &id, &user).await?;
     RepoRepo::delete(&*state.db, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -297,7 +297,7 @@ pub async fn sync_repo(
     Path(id): Path<String>,
     user: AuthenticatedUser,
 ) -> ApiResult<Json<RepoSyncResponse>> {
-    let repo = require_repo_visible(&state, &id, &user).await?;
+    let repo = require_repo_admin(&state, &id, &user).await?;
     let local_path = repo.local_path.ok_or_else(|| {
         ApiError::bad_request_with_code(
             "repo.no_local_path",
@@ -329,6 +329,18 @@ async fn require_repo_visible(
         .ok_or_else(|| ApiError::not_found("repo", repo_id.to_owned()))?;
     crate::routes::projects::require_project_visible(state, &repo.project_id, &user.user_id)
         .await?;
+    Ok(repo)
+}
+
+async fn require_repo_admin(
+    state: &AppState,
+    repo_id: &str,
+    user: &AuthenticatedUser,
+) -> ApiResult<Repo> {
+    let repo = RepoRepo::get_by_id(&*state.db, repo_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("repo", repo_id.to_owned()))?;
+    crate::routes::projects::require_project_admin(state, &repo.project_id, &user.user_id).await?;
     Ok(repo)
 }
 

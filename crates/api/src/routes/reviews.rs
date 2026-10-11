@@ -8,8 +8,10 @@ use db::{CollaborationRepo, ExecutionPurpose, ExecutionRepo, ValidationRunRepo};
 use crate::{
     errors::{ApiError, ApiResult},
     routes::{
-        auth::AuthenticatedUser, collaboration::artifact_response, execution_response,
-        tasks::require_task_visible,
+        auth::AuthenticatedUser,
+        collaboration::artifact_response,
+        execution_response,
+        tasks::{require_task_mutable, require_task_visible},
     },
     state::AppState,
 };
@@ -57,7 +59,7 @@ pub async fn submit_review_report(
     Json(request): Json<SubmitReviewReportRequest>,
 ) -> ApiResult<Json<SubmitReviewReportResponse>> {
     let execution = exact_review_execution(&state, &execution_id).await?;
-    let _task = require_task_visible(&state, &execution.task_id, &user).await?;
+    let _task = require_task_mutable(&state, &execution.task_id, &user).await?;
     let (execution, report) = state
         .task_service
         .submit_human_review_report(&execution_id, &user.user_id, request)

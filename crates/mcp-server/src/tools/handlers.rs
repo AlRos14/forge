@@ -386,9 +386,9 @@ pub(super) async fn forge_update_task(
     params: Value,
 ) -> Result<Value, McpToolError> {
     let params: UpdateTaskParams = parse_params(params)?;
-    let task = TaskRepo::update(
-        &*state.db,
-        UpdateTask {
+    let task = state
+        .task_service
+        .update_task(UpdateTask {
             id: params.task_id,
             expected_version: params.version,
             title: params.title,
@@ -401,9 +401,8 @@ pub(super) async fn forge_update_task(
             task_state_config: None,
             parent_task_id: None,
             updated_at: now_rfc3339(),
-        },
-    )
-    .await?;
+        })
+        .await?;
     task_public_value(state, task).await
 }
 
@@ -1070,6 +1069,43 @@ pub(crate) async fn require_project_access(
     }
 }
 
+pub(crate) async fn require_project_write_access(
+    state: &AppState,
+    project_id: &str,
+    user_id: &str,
+) -> Result<(), McpToolError> {
+    require_project_access(state, project_id, user_id).await?;
+    let project = ProjectRepo::get_by_id(&*state.db, project_id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("project", project_id.to_owned()))?;
+    if services::project_authority::user_can_write_project(&state.db, &project, user_id).await? {
+        Ok(())
+    } else {
+        Err(McpToolError::new(
+            -32003,
+            "Project write access is required",
+        ))
+    }
+}
+
+pub(crate) async fn require_project_admin_access(
+    state: &AppState,
+    project_id: &str,
+    user_id: &str,
+) -> Result<(), McpToolError> {
+    require_project_access(state, project_id, user_id).await?;
+    let project = ProjectRepo::get_by_id(&*state.db, project_id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("project", project_id.to_owned()))?;
+    if services::project_authority::user_can_administer_project(&state.db, &project, user_id)
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(McpToolError::new(-32003, "Project admin role is required"))
+    }
+}
+
 async fn project_is_visible_to_user(
     state: &AppState,
     project: &db::Project,
@@ -1077,14 +1113,7 @@ async fn project_is_visible_to_user(
 ) -> Result<bool, McpToolError> {
     // REST treats ownerless rows as public system Projects. Keep that
     // established visibility rule for user/local and Project-scoped MCP.
-    if project.owner_id.is_none() || project.owner_id.as_deref() == Some(user_id) {
-        return Ok(true);
-    }
-    Ok(
-        ProjectMemberRepo::get_member(&*state.db, &project.id, user_id)
-            .await?
-            .is_some(),
-    )
+    Ok(services::project_authority::user_can_read_project(&state.db, project, user_id).await?)
 }
 
 pub(crate) async fn require_task_access(

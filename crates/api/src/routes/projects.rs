@@ -144,21 +144,35 @@ pub async fn delete_project(
     user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    require_project_visible(&state, &id, &user.user_id).await?;
+    let project = require_project_admin(&state, &id, &user.user_id).await?;
+    let mut recipients = std::collections::BTreeSet::new();
+    if let Some(owner_id) = project.owner_id.as_deref() {
+        recipients.insert(owner_id.to_owned());
+    }
+    recipients.extend(
+        db::ProjectMemberRepo::list_members(&*state.db, &id)
+            .await?
+            .into_iter()
+            .map(|member| member.user_id),
+    );
+    recipients.insert(user.user_id.clone());
     services::project_deletion::delete_project(
         state.db.clone(),
         state.cleanup_scheduler.workspace_root(),
         &id,
     )
     .await?;
-    state.event_bus.publish(ForgeEvent {
-        event_type: "project.deleted".to_owned(),
-        entity_id: id,
-        timestamp: event_timestamp(),
-        context: EventContext::ProjectDeleted {
-            actor_user_id: user.user_id.clone(),
-        },
-    });
+    for recipient_user_id in recipients {
+        state.event_bus.publish(ForgeEvent {
+            event_type: "project.deleted".to_owned(),
+            entity_id: id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::ProjectDeleted {
+                actor_user_id: user.user_id.clone(),
+                recipient_user_id,
+            },
+        });
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -167,7 +181,7 @@ pub async fn pause_project(
     user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProjectResponse>> {
-    let project = require_project_visible(&state, &id, &user.user_id).await?;
+    let project = require_project_admin(&state, &id, &user.user_id).await?;
     if project.paused_at.is_some() {
         return Ok(Json(project_response(project)?));
     }
@@ -193,7 +207,7 @@ pub async fn resume_project(
     user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProjectResponse>> {
-    let project = require_project_visible(&state, &id, &user.user_id).await?;
+    let project = require_project_admin(&state, &id, &user.user_id).await?;
     if project.paused_at.is_none() {
         return Ok(Json(project_response(project)?));
     }
@@ -219,7 +233,7 @@ pub async fn update_project(
     Path(id): Path<String>,
     Json(request): Json<UpdateProjectRequest>,
 ) -> ApiResult<Json<ProjectResponse>> {
-    require_project_visible(&state, &id, &user.user_id).await?;
+    require_project_admin(&state, &id, &user.user_id).await?;
     let UpdateProjectRequest {
         name,
         paused,
@@ -274,19 +288,44 @@ pub(super) async fn require_project_visible(
     Ok(project)
 }
 
+pub(super) async fn require_project_mutable(
+    state: &AppState,
+    project_id: &str,
+    user_id: &str,
+) -> ApiResult<db::Project> {
+    let project = require_project_visible(state, project_id, user_id).await?;
+    if !services::project_authority::user_can_write_project(&state.db, &project, user_id).await? {
+        return Err(ApiError::forbidden_with_code(
+            "project_write_forbidden",
+            "Project membership does not grant write access",
+        ));
+    }
+    Ok(project)
+}
+
+pub(super) async fn require_project_admin(
+    state: &AppState,
+    project_id: &str,
+    user_id: &str,
+) -> ApiResult<db::Project> {
+    let project = require_project_visible(state, project_id, user_id).await?;
+    if !services::project_authority::user_can_administer_project(&state.db, &project, user_id)
+        .await?
+    {
+        return Err(ApiError::forbidden_with_code(
+            "project_admin_required",
+            "Project owner or admin role is required",
+        ));
+    }
+    Ok(project)
+}
+
 async fn project_is_visible(
     state: &AppState,
     project: &db::Project,
     user_id: &str,
 ) -> ApiResult<bool> {
-    if project.owner_id.is_none() || project.owner_id.as_deref() == Some(user_id) {
-        return Ok(true);
-    }
-    Ok(
-        db::ProjectMemberRepo::get_member(&*state.db, &project.id, user_id)
-            .await?
-            .is_some(),
-    )
+    Ok(services::project_authority::user_can_read_project(&state.db, project, user_id).await?)
 }
 
 fn project_hook_run_response(run: ProjectHookRun) -> ProjectHookRunResponse {

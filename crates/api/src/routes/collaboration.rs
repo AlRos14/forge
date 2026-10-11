@@ -321,6 +321,7 @@ pub async fn create_artifact(
     user: AuthenticatedUser,
     Json(body): Json<CreateArtifactRequest>,
 ) -> ApiResult<Json<ArtifactResponse>> {
+    crate::routes::tasks::require_task_mutable(&state, &task_id, &user).await?;
     let record = state
         .collaboration_service
         .create_artifact(
@@ -381,6 +382,7 @@ pub async fn create_message(
     user: AuthenticatedUser,
     Json(body): Json<CreateMessageRequest>,
 ) -> ApiResult<Json<MessageResponse>> {
+    crate::routes::tasks::require_task_mutable(&state, &task_id, &user).await?;
     let record = state
         .collaboration_service
         .create_message(
@@ -428,6 +430,7 @@ pub async fn create_handoff(
     user: AuthenticatedUser,
     Json(body): Json<CreateHandoffRequest>,
 ) -> ApiResult<Json<HandoffResponse>> {
+    crate::routes::tasks::require_task_mutable(&state, &task_id, &user).await?;
     let record = state
         .collaboration_service
         .create_handoff(
@@ -478,6 +481,11 @@ pub async fn transition_handoff(
     user: AuthenticatedUser,
     Json(body): Json<HandoffTransitionRequest>,
 ) -> ApiResult<Json<HandoffResponse>> {
+    let existing = state
+        .collaboration_service
+        .get_handoff(&id, source(&user))
+        .await?;
+    crate::routes::tasks::require_task_mutable(&state, &existing.task_id, &user).await?;
     let record = state
         .collaboration_service
         .transition_handoff(
@@ -496,6 +504,7 @@ pub async fn create_proposal(
     user: AuthenticatedUser,
     Json(body): Json<CreateProposalRequest>,
 ) -> ApiResult<Json<ProposalResponse>> {
+    crate::routes::tasks::require_task_mutable(&state, &task_id, &user).await?;
     let record = state
         .collaboration_service
         .create_proposal(
@@ -548,6 +557,11 @@ pub async fn withdraw_proposal(
     Path(id): Path<String>,
     user: AuthenticatedUser,
 ) -> ApiResult<Json<ProposalResponse>> {
+    let existing = state
+        .collaboration_service
+        .get_proposal(&id, source(&user))
+        .await?;
+    crate::routes::tasks::require_task_mutable(&state, &existing.task_id, &user).await?;
     let record = state
         .collaboration_service
         .withdraw_proposal(source(&user), &id)
@@ -561,6 +575,7 @@ pub async fn create_decision(
     user: AuthenticatedUser,
     Json(body): Json<CreateDecisionRequest>,
 ) -> ApiResult<Json<DecisionResponse>> {
+    crate::routes::tasks::require_task_mutable(&state, &task_id, &user).await?;
     let record = state
         .collaboration_service
         .record_decision(
