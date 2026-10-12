@@ -16,6 +16,7 @@ pub struct ProjectHookRule {
     #[ts(type = "unknown")]
     pub filters: Option<Value>,
     pub action: ProjectHookAction,
+    #[ts(type = "number | null")]
     pub cooldown_seconds: Option<u64>,
     pub max_concurrent_runs: u8,
 }
@@ -44,6 +45,7 @@ pub enum ProjectHookAction {
         title: String,
         description: Option<String>,
         task_type: Option<TaskType>,
+        #[ts(type = "number | null")]
         priority: Option<i64>,
     },
     #[serde(rename = "add_comment")]

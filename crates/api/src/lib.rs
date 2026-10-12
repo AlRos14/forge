@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Request};
+use axum::extract::Request;
 use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
@@ -17,7 +17,6 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 pub mod errors;
-mod extract;
 pub mod middleware;
 mod path_input;
 pub mod routes;
@@ -110,38 +109,6 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::auth::create_pat).get(routes::auth::list_pats),
         )
         .route("/api/v1/auth/tokens/{id}", delete(routes::auth::delete_pat))
-        .route(
-            "/api/v1/account/main-agent",
-            get(routes::agent_chats::get_main_agent).put(routes::agent_chats::set_main_agent),
-        )
-        .route(
-            "/api/v1/account/main-agent/product-genesis",
-            post(routes::product_genesis::start_product_genesis),
-        )
-        .route(
-            "/api/v1/account/main-agent/product-genesis/active",
-            get(routes::product_genesis::get_active_product_genesis),
-        )
-        .route(
-            "/api/v1/account/main-agent/product-genesis/{session_id}",
-            get(routes::product_genesis::get_product_genesis),
-        )
-        .route(
-            "/api/v1/account/main-agent/product-genesis/{session_id}/charter",
-            get(routes::project_orchestration::get_genesis_charter),
-        )
-        .route(
-            "/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions",
-            post(routes::project_orchestration::save_genesis_charter_revision),
-        )
-        .route(
-            "/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions/{revision_id}/approve",
-            post(routes::project_orchestration::approve_genesis_charter_revision),
-        )
-        .route(
-            "/api/v1/account/main-agent/product-genesis/{session_id}/cancel",
-            post(routes::product_genesis::cancel_product_genesis),
-        )
         .route("/api/v1/admin/users", get(routes::admin::list_users))
         .route(
             "/api/v1/admin/users/{id}",
@@ -151,31 +118,6 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/admin/settings/{key}",
             put(routes::admin::upsert_setting).delete(routes::admin::delete_setting),
-        )
-        .route(
-            "/api/v1/memory/backfill",
-            post(routes::admin::backfill_memory),
-        )
-        .route("/api/v1/memory/{id}", get(routes::memory::get_memory_item))
-        .route(
-            "/api/v1/memory/{id}/publish",
-            post(routes::scoped_memory::publish_memory),
-        )
-        .route(
-            "/api/v1/memory/{id}/lifecycle",
-            post(routes::scoped_memory::assert_memory_lifecycle),
-        )
-        .route(
-            "/api/v1/memory/{id}/provenance",
-            get(routes::scoped_memory::get_memory_provenance),
-        )
-        .route(
-            "/api/v1/context-manifests/{id}",
-            get(routes::scoped_memory::get_context_manifest),
-        )
-        .route(
-            "/api/v1/agents/{id}/context-manifests",
-            get(routes::scoped_memory::list_context_manifests),
         )
         .route(
             "/api/v1/projects",
@@ -196,148 +138,6 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::projects::resume_project),
         )
         .route(
-            "/api/v1/projects/{id}/analytics",
-            get(routes::projects::get_project_analytics),
-        )
-        .route(
-            "/api/v1/projects/{id}/overview",
-            get(routes::project_overview::get_project_overview),
-        )
-        .route(
-            "/api/v1/projects/{id}/execution-baseline",
-            get(routes::execution_baseline::get_execution_baseline)
-                .post(routes::execution_baseline::create_execution_baseline),
-        )
-        .route(
-            "/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions",
-            post(routes::execution_baseline::save_execution_baseline_revision),
-        )
-        .route(
-            "/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve",
-            post(routes::execution_baseline::approve_execution_baseline),
-        )
-        .route(
-            "/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate",
-            post(routes::execution_baseline::activate_execution_baseline),
-        )
-        .route(
-            "/api/v1/projects/{id}/charter",
-            get(routes::project_charters::get_project_charter),
-        )
-        .route(
-            "/api/v1/projects/{id}/charter/revisions",
-            post(routes::project_charters::save_project_charter_revision),
-        )
-        .route(
-            "/api/v1/projects/{id}/charter/revisions/{revision_id}/approve",
-            post(routes::project_charters::approve_project_charter_revision),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/documents",
-            get(routes::project_documents::list_project_documents)
-                .post(routes::project_documents::create_project_document),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/documents/{document_id}",
-            get(routes::project_documents::get_project_document),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/documents/{document_id}/revisions",
-            get(routes::project_documents::list_project_document_revisions)
-                .post(routes::project_documents::save_project_document_revision),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/documents/{document_id}/revisions/{revision_id}",
-            get(routes::project_documents::get_project_document_revision),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/documents/{document_id}/revisions/{revision_id}/diff",
-            get(routes::project_documents::get_project_document_revision_diff),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/documents/{document_id}/approve",
-            post(routes::project_documents::approve_project_document),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/decisions",
-            get(routes::project_documents::list_decisions),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/decisions/candidates",
-            get(routes::project_documents::list_decision_candidates)
-                .post(routes::project_documents::create_decision_candidate),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/decisions/candidates/{candidate_id}",
-            get(routes::project_documents::get_decision_candidate),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/decisions/candidates/{candidate_id}/approve",
-            post(routes::project_documents::approve_decision_candidate),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/decisions/candidates/{candidate_id}/reject",
-            post(routes::project_documents::reject_decision_candidate),
-        )
-        .route(
-            "/api/v1/projects/{project_id}/decisions/{decision_id}",
-            get(routes::project_documents::get_decision),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones",
-            get(routes::milestones::list_milestones_with_query)
-                .post(routes::milestones::create_milestone),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones/{milestone_id}",
-            get(routes::milestones::get_milestone),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones/{milestone_id}/readiness",
-            post(routes::milestones::evaluate_readiness),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones/{milestone_id}/readiness/history",
-            get(routes::milestones::list_readiness_snapshots),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones/{milestone_id}/readiness/{snapshot_id}",
-            get(routes::milestones::get_readiness_snapshot),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones/{milestone_id}/transition",
-            post(routes::milestones::transition_milestone),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/result",
-            post(routes::milestones::record_milestone_check),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/waive",
-            post(routes::milestones::waive_milestone_check),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones/{milestone_id}/revisions",
-            get(routes::milestones::list_milestone_revisions_with_query)
-                .post(routes::milestones::save_milestone_revision),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones/{milestone_id}/revisions/{revision_id}",
-            get(routes::milestones::get_milestone_revision),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones/{milestone_id}/revisions/{revision_id}/transition",
-            post(routes::milestones::transition_milestone_revision),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones/{milestone_id}/release",
-            post(routes::milestones::release_milestone),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones/primary",
-            post(routes::milestones::set_primary_milestone),
-        )
-        .route(
             "/api/v1/projects/{id}/media",
             get(routes::project_media::list_media).post(routes::project_media::upload_media),
         )
@@ -354,25 +154,12 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::project_media::purge_media),
         )
         .route(
-            "/api/v1/projects/{id}/milestones/{milestone_id}/evidence",
-            get(routes::project_media::list_evidence).post(routes::project_media::attach_evidence),
-        )
-        .route(
-            "/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}",
-            get(routes::project_media::get_evidence)
-                .delete(routes::project_media::remove_evidence),
-        )
-        .route(
             "/api/v1/projects/{id}/releases/{release_id}",
-            get(routes::milestones::get_release),
+            get(routes::project_releases::get_release),
         )
         .route(
             "/api/v1/projects/{id}/milestones/{milestone_id}/releases",
-            get(routes::milestones::list_releases),
-        )
-        .route(
-            "/api/v1/projects/{id}/memory/search",
-            get(routes::memory::search_project_memory),
+            get(routes::project_releases::list_releases),
         )
         .route(
             "/api/v1/projects/{id}/project_hook_runs",
@@ -388,53 +175,6 @@ pub fn api_router(state: AppState) -> Router {
             patch(routes::members::update_member_role).delete(routes::members::remove_member),
         )
         .route(
-            "/api/v1/projects/{id}/agents",
-            get(routes::project_agents::list_project_agents),
-        )
-        .route(
-            "/api/v1/projects/{id}/project-agent",
-            get(routes::agent_chats::get_project_agent).put(routes::agent_chats::set_project_agent),
-        )
-        .route(
-            "/api/v1/agent-chats",
-            get(routes::agent_chats::list_agent_chats),
-        )
-        .route(
-            "/api/v1/agent-chats/{chat_id}",
-            get(routes::agent_chats::get_agent_chat),
-        )
-        .route(
-            "/api/v1/agent-chats/{chat_id}/messages",
-            get(routes::agent_chats::list_agent_chat_messages)
-                .post(routes::agent_chats::send_agent_chat_message),
-        )
-        .route(
-            "/api/v1/agent-chats/{chat_id}/turns",
-            get(routes::agent_chats::list_agent_chat_turns),
-        )
-        .route(
-            "/api/v1/agent-chats/{chat_id}/turns/{turn_id}/cancel",
-            post(routes::agent_chats::cancel_agent_chat_turn),
-        )
-        .route(
-            "/api/v1/projects/{id}/agent-handoffs",
-            get(routes::agent_chats::list_agent_handoffs)
-                .post(routes::agent_chats::create_agent_handoff),
-        )
-        .route(
-            "/api/v1/projects/{id}/agent-handoffs/{handoff_id}",
-            get(routes::agent_chats::get_agent_handoff),
-        )
-        .route(
-            "/api/v1/projects/{id}/workflow",
-            get(routes::projects::get_project_workflow)
-                .put(routes::projects::update_project_workflow),
-        )
-        .route(
-            "/api/v1/projects/{id}/hooks/test",
-            post(routes::projects::test_project_lifecycle_hook),
-        )
-        .route(
             "/api/v1/projects/{id}/integration",
             post(routes::integrations::create_integration)
                 .get(routes::integrations::get_integration)
@@ -444,20 +184,6 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/projects/{id}/integration/sync",
             post(routes::integrations::trigger_sync),
-        )
-        .route(
-            "/api/v1/workflow/prompt-builders",
-            get(routes::workflow::list_prompt_builders),
-        )
-        .route(
-            "/api/v1/workflow-templates",
-            get(routes::workflow_templates::list_templates),
-        )
-        .route(
-            "/api/v1/workflow-templates/{name}",
-            get(routes::workflow_templates::get_template)
-                .put(routes::workflow_templates::save_template)
-                .delete(routes::workflow_templates::delete_template),
         )
         .route(
             "/api/v1/projects/{id}/repos",
@@ -510,8 +236,7 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/tasks/{task_id}/artifacts",
-            post(routes::collaboration::create_artifact)
-                .get(routes::collaboration::list_artifacts),
+            post(routes::collaboration::create_artifact).get(routes::collaboration::list_artifacts),
         )
         .route(
             "/api/v1/artifacts/{id}",
@@ -519,8 +244,7 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/tasks/{task_id}/messages",
-            post(routes::collaboration::create_message)
-                .get(routes::collaboration::list_messages),
+            post(routes::collaboration::create_message).get(routes::collaboration::list_messages),
         )
         .route(
             "/api/v1/messages/{id}",
@@ -528,8 +252,7 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/tasks/{task_id}/handoffs",
-            post(routes::collaboration::create_handoff)
-                .get(routes::collaboration::list_handoffs),
+            post(routes::collaboration::create_handoff).get(routes::collaboration::list_handoffs),
         )
         .route(
             "/api/v1/handoffs/{id}",
@@ -541,8 +264,7 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/tasks/{task_id}/proposals",
-            post(routes::collaboration::create_proposal)
-                .get(routes::collaboration::list_proposals),
+            post(routes::collaboration::create_proposal).get(routes::collaboration::list_proposals),
         )
         .route(
             "/api/v1/proposals/{id}",
@@ -554,8 +276,7 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/tasks/{task_id}/collaboration/decisions",
-            post(routes::collaboration::create_decision)
-                .get(routes::collaboration::list_decisions),
+            post(routes::collaboration::create_decision).get(routes::collaboration::list_decisions),
         )
         .route(
             "/api/v1/decisions/{id}",
@@ -568,19 +289,9 @@ pub fn api_router(state: AppState) -> Router {
                 .delete(routes::tasks::delete_task),
         )
         .route(
-            "/api/v1/tasks/{id}/prompt-preview",
-            get(routes::tasks::prompt_preview),
-        )
-        .route("/api/v1/tasks/{id}/claim", post(routes::tasks::claim_task))
-        .route(
-            "/api/v1/tasks/{id}/launch",
-            post(routes::tasks::launch_task),
-        )
-        .route(
             "/api/v1/tasks/{id}/subtasks/reorder",
             post(routes::tasks::reorder_subtasks),
         )
-        .route("/api/v1/tasks/{id}/move", post(routes::tasks::move_task))
         .route(
             "/api/v1/tasks/{id}/workspace",
             get(routes::tasks::get_task_workspace),
@@ -590,12 +301,6 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::tasks::reset_task_workspace),
         )
         .route("/api/v1/tasks/{id}/diff", get(routes::tasks::get_task_diff))
-        .route("/api/v1/tasks/{id}/plan", get(routes::tasks::get_task_plan))
-        .route("/api/v1/tasks/{id}/decisions", get(routes::tasks::list_task_decisions))
-        .route(
-            "/api/v1/tasks/{id}/decisions/{request_id}/answer",
-            post(routes::tasks::answer_task_decision),
-        )
         .route(
             "/api/v1/tasks/{id}/dependencies",
             post(routes::tasks::add_dependency).get(routes::tasks::list_dependencies),
@@ -609,67 +314,10 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::tasks::list_dependents),
         )
         .route(
-            "/api/v1/tasks/{id}/cancel",
-            post(routes::tasks::cancel_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/actions",
-            get(routes::tasks::list_task_actions),
-        )
-        .route("/api/v1/tasks/{id}/start", post(routes::tasks::start_task))
-        .route("/api/v1/tasks/{id}/pause", post(routes::tasks::pause_task))
-        .route(
-            "/api/v1/tasks/{id}/resume",
-            post(routes::tasks::resume_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/submit",
-            post(routes::tasks::submit_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/request-changes",
-            post(routes::tasks::request_changes_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/approve",
-            post(routes::tasks::approve_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/archive",
-            post(routes::tasks::archive_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/advance",
-            post(routes::tasks::advance_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/recover",
-            post(routes::tasks::recover_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/duplicate",
-            post(routes::tasks::duplicate_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/transition",
-            post(routes::tasks::transition_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/gates/{state_name}/approve",
-            post(routes::tasks::approve_gate),
-        )
-        .route(
-            "/api/v1/tasks/{id}/gates/{state_name}/reject",
-            post(routes::tasks::reject_gate),
-        )
-        .route(
             "/api/v1/tasks/{id}/gates",
-            post(routes::tasks::create_task_gate),
+            get(routes::tasks::list_task_gates).post(routes::tasks::create_task_gate),
         )
-        .route(
-            "/api/v1/gates/{id}",
-            get(routes::tasks::get_gate),
-        )
+        .route("/api/v1/gates/{id}", get(routes::tasks::get_gate))
         .route(
             "/api/v1/gates/{id}/policy",
             put(routes::tasks::revise_gate_policy),
@@ -688,24 +336,15 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/tasks/{id}/lifecycle",
-            get(routes::tasks::get_task_lifecycle),
+            get(routes::tasks::get_task_lifecycle).post(routes::tasks::transition_task_lifecycle),
         )
         .route(
-            "/api/v1/tasks/{id}/transitions",
-            get(routes::tasks::list_transitions),
-        )
-        .route(
-            "/api/v1/tasks/{id}/roles",
-            get(routes::tasks::list_task_roles),
-        )
-        .route(
-            "/api/v1/tasks/{id}/roles/{role_name}",
-            put(routes::tasks::assign_task_role).delete(routes::tasks::remove_task_role),
+            "/api/v1/tasks/{id}/lifecycle/transitions",
+            get(routes::tasks::list_task_lifecycle_transitions),
         )
         .route(
             "/api/v1/tasks/{id}/task-roles",
-            get(routes::tasks::list_task_role_model)
-                .post(routes::tasks::create_task_role_model),
+            get(routes::tasks::list_task_role_model).post(routes::tasks::create_task_role_model),
         )
         .route(
             "/api/v1/tasks/{id}/task-roles/{role}",
@@ -720,30 +359,8 @@ pub fn api_router(state: AppState) -> Router {
             patch(routes::tasks::update_task_role_member),
         )
         .route(
-            "/api/v1/tasks/{id}/review",
-            post(routes::tasks::trigger_review),
-        )
-        .route(
-            "/api/v1/tasks/{id}/review/approve",
-            post(routes::tasks::approve_review),
-        )
-        .route(
-            "/api/v1/tasks/{id}/review/reject",
-            post(routes::tasks::reject_review),
-        )
-        .route(
-            "/api/v1/tasks/{id}/reviews",
-            get(routes::tasks::list_reviews),
-        )
-        .route(
-            "/api/v1/tasks/{id}/comments",
-            post(routes::tasks::create_comment).get(routes::tasks::list_comments),
-        )
-        .route(
-            "/api/v1/tasks/{id}/media",
-            post(routes::tasks::upload_media)
-                .get(routes::tasks::list_media)
-                .layer(DefaultBodyLimit::disable()),
+            "/api/v1/tasks/{id}/review-executions",
+            post(routes::tasks::trigger_review).get(routes::tasks::list_reviews),
         )
         .route(
             "/api/v1/tasks/{id}/terminals",
@@ -775,14 +392,6 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::terminals::terminal_ws),
         )
         .route(
-            "/api/v1/comments/{id}",
-            delete(routes::tasks::delete_comment),
-        )
-        .route(
-            "/api/v1/media/{media_id}",
-            get(routes::tasks::get_media).delete(routes::tasks::delete_media),
-        )
-        .route(
             "/api/v1/tasks/{id}/external-links",
             get(routes::external_links::list_external_links)
                 .post(routes::external_links::create_external_link),
@@ -792,15 +401,15 @@ pub fn api_router(state: AppState) -> Router {
             delete(routes::external_links::delete_external_link),
         )
         .route(
-            "/api/v1/reviews/{id}",
+            "/api/v1/review-executions/{id}",
             get(routes::reviews::get_review).post(routes::reviews::submit_review_report),
         )
         .route(
-            "/api/v1/tasks/{id}/validations",
+            "/api/v1/tasks/{id}/validation-runs",
             get(routes::reviews::list_validation_runs),
         )
         .route(
-            "/api/v1/validations/{id}",
+            "/api/v1/validation-runs/{id}",
             get(routes::reviews::get_validation_run),
         )
         .route("/api/v1/evidence/{id}", get(routes::reviews::get_evidence))
@@ -833,30 +442,6 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::operations::refresh_operations),
         )
         .route(
-            "/api/v1/mission-control",
-            get(routes::mission_control::home),
-        )
-        .route(
-            "/api/v1/mission-control/attention",
-            get(routes::mission_control::list_attention),
-        )
-        .route(
-            "/api/v1/mission-control/attention/{id}/acknowledge",
-            post(routes::mission_control::acknowledge),
-        )
-        .route(
-            "/api/v1/mission-control/attention/{id}/snooze",
-            post(routes::mission_control::snooze),
-        )
-        .route(
-            "/api/v1/mission-control/attention/{id}/resolve",
-            post(routes::mission_control::resolve),
-        )
-        .route(
-            "/api/v1/mission-control/agents/{identity_id}",
-            get(routes::mission_control::agent_detail),
-        )
-        .route(
             "/api/v1/settings",
             get(routes::settings::get_settings).put(routes::settings::update_settings),
         )
@@ -869,31 +454,6 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::agents::get_agent)
                 .patch(routes::agents::update_agent)
                 .delete(routes::agents::archive_agent),
-        )
-        .route(
-            "/api/v1/agents/{id}/tasks",
-            get(routes::agents::list_agent_tasks),
-        )
-        .route(
-            "/api/v1/agents/{id}/commitments",
-            get(routes::coordination::list_commitments)
-                .post(routes::coordination::create_commitment),
-        )
-        .route(
-            "/api/v1/agents/{id}/inbox",
-            get(routes::coordination::list_inbox),
-        )
-        .route(
-            "/api/v1/agents/{id}/questions",
-            get(routes::coordination::list_questions).post(routes::coordination::ask_question),
-        )
-        .route(
-            "/api/v1/agents/{id}/actions",
-            get(routes::coordination::list_actions).post(routes::coordination::propose_action),
-        )
-        .route(
-            "/api/v1/agents/{id}/task-proposals",
-            post(routes::coordination::propose_task),
         )
         .route(
             "/api/v1/agents/{id}/pause",
@@ -912,20 +472,8 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::agents::get_agent_usage),
         )
         .route(
-            "/api/v1/agents/{id}/usage/refresh",
-            post(routes::agents::refresh_agent_usage),
-        )
-        .route(
             "/api/v1/agents/{id}/discovered-options",
             get(routes::agents::agent_discovered_options),
-        )
-        .route(
-            "/api/v1/agents/{id}/duplicate",
-            post(routes::agents::duplicate_agent),
-        )
-        .route(
-            "/api/v1/embedded-agents",
-            post(routes::embedded_agents::create_embedded_agent),
         )
         .route(
             "/api/v1/providers/catalog",
@@ -962,113 +510,11 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/agents/{id}/profiles",
-            get(routes::embedded_agents::list_profiles),
-        )
-        .route(
-            "/api/v1/agents/{id}/profiles/connect",
-            post(routes::embedded_agents::connect_embedded_profile),
+            get(routes::agent_profiles::list_profiles),
         )
         .route(
             "/api/v1/agents/{id}/profiles/{profile_id}/select",
-            post(routes::embedded_agents::select_profile),
-        )
-        .route(
-            "/api/v1/agents/{id}/sessions",
-            get(routes::embedded_agents::list_sessions)
-                .post(routes::embedded_agents::create_session),
-        )
-        .route(
-            "/api/v1/agents/{id}/effective-permissions",
-            post(routes::embedded_agents::effective_permissions),
-        )
-        .route(
-            "/api/v1/agent-sessions/{id}/rotate",
-            post(routes::embedded_agents::rotate_session),
-        )
-        .route(
-            "/api/v1/agent-sessions/{id}/suspend",
-            post(routes::embedded_agents::suspend_session),
-        )
-        .route(
-            "/api/v1/agent-sessions/{id}/resume",
-            post(routes::embedded_agents::resume_session),
-        )
-        .route(
-            "/api/v1/agent-sessions/{id}/cancel",
-            post(routes::embedded_agents::cancel_session_turn),
-        )
-        .route(
-            "/api/v1/agent-sessions/{id}/steer",
-            post(routes::embedded_agents::steer_session_turn),
-        )
-        .route(
-            "/api/v1/agent-sessions/{session_id}/interactions",
-            get(routes::embedded_agents::list_session_interactions),
-        )
-        .route(
-            "/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/answer",
-            post(routes::embedded_agents::answer_session_interaction),
-        )
-        .route(
-            "/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/cancel",
-            post(routes::embedded_agents::cancel_session_interaction),
-        )
-        .route(
-            "/api/v1/commitments/{id}",
-            get(routes::coordination::get_commitment)
-                .patch(routes::coordination::update_commitment),
-        )
-        .route(
-            "/api/v1/commitments/{id}/complete",
-            post(routes::coordination::complete_commitment),
-        )
-        .route(
-            "/api/v1/commitments/{id}/transfer",
-            post(routes::coordination::transfer_commitment),
-        )
-        .route(
-            "/api/v1/commitments/{id}/cancel",
-            post(routes::coordination::cancel_commitment),
-        )
-        .route(
-            "/api/v1/commitments/{id}/evidence",
-            get(routes::coordination::list_commitment_evidence),
-        )
-        .route(
-            "/api/v1/inbox/{id}",
-            get(routes::coordination::get_inbox_item),
-        )
-        .route(
-            "/api/v1/inbox/{id}/status",
-            patch(routes::coordination::update_inbox_item),
-        )
-        .route(
-            "/api/v1/questions/{id}",
-            get(routes::coordination::get_question),
-        )
-        .route(
-            "/api/v1/questions/{id}/answer",
-            post(routes::coordination::answer_question),
-        )
-        .route(
-            "/api/v1/actions/{id}",
-            get(routes::coordination::get_action),
-        )
-        .route(
-            "/api/v1/actions/{id}/approve",
-            post(routes::coordination::approve_action),
-        )
-        .route(
-            "/api/v1/actions/{id}/execute",
-            post(routes::coordination::execute_action),
-        )
-        .route(
-            "/api/v1/actions/{id}/execute-orchestration",
-            post(routes::coordination::execute_orchestration_action),
-        )
-        .route(
-            "/api/v1/actions/{id}/execute-task",
-            post(routes::coordination::execute_task_proposal),
+            post(routes::agent_profiles::select_profile),
         )
         .route(
             "/api/v1/executor-types",
@@ -1095,7 +541,7 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/tasks/{id}/executions",
-            get(routes::executions::list_executions),
+            get(routes::executions::list_executions).post(routes::executions::start_task_execution),
         )
         .route(
             "/api/v1/executions/{id}",
@@ -1112,10 +558,6 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/executions/{id}/follow-up",
             post(routes::executions::follow_up_execution),
-        )
-        .route(
-            "/api/v1/executions/{id}/re-execute",
-            post(routes::executions::re_execute_execution),
         )
         .route(
             "/api/v1/executions/{id}/cancel",
@@ -1138,7 +580,6 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/config/mcp",
             get(routes::mcp_config::get_mcp_config).post(routes::mcp_config::update_mcp_config),
         )
-        .layer(from_fn(retired_vertical_write_middleware))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,
@@ -1181,142 +622,7 @@ pub fn api_router(state: AppState) -> Router {
     )
 }
 
-async fn retired_vertical_write_middleware(
-    request: Request,
-    next: Next,
-) -> axum::response::Response {
-    if !is_retired_vertical_mutation(request.method(), request.uri().path()) {
-        return next.run(request).await;
-    }
-
-    let request_id = request
-        .headers()
-        .get(&middleware::REQUEST_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
-    let mut response = (
-        StatusCode::GONE,
-        axum::Json(api_types::ErrorResponse {
-            code: "operation_retired".to_owned(),
-            message:
-                "This Main Agent, Project Agent, or Project OS operation was retired in Plan PR11"
-                    .to_owned(),
-            details: None,
-            request_id,
-        }),
-    )
-        .into_response();
-    if let Some(request_id) = request
-        .headers()
-        .get(&middleware::REQUEST_ID_HEADER)
-        .cloned()
-    {
-        response
-            .headers_mut()
-            .insert(middleware::REQUEST_ID_HEADER.clone(), request_id);
-    }
-    response
-}
-
-fn is_retired_vertical_mutation(method: &axum::http::Method, path: &str) -> bool {
-    use axum::http::Method;
-
-    let path = path.trim_end_matches('/');
-    let segments = path.split('/').collect::<Vec<_>>();
-    if segments.len() >= 6
-        && segments[1..3] == ["api", "v1"]
-        && segments[3] == "projects"
-        && segments[5] == "memory"
-        && segments.get(6) == Some(&"search")
-    {
-        // This search feeds retrieved semantic memory into cognition. PR11
-        // keeps point reads for historical inspection but retires retrieval.
-        return true;
-    }
-
-    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
-        return false;
-    }
-
-    if path == "/api/v1/account/main-agent"
-        || path.starts_with("/api/v1/account/main-agent/product-genesis")
-        || path.starts_with("/api/v1/agent-chats/")
-        || path.starts_with("/api/v1/actions/")
-        || path.starts_with("/api/v1/commitments/")
-        || path.starts_with("/api/v1/inbox/")
-        || path.starts_with("/api/v1/questions/")
-        || path == "/api/v1/memory/backfill"
-        || path.starts_with("/api/v1/memory/")
-            && (path.ends_with("/publish") || path.ends_with("/lifecycle"))
-        || path.starts_with("/api/v1/mission-control/attention/")
-    {
-        return true;
-    }
-    if segments.len() >= 5 && segments[1..3] == ["api", "v1"] {
-        let project_area = segments[3] == "projects";
-        if project_area {
-            return matches!(
-                segments.get(5).copied(),
-                Some(
-                    "project-agent"
-                        | "execution-baseline"
-                        | "charter"
-                        | "documents"
-                        | "milestones"
-                        | "agent-handoffs"
-                )
-            ) || (segments.get(5) == Some(&"decisions")
-                && segments.get(6) == Some(&"candidates"));
-        }
-        if segments[3] == "agents" {
-            return matches!(
-                segments.get(5).copied(),
-                Some("commitments" | "questions" | "actions" | "task-proposals")
-            );
-        }
-    }
-
-    false
-}
-
 #[cfg(test)]
-mod retired_vertical_route_tests {
-    use super::is_retired_vertical_mutation;
-    use axum::http::Method;
-
-    #[test]
-    fn retired_mutations_fail_closed_while_history_reads_remain_available() {
-        assert!(is_retired_vertical_mutation(
-            &Method::POST,
-            "/api/v1/account/main-agent/product-genesis"
-        ));
-        assert!(is_retired_vertical_mutation(
-            &Method::POST,
-            "/api/v1/projects/p1/milestones/m1/release"
-        ));
-        assert!(is_retired_vertical_mutation(
-            &Method::POST,
-            "/api/v1/actions/a1/execute"
-        ));
-        assert!(is_retired_vertical_mutation(
-            &Method::GET,
-            "/api/v1/projects/p1/memory/search"
-        ));
-        assert!(!is_retired_vertical_mutation(
-            &Method::GET,
-            "/api/v1/projects/p1/milestones/m1"
-        ));
-        assert!(!is_retired_vertical_mutation(
-            &Method::POST,
-            "/api/v1/projects"
-        ));
-        assert!(!is_retired_vertical_mutation(
-            &Method::POST,
-            "/api/v1/projects/p1/tasks"
-        ));
-    }
-}
 
 pub async fn serve(
     addr: SocketAddr,

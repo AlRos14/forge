@@ -1,7 +1,6 @@
 mod claim;
 mod dependencies;
 mod executions;
-mod lifecycle_test;
 mod move_task;
 mod roles;
 mod subtask_modes;

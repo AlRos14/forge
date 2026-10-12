@@ -35,6 +35,7 @@ pub struct TerminalSessionResponse {
     pub status: TerminalSessionStatus,
     pub rows: u16,
     pub cols: u16,
+    #[ts(type = "number | null")]
     pub exit_code: Option<i32>,
     pub exit_signal: Option<String>,
     pub exit_reason: Option<String>,
@@ -82,9 +83,13 @@ pub struct TerminalAvailability {
     pub workspace_ready: bool,
     pub daemon_reachable: bool,
     pub active_execution: bool,
+    #[ts(type = "number")]
     pub session_count_for_task: u32,
+    #[ts(type = "number")]
     pub session_count_for_user: u32,
+    #[ts(type = "number")]
     pub max_sessions_per_task: u32,
+    #[ts(type = "number")]
     pub max_sessions_per_user: u32,
     pub can_create: bool,
     pub reason: Option<String>,

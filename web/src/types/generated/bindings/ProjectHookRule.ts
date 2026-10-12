@@ -2,4 +2,4 @@
 import type { ProjectHookAction } from "./ProjectHookAction";
 import type { ProjectHookTrigger } from "./ProjectHookTrigger";
 
-export type ProjectHookRule = { id: string, enabled: boolean, name: string, trigger: ProjectHookTrigger, filters: unknown, action: ProjectHookAction, cooldown_seconds: bigint | null, max_concurrent_runs: number, };
+export type ProjectHookRule = { id: string, enabled: boolean, name: string, trigger: ProjectHookTrigger, filters: unknown, action: ProjectHookAction, cooldown_seconds: number | null, max_concurrent_runs: number, };

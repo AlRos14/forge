@@ -1,191 +1,144 @@
-import { lazy, Suspense } from 'react'
-import { Kanban, Plus } from '@phosphor-icons/react'
+import { useEffect, useState } from 'react'
+import { useNavigate } from '@tanstack/react-router'
+import { toast } from 'sonner'
+import { useCreateTask, useTasksQuery, useTransitionTaskLifecycle } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
 import { Button } from '@/components/ui/button'
-import { BoardToolbar } from './BoardToolbar'
-import { BoardView } from './BoardView'
-import { useBoardPageController } from './useBoardPageController'
+import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
+import { getApiErrorMessage } from '@/lib/api-error'
+import type { Task, TaskLifecycleState } from '@/types/generated'
 
-const TaskCreateDialog = lazy(() =>
-  import('@/components/task-create-dialog').then((module) => ({
-    default: module.TaskCreateDialog,
-  })),
-)
-const TaskDetailModal = lazy(() =>
-  import('@/components/task-detail-modal').then((module) => ({
-    default: module.TaskDetailModal,
-  })),
-)
+const lanes: TaskLifecycleState[] = [
+  'backlog', 'ready', 'active', 'blocked', 'ready_to_merge', 'merging', 'done', 'cancelled',
+]
+
+const nextStates: Partial<Record<TaskLifecycleState, TaskLifecycleState[]>> = {
+  backlog: ['ready', 'blocked', 'cancelled'],
+  ready: ['active', 'blocked', 'cancelled'],
+  active: ['ready', 'blocked', 'cancelled'],
+  blocked: ['ready', 'active', 'cancelled'],
+}
 
 export function BoardPage({ projectId }: { projectId: string }) {
-  const board = useBoardPageController(projectId)
+  const navigate = useNavigate()
+  const [queryText, setQueryText] = useState('')
+  const [includeCancelled, setIncludeCancelled] = useState(false)
+  const [createOpen, setCreateOpen] = useState(false)
+  const [title, setTitle] = useState('')
+  const [description, setDescription] = useState('')
+  const tasksQuery = useTasksQuery(projectId, {
+    q: queryText.trim() || undefined,
+    lifecycle_state: lanes.join(','),
+    sort_by: 'board_position',
+    sort_order: 'asc',
+    limit: 200,
+  })
+  const createTask = useCreateTask(projectId)
+  const transition = useTransitionTaskLifecycle()
+  const allTasks = tasksQuery.data?.pages.flatMap((page) => page.items) ?? []
+  const tasks = includeCancelled ? allTasks : allTasks.filter((task) => task.lifecycle.state !== 'cancelled')
+
+  useEffect(() => {
+    const open = () => setCreateOpen(true)
+    const focus = () => document.getElementById('board-search')?.focus()
+    window.addEventListener('forge:create-task', open)
+    window.addEventListener('forge:focus-board-search', focus)
+    return () => {
+      window.removeEventListener('forge:create-task', open)
+      window.removeEventListener('forge:focus-board-search', focus)
+    }
+  }, [])
+
+  async function create() {
+    const nextTitle = title.trim()
+    if (!nextTitle) return
+    try {
+      const task = await createTask.mutateAsync({
+        title: nextTitle,
+        description: description.trim() || undefined,
+        task_type: 'implementation',
+        priority: 0,
+      })
+      setTitle('')
+      setDescription('')
+      setCreateOpen(false)
+      void navigate({ to: '/tasks/$taskId', params: { taskId: task.id } })
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Task creation failed'))
+    }
+  }
+
+  async function move(task: Task, toState: TaskLifecycleState) {
+    try {
+      await transition.mutateAsync({
+        taskId: task.id,
+        toState,
+        expectedLifecycleVersion: task.lifecycle.version,
+        idempotencyKey: crypto.randomUUID(),
+      })
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Task lifecycle transition failed'))
+    }
+  }
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-3" data-board-page>
-      <BoardToolbar
-        agents={board.agentsQuery.data?.items ?? []}
-        selectedAgentIds={board.filterAgentIds}
-        q={board.filterQ}
-        priorityMin={board.filterPriorityMin}
-        priorityMax={board.filterPriorityMax}
-        blockedOnly={board.filterBlockedOnly}
-        includeCancelled={board.filterIncludeCancelled}
-        includeArchived={board.filterIncludeArchived}
-        showMobileFilters={board.showMobileFilters}
-        searchInputRef={board.searchInputRef}
-        orderingMessage={board.ordering.reason}
-        onToggleMobileFilters={() => board.setShowMobileFilters((visible) => !visible)}
-        onFilterChange={board.setUrlFilters}
-        onNewTask={() => board.setCreateDialogOpen(true)}
-      />
-
-      {board.dragSession.state.announcement ? (
-        <div
-          className="flex shrink-0 items-center justify-between gap-3 rounded-lg border border-amber-300/60 bg-amber-50 px-3 py-2 text-xs text-amber-950 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-100"
-          role="status"
-          data-board-announcement
-        >
-          <span>{board.dragSession.state.announcement}</span>
-          <button
-            type="button"
-            className="font-medium underline underline-offset-2"
-            onClick={board.dragSession.dismissAnnouncement}
-          >
-            Dismiss
-          </button>
+    <main className="flex h-full min-h-0 flex-col gap-4 p-4 sm:p-6" data-board-page>
+      <header className="flex flex-wrap items-end gap-3">
+        <div className="min-w-0 flex-1">
+          <h1 className="text-2xl font-semibold">Task board</h1>
+          <p className="mt-1 text-sm text-muted-foreground">Columns show aggregate TaskLifecycle states.</p>
         </div>
-      ) : null}
+        <Input id="board-search" className="max-w-xs" value={queryText} onChange={(event) => setQueryText(event.target.value)} placeholder="Search tasks" aria-label="Search tasks" />
+        <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={includeCancelled} onChange={(event) => setIncludeCancelled(event.target.checked)} /> Cancelled</label>
+        <Button onClick={() => setCreateOpen((open) => !open)}>New task</Button>
+      </header>
 
-      {board.tasksQuery.isError ? (
-        <ErrorBanner
-          error={board.tasksQuery.error}
-          fallback="Tasks failed to load"
-          onRetry={() => void board.tasksQuery.refetch()}
-        />
-      ) : null}
-
-      {board.tasksQuery.isLoading ? (
-        <div className="flex min-h-0 flex-1 gap-2.5 overflow-hidden" aria-label="Loading board">
-          {[0, 1, 2].map((index) => (
-            <div
-              key={index}
-              className="h-full w-[280px] shrink-0 animate-pulse rounded-xl border bg-muted/40"
-            />
-          ))}
-        </div>
-      ) : null}
-
-      {!board.tasksQuery.isLoading && !board.tasksQuery.isError && board.tasks.length === 0 ? (
-        <div className="flex flex-1 items-center justify-center">
-          <div className="rounded-xl border border-dashed p-12 text-center">
-            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
-              <Kanban size={22} className="text-muted-foreground" />
-            </div>
-            <p className="text-sm font-semibold">No tasks yet</p>
-            <p className="mt-1.5 text-xs text-muted-foreground">
-              Create your first task to get started
-            </p>
-            <Button
-              className="mt-5 rounded-lg"
-              size="sm"
-              onClick={() => board.setCreateDialogOpen(true)}
-            >
-              <Plus size={13} weight="bold" className="mr-1.5" />
-              Create task
-            </Button>
+      {createOpen ? (
+        <section className="grid gap-3 rounded-lg border p-4 sm:grid-cols-2">
+          <Input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Task title" aria-label="Task title" />
+          <Textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Description (optional)" aria-label="Task description" />
+          <div className="flex gap-2 sm:col-span-2">
+            <Button disabled={!title.trim() || createTask.isPending} onClick={() => void create()}>{createTask.isPending ? 'Creating…' : 'Create task'}</Button>
+            <Button variant="outline" onClick={() => setCreateOpen(false)}>Cancel</Button>
           </div>
-        </div>
+        </section>
       ) : null}
 
-      {!board.tasksQuery.isLoading && !board.tasksQuery.isError && board.tasks.length > 0 ? (
-        <BoardView
-          columns={board.boardColumns}
-          groupedTasks={board.grouped}
-          orderingEnabled={board.ordering.enabled}
-          orderingReason={board.ordering.reason}
-          movePending={board.dragSession.movePending}
-          draggingTaskId={board.dragSession.state.draggableId}
-          validDropStatuses={board.validDropStatuses}
-          activeDropStatus={board.dragSession.state.activeDropStatus}
-          quickCreateOpen={board.quickCreateOpen}
-          quickCreateTitle={board.quickCreateTitle}
-          quickCreateDescription={board.quickCreateDescription}
-          quickCreateDescriptionRef={board.quickCreateDescriptionRef}
-          createPending={board.createTask.isPending}
-          agentPickerTaskId={board.agentPickerTaskId}
-          agents={board.agentsQuery.data?.items ?? []}
-          agentNamesById={board.agentNamesById}
-          assignPending={board.assignRole.isPending}
-          renderTaskMenuItems={board.renderTaskMenuItems}
-          onToggleQuickCreate={() => board.setQuickCreateOpen((open) => !open)}
-          onQuickCreateTitleChange={board.setQuickCreateTitle}
-          onQuickCreateDescriptionChange={board.setQuickCreateDescription}
-          onSubmitQuickCreate={board.submitQuickCreate}
-          onCancelQuickCreate={board.cancelQuickCreate}
-          onAssignAgent={board.assignAgent}
-          onAgentClick={board.handleAgentClick}
-          onTaskClick={(task) => board.openTaskDetail(task.id)}
-          onTaskContextMenu={board.openContextMenu}
-          hasMore={Boolean(board.tasksQuery.hasNextPage)}
-          onLoadMore={board.handleLoadMore}
-          onDragStart={board.dragSession.onDragStart}
-          onDragUpdate={board.dragSession.onDragUpdate}
-          onDragEnd={(result) => void board.dragSession.onDragEnd(result)}
-        />
-      ) : null}
-
-      {board.contextMenu ? (
-        <div
-          className="fixed z-50 min-w-40 overflow-hidden rounded-lg border bg-popover p-1 text-popover-foreground shadow-float"
-          style={{ left: board.contextMenu.x, top: board.contextMenu.y }}
-          onClick={(event) => event.stopPropagation()}
-        >
-          <button
-            type="button"
-            className="flex w-full cursor-pointer items-center rounded-md px-2.5 py-1.5 text-sm hover:bg-accent"
-            onClick={() => {
-              board.transitionTaskFromMenu(board.contextMenu!.task, 'cancelled')
-              board.setContextMenu(undefined)
-            }}
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            className="flex w-full cursor-pointer items-center rounded-md px-2.5 py-1.5 text-sm hover:bg-accent"
-            onClick={() => {
-              board.setAgentPickerTaskId(board.contextMenu!.task.id)
-              board.setContextMenu(undefined)
-            }}
-          >
-            Assign Agent
-          </button>
-          <button
-            type="button"
-            className="flex w-full cursor-pointer items-center rounded-md px-2.5 py-1.5 text-sm hover:bg-accent"
-            onClick={() => {
-              board.openTaskDetail(board.contextMenu!.task.id)
-              board.setContextMenu(undefined)
-            }}
-          >
-            View Detail
-          </button>
-        </div>
-      ) : null}
-
-      <Suspense fallback={null}>
-        {board.createDialogOpen ? (
-          <TaskCreateDialog
-            open
-            projectId={projectId}
-            onCreated={(task) => board.openTaskDetail(task.id)}
-            onOpenChange={board.setCreateDialogOpen}
-          />
-        ) : null}
-        {board.selectedTaskId ? (
-          <TaskDetailModal taskId={board.selectedTaskId} open onClose={board.closeTaskDetail} />
-        ) : null}
-      </Suspense>
-    </div>
+      {tasksQuery.isError ? <ErrorBanner error={tasksQuery.error} fallback="Task board failed to load" onRetry={() => void tasksQuery.refetch()} /> : null}
+      {tasksQuery.isLoading ? <p className="text-sm text-muted-foreground">Loading board…</p> : null}
+      <section className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-x-auto pb-2 sm:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-8">
+        {lanes.filter((state) => includeCancelled || state !== 'cancelled').map((state) => {
+          const laneTasks = tasks.filter((task) => task.lifecycle.state === state)
+          return (
+            <div key={state} className="flex min-h-40 min-w-[220px] flex-col rounded-lg border bg-muted/15">
+              <div className="flex items-center justify-between border-b px-3 py-2">
+                <h2 className="text-sm font-semibold capitalize">{state.replaceAll('_', ' ')}</h2>
+                <span className="rounded-full bg-muted px-2 py-0.5 text-xs">{laneTasks.length}</span>
+              </div>
+              <div className="flex flex-1 flex-col gap-2 overflow-y-auto p-2">
+                {laneTasks.map((task) => (
+                  <article key={task.id} className="space-y-3 rounded-md border bg-card p-3 shadow-sm">
+                    <button type="button" className="block w-full text-left" onClick={() => void navigate({ to: '/tasks/$taskId', params: { taskId: task.id } })}>
+                      <strong className="block text-sm">{task.title}</strong>
+                      <span className="mt-1 block text-xs text-muted-foreground">{task.task_type} · priority {task.priority}</span>
+                    </button>
+                    <div className="flex flex-wrap gap-1">
+                      {(nextStates[state] ?? []).map((next) => (
+                        <Button key={next} size="sm" variant="outline" className="h-7 px-2 text-xs" disabled={transition.isPending} onClick={() => void move(task, next)}>
+                          {next.replaceAll('_', ' ')}
+                        </Button>
+                      ))}
+                    </div>
+                  </article>
+                ))}
+                {laneTasks.length === 0 ? <p className="p-2 text-xs text-muted-foreground">No tasks</p> : null}
+              </div>
+            </div>
+          )
+        })}
+      </section>
+      {tasksQuery.hasNextPage ? <div className="flex justify-center"><Button variant="outline" disabled={tasksQuery.isFetchingNextPage} onClick={() => void tasksQuery.fetchNextPage()}>{tasksQuery.isFetchingNextPage ? 'Loading…' : 'Load more'}</Button></div> : null}
+    </main>
   )
 }

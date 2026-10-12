@@ -11,10 +11,26 @@ pub trait TaskRepo: Send + Sync {
         input: CreateTask,
     ) -> Result<Task>;
     async fn get_by_id(&self, id: &str, include_deleted: bool) -> Result<Option<Task>>;
+    async fn get_by_id_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        include_deleted: bool,
+    ) -> Result<Option<Task>>;
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>>;
     async fn list_by_executing_agent(&self, query: AgentTaskListQuery) -> Result<Page<Task>>;
     async fn list_subtasks_ordered(&self, parent_task_id: &str) -> Result<Vec<Task>>;
     async fn next_subtask_order(&self, parent_task_id: &str) -> Result<i64>;
+    async fn next_subtask_order_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        parent_task_id: &str,
+    ) -> Result<i64>;
+    async fn count_live_children_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+    ) -> Result<i64>;
     async fn reorder_subtasks(
         &self,
         parent_task_id: &str,
@@ -22,8 +38,18 @@ pub trait TaskRepo: Send + Sync {
         updated_at: &str,
     ) -> Result<()>;
     async fn update(&self, input: UpdateTask) -> Result<Task>;
+    async fn update_parent_structure_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: UpdateTask,
+        subtask_order: Option<i64>,
+    ) -> Result<Task>;
     async fn archive(&self, input: ArchiveTask) -> Result<Task>;
-    async fn soft_delete(&self, input: SoftDeleteTask) -> Result<Task>;
+    async fn soft_delete_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: SoftDeleteTask,
+    ) -> Result<Task>;
     async fn set_review_passed_at(
         &self,
         id: &str,
@@ -32,6 +58,13 @@ pub trait TaskRepo: Send + Sync {
     ) -> Result<Task>;
     async fn set_metadata_json(
         &self,
+        id: &str,
+        metadata_json: Option<String>,
+        updated_at: &str,
+    ) -> Result<()>;
+    async fn set_metadata_json_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
         id: &str,
         metadata_json: Option<String>,
         updated_at: &str,
@@ -54,6 +87,16 @@ pub trait TaskRepo: Send + Sync {
 #[async_trait]
 pub trait TaskLifecycleRepo: Send + Sync {
     async fn get_task_lifecycle(&self, task_id: &str) -> Result<Option<TaskLifecycle>>;
+    async fn get_task_lifecycle_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+    ) -> Result<Option<TaskLifecycle>>;
+    async fn list_task_lifecycle_transitions(
+        &self,
+        task_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TaskLifecycleTransitionFact>>;
     async fn get_task_lifecycle_transition_fact(
         &self,
         transition_id: &str,
@@ -165,6 +208,11 @@ pub trait AgentRepo: Send + Sync {
     ) -> Result<Agent>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Agent>>;
     async fn list(&self, query: AgentListQuery) -> Result<Page<Agent>>;
+    async fn list_visible_to_user(
+        &self,
+        user_id: &str,
+        query: AgentListQuery,
+    ) -> Result<Page<Agent>>;
     async fn update(&self, input: UpdateAgent) -> Result<Agent>;
     async fn set_paused(&self, id: &str, paused: bool) -> Result<()>;
     async fn duplicate_agent(
@@ -175,7 +223,7 @@ pub trait AgentRepo: Send + Sync {
         now: String,
     ) -> Result<Agent>;
     async fn archive(&self, id: &str, archived_at: &str) -> Result<()>;
-    async fn count_active_tasks(&self, agent_id: &str) -> Result<i64>;
+    async fn count_running_executions(&self, agent_id: &str) -> Result<i64>;
 }
 
 #[async_trait]
@@ -1654,6 +1702,8 @@ pub trait ProjectRepo: Send + Sync {
     async fn create(&self, input: CreateProject) -> Result<Project>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Project>>;
     async fn list(&self, page: PageRequest) -> Result<Page<Project>>;
+    async fn list_visible_to_user(&self, user_id: &str, page: PageRequest)
+        -> Result<Page<Project>>;
     async fn update(&self, input: UpdateProject) -> Result<Project>;
     async fn update_at_version(
         &self,
@@ -1771,10 +1821,27 @@ pub trait SkillRepo: Send + Sync {
 pub trait NotificationRepo: Send + Sync {
     async fn create(&self, input: CreateNotification) -> Result<Notification>;
     async fn list(&self, query: NotificationListQuery) -> Result<Page<Notification>>;
+    async fn list_visible_to_user(
+        &self,
+        user_id: &str,
+        query: NotificationListQuery,
+    ) -> Result<Page<Notification>>;
     async fn unread_count(&self, project_id: Option<&str>) -> Result<i64>;
+    async fn unread_count_visible_to_user(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<i64>;
     async fn mark_read(&self, id: &str) -> Result<Notification>;
+    async fn mark_read_for_user(&self, id: &str, user_id: &str) -> Result<Notification>;
     async fn mark_all_read(&self, project_id: Option<&str>) -> Result<u64>;
+    async fn mark_all_read_visible_to_user(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<u64>;
     async fn delete(&self, id: &str) -> Result<()>;
+    async fn delete_for_user(&self, id: &str, user_id: &str) -> Result<()>;
 }
 
 #[async_trait]
@@ -1790,6 +1857,8 @@ pub trait TaskDependencyRepo: Send + Sync {
 pub struct TaskListQuery {
     pub project_id: String,
     pub q: Option<String>,
+    pub lifecycle_states: Vec<TaskLifecycleState>,
+    /// Internal transition-era query support. Public Task listing uses `lifecycle_states`.
     pub statuses: Vec<String>,
     pub agent_ids: Vec<String>,
     pub assignee_types: Vec<String>,
@@ -1815,6 +1884,9 @@ pub struct AgentListQuery {
     pub status: Option<AgentStatus>,
     pub executor_type: Option<String>,
     pub capabilities: Vec<String>,
+    /// Exclude historical native/embedded identities from current Harness
+    /// Agent rosters without deleting their durable records.
+    pub harness_only: bool,
     pub page: PageRequest,
 }
 

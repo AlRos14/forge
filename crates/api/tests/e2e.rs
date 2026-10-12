@@ -7,8 +7,9 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentAvailabilityResponse, AgentResponse, ErrorResponse, MoveTaskResponse, PaginatedResponse,
-    ProjectResponse, RepoResponse, TaskDependency, TaskResponse, TasksResponse,
+    AgentAvailabilityResponse, AgentResponse, ErrorResponse, ExecutionResponse, PaginatedResponse,
+    ProjectResponse, RepoResponse, TaskDependency, TaskLifecycleState,
+    TaskLifecycleTransitionResponse, TaskResponse, TasksResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -20,7 +21,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 #[tokio::test]
-async fn forge_mvp_rest_api_flow() {
+async fn project_task_lifecycle_flow_uses_exact_transition_identity() {
     let app = test_app().await;
 
     let project: ProjectResponse = json_request(
@@ -36,7 +37,7 @@ async fn forge_mvp_rest_api_flow() {
     let repo_dir = TestDir::new("forge-e2e-repo");
     let repo_path = setup_git_repo(repo_dir.path());
     let default_branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"]);
-    let repo: RepoResponse = json_request(
+    let _: RepoResponse = json_request(
         &app,
         Method::POST,
         &format!("/api/v1/projects/{project_id}/repos"),
@@ -49,32 +50,21 @@ async fn forge_mvp_rest_api_flow() {
         StatusCode::OK,
     )
     .await;
-    let _repo_id = repo.id;
 
-    let daemon_id = existing_daemon_id(&app).await;
-    let agent: AgentResponse = json_request(
-        &app,
-        Method::POST,
-        "/api/v1/agents",
-        json!({ "name": "shell-agent", "executor_type": "shell", "daemon_id": daemon_id }),
-        StatusCode::OK,
-    )
-    .await;
-    let agent_id = agent.id;
-
-    let created_task: TaskResponse = json_request(
+    let created: TaskResponse = json_request(
         &app,
         Method::POST,
         &format!("/api/v1/projects/{project_id}/tasks"),
-        // The shell executor uses the task description as the command. Keep it
-        // running long enough for the cancellation request to be deterministic.
-        json!({ "title": "E2E test task", "description": "sleep 5" }),
+        json!({ "title": "E2E task", "description": "ordinary task" }),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(created_task.status, "todo".to_owned());
-    assert_eq!(created_task.version, 1);
-    let task_id = created_task.id;
+    assert_eq!(created.lifecycle.state, TaskLifecycleState::Ready);
+    assert_eq!(created.lifecycle.version, 1);
+    assert!(serde_json::to_value(&created)
+        .expect("Task response serializes")
+        .get("status")
+        .is_none());
 
     let tasks: PaginatedResponse<TaskResponse> = empty_request(
         &app,
@@ -83,42 +73,57 @@ async fn forge_mvp_rest_api_flow() {
         StatusCode::OK,
     )
     .await;
-    assert!(tasks.items.iter().any(|task| task.id == task_id));
+    assert!(tasks.items.iter().any(|task| task.id == created.id));
 
-    let claimed_task: TaskResponse = json_request(
+    let active: TaskLifecycleTransitionResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/claim"),
-        json!({ "agent_id": agent_id, "overrides": null }),
+        &format!("/api/v1/tasks/{}/lifecycle", created.id),
+        json!({
+            "to_state": "active",
+            "expected_lifecycle_version": created.lifecycle.version,
+            "idempotency_key": "e2e-start-task",
+            "reason_kind": "user_request",
+            "reason_ref": "e2e-start",
+        }),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(claimed_task.status, "in_progress".to_owned());
-    assert_eq!(claimed_task.version, 2);
+    assert_eq!(active.lifecycle.state, TaskLifecycleState::Active);
+    assert!(active.transition_id.is_some());
 
-    let cancelled_task: TaskResponse = empty_request(
+    let cancelled: TaskLifecycleTransitionResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/cancel"),
+        &format!("/api/v1/tasks/{}/lifecycle", created.id),
+        json!({
+            "to_state": "cancelled",
+            "expected_lifecycle_version": active.lifecycle.version,
+            "idempotency_key": "e2e-cancel-task",
+            "reason_kind": "user_request",
+            "reason_ref": "e2e-cancel",
+        }),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(cancelled_task.status, "cancelled".to_owned());
-    assert_eq!(cancelled_task.version, 3);
+    assert_eq!(cancelled.lifecycle.state, TaskLifecycleState::Cancelled);
 
-    let terminal_error = raw_json_request(
+    let legacy_transition = raw_json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/transition"),
-        json!({ "status": "in_progress", "version": cancelled_task.version }),
+        &format!("/api/v1/tasks/{}/transition", created.id),
+        json!({ "status": "active", "version": created.version }),
     )
     .await;
-    assert_eq!(terminal_error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(legacy_transition.status(), StatusCode::NOT_FOUND);
 
-    let delete_response =
-        raw_empty_request(&app, Method::DELETE, &format!("/api/v1/tasks/{task_id}")).await;
+    let delete_response = raw_empty_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/tasks/{}", created.id),
+    )
+    .await;
     assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
-
     let tasks_after_delete: PaginatedResponse<TaskResponse> = empty_request(
         &app,
         Method::GET,
@@ -129,36 +134,42 @@ async fn forge_mvp_rest_api_flow() {
     assert!(!tasks_after_delete
         .items
         .iter()
-        .any(|task| task.id == task_id));
+        .any(|task| task.id == created.id));
 
-    let second_task: TaskResponse = json_request(
+    let second: TaskResponse = json_request(
         &app,
         Method::POST,
         &format!("/api/v1/projects/{project_id}/tasks"),
-        json!({ "title": "E2E cancellable task" }),
+        json!({ "title": "Idempotent cancellation" }),
         StatusCode::OK,
     )
     .await;
-    let second_task_id = second_task.id;
-
-    let cancelled_task: TaskResponse = empty_request(
+    let cancel_request = json!({
+        "to_state": "cancelled",
+        "expected_lifecycle_version": second.lifecycle.version,
+        "idempotency_key": "e2e-idempotent-cancel",
+        "reason_kind": "user_request",
+        "reason_ref": "e2e-idempotent-cancel",
+    });
+    let cancelled: TaskLifecycleTransitionResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{second_task_id}/cancel"),
+        &format!("/api/v1/tasks/{}/lifecycle", second.id),
+        cancel_request.clone(),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(cancelled_task.status, "cancelled".to_owned());
-
-    let cancelled_again: TaskResponse = empty_request(
+    let replay: TaskLifecycleTransitionResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{second_task_id}/cancel"),
+        &format!("/api/v1/tasks/{}/lifecycle", second.id),
+        cancel_request,
         StatusCode::OK,
     )
     .await;
-    assert_eq!(cancelled_again.status, "cancelled".to_owned());
-    assert_eq!(cancelled_again.version, cancelled_task.version);
+    assert!(replay.replayed);
+    assert_eq!(replay.transition_id, cancelled.transition_id);
+    assert_eq!(replay.lifecycle.state, TaskLifecycleState::Cancelled);
 }
 
 #[tokio::test]
@@ -234,183 +245,6 @@ async fn remove_dependency_succeeds() {
     )
     .await;
     assert!(dependencies.is_empty());
-}
-
-#[tokio::test]
-async fn move_task_endpoint_updates_board_order_replays_and_reports_conflicts() {
-    let app = test_app().await;
-    let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
-    let first: TaskResponse = json_request(
-        &app,
-        Method::POST,
-        &format!("/api/v1/projects/{project_id}/tasks"),
-        json!({ "title": "First" }),
-        StatusCode::OK,
-    )
-    .await;
-    let second: TaskResponse = json_request(
-        &app,
-        Method::POST,
-        &format!("/api/v1/projects/{project_id}/tasks"),
-        json!({ "title": "Second" }),
-        StatusCode::OK,
-    )
-    .await;
-    let third: TaskResponse = json_request(
-        &app,
-        Method::POST,
-        &format!("/api/v1/projects/{project_id}/tasks"),
-        json!({ "title": "Third" }),
-        StatusCode::OK,
-    )
-    .await;
-    let _: Value = json_request(
-        &app,
-        Method::PUT,
-        &format!("/api/v1/tasks/{}/roles/coder", third.id),
-        json!({ "assignee_type": "user", "assignee_id": "test-user-id" }),
-        StatusCode::OK,
-    )
-    .await;
-
-    let initial_page: TasksResponse = empty_request(
-        &app,
-        Method::GET,
-        &format!("/api/v1/projects/{project_id}/tasks"),
-        StatusCode::OK,
-    )
-    .await;
-    let operation_id = uuid::Uuid::new_v4().to_string();
-    let move_body = json!({
-        "operation_id": operation_id,
-        "task_version": third.version,
-        "board_revision": initial_page.board_revision,
-        "target_status": third.status,
-        "before_id": first.id,
-        "after_id": second.id,
-    });
-    let response: MoveTaskResponse = json_request(
-        &app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/move", third.id),
-        move_body.clone(),
-        StatusCode::OK,
-    )
-    .await;
-
-    assert_eq!(response.task.id, third.id);
-    assert_eq!(response.operation_id, operation_id);
-    assert!(response.board_revision > initial_page.board_revision);
-    assert!((response.task.board_position - 1.5).abs() < 1e-9);
-    assert!(response.task.role_assignments.iter().any(|assignment| {
-        assignment.role_name == "coder" && assignment.assignee_id.as_deref() == Some("test-user-id")
-    }));
-    let replay: MoveTaskResponse = json_request(
-        &app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/move", third.id),
-        move_body,
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(replay.task.version, response.task.version);
-    assert_eq!(replay.board_revision, response.board_revision);
-
-    let operation_conflict = raw_json_request(
-        &app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/move", third.id),
-        json!({
-            "operation_id": operation_id,
-            "task_version": third.version,
-            "board_revision": initial_page.board_revision,
-            "target_status": third.status,
-            "before_id": second.id,
-            "after_id": null,
-        }),
-    )
-    .await;
-    let operation_error: ErrorResponse =
-        parse_response(operation_conflict, StatusCode::CONFLICT).await;
-    assert_eq!(operation_error.code, "operation_conflict");
-    assert_eq!(
-        operation_error.details,
-        Some(json!({ "operation_id": operation_id }))
-    );
-
-    let version_conflict = raw_json_request(
-        &app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/move", third.id),
-        json!({
-            "operation_id": uuid::Uuid::new_v4().to_string(),
-            "task_version": third.version,
-            "board_revision": response.board_revision,
-            "target_status": third.status,
-            "before_id": first.id,
-            "after_id": second.id,
-        }),
-    )
-    .await;
-    let version_error: ErrorResponse = parse_response(version_conflict, StatusCode::CONFLICT).await;
-    assert_eq!(version_error.code, "version_conflict");
-    assert_eq!(
-        version_error.details,
-        Some(json!({
-            "expected_task_version": third.version,
-            "actual_task_version": response.task.version,
-        }))
-    );
-
-    let board_conflict = raw_json_request(
-        &app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/move", third.id),
-        json!({
-            "operation_id": uuid::Uuid::new_v4().to_string(),
-            "task_version": response.task.version,
-            "board_revision": initial_page.board_revision,
-            "target_status": third.status,
-            "before_id": first.id,
-            "after_id": second.id,
-        }),
-    )
-    .await;
-    let board_error: ErrorResponse = parse_response(board_conflict, StatusCode::CONFLICT).await;
-    assert_eq!(board_error.code, "board_revision_conflict");
-    assert_eq!(
-        board_error.details,
-        Some(json!({
-            "expected_board_revision": initial_page.board_revision,
-            "actual_board_revision": response.board_revision,
-        }))
-    );
-
-    let tasks: TasksResponse = empty_request(
-        &app,
-        Method::GET,
-        &format!("/api/v1/projects/{project_id}/tasks"),
-        StatusCode::OK,
-    )
-    .await;
-    let ids = tasks
-        .items
-        .iter()
-        .map(|task| task.id.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        ids,
-        vec![first.id.as_str(), third.id.as_str(), second.id.as_str()]
-    );
-
-    let removed_endpoint = raw_json_request(
-        &app,
-        Method::PUT,
-        &format!("/api/v1/tasks/{}/position", third.id),
-        json!({ "before_id": first.id, "after_id": second.id }),
-    )
-    .await;
-    assert_eq!(removed_endpoint.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -492,7 +326,7 @@ async fn list_dependencies_returns_task_dependencies() {
 }
 
 #[tokio::test]
-async fn claim_blocked_by_dependency_gate_returns_conflict() {
+async fn execution_start_blocked_by_dependency_gate_returns_conflict() {
     let app = test_app().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let daemon_id = existing_daemon_id(&app).await;
@@ -506,28 +340,61 @@ async fn claim_blocked_by_dependency_gate_returns_conflict() {
     .await;
     let (task_id, depends_on_id) = create_task_pair(&app, &project_id).await;
 
-    let response = raw_json_request(
+    let dependency = raw_json_request(
         &app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/dependencies"),
         json!({ "depends_on_id": depends_on_id }),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = raw_json_request(
+    assert_eq!(dependency.status(), StatusCode::CREATED);
+    let dependencies: Vec<TaskDependency> = empty_request(
         &app,
-        Method::POST,
-        &format!("/api/v1/tasks/{task_id}/claim"),
-        json!({ "agent_id": agent.id, "overrides": null }),
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}/dependencies"),
+        StatusCode::OK,
     )
     .await;
-    let error: ErrorResponse = parse_response(response, StatusCode::CONFLICT).await;
-    assert_eq!(error.code, "dependency_gate");
+    assert_eq!(dependencies.len(), 1);
+    assert_eq!(dependencies[0].task_id, task_id);
+    assert_eq!(dependencies[0].depends_on_id, depends_on_id);
+
+    let _: Value = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/task-roles"),
+        json!({ "role": "implementer", "coordination_mode": "independent", "policy": {} }),
+        StatusCode::OK,
+    )
+    .await;
+    let _: Value = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/task-roles/implementer/members"),
+        json!({ "actor_ref": { "kind": "agent", "id": agent.id } }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let response: ErrorResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/executions"),
+        json!({
+            "agent_id": agent.id,
+            "role": "implementer",
+            "purpose": "implement",
+            "prompt": "echo blocked by dependency",
+            "input_artifact_ids": []
+        }),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(response.code, "dependency_gate");
 }
 
 #[tokio::test]
-async fn agent_claim_succeeds() {
+async fn agent_execution_records_exact_actor_role_and_purpose() {
     let app = test_app().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let daemon_id = existing_daemon_id(&app).await;
@@ -548,23 +415,47 @@ async fn agent_claim_succeeds() {
     )
     .await;
 
-    let claimed: TaskResponse = json_request(
+    let _: Value = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/claim", task.id),
-        json!({ "agent_id": agent.id.clone(), "overrides": null }),
+        &format!("/api/v1/tasks/{}/task-roles", task.id),
+        json!({ "role": "implementer", "coordination_mode": "independent", "policy": {} }),
+        StatusCode::OK,
+    )
+    .await;
+    let _: Value = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/task-roles/implementer/members", task.id),
+        json!({ "actor_ref": { "kind": "agent", "id": agent.id } }),
         StatusCode::OK,
     )
     .await;
 
-    assert_eq!(claimed.status, "in_progress".to_owned());
-    assert_eq!(claimed.assignee_type.as_deref(), Some("agent"));
-    assert!(claimed.role_assignments.iter().any(|assignment| {
-        assignment.role_name == "coder"
-            && assignment.assignee_type.as_deref() == Some("agent")
-            && assignment.assignee_id.as_deref() == Some(agent.id.as_str())
-    }));
-    assert_eq!(claimed.assignee_id.as_deref(), Some(agent.id.as_str()));
+    let execution: ExecutionResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/executions", task.id),
+        json!({
+            "agent_id": agent.id,
+            "role": "implementer",
+            "purpose": "implement",
+            "prompt": "echo agent execution",
+            "input_artifact_ids": []
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(execution.task_id, task.id);
+    assert_eq!(
+        execution.actor_ref,
+        Some(api_types::ActorRef::Agent(agent.id))
+    );
+    assert_eq!(execution.role, "implementer");
+    assert_eq!(
+        execution.purpose,
+        Some(api_types::ExecutionPurpose::Implement)
+    );
 }
 
 #[tokio::test]
@@ -956,6 +847,7 @@ where
     T: DeserializeOwned,
 {
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read response body");
@@ -965,5 +857,10 @@ where
         "unexpected response status with body: {}",
         String::from_utf8_lossy(&bytes)
     );
-    serde_json::from_slice(&bytes).expect("parse JSON response")
+    serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "parse JSON response (status {status}, headers {headers:?}, body {:?}): {error}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })
 }

@@ -1100,7 +1100,7 @@ impl ProviderAuthorizationService {
                     return Err(ServiceError::invalid_operation(
                         "this provider's OAuth client only accepts a localhost callback, so \
                          browser login needs Forge on the same machine as the browser; use the \
-                         device-code method or `forge-ctl embedded provider login`",
+                         device-code method or `forge-ctl provider login`",
                     ));
                 }
                 let (listener, port) = bind_loopback_callback().await?;
@@ -1353,17 +1353,7 @@ fn runtime_matrix(
     provider: AgentProviderId,
     method: ProviderCredentialMethod,
 ) -> Vec<ProviderRuntimeCapability> {
-    let mut runtimes = vec![ProviderRuntimeCapability {
-        runtime: "direct".to_owned(),
-        support_level: if method == ProviderCredentialMethod::ApiKey
-            || provider == AgentProviderId::Gemini
-        {
-            ProviderSupportLevel::Stable
-        } else {
-            ProviderSupportLevel::Experimental
-        },
-        reason: None,
-    }];
+    let mut runtimes = Vec::new();
     match (provider, method) {
         (AgentProviderId::OpenAi, ProviderCredentialMethod::ApiKey) => {
             runtimes.push(ProviderRuntimeCapability {

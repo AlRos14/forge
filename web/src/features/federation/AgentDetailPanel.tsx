@@ -3,9 +3,7 @@ import { useState } from 'react'
 import { AccountUsageDetails } from '@/components/account-usage'
 import { Button } from '@/components/ui/button'
 import { CollapsibleSection } from '@/components/ui/collapsible-section'
-import type { AgentChatEntry } from '@/features/agent-chat/types'
-import { useAgentProfilesQuery, useAgentUsageQuery, useRefreshAgentUsageMutation, useSelectAgentProfileMutation, isVersionConflict } from '@/features/federation/hooks'
-import { toastApiError } from '@/lib/api-error'
+import { useAgentProfilesQuery, useAgentUsageQuery, useSelectAgentProfileMutation, isVersionConflict } from '@/features/federation/hooks'
 import type { FederatedAgent } from '@/features/federation/types'
 import type { ProviderEntryResponse } from '@/types/generated'
 import { StateBadge, StatusDot } from '@/features/federation/components'
@@ -14,17 +12,14 @@ import { allowedPolicyValues, humanize, runtimeDisplayNames } from './format'
 export function AgentDetailPanel({
   agent,
   entries,
-  chatEntries,
   onChangeModel,
 }: {
   agent: FederatedAgent
   entries: ProviderEntryResponse[]
-  chatEntries: AgentChatEntry[]
   onChangeModel: (agent: FederatedAgent) => void
 }) {
   const profilesQuery = useAgentProfilesQuery(agent.id)
   const usageQuery = useAgentUsageQuery(agent.id)
-  const refreshUsage = useRefreshAgentUsageMutation(agent.id)
   const selectProfile = useSelectAgentProfileMutation(agent.id)
   const [profileError, setProfileError] = useState<string | null>(null)
   const profiles = profilesQuery.data ?? []
@@ -35,11 +30,7 @@ export function AgentDetailPanel({
   const connectionStatus = requiresRecovery
     ? 'recovery_required'
     : (agent.effective_status ?? agent.status)
-  const runtime = agent.executor_type === 'embedded' ? 'direct' : agent.executor_type
-
-  const boundChips = chatEntries
-    .filter((entry) => entry.identity_id === agent.id)
-    .map((entry) => (entry.kind === 'main' ? 'Main Agent' : (entry.project_name ?? 'Project Agent')))
+  const runtime = agent.executor_type
 
   async function selectProfileVersion(profileId: string) {
     setProfileError(null)
@@ -71,18 +62,6 @@ export function AgentDetailPanel({
             {runtimeDisplayNames[runtime] ?? humanize(runtime)}
             {selectedEntry ? ` · ${selectedEntry.label}` : ''}
           </p>
-          {boundChips.length > 0 ? (
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {boundChips.map((chip) => (
-                <span
-                  key={chip}
-                  className="rounded-full border border-ember-border bg-ember-surface px-2 py-0.5 font-mono text-micro font-semibold uppercase tracking-[0.6px] text-primary"
-                >
-                  {chip}
-                </span>
-              ))}
-            </div>
-          ) : null}
         </div>
       </header>
 
@@ -116,9 +95,7 @@ export function AgentDetailPanel({
             <div>
               <h3 id="agent-usage-heading" className="text-sm font-semibold">Account usage</h3>
               <p className="mt-1 text-xs text-muted-foreground">
-                {usageQuery.data?.manual_refresh_supported === false
-                  ? 'Manual refresh is unavailable for this Agent; usage updates come from its owning runtime observation path.'
-                  : usageQuery.data?.shared_account
+                {usageQuery.data?.shared_account
                   ? 'Shared by agents using the same explicit credential context.'
                   : usageQuery.data?.daemon_id
                     ? `Observed on daemon ${usageQuery.data.daemon_id}.`
@@ -127,18 +104,6 @@ export function AgentDetailPanel({
                       : 'No shared daemon account is assumed for this Agent.'}
               </p>
             </div>
-            {usageQuery.data?.manual_refresh_supported ? (
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={refreshUsage.isPending}
-                onClick={() => refreshUsage.mutate(undefined, {
-                  onError: (error) => toastApiError(error, 'Account usage refresh failed'),
-                })}
-              >
-                {refreshUsage.isPending ? 'Refreshing…' : 'Refresh'}
-              </Button>
-            ) : null}
           </div>
           {usageQuery.isLoading ? <p className="mt-3 text-xs text-muted-foreground">Checking usage…</p> : null}
           {usageQuery.data?.available && usageQuery.data.usage ? (
@@ -238,7 +203,7 @@ export function AgentDetailPanel({
               role="status"
             >
               This agent&apos;s provider entry is disconnected. Publish a profile on another entry
-              before relying on its Main or Project binding.
+              before using it in a Task Role membership.
             </p>
           ) : null}
           <div className="mt-4 border-t border-border-subtle pt-3">
@@ -256,7 +221,7 @@ export function AgentDetailPanel({
             </div>
             <p className="mt-2 text-micro leading-5 text-muted-foreground">
               This is a ceiling, not a grant. Effective permissions are recomputed for each account,
-              Main Agent Chat, Project Agent Chat, or Task scope.
+              an explicit Task Execution.
             </p>
           </div>
         </CollapsibleSection>

@@ -4,20 +4,23 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use db::{now_rfc3339, CreateTaskExternalLink, ExternalLinkRepo, IntegrationRepo, TaskRepo};
+use db::{now_rfc3339, CreateTaskExternalLink, ExternalLinkRepo, IntegrationRepo};
 
 use crate::{
     errors::{ApiError, ApiResult},
+    routes::{
+        auth::AuthenticatedUser,
+        tasks::{require_task_mutable, require_task_visible},
+    },
     state::AppState,
 };
 
 pub async fn list_external_links(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<Vec<ExternalLinkResponse>>> {
-    TaskRepo::get_by_id(&*state.db, &id, false)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task", id.clone()))?;
+    require_task_visible(&state, &id, &user).await?;
 
     let links = ExternalLinkRepo::list_by_task_id(&*state.db, &id).await?;
     Ok(Json(
@@ -28,11 +31,10 @@ pub async fn list_external_links(
 pub async fn create_external_link(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
     Json(request): Json<CreateExternalLinkRequest>,
 ) -> ApiResult<(StatusCode, Json<ExternalLinkResponse>)> {
-    let task = TaskRepo::get_by_id(&*state.db, &id, false)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task", id.clone()))?;
+    let task = require_task_mutable(&state, &id, &user).await?;
     let integration = IntegrationRepo::get_by_project_id(&*state.db, &task.project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project has no integration", task.project_id))?;
@@ -79,7 +81,9 @@ pub async fn create_external_link(
 pub async fn delete_external_link(
     State(state): State<AppState>,
     Path((id, link_id)): Path<(String, String)>,
+    user: AuthenticatedUser,
 ) -> ApiResult<StatusCode> {
+    require_task_mutable(&state, &id, &user).await?;
     let link = ExternalLinkRepo::get_by_id(&*state.db, &link_id)
         .await?
         .ok_or_else(|| ApiError::not_found("external link", link_id.clone()))?;

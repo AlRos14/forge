@@ -136,6 +136,7 @@ pub async fn mcp_user_bridge(mut req: Request, next: Next) -> Response {
         {
             req.extensions_mut().insert(mcp_server::McpUser {
                 user_id: auth_user.user_id,
+                is_admin: auth_user.is_admin,
             });
         }
     }
@@ -169,8 +170,9 @@ pub async fn mcp_auth_middleware(
     };
 
     match result {
-        Ok((user_id, _email, _is_admin)) => {
-            req.extensions_mut().insert(mcp_server::McpUser { user_id });
+        Ok((user_id, _email, is_admin)) => {
+            req.extensions_mut()
+                .insert(mcp_server::McpUser { user_id, is_admin });
             next.run(req).await
         }
         Err(_) => unauthorized_response_with_challenge(

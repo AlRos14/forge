@@ -50,24 +50,10 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
-        let (repo_id, subtask_order) = if let Some(parent_id) = parent_task_id.as_deref() {
-            validate_required("parent_task_id", parent_id)?;
-            let parent = TaskRepo::get_by_id(&*self.db, parent_id, false)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("task", parent_id.to_owned()))?;
-            if parent.parent_task_id.is_some() {
-                return Err(ServiceError::nested_subtask_unsupported());
-            }
-            (
-                parent.repo_id,
-                Some(TaskRepo::next_subtask_order(&*self.db, parent_id).await?),
-            )
-        } else {
-            (project.primary_repo_id.clone(), None)
-        };
-
         let is_subtask = parent_task_id.is_some();
-        let is_root = !is_subtask;
+        if let Some(parent_id) = parent_task_id.as_deref() {
+            validate_required("parent_task_id", parent_id)?;
+        }
         let effective_task_type = task_type.unwrap_or_else(|| "implementation".to_owned());
         if !matches!(
             effective_task_type.as_str(),
@@ -78,11 +64,6 @@ impl TaskService {
             ));
         }
         let now = now_rfc3339();
-        let no_repo = repo_id.is_none();
-        // New Task progress starts in the aggregate lifecycle directly. A
-        // project workflow state name must not decide whether the Task is
-        // ready, active, or blocked.
-        let initial_status = if no_repo { "backlog" } else { "todo" }.to_owned();
         let validated_assignments = if let Some(ref assignments) = role_assignments {
             let mut validated = Vec::with_capacity(assignments.len());
             for assignment in assignments {
@@ -120,28 +101,6 @@ impl TaskService {
                 }
             }
         }
-        let explicit_roles = validated_assignments
-            .as_ref()
-            .map(|assignments| {
-                assignments
-                    .iter()
-                    .filter_map(|(role_name, _, _)| db::canonical_task_role_name(role_name))
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
-        let default_assignments = if is_root {
-            let assignments = project_default_role_assignments(&project, &explicit_roles)?;
-            for (_, assignee_type, assignee_id) in &assignments {
-                if let Some(actor_ref) = actor_ref_for_assignment(assignee_type, assignee_id) {
-                    self.validate_actor_for_project(&project, &actor_ref)
-                        .await?;
-                }
-            }
-            assignments
-        } else {
-            Vec::new()
-        };
-
         let metadata_json = if is_subtask {
             let metadata = TaskMetadata {
                 ..TaskMetadata::default()
@@ -150,6 +109,34 @@ impl TaskService {
         } else {
             None
         };
+        // BEGIN IMMEDIATE takes SQLite's writer reservation before the parent
+        // and sibling reads. Competing creates/reparents therefore validate
+        // against one serial structural state.
+        let mut transaction = if is_subtask {
+            self.db.pool().begin_with("BEGIN IMMEDIATE").await?
+        } else {
+            self.db.pool().begin().await?
+        };
+        let (repo_id, subtask_order) = if let Some(parent_id) = parent_task_id.as_deref() {
+            let parent = super::subtask::validate_parent_placement_in_tx(
+                &self.db,
+                &mut transaction,
+                None,
+                &project_id,
+                parent_id,
+            )
+            .await?;
+            let order =
+                TaskRepo::next_subtask_order_in_tx(&*self.db, &mut transaction, parent_id).await?;
+            (parent.repo_id, Some(order))
+        } else {
+            (project.primary_repo_id.clone(), None)
+        };
+        let no_repo = repo_id.is_none();
+        // New Task progress starts in the aggregate lifecycle directly. A
+        // project workflow state name must not decide whether the Task is
+        // ready, active, or blocked.
+        let initial_status = if no_repo { "backlog" } else { "todo" }.to_owned();
         let create_task = CreateTask {
             id: new_uuid_v4(),
             project_id,
@@ -169,8 +156,17 @@ impl TaskService {
             created_at: now.clone(),
             updated_at: now.clone(),
         };
-        let mut transaction = self.db.pool().begin().await?;
         let mut task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
+        if is_subtask {
+            TaskRepo::set_metadata_json_in_tx(
+                &*self.db,
+                &mut transaction,
+                &task.id,
+                metadata_json.clone(),
+                &now,
+            )
+            .await?;
+        }
         if !task.is_automation {
             ProjectRepo::increment_project_work_epoch(
                 &*self.db,
@@ -182,7 +178,6 @@ impl TaskService {
         }
         transaction.commit().await?;
         if is_subtask {
-            TaskRepo::set_metadata_json(&*self.db, &task.id, metadata_json.clone(), &now).await?;
             task.metadata_json = metadata_json;
         }
 
@@ -200,9 +195,6 @@ impl TaskService {
                 .await?;
             }
         }
-
-        self.assign_project_default_roles(&task, default_assignments)
-            .await?;
 
         self.publish(ForgeEvent {
             event_type: "task.created".to_owned(),
@@ -300,70 +292,6 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task.id))
     }
-
-    async fn assign_project_default_roles(
-        &self,
-        task: &Task,
-        assignments: Vec<(String, AssigneeKind, String)>,
-    ) -> Result<()> {
-        for (role_name, assignee_type, assignee_id) in assignments {
-            let now = now_rfc3339();
-            self.assign_role_membership(CreateTaskRoleAssignment {
-                id: new_uuid_v4(),
-                task_id: task.id.clone(),
-                role_name: role_name.clone(),
-                assignee_type: Some(assignee_type),
-                assignee_id: Some(assignee_id),
-                created_at: now.clone(),
-                updated_at: now,
-            })
-            .await?;
-        }
-
-        Ok(())
-    }
-}
-
-fn project_default_role_assignments(
-    project: &db::Project,
-    covered_roles: &HashSet<String>,
-) -> Result<Vec<(String, AssigneeKind, String)>> {
-    let settings = serde_json::from_str::<ProjectSettings>(&project.settings).map_err(|error| {
-        ServiceError::invalid_operation(format!("invalid project settings: {error}"))
-    })?;
-    let mut covered_roles = covered_roles.clone();
-    let mut result = Vec::new();
-    for assignment in settings.default_role_assignments {
-        let role_name = assignment.role_name;
-        let canonical_role = db::canonical_task_role_name(&role_name).ok_or_else(|| {
-            ServiceError::invalid_operation(format!(
-                "default role assignment is not a TaskRole: {role_name}"
-            ))
-        })?;
-        if covered_roles.contains(&canonical_role) {
-            continue;
-        }
-        if !matches!(assignment.assignee_type.as_str(), "agent" | "user") {
-            return Err(ServiceError::invalid_operation(format!(
-                "default role assignment for role '{role_name}' must use assignee_type 'agent' or 'user'"
-            )));
-        }
-        let assignee_id = assignment
-            .assignee_id
-            .filter(|assignee_id| !assignee_id.trim().is_empty())
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "default role assignment for role '{role_name}' requires assignee_id"
-                ))
-            })?;
-        let assignee_type = assignment
-            .assignee_type
-            .parse::<AssigneeKind>()
-            .map_err(ServiceError::invalid_operation)?;
-        result.push((role_name.clone(), assignee_type, assignee_id));
-        covered_roles.insert(canonical_role);
-    }
-    Ok(result)
 }
 
 fn actor_ref_for_assignment(assignee_type: &AssigneeKind, assignee_id: &str) -> Option<ActorRef> {

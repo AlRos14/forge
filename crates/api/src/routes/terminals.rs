@@ -15,7 +15,7 @@ use axum::{
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use serde::Deserialize;
 
-use db::{ProjectMemberRepo, ProjectRepo, Task, TaskRepo};
+use db::{ProjectRepo, Task, TaskRepo};
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -45,7 +45,7 @@ pub async fn create_terminal_session(
     Path(id): Path<String>,
     Json(request): Json<CreateTerminalSessionRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateTerminalSessionResponse>)> {
-    require_task_terminal_access(&state, &id, &user).await?;
+    require_task_terminal_mutation_access(&state, &id, &user).await?;
     let (session, attach) = state
         .terminal_service
         .create_session(&id, &user.user_id, request.rows, request.cols)
@@ -98,7 +98,7 @@ pub async fn issue_terminal_attach_token(
     user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<api_types::TerminalAttachTokenResponse>> {
-    require_terminal_session_access(&state, &id, &user).await?;
+    require_terminal_session_mutation_access(&state, &id, &user).await?;
     Ok(Json(
         state
             .terminal_service
@@ -113,7 +113,7 @@ pub async fn resize_terminal_session(
     Path(id): Path<String>,
     Json(request): Json<ResizeTerminalSessionRequest>,
 ) -> ApiResult<Json<TerminalSessionResponse>> {
-    require_terminal_session_access(&state, &id, &user).await?;
+    require_terminal_session_mutation_access(&state, &id, &user).await?;
     Ok(Json(
         state
             .terminal_service
@@ -128,7 +128,7 @@ pub async fn terminate_terminal_session(
     Path(id): Path<String>,
     body: Option<Json<TerminateTerminalSessionRequest>>,
 ) -> ApiResult<Json<TerminalSessionResponse>> {
-    require_terminal_session_access(&state, &id, &user).await?;
+    require_terminal_session_mutation_access(&state, &id, &user).await?;
     let reason = body.and_then(|Json(body)| body.reason);
     Ok(Json(
         state
@@ -306,6 +306,16 @@ async fn require_terminal_session_access(
     Ok(session)
 }
 
+async fn require_terminal_session_mutation_access(
+    state: &AppState,
+    session_id: &str,
+    user: &AuthenticatedUser,
+) -> ApiResult<TerminalSessionResponse> {
+    let session = state.terminal_service.get_session(session_id).await?;
+    require_task_terminal_mutation_access(state, &session.task_id, user).await?;
+    Ok(session)
+}
+
 async fn require_task_terminal_access(
     state: &AppState,
     task_id: &str,
@@ -318,6 +328,17 @@ async fn require_task_terminal_access(
     Ok(task)
 }
 
+async fn require_task_terminal_mutation_access(
+    state: &AppState,
+    task_id: &str,
+    user: &AuthenticatedUser,
+) -> ApiResult<Task> {
+    let task = require_task_terminal_access(state, task_id, user).await?;
+    crate::routes::projects::require_project_mutable(state, &task.project_id, &user.user_id)
+        .await?;
+    Ok(task)
+}
+
 async fn require_project_terminal_access(
     state: &AppState,
     project_id: &str,
@@ -326,11 +347,9 @@ async fn require_project_terminal_access(
     let project = ProjectRepo::get_by_id(&*state.db, project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.is_none() {
-        return Ok(());
-    }
-    let member = ProjectMemberRepo::get_member(&*state.db, project_id, &user.user_id).await?;
-    if member.is_none() {
+    if !services::project_authority::user_can_read_project(&state.db, &project, &user.user_id)
+        .await?
+    {
         return Err(ApiError::not_found("project", project_id.to_owned()));
     }
     Ok(())

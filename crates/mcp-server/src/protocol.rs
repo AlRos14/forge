@@ -19,6 +19,7 @@ use crate::{rpc::dispatch_with_context, AppState};
 pub(crate) struct McpContext {
     pub(crate) project_id: Option<String>,
     pub(crate) user_id: Option<String>,
+    pub(crate) is_admin: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,6 +61,7 @@ fn is_notification(request: &McpRequest) -> bool {
 #[derive(Debug, Clone)]
 pub struct McpUser {
     pub user_id: String,
+    pub is_admin: bool,
 }
 
 pub async fn mcp_handler(
@@ -95,9 +97,11 @@ pub async fn mcp_handler(
 
     let notification = is_notification(&request);
     let id = request.id.unwrap_or(Value::Null);
+    let mcp_user = mcp_user.map(|user| user.0);
     let context = McpContext {
         project_id: scoped_project_id(query.project_id, &headers),
-        user_id: mcp_user.map(|u| u.user_id.clone()),
+        user_id: mcp_user.as_ref().map(|user| user.user_id.clone()),
+        is_admin: mcp_user.is_some_and(|user| user.is_admin),
     };
     let result = dispatch_with_context(&state, &context, &request.method, request.params).await;
 

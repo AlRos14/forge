@@ -86,6 +86,7 @@ async fn find_default_agent(db: &SqliteDb, executor_type: &str) -> db::Result<Op
             status: None,
             executor_type: Some(executor_type.to_owned()),
             capabilities: Vec::new(),
+            harness_only: true,
             page: PageRequest {
                 cursor: None,
                 limit: 500,

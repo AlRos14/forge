@@ -304,6 +304,7 @@ impl HeartbeatMonitor {
                     status: Some(AgentStatus::Busy),
                     executor_type: None,
                     capabilities: Vec::new(),
+                    harness_only: true,
                     page: page_request(cursor),
                 },
             )
@@ -738,6 +739,7 @@ async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result
                 TaskListQuery {
                     project_id: project.id.clone(),
                     q: None,
+                    lifecycle_states: Vec::new(),
                     statuses: vec![TaskLifecycleState::Active.legacy_projection().to_owned()],
                     agent_ids: agent_id.map(str::to_owned).into_iter().collect(),
                     assignee_types: Vec::new(),
@@ -936,6 +938,7 @@ async fn sweep_stale_recovery_annotations(
                 TaskListQuery {
                     project_id: project.id.clone(),
                     q: None,
+                    lifecycle_states: Vec::new(),
                     statuses: vec![],
                     agent_ids: Vec::new(),
                     assignee_types: Vec::new(),

@@ -6,7 +6,7 @@ pub async fn trigger_review(
     Path(task_id): Path<String>,
     Json(request): Json<api_types::StartReviewExecutionRequest>,
 ) -> ApiResult<Json<api_types::ReviewExecutionResponse>> {
-    let _task = super::require_task_visible(&state, &task_id, &user).await?;
+    let _task = super::require_task_mutable(&state, &task_id, &user).await?;
     let workspace_id = match request.workspace_id {
         Some(workspace_id) => Some(workspace_id),
         None => WorkspaceRepo::get_by_task_id(&*state.db, &task_id)
@@ -62,23 +62,4 @@ pub async fn list_reviews(
         });
     }
     Ok(Json(reviews))
-}
-
-pub async fn approve_review(
-    State(_state): State<AppState>,
-    Path(_task_id): Path<String>,
-) -> ApiResult<Json<api_types::ReviewDecisionResponse>> {
-    Err(ApiError::invalid_operation_conflict(
-        "Task-level Review approval is retired; submit a ReviewReport for an exact Human Review Execution",
-    ))
-}
-
-pub async fn reject_review(
-    State(_state): State<AppState>,
-    Path(_task_id): Path<String>,
-    Json(_request): Json<RejectReviewRequest>,
-) -> ApiResult<Json<api_types::ReviewDecisionResponse>> {
-    Err(ApiError::invalid_operation_conflict(
-        "Task-level Review rejection is retired; submit a ReviewReport for an exact Human Review Execution",
-    ))
 }

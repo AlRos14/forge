@@ -1,209 +1,146 @@
 # forge-ctl
 
-`forge-ctl` is the CLI client for the Forge REST API. The server must be
-running first. By default, `forge-ctl` uses the server from the stored CLI
-login, then falls back to the server URL persisted by the last `forge` launch
-under the Forge data directory.
+`forge-ctl` is the client for Forge's REST API. The server must be running.
+It uses an explicit `--server` URL first, then the saved CLI login, then the
+server URL recorded by the last local `forge` launch.
 
-## Global flags
+## Global options
 
 ```text
---server <URL>            Forge server URL  (default: stored login, then local server)
---output <FORMAT>         table | json      (default: table)
+--server <URL>       Forge server URL
+--output <FORMAT>    table | json (default: table)
 ```
 
-## Subcommands
+## Commands
 
-| Command | What it does |
-|---------|--------------|
-| `login`   | Authenticate the CLI and store a reusable token |
-| `logout`  | Remove stored CLI credentials |
-| `whoami`  | Show stored CLI login state |
-| `project` | Create / list / show projects |
-| `repo`    | Add / list repos under a project |
-| `memory`  | Search and retrieve project-scoped memory |
-| `task`    | Create, list, show, transition, cancel, archive tasks, preview prompts |
-| `agent`   | Register / list / show agents |
-| `embedded` | Manage provider entries, embedded agents, profiles/sessions, singular bindings/chats, and handoffs |
-| `daemon`  | Link, start, and report an external daemon |
-| `run`     | Create + claim a task and follow the SSE stream until terminal state |
-| `mcp`     | Helpers for the MCP JSON-RPC endpoint |
+| Command | Purpose |
+| --- | --- |
+| `login`, `logout`, `whoami` | Manage the CLI's user token. |
+| `project create`, `project list` | Create and list Projects. |
+| `repo create`, `repo list` | Register and list Project repositories. |
+| `task create`, `task list`, `task get`, `task role`, `task transition`, `task execute` | Manage Tasks, TaskRole membership, TaskLifecycle, and explicitly scoped Executions. |
+| `agent register`, `agent list`, `agent get`, `agent profile` | Inspect external Harness Agents and select immutable profiles. |
+| `provider` | Manage provider credentials and authorization. |
+| `daemon link`, `daemon start`, `daemon report` | Register and report an external execution daemon. |
+| `mcp install`, `mcp uninstall`, `mcp status` | Configure Forge as an MCP server in a supported client. |
 
-Use `forge-ctl <command> --help` for the full set of flags on each subcommand.
+Use `forge-ctl <command> --help` for argument details.
 
-## Common flows
+## Authentication
 
-### Authenticate the CLI
-
-`forge-ctl login` exchanges your account credentials for a CLI personal access
-token and stores it under the Forge data directory. Later commands, including
-`forge-ctl mcp install`, reuse that stored token automatically for the same
-server URL.
-
-When run in a terminal, `forge-ctl login` prompts for the password without
-displaying it. For scripts or piped input, pass `--password-stdin`; an implicit
-password prompt fails with guidance when standard input is not a terminal.
+`forge-ctl login` exchanges account credentials for a personal access token and
+stores it under the Forge data directory. In a terminal it prompts without
+echoing the password. For scripts, pass `--password-stdin`:
 
 ```bash
 printf '%s\n' "$FORGE_PASSWORD" | forge-ctl login \
-  --email you@example.com \
-  --password-stdin
-
+  --email you@example.com --password-stdin
 forge-ctl whoami
 ```
 
-Use `forge-ctl logout` to remove the local credentials file.
+Use `forge-ctl logout` to remove the local token. Commands accept `--output
+json` for scripting.
 
-### Quick scripted run
+## Project, repository, and Task workflow
 
-```bash
-forge-ctl run --project <ID> --repo <ID> --agent <ID> \
-              --title "fix login bug" \
-              --description "patch the session handler"
-# Exits 0 on done; 1 on blocked / merge_failed / cancelled.
-```
-
-This creates the task, claims it (which auto-dispatches the executor), then
-streams events until the task reaches a terminal state. Useful in CI or shell
-pipelines.
-
-### Manual task management
+Project creation is ordinary Project creation; it does not configure a Main
+Agent, Project Agent, Charter, Genesis session, or execution baseline.
 
 ```bash
 forge-ctl project create --name "My Project"
-forge-ctl repo create --project-id <ID> --name "main-repo" \
-                      --kind local --local-path /abs/path/to/repo \
-                      --default-branch main
+forge-ctl project list
 
-forge-ctl agent register --name "Claude" --executor-type shell
+forge-ctl repo create --project-id <PROJECT_ID> --name main \
+  --kind local --local-path /abs/path/to/repo --default-branch main
+forge-ctl repo list --project-id <PROJECT_ID>
 
-forge-ctl task list --project-id <ID>
-forge-ctl task show <TASK_ID>
-forge-ctl task prompt-preview <TASK_ID> --role coder
-forge-ctl task cancel <TASK_ID>
+forge-ctl task create --project-id <PROJECT_ID> --title "Fix login"
+forge-ctl task list --project-id <PROJECT_ID> --lifecycle-state active
+forge-ctl task get <TASK_ID>
+forge-ctl task role create <TASK_ID> --role implementer --coordination-mode independent
+forge-ctl task role add-member <TASK_ID> implementer --actor-kind agent --actor-id <AGENT_ID>
+forge-ctl task role list <TASK_ID>
+forge-ctl task execute <TASK_ID> --agent-id <AGENT_ID> \
+  --role implementer --purpose implement --prompt "Fix the login error"
+forge-ctl task transition <TASK_ID> blocked \
+  --expected-lifecycle-version 3 --idempotency-key <KEY> \
+  --reason-kind dependency --reason-ref issue:123
 ```
 
-`task prompt-preview` is read-only. Add `--trigger accept|reject|fail|retry`
-to preview the prompt for a transition target instead of the task's current
-state.
-
-### Linking an external daemon
-
-`forge-ctl daemon link` registers the current machine with a running Forge
-server, saves daemon credentials, reports installed CLI inventory, keeps
-sending heartbeats, and serves filesystem and execution commands over the
-daemon command stream. In the web UI: **Daemons → Link daemon** generates the
-token and prints the full command:
+Task lists filter with `--lifecycle-state` and display TaskLifecycle. A
+transition is versioned and idempotent. A transition to `ready-to-merge`
+requires the exact satisfied Gate evaluation:
 
 ```bash
-forge-ctl daemon link \
-  --token fg_... \
+forge-ctl task transition <TASK_ID> ready-to-merge \
+  --expected-lifecycle-version 4 --idempotency-key <KEY> \
+  --gate-evaluation-id <GATE_EVALUATION_ID>
+```
+
+Gate evaluation and merge admission are also available through the REST API.
+`task execute` requires the exact Agent, active TaskRole membership, purpose,
+and prompt. It never selects a current role member implicitly. Tasks with
+WorkUnits fail closed until an explicit WorkUnit-scoped Execution command is
+available. The CLI will not translate old Task status or workflow values.
+
+## Agents and provider credentials
+
+Agents are Harness-bound participants. Register an external Harness Agent and
+inspect its profiles with:
+
+```bash
+forge-ctl agent register --name "Build worker" --executor-type shell
+forge-ctl agent list
+forge-ctl agent profile list <AGENT_ID>
+forge-ctl agent profile select <AGENT_ID> <PROFILE_ID> --version <VERSION>
+```
+
+Provider credentials live under the separate `provider` command. API keys are
+read from a hidden terminal prompt or from stdin; credential values are never
+printed:
+
+```bash
+forge-ctl provider add --provider openai --label work
+forge-ctl provider login --provider openai --label chatgpt
+forge-ctl provider list
+forge-ctl provider rename <ENTRY_ID> --label team --version <VERSION>
+forge-ctl provider remove <ENTRY_ID> --version <VERSION>
+```
+
+Use `--credential-stdin` for non-interactive API key input. OAuth login supports
+browser and device flows. Provider entries do not create Agents or Harness
+sessions.
+
+## External daemon
+
+`daemon link` registers the machine and keeps the heartbeat and command stream
+open. The token establishes ownership during the first registration; the
+daemon stores its own credentials afterward. Add `--once` to register and
+report once. Later, `daemon start` uses saved daemon credentials and keeps the
+stream open; `daemon report` sends one report.
+
+```bash
+forge-ctl daemon link --token fg_... \
   --workspace-root "$HOME/.forge/workspaces"
+forge-ctl daemon start --workspace-root "$HOME/.forge/workspaces"
 ```
 
-The token is used only for initial ownership; the daemon receives and stores
-its own registration token afterward. Add `--once` for a one-shot
-registration/report that does not keep the command stream open.
-The configured workspace root is created automatically before the daemon
-registers or reports.
+The Task worktree must exist at the same absolute path on the execution host.
+Use a local daemon or mount the server workspace root at that path.
 
-After a daemon has been linked once, use `forge-ctl daemon start` to run it
-again from the saved daemon credentials without registering or claiming it
-again:
+## MCP client configuration
+
+MCP requests use the stored login token unless `--token` or `FORGE_TOKEN`
+overrides it. Forge can scope tool access to one Project:
 
 ```bash
-forge-ctl daemon start \
-  --workspace-root "$HOME/.forge/workspaces"
+forge-ctl mcp install --agent claude --project-id <PROJECT_ID>
+forge-ctl mcp install --agent codex --scope user
+forge-ctl mcp status --agent cursor --scope project
+forge-ctl mcp uninstall --agent claude --scope project
 ```
 
-`daemon start` keeps the same heartbeat and command stream open as `daemon
-link`. Use `daemon report` only for a one-shot status update; it does not keep
-the command stream open.
-Forge marks the daemon offline when that command stream disconnects, and uses
-stream heartbeats to keep the daemon's last-seen timestamp fresh while it is
-connected. When the Forge server starts, external daemons are considered
-offline until their command stream reconnects.
-
-Execution dispatch requires the task worktree path created by the server to
-exist at the same absolute path on the daemon host. Use a local daemon or mount
-the server workspace root into the daemon host/container at the same path. A
-daemon on an unrelated filesystem can browse its own `--workspace-root`, but it
-cannot run server-created task worktrees yet.
-
-### Installing MCP client config
-
-`forge-ctl mcp install` writes the Forge MCP URL into a supported MCP client
-config file. MCP requests require authentication; after `forge-ctl login`, the
-stored CLI token is used automatically. You can still pass `--token` or set
-`FORGE_TOKEN` to override the stored token:
-
-```bash
-forge-ctl mcp install --agent claude
-forge-ctl mcp install --agent codex --project-id <PROJECT_ID>
-forge-ctl mcp install --agent cursor --scope user --token fg_...
-```
-
-Supported agents are `claude`, `codex`, and `cursor`. Supported config scopes
-are `project`, `local`, and `user`; the optional `--project-id` scopes MCP tool
-calls to one Forge project.
-
-### Agent identities and Task sessions
-
-`forge-ctl embedded` retains provider entries, Agent identities, profile
-revisions, and explicit Task-scoped HarnessSessions. Main/Project bindings,
-Main/Project Chat, Genesis, vertical handoffs, and bespoke commitments are
-retired. Their historical reads may remain available during the PR12 public
-surface transition, but requests that mutate those records return the stable
-`operation_retired` error. An old binding or approved action cannot authorize a
-Task or Execution.
-
-Provider credentials are accepted only through a hidden terminal prompt or
-`--credential-stdin` and are never printed by the CLI.
-
-```bash
-forge-ctl embedded provider add --provider openai --label "primary"
-forge-ctl embedded provider login --provider openai --label "chatgpt"
-forge-ctl embedded provider list
-forge-ctl embedded provider rename <ENTRY_ID> --label "work" --version <VERSION>
-forge-ctl embedded provider remove <ENTRY_ID> --version <VERSION>
-
-forge-ctl embedded create --name "Forge Assistant" \
-  --credential-id <ENTRY_ID> --model gpt-5.6
-forge-ctl embedded profile list <IDENTITY_ID>
-forge-ctl embedded profile connect <IDENTITY_ID> --version <VERSION> \
-  --credential-id <ENTRY_ID> --model gpt-5.6
-
-forge-ctl embedded session create <IDENTITY_ID> --scope task \
-  --task-id <TASK_ID> --role implementer
-forge-ctl embedded session list <IDENTITY_ID>
-forge-ctl embedded session cancel <SESSION_ID>
-```
-
-Only a Task with explicit TaskRole membership and ordinary Execution authority
-can use a Task HarnessSession. Main and Project chat scopes are retired.
-Provider entry removal and profile changes use optimistic concurrency; pass the
-current `--version` to avoid overwriting a concurrent update.
-
-For OAuth login, the CLI binds the provider callback on the machine running the
-browser flow and relays the authorization code to the server. When Forge and the
-browser are on the same machine, the web UI's **Continue with ChatGPT** flow can
-bind the callback locally. Use `--method device` when no browser is available.
-
-The old `embedded main`, `embedded project`, `embedded chat`, `embedded handoff`,
-and `embedded commitment` commands are retained only as compatibility surfaces
-until PR12; writes fail with `operation_retired`. Task communication uses
-Task-scoped Message and Handoff records through the generic Task APIs.
-
-Use `--output json` for machine-readable responses. Agent identity, profile,
-provider, and Task session resources are emitted as JSON even with the default
-table output so their provenance and lifecycle fields are not lost.
-
-### JSON output for scripting
-
-```bash
-forge-ctl --output json task list --project-id <ID> | jq '.items[].title'
-```
-
-Every subcommand respects `--output json` and emits the same payload structure
-the REST API does — the tables shown in the default mode are just a render of
-that JSON.
+Supported clients are `claude`, `codex`, and `cursor`; scopes are `project`,
+`local`, and `user`. MCP exposes the same target domain: TaskLifecycle,
+TaskRoles, Gates, exact Review Executions, ValidationRuns, Evidence, and generic
+collaboration records. Retired tools are not announced or translated.

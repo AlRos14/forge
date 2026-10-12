@@ -1,6 +1,6 @@
 use api_types::{
-    AdminUserListResponse, AdminUserResponse, MemoryBackfillResponse, SettingListResponse,
-    SettingResponse, UpdateAdminRequest, UpsertSettingRequest,
+    AdminUserListResponse, AdminUserResponse, SettingListResponse, SettingResponse,
+    UpdateAdminRequest, UpsertSettingRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -142,16 +142,6 @@ pub async fn delete_setting(
     SystemSettingRepo::delete_setting(&*state.db, &key).await?;
 
     Ok(StatusCode::NO_CONTENT)
-}
-
-pub async fn backfill_memory(
-    _admin: RequireAdmin,
-    State(_state): State<AppState>,
-) -> ApiResult<Json<MemoryBackfillResponse>> {
-    Err(ApiError::gone_with_code(
-        "operation_retired",
-        "Agent semantic memory backfill was retired in Plan PR11",
-    ))
 }
 
 fn admin_user_response(user: User) -> AdminUserResponse {

@@ -593,11 +593,13 @@ export function ProjectHooksSection({
   )
 
   const saveRules = useMutation({
-    mutationFn: (nextRules: ProjectHookRuleWire[]) =>
-      apiFetch<Project>(`/projects/${projectId}`, {
+    mutationFn: (nextRules: ProjectHookRuleWire[]) => {
+      if (!project) throw new Error('Project is unavailable')
+      return apiFetch<Project>(`/projects/${projectId}`, {
         method: 'PATCH',
-        body: JSON.stringify({ project_hooks: nextRules }),
-      }),
+        body: JSON.stringify({ version: project.version, project_hooks: nextRules }),
+      })
+    },
     onSuccess: (updatedProject) => {
       void queryClient.invalidateQueries({ queryKey: qk.project(updatedProject.id) })
       void queryClient.invalidateQueries({ queryKey: qk.projects })

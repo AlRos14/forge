@@ -211,12 +211,17 @@ impl TaskService {
     pub async fn soft_delete(&self, task_id: impl Into<String>) -> Result<Task> {
         let task_id = task_id.into();
         validate_required("task_id", &task_id)?;
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, true)
+        // Take SQLite's writer reservation before loading the Task and its
+        // children. Parent-backed creates, reparents, detaches, and reorder
+        // operations use this same structural boundary.
+        let mut transaction = self.db.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let task = TaskRepo::get_by_id_in_tx(&*self.db, &mut transaction, &task_id, true)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        let lifecycle =
+            TaskLifecycleRepo::get_task_lifecycle_in_tx(&*self.db, &mut transaction, &task.id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
         if matches!(
             lifecycle.state,
             db::TaskLifecycleState::Active
@@ -227,17 +232,29 @@ impl TaskService {
                 "Tasks with active aggregate work cannot be deleted",
             ));
         }
+        if task.deleted_at.is_some()
+            || matches!(task.status.as_str(), "in_progress" | "review" | "merging")
+        {
+            return Err(db::DbError::InvalidSoftDelete.into());
+        }
+        if TaskRepo::count_live_children_in_tx(&*self.db, &mut transaction, &task.id).await? != 0 {
+            return Err(ServiceError::invalid_operation(
+                "Tasks with live subtasks cannot be deleted; delete, detach, or move the subtasks first",
+            ));
+        }
 
-        let deleted = TaskRepo::soft_delete(
+        let deleted = TaskRepo::soft_delete_in_tx(
             &*self.db,
+            &mut transaction,
             SoftDeleteTask {
-                id: task_id,
+                id: task_id.clone(),
                 expected_version: task.version,
                 deleted_at: now_rfc3339(),
                 updated_at: now_rfc3339(),
             },
         )
         .await?;
+        transaction.commit().await?;
 
         self.publish(ForgeEvent {
             event_type: "task.deleted".to_owned(),

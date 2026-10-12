@@ -21,7 +21,7 @@ const SyntaxHighlighter = lazy(async () => {
 function capturedPlanHref(href: string | undefined) {
   if (!href) return null
   const match = href.match(/\/worktrees\/([0-9a-f-]{36})\/plan\.md$/i)
-  return match ? `/tasks/${match[1]}/overview#task-plan` : null
+  return match ? `/tasks/${match[1]}` : null
 }
 
 const markdownComponents: Components = {

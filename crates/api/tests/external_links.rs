@@ -32,7 +32,7 @@ async fn test_manual_link_existing_task_to_issue() {
             "base_url": "https://api.github.com",
             "owner": "org",
             "repo": "repo",
-            "token_secret_ref": "GITHUB_TOKEN"
+            "credential_env_var": "GITHUB_TOKEN"
         }),
         StatusCode::CREATED,
     )
@@ -63,7 +63,8 @@ async fn test_manual_link_existing_task_to_issue() {
     .await;
     assert_eq!(task_detail.title, task.title);
     assert_eq!(task_detail.description, task.description);
-    assert_eq!(task_detail.status, task.status);
+    assert_eq!(task_detail.lifecycle.state, task.lifecycle.state);
+    assert_eq!(task_detail.lifecycle.version, task.lifecycle.version);
     assert_eq!(task_detail.external_issue_number, Some(42));
     assert_eq!(
         task_detail.external_issue_url.as_deref(),
@@ -126,7 +127,7 @@ async fn test_duplicate_manual_link_returns_409() {
             "base_url": "https://api.github.com",
             "owner": "org",
             "repo": "repo",
-            "token_secret_ref": "GITHUB_TOKEN"
+            "credential_env_var": "GITHUB_TOKEN"
         }),
         StatusCode::CREATED,
     )
@@ -179,7 +180,7 @@ async fn test_unlink_external_link() {
             "base_url": "https://api.github.com",
             "owner": "org",
             "repo": "repo",
-            "token_secret_ref": "GITHUB_TOKEN"
+            "credential_env_var": "GITHUB_TOKEN"
         }),
         StatusCode::CREATED,
     )
@@ -277,7 +278,7 @@ async fn test_gitea_manual_link_url_derivation() {
             "base_url": "https://gitea.example.com",
             "owner": "myorg",
             "repo": "myrepo",
-            "token_secret_ref": "GITEA_TOKEN"
+            "credential_env_var": "GITEA_TOKEN"
         }),
         StatusCode::CREATED,
     )
@@ -318,7 +319,7 @@ async fn test_sync_endpoint_handles_missing_token_gracefully() {
             "base_url": "https://api.github.com",
             "owner": "org",
             "repo": "repo",
-            "token_secret_ref": token_secret_ref
+            "credential_env_var": token_secret_ref
         }),
         StatusCode::CREATED,
     )
@@ -360,7 +361,7 @@ async fn test_dedup_manual_links_no_duplicate_tasks() {
             "base_url": "https://api.github.com",
             "owner": "org",
             "repo": "repo",
-            "token_secret_ref": "GITHUB_TOKEN"
+            "credential_env_var": "GITHUB_TOKEN"
         }),
         StatusCode::CREATED,
     )
@@ -454,7 +455,7 @@ async fn test_external_link_appears_in_task_detail_and_list() {
             "base_url": "https://api.github.com",
             "owner": "org",
             "repo": "repo",
-            "token_secret_ref": "GITHUB_TOKEN"
+            "credential_env_var": "GITHUB_TOKEN"
         }),
         StatusCode::CREATED,
     )
@@ -527,7 +528,7 @@ async fn test_integration_isolation_between_projects() {
             "base_url": "https://api.github.com",
             "owner": "org",
             "repo": "repo",
-            "token_secret_ref": "GITHUB_TOKEN"
+            "credential_env_var": "GITHUB_TOKEN"
         }),
         StatusCode::CREATED,
     )

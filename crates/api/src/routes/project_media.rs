@@ -151,7 +151,7 @@ pub async fn upload_media(
     Path(project_id): Path<String>,
     mut multipart: Multipart,
 ) -> ApiResult<(StatusCode, Json<MediaAsset>)> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::projects::require_project_mutable(&state, &project_id, &user.user_id).await?;
     let mut mutation: Option<api_types::MutationEnvelope> = None;
     let mut upload: Option<(String, String, Vec<u8>)> = None;
     while let Some(mut field) = multipart
@@ -499,7 +499,7 @@ pub async fn attach_evidence(
     Path((project_id, milestone_id)): Path<(String, String)>,
     Json(request): Json<AttachEvidenceRequest>,
 ) -> ApiResult<Json<EvidenceAttachment>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::projects::require_project_mutable(&state, &project_id, &user.user_id).await?;
     if request.milestone_id != milestone_id {
         return Err(ApiError::bad_request(
             "milestone_id in the path and request must match",
@@ -662,7 +662,7 @@ pub async fn remove_evidence(
     Path((project_id, milestone_id, evidence_id)): Path<(String, String, String)>,
     Json(request): Json<api_types::MutationEnvelope>,
 ) -> ApiResult<StatusCode> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::projects::require_project_mutable(&state, &project_id, &user.user_id).await?;
     validate_authorization(
         &request.authorization,
         &user.user_id,

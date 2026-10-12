@@ -3,4 +3,4 @@ import type { ActorRef } from "./ActorRef";
 import type { ProposalStatus } from "./ProposalStatus";
 import type { ProposalTarget } from "./ProposalTarget";
 
-export type ProposalResponse = { id: string, task_id: string, proposer: ActorRef, target: ProposalTarget, action: string, reason: string, target_version: bigint | null, target_digest: string | null, required_policy_ref: string | null, required_policy_version: bigint | null, required_policy_digest: string | null, content_version: bigint, status: ProposalStatus, supersedes_proposal_id: string | null, artifact_ids: Array<string>, created_at: string, };
+export type ProposalResponse = { id: string, task_id: string, proposer: ActorRef, target: ProposalTarget, action: string, reason: string, target_version: number | null, target_digest: string | null, required_policy_ref: string | null, required_policy_version: number | null, required_policy_digest: string | null, content_version: number, status: ProposalStatus, supersedes_proposal_id: string | null, artifact_ids: Array<string>, created_at: string, };

@@ -2,6 +2,6 @@
 
 export type ProviderEntryAgentRef = { agent_id: string, agent_name: string, 
 /**
- * `direct` for embedded agents, otherwise the harness executor type.
+ * The external harness executor type.
  */
 runtime: string, };

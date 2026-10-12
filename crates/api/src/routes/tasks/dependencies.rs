@@ -3,8 +3,10 @@ use super::*;
 pub async fn add_dependency(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
     Json(request): Json<AddDependencyRequest>,
 ) -> ApiResult<StatusCode> {
+    require_same_project_tasks(&state, &id, &request.depends_on_id, &user, true).await?;
     TaskDependencyRepo::add_dependency(&*state.db, &id, &request.depends_on_id, &now_rfc3339())
         .await?;
     Ok(StatusCode::CREATED)
@@ -13,7 +15,9 @@ pub async fn add_dependency(
 pub async fn remove_dependency(
     State(state): State<AppState>,
     Path((id, dep_id)): Path<(String, String)>,
+    user: AuthenticatedUser,
 ) -> ApiResult<StatusCode> {
+    require_same_project_tasks(&state, &id, &dep_id, &user, true).await?;
     TaskDependencyRepo::remove_dependency(&*state.db, &id, &dep_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -21,8 +25,13 @@ pub async fn remove_dependency(
 pub async fn list_dependencies(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<Vec<TaskDependency>>> {
+    require_task_visible(&state, &id, &user).await?;
     let dependencies = TaskDependencyRepo::list_dependencies(&*state.db, &id).await?;
+    for dependency_id in &dependencies {
+        require_same_project_tasks(&state, &id, dependency_id, &user, false).await?;
+    }
     Ok(Json(
         dependencies_with_created_at(&state.db, id, dependencies).await?,
     ))
@@ -31,11 +40,39 @@ pub async fn list_dependencies(
 pub async fn list_dependents(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<Vec<TaskDependency>>> {
+    require_task_visible(&state, &id, &user).await?;
     let dependents = TaskDependencyRepo::list_dependents(&*state.db, &id).await?;
+    for dependent_id in &dependents {
+        require_same_project_tasks(&state, dependent_id, &id, &user, false).await?;
+    }
     Ok(Json(
         dependents_with_created_at(&state.db, id, dependents).await?,
     ))
+}
+
+async fn require_same_project_tasks(
+    state: &AppState,
+    task_id: &str,
+    related_task_id: &str,
+    user: &AuthenticatedUser,
+    mutation: bool,
+) -> ApiResult<()> {
+    let task = if mutation {
+        super::require_task_mutable(state, task_id, user).await?
+    } else {
+        require_task_visible(state, task_id, user).await?
+    };
+    let related = if mutation {
+        super::require_task_mutable(state, related_task_id, user).await?
+    } else {
+        require_task_visible(state, related_task_id, user).await?
+    };
+    if task.project_id != related.project_id {
+        return Err(ApiError::not_found("task", related_task_id.to_owned()));
+    }
+    Ok(())
 }
 
 async fn dependencies_with_created_at(

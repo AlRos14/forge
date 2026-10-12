@@ -1,85 +1,47 @@
-use db::{Agent, AgentProfile, AgentSession, ClaimedTask, Execution, Page, Project, Task};
+use api_types::parse_project_hooks_json;
+use db::{Agent, AgentProfile, Execution, Page, Project};
 use serde_json::{json, Value};
-
-pub(crate) fn task_page_value(page: Page<Task>) -> Value {
-    let has_more = page.next_cursor.is_some();
-    json!({
-        "data": page.items.into_iter().map(task_value).collect::<Vec<_>>(),
-        "next_cursor": page.next_cursor,
-        "has_more": has_more,
-        "total_count": page.total_count,
-    })
-}
 
 pub(crate) fn execution_page_value(page: Page<Execution>) -> Value {
     let has_more = page.next_cursor.is_some();
     json!({
-        "data": page.items.into_iter().map(execution_value).collect::<Vec<_>>(),
+        "items": page.items.into_iter().map(execution_value).collect::<Vec<_>>(),
         "next_cursor": page.next_cursor,
         "has_more": has_more,
         "total_count": page.total_count,
     })
 }
 
-pub(crate) fn agent_page_value(page: Page<Agent>) -> Value {
+pub(crate) fn project_page_value(page: Page<Project>) -> Result<Value, crate::error::McpToolError> {
     let has_more = page.next_cursor.is_some();
-    json!({
-        "data": page.items.into_iter().map(agent_value).collect::<Vec<_>>(),
+    let items = page
+        .items
+        .into_iter()
+        .map(project_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "items": items,
         "next_cursor": page.next_cursor,
         "has_more": has_more,
         "total_count": page.total_count,
-    })
+    }))
 }
 
-pub(crate) fn project_page_value(page: Page<Project>) -> Value {
-    let has_more = page.next_cursor.is_some();
-    json!({
-        "data": page.items.into_iter().map(project_value).collect::<Vec<_>>(),
-        "next_cursor": page.next_cursor,
-        "has_more": has_more,
-        "total_count": page.total_count,
-    })
-}
-
-pub(crate) fn task_value(task: Task) -> Value {
-    json!({
-        "id": task.id,
-        "project_id": task.project_id,
-        "repo_id": task.repo_id,
-        "parent_task_id": task.parent_task_id,
-        "subtask_order": task.subtask_order,
-        "assignee_type": task.assignee_type,
-        "assignee_id": task.assignee_id,
-        "title": task.title,
-        "description": task.description,
-        "status": task.status.to_string(),
-        "priority": task.priority,
-        "merge_config": json_string(task.merge_config),
-        "error_annotation": json_string(task.error_annotation),
-        "deleted_at": task.deleted_at,
-        "version": task.version,
-        "created_at": task.created_at,
-        "updated_at": task.updated_at,
-    })
-}
-
-pub(crate) fn agent_value(agent: Agent) -> Value {
+pub(crate) fn agent_value(agent: Agent, is_admin: bool) -> Value {
     json!({
         "id": agent.id,
         "name": agent.name,
         "description": agent.description,
         "profile_id": agent.profile_id,
-        "backend_kind": agent.backend_kind,
         "executor_type": agent.executor_type,
         "provider": agent.provider,
         "model": agent.model,
         "reasoning_effort": agent.reasoning_effort,
         "permission_policy": agent.permission_policy,
         "capabilities": safe_json(&agent.capabilities_json),
-        "config_json": safe_json(&agent.config_json),
-        // Opaque handle only; the protected credential is never serialized.
+        "config_json": redact_sensitive_config(parsed_json(&agent.config_json)),
         "credential_handle_id": agent.credential_ref,
-        "daemon_id": agent.daemon_id,
+        "daemon_id": if is_admin { agent.daemon_id } else { None },
         "max_concurrent_tasks": agent.max_concurrent_tasks,
         "heartbeat_interval_seconds": agent.heartbeat_interval_seconds,
         "max_missed_heartbeats": agent.max_missed_heartbeats,
@@ -92,25 +54,61 @@ pub(crate) fn agent_value(agent: Agent) -> Value {
     })
 }
 
-pub(crate) fn project_value(project: Project) -> Value {
+pub(crate) fn redact_sensitive_config(value: Value) -> Value {
+    match value {
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| {
+                    let normalized = key.to_ascii_lowercase().replace('-', "_");
+                    let sensitive = [
+                        "api_key",
+                        "token",
+                        "secret",
+                        "password",
+                        "authorization",
+                        "credential",
+                        "private_key",
+                    ]
+                    .iter()
+                    .any(|candidate| normalized.contains(candidate));
+                    (
+                        key,
+                        if sensitive {
+                            Value::String("[redacted]".to_owned())
+                        } else {
+                            redact_sensitive_config(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(redact_sensitive_config).collect())
+        }
+        value => value,
+    }
+}
+
+pub(crate) fn project_value(project: Project) -> Result<Value, crate::error::McpToolError> {
     let paused = project.paused_at.is_some();
-    json!({
+    let project_hooks = parse_project_hooks_json(&project.project_hooks_json)
+        .map_err(|error| crate::error::McpToolError::new(-32603, error))?;
+    Ok(json!({
         "id": project.id,
         "name": project.name,
-        "settings": json_string(Some(project.settings)),
-        "workflow_template_name": project.workflow_template_name,
+        "project_hooks": project_hooks,
         "paused_at": project.paused_at,
         "paused": paused,
         "created_at": project.created_at,
         "updated_at": project.updated_at,
-    })
+    }))
 }
 
 pub(crate) fn agent_profile_value(profile: AgentProfile) -> Value {
     json!({
         "id": profile.id,
         "identity_id": profile.identity_id,
-        "backend_kind": profile.backend_kind,
         "executor_type": profile.executor_type,
         "provider": profile.provider,
         "model": profile.model,
@@ -118,38 +116,11 @@ pub(crate) fn agent_profile_value(profile: AgentProfile) -> Value {
         "permission_policy": profile.permission_policy,
         "system_prompt": profile.prompt_template,
         "capabilities": safe_json(&profile.capabilities_json),
-        "tool_policy": safe_json(&profile.tool_policy_json),
-        "config": safe_json(&profile.config_json),
-        // This is an opaque database handle, never the protected credential.
+        "tool_policy": redact_sensitive_config(parsed_json(&profile.tool_policy_json)),
+        "config": redact_sensitive_config(parsed_json(&profile.config_json)),
         "credential_handle_id": profile.credential_ref,
         "version": profile.version,
         "created_at": profile.created_at,
-    })
-}
-
-pub(crate) fn agent_session_value(session: AgentSession) -> Value {
-    json!({
-        "id": session.id,
-        "identity_id": session.identity_id,
-        "profile_id": session.profile_id,
-        "context_scope_id": session.context_scope_id,
-        "backend_kind": session.backend_kind,
-        "status": session.status,
-        "capabilities": json_string(Some(session.capabilities_json)),
-        "connection_status": session.connection_status,
-        "predecessor_session_id": session.predecessor_session_id,
-        "replaced_by_session_id": session.replaced_by_session_id,
-        "last_activity_at": session.last_activity_at,
-        "version": session.version,
-        "created_at": session.created_at,
-        "updated_at": session.updated_at,
-    })
-}
-
-pub(crate) fn claimed_task_value(claimed: ClaimedTask) -> Value {
-    json!({
-        "task": task_value(claimed.task),
-        "execution": execution_value(claimed.execution),
     })
 }
 
@@ -161,14 +132,11 @@ pub(crate) fn execution_value(execution: Execution) -> Value {
             db::ActorRef::Human(id) => json!({"kind": "human", "id": id}),
             db::ActorRef::Agent(id) => json!({"kind": "agent", "id": id}),
         }),
-        "agent_id": execution.agent_id,
         "role": execution.role.to_string(),
         "purpose": execution.purpose.map(|purpose| purpose.to_string()),
         "status": execution.status.to_string(),
         "parent_execution_id": execution.parent_execution_id,
-        "agent_session_id": execution.agent_session_id,
         "harness_session_id": execution.harness_session_id,
-        "agent_message_id": execution.agent_message_id,
         "prompt": execution.prompt,
         "summary": execution.summary,
         "logs_path": execution.logs_path,
@@ -180,15 +148,12 @@ pub(crate) fn execution_value(execution: Execution) -> Value {
     })
 }
 
-fn json_string(value: Option<String>) -> Value {
-    value
-        .map(|value| serde_json::from_str(&value).unwrap_or(Value::String(value)))
-        .unwrap_or(Value::Null)
+fn safe_json(value: &str) -> Value {
+    redact_sensitive(parsed_json(value))
 }
 
-fn safe_json(value: &str) -> Value {
-    let parsed = serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()));
-    redact_sensitive(parsed)
+fn parsed_json(value: &str) -> Value {
+    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()))
 }
 
 fn redact_sensitive(value: Value) -> Value {

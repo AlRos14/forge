@@ -34,6 +34,7 @@ pub struct AuthResponse {
     pub access_token: String,
     pub refresh_token: String,
     pub token_type: String,
+    #[ts(type = "number")]
     pub expires_in: u64,
 }
 

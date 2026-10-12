@@ -11,7 +11,8 @@ This seeds demo data and starts the API server. The suite mints admin JWTs clien
 ## Running tests
 
     cd web
-    pnpm run e2e          # run all tests (headless)
+    pnpm run e2e          # run the CI smoke test (headless)
+    pnpm run e2e:terminal # run the workspace terminal UI test
     pnpm run e2e:ui       # open Playwright UI mode
     pnpm run e2e:debug    # run in debug mode
 
@@ -25,10 +26,10 @@ Most specs use `./fixtures`, which logs in a deterministic default user before n
 
 ## What the smoke tests cover
 
-- smoke.spec.ts: page loads, navigation visible
-- kanban-board.spec.ts: board columns render correctly
-- task-transition-timeline.spec.ts: task detail transition timeline renders
-- task-media.spec.ts: task comments upload and preview real image/video media fixtures
+- smoke.spec.ts: application shell loads
+- main-pages-render.spec.ts: target navigation and project settings render without retired surfaces
+- operations.spec.ts: operator status page renders
+- task-terminal.spec.ts: workspace terminal UI connects, sends input, and terminates a session
 
 ## Adding tests
 

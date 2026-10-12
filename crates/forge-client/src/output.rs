@@ -14,7 +14,7 @@ pub fn print_table_tasks(items: &[TaskResponse]) {
             vec![
                 short_id(&value.id),
                 value.title.clone(),
-                serialized_label(&value.status),
+                serialized_label(&value.lifecycle.state),
                 value.priority.to_string(),
                 value.updated_at.clone(),
             ]
@@ -22,7 +22,7 @@ pub fn print_table_tasks(items: &[TaskResponse]) {
         .collect::<Vec<_>>();
     println!(
         "{}",
-        Table::from_rows(&["ID", "Title", "Status", "Priority", "Updated"], rows)
+        Table::from_rows(&["ID", "Title", "Lifecycle", "Priority", "Updated"], rows)
     );
 }
 

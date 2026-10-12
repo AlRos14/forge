@@ -39,17 +39,14 @@ import { cn } from '@/lib/cn'
 import { roleDisplayName } from '@/lib/execution-utils'
 import { productTerm } from '@/lib/i18n'
 import { saveRecentExecutionSelection } from '@/lib/execution-config-storage'
-import { useAuthStore } from '@/stores/auth'
 import {
   compareLogsChronologically,
   mergeLogs,
-  parseExecutionLogEvent,
 } from '@/lib/execution-log-utils'
 import { effectiveLogFilterKind, type LogFilterKind } from '@/lib/log-filter'
 import type {
   Execution,
   FollowUpRequest,
-  LaunchExecutionResponse,
   LogEntry,
 } from '@/types/generated'
 
@@ -219,6 +216,8 @@ export function ExecutionDetailPage({
   const agentsQuery = useAgentsQuery()
   const followUpExecution = useFollowUpExecution(executionId)
   const execution = executionQuery.data
+  const executionAgentId =
+    execution?.actor_ref?.kind === 'agent' ? execution.actor_ref.id : undefined
   const parentExecutionId = execution?.parent_execution_id ?? ''
   const parentTurnQuery = useQuery({
     queryKey: ['executions', parentExecutionId, 'timeline-turn'] as const,
@@ -237,7 +236,6 @@ export function ExecutionDetailPage({
     executionQuery.data?.status === 'running',
   )
   const hookLogsQuery = useExecutionHookLogs(executionId)
-  const accessToken = useAuthStore((state) => state.accessToken)
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [hasMoreLogs, setHasMoreLogs] = useState(false)
   const [enabledKinds, setEnabledKinds] = useState<Set<LogFilterKind>>(() => new Set(defaultLogKinds))
@@ -295,34 +293,10 @@ export function ExecutionDetailPage({
     return () => window.clearTimeout(timeout)
   }, [executionQuery.data?.status, logsQuery.data, nextLoadedSequence])
 
-  useEffect(() => {
-    if (executionQuery.data?.status !== 'running' || !accessToken) return undefined
-
-    const source = new EventSource(`/api/v1/events?token=${encodeURIComponent(accessToken)}`)
-    const handleMessage = (event: MessageEvent<string>) => {
-      const parsedLogs = parseExecutionLogEvent(event.data, executionId)
-      if (parsedLogs.length === 0) return
-      setLogs((current) => mergeLogs(current, parsedLogs))
-      setLogsParams((current) => advanceLogParams(current, nextSequenceForLogs(parsedLogs)))
-    }
-
-    source.onmessage = handleMessage
-    source.addEventListener('execution.log', handleMessage as EventListener)
-
-    return () => {
-      source.removeEventListener('execution.log', handleMessage as EventListener)
-      source.close()
-    }
-  }, [accessToken, executionId, executionQuery.data?.status])
-
   const executionUsage = execution?.usage ?? executionUsageQuery.data ?? []
-  const executionAgentSessionId = execution?.agent_session_id ?? null
-  const showRecoveryAction = execution?.status === 'cancelled' || execution?.status === 'failed'
-  const recoveryActionLabel = executionAgentSessionId ? 'Continue Session' : 'Re-execute'
-
   const parentAgent = useMemo(
-    () => (agentsQuery.data?.items ?? []).find((agent) => agent.id === execution?.agent_id),
-    [agentsQuery.data, execution?.agent_id],
+    () => (agentsQuery.data?.items ?? []).find((agent) => agent.id === executionAgentId),
+    [agentsQuery.data, executionAgentId],
   )
   const parentExecutorType =
     snapshotString(execution?.executor_config_snapshot, 'executor_type') ??
@@ -330,14 +304,14 @@ export function ExecutionDetailPage({
     null
   const agentUsageQuery = useAgentUsageQuery(
     parentExecutorType === 'codex' || parentExecutorType === 'cursor'
-      ? (execution?.agent_id ?? undefined)
+      ? executionAgentId
       : undefined,
   )
   const accountUsage =
     asUsageRecord(execution?.account_usage) ??
     (agentUsageQuery.data?.available ? agentUsageQuery.data.usage : null)
 
-  const followUpInitialAgentId = execution?.agent_id ?? null
+  const followUpInitialAgentId = executionAgentId ?? null
   const followUpInitialOverrides = useMemo(
     () => initialOverridesFromSnapshot(execution?.executor_config_snapshot),
     [execution?.executor_config_snapshot],
@@ -385,34 +359,6 @@ export function ExecutionDetailPage({
     }
   }, [isLoadingOlderTurn, oldestLoadedParentExecutionId])
 
-  const recoveryExecution = useMutation({
-    mutationFn: () => {
-      if (!execution) {
-        throw new Error(`${productTerm('run')} not found`)
-      }
-      if (executionAgentSessionId) {
-        const body: FollowUpRequest = { message: 'Resume' }
-        return apiFetch<LaunchExecutionResponse>(`/executions/${execution.id}/follow-up`, {
-          method: 'POST',
-          body: JSON.stringify(body),
-        })
-      }
-      return apiFetch<LaunchExecutionResponse>(`/executions/${execution.id}/re-execute`, {
-        method: 'POST',
-      })
-    },
-    onSuccess: (response) => {
-      void navigate({
-        to: '/tasks/$taskId/executions/$executionId',
-        params: {
-          taskId: response.data.task.id,
-          executionId: response.data.execution.id,
-        },
-      })
-    },
-    onError: (error) => toast.error(getApiErrorMessage(error, `${recoveryActionLabel} failed`)),
-  })
-
   const cancelExecution = useMutation({
     mutationFn: () => {
       if (!execution) throw new Error(`${productTerm('run')} not found`)
@@ -450,9 +396,22 @@ export function ExecutionDetailPage({
   const sendFollowUp = () => {
     const trimmed = followUpMessage.trim()
     if (!trimmed) return
-    const body: FollowUpRequest = { message: trimmed }
-    if (followUpConfig?.agentId) body.agent_id = followUpConfig.agentId
-    if (followUpConfig?.overrides) body.overrides = followUpConfig.overrides
+    const selectedAgentId = followUpConfig?.agentId ?? executionAgentId
+    if (!selectedAgentId) {
+      toast.error('Choose an exact Agent identity before starting a child Execution')
+      return
+    }
+    const body: FollowUpRequest = {
+      message: trimmed,
+      agent_id: selectedAgentId,
+      overrides: followUpConfig?.overrides
+        ? {
+            model_id: followUpConfig.overrides.model_id ?? null,
+            reasoning_effort: followUpConfig.overrides.reasoning_effort ?? null,
+            permission_policy: followUpConfig.overrides.permission_policy ?? null,
+          }
+        : null,
+    }
     followUpExecution.mutate(body, {
       onSuccess: (response) => {
         saveRecentExecutionSelection(
@@ -469,8 +428,8 @@ export function ExecutionDetailPage({
         void navigate({
           to: '/tasks/$taskId/executions/$executionId',
           params: {
-            taskId: response.data.task.id,
-            executionId: response.data.execution.id,
+            taskId: response.task_id,
+            executionId: response.id,
           },
         })
       },
@@ -617,8 +576,6 @@ export function ExecutionDetailPage({
                 actions={{
                   onStop: execution?.status === 'running' ? () => cancelExecution.mutate() : undefined,
                   stopPending: cancelExecution.isPending,
-                  onContinue: showRecoveryAction && executionAgentSessionId ? () => recoveryExecution.mutate() : undefined,
-                  continuePending: recoveryExecution.isPending,
                 }}
               />
             </Panel>

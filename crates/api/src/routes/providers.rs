@@ -8,7 +8,7 @@ use api_types::{
     AgentProviderCapabilitiesResponse, CliRuntimeEntryResponse, CreateProviderEntryRequest,
     DetectedCli, DisconnectCredentialResponse, ProviderEntriesResponse, ProviderEntryAgentRef,
     ProviderEntryResponse, ProviderEntryTestResponse, ProviderRevocationStatus,
-    ProviderUsageResponse, ProviderUsageWindow, RenameProviderEntryRequest, SessionVersionRequest,
+    ProviderUsageResponse, ProviderUsageWindow, RenameProviderEntryRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -19,6 +19,7 @@ use db::{
     CredentialHandleRepo, CredentialUsage, Daemon, DaemonRepo, DbError, PageRequest, SortBy,
     SortOrder, UpsertAgentConnectionHealth,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use services::credential_service::{
     ConnectApiKeyCredential, CredentialError, CredentialRevocationOutcome, Secret,
@@ -29,6 +30,11 @@ use crate::{
     routes::auth::AuthenticatedUser,
     state::AppState,
 };
+
+#[derive(Debug, Deserialize)]
+pub struct ProviderEntryVersionQuery {
+    version: i64,
+}
 
 pub async fn provider_catalog(
     State(state): State<AppState>,
@@ -57,7 +63,7 @@ pub async fn list_providers(
             entry_response(handle, usage)
         })
         .collect();
-    let cli_runtimes = cli_runtime_entries(&state).await?;
+    let cli_runtimes = cli_runtime_entries(&state, &user.user_id).await?;
     Ok(Json(ProviderEntriesResponse {
         items,
         cli_runtimes,
@@ -166,13 +172,13 @@ pub async fn delete_provider_entry(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(handle_id): Path<String>,
-    Query(request): Query<SessionVersionRequest>,
+    Query(request): Query<ProviderEntryVersionQuery>,
 ) -> ApiResult<Json<DisconnectCredentialResponse>> {
     let affected: Vec<CredentialUsage> =
         CredentialHandleRepo::list_credential_usage(&*state.db, &user.user_id)
             .await?
             .into_iter()
-            .filter(|row| row.credential_id == handle_id)
+            .filter(|row| row.credential_id == handle_id && row.runtime != "embedded")
             .collect();
     let outcome = state
         .credential_service
@@ -228,6 +234,7 @@ fn entry_response(handle: CredentialHandle, usage: Vec<CredentialUsage>) -> Prov
         .map(str::to_owned);
     let last_used_at = usage
         .iter()
+        .filter(|row| row.runtime != "embedded")
         .filter_map(|row| row.last_used_at.as_deref())
         .max()
         .map(str::to_owned);
@@ -239,7 +246,11 @@ fn entry_response(handle: CredentialHandle, usage: Vec<CredentialUsage>) -> Prov
         status: handle.status,
         base_url,
         provider_account_id,
-        used_by: usage.into_iter().map(usage_ref).collect(),
+        used_by: usage
+            .into_iter()
+            .filter(|row| row.runtime != "embedded")
+            .map(usage_ref)
+            .collect(),
         last_used_at,
         version: handle.version,
         created_at: handle.created_at,
@@ -251,11 +262,7 @@ fn usage_ref(row: CredentialUsage) -> ProviderEntryAgentRef {
     ProviderEntryAgentRef {
         agent_id: row.agent_id,
         agent_name: row.agent_name,
-        runtime: if row.runtime == "embedded" {
-            "direct".to_owned()
-        } else {
-            row.runtime
-        },
+        runtime: row.runtime,
     }
 }
 
@@ -280,10 +287,13 @@ fn cli_login_hint(kind: &str) -> Option<&'static str> {
     }
 }
 
-async fn cli_runtime_entries(state: &AppState) -> ApiResult<Vec<CliRuntimeEntryResponse>> {
-    let daemons = all_daemons(state).await?;
+async fn cli_runtime_entries(
+    state: &AppState,
+    user_id: &str,
+) -> ApiResult<Vec<CliRuntimeEntryResponse>> {
+    let daemons = all_daemons(state, user_id).await?;
     let mut used_by: HashMap<String, Vec<ProviderEntryAgentRef>> = HashMap::new();
-    for agent in all_agents(state).await? {
+    for agent in all_agents(state, user_id).await? {
         if agent.backend_kind != "cli" || agent.credential_ref.is_some() {
             continue;
         }
@@ -316,12 +326,13 @@ async fn cli_runtime_entries(state: &AppState) -> ApiResult<Vec<CliRuntimeEntryR
     Ok(items)
 }
 
-async fn all_daemons(state: &AppState) -> ApiResult<Vec<Daemon>> {
+async fn all_daemons(state: &AppState, user_id: &str) -> ApiResult<Vec<Daemon>> {
     let mut daemons = Vec::new();
     let mut cursor = None;
     loop {
-        let page = DaemonRepo::list(
+        let page = DaemonRepo::list_visible(
             &*state.db,
+            Some(user_id),
             PageRequest {
                 cursor,
                 limit: 500,
@@ -340,16 +351,18 @@ async fn all_daemons(state: &AppState) -> ApiResult<Vec<Daemon>> {
     Ok(daemons)
 }
 
-async fn all_agents(state: &AppState) -> ApiResult<Vec<db::Agent>> {
+async fn all_agents(state: &AppState, user_id: &str) -> ApiResult<Vec<db::Agent>> {
     let mut agents = Vec::new();
     let mut cursor = None;
     loop {
-        let page = AgentRepo::list(
+        let page = AgentRepo::list_visible_to_user(
             &*state.db,
+            user_id,
             AgentListQuery {
                 status: None,
                 executor_type: None,
                 capabilities: Vec::new(),
+                harness_only: false,
                 page: PageRequest {
                     cursor,
                     limit: 500,

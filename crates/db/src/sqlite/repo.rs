@@ -93,17 +93,47 @@ impl RepoRepo for SqliteDb {
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
-        sqlx::query("UPDATE project SET primary_repo_id = NULL WHERE primary_repo_id = ?")
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        let repo_exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM repo WHERE id = ?)")
             .bind(id)
-            .execute(&self.pool)
+            .fetch_one(&mut *transaction)
             .await?;
-        let result = sqlx::query("DELETE FROM repo WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        if result.rows_affected() == 0 {
+        if repo_exists == 0 {
+            transaction.rollback().await?;
             return Err(DbError::NotFound);
         }
+
+        let has_tasks: i64 =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE repo_id = ?)")
+                .bind(id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        if has_tasks != 0 {
+            transaction.rollback().await?;
+            return Err(DbError::RepoInUse);
+        }
+
+        sqlx::query("UPDATE project SET primary_repo_id = NULL WHERE primary_repo_id = ?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        let result = match sqlx::query("DELETE FROM repo WHERE id = ?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                transaction.rollback().await?;
+                return Err(error.into());
+            }
+        };
+        if result.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Err(DbError::NotFound);
+        }
+        transaction.commit().await?;
         Ok(())
     }
 }

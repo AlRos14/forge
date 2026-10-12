@@ -243,7 +243,7 @@ function ProviderAuthorizationPanel({
         // The browser is on the server's machine whenever Forge is served over
         // loopback, so Forge itself binds the provider's localhost callback.
         // Anywhere else the server rejects browser OAuth and points at the
-        // device-code method or `forge-ctl embedded provider login`.
+        // device-code method or `forge-ctl provider login`.
         loopback_owner: 'server',
         loopback_port: null,
       })

@@ -8,6 +8,66 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Plan PR12 aligns public REST, MCP, `forge-ctl`, web, generated TypeScript, and
+  SSE contracts with Architecture V2. Removed retired Main/Project Agent,
+  Product Genesis, Agent Chat, Attention, Charter/baseline, milestone/readiness,
+  workflow, legacy review, and native runtime endpoints and commands. Task
+  responses and list filters now use TaskLifecycle and exact lifecycle
+  versions; formal Review is an exact reviewer `review` Execution with its
+  frozen subject and ReviewReport. MCP exposes target lifecycle, Gate, role,
+  review, validation/evidence, and generic collaboration operations. Public
+  SSE now uses an explicit typed projection over durable DomainEvents plus a
+  small allowlist of safe runtime hints. Immutable Project Release snapshots
+  remain read-only history. Issue integrations now use the accurate public
+  `credential_env_var` name for the environment-variable key, return no
+  credential value, and accept an exact `default_implementer` ActorRef that
+  creates a TaskRole membership for imported issues; legacy state/singular-
+  assignee configuration is rejected.
+  Agent roster and availability responses rename `active_task_count` to
+  `active_execution_count`, which counts only running Executions attributed to
+  the exact Agent Actor, not active Tasks or RoleMemberships.
+  Ordinary Task creation no longer applies `ProjectSettings.default_role_assignments`
+  from historical Project rows. Legacy state-driven lifecycle hook scripts and
+  their EventBus emitter no longer run or block new Executions; their stored
+  settings remain intact, and generic durable Project hooks remain supported.
+  REST and MCP Project lists now filter before pagination, and Project reads,
+  mutations, and derived MCP resources enforce the authenticated user's
+  Project authority. Reads retain owner/member/viewer visibility and public
+  ownerless visibility; ordinary writes require owner/admin/member, while
+  Project administration and sensitive configuration require owner/admin.
+  MCP-created Projects record that Human as owner;
+  Project-scoped MCP calls cannot cross into a different Project. MCP Agent
+  registration binds the Agent to its caller, daemon pinning requires an admin,
+  and non-admin Agent output omits daemon IDs and redacts sensitive config.
+  REST repository/integration paths resolve their Project before access, Task
+  and Execution paths resolve through the authorized Project, and notification
+  reads/mutations plus Project-scoped MCP configuration use the same
+  visible-Project set. Authenticated SSE
+  streams now filter Project/Task events by caller visibility; operational
+  status hints are admin-only. Historical Release snapshot reads share the
+  Project visibility rule, including existing public ownerless Projects.
+  Public visibility never grants write authority. Task creation and reparenting
+  reject missing, cross-Project, self, cyclic, or unsupported nested parents
+  before writing. Project deletion snapshots its exact authorized recipients
+  before teardown and emits per-user invalidation hints without exposing
+  membership data.
+  Task parent links require the same exact Project and Repo; soft deletion is
+  rejected while live subtasks remain, and delete/create/reparent serialize at
+  the hierarchy boundary. Repo deletion is atomic when protected TaskLifecycle
+  cascades reject it, preserving the primary-Repo selection and Task links.
+  REST and MCP Agent rosters filter private Agents before pagination and page
+  metadata; provider runtime projections also filter private Agents and Daemons
+  before returning items or counts.
+  Operator health now reports blocked state from TaskLifecycle, retry pressure
+  from exact immutable retry receipts, and HarnessSession only from an
+  Execution's explicit reference; it no longer projects transition-log retry
+  counts, legacy task state, or `agent_session_id`.
+  Removed the unused `public_search` server configuration and its environment
+  variables with the retired chat tool; a saved top-level `public_search`
+  setting is rejected during config loading.
+  No storage is dropped; physical cleanup remains PR13 and general
+  naming/branding remains PR14.
+
 - Plan PR11 retires Main Agent, Project Agent, Agent Chat cognition, Product
   Genesis, bespoke Agent actions/commitments/inbox/questions, semantic Agent
   memory writes, Attention dispatch, and Project OS authority. V118 preserves
@@ -194,6 +254,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   launch-dialog checkbox could touch it).
 
 ### Fixed
+
+- `DELETE /repos/{id}` now checks for associated Tasks inside its write
+  transaction and returns `409 repo_in_use` while preserving the Repo,
+  primary-Repo selection, and Tasks. Task-free Repo deletion still returns
+  `204` and clears the primary-Repo selection atomically.
 
 - WorkUnit integration failures and final TaskMerge failures now consume
   separate retry budgets. PullRequest publication first records the exact

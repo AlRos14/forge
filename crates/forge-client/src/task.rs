@@ -1,14 +1,11 @@
-use std::path::{Path, PathBuf};
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use api_types::{
-    ClaimTaskRequest, CommentResponse, CreateCommentRequest, CreateTaskRequest, PaginatedResponse,
-    PromptPreviewResponse, TaskMediaResponse, TaskResponse, TransitionTaskRequest,
-    TransitionTaskResponse,
+    ActorRef, AddRoleMembershipRequest, CoordinationMode, CreateTaskRequest, CreateTaskRoleRequest,
+    ExecutionPurpose, ExecutionResponse, PaginatedResponse, RoleMembershipResponse,
+    StartExecutionRequest, TaskLifecycleState, TaskLifecycleTransitionResponse, TaskResponse,
+    TaskRoleResponse, TransitionTaskLifecycleRequest,
 };
-use clap::Subcommand;
-use reqwest::multipart::Form;
-use serde_json::json;
+use clap::{Subcommand, ValueEnum};
 
 use crate::{
     client::ForgeClient,
@@ -38,62 +35,157 @@ pub enum TaskCmd {
         #[arg(long)]
         project_id: String,
         #[arg(long)]
-        status: Option<String>,
+        lifecycle_state: Option<LifecycleStateArg>,
         #[arg(long)]
         limit: Option<i64>,
     },
     Get {
         id: String,
     },
-    Claim {
+    Execute {
         id: String,
         #[arg(long)]
         agent_id: String,
+        #[arg(long)]
+        role: String,
+        #[arg(long, value_enum)]
+        purpose: PurposeArg,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long = "input-artifact-id")]
+        input_artifact_ids: Vec<String>,
+    },
+    Role {
+        #[command(subcommand)]
+        command: TaskRoleCmd,
     },
     Transition {
         id: String,
-        status: String,
-        version: i64,
-    },
-    Cancel {
-        id: String,
-    },
-    PromptPreview {
-        task_id: String,
+        #[arg(value_enum)]
+        to_state: LifecycleStateArg,
         #[arg(long)]
-        role: String,
+        expected_lifecycle_version: i64,
         #[arg(long)]
-        trigger: Option<String>,
+        idempotency_key: String,
+        #[arg(long)]
+        gate_evaluation_id: Option<String>,
+        #[arg(long)]
+        reason_kind: Option<String>,
+        #[arg(long)]
+        reason_ref: Option<String>,
     },
-    Media(MediaArgs),
-}
-
-#[derive(clap::Args)]
-pub struct MediaArgs {
-    #[command(subcommand)]
-    pub cmd: MediaCmd,
 }
 
 #[derive(Subcommand)]
-pub enum MediaCmd {
-    Upload {
-        #[arg(long)]
-        task_id: String,
-        #[arg(long)]
-        file: PathBuf,
-        #[arg(long)]
-        author_name: Option<String>,
+pub enum TaskRoleCmd {
+    List {
+        id: String,
     },
-    Comment {
+    Create {
+        id: String,
         #[arg(long)]
-        task_id: String,
-        #[arg(long)]
-        content: String,
-        #[arg(long)]
-        author_name: Option<String>,
-        #[arg(long)]
-        media_url: Vec<String>,
+        role: String,
+        #[arg(long, value_enum)]
+        coordination_mode: CoordinationModeArg,
     },
+    AddMember {
+        id: String,
+        role: String,
+        #[arg(long, value_enum)]
+        actor_kind: ActorKindArg,
+        #[arg(long)]
+        actor_id: String,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum CoordinationModeArg {
+    Partitioned,
+    Collaborative,
+    Independent,
+}
+
+impl From<CoordinationModeArg> for CoordinationMode {
+    fn from(value: CoordinationModeArg) -> Self {
+        match value {
+            CoordinationModeArg::Partitioned => Self::Partitioned,
+            CoordinationModeArg::Collaborative => Self::Collaborative,
+            CoordinationModeArg::Independent => Self::Independent,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum ActorKindArg {
+    Human,
+    Agent,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum LifecycleStateArg {
+    Backlog,
+    Ready,
+    Active,
+    Blocked,
+    ReadyToMerge,
+    Merging,
+    Done,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum PurposeArg {
+    Plan,
+    Implement,
+    Review,
+    Validate,
+    Investigate,
+    Orchestrate,
+    General,
+}
+
+impl From<PurposeArg> for ExecutionPurpose {
+    fn from(value: PurposeArg) -> Self {
+        match value {
+            PurposeArg::Plan => Self::Plan,
+            PurposeArg::Implement => Self::Implement,
+            PurposeArg::Review => Self::Review,
+            PurposeArg::Validate => Self::Validate,
+            PurposeArg::Investigate => Self::Investigate,
+            PurposeArg::Orchestrate => Self::Orchestrate,
+            PurposeArg::General => Self::General,
+        }
+    }
+}
+
+impl From<LifecycleStateArg> for TaskLifecycleState {
+    fn from(value: LifecycleStateArg) -> Self {
+        match value {
+            LifecycleStateArg::Backlog => Self::Backlog,
+            LifecycleStateArg::Ready => Self::Ready,
+            LifecycleStateArg::Active => Self::Active,
+            LifecycleStateArg::Blocked => Self::Blocked,
+            LifecycleStateArg::ReadyToMerge => Self::ReadyToMerge,
+            LifecycleStateArg::Merging => Self::Merging,
+            LifecycleStateArg::Done => Self::Done,
+            LifecycleStateArg::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+impl LifecycleStateArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Backlog => "backlog",
+            Self::Ready => "ready",
+            Self::Active => "active",
+            Self::Blocked => "blocked",
+            Self::ReadyToMerge => "ready_to_merge",
+            Self::Merging => "merging",
+            Self::Done => "done",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 impl TaskArgs {
@@ -111,10 +203,6 @@ impl TaskArgs {
                     parent_task_id: None,
                     task_type: None,
                     priority: *priority,
-                    review_config: None,
-                    merge_config: None,
-                    role_assignments: None,
-                    governance: None,
                 };
                 let task: TaskResponse = client
                     .post(&format!("/api/v1/projects/{project_id}/tasks"), &request)
@@ -123,11 +211,15 @@ impl TaskArgs {
             }
             TaskCmd::List {
                 project_id,
-                status,
+                lifecycle_state,
                 limit,
             } => {
                 let response: PaginatedResponse<TaskResponse> = client
-                    .get(&task_list_path(project_id, status.as_deref(), *limit))
+                    .get(&task_list_path(
+                        project_id,
+                        lifecycle_state.map(LifecycleStateArg::as_str),
+                        *limit,
+                    ))
                     .await?;
                 match output {
                     OutputFormat::Json => print_json(&response),
@@ -141,128 +233,164 @@ impl TaskArgs {
                 let task: TaskResponse = client.get(&format!("/api/v1/tasks/{id}")).await?;
                 print_task(output, &task)
             }
-            TaskCmd::Claim { id, agent_id } => {
-                let request = ClaimTaskRequest {
+            TaskCmd::Execute {
+                id,
+                agent_id,
+                role,
+                purpose,
+                prompt,
+                input_artifact_ids,
+            } => {
+                let request = StartExecutionRequest {
                     agent_id: agent_id.clone(),
-                    overrides: None,
+                    role: role.clone(),
+                    purpose: (*purpose).into(),
+                    prompt: prompt.clone(),
+                    input_artifact_ids: input_artifact_ids.clone(),
                 };
-                let task: TaskResponse = client
-                    .post(&format!("/api/v1/tasks/{id}/claim"), &request)
+                let execution: ExecutionResponse = client
+                    .post(&format!("/api/v1/tasks/{id}/executions"), &request)
                     .await?;
-                print_task(output, &task)
+                match output {
+                    OutputFormat::Json => print_json(&execution),
+                    OutputFormat::Table => {
+                        let actor = serde_json::to_value(&execution.actor_ref)?.to_string();
+                        let purpose = serde_json::to_value(&execution.purpose)?;
+                        println!(
+                            "Execution {} status={} actor={} role={} purpose={}",
+                            execution.id,
+                            serde_json::to_value(execution.status)?
+                                .as_str()
+                                .unwrap_or("unknown"),
+                            actor,
+                            execution.role,
+                            purpose.as_str().unwrap_or("unknown")
+                        );
+                        Ok(())
+                    }
+                }
             }
+            TaskCmd::Role { command } => match command {
+                TaskRoleCmd::List { id } => {
+                    let roles: Vec<TaskRoleResponse> = client
+                        .get(&format!("/api/v1/tasks/{id}/task-roles"))
+                        .await?;
+                    match output {
+                        OutputFormat::Json => print_json(&roles),
+                        OutputFormat::Table => {
+                            for role in &roles {
+                                println!(
+                                    "{} coordination={:?} members={}",
+                                    role.role,
+                                    role.coordination_mode,
+                                    role.members.len()
+                                );
+                            }
+                            Ok(())
+                        }
+                    }
+                }
+                TaskRoleCmd::Create {
+                    id,
+                    role,
+                    coordination_mode,
+                } => {
+                    let request = CreateTaskRoleRequest {
+                        role: role.clone(),
+                        coordination_mode: (*coordination_mode).into(),
+                        policy: None,
+                    };
+                    let response: TaskRoleResponse = client
+                        .post(&format!("/api/v1/tasks/{id}/task-roles"), &request)
+                        .await?;
+                    match output {
+                        OutputFormat::Json => print_json(&response),
+                        OutputFormat::Table => {
+                            println!(
+                                "task role {} coordination={:?}",
+                                response.role, response.coordination_mode
+                            );
+                            Ok(())
+                        }
+                    }
+                }
+                TaskRoleCmd::AddMember {
+                    id,
+                    role,
+                    actor_kind,
+                    actor_id,
+                } => {
+                    let actor_ref = match actor_kind {
+                        ActorKindArg::Human => ActorRef::Human(actor_id.clone()),
+                        ActorKindArg::Agent => ActorRef::Agent(actor_id.clone()),
+                    };
+                    let request = AddRoleMembershipRequest { actor_ref };
+                    let response: RoleMembershipResponse = client
+                        .post(
+                            &format!("/api/v1/tasks/{id}/task-roles/{role}/members"),
+                            &request,
+                        )
+                        .await?;
+                    match output {
+                        OutputFormat::Json => print_json(&response),
+                        OutputFormat::Table => {
+                            println!(
+                                "membership {} actor={:?} status={:?}",
+                                response.id, response.actor_ref, response.status
+                            );
+                            Ok(())
+                        }
+                    }
+                }
+            },
             TaskCmd::Transition {
                 id,
-                status,
-                version,
+                to_state,
+                expected_lifecycle_version,
+                idempotency_key,
+                gate_evaluation_id,
+                reason_kind,
+                reason_ref,
             } => {
-                let request = TransitionTaskRequest {
-                    status: status.to_string(),
-                    version: *version,
-                    reason: None,
-                    source: None,
+                let request = TransitionTaskLifecycleRequest {
+                    to_state: (*to_state).into(),
+                    expected_lifecycle_version: *expected_lifecycle_version,
+                    idempotency_key: idempotency_key.clone(),
+                    gate_evaluation_id: gate_evaluation_id.clone(),
+                    reason_kind: reason_kind.clone(),
+                    reason_ref: reason_ref.clone(),
                 };
-                let response: TransitionTaskResponse = client
-                    .post(&format!("/api/v1/tasks/{id}/transition"), &request)
+                let response: TaskLifecycleTransitionResponse = client
+                    .post(&format!("/api/v1/tasks/{id}/lifecycle"), &request)
                     .await?;
-                print_task(output, &response.task)
-            }
-            TaskCmd::Cancel { id } => {
-                let task: TaskResponse = client
-                    .post(&format!("/api/v1/tasks/{id}/cancel"), &json!({}))
-                    .await?;
-                print_task(output, &task)
-            }
-            TaskCmd::PromptPreview {
-                task_id,
-                role,
-                trigger,
-            } => {
-                let preview = client
-                    .prompt_preview(task_id, role, trigger.as_deref())
-                    .await?;
-                print_prompt_preview(output, &preview)
-            }
-            TaskCmd::Media(args) => args.run(client, output).await,
-        }
-    }
-}
-
-impl MediaArgs {
-    async fn run(&self, client: &ForgeClient, output: &OutputFormat) -> Result<()> {
-        match &self.cmd {
-            MediaCmd::Upload {
-                task_id,
-                file,
-                author_name,
-            } => {
-                let media = upload_media(client, task_id, file, author_name.as_deref()).await?;
-                print_media(output, &media)
-            }
-            MediaCmd::Comment {
-                task_id,
-                content,
-                author_name,
-                media_url,
-            } => {
-                let comment = create_media_comment(
-                    client,
-                    task_id,
-                    content,
-                    author_name.as_deref(),
-                    media_url,
-                )
-                .await?;
-                print_json(&comment)
+                match output {
+                    OutputFormat::Json => print_json(&response),
+                    OutputFormat::Table => {
+                        println!(
+                            "task {} lifecycle={} version={} transition={}",
+                            response.task_id,
+                            serde_json::to_value(response.lifecycle.state)?
+                                .as_str()
+                                .unwrap_or("unknown"),
+                            response.lifecycle.version,
+                            response.transition_id.as_deref().unwrap_or("replayed")
+                        );
+                        Ok(())
+                    }
+                }
             }
         }
     }
 }
 
-async fn upload_media(
-    client: &ForgeClient,
-    task_id: &str,
-    file: &Path,
-    author_name: Option<&str>,
-) -> Result<TaskMediaResponse> {
-    let mut form = Form::new()
-        .file("file", file)
-        .await
-        .with_context(|| format!("read media file {}", file.display()))?;
-    if let Some(author_name) = non_empty_author(author_name) {
-        form = form.text("author_name", author_name.to_owned());
-    }
-
-    client
-        .post_multipart(&format!("/api/v1/tasks/{task_id}/media"), form)
-        .await
-}
-
-async fn create_media_comment(
-    client: &ForgeClient,
-    task_id: &str,
-    content: &str,
-    author_name: Option<&str>,
-    media_urls: &[String],
-) -> Result<CommentResponse> {
-    let request = CreateCommentRequest {
-        content: comment_content_with_media(content, media_urls),
-        author_name: non_empty_author(author_name).unwrap_or("Agent").to_owned(),
-    };
-    client
-        .post(&format!("/api/v1/tasks/{task_id}/comments"), &request)
-        .await
-}
-
-fn task_list_path(project_id: &str, status: Option<&str>, limit: Option<i64>) -> String {
+fn task_list_path(project_id: &str, lifecycle_state: Option<&str>, limit: Option<i64>) -> String {
     let mut params = Vec::new();
-    if let Some(status) = status {
-        params.push(format!("status={status}"));
+    if let Some(state) = lifecycle_state {
+        params.push(format!("lifecycle_state={state}"));
     }
     if let Some(limit) = limit {
         params.push(format!("limit={limit}"));
     }
-
     if params.is_empty() {
         format!("/api/v1/projects/{project_id}/tasks")
     } else {
@@ -278,102 +406,4 @@ fn print_task(output: &OutputFormat, task: &TaskResponse) -> Result<()> {
             Ok(())
         }
     }
-}
-
-fn print_media(output: &OutputFormat, media: &TaskMediaResponse) -> Result<()> {
-    match output {
-        OutputFormat::Json => print_json(media),
-        OutputFormat::Table => {
-            println!(
-                "{}  {}  {}  {}",
-                media.id, media.content_type, media.byte_size, media.url
-            );
-            Ok(())
-        }
-    }
-}
-
-fn print_prompt_preview(output: &OutputFormat, preview: &PromptPreviewResponse) -> Result<()> {
-    match output {
-        OutputFormat::Json => print_json(preview),
-        OutputFormat::Table => {
-            println!("System:\n{}\n", preview.system);
-            println!("User:\n{}\n", preview.user);
-            let tools = preview
-                .tools
-                .as_ref()
-                .filter(|tools| !tools.is_empty())
-                .map(|tools| tools.join(", "))
-                .unwrap_or_else(|| "none".to_owned());
-            println!("Tools:\n{tools}");
-            Ok(())
-        }
-    }
-}
-
-fn non_empty_author(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
-}
-
-fn comment_content_with_media(content: &str, media_urls: &[String]) -> String {
-    if media_urls.is_empty() {
-        return content.to_owned();
-    }
-
-    let mut rendered = content.to_owned();
-    if !rendered.ends_with('\n') {
-        rendered.push('\n');
-    }
-    rendered.push('\n');
-    for media_url in media_urls {
-        rendered.push_str(&media_markdown(media_url));
-        rendered.push('\n');
-    }
-    rendered
-}
-
-fn media_markdown(media_url: &str) -> String {
-    match media_extension(media_url).as_deref() {
-        Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "svg") => {
-            format!("![media]({media_url})")
-        }
-        Some("mp4" | "webm" | "mov") => {
-            format!(
-                "<video src=\"{}\" controls></video>",
-                html_attr_escape(media_url)
-            )
-        }
-        _ => format!("[media]({media_url})"),
-    }
-}
-
-fn media_extension(media_url: &str) -> Option<String> {
-    let path = url::Url::parse(media_url)
-        .ok()
-        .map(|url| url.path().to_owned())
-        .unwrap_or_else(|| {
-            media_url
-                .split(['?', '#'])
-                .next()
-                .unwrap_or(media_url)
-                .to_owned()
-        });
-    Path::new(&path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-}
-
-fn html_attr_escape(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '"' => escaped.push_str("&quot;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            _ => escaped.push(character),
-        }
-    }
-    escaped
 }

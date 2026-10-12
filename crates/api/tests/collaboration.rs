@@ -68,7 +68,10 @@ async fn generic_api_derives_sender_authorizes_ids_and_hides_content_ref() {
     let artifact: ArtifactResponse = serde_json::from_value(value).expect("Artifact response");
     assert_eq!(
         artifact.producer,
-        api_types::ActorRef::Human("test-user-id".to_owned())
+        api_types::ArtifactProducer::Execution {
+            execution_id: execution_id.to_owned(),
+            actor: api_types::ActorRef::Human("test-user-id".to_owned()),
+        }
     );
     let artifact_detail: Value = empty_request(
         &harness.app,

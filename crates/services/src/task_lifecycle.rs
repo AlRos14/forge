@@ -99,6 +99,37 @@ impl TaskLifecycleService {
         &self,
         input: TransitionLifecycleInput,
     ) -> Result<TaskLifecycleTransitionResult> {
+        self.transition_inner(input, None).await
+    }
+
+    /// Apply an externally requested transition against the exact public
+    /// TaskLifecycle version. The Task row still has its own transactional
+    /// version check, but clients do not use it as lifecycle authority.
+    pub async fn transition_at_lifecycle_version(
+        &self,
+        input: TransitionLifecycleInput,
+        expected_lifecycle_version: i64,
+    ) -> Result<TaskLifecycleTransitionResult> {
+        self.transition_inner(input, Some(expected_lifecycle_version))
+            .await
+    }
+
+    async fn transition_inner(
+        &self,
+        input: TransitionLifecycleInput,
+        expected_lifecycle_version: Option<i64>,
+    ) -> Result<TaskLifecycleTransitionResult> {
+        match (&input.reason_kind, &input.reason_ref) {
+            (None, None) => {}
+            (Some(kind), Some(reference))
+                if !kind.trim().is_empty() && !reference.trim().is_empty() => {}
+            _ => {
+                return Err(ServiceError::Domain(
+                    "reason_kind and reason_ref must be supplied together and be non-empty"
+                        .to_owned(),
+                ));
+            }
+        }
         self.validate_cause(&input.task_id, &input.cause).await?;
         let cause = lifecycle_cause(input.cause);
         // Resolve the durable receipt first. This lets a retry after a crash
@@ -109,7 +140,10 @@ impl TaskLifecycleService {
             db::TaskLifecycleTransitionIdentity {
                 task_id: input.task_id.clone(),
                 idempotency_key: input.idempotency_key.clone(),
-                expected_task_version: input.expected_task_version,
+                expected_task_version: expected_lifecycle_version
+                    .is_none()
+                    .then_some(input.expected_task_version),
+                expected_lifecycle_version,
                 to_state: input.to_state,
                 cause_kind: cause.kind.clone(),
                 cause_ref: cause.cause_ref.clone(),
@@ -131,6 +165,9 @@ impl TaskLifecycleService {
                 lifecycle,
                 transition: Some(transition),
             });
+        }
+        if expected_lifecycle_version.is_some_and(|expected| lifecycle.version != expected) {
+            return Err(ServiceError::Db(db::DbError::VersionConflict));
         }
         if matches!(
             input.to_state,

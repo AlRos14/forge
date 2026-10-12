@@ -3,7 +3,6 @@ import type { ProviderSupportLevel } from "./ProviderSupportLevel";
 
 export type ProviderRuntimeCapability = { 
 /**
- * `direct` for the embedded native adapter, or a harness executor type
- * such as `codex` or `gemini`.
+ * A supported external harness executor type such as `codex` or `gemini`.
  */
 runtime: string, support_level: ProviderSupportLevel, reason: string | null, };

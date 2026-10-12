@@ -39,6 +39,7 @@ pub enum Actor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UserActionSource {
     Api,
+    Mcp,
     BoardDrag,
     Board,
     Override(Box<UserActionSource>),
@@ -141,6 +142,7 @@ impl fmt::Display for UserActionSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Api => f.write_str("api"),
+            Self::Mcp => f.write_str("mcp"),
             Self::BoardDrag => f.write_str("board_drag"),
             Self::Board => f.write_str("board"),
             Self::Override(source) => write!(f, "override:{source}"),

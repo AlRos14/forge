@@ -795,6 +795,7 @@ pub struct RoleMembershipResponse {
     pub task_role_id: String,
     pub actor_ref: ActorRef,
     pub status: RoleMembershipStatus,
+    #[ts(type = "number")]
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -811,6 +812,7 @@ pub struct TaskRoleResponse {
     pub coordination_mode: Option<CoordinationMode>,
     #[ts(type = "Record<string, unknown>")]
     pub policy: serde_json::Value,
+    #[ts(type = "number")]
     pub version: i64,
     pub members: Vec<RoleMembershipResponse>,
     pub created_at: String,
@@ -832,6 +834,7 @@ pub struct CreateTaskRoleRequest {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct UpdateTaskRoleRequest {
+    #[ts(type = "number")]
     pub expected_version: i64,
     pub coordination_mode: Option<CoordinationMode>,
     #[serde(default)]
@@ -850,6 +853,7 @@ pub struct AddRoleMembershipRequest {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct UpdateRoleMembershipRequest {
+    #[ts(type = "number")]
     pub expected_version: i64,
     pub status: RoleMembershipStatus,
 }

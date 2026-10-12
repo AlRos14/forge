@@ -27,14 +27,7 @@ impl ProjectArgs {
     pub async fn run(&self, client: &ForgeClient, output: &OutputFormat) -> Result<()> {
         match &self.cmd {
             ProjectCmd::Create { name } => {
-                let request = CreateProjectRequest {
-                    name: name.clone(),
-                    settings: None,
-                    default_review_config: None,
-                    paused: None,
-                    project_agent_identity_id: None,
-                    project_agent_profile_id: None,
-                };
+                let request = CreateProjectRequest { name: name.clone() };
                 let project: ProjectResponse = client.post("/api/v1/projects", &request).await?;
                 print_project(output, &project)
             }

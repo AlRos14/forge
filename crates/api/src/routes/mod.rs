@@ -1,41 +1,29 @@
-use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
-};
+use std::str::FromStr;
 
 use api_types::{
     parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
-    ProjectResponse, RepoResponse, RoleMembershipResponse, RoleMembershipStatus, Task as ApiTask,
-    TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse,
+    ProjectResponse, RepoResponse, RoleMembershipResponse, RoleMembershipStatus, TaskResponse,
     TaskRoleResponse, TaskType, WorkspaceResponse,
 };
 use db::{
     ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, Page, PageRequest,
-    Project, ProjectRepo, Repo, RoleMembership, RoleMembershipRepo, SortBy, SortOrder, Task,
-    TaskRoleAssignment, TaskRoleAssignmentRepo, TaskRoleRepo, Workspace, WorkspaceRepo,
+    Project, Repo, RoleMembership, RoleMembershipRepo, SortBy, SortOrder, Task, TaskLifecycleRepo,
+    TaskLifecycleState as DbTaskLifecycleState, TaskRoleRepo, Workspace, WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use services::workflow::engine::WorkflowEngine;
-use services::{
-    task_diagnostics::{derive_workflow_exception, derive_workflow_health},
-    task_service::action_resolver::resolve_execution_actions_with_session_state,
-};
 use sqlx::Row;
 
 use crate::errors::{ApiError, ApiResult};
 
 pub mod admin;
-pub mod agent_chats;
+pub mod agent_profiles;
 pub mod agents;
 pub mod auth;
 pub mod clis;
 pub mod collaboration;
-pub mod coordination;
 pub mod daemons;
-pub mod embedded_agents;
 pub mod events;
-pub mod execution_baseline;
 pub mod executions;
 pub mod executor_types;
 pub mod external_links;
@@ -43,62 +31,21 @@ pub mod fs;
 pub mod integrations;
 pub mod mcp_config;
 pub mod members;
-pub mod memory;
-pub mod milestones;
-pub mod mission_control;
 pub mod notifications;
 pub mod oauth;
 pub mod operations;
-pub mod product_genesis;
-pub mod project_agents;
-pub mod project_charters;
-pub mod project_documents;
 pub mod project_media;
-pub mod project_orchestration;
-pub mod project_overview;
+pub mod project_releases;
 pub mod projects;
 pub mod provider_authorizations;
 pub mod providers;
 pub mod repos;
 pub mod reviews;
-pub mod scoped_memory;
 pub mod settings;
 pub mod tasks;
 pub mod terminals;
 pub mod work_units;
-pub mod workflow;
-pub mod workflow_templates;
 pub mod workspaces;
-
-const SCOPED_IDEMPOTENCY_PREFIX: &str = "forge-idem-v1";
-
-pub(crate) fn scoped_idempotency_key(
-    operation: &str,
-    project_id: &str,
-    principal_id: &str,
-    client_key: &str,
-) -> String {
-    format!(
-        "{SCOPED_IDEMPOTENCY_PREFIX}:{}:{}:{}:{client_key}",
-        hex::encode(operation),
-        hex::encode(project_id),
-        hex::encode(principal_id),
-    )
-}
-
-pub(crate) fn client_idempotency_key(stored_key: &str) -> String {
-    let mut parts = stored_key.splitn(5, ':');
-    if parts.next() == Some(SCOPED_IDEMPOTENCY_PREFIX)
-        && parts.next().is_some()
-        && parts.next().is_some()
-        && parts.next().is_some()
-    {
-        if let Some(client_key) = parts.next() {
-            return client_key.to_owned();
-        }
-    }
-    stored_key.to_owned()
-}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListParams {
@@ -108,11 +55,8 @@ pub struct ListParams {
     pub q: Option<String>,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
-    pub status: Option<String>,
-    pub canonical_phase: Option<String>,
-    pub agent_id: Option<String>,
-    pub assignee_type: Option<String>,
-    pub assignee_id: Option<String>,
+    pub status: Option<String>, // Agent status filter; Task filters use lifecycle_state.
+    pub lifecycle_state: Option<String>,
     pub include_archived: Option<bool>,
     pub include_cancelled: Option<bool>,
     pub task_type: Option<String>,
@@ -163,11 +107,6 @@ pub fn paginated<T, U>(page: Page<T>, map: impl Fn(T) -> U) -> PaginatedResponse
 }
 
 pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
-    let settings = parse_json_value(project.settings);
-    let default_review_config = settings
-        .get("default_review_config")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok());
     let project_hooks = parse_project_hooks_json(&project.project_hooks_json).map_err(|error| {
         ApiError::internal(format!(
             "invalid persisted project hooks for project {}: {error}",
@@ -177,22 +116,13 @@ pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
     Ok(ProjectResponse {
         id: project.id,
         name: project.name,
-        settings,
         project_hooks,
-        default_review_config,
         primary_repo_id: project.primary_repo_id,
         owner_id: project.owner_id,
         created_at: project.created_at,
         updated_at: project.updated_at,
-        workflow_template_name: project.workflow_template_name,
         paused_at: project.paused_at.clone(),
         paused: project.paused_at.is_some(),
-        charter_status: project.charter_status,
-        charter_setup_required: project.charter_setup_required,
-        current_charter_id: project.current_charter_id,
-        current_charter_revision_id: project.current_charter_revision_id,
-        current_charter_version: project.current_charter_version,
-        primary_milestone_id: project.primary_milestone_id,
         version: project.version,
     })
 }
@@ -221,222 +151,39 @@ fn repo_work_mode_response(work_mode: db::WorkMode) -> api_types::WorkMode {
 }
 
 pub async fn task_response(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
-    let latest_execution = latest_diagnostic_execution(db, &task.id).await?;
-    task_response_inner(db, task, true, false, latest_execution).await
+    task_response_inner(db, task).await
 }
 
 pub async fn task_response_light(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
-    let latest_execution = latest_diagnostic_execution(db, &task.id).await?;
-    task_response_inner(db, task, false, false, latest_execution).await
+    task_response_inner(db, task).await
 }
 
-pub async fn task_response_with_awaiting_human(
-    db: &db::SqliteDb,
-    task: Task,
-    awaiting_human: bool,
-) -> ApiResult<TaskResponse> {
-    let latest_execution = latest_diagnostic_execution(db, &task.id).await?;
-    task_response_inner(db, task, true, awaiting_human, latest_execution).await
-}
-
-pub(crate) async fn task_response_light_with_latest(
-    db: &db::SqliteDb,
-    task: Task,
-    latest_execution: Option<Execution>,
-) -> ApiResult<TaskResponse> {
-    task_response_inner(db, task, false, false, latest_execution).await
-}
-
-async fn latest_diagnostic_execution(
-    db: &db::SqliteDb,
-    task_id: &str,
-) -> std::result::Result<Option<Execution>, db::DbError> {
-    let task_ids = [task_id];
-    let mut executions = db::ExecutionRepo::list_latest_executions_for_tasks(db, &task_ids).await?;
-    Ok(executions.pop())
-}
-
-async fn task_response_inner(
-    db: &db::SqliteDb,
-    task: Task,
-    include_actions: bool,
-    awaiting_human: bool,
-    latest_execution: Option<Execution>,
-) -> ApiResult<TaskResponse> {
-    let task_role_assignments = TaskRoleAssignmentRepo::list_by_task(db, &task.id).await?;
-    let role_assignments = task_role_assignments
-        .iter()
-        .cloned()
-        .map(task_role_assignment_response)
-        .collect();
+async fn task_response_inner(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
     let task_roles = task_roles_response(db, &task.id, false).await?;
-    let compatibility_assignee = task_roles
-        .iter()
-        .find(|role| role.role == "implementer")
-        .map(|role| {
-            role.members
-                .iter()
-                .filter(|member| member.status == RoleMembershipStatus::Active)
-                .min_by_key(|member| {
-                    (
-                        match &member.actor_ref {
-                            api_types::ActorRef::Agent(_) => 0_u8,
-                            api_types::ActorRef::Human(_) => 1_u8,
-                        },
-                        member.created_at.clone(),
-                        member.id.clone(),
-                    )
-                })
-                .map(|member| match &member.actor_ref {
-                    api_types::ActorRef::Agent(id) => (Some("agent".to_owned()), Some(id.clone())),
-                    api_types::ActorRef::Human(id) => (Some("user".to_owned()), Some(id.clone())),
-                })
-        });
-    let (assignee_type, assignee_id) = match compatibility_assignee {
-        Some(assignee) => assignee.unwrap_or((None, None)),
-        None => (task.assignee_type.clone(), task.assignee_id.clone()),
-    };
-
-    let project = ProjectRepo::get_by_id(db, &task.project_id)
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(db, &task.id)
         .await?
-        .ok_or_else(|| ApiError::not_found("project", task.project_id.clone()))?;
-    let workflow = WorkflowEngine::resolve_workflow_for_task(
-        &task,
-        &project.workflow_definition,
-        &api_types::Actor::system(api_types::SystemComponent::General),
-    );
-    let canonical_phase = workflow.canonical_phase_for_state(&task.status);
-    let remaining_retries: HashMap<String, i64> = HashMap::new();
-    let workspace_model = WorkspaceRepo::get_by_task_id(db, &task.id).await?;
-    let current_workspace_id = workspace_model
-        .as_ref()
-        .map(|workspace| workspace.id.clone());
-    let (plan_progress, plan_artifact) = if include_actions {
-        plan_artifact_response(db, &task.id).await?
-    } else {
-        (None, None)
+        .ok_or_else(|| ApiError::not_found("task lifecycle", task.id.clone()))?;
+    let lifecycle = api_types::TaskLifecycleResponse {
+        task_id: lifecycle.task_id,
+        state: match lifecycle.state {
+            DbTaskLifecycleState::Backlog => api_types::TaskLifecycleState::Backlog,
+            DbTaskLifecycleState::Ready => api_types::TaskLifecycleState::Ready,
+            DbTaskLifecycleState::Active => api_types::TaskLifecycleState::Active,
+            DbTaskLifecycleState::Blocked => api_types::TaskLifecycleState::Blocked,
+            DbTaskLifecycleState::ReadyToMerge => api_types::TaskLifecycleState::ReadyToMerge,
+            DbTaskLifecycleState::Merging => api_types::TaskLifecycleState::Merging,
+            DbTaskLifecycleState::Done => api_types::TaskLifecycleState::Done,
+            DbTaskLifecycleState::Cancelled => api_types::TaskLifecycleState::Cancelled,
+        },
+        version: lifecycle.version,
+        reason_kind: lifecycle.reason_kind,
+        reason_ref: lifecycle.reason_ref,
+        created_at: lifecycle.created_at,
+        updated_at: lifecycle.updated_at,
     };
-    let workspace = workspace_model.map(workspace_response);
-    let mut error_annotation = task.error_annotation.as_deref().map(|s| {
-        serde_json::from_str::<TaskAnnotation>(s)
-            .unwrap_or_else(|_| TaskAnnotation::Legacy(parse_json_value(s)))
-    });
-    let mut diagnostic_task = task.clone();
-    if let Some(TaskAnnotation::Blocking(annotation)) = error_annotation.as_mut() {
-        services::task_diagnostics::filter_retired_workflow_recovery_actions(
-            &mut annotation.recovery_actions,
-        );
-        diagnostic_task.error_annotation = Some(
-            serde_json::to_string(&TaskAnnotation::Blocking(annotation.clone()))
-                .map_err(|error| ApiError::internal(error.to_string()))?,
-        );
-        if annotation
-            .recovery_actions
-            .contains(&api_types::RecoveryAction::ResumeSession)
-        {
-            let resumable = annotation_session_is_resumable(
-                db,
-                annotation,
-                latest_execution.as_ref(),
-                current_workspace_id.as_deref(),
-            )
-            .await?;
-            filter_resume_session_action(annotation, resumable);
-            if !resumable {
-                diagnostic_task.error_annotation = Some(
-                    serde_json::to_string(&TaskAnnotation::Blocking(annotation.clone()))
-                        .map_err(|error| ApiError::internal(error.to_string()))?,
-                );
-            }
-        }
-    }
-    let mut blocked_metadata_annotation = blocked_metadata_annotation(&task);
-    if let Some(annotation) = blocked_metadata_annotation.as_mut() {
-        services::task_diagnostics::filter_retired_workflow_recovery_actions(
-            &mut annotation.recovery_actions,
-        );
-        if annotation
-            .recovery_actions
-            .contains(&api_types::RecoveryAction::ResumeSession)
-        {
-            let resumable = annotation_session_is_resumable(
-                db,
-                annotation,
-                latest_execution.as_ref(),
-                current_workspace_id.as_deref(),
-            )
-            .await?;
-            filter_resume_session_action(annotation, resumable);
-        }
-    }
-    let error_blocking_annotation = match error_annotation.as_ref() {
-        Some(TaskAnnotation::Blocking(annotation)) => Some(annotation),
-        _ => None,
-    };
-    let execution_actions = if include_actions {
-        let executions = db::ExecutionRepo::list_by_task(
-            db,
-            &task.id,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
+    let workspace = WorkspaceRepo::get_by_task_id(db, &task.id)
         .await?
-        .items;
-        let blocking_annotation = blocked_metadata_annotation
-            .as_ref()
-            .or(error_blocking_annotation);
-        let mut resumable_execution_ids = HashSet::new();
-        for execution in executions
-            .iter()
-            .filter(|execution| execution.work_unit_id.is_none())
-        {
-            let expected_agent_id = match execution.actor_ref() {
-                Some(db::ActorRef::Agent(agent_id)) => Some(agent_id),
-                _ => None,
-            };
-            if services::task_service::resumable_external_session(
-                db,
-                execution,
-                expected_agent_id.as_deref(),
-                current_workspace_id.as_deref(),
-            )
-            .await?
-            .is_some()
-            {
-                resumable_execution_ids.insert(execution.id.clone());
-            }
-        }
-        resolve_execution_actions_with_session_state(
-            &task,
-            &workflow,
-            &executions,
-            blocking_annotation,
-            Some(&resumable_execution_ids),
-        )
-    } else {
-        Vec::new()
-    };
-    let workflow_exception = derive_workflow_exception(
-        &diagnostic_task,
-        &workflow,
-        None,
-        latest_execution.as_ref(),
-        &remaining_retries,
-    );
-    let workflow_health = Some(derive_workflow_health(
-        &task,
-        &workflow,
-        &task_role_assignments,
-        None,
-        latest_execution.as_ref(),
-        awaiting_human,
-        workflow_exception.as_ref(),
-    ));
+        .map(workspace_response);
     let execution_observability = task_execution_observability(db, &task.id).await?;
     let external_link = db::ExternalLinkRepo::get_by_task_id(db, &task.id).await?;
 
@@ -445,137 +192,22 @@ async fn task_response_inner(
         project_id: task.project_id,
         repo_id: task.repo_id,
         parent_task_id: task.parent_task_id.clone(),
-        assignee_type,
-        assignee_id,
         title: task.title,
         description: task.description,
         task_type: parse_task_type(&task.task_type),
-        status: task.status,
-        canonical_phase,
-        awaiting_human,
+        lifecycle,
         priority: task.priority,
         board_position: task.board_position,
         subtask_order: task.subtask_order,
-        role_assignments,
         task_roles,
-        remaining_retries,
-        execution_actions,
-        error_annotation,
-        blocked: task
-            .blocked_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok()),
-        failed: task
-            .failed_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok()),
-        workflow_health,
-        workflow_exception,
         execution_observability,
-        task_state_config: task.task_state_config.map(parse_json_value),
-        // Kept in the public response shape during the PR13 storage cleanup;
-        // this field is no longer projected as a current Review decision.
-        review_passed_at: None,
-        archived_at: task.archived_at,
         workspace,
-        plan_progress,
-        plan_artifact,
         external_issue_number: external_link.as_ref().map(|link| link.remote_issue_number),
         external_issue_url: external_link.as_ref().map(|link| link.remote_url.clone()),
         version: task.version,
         created_at: task.created_at,
         updated_at: task.updated_at,
     })
-}
-
-fn blocked_metadata_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
-    let metadata: Value = serde_json::from_str(task.blocked_json.as_deref()?).ok()?;
-    let kind = metadata
-        .get("kind")
-        .cloned()
-        .and_then(|kind| serde_json::from_value::<api_types::FailureKind>(kind).ok())
-        .unwrap_or(api_types::FailureKind::Unknown);
-    let reason = metadata
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("Task is blocked")
-        .to_owned();
-    let execution_id = metadata
-        .get("execution_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let recovery_actions = metadata
-        .get("recovery_actions")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default();
-
-    Some(TaskBlockingAnnotation {
-        annotation_type: kind,
-        blocking_reason: reason.clone(),
-        blocked_by: Some(
-            metadata
-                .get("blocked_by")
-                .and_then(Value::as_str)
-                .unwrap_or("system")
-                .to_owned(),
-        ),
-        blocked_at: metadata
-            .get("created_at")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        blocked_execution_id: execution_id.clone(),
-        artifact: execution_id.map(|id| api_types::BlockingArtifact {
-            kind: "execution".to_owned(),
-            id: Some(id),
-            log_path: None,
-        }),
-        message: Some(reason),
-        hook: metadata.get("hook").cloned(),
-        recovery_actions,
-    })
-}
-
-async fn annotation_session_is_resumable(
-    db: &db::SqliteDb,
-    annotation: &TaskBlockingAnnotation,
-    latest_execution: Option<&Execution>,
-    workspace_id: Option<&str>,
-) -> ApiResult<bool> {
-    let execution_id = annotation
-        .blocked_execution_id
-        .as_deref()
-        .or_else(|| latest_execution.map(|execution| execution.id.as_str()));
-    let Some(execution_id) = execution_id else {
-        return Ok(false);
-    };
-    let execution = match latest_execution.filter(|execution| execution.id == execution_id) {
-        Some(execution) => execution.clone(),
-        None => match db::ExecutionRepo::get_by_id(db, execution_id).await? {
-            Some(execution) => execution,
-            None => return Ok(false),
-        },
-    };
-    let expected_agent_id = match execution.actor_ref() {
-        Some(db::ActorRef::Agent(agent_id)) => Some(agent_id),
-        _ => None,
-    };
-    Ok(services::task_service::resumable_external_session(
-        db,
-        &execution,
-        expected_agent_id.as_deref(),
-        workspace_id,
-    )
-    .await?
-    .is_some())
-}
-
-fn filter_resume_session_action(annotation: &mut TaskBlockingAnnotation, resumable: bool) {
-    if !resumable {
-        annotation
-            .recovery_actions
-            .retain(|action| *action != api_types::RecoveryAction::ResumeSession);
-    }
 }
 
 async fn task_execution_observability(
@@ -605,25 +237,6 @@ async fn task_execution_observability(
                   END) - CAST(strftime('%s', created_at) AS INTEGER),
                  0), 0)), 0)
               FROM task_executions) AS total_runtime_seconds,
-             (SELECT id FROM task_executions WHERE work_unit_id IS NULL AND status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_execution_id,
-             (SELECT role FROM task_executions WHERE work_unit_id IS NULL AND status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_role,
-             (SELECT created_at FROM task_executions WHERE work_unit_id IS NULL AND status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_started_at,
-             (SELECT max(COALESCE(
-                 CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER),
-                 0), 0)
-              FROM task_executions WHERE work_unit_id IS NULL AND status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1) AS active_elapsed_seconds,
-             (SELECT id FROM task_executions WHERE work_unit_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_execution_id,
-             (SELECT status FROM task_executions WHERE work_unit_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_execution_status,
-             (SELECT role FROM task_executions WHERE work_unit_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_role,
-             (SELECT created_at FROM task_executions WHERE work_unit_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_started_at,
-             (SELECT stopped_at FROM task_executions WHERE work_unit_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_stopped_at,
-             (SELECT max(COALESCE(
-                 (CASE
-                     WHEN status = 'running' THEN CAST(strftime('%s', 'now') AS INTEGER)
-                     ELSE CAST(strftime('%s', COALESCE(stopped_at, updated_at)) AS INTEGER)
-                  END) - CAST(strftime('%s', created_at) AS INTEGER),
-                 0), 0)
-              FROM task_executions WHERE work_unit_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_runtime_seconds,
              usage_totals.total_input_tokens,
              usage_totals.total_output_tokens,
              usage_totals.total_cache_read_tokens,
@@ -641,20 +254,6 @@ async fn task_execution_observability(
     let total_cache_write_tokens = row.try_get::<i64, _>("total_cache_write_tokens")?;
     Ok(api_types::TaskExecutionObservability {
         execution_count: row.try_get("execution_count")?,
-        active_execution_id: row.try_get("active_execution_id")?,
-        active_role: row.try_get("active_role")?,
-        active_started_at: row.try_get("active_started_at")?,
-        active_elapsed_seconds: row
-            .try_get::<Option<i64>, _>("active_elapsed_seconds")?
-            .map(|value| value as f64),
-        latest_execution_id: row.try_get("latest_execution_id")?,
-        latest_execution_status: row.try_get("latest_execution_status")?,
-        latest_role: row.try_get("latest_role")?,
-        latest_started_at: row.try_get("latest_started_at")?,
-        latest_stopped_at: row.try_get("latest_stopped_at")?,
-        latest_runtime_seconds: row
-            .try_get::<Option<i64>, _>("latest_runtime_seconds")?
-            .map(|value| value as f64),
         total_runtime_seconds: row.try_get::<i64, _>("total_runtime_seconds")? as f64,
         total_input_tokens,
         total_output_tokens,
@@ -675,57 +274,6 @@ fn parse_task_type(task_type: &str) -> TaskType {
         "review" => TaskType::Review,
         "validation" => TaskType::Validation,
         _ => TaskType::Implementation,
-    }
-}
-
-pub fn task_wire(task: Task, agent_name: Option<String>) -> ApiTask {
-    let task_type = parse_task_type(&task.task_type);
-    let agent_id = if task.assignee_type.as_deref() == Some("agent") {
-        task.assignee_id
-    } else {
-        None
-    };
-    ApiTask {
-        id: task.id,
-        project_id: task.project_id,
-        title: task.title,
-        description: task.description,
-        status: task.status,
-        task_type,
-        priority: task.priority.try_into().unwrap_or_else(|_| {
-            if task.priority.is_negative() {
-                i32::MIN
-            } else {
-                i32::MAX
-            }
-        }),
-        board_position: task.board_position,
-        blocked: task
-            .blocked_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok()),
-        failed: task
-            .failed_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok()),
-        agent_id,
-        agent_name,
-        external_issue_number: None,
-        external_issue_url: None,
-        version: task.version,
-        updated_at: task.updated_at,
-    }
-}
-
-pub fn task_role_assignment_response(assignment: TaskRoleAssignment) -> TaskRoleAssignmentResponse {
-    TaskRoleAssignmentResponse {
-        id: assignment.id,
-        task_id: assignment.task_id,
-        role_name: assignment.role_name,
-        assignee_type: assignment.assignee_type.map(|kind| kind.to_string()),
-        assignee_id: assignment.assignee_id,
-        created_at: assignment.created_at,
-        updated_at: assignment.updated_at,
     }
 }
 
@@ -783,7 +331,7 @@ pub(crate) fn role_membership_response(member: RoleMembership) -> RoleMembership
 
 pub fn agent_response(
     agent: Agent,
-    active_task_count: Option<i64>,
+    active_execution_count: Option<i64>,
     effective_status: Option<String>,
     stats: db::AgentExecutionStats,
 ) -> AgentResponse {
@@ -792,7 +340,6 @@ pub fn agent_response(
         name: agent.name,
         description: agent.description,
         profile_id: agent.profile_id,
-        backend_kind: agent.backend_kind,
         executor_type: agent.executor_type,
         provider: agent.provider,
         model: agent.model,
@@ -805,7 +352,7 @@ pub fn agent_response(
         daemon_id: agent.daemon_id,
         max_concurrent_tasks: agent.max_concurrent_tasks,
         status: agent_status_response(agent.status),
-        active_task_count,
+        active_execution_count,
         effective_status,
         total_runs: stats.total_runs,
         avg_duration_ms: stats.avg_duration_ms,
@@ -864,12 +411,10 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
         id: execution.id,
         task_id: execution.task_id,
         actor_ref,
-        agent_id: execution.agent_id,
         role: execution.role,
-        purpose: execution.purpose.map(|purpose| purpose.to_string()),
+        purpose: execution.purpose.map(execution_purpose_response),
         status: execution_status_response(execution.status),
         parent_execution_id: execution.parent_execution_id,
-        agent_session_id: execution.agent_session_id,
         harness_session_id: execution.harness_session_id,
         prompt: execution.prompt,
         summary: execution.summary,
@@ -892,6 +437,18 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
     }
 }
 
+fn execution_purpose_response(purpose: db::ExecutionPurpose) -> api_types::ExecutionPurpose {
+    match purpose {
+        db::ExecutionPurpose::Plan => api_types::ExecutionPurpose::Plan,
+        db::ExecutionPurpose::Implement => api_types::ExecutionPurpose::Implement,
+        db::ExecutionPurpose::Review => api_types::ExecutionPurpose::Review,
+        db::ExecutionPurpose::Validate => api_types::ExecutionPurpose::Validate,
+        db::ExecutionPurpose::Investigate => api_types::ExecutionPurpose::Investigate,
+        db::ExecutionPurpose::Orchestrate => api_types::ExecutionPurpose::Orchestrate,
+        db::ExecutionPurpose::General => api_types::ExecutionPurpose::General,
+    }
+}
+
 pub async fn execution_response_with_usage(
     db: &db::SqliteDb,
     execution: Execution,
@@ -900,23 +457,6 @@ pub async fn execution_response_with_usage(
     let mut response = execution_response(execution);
     response.account_usage = execution_account_usage(db, &execution_id).await?;
     Ok(response)
-}
-
-async fn plan_artifact_response(
-    db: &db::SqliteDb,
-    task_id: &str,
-) -> ApiResult<(
-    Option<api_types::PlanProgressSummary>,
-    Option<api_types::PlanArtifactDetail>,
-)> {
-    let Some(artifact) = services::plan_artifact::latest_plan_artifact(db, task_id)
-        .await
-        .map_err(ApiError::from)?
-    else {
-        return Ok((None, None));
-    };
-    let progress = services::plan_artifact::to_plan_progress_summary(&artifact);
-    Ok((Some(progress), Some(artifact)))
 }
 
 async fn execution_account_usage(
@@ -1073,8 +613,7 @@ fn parse_task_sort_by(value: Option<&str>) -> ApiResult<SortBy> {
         "priority" => Ok(SortBy::Priority),
         "board_position" => Ok(SortBy::BoardPosition),
         "title" => Ok(SortBy::Title),
-        "status" => Ok(SortBy::Status),
-        "agent" => Ok(SortBy::Agent),
+        "lifecycle_state" => Ok(SortBy::LifecycleState),
         "task_type" => Ok(SortBy::TaskType),
         "id" => Ok(SortBy::Id),
         value => Err(ApiError::bad_request(format!("invalid sort_by: {value}"))),
@@ -1130,45 +669,5 @@ fn execution_status_response(value: db::ExecutionStatus) -> api_types::Execution
         db::ExecutionStatus::Completed => api_types::ExecutionStatus::Completed,
         db::ExecutionStatus::Failed => api_types::ExecutionStatus::Failed,
         db::ExecutionStatus::Cancelled => api_types::ExecutionStatus::Cancelled,
-    }
-}
-
-#[cfg(test)]
-mod route_projection_tests {
-    use super::{client_idempotency_key, filter_resume_session_action, scoped_idempotency_key};
-
-    #[test]
-    fn stale_resume_session_recovery_hint_is_removed_from_response_projection() {
-        let mut annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: api_types::FailureKind::ExecutorFailed,
-            blocking_reason: "executor failed".to_owned(),
-            blocked_by: None,
-            blocked_at: None,
-            blocked_execution_id: Some("ambiguous-execution".to_owned()),
-            artifact: None,
-            message: None,
-            hook: None,
-            recovery_actions: vec![
-                api_types::RecoveryAction::ResumeSession,
-                api_types::RecoveryAction::Reexecute,
-            ],
-        };
-
-        filter_resume_session_action(&mut annotation, false);
-
-        assert_eq!(
-            annotation.recovery_actions,
-            vec![api_types::RecoveryAction::Reexecute]
-        );
-    }
-
-    #[test]
-    fn idempotency_storage_keys_are_project_and_principal_scoped() {
-        let first = scoped_idempotency_key("approval", "project-a", "user-a", "same:key");
-        let other_project = scoped_idempotency_key("approval", "project-b", "user-a", "same:key");
-        let other_user = scoped_idempotency_key("approval", "project-a", "user-b", "same:key");
-        assert_ne!(first, other_project);
-        assert_ne!(first, other_user);
-        assert_eq!(client_idempotency_key(&first), "same:key");
     }
 }

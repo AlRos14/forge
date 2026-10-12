@@ -41,7 +41,7 @@ import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { productTerm } from '@/lib/i18n'
 import { useAuthStore } from '@/stores/auth'
-import type { CreateRepoRequest, Project, Repo, UpdateRepoRequest } from '@/types/generated/api'
+import type { CreateRepoRequest, Project, Repo, UpdateRepoRequest } from '@/types/generated'
 
 export function ReposTab({ project, projectId }: { project?: Project; projectId: string }) {
   const isAdmin = useAuthStore((s) => Boolean(s.user?.is_admin))
@@ -187,7 +187,7 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
               base_url:
                 nextForm.pr_provider === 'github' ? null : nextForm.pr_base_url.trim() || null,
               polling_interval_seconds: pollingInterval,
-              token: nextForm.pr_token.trim() || null,
+              ...(nextForm.pr_token.trim() ? { token: nextForm.pr_token.trim() } : {}),
             }
           : null,
     }
@@ -229,7 +229,7 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
               base_url:
                 nextForm.pr_provider === 'github' ? null : nextForm.pr_base_url.trim() || null,
               polling_interval_seconds: pollingInterval,
-              token: nextForm.pr_token.trim() || null,
+              ...(nextForm.pr_token.trim() ? { token: nextForm.pr_token.trim() } : {}),
             }
           : null,
     }

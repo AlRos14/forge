@@ -2,4 +2,4 @@
 import type { ActorRef } from "./ActorRef";
 import type { DecisionOutcome } from "./DecisionOutcome";
 
-export type DecisionResponse = { id: string, task_id: string, proposal_id: string, proposal_version: bigint, outcome: DecisionOutcome, rationale: string, policy_ref: string | null, policy_version: bigint | null, policy_digest: string | null, actors: Array<ActorRef>, created_at: string, };
+export type DecisionResponse = { id: string, task_id: string, proposal_id: string, proposal_version: number, outcome: DecisionOutcome, rationale: string, policy_ref: string | null, policy_version: number | null, policy_digest: string | null, actors: Array<ActorRef>, created_at: string, };

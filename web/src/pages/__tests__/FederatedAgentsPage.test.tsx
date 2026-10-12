@@ -2,16 +2,13 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { FederatedAgentsPage } from '@/pages/FederatedAgentsPage'
-import type { AgentChatEntry } from '@/features/agent-chat/types'
 import type { FederatedAgent } from '@/features/federation/types'
 import type {
   ProviderAuthorizationOperationResponse,
   ProviderEntryResponse,
 } from '@/types/generated'
 
-const createEmbeddedAgent = vi.fn().mockResolvedValue({})
 const registerHarnessAgent = vi.fn().mockResolvedValue({})
-const connectProfile = vi.fn().mockResolvedValue({})
 const createProviderEntry = vi.fn()
 const removeProviderEntry = vi.fn().mockResolvedValue({ provider_revocation: 'succeeded' })
 const cancelAuthorization = vi.fn().mockResolvedValue({})
@@ -56,9 +53,7 @@ vi.mock('@tanstack/react-router', () => ({
 vi.mock('@/stores/auth', () => ({
   useAuthStore: (selector: (state: { user: null }) => unknown) => selector({ user: null }),
 }))
-// The Projects section on the Bindings tab lists every project; keep it empty here.
 vi.mock('@/api/hooks', () => ({
-  useProjectsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false, refetch: vi.fn() }),
   useUpdateAgent: () => ({ mutateAsync: updateAgent, isPending: false }),
 }))
 vi.mock('@/hooks/useDiscoveredOptions', async (importOriginal) => ({
@@ -94,24 +89,19 @@ vi.mock('@/hooks/useDiscoveredOptions', async (importOriginal) => ({
   }),
 }))
 vi.mock('@/features/federation/hooks', () => ({
+  federationQueryKeys: { agents: ['agents'] },
   isVersionConflict: () => false,
   useFederatedAgentsQuery: () => ({
-    data: { items: [agent, cliAgent], has_more: false },
+    data: { items: [cliAgent], has_more: false },
     isLoading: false,
     isError: false,
     refetch: vi.fn(),
   }),
   useAgentProfilesQuery: () => ({ data: [], isLoading: false, isError: false }),
   useAgentUsageQuery: () => ({ data: undefined, isLoading: false, isError: false }),
-  useRefreshAgentUsageMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useSelectAgentProfileMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  useCreateEmbeddedAgentMutation: () => ({ mutateAsync: createEmbeddedAgent, isPending: false }),
   useRegisterHarnessAgentMutation: () => ({
     mutateAsync: registerHarnessAgent,
-    isPending: false,
-  }),
-  useConnectEmbeddedProfileMutation: () => ({
-    mutateAsync: connectProfile,
     isPending: false,
   }),
   useAgentProviderCapabilitiesQuery: () => ({
@@ -191,13 +181,6 @@ vi.mock('@/features/federation/hooks', () => ({
     isFetching: false,
     refetch: vi.fn(),
   }),
-  useProjectAgentBindingQuery: () => ({
-    data: undefined,
-    isLoading: false,
-    isError: false,
-    refetch: vi.fn(),
-  }),
-  useSetProjectAgentBindingMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useCreateProviderEntryMutation: () => ({ mutateAsync: createProviderEntry, isPending: false }),
   useRenameProviderEntryMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useRemoveProviderEntryMutation: () => ({ mutateAsync: removeProviderEntry, isPending: false }),
@@ -210,38 +193,7 @@ vi.mock('@/features/federation/hooks', () => ({
     mutateAsync: cancelAuthorization,
     isPending: false,
   }),
-  useMainAgentBindingQuery: () => ({
-    data: undefined,
-    isLoading: false,
-    isError: false,
-    refetch: vi.fn(),
-  }),
-  useSetMainAgentBindingMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }))
-vi.mock('@/features/agent-chat/hooks', () => ({
-  useAgentChatsQuery: () => ({
-    data: { items: chatEntries },
-    isLoading: false,
-    isError: false,
-    refetch: vi.fn(),
-  }),
-}))
-
-const chatEntries: AgentChatEntry[] = [
-  {
-    chat_id: 'main-chat',
-    kind: 'main',
-    project_id: null,
-    project_name: null,
-    identity_id: 'agent-1',
-    identity_name: 'Forge Guide',
-    binding_state: 'active',
-    chat_status: 'ready',
-    unread_count: 0n,
-    pending_turn_count: 0n,
-    last_message_at: null,
-  },
-]
 
 const providerEntries: ProviderEntryResponse[] = [
   {
@@ -287,44 +239,11 @@ const cliRuntimes = [
   },
 ]
 
-const agent: FederatedAgent = {
-  id: 'agent-1',
-  name: 'Forge Guide',
-  description: 'A bounded account assistant.',
-  profile_id: 'profile-1',
-  backend_kind: 'native',
-  executor_type: 'embedded',
-  provider: 'openai',
-  model: 'gpt-test',
-  reasoning_effort: null,
-  permission_policy: 'scoped_proposals',
-  prompt_template: null,
-  capabilities: ['read_account'],
-  config_json: {},
-  credential_handle_id: 'credential-1',
-  daemon_id: null,
-  max_concurrent_tasks: 1,
-  status: 'idle',
-  active_task_count: 0,
-  effective_status: 'ready',
-  total_runs: 4,
-  avg_duration_ms: 500,
-  success_rate: 1,
-  is_default: false,
-  paused: false,
-  owner_id: 'user-1',
-  visibility: 'private',
-  version: 1,
-  created_at: '2026-08-12T11:00:00Z',
-  updated_at: '2026-08-12T12:00:00Z',
-}
-
 const cliAgent: FederatedAgent = {
   id: 'agent-2',
   name: 'Codex Runner',
   description: 'A CLI-harness worker.',
   profile_id: 'profile-2',
-  backend_kind: 'harness',
   executor_type: 'codex',
   provider: 'openai',
   model: 'gpt-5-codex',
@@ -337,7 +256,7 @@ const cliAgent: FederatedAgent = {
   daemon_id: null,
   max_concurrent_tasks: 1,
   status: 'idle',
-  active_task_count: 0,
+  active_execution_count: 0,
   effective_status: 'ready',
   total_runs: 0,
   avg_duration_ms: null,
@@ -372,9 +291,7 @@ function openProvidersTab() {
 describe('FederatedAgentsPage', () => {
   beforeEach(() => {
     authorizationOperation = undefined
-    createEmbeddedAgent.mockClear()
     registerHarnessAgent.mockClear()
-    connectProfile.mockClear()
     createProviderEntry.mockClear()
     createProviderEntry.mockResolvedValue(providerEntries[1])
     removeProviderEntry.mockClear()
@@ -383,19 +300,13 @@ describe('FederatedAgentsPage', () => {
     updateAgent.mockClear()
   })
 
-  it('defaults to the agents roster and keeps bindings on their own tab', () => {
+  it('offers only providers and external harness Agents', () => {
     renderPage()
     expect(screen.getByRole('tab', { name: /agents/i }).getAttribute('aria-selected')).toBe('true')
-    expect(screen.getByText('Forge Guide')).toBeTruthy()
+    expect(screen.getAllByRole('tab')).toHaveLength(2)
+    expect(screen.queryByRole('tab', { name: /bindings/i })).toBeNull()
     expect(screen.queryByText('Main and Project Agent bindings')).toBeNull()
-    fireEvent.click(screen.getByRole('tab', { name: /bindings/i }))
-    expect(
-      screen.getByRole('tab', { name: /bindings/i }).getAttribute('aria-selected'),
-    ).toBe('true')
-    expect(screen.getByText('Main and Project Agent bindings')).toBeTruthy()
-    expect(screen.getByText('Global · Main')).toBeTruthy()
-    // The Projects section is always present on the Bindings tab, never gated on `?project=`.
-    expect(screen.getByText('Project Agent bindings')).toBeTruthy()
+    expect(screen.queryByText('Forge Guide')).toBeNull()
   })
 
   it('shows reasoning and execution policy independently and opens agent editing', () => {
@@ -471,7 +382,6 @@ describe('FederatedAgentsPage', () => {
         expect.objectContaining({ provider: 'openai', credential: 'secret-value' }),
       ),
     )
-    expect(createEmbeddedAgent).not.toHaveBeenCalled()
     expect(registerHarnessAgent).not.toHaveBeenCalled()
     expect(await screen.findByText(/is connected\. No agent was created\./)).toBeTruthy()
     await vi.waitFor(() => expect(testProviderEntry).toHaveBeenCalledWith('credential-2'))
@@ -532,25 +442,14 @@ describe('FederatedAgentsPage', () => {
     )
   })
 
-  it('creates a direct agent from a provider entry through the wizard', async () => {
+  it('does not offer Forge-owned direct runtime creation', async () => {
     renderPage()
     fireEvent.click(screen.getAllByRole('button', { name: /new agent/i })[0])
     const wizard = within(screen.getByRole('dialog'))
     fireEvent.click(wizard.getByRole('button', { name: /Openai · Work key/i }))
     expect(wizard.getByText('Codex CLI harness')).toBeTruthy()
-    fireEvent.click(wizard.getByRole('button', { name: /Direct · built-in runtime/i }))
-    fireEvent.change(wizard.getByLabelText('Agent name'), { target: { value: 'Main guide' } })
-    fireEvent.change(wizard.getByLabelText('Model'), { target: { value: 'gpt-5' } })
-    fireEvent.click(wizard.getByRole('button', { name: /create agent/i }))
-    await vi.waitFor(() =>
-      expect(createEmbeddedAgent).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'Main guide',
-          credential_id: 'credential-2',
-          model: 'gpt-5',
-        }),
-      ),
-    )
+    expect(wizard.queryByText(/Direct · built-in runtime/i)).toBeNull()
+    expect(registerHarnessAgent).not.toHaveBeenCalled()
   })
 
   it('disables incompatible runtimes with the server-provided reason', () => {

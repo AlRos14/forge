@@ -303,9 +303,9 @@ function ErrorState({
             <ArrowUpRight size={15} aria-hidden /> Retry
           </Button>
         ) : null}
-        <Link to="/projects/$projectId/overview" params={{ projectId }}>
+        <Link to="/projects/$projectId/board" params={{ projectId }}>
           <Button variant="outline">
-            <ArrowLeft size={15} aria-hidden /> Project Overview
+            <ArrowLeft size={15} aria-hidden /> Project board
           </Button>
         </Link>
       </div>
@@ -318,11 +318,11 @@ function ReleaseHeader({ release }: { release: ProjectRelease }) {
   return (
     <header className="min-w-0">
       <Link
-        to="/projects/$projectId/overview"
+        to="/projects/$projectId/board"
         params={{ projectId: release.project_id }}
         className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
-        <ArrowLeft size={13} aria-hidden /> Project Overview
+        <ArrowLeft size={13} aria-hidden /> Project board
       </Link>
       <div className="mt-4 flex min-w-0 flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
@@ -364,6 +364,11 @@ export function ProjectReleasePage({ projectId, releaseId }: { projectId: string
   return (
     <div className="mx-auto flex w-full max-w-[1100px] min-w-0 flex-col gap-5">
       <ReleaseHeader release={release} />
+
+      <p className="rounded-md border border-border-subtle bg-muted/40 px-4 py-3 text-xs leading-5 text-muted-foreground">
+        Historical immutable snapshot. It records release-time evidence and does not represent
+        current TaskLifecycle, Gate, or Project authority.
+      </p>
 
       <div className="grid min-w-0 gap-5 lg:grid-cols-[minmax(0,1.35fr)_minmax(18rem,0.65fr)]">
         <section className="min-w-0 space-y-5" aria-label="Release snapshot details">
@@ -476,8 +481,7 @@ export function ProjectReleasePage({ projectId, releaseId }: { projectId: string
             <p className="text-xs leading-5 text-muted-foreground">
               This snapshot records the exact Charter, Documents, Tasks, validation, repository
               references, baseline, source watermark, evidence projections, waivers, and known
-              issues at release time. Later Project changes update live Overview projections only;
-              they do not rewrite this history.
+              issues at release time. Later Project changes do not rewrite this history.
             </p>
             {snapshot.waived_check_ids.length > 0 ? (
               <div className="mt-3 rounded-md border border-warning/40 bg-warning/10 p-3">

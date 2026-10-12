@@ -182,6 +182,8 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
         (SortBy::BoardPosition, SortOrder::Desc) => "board_position DESC, created_at DESC, id DESC",
         (SortBy::Title, SortOrder::Asc) => "title ASC, id ASC",
         (SortBy::Title, SortOrder::Desc) => "title DESC, id DESC",
+        (SortBy::LifecycleState, SortOrder::Asc) => "(SELECT state FROM task_lifecycle WHERE task_id = task.id) ASC, id ASC",
+        (SortBy::LifecycleState, SortOrder::Desc) => "(SELECT state FROM task_lifecycle WHERE task_id = task.id) DESC, id DESC",
         (SortBy::Status, SortOrder::Asc) => "status ASC, id ASC",
         (SortBy::Status, SortOrder::Desc) => "status DESC, id DESC",
         (SortBy::Agent, SortOrder::Asc) => {

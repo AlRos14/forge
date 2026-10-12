@@ -44,7 +44,7 @@ const degradedStatus: OperatorStatusResponse = {
       daemon_id: 'daemon-1',
       workspace_id: 'workspace-active-1',
       workspace_path: '/workspaces/task-active-1',
-      session_id: 'session-1',
+      harness_session_id: 'session-1',
       started_at: '2026-04-29T11:30:00Z',
       runtime_seconds: 1800,
       elapsed_seconds: 1800,
@@ -77,7 +77,11 @@ const degradedStatus: OperatorStatusResponse = {
     {
       task_id: 'task-blocked-1',
       title: 'Blocked migration task',
-      blocked_reason: 'Waiting for reviewer handoff',
+      lifecycle_state: 'blocked',
+      lifecycle_version: 3,
+      transition_id: 'lifecycle-transition-3',
+      reason_kind: 'execution',
+      reason_ref: 'execution-4',
       blocked_since: '2026-04-29T10:00:00Z',
     },
   ],
@@ -94,7 +98,7 @@ const degradedStatus: OperatorStatusResponse = {
     {
       daemon_id: 'daemon-1',
       hostname: 'worker-01',
-      active_sessions: 2,
+      active_execution_count: 2,
       max_sessions: 4,
       at_capacity: false,
     },
@@ -104,8 +108,8 @@ const degradedStatus: OperatorStatusResponse = {
       agent_id: 'agent-1',
       agent_name: 'Agent One',
       daemon_id: 'daemon-1',
-      active_sessions: 1,
-      max_sessions: 2,
+      active_execution_count: 1,
+      max_concurrent_tasks: 2,
       at_capacity: false,
     },
   ],
@@ -183,7 +187,7 @@ describe('OperationsPage', () => {
     expect(screen.getByRole('link', { name: 'task-active-1' }).getAttribute('href')).toBe(
       '/tasks/task-active-1',
     )
-    expect(screen.getByText('2/4 completed')).toBeTruthy()
+    expect(screen.getByText('HarnessSession session-1')).toBeTruthy()
   })
 
   it('renders blocked task rows', () => {
@@ -192,7 +196,8 @@ describe('OperationsPage', () => {
     expect(screen.getByRole('link', { name: 'Blocked migration task' }).getAttribute('href')).toBe(
       '/tasks/task-blocked-1',
     )
-    expect(screen.getByText('Waiting for reviewer handoff')).toBeTruthy()
+    expect(screen.getByText('execution · execution-4')).toBeTruthy()
+    expect(screen.getByText('Blocked lifecycle v3 · transition lifecycle-transition-3')).toBeTruthy()
   })
 
   it('renders daemon issues', () => {

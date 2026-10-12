@@ -35,6 +35,7 @@ pub struct DaemonProtocolCapabilitiesRequest {}
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct DaemonProtocolCapabilities {
+    #[ts(type = "number")]
     pub schema_version: u32,
     pub features: Vec<String>,
 }
@@ -118,6 +119,7 @@ pub struct ExecutionStartParams {
     #[ts(type = "unknown")]
     pub prompt: serde_json::Value,
     pub invocation: crate::HarnessInvocation,
+    #[ts(type = "number | null")]
     pub max_turns: Option<u32>,
 }
 
@@ -146,6 +148,7 @@ pub struct ExecutionCancelResult {
 #[ts(export)]
 pub struct ExecutionLogNotification {
     pub execution_id: String,
+    #[ts(type = "number")]
     pub seq: u64,
     pub stream: String,
     pub line: String,
@@ -165,6 +168,7 @@ pub struct ExecutionLogNotification {
 #[ts(export)]
 pub struct ExecutionTerminalNotification {
     pub execution_id: String,
+    #[ts(type = "number | null")]
     pub exit_code: Option<i32>,
     pub signal: Option<String>,
     pub error: Option<String>,
@@ -216,8 +220,8 @@ pub struct RemoteResolvedCandidate {
     pub executor_type: String,
     #[ts(type = "Record<string, unknown>")]
     pub config: serde_json::Value,
-    /// Absent on pre-PR3 daemons. The server resolves absence to an explicit
-    /// all-Unknown snapshot and never inherits primary-candidate evidence.
+    // Absent on pre-PR3 daemons. The server resolves absence to an explicit
+    // all-Unknown snapshot and never inherits primary-candidate evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_capabilities: Option<crate::HarnessCapabilitiesSnapshot>,
     #[serde(default)]
@@ -235,9 +239,13 @@ pub struct RemoteRouteAttempt {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct RemoteTokenUsage {
+    #[ts(type = "number")]
     pub input_tokens: i64,
+    #[ts(type = "number")]
     pub output_tokens: i64,
+    #[ts(type = "number")]
     pub cache_read_tokens: i64,
+    #[ts(type = "number")]
     pub cache_write_tokens: i64,
     pub cost_usd: Option<f64>,
     pub model: Option<String>,
@@ -252,7 +260,9 @@ pub struct TerminalStartParams {
     pub cols: u16,
     pub shell: Option<String>,
     pub env: Option<Vec<(String, String)>>,
+    #[ts(type = "number")]
     pub idle_timeout_secs: u64,
+    #[ts(type = "number")]
     pub max_lifetime_secs: u64,
 }
 
@@ -260,6 +270,7 @@ pub struct TerminalStartParams {
 #[ts(export)]
 pub struct TerminalStartResult {
     pub session_id: String,
+    #[ts(type = "number | null")]
     pub pid: Option<u32>,
     pub started_at: String,
 }
@@ -319,6 +330,7 @@ pub struct TerminalOutputNotification {
 #[ts(export)]
 pub struct TerminalExitedNotification {
     pub session_id: String,
+    #[ts(type = "number | null")]
     pub exit_code: Option<i32>,
     pub signal: Option<String>,
     pub reason: Option<String>,

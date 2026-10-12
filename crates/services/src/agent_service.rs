@@ -344,6 +344,7 @@ impl AgentService {
                 status: Some(AgentStatus::Idle),
                 executor_type: None,
                 capabilities: capabilities_filter.unwrap_or_default(),
+                harness_only: true,
                 page: PageRequest {
                     cursor: None,
                     limit: 500,

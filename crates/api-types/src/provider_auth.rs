@@ -41,8 +41,7 @@ pub enum ProviderSupportLevel {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct ProviderRuntimeCapability {
-    /// `direct` for the embedded native adapter, or a harness executor type
-    /// such as `codex` or `gemini`.
+    /// A supported external harness executor type such as `codex` or `gemini`.
     pub runtime: String,
     pub support_level: ProviderSupportLevel,
     pub reason: Option<String>,
@@ -157,6 +156,7 @@ pub struct ProviderAuthorizationOperationResponse {
     pub authorization_url: Option<String>,
     pub user_code: Option<String>,
     pub expires_at: String,
+    #[ts(type = "number")]
     pub poll_interval_seconds: u32,
     pub credential_handle_id: Option<String>,
     pub error_code: Option<String>,
@@ -180,7 +180,7 @@ pub struct ProviderAuthorizationCallbackQuery {
 pub struct ProviderEntryAgentRef {
     pub agent_id: String,
     pub agent_name: String,
-    /// `direct` for embedded agents, otherwise the harness executor type.
+    /// The external harness executor type.
     pub runtime: String,
 }
 
@@ -267,6 +267,7 @@ pub struct RenameProviderEntryRequest {
 pub struct ProviderUsageWindow {
     pub id: String,
     pub used_percent: f64,
+    #[ts(type = "number | null")]
     pub window_minutes: Option<i64>,
     pub resets_at: Option<String>,
 }

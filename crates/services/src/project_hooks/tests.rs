@@ -7,7 +7,7 @@ use db::{
     ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus, ProjectRepo, RoleMembershipRepo,
     SqliteDb, Task, TaskRepo, UpdateDaemonReport, UpsertDaemon,
 };
-use events::EventBus;
+use events::{EventBus, EventContext, ForgeEvent};
 use serde_json::json;
 
 use crate::{NotificationService, TaskService};
@@ -490,6 +490,65 @@ async fn all_work_completed_uses_aggregate_lifecycle_over_custom_workflow_termin
     assert!(
         trigger_match.is_none(),
         "a workflow cannot make active aggregate work terminal"
+    );
+}
+
+#[tokio::test]
+async fn project_hook_rechecks_from_exact_task_lifecycle_domain_event() {
+    let (db, service) = test_service().await;
+    let project = seed_project(&db).await;
+    let task = seed_task(&db, &project.id, "todo", false).await;
+    let mut receiver = service.event_bus.subscribe();
+    let lifecycle = crate::task_lifecycle::TaskLifecycleService::new(
+        Arc::clone(&db),
+        Arc::clone(&service.event_bus),
+    );
+
+    let transition = lifecycle
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: task.id.clone(),
+            expected_task_version: task.version,
+            to_state: db::TaskLifecycleState::Active,
+            cause: crate::task_lifecycle::LifecycleCause::System(
+                api_types::SystemComponent::General,
+            ),
+            reason_kind: Some("project_hook_test".to_owned()),
+            reason_ref: Some("exact lifecycle event".to_owned()),
+            idempotency_key: format!("project-hook-lifecycle:{}", task.id),
+        })
+        .await
+        .expect("TaskLifecycle transition succeeds");
+    assert_eq!(transition.lifecycle.state, db::TaskLifecycleState::Active);
+
+    let hint = receiver.recv().await.expect("committed event hint arrives");
+    assert_eq!(hint.event_type, "domain_event.committed");
+    let (project_id, cause) = super::evaluation_cause_from_event(&service, &hint)
+        .await
+        .expect("exact DomainEvent loads")
+        .expect("TaskLifecycle change schedules aggregate hook evaluation");
+    assert_eq!(project_id, project.id);
+    assert_eq!(
+        cause,
+        EvaluationCause::TaskTransitioned {
+            task_id: task.id.clone()
+        }
+    );
+
+    let legacy_status_hint = ForgeEvent {
+        event_type: "task.status_changed".to_owned(),
+        entity_id: task.id,
+        timestamp: now_rfc3339(),
+        context: EventContext::TaskStatusChanged {
+            project_id: project.id,
+            old_status: "todo".to_owned(),
+            new_status: "in_progress".to_owned(),
+        },
+    };
+    assert!(
+        super::evaluation_cause_from_event(&service, &legacy_status_hint)
+            .await
+            .expect("legacy hint is ignored")
+            .is_none()
     );
 }
 

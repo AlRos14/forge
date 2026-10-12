@@ -9,7 +9,7 @@ import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
-import type { Daemon, WorkMode } from '@/types/generated/api'
+import type { Daemon, WorkMode } from '@/types/generated'
 import {
   ArrowCounterClockwise,
   CaretRight,

@@ -16,6 +16,7 @@ pub struct OAuthRegisterRequest {
 #[ts(export)]
 pub struct OAuthRegisterResponse {
     pub client_id: String,
+    #[ts(type = "number")]
     pub client_id_issued_at: u64,
     pub client_name: Option<String>,
     pub redirect_uris: Vec<String>,

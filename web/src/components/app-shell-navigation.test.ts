@@ -2,15 +2,11 @@ import { describe, expect, it } from 'vitest'
 import { navigationItemsForSection } from './app-shell'
 
 describe('application shell navigation contract', () => {
-  it('places the canonical Main Chat before Project navigation', () => {
-    expect(navigationItemsForSection('main').map(({ key, to }) => [key, to])).toEqual([
-      ['mainChat', '/chat'],
-    ])
+  it('exposes target Project navigation without retired workspaces', () => {
+    expect(navigationItemsForSection('main')).toEqual([])
     expect(navigationItemsForSection('project').map(({ key, to }) => [key, to])).toEqual([
-      ['overview', '/projects/$projectId/overview'],
       ['board', '/projects/$projectId/board'],
       ['tasks', '/projects/$projectId/tasks'],
-      ['agentWorkspace', '/projects/$projectId/chat'],
       ['settings', '/projects/$projectId/settings'],
     ])
   })

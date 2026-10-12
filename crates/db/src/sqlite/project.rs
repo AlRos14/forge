@@ -85,6 +85,47 @@ impl ProjectRepo for SqliteDb {
         page_from_items(items, &page, offset, total)
     }
 
+    async fn list_visible_to_user(
+        &self,
+        user_id: &str,
+        page: PageRequest,
+    ) -> Result<Page<Project>> {
+        let offset = decode_offset(&page.cursor)?;
+        let visibility_filter = "owner_id IS NULL OR owner_id = ? OR EXISTS (
+            SELECT 1 FROM project_member
+            WHERE project_member.project_id = project.id AND project_member.user_id = ?
+        )";
+        let sql = format!(
+            "SELECT {PROJECT_COLUMNS} FROM project WHERE ({visibility_filter}) ORDER BY {} LIMIT ? OFFSET ?",
+            order_clause_without_priority(&page)
+        );
+        let rows = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(user_id)
+            .bind(limit(&page) + 1)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        let items = rows
+            .into_iter()
+            .map(map_project)
+            .collect::<Result<Vec<_>>>()?;
+        let total = if page.include_total {
+            Some(
+                sqlx::query_scalar::<_, i64>(&format!(
+                    "SELECT COUNT(*) FROM project WHERE ({visibility_filter})"
+                ))
+                .bind(user_id)
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?,
+            )
+        } else {
+            None
+        };
+        page_from_items(items, &page, offset, total)
+    }
+
     async fn update(&self, input: UpdateProject) -> Result<Project> {
         let mut project = ProjectRepo::get_by_id(self, &input.id)
             .await?

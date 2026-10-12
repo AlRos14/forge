@@ -238,17 +238,73 @@ the aggregate lifecycle and Execution admission. An exact failure replay does
 not consume another attempt, and a rework fact does not release a block owned
 by an unrelated cause.
 
-`task.status` remains only as a one-way compatibility projection until PR12.
-Legacy workflow state, hooks, GateConfig, and transition-log counts do not
-advance lifecycle or authorize Gate outcomes. Stored workflow configuration,
-diagnostic projections, historical transition data, and unused recovery code
-remain bounded cleanup for PR12/PR13; the final authority audit is in the
-PR9 plan. MCP/UI/CLI projection alignment belongs to PR12, and physical legacy
-schema cleanup belongs to PR13.
+`task.status` remains only as a guarded one-way storage projection; PR12 removes
+it from Task responses, filters, sorting, CLI output, and web views. Legacy
+workflow state, hooks, GateConfig, and transition-log counts do not advance
+lifecycle or authorize Gate outcomes. Public workflow/status routes and UI are
+removed or replaced by exact TaskLifecycle transition receipts, Gate policy
+revisions/evaluations, and current TaskRole/RoleMembership records. Stored
+workflow configuration, diagnostic projections, historical transition data,
+the status column/projection, and unused recovery code remain PR13 physical
+cleanup. MCP exposes target lifecycle, Gates, review executions/reports,
+ValidationRuns, Evidence, roles/memberships, and generic collaboration through
+exact identities. Formal Review remains exactly reviewer role plus review
+purpose.
 
-MCP has no tool that reads or writes the new ReviewReport, ValidationRun, or
-deterministic Evidence authorities. Its generic task-type enum, review retry
-budget setting, and prompt preview remain configuration/projection surfaces.
+PR12 also stops applying historical `ProjectSettings.default_role_assignments`
+to newly created Tasks and removes the old state-driven lifecycle script
+runner from Execution admission and server startup. The stored settings remain
+untouched for PR13; durable generic Project hooks continue independently from
+their exact target records and DomainEvent inputs.
+
+PR12 also separates the public SSE contract from internal `EventContext`.
+Typed public events project exact durable DomainEvents and a bounded set of
+safe runtime hints; legacy status/workflow, assignment, recovery, Review-row,
+and Agent Chat contexts do not escape through SSE. `events.resync_required`
+remains a notification after subscriber lag. The EventBus remains a wake and
+delivery mechanism, never lifecycle or Gate authority.
+
+### INV-038 — Visibility is not mutation authority
+
+Project read visibility and write authority are separate checks. Owners and
+all explicit Project members, including viewers, retain the current read rule;
+ownerless system Projects retain public reads. Ordinary Project-derived
+mutations require an owner or explicit owner/admin/member membership.
+Administrative operations require owner/admin authority. Ownerless visibility
+never grants write access, and MCP Project scope only narrows the exact resource
+scope; the authenticated Human remains the authority source. Every mutable
+Project-derived REST and MCP resource must pass the same operation-appropriate
+Project authority boundary.
+
+### INV-039 — Task parent links stay inside one Project
+
+Whenever `Task.parent_task_id` is non-null, the parent and child Tasks belong to
+the same exact Project and their `repo_id` values match, including when both
+are null. Forge supports one subtask level: a parent is a root, and a Task with
+live children cannot itself become a subtask. TaskService rejects absent
+parents, cross-Project or cross-Repo links, self-parenting, cycles, nested
+parents, and moving a Task that has children. No router or MCP scope check
+substitutes for this service invariant.
+
+Every parent-backed create, batch subtask create, attach, reparent, and detach
+validates and writes inside one SQLite `BEGIN IMMEDIATE` transaction. This
+reserves SQLite's single writer before hierarchy reads, so competing
+structural requests revalidate serially. `parent_task_id` and `subtask_order`
+change together: attach and moves to another parent append to the destination
+sibling order, and detach clears both fields. An ordinary Task update leaves
+both fields untouched. A Task with live children cannot be soft-deleted; leaf
+deletion is serialized with structural writes. Project teardown deletes its
+Tasks and children together through the existing FK cascade. Repo deletion
+shares one SQLite `BEGIN IMMEDIATE` boundary between checking whether any Task
+references the Repo and mutating the Repo/Project state. If any Task row
+references it, deletion is rejected before mutation as `DbError::RepoInUse`,
+mapped by REST to `409 Conflict` with `code = repo_in_use`; the Repo,
+`Project.primary_repo_id`, and Tasks are preserved. If no Task references it,
+REST returns `204`, the Repo is deleted, and `Project.primary_repo_id` is
+cleared. Defensive FK/trigger protections may remain, but this preflight and
+conflict response are the domain/public contract. This PR does not rewrite
+legacy rows; any historical root with a non-null `subtask_order` remains a
+PR13 cleanup item if found.
 
 ## Current repository baseline
 
@@ -596,7 +652,7 @@ fallback is authorized by Plan PR0.
 | Plan PR9 | Aggregate Task lifecycle and Gates | Old workflow engine/state mapping | New lifecycle authoritative; remove workflow tables/branches in Plan PR13 |
 | Plan PR10 | External harness cognition, immutable Execution identity, and deterministic no-Workspace admission | agent-host, embedded runtime, and Forge-owned model/tool loop | The removed runtime stays retired. Task dispatch and cancellation use the Execution snapshot's exact `resolved_daemon_id`; a missing host fails closed. Task launches select credentials from the Execution snapshot; only local in-process dispatch injects them. Remote credential-backed Start fails before daemon dispatch. Agent Chat storage and provenance remain readable, but every current production adapter fails closed because none proves `permission_policy=deny` and `isolation_posture=no-filesystem`. Periodic Cursor `/usage` polling is disabled during Executions because its PTY child can leave the wrapper process group; no old snapshot is attached to the current Execution. PR11 owns vertical retirement or migration. |
 | Plan PR11 | Project/Repo/Task plus generic collaboration | Retired vertical writes/authority are database-fenced; safe history reads remain | V118; remove vertical workers/materializers and legacy authority; PR12 removes surfaces, PR13 drops storage |
-| Plan PR12 | Public surfaces over target domain | Old API/MCP/CLI/UI endpoints | Remove obsolete endpoints and UI |
+| Plan PR12 | Public REST/MCP/CLI/web/types/SSE projections over target domain | Old API/MCP/CLI/UI and EventBus vocabulary | Remove obsolete surfaces; physical storage/projection cleanup remains PR13 |
 | Plan PR13 | Destructive persistence cleanup | None if preconditions hold | Drop old schema and compatibility code |
 | Plan PR14 | Final product documentation/name | Old public branding where intentionally retained | Rename only with explicit supplied name and data discovery |
 | Plan PR15 | Reference scenarios and reliability | None | Final acceptance and documentation correction |

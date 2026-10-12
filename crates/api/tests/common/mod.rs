@@ -230,7 +230,10 @@ pub async fn poll_task_status(app: &Router, task_id: &str, expected: &str) -> Ta
             StatusCode::OK,
         )
         .await;
-        if task.status == expected {
+        let lifecycle_state = serde_json::to_value(task.lifecycle.state)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned));
+        if lifecycle_state.as_deref() == Some(expected) {
             return task;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -239,10 +242,21 @@ pub async fn poll_task_status(app: &Router, task_id: &str, expected: &str) -> Ta
 }
 
 pub fn role_assignee<'a>(task: &'a TaskResponse, role_name: &str) -> Option<&'a str> {
-    task.role_assignments
+    task.task_roles
         .iter()
-        .find(|assignment| assignment.role_name == role_name)
-        .and_then(|assignment| assignment.assignee_id.as_deref())
+        .find(|role| role.role == role_name)
+        .and_then(|role| {
+            role.members
+                .iter()
+                .find_map(|member| match &member.actor_ref {
+                    api_types::ActorRef::Agent(agent_id)
+                        if member.status == api_types::RoleMembershipStatus::Active =>
+                    {
+                        Some(agent_id.as_str())
+                    }
+                    _ => None,
+                })
+        })
 }
 
 pub async fn json_request<T>(
@@ -333,14 +347,18 @@ pub fn admin_jwt() -> String {
 }
 
 fn test_jwt_with_admin(is_admin: bool) -> String {
+    test_jwt_for_user("test-user-id", "test@example.com", is_admin)
+}
+
+pub fn test_jwt_for_user(user_id: &str, email: &str, is_admin: bool) -> String {
     use jsonwebtoken::{Algorithm, EncodingKey, Header};
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let claims = serde_json::json!({
-        "sub": "test-user-id",
-        "email": "test@example.com",
+        "sub": user_id,
+        "email": email,
         "is_admin": is_admin,
         "iat": now,
         "exp": now + 900,

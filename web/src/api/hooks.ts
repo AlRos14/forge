@@ -14,42 +14,30 @@ import {
   createPat,
   deleteNotification,
   deletePat,
-  getProjectAnalytics,
   getOperationsStatus,
   getSettings,
   getUnreadNotificationCount,
-  deleteWorkflowTemplate,
-  getWorkflowTemplate,
   listDependencies,
   listDependents,
   listMembers,
   listNotifications,
   listPats,
   listProjectHookRuns,
-  listProjectAgents,
-  listWorkflowTemplates,
   markAllNotificationsRead,
   markNotificationRead,
-  recoverTask,
   refreshOperations,
   removeDependency,
   removeMember,
-  saveWorkflowTemplate,
   updateMe,
   updateMemberRole,
   updateSettings,
 } from '@/api/client'
 import { qk } from '@/api/query-keys'
-import { getApiErrorCode } from '@/lib/api-error'
 import { useAuthStore } from '@/stores/auth'
 import type {
   Agent,
   AgentAvailability,
   AgentDiscoveredOptions,
-  AssignRoleRequest,
-  ClaimTaskRequest,
-  Comment,
-  CreateCommentRequest,
   DiffEnvelope,
   CreateAgentRequest,
   CreateProjectRequest,
@@ -59,12 +47,11 @@ import type {
   CreateTaskRequest,
   Daemon,
   Execution,
+  ExecutionLogsResponse,
   ExecutionUsage,
   ExecutorType,
   FollowUpRequest,
-  LaunchExecutionRequest,
-  LaunchExecutionResponse,
-  LogEntry,
+  StartExecutionRequest,
   McpConfigActionRequest,
   McpConfigResponse,
   OAuthApproveRequest,
@@ -72,34 +59,29 @@ import type {
   OAuthAuthorizeContext,
   PaginatedResponse,
   Project,
-  ProjectOverview,
   ProjectRelease,
   Repo,
+  CreateIntegrationRequest,
+  PatchIntegrationRequest,
+  IntegrationResponse,
   ReviewExecutionResponse,
   StartReviewExecutionRequest,
   SubmitReviewReportRequest,
   SubmitReviewReportResponse,
   ValidationRunResponse,
   Task,
-  TaskPlanHistoryResponse,
-  TaskMediaResponse,
-  TaskDecisionRequestResponse,
-  TaskRoleAssignmentResponse,
-  TransitionLogEntry,
-  TransitionTaskResponse,
-  TransitionTaskRequest,
+  TaskLifecycleState,
+  TaskLifecycleTransitionFactResponse,
+  TransitionTaskLifecycleRequest,
+  TaskLifecycleTransitionResponse,
+  GateResponse,
+  GateEvaluationResponse,
   UpdateAgentRequest,
-  SaveWorkflowTemplateRequest,
-  RecoveryAction,
   UpdateProjectRequest,
-  UpdateProjectWorkflowRequest,
   UpdateTaskRequest,
   TaskUsageSummary,
-  TestLifecycleHookRequest,
-  LifecycleHookTestResponse,
   SettingsResponse,
   UpdateSettingsRequest,
-  WorkflowDefinition,
   Workspace,
 } from '@/types/generated'
 import { recordUserInitiatedTransition } from '@/lib/notification-toast-suppression'
@@ -107,27 +89,16 @@ import { recordUserInitiatedTransition } from '@/lib/notification-toast-suppress
 type TaskSearch = {
   cursor?: string
   limit?: number
-  assignee_id?: string
-  assignee_type?: string
   q?: string
   sort_by?: string
   sort_order?: 'asc' | 'desc'
-  status?: string
-  agent_id?: string
-  include_archived?: boolean
-  include_cancelled?: boolean
+  lifecycle_state?: TaskLifecycleState | string
 }
 
 export type ExecutionLogsParams = {
   tail?: number
   from_sequence?: number
   limit?: number
-}
-
-export type ExecutionLogsResponse = {
-  items: LogEntry[]
-  has_more: boolean
-  next_sequence?: number | null
 }
 
 export type CliProjectionItem = {
@@ -149,13 +120,6 @@ export type CliProjectionItem = {
 
 export type CliProjectionResponse = {
   items: CliProjectionItem[]
-}
-
-export type PromptBuilderRegistryEntry = {
-  id: string
-  label: string
-  compatible_role_hints: string[]
-  description: string
 }
 
 function filterKey(input: TaskSearch): string {
@@ -224,26 +188,11 @@ export function useProjectQuery(projectId: string) {
   })
 }
 
-export function useProjectOverviewQuery(projectId: string) {
-  return useQuery({
-    queryKey: qk.projectOverview(projectId),
-    queryFn: () => apiFetch<ProjectOverview>(`/projects/${projectId}/overview`),
-    enabled: Boolean(projectId),
-  })
-}
-
 export function useProjectReleaseQuery(projectId: string, releaseId: string) {
   return useQuery({
     queryKey: qk.projectRelease(projectId, releaseId),
     queryFn: () => apiFetch<ProjectRelease>(`/projects/${projectId}/releases/${releaseId}`),
     enabled: Boolean(projectId && releaseId),
-  })
-}
-
-export function useProjectAnalytics(projectId: string, from?: string, to?: string) {
-  return useQuery({
-    queryKey: qk.projectAnalytics(projectId, from, to),
-    queryFn: () => getProjectAnalytics(projectId, from, to),
   })
 }
 
@@ -266,8 +215,6 @@ export function useCreateProject() {
       }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.projects })
-      void queryClient.invalidateQueries({ queryKey: ['agent-chats'] })
-      void queryClient.invalidateQueries({ queryKey: ['product-genesis', 'active'] })
     },
   })
 }
@@ -326,16 +273,6 @@ export function useDeleteProject() {
   })
 }
 
-export function useTestProjectLifecycleHook(projectId: string) {
-  return useMutation({
-    mutationFn: (body: TestLifecycleHookRequest) =>
-      apiFetch<LifecycleHookTestResponse>(`/projects/${projectId}/hooks/test`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
-  })
-}
-
 // --- Tasks ---
 
 export function useTasksQuery(projectId: string, search: TaskSearch) {
@@ -350,58 +287,10 @@ export function useTasksQuery(projectId: string, search: TaskSearch) {
   })
 }
 
-export function useAgentRecentTasks(agentId?: string, limit = 5) {
-  const search: Omit<TaskSearch, 'cursor'> = {
-    include_cancelled: true,
-    limit,
-    sort_by: 'updated_at',
-    sort_order: 'desc',
-  }
-  return useQuery({
-    queryKey: qk.agentTasks(agentId ?? '', filterKey(search)),
-    queryFn: () =>
-      apiFetch<PaginatedResponse<Task>>(`/agents/${agentId}/tasks`, {
-        search,
-      }),
-    enabled: Boolean(agentId),
-    select: (response) => response.items,
-  })
-}
-
 export function useTaskQuery(taskId: string) {
   return useQuery({
     queryKey: qk.task(taskId),
     queryFn: () => apiFetch<Task>(`/tasks/${taskId}`),
-  })
-}
-
-export function useTaskPlanQuery(taskId: string) {
-  return useQuery({
-    queryKey: qk.taskPlan(taskId),
-    queryFn: () => apiFetch<TaskPlanHistoryResponse>(`/tasks/${taskId}/plan`),
-    enabled: Boolean(taskId),
-  })
-}
-
-export function useTaskDecisionsQuery(taskId: string) {
-  return useQuery({
-    queryKey: ['tasks', taskId, 'decisions'],
-    queryFn: () => apiFetch<TaskDecisionRequestResponse[]>(`/tasks/${taskId}/decisions`),
-    enabled: Boolean(taskId),
-  })
-}
-
-export function useAnswerTaskDecision(taskId: string) {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ requestId, answers }: { requestId: string; answers: Record<string, unknown> }) =>
-      apiFetch<TaskDecisionRequestResponse>(`/tasks/${taskId}/decisions/${requestId}/answer`, {
-        method: 'POST', body: JSON.stringify({ answers }),
-      }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['tasks', taskId, 'decisions'] })
-      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
-    },
   })
 }
 
@@ -415,7 +304,6 @@ export function useCreateTask(projectId: string) {
       }),
     onSuccess: (task) => {
       void queryClient.invalidateQueries({ queryKey: qk.projectTasks(projectId) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectOverview(projectId) })
       void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
     },
   })
@@ -436,136 +324,74 @@ export function useUpdateTask() {
   })
 }
 
-type TransitionTaskMutation = {
-  taskId: string
-  body: TransitionTaskRequest
-  currentStatus?: string
-}
-
-function transitionTask(taskId: string, body: TransitionTaskRequest) {
-  return apiFetch<TransitionTaskResponse>(`/tasks/${taskId}/transition`, {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
-}
-
-export function useTransitionTask() {
+export function useTransitionTaskLifecycle() {
   const queryClient = useQueryClient()
-
   return useMutation({
-    mutationFn: async ({ taskId, body, currentStatus }: TransitionTaskMutation) => {
-      try {
-        return await transitionTask(taskId, body)
-      } catch (error) {
-        if (
-          !(error instanceof ApiError) ||
-          error.status !== 409 ||
-          getApiErrorCode(error) !== 'version_conflict' ||
-          !currentStatus
-        ) {
-          throw error
-        }
-
-        const latest = await apiFetch<Task>(`/tasks/${taskId}`)
-        if (latest.status === body.status) {
-          return { task: latest, review: null }
-        }
-        if (latest.status !== currentStatus) {
-          throw error
-        }
-        return transitionTask(taskId, { ...body, version: latest.version })
-      }
-    },
+    mutationFn: ({
+      taskId,
+      toState,
+      expectedLifecycleVersion,
+      gateEvaluationId,
+      reasonKind,
+      reasonRef,
+      idempotencyKey,
+    }: {
+      taskId: string
+      toState: TaskLifecycleState
+      expectedLifecycleVersion: number
+      gateEvaluationId?: string | null
+      reasonKind?: string | null
+      reasonRef?: string | null
+      idempotencyKey: string
+    }) => apiFetch<TaskLifecycleTransitionResponse>(`/tasks/${taskId}/lifecycle`, {
+      method: 'POST',
+      body: JSON.stringify({
+        to_state: toState,
+        expected_lifecycle_version: expectedLifecycleVersion,
+        gate_evaluation_id: gateEvaluationId ?? null,
+        reason_kind: reasonKind ?? null,
+        reason_ref: reasonRef ?? null,
+        idempotency_key: idempotencyKey,
+      } satisfies TransitionTaskLifecycleRequest),
+    }),
     onMutate: ({ taskId }) => {
       recordUserInitiatedTransition(taskId)
     },
     onSuccess: (result) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(result.task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(result.task.project_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(result.task.id) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(result.task_id) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(result.task_id) })
+      void queryClient.invalidateQueries({ queryKey: qk.lifecycleTransitions(result.task_id) })
+      void queryClient.invalidateQueries({
+        predicate: (query) => query.queryKey[0] === 'projects' && query.queryKey[2] === 'tasks',
+      })
     },
   })
 }
 
-type GateDecisionRequest = {
-  version: Task['version']
-  reason?: string | null
-}
-
-type GateRejectDecisionRequest = {
-  version: Task['version']
-  reason: string
-}
-
-export function useApproveGate() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({
-      taskId,
-      stateName,
-      body,
-    }: {
-      taskId: string
-      stateName: string
-      body: GateDecisionRequest
-    }) =>
-      apiFetch<Task>(`/tasks/${taskId}/gates/${stateName}/approve`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
-    onSuccess: (task) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(task.id) })
-    },
+export function useTaskLifecycleTransitionsQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.lifecycleTransitions(taskId),
+    queryFn: () => apiFetch<TaskLifecycleTransitionFactResponse[]>(`/tasks/${taskId}/lifecycle/transitions`),
+    enabled: Boolean(taskId),
   })
 }
 
-export function useRejectGate() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({
-      taskId,
-      stateName,
-      body,
-    }: {
-      taskId: string
-      stateName: string
-      body: GateRejectDecisionRequest
-    }) =>
-      apiFetch<Task>(`/tasks/${taskId}/gates/${stateName}/reject`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
-    onSuccess: (task) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(task.id) })
-    },
+export function useTaskGatesQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.gates(taskId),
+    queryFn: () => apiFetch<GateResponse[]>(`/tasks/${taskId}/gates`),
+    enabled: Boolean(taskId),
   })
 }
 
-export function useRecoverTask() {
+export function useEvaluateGate() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({
-      taskId,
-      action,
-      reason,
-      context,
-    }: {
-      taskId: string
-      action: RecoveryAction
-      reason?: string
-      context?: string
-    }) => recoverTask(taskId, action, reason, context),
-    onSuccess: (task) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.executions(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.transitions(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
+    mutationFn: (gateId: string) =>
+      apiFetch<GateEvaluationResponse>(`/gates/${gateId}/evaluate`, { method: 'POST' }),
+    onSuccess: (evaluation) => {
+      void queryClient.invalidateQueries({ queryKey: qk.gates(evaluation.task_id) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(evaluation.task_id) })
     },
   })
 }
@@ -574,13 +400,13 @@ export function useTriggerReview() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: ({ taskId, body }: { taskId: string; body: StartReviewExecutionRequest }) =>
-      apiFetch<ReviewExecutionResponse>(`/tasks/${taskId}/review`, {
+      apiFetch<ReviewExecutionResponse>(`/tasks/${taskId}/review-executions`, {
         method: 'POST',
         body: JSON.stringify(body),
       }),
     onSuccess: (result) => {
       void queryClient.invalidateQueries({ queryKey: qk.task(result.execution.task_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(result.execution.task_id) })
+      void queryClient.invalidateQueries({ queryKey: qk.reviewExecutions(result.execution.task_id) })
       void queryClient.invalidateQueries({ queryKey: qk.executions(result.execution.task_id) })
     },
   })
@@ -588,8 +414,8 @@ export function useTriggerReview() {
 
 export function useReviewsQuery(taskId: string) {
   return useQuery({
-    queryKey: qk.reviews(taskId),
-    queryFn: () => apiFetch<ReviewExecutionResponse[]>(`/tasks/${taskId}/reviews`),
+    queryKey: qk.reviewExecutions(taskId),
+    queryFn: () => apiFetch<ReviewExecutionResponse[]>(`/tasks/${taskId}/review-executions`),
     enabled: Boolean(taskId),
   })
 }
@@ -598,13 +424,13 @@ export function useSubmitReviewReport() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: ({ executionId, body }: { executionId: string; body: SubmitReviewReportRequest }) =>
-      apiFetch<SubmitReviewReportResponse>(`/reviews/${executionId}`, {
+      apiFetch<SubmitReviewReportResponse>(`/review-executions/${executionId}`, {
         method: 'POST',
         body: JSON.stringify(body),
       }),
     onSuccess: (result) => {
       const taskId = result.review_execution.execution.task_id
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.reviewExecutions(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
     },
@@ -613,37 +439,8 @@ export function useSubmitReviewReport() {
 
 export function useValidationsQuery(taskId: string) {
   return useQuery({
-    queryKey: qk.validations(taskId),
-    queryFn: () => apiFetch<ValidationRunResponse[]>(`/tasks/${taskId}/validations`),
-    enabled: Boolean(taskId),
-  })
-}
-
-export function useCommentsQuery(taskId: string) {
-  return useQuery({
-    queryKey: qk.comments(taskId),
-    queryFn: async () => {
-      const response = await apiFetch<PaginatedResponse<Comment>>(`/tasks/${taskId}/comments`, {
-        search: { limit: 200, sort_by: 'created_at', sort_order: 'asc' },
-      })
-      return response.items
-    },
-    enabled: Boolean(taskId),
-  })
-}
-
-export function useTaskMediaQuery(taskId: string) {
-  return useQuery({
-    queryKey: qk.taskMedia(taskId),
-    queryFn: async () => {
-      const response = await apiFetch<PaginatedResponse<TaskMediaResponse>>(
-        `/tasks/${taskId}/media`,
-        {
-          search: { limit: 200, sort_by: 'created_at', sort_order: 'asc' },
-        },
-      )
-      return response.items
-    },
+    queryKey: qk.validationRuns(taskId),
+    queryFn: () => apiFetch<ValidationRunResponse[]>(`/tasks/${taskId}/validation-runs`),
     enabled: Boolean(taskId),
   })
 }
@@ -711,119 +508,6 @@ export function useDeleteNotification() {
   })
 }
 
-export function useCreateComment() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ taskId, body }: { taskId: string; body: CreateCommentRequest }) =>
-      apiFetch<Comment>(`/tasks/${taskId}/comments`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
-    onSuccess: (comment) => {
-      void queryClient.invalidateQueries({ queryKey: qk.comments(comment.task_id) })
-    },
-  })
-}
-
-export function useUploadTaskMedia() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({
-      taskId,
-      file,
-      authorName,
-    }: {
-      taskId: string
-      file: File
-      authorName?: string
-    }) => {
-      const formData = new FormData()
-      formData.append('file', file)
-      if (authorName) formData.append('author_name', authorName)
-      return apiFetch<TaskMediaResponse>(`/tasks/${taskId}/media`, {
-        method: 'POST',
-        body: formData,
-      })
-    },
-    onSuccess: (media) => {
-      void queryClient.invalidateQueries({ queryKey: qk.taskMedia(media.task_id) })
-    },
-  })
-}
-
-export function useDeleteComment() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ commentId }: { taskId: string; commentId: string }) =>
-      apiFetch<void>(`/comments/${commentId}`, { method: 'DELETE' }),
-    onSuccess: (_, variables) => {
-      void queryClient.invalidateQueries({ queryKey: qk.comments(variables.taskId) })
-    },
-  })
-}
-
-export function useCancelTask() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (taskId: string) =>
-      apiFetch<Task>(`/tasks/${taskId}/cancel`, {
-        method: 'POST',
-      }),
-    onSuccess: (task) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-    },
-  })
-}
-
-export function useArchiveTask() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (taskId: string) =>
-      apiFetch<Task>(`/tasks/${taskId}/archive`, {
-        method: 'POST',
-      }),
-    onSuccess: (task) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-    },
-  })
-}
-
-export function useAdvanceTask() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (taskId: string) =>
-      apiFetch<Task>(`/tasks/${taskId}/advance`, {
-        method: 'POST',
-      }),
-    onMutate: (taskId) => {
-      recordUserInitiatedTransition(taskId)
-    },
-    onSuccess: (task) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.executions(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.transitions(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.agents })
-    },
-  })
-}
-
-export function useDuplicateTask() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (taskId: string) =>
-      apiFetch<Task>(`/tasks/${taskId}/duplicate`, {
-        method: 'POST',
-      }),
-    onSuccess: (task) => {
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-    },
-  })
-}
-
 export function useTaskWorkspace(taskId: string) {
   return useQuery({
     queryKey: qk.taskWorkspace(taskId),
@@ -846,59 +530,25 @@ export function useResetTaskWorkspace() {
   })
 }
 
-export function useClaimTask() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ taskId, agentId }: { taskId: string; agentId: string }) =>
-      apiFetch<Task>(`/tasks/${taskId}/claim`, {
-        method: 'POST',
-        body: JSON.stringify({ agent_id: agentId } satisfies ClaimTaskRequest),
-      }),
-    onSuccess: (task) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.agents })
-    },
-  })
-}
-
-export function useLaunchExecution() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ taskId, body }: { taskId: string; body: LaunchExecutionRequest }) =>
-      apiFetch<LaunchExecutionResponse>(`/tasks/${taskId}/launch`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
-    onSuccess: (response) => {
-      const task = response.data.task
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.executions(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.taskDiff(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.agents })
-    },
-  })
-}
-
 export function useFollowUpExecution(executionId: string) {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (body: FollowUpRequest) =>
-      apiFetch<LaunchExecutionResponse>(`/executions/${executionId}/follow-up`, {
+      apiFetch<Execution>(`/executions/${executionId}/follow-up`, {
         method: 'POST',
         body: JSON.stringify(body),
       }),
-    onSuccess: (response) => {
-      const task = response.data.task
-      const nextExecution = response.data.execution
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.executions(task.id) })
+    onSuccess: (nextExecution) => {
+      void queryClient.invalidateQueries({ queryKey: qk.task(nextExecution.task_id) })
+      void queryClient.invalidateQueries({
+        queryKey: qk.projects,
+        predicate: ({ queryKey }) => queryKey[2] === 'tasks',
+      })
+      void queryClient.invalidateQueries({ queryKey: qk.executions(nextExecution.task_id) })
       void queryClient.invalidateQueries({ queryKey: qk.execution(executionId) })
       void queryClient.invalidateQueries({ queryKey: qk.execution(nextExecution.id) })
       void queryClient.invalidateQueries({ queryKey: qk.executionLogs(nextExecution.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.taskDiff(task.id) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDiff(nextExecution.task_id) })
       void queryClient.invalidateQueries({ queryKey: qk.agents })
     },
   })
@@ -1057,20 +707,6 @@ export function useDeleteAgent() {
   })
 }
 
-export function useDuplicateAgent() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ agentId, name }: { agentId: string; name: string }) =>
-      apiFetch<Agent>(`/agents/${agentId}/duplicate`, {
-        method: 'POST',
-        body: JSON.stringify({ name }),
-      }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: qk.agents })
-    },
-  })
-}
-
 export function useAgentDiscoveredOptions(agentId: string | null | undefined) {
   return useQuery({
     queryKey: qk.agentDiscoveredOptions(agentId ?? ''),
@@ -1162,7 +798,11 @@ export function useUpdateMcpConfig() {
       }),
     onSuccess: (_data, variables) => {
       void queryClient.invalidateQueries({
-        queryKey: qk.mcpConfig(variables.agent, variables.scope ?? 'project', variables.project_id),
+        queryKey: qk.mcpConfig(
+          variables.agent,
+          variables.scope ?? 'project',
+          variables.project_id ?? undefined,
+        ),
       })
     },
   })
@@ -1230,6 +870,21 @@ export function useExecutionsQuery(taskId: string) {
   })
 }
 
+export function useStartExecution() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, body }: { taskId: string; body: StartExecutionRequest }) =>
+      apiFetch<Execution>(`/tasks/${taskId}/executions`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: (execution) => {
+      void queryClient.invalidateQueries({ queryKey: qk.executions(execution.task_id) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(execution.task_id) })
+    },
+  })
+}
+
 export function useExecutionQuery(executionId: string) {
   return useQuery({
     queryKey: qk.execution(executionId),
@@ -1255,153 +910,6 @@ export function useTaskUsageQuery(taskId: string) {
 /**
  * Execution logs are returned as parsed JSONL entries from the backend.
  */
-// --- Workflow ---
-
-export function useWorkflowQuery(projectId: string) {
-  return useQuery({
-    queryKey: qk.workflow(projectId),
-    queryFn: () => apiFetch<WorkflowDefinition>(`/projects/${projectId}/workflow`),
-    enabled: Boolean(projectId),
-  })
-}
-
-export function useUpdateWorkflow() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ projectId, body }: { projectId: string; body: UpdateProjectWorkflowRequest }) =>
-      apiFetch<WorkflowDefinition>(`/projects/${projectId}/workflow`, {
-        method: 'PUT',
-        body: JSON.stringify(body),
-      }),
-    onSuccess: (_, vars) => {
-      void queryClient.invalidateQueries({ queryKey: qk.workflow(vars.projectId) })
-      void queryClient.invalidateQueries({ queryKey: qk.project(vars.projectId) })
-    },
-  })
-}
-
-export function useWorkflowPromptBuildersQuery() {
-  return useQuery({
-    queryKey: qk.workflowPromptBuilders,
-    queryFn: () => apiFetch<PromptBuilderRegistryEntry[]>('/workflow/prompt-builders'),
-  })
-}
-
-// --- Workflow Templates ---
-
-export function useWorkflowTemplatesQuery() {
-  return useQuery({
-    queryKey: qk.workflowTemplates,
-    queryFn: () => listWorkflowTemplates(),
-  })
-}
-
-export function useWorkflowTemplateQuery(name: string) {
-  return useQuery({
-    queryKey: qk.workflowTemplate(name),
-    queryFn: () => getWorkflowTemplate(name),
-    enabled: Boolean(name),
-  })
-}
-
-export function useSaveWorkflowTemplate() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ name, body }: { name: string; body: SaveWorkflowTemplateRequest }) =>
-      saveWorkflowTemplate(name, body),
-    onSuccess: (saved) => {
-      void queryClient.invalidateQueries({ queryKey: qk.workflowTemplates })
-      void queryClient.invalidateQueries({ queryKey: qk.workflowTemplate(saved.name) })
-    },
-  })
-}
-
-export function useDeleteWorkflowTemplate() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (name: string) => deleteWorkflowTemplate(name),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: qk.workflowTemplates })
-    },
-  })
-}
-
-// --- Transition log ---
-
-export function useTransitionLogQuery(taskId: string, enabled = true) {
-  return useQuery({
-    queryKey: qk.transitions(taskId),
-    queryFn: async () => {
-      const response = await apiFetch<{ items: TransitionLogEntry[] }>(
-        `/tasks/${taskId}/transitions`,
-      )
-      return response.items
-    },
-    enabled: Boolean(taskId) && enabled,
-  })
-}
-
-// --- Role assignments ---
-
-export function useTaskRolesQuery(taskId: string, enabled = true) {
-  return useQuery({
-    queryKey: qk.taskRoles(taskId),
-    queryFn: () => apiFetch<TaskRoleAssignmentResponse[]>(`/tasks/${taskId}/roles`),
-    enabled: Boolean(taskId) && enabled,
-  })
-}
-
-export function useAssignRole() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({
-      taskId,
-      roleName,
-      body,
-    }: {
-      taskId: string
-      roleName: string
-      body: AssignRoleRequest
-    }) =>
-      apiFetch<TaskRoleAssignmentResponse>(`/tasks/${taskId}/roles/${roleName}`, {
-        method: 'PUT',
-        body: JSON.stringify(body),
-      }),
-    onSuccess: (assignment) => {
-      void queryClient.invalidateQueries({ queryKey: qk.taskRoles(assignment.task_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.task(assignment.task_id) })
-    },
-  })
-}
-
-export type RemoveRoleRequestBody = {
-  reset_workspace?: boolean
-  reset_worktree?: boolean
-}
-
-export function useRemoveRole() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({
-      taskId,
-      roleName,
-      body,
-    }: {
-      taskId: string
-      roleName: string
-      body?: RemoveRoleRequestBody
-    }) =>
-      apiFetch<void>(`/tasks/${taskId}/roles/${roleName}`, {
-        method: 'DELETE',
-        body: JSON.stringify(body ?? {}),
-      }),
-    onSuccess: (_, vars) => {
-      void queryClient.invalidateQueries({ queryKey: qk.taskRoles(vars.taskId) })
-      void queryClient.invalidateQueries({ queryKey: qk.task(vars.taskId) })
-    },
-  })
-}
-
 export async function getExecutionLogs(
   executionId: string,
   params?: ExecutionLogsParams,
@@ -1416,8 +924,8 @@ export async function getExecutionLogs(
   const response: ExecutionLogsResponse = {
     items: data.items ?? [],
     has_more: data.has_more ?? false,
+    next_sequence: data.next_sequence ?? null,
   }
-  if (data.next_sequence !== undefined) response.next_sequence = data.next_sequence
   return response
 }
 
@@ -1480,53 +988,6 @@ export function useUpdateSettings() {
 }
 
 // --- Integrations ---
-
-export type IntegrationResponse = {
-  id: string
-  project_id: string
-  platform: string
-  base_url: string
-  owner: string
-  repo: string
-  token_secret_ref: string
-  poll_interval_secs: number
-  sync_filter: Record<string, unknown>
-  default_task_state: string | null
-  default_assignee_type: string | null
-  default_assignee_id: string | null
-  enabled: boolean
-  last_polled_at: string | null
-  created_at: string
-  updated_at: string
-}
-
-export type CreateIntegrationRequest = {
-  platform: string
-  base_url: string
-  owner: string
-  repo: string
-  token_secret_ref: string
-  poll_interval_secs?: number
-  sync_filter?: Record<string, unknown>
-  default_task_state?: string
-  default_assignee_type?: string
-  default_assignee_id?: string
-  enabled?: boolean
-}
-
-export type PatchIntegrationRequest = {
-  platform?: string
-  base_url?: string
-  owner?: string
-  repo?: string
-  token_secret_ref?: string
-  poll_interval_secs?: number
-  sync_filter?: Record<string, unknown>
-  default_task_state?: string
-  default_assignee_type?: string
-  default_assignee_id?: string
-  enabled?: boolean
-}
 
 export type SyncTriggerResponse = {
   imported: number
@@ -1742,14 +1203,6 @@ export function useMembersQuery(projectId: string) {
   return useQuery({
     queryKey: qk.projectMembers(projectId),
     queryFn: () => listMembers(projectId),
-    enabled: Boolean(projectId),
-  })
-}
-
-export function useProjectAgentsQuery(projectId: string) {
-  return useQuery({
-    queryKey: qk.projectAgents(projectId),
-    queryFn: () => listProjectAgents(projectId),
     enabled: Boolean(projectId),
   })
 }

@@ -7,11 +7,13 @@ workflow-as-cognition model.
 
 Forge originated as a fork of [ForgeAILab/forge](upstream.md). The origin,
 license, and attribution remain important; architectural compatibility with
-upstream does not. The migration is intentionally incremental. At Plan PR0 the
-Rust, SQLite, REST, MCP, CLI, and web implementations still contain the
-previous model. They remain operational until a later Plan PR moves their
-readers and writers. This document describes the target contract, not a claim
-that every target primitive already exists.
+upstream does not. The migration is intentionally incremental. PR11 retired
+Main Agent, Project Agent, Agent Chat, Product Genesis, Attention, and Project
+OS authority while preserving historical data. PR12 aligns REST, MCP,
+`forge-ctl`, web, generated public types, and SSE with the target domain.
+Legacy workflow and storage code may remain internally until PR13, but it
+does not regain public authority. This document describes the target contract
+and names the remaining migration boundary.
 
 The migration register, invariant definitions, current dependency audit, and
 Plan PR boundaries live in [migration/architecture-v2.md](migration/architecture-v2.md).
@@ -335,9 +337,11 @@ derived projection.
 
 PR9 implements `task_lifecycle`, an optimistic version, and immutable
 transition receipts. The existing `task.status` column is a one-way projection
-of aggregate lifecycle. WorkflowEngine, StateDefinition, GateConfig, hooks,
-and transition-log retry counts no longer advance Task lifecycle or authorize
-Gate outcomes. Gate identity covers Task, WorkUnit, exact merge operation, and
+of aggregate lifecycle. The legacy WorkflowEngine, StateDefinition,
+GateConfig, project-settings lifecycle hook scripts, and transition-log retry
+counts no longer advance Task lifecycle or authorize Gate outcomes. PR12
+removes dispatch of the old state-driven hook scripts; durable generic Project
+hooks remain a separate target subsystem. Gate identity covers Task, WorkUnit, exact merge operation, and
 exact lifecycle transition scopes. Immutable policies and exact-input
 evaluations provide deterministic readiness evidence. Merge readiness rejects
 failed ValidationRuns and non-approving Decisions. TaskRole reviewer snapshots
@@ -419,11 +423,11 @@ The target responsibility map is:
 | workspace | Worktree creation, leases, path safety, cleanup | Preserve and extend for WorkUnits |
 | git | Low-level Git operations and deterministic integration | Preserve |
 | config | Configuration precedence and local data paths | Preserve |
-| api-types | Shared public request/response/domain types | Thin and align to new domain |
-| db | Additive persistence, repositories, migrations, row mapping | Thin around new primitives |
-| services | Deterministic orchestration domain, scheduling, authority, projections | Replace cognitive workflow branches with small domain services |
+| api-types | Target public request/response/domain types | Keep public DTOs aligned; retain storage models only where internal consumers require them |
+| db | SQLite persistence, repositories, numbered migrations, row mapping | Preserve user data; PR13 owns destructive cleanup |
+| services | Deterministic orchestration domain, scheduling, authority, projections | Keep cognition in harnesses and deterministic policy in small domain services |
 | api | Thin REST/SSE boundary and authentication/authorization mapping | Thin |
-| forge-client | Operational CLI client | Rebuild public commands later |
+| forge-client | `forge-ctl` REST client for target Project, Repo, TaskLifecycle, Execution, Agent, provider, and daemon operations | Keep commands on exact V2 identities and receipts |
 | mcp-server | MCP projection of the same domain primitives | Thin, no second domain |
 | events | Durable-event projection and live delivery | Preserve, update event vocabulary |
 | executors | Transitional execution/logging facade | Replace with adapter-facing execution boundary |

@@ -141,6 +141,7 @@ impl TaskDispatcher {
                 TaskListQuery {
                     project_id: project_id.to_owned(),
                     q: None,
+                    lifecycle_states: Vec::new(),
                     statuses: statuses.clone(),
                     agent_ids: Vec::new(),
                     assignee_types: Vec::new(),

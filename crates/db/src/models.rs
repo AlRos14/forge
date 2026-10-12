@@ -3817,7 +3817,8 @@ pub struct TransitionTaskLifecycle {
 pub struct TaskLifecycleTransitionIdentity {
     pub task_id: String,
     pub idempotency_key: String,
-    pub expected_task_version: i64,
+    pub expected_task_version: Option<i64>,
+    pub expected_lifecycle_version: Option<i64>,
     pub to_state: TaskLifecycleState,
     pub cause_kind: String,
     pub cause_ref: Option<String>,

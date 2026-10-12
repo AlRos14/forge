@@ -1240,35 +1240,17 @@ async fn task_creation_rejects_invalid_explicit_actor_before_task_insert() {
 }
 
 #[tokio::test]
-async fn task_creation_rejects_invalid_project_default_before_task_insert() {
+async fn task_creation_ignores_legacy_project_role_defaults() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let project_owner = seed_human_user(&db).await;
-    let outsider = seed_human_user(&db).await;
-    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
-        .bind(&project_owner)
-        .bind(&project_id)
-        .execute(db.pool())
-        .await
-        .expect("project owner updates");
-    let invalid_agent = seed_agent(&db).await;
-    sqlx::query(
-        "UPDATE agent_identity
-         SET visibility = 'account', owner_id = ?
-         WHERE id = ?",
-    )
-    .bind(&outsider)
-    .bind(&invalid_agent)
-    .execute(db.pool())
-    .await
-    .expect("outsider Agent scope updates");
+    let agent_id = seed_agent(&db).await;
     let settings = serde_json::json!({
         "default_role_assignments": [{
-            "role_name": "coder",
+            "role_name": "implementer",
             "assignee_type": "agent",
-            "assignee_id": invalid_agent
+            "assignee_id": agent_id
         }]
     });
     sqlx::query("UPDATE project SET settings = ?, updated_at = ? WHERE id = ?")
@@ -1279,15 +1261,10 @@ async fn task_creation_rejects_invalid_project_default_before_task_insert() {
         .await
         .expect("project defaults update");
 
-    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
-        .bind(&project_id)
-        .fetch_one(db.pool())
-        .await
-        .expect("task count loads");
-    let result = service
+    let task = service
         .create_task(
             project_id.clone(),
-            "reject invalid default Actor",
+            "ordinary Task ignores old defaults",
             None,
             None,
             None,
@@ -1297,15 +1274,35 @@ async fn task_creation_rejects_invalid_project_default_before_task_insert() {
             None,
         )
         .await;
-    assert!(result.is_err());
-    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
+    let task = task.expect("ordinary Task creates");
+    let role_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_role WHERE task_id = ?")
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("TaskRole count loads");
+    let membership_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM role_membership
+         WHERE task_role_id IN (SELECT id FROM task_role WHERE task_id = ?)",
+    )
+    .bind(&task.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("RoleMembership count loads");
+    assert_eq!(role_count, 0, "old Project settings create no TaskRole");
+    assert_eq!(
+        membership_count, 0,
+        "old Project settings create no membership"
+    );
+
+    let retained_settings: String = sqlx::query_scalar("SELECT settings FROM project WHERE id = ?")
         .bind(&project_id)
         .fetch_one(db.pool())
         .await
-        .expect("task count loads");
+        .expect("historical Project settings remain stored");
     assert_eq!(
-        after, before,
-        "invalid default Actor must not persist a Task"
+        serde_json::from_str::<serde_json::Value>(&retained_settings).expect("settings parse"),
+        settings,
+        "retiring the reader preserves the historical Project setting"
     );
 }
 
