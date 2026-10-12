@@ -10,6 +10,9 @@ pub enum DbError {
     #[error("not found")]
     NotFound,
 
+    #[error("repository has associated tasks")]
+    RepoInUse,
+
     #[error("version conflict")]
     VersionConflict,
 

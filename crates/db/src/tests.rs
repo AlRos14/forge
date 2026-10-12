@@ -5756,10 +5756,10 @@ async fn delete_lifecycle_foreign_keys_match_repository_operations() {
         "Repo cascade",
     )
     .await;
-    assert!(
-        RepoRepo::delete(&db, &repo_id).await.is_err(),
-        "Repo deletion cannot remove protected TaskLifecycle rows"
-    );
+    assert!(matches!(
+        RepoRepo::delete(&db, &repo_id).await,
+        Err(DbError::RepoInUse)
+    ));
     assert!(RepoRepo::get_by_id(&db, &repo_id)
         .await
         .expect("Repo lookup succeeds")

@@ -255,6 +255,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- `DELETE /repos/{id}` now checks for associated Tasks inside its write
+  transaction and returns `409 repo_in_use` while preserving the Repo,
+  primary-Repo selection, and Tasks. Task-free Repo deletion still returns
+  `204` and clears the primary-Repo selection atomically.
+
 - WorkUnit integration failures and final TaskMerge failures now consume
   separate retry budgets. PullRequest publication first records the exact
   durable TaskMerge admission, PublishPr child, and provider intent in one

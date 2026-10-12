@@ -1,6 +1,6 @@
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateProject, CreateRepo,
-    CreateTask, ProjectRepo, RepoRepo, SqliteDb, TaskRepo, UpdateProject, WorkMode,
+    CreateTask, DbError, ProjectRepo, RepoRepo, SqliteDb, TaskRepo, UpdateProject, WorkMode,
 };
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -13,10 +13,10 @@ async fn repo_delete_rejection_preserves_a_same_repo_parent_and_child() {
     let parent = create_task(&db, &project_id, &repo_id, None, None, "P").await;
     let child = create_task(&db, &project_id, &repo_id, Some(&parent.id), Some(0), "C").await;
 
-    assert!(
-        RepoRepo::delete(&db, &repo_id).await.is_err(),
-        "Repo delete is blocked by protected TaskLifecycle rows"
-    );
+    assert!(matches!(
+        RepoRepo::delete(&db, &repo_id).await,
+        Err(DbError::RepoInUse)
+    ));
     assert!(RepoRepo::get_by_id(&db, &repo_id)
         .await
         .expect("Repo query succeeds")

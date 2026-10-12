@@ -446,6 +446,12 @@ impl From<DbError> for ApiError {
                 message: "resource not found".to_owned(),
                 details: None,
             },
+            DbError::RepoInUse => Self {
+                status: StatusCode::CONFLICT,
+                code: "repo_in_use",
+                message: "repository cannot be deleted while Tasks reference it".to_owned(),
+                details: None,
+            },
             DbError::VersionConflict => Self {
                 status: StatusCode::CONFLICT,
                 code: "version_conflict",

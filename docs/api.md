@@ -43,7 +43,7 @@ the maximum is 100.
 | `DELETE /projects/{id}` | Delete a Project under the existing workspace cleanup contract. |
 | `POST /projects/{id}/pause`, `POST /projects/{id}/resume` | Pause or resume the Project. |
 | `GET /projects/{id}/repos`, `POST /projects/{id}/repos` | List or add repositories. |
-| `GET /repos/{id}`, `PATCH /repos/{id}`, `DELETE /repos/{id}`, `POST /repos/{id}/sync` | Read, update, remove, or sync a repository. `PATCH` can set `pr_provider` and its polling/base URL configuration; setting the provider to `null` removes the provider configuration. Blank token input leaves the saved credential unchanged. Responses expose provider type, token presence, and polling interval without returning the secret. Repo deletion is atomic; if protected TaskLifecycle rows block its Task cascade, the Repo and primary-Repo selection remain unchanged. |
+| `GET /repos/{id}`, `PATCH /repos/{id}`, `DELETE /repos/{id}`, `POST /repos/{id}/sync` | Read, update, remove, or sync a repository. `PATCH` can set `pr_provider` and its polling/base URL configuration; setting the provider to `null` removes the provider configuration. Blank token input leaves the saved credential unchanged. Responses expose provider type, token presence, and polling interval without returning the secret. Deleting a Repo with any associated Task returns `409 repo_in_use` and leaves the Repo, primary-Repo selection, and Tasks intact. Deleting a Task-free Repo returns `204` and clears its primary-Repo selection atomically. |
 | `GET /projects/{id}/project_hook_runs` | Read generic Project hook run history. |
 | `GET /projects/{id}/media`, `POST /projects/{id}/media` | List or upload Project media. |
 | `GET /projects/{id}/media/{asset_id}` | Read an exact media asset. |
