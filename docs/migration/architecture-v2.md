@@ -294,11 +294,17 @@ change together: attach and moves to another parent append to the destination
 sibling order, and detach clears both fields. An ordinary Task update leaves
 both fields untouched. A Task with live children cannot be soft-deleted; leaf
 deletion is serialized with structural writes. Project teardown deletes its
-Tasks and children together through the existing FK cascade. Repo deletion is
-rejected while its cascade would remove protected TaskLifecycle rows; the
-Repo, its primary-repo selection, and all Task links remain unchanged. This PR
-does not rewrite legacy rows; any historical root with a non-null
-`subtask_order` remains a PR13 cleanup item if found.
+Tasks and children together through the existing FK cascade. Repo deletion
+shares one SQLite `BEGIN IMMEDIATE` boundary between checking whether any Task
+references the Repo and mutating the Repo/Project state. If any Task row
+references it, deletion is rejected before mutation as `DbError::RepoInUse`,
+mapped by REST to `409 Conflict` with `code = repo_in_use`; the Repo,
+`Project.primary_repo_id`, and Tasks are preserved. If no Task references it,
+REST returns `204`, the Repo is deleted, and `Project.primary_repo_id` is
+cleared. Defensive FK/trigger protections may remain, but this preflight and
+conflict response are the domain/public contract. This PR does not rewrite
+legacy rows; any historical root with a non-null `subtask_order` remains a
+PR13 cleanup item if found.
 
 ## Current repository baseline
 
