@@ -248,6 +248,23 @@ impl TaskLifecycleRepo for SqliteDb {
         .transpose()
     }
 
+    async fn get_task_lifecycle_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+    ) -> Result<Option<TaskLifecycle>> {
+        sqlx::query(
+            "SELECT task_id, state, version, reason_kind, reason_ref, created_at, updated_at
+             FROM task_lifecycle WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .as_ref()
+        .map(map_task_lifecycle)
+        .transpose()
+    }
+
     async fn list_task_lifecycle_transitions(
         &self,
         task_id: &str,

@@ -664,8 +664,14 @@ impl TaskRepo for SqliteDb {
             .ok_or(DbError::NotFound)
     }
 
-    async fn soft_delete(&self, input: crate::SoftDeleteTask) -> Result<Task> {
-        let mut task = self.get_task_required(&input.id, true).await?;
+    async fn soft_delete_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: crate::SoftDeleteTask,
+    ) -> Result<Task> {
+        let mut task = TaskRepo::get_by_id_in_tx(self, transaction, &input.id, true)
+            .await?
+            .ok_or(DbError::NotFound)?;
         if task.deleted_at.is_some()
             || matches!(task.status.as_str(), "in_progress" | "review" | "merging")
         {
@@ -682,7 +688,7 @@ impl TaskRepo for SqliteDb {
             .bind(&task.updated_at)
             .bind(&task.id)
             .bind(input.expected_version)
-            .execute(&self.pool)
+            .execute(&mut **transaction)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);

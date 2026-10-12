@@ -51,6 +51,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   before writing. Project deletion snapshots its exact authorized recipients
   before teardown and emits per-user invalidation hints without exposing
   membership data.
+  Task parent links require the same exact Project and Repo; soft deletion is
+  rejected while live subtasks remain, and delete/create/reparent serialize at
+  the hierarchy boundary. Repo deletion is atomic when protected TaskLifecycle
+  cascades reject it, preserving the primary-Repo selection and Task links.
   REST and MCP Agent rosters filter private Agents before pagination and page
   metadata; provider runtime projections also filter private Agents and Daemons
   before returning items or counts.

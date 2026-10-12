@@ -45,7 +45,11 @@ pub trait TaskRepo: Send + Sync {
         subtask_order: Option<i64>,
     ) -> Result<Task>;
     async fn archive(&self, input: ArchiveTask) -> Result<Task>;
-    async fn soft_delete(&self, input: SoftDeleteTask) -> Result<Task>;
+    async fn soft_delete_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: SoftDeleteTask,
+    ) -> Result<Task>;
     async fn set_review_passed_at(
         &self,
         id: &str,
@@ -83,6 +87,11 @@ pub trait TaskRepo: Send + Sync {
 #[async_trait]
 pub trait TaskLifecycleRepo: Send + Sync {
     async fn get_task_lifecycle(&self, task_id: &str) -> Result<Option<TaskLifecycle>>;
+    async fn get_task_lifecycle_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+    ) -> Result<Option<TaskLifecycle>>;
     async fn list_task_lifecycle_transitions(
         &self,
         task_id: &str,

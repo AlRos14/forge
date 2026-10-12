@@ -5756,13 +5756,25 @@ async fn delete_lifecycle_foreign_keys_match_repository_operations() {
         "Repo cascade",
     )
     .await;
-    RepoRepo::delete(&db, &repo_id)
+    assert!(
+        RepoRepo::delete(&db, &repo_id).await.is_err(),
+        "Repo deletion cannot remove protected TaskLifecycle rows"
+    );
+    assert!(RepoRepo::get_by_id(&db, &repo_id)
         .await
-        .expect("repo delete cascades task data");
-    assert!(TaskRepo::get_by_id(&db, &task_id, true)
+        .expect("Repo lookup succeeds")
+        .is_some());
+    let selected_repo: Option<String> =
+        sqlx::query_scalar("SELECT primary_repo_id FROM project WHERE id = ?")
+            .bind(&project_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("primary Repo remains selected");
+    assert_eq!(selected_repo.as_deref(), Some(repo_id.as_str()));
+    assert!(TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task lookup succeeds")
-        .is_none());
+        .is_some());
 }
 
 #[tokio::test]

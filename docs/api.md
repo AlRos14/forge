@@ -43,7 +43,7 @@ the maximum is 100.
 | `DELETE /projects/{id}` | Delete a Project under the existing workspace cleanup contract. |
 | `POST /projects/{id}/pause`, `POST /projects/{id}/resume` | Pause or resume the Project. |
 | `GET /projects/{id}/repos`, `POST /projects/{id}/repos` | List or add repositories. |
-| `GET /repos/{id}`, `PATCH /repos/{id}`, `DELETE /repos/{id}`, `POST /repos/{id}/sync` | Read, update, remove, or sync a repository. `PATCH` can set `pr_provider` and its polling/base URL configuration; setting the provider to `null` removes the provider configuration. Blank token input leaves the saved credential unchanged. Responses expose provider type, token presence, and polling interval without returning the secret. |
+| `GET /repos/{id}`, `PATCH /repos/{id}`, `DELETE /repos/{id}`, `POST /repos/{id}/sync` | Read, update, remove, or sync a repository. `PATCH` can set `pr_provider` and its polling/base URL configuration; setting the provider to `null` removes the provider configuration. Blank token input leaves the saved credential unchanged. Responses expose provider type, token presence, and polling interval without returning the secret. Repo deletion is atomic; if protected TaskLifecycle rows block its Task cascade, the Repo and primary-Repo selection remain unchanged. |
 | `GET /projects/{id}/project_hook_runs` | Read generic Project hook run history. |
 | `GET /projects/{id}/media`, `POST /projects/{id}/media` | List or upload Project media. |
 | `GET /projects/{id}/media/{asset_id}` | Read an exact media asset. |
@@ -123,12 +123,14 @@ unchanged for PR13, but do not control newly imported Tasks.
 | `POST /tasks/{id}/task-roles/{role}/members`, `PATCH /tasks/{id}/task-roles/{role}/members/{membership_id}` | Add or update an exact RoleMembership. Memberships name a Human or Agent Actor. |
 
 When present, `parent_task_id` must identify a root Task in the same Project;
-only one subtask level is supported, and a Task with children cannot itself
-become a subtask. TaskService enforces parent-backed create, batch create,
-attach, reparent, and detach in one SQLite `BEGIN IMMEDIATE` transaction.
-New attachments and reparents append at the next destination `subtask_order`;
-detach clears both parent fields. An ordinary Task update leaves the existing
-structure untouched.
+the parent and child `repo_id` values must match, including when both are null.
+Only one subtask level is supported, and a Task with children cannot itself
+become a subtask. TaskService enforces parent-backed create,
+batch create, attach, reparent, detach, and Task soft-delete in one SQLite
+`BEGIN IMMEDIATE` transaction. A Task with live subtasks cannot be deleted;
+move, detach, or delete those subtasks first. New attachments and reparents
+append at the next destination `subtask_order`; detach clears both fields. An
+ordinary Task update leaves the existing structure untouched.
 
 TaskLifecycle is aggregate progress. The database `task.status` column remains
 only as a one-way storage projection pending PR13; REST lists, filters, task

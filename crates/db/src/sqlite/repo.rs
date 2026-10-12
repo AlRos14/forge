@@ -93,17 +93,27 @@ impl RepoRepo for SqliteDb {
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("UPDATE project SET primary_repo_id = NULL WHERE primary_repo_id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
-        let result = sqlx::query("DELETE FROM repo WHERE id = ?")
+        let result = match sqlx::query("DELETE FROM repo WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
-            .await?;
+            .execute(&mut *transaction)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                transaction.rollback().await?;
+                return Err(error.into());
+            }
+        };
         if result.rows_affected() == 0 {
+            transaction.rollback().await?;
             return Err(DbError::NotFound);
         }
+        transaction.commit().await?;
         Ok(())
     }
 }

@@ -2071,6 +2071,79 @@ fn forge_update_task_updates_mutable_fields() {
 }
 
 #[test]
+fn forge_update_task_rejects_cross_repo_parent_without_partial_write() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+        let now = now_rfc3339();
+        let other_repo = RepoRepo::create(
+            &*state.db,
+            CreateRepo {
+                id: new_uuid_v4(),
+                project_id: task.project_id.clone(),
+                name: "other-repo".to_owned(),
+                remote_url: "https://example.invalid/other-repo".to_owned(),
+                local_path: None,
+                work_mode: db::WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("second Repo creates");
+        let other_parent = TaskRepo::create(
+            &*state.db,
+            CreateTask {
+                id: new_uuid_v4(),
+                project_id: task.project_id.clone(),
+                repo_id: Some(other_repo.id),
+                parent_task_id: None,
+                subtask_order: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: "Parent in other Repo".to_owned(),
+                description: None,
+                task_type: "implementation".to_owned(),
+                status: "todo".to_owned(),
+                is_automation: false,
+                priority: 0,
+                task_state_config: None,
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("other Repo parent creates");
+
+        let error = call_tool_error(
+            &state,
+            "forge_update_task",
+            json!({
+                "task_id": task.id,
+                "parent_task_id": other_parent.id,
+                "version": task.version,
+            }),
+        )
+        .await;
+        assert!(
+            error.message.contains("same Repo"),
+            "unexpected error: {error:?}"
+        );
+
+        let after = TaskRepo::get_by_id(&*state.db, &task.id, false)
+            .await
+            .expect("Task query succeeds")
+            .expect("Task remains live");
+        assert_eq!(after.repo_id, task.repo_id);
+        assert_eq!(after.parent_task_id, task.parent_task_id);
+        assert_eq!(after.subtask_order, task.subtask_order);
+        assert_eq!(after.version, task.version);
+    });
+}
+
+#[test]
 fn forge_transition_task_lifecycle_requires_exact_identity_and_returns_authority() {
     run_async(async {
         let state = sqlite_state().await;

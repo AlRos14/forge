@@ -734,6 +734,436 @@ async fn create_subtasks_preserves_input_order_and_rejects_different_assignee_at
 }
 
 #[tokio::test]
+async fn soft_delete_rejects_parent_with_live_children_without_partial_writes() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _, _) = seed_project_repo(&db).await;
+    let parent = create_root(&service, &project_id, "Parent").await;
+    let child = service
+        .create_task(
+            project_id,
+            "Child",
+            None,
+            Some(parent.id.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("child creates");
+
+    let result = service.soft_delete(parent.id.clone()).await;
+    assert!(
+        matches!(result, Err(ServiceError::InvalidOperation { .. })),
+        "a parent with live children is rejected: {result:?}"
+    );
+
+    let after_parent = TaskRepo::get_by_id(&*db, &parent.id, true)
+        .await
+        .expect("parent query succeeds")
+        .expect("parent remains");
+    let after_child = TaskRepo::get_by_id(&*db, &child.id, true)
+        .await
+        .expect("child query succeeds")
+        .expect("child remains");
+    assert_eq!(after_parent.deleted_at, parent.deleted_at);
+    assert_eq!(after_parent.version, parent.version);
+    assert_eq!(after_parent.updated_at, parent.updated_at);
+    assert_eq!(after_child, child, "rejected delete leaves child unchanged");
+    assert_parent_structure_is_clean(&db).await;
+}
+
+#[tokio::test]
+async fn soft_delete_leaf_keeps_its_parent_live() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _, _) = seed_project_repo(&db).await;
+    let parent = create_root(&service, &project_id, "Parent").await;
+    let child = service
+        .create_task(
+            project_id,
+            "Child",
+            None,
+            Some(parent.id.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("child creates");
+
+    let deleted_child = service
+        .soft_delete(child.id.clone())
+        .await
+        .expect("leaf deletion succeeds");
+    assert!(deleted_child.deleted_at.is_some());
+    assert_eq!(
+        deleted_child.parent_task_id.as_deref(),
+        Some(parent.id.as_str())
+    );
+    assert_eq!(deleted_child.subtask_order, Some(0));
+    let live_parent = TaskRepo::get_by_id(&*db, &parent.id, false)
+        .await
+        .expect("parent query succeeds")
+        .expect("parent remains live");
+    assert_eq!(live_parent.version, parent.version);
+    assert_eq!(live_parent.deleted_at, None);
+    assert_parent_structure_is_clean(&db).await;
+}
+
+#[tokio::test]
+async fn create_child_serializes_with_parent_soft_delete() {
+    let (db, _database_dir) = sqlite_file_db().await;
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _, _) = seed_project_repo(&db).await;
+    let parent = create_root(&service, &project_id, "P").await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+    let create_service = service.clone();
+    let create_barrier = Arc::clone(&barrier);
+    let create_parent_id = parent.id.clone();
+    let create_project_id = project_id.clone();
+    let create_child = tokio::spawn(async move {
+        create_barrier.wait().await;
+        create_service
+            .create_task(
+                create_project_id,
+                "C",
+                None,
+                Some(create_parent_id),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+    });
+
+    let delete_service = service.clone();
+    let delete_barrier = Arc::clone(&barrier);
+    let delete_parent_id = parent.id.clone();
+    let delete_parent = tokio::spawn(async move {
+        delete_barrier.wait().await;
+        delete_service.soft_delete(delete_parent_id).await
+    });
+    barrier.wait().await;
+
+    let create_result = create_child.await.expect("child create joins");
+    let delete_result = delete_parent.await.expect("parent delete joins");
+    if create_result.is_ok() {
+        eprintln!("observed race outcome: child create committed; parent delete was rejected");
+        let child = create_result.expect("child create wins");
+        assert!(
+            delete_result.is_err(),
+            "parent delete loses to child create"
+        );
+        let live_parent = TaskRepo::get_by_id(&*db, &parent.id, false)
+            .await
+            .expect("parent query succeeds")
+            .expect("parent remains live");
+        assert_eq!(child.parent_task_id.as_deref(), Some(parent.id.as_str()));
+        assert!(live_parent.deleted_at.is_none());
+        assert_eq!(live_parent.version, parent.version);
+    } else {
+        eprintln!("observed race outcome: parent delete committed; child create was rejected");
+        assert!(
+            matches!(
+                create_result,
+                Err(ServiceError::NotFound { entity: "task", .. })
+            ),
+            "create loses only because parent is no longer live: {create_result:?}"
+        );
+        let deleted_parent = delete_result.expect("parent delete wins");
+        assert!(deleted_parent.deleted_at.is_some());
+        let child_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE parent_task_id = ?")
+                .bind(&parent.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("child count loads");
+        assert_eq!(child_count, 0, "losing create leaves no child row");
+    }
+    assert_parent_structure_is_clean(&db).await;
+}
+
+#[tokio::test]
+async fn create_subtasks_batch_serializes_with_parent_soft_delete() {
+    let (db, _database_dir) = sqlite_file_db().await;
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _, _) = seed_project_repo(&db).await;
+    let parent = create_root(&service, &project_id, "P").await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+    let batch_service = service.clone();
+    let batch_barrier = Arc::clone(&barrier);
+    let batch_parent_id = parent.id.clone();
+    let create_batch = tokio::spawn(async move {
+        batch_barrier.wait().await;
+        batch_service
+            .create_subtasks(
+                batch_parent_id,
+                vec![subtask_input("C1"), subtask_input("C2")],
+            )
+            .await
+    });
+
+    let delete_service = service.clone();
+    let delete_barrier = Arc::clone(&barrier);
+    let delete_parent_id = parent.id.clone();
+    let delete_parent = tokio::spawn(async move {
+        delete_barrier.wait().await;
+        delete_service.soft_delete(delete_parent_id).await
+    });
+    barrier.wait().await;
+
+    let batch_result = create_batch.await.expect("batch create joins");
+    let delete_result = delete_parent.await.expect("parent delete joins");
+    if batch_result.is_ok() {
+        eprintln!("observed race outcome: batch committed; parent delete was rejected");
+        let children = batch_result.expect("batch create wins");
+        assert_eq!(children.len(), 2, "the batch is complete");
+        assert!(delete_result.is_err(), "parent delete loses to the batch");
+        assert_eq!(children[0].subtask_order, Some(0));
+        assert_eq!(children[1].subtask_order, Some(1));
+        let live_parent = TaskRepo::get_by_id(&*db, &parent.id, false)
+            .await
+            .expect("parent query succeeds")
+            .expect("parent remains live");
+        assert!(live_parent.deleted_at.is_none());
+        assert_eq!(live_parent.version, parent.version);
+    } else {
+        eprintln!("observed race outcome: parent delete committed; batch was rejected");
+        assert!(
+            matches!(
+                batch_result,
+                Err(ServiceError::NotFound { entity: "task", .. })
+            ),
+            "batch loses only because parent is no longer live: {batch_result:?}"
+        );
+        let deleted_parent = delete_result.expect("parent delete wins");
+        assert!(deleted_parent.deleted_at.is_some());
+        let child_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE parent_task_id = ?")
+                .bind(&parent.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("child count loads");
+        assert_eq!(child_count, 0, "losing batch leaves no partial children");
+    }
+    assert_parent_structure_is_clean(&db).await;
+}
+
+#[tokio::test]
+async fn reparent_serializes_with_destination_parent_soft_delete() {
+    let (db, _database_dir) = sqlite_file_db().await;
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _, _) = seed_project_repo(&db).await;
+    let child = create_root(&service, &project_id, "C").await;
+    let parent = create_root(&service, &project_id, "P").await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+    let move_service = service.clone();
+    let move_child = child.clone();
+    let move_parent_id = parent.id.clone();
+    let move_barrier = Arc::clone(&barrier);
+    let reparent = tokio::spawn(async move {
+        move_barrier.wait().await;
+        move_service
+            .update_task(task_update(&move_child, Some(Some(move_parent_id))))
+            .await
+    });
+
+    let delete_service = service.clone();
+    let delete_parent_id = parent.id.clone();
+    let delete_barrier = Arc::clone(&barrier);
+    let delete_parent = tokio::spawn(async move {
+        delete_barrier.wait().await;
+        delete_service.soft_delete(delete_parent_id).await
+    });
+    barrier.wait().await;
+
+    let reparent_result = reparent.await.expect("reparent joins");
+    let delete_result = delete_parent.await.expect("parent delete joins");
+    let final_child = TaskRepo::get_by_id(&*db, &child.id, false)
+        .await
+        .expect("child query succeeds")
+        .expect("child remains live");
+    let final_parent = TaskRepo::get_by_id(&*db, &parent.id, true)
+        .await
+        .expect("parent query succeeds")
+        .expect("parent row remains");
+    if reparent_result.is_ok() {
+        eprintln!("observed race outcome: reparent committed; destination delete was rejected");
+        let moved = reparent_result.expect("reparent wins");
+        assert!(delete_result.is_err(), "delete loses to reparent");
+        assert_eq!(moved.parent_task_id.as_deref(), Some(parent.id.as_str()));
+        assert!(final_parent.deleted_at.is_none());
+        assert_eq!(final_parent.version, parent.version);
+    } else {
+        eprintln!("observed race outcome: destination delete committed; reparent was rejected");
+        assert!(delete_result.is_ok(), "parent delete wins the race");
+        assert!(
+            matches!(
+                reparent_result,
+                Err(ServiceError::NotFound { entity: "task", .. })
+            ),
+            "reparent loses because the destination is no longer live: {reparent_result:?}"
+        );
+        assert!(final_parent.deleted_at.is_some());
+        assert!(final_child.parent_task_id.is_none());
+        assert!(final_child.subtask_order.is_none());
+        assert_eq!(final_child.version, child.version);
+    }
+    assert_parent_structure_is_clean(&db).await;
+}
+
+#[tokio::test]
+async fn reparent_requires_the_same_exact_repo() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, repo_a_id, _) = seed_project_repo(&db).await;
+    let now = now_rfc3339();
+    let repo_b = db::RepoRepo::create(
+        &*db,
+        db::CreateRepo {
+            id: db::new_uuid_v4(),
+            project_id: project_id.clone(),
+            name: "repo-b".to_owned(),
+            remote_url: "https://example.invalid/repo-b".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("second Repo creates");
+    let child = create_root(&service, &project_id, "A in Repo A").await;
+    assert_eq!(child.repo_id.as_deref(), Some(repo_a_id.as_str()));
+    let parent_b = TaskRepo::create(
+        &*db,
+        CreateTask {
+            id: db::new_uuid_v4(),
+            project_id: project_id.clone(),
+            repo_id: Some(repo_b.id.clone()),
+            parent_task_id: None,
+            subtask_order: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "B in Repo B".to_owned(),
+            description: None,
+            task_type: "implementation".to_owned(),
+            status: "todo".to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Repo B parent creates");
+
+    let rejected = service
+        .update_task(task_update(&child, Some(Some(parent_b.id.clone()))))
+        .await;
+    assert!(
+        matches!(rejected, Err(ServiceError::InvalidOperation { .. })),
+        "cross-Repo reparent is rejected: {rejected:?}"
+    );
+    let after_rejected = TaskRepo::get_by_id(&*db, &child.id, false)
+        .await
+        .expect("child query succeeds")
+        .expect("child remains");
+    assert_eq!(after_rejected.repo_id, child.repo_id);
+    assert_eq!(after_rejected.parent_task_id, child.parent_task_id);
+    assert_eq!(after_rejected.subtask_order, child.subtask_order);
+    assert_eq!(after_rejected.version, child.version);
+
+    let parent_a = create_root(&service, &project_id, "Parent in Repo A").await;
+    let attached = service
+        .update_task(task_update(
+            &after_rejected,
+            Some(Some(parent_a.id.clone())),
+        ))
+        .await
+        .expect("same-Repo reparent succeeds");
+    assert_eq!(attached.repo_id, child.repo_id);
+    assert_eq!(
+        attached.parent_task_id.as_deref(),
+        Some(parent_a.id.as_str())
+    );
+    assert_eq!(attached.subtask_order, Some(0));
+    assert_parent_structure_is_clean(&db).await;
+}
+
+#[tokio::test]
+async fn deleting_parent_after_detach_preserves_a_clean_root() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _, _) = seed_project_repo(&db).await;
+    let parent = create_root(&service, &project_id, "Parent").await;
+    let child = service
+        .create_task(
+            project_id,
+            "Child",
+            None,
+            Some(parent.id.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("child creates");
+    let detached = service
+        .update_task(task_update(&child, Some(None)))
+        .await
+        .expect("child detaches");
+    let deleted_parent = service
+        .soft_delete(parent.id.clone())
+        .await
+        .expect("parent without live children deletes");
+    assert!(deleted_parent.deleted_at.is_some());
+    assert!(detached.parent_task_id.is_none());
+    assert!(detached.subtask_order.is_none());
+    assert_parent_structure_is_clean(&db).await;
+}
+
+async fn assert_parent_structure_is_clean(db: &SqliteDb) {
+    let live_orphans: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM task child
+         LEFT JOIN task parent ON parent.id = child.parent_task_id
+         WHERE child.deleted_at IS NULL
+           AND child.parent_task_id IS NOT NULL
+           AND (parent.id IS NULL OR parent.deleted_at IS NOT NULL)",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("live parent invariant query succeeds");
+    let live_roots_with_order: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task
+         WHERE deleted_at IS NULL
+           AND parent_task_id IS NULL
+           AND subtask_order IS NOT NULL",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("root/order invariant query succeeds");
+    assert_eq!(live_orphans, 0, "all live children have a live parent");
+    assert_eq!(live_roots_with_order, 0, "live roots have no stale order");
+}
+
+#[tokio::test]
 async fn reorder_subtasks_updates_order() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

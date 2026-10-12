@@ -279,9 +279,10 @@ Project authority boundary.
 ### INV-039 — Task parent links stay inside one Project
 
 Whenever `Task.parent_task_id` is non-null, the parent and child Tasks belong to
-the same exact Project. Forge supports one subtask level: a parent is a root,
-and a Task with live children cannot itself become a subtask. TaskService
-rejects absent parents, cross-Project links, self-parenting, cycles, nested
+the same exact Project and their `repo_id` values match, including when both
+are null. Forge supports one subtask level: a parent is a root, and a Task with
+live children cannot itself become a subtask. TaskService rejects absent
+parents, cross-Project or cross-Repo links, self-parenting, cycles, nested
 parents, and moving a Task that has children. No router or MCP scope check
 substitutes for this service invariant.
 
@@ -291,8 +292,13 @@ reserves SQLite's single writer before hierarchy reads, so competing
 structural requests revalidate serially. `parent_task_id` and `subtask_order`
 change together: attach and moves to another parent append to the destination
 sibling order, and detach clears both fields. An ordinary Task update leaves
-both fields untouched. This PR does not rewrite legacy rows; any historical
-root with a non-null `subtask_order` remains a PR13 cleanup item if found.
+both fields untouched. A Task with live children cannot be soft-deleted; leaf
+deletion is serialized with structural writes. Project teardown deletes its
+Tasks and children together through the existing FK cascade. Repo deletion is
+rejected while its cascade would remove protected TaskLifecycle rows; the
+Repo, its primary-repo selection, and all Task links remain unchanged. This PR
+does not rewrite legacy rows; any historical root with a non-null
+`subtask_order` remains a PR13 cleanup item if found.
 
 ## Current repository baseline
 

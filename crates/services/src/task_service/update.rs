@@ -19,7 +19,7 @@ impl TaskService {
 
         let subtask_order = if let Some(parent_task_id) = requested_parent.as_deref() {
             validate_required("parent_task_id", parent_task_id)?;
-            let _parent = super::subtask::validate_parent_placement_in_tx(
+            let parent = super::subtask::validate_parent_placement_in_tx(
                 &self.db,
                 &mut transaction,
                 Some(&task.id),
@@ -27,6 +27,11 @@ impl TaskService {
                 parent_task_id,
             )
             .await?;
+            if task.repo_id != parent.repo_id {
+                return Err(ServiceError::invalid_operation(
+                    "parent and child Tasks must belong to the same Repo",
+                ));
+            }
             if task.parent_task_id.as_deref() == Some(parent_task_id)
                 && task.subtask_order.is_some()
             {
