@@ -203,6 +203,9 @@ async fn apply_migration_sql(pool: &SqlitePool, migration: &Migration, sql: &str
             let _ = sqlx::query("PRAGMA foreign_keys = ON")
                 .execute(&mut *connection)
                 .await;
+            let _ = sqlx::query("PRAGMA legacy_alter_table = OFF")
+                .execute(&mut *connection)
+                .await;
             return Err(error.into());
         }
         let receipt_exists = sqlx::query_scalar::<_, i64>(
@@ -242,4 +245,62 @@ fn migration_requires_direct_connection(sql: &str) -> bool {
     // migrations that rebuild referenced tables must run directly on a single
     // connection instead of inside the default transaction wrapper.
     sql.to_ascii_lowercase().contains("pragma foreign_keys")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_direct_migration_restores_pragmas_and_rolls_back_schema_and_receipt() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool creates");
+        ensure_migration_table(&pool)
+            .await
+            .expect("migration receipt table creates");
+        let migration = Migration {
+            version: 900,
+            name: "failed_direct_fixture".to_owned(),
+            path: PathBuf::from("V900__failed_direct_fixture.sql"),
+        };
+        let result = apply_migration_sql(
+            &pool,
+            &migration,
+            "PRAGMA foreign_keys = OFF;
+             PRAGMA legacy_alter_table = ON;
+             BEGIN IMMEDIATE;
+             CREATE TABLE pr13_partial_ddl (id TEXT PRIMARY KEY);
+             SELECT * FROM pr13_missing_table;
+             INSERT INTO _migration (version, name, applied_at)
+             VALUES (900, 'failed_direct_fixture', 'fixture');
+             COMMIT;",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "fixture migration must fail mid-transaction"
+        );
+
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .expect("foreign key PRAGMA reads after migration failure");
+        let legacy_alter_table: i64 = sqlx::query_scalar("PRAGMA legacy_alter_table")
+            .fetch_one(&pool)
+            .await
+            .expect("legacy alter PRAGMA reads after migration failure");
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(legacy_alter_table, 0);
+        let partial_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pr13_partial_ddl'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("partial DDL lookup succeeds");
+        assert_eq!(partial_table, 0, "failed migration DDL rolls back");
+        assert!(!is_applied(&pool, migration.version)
+            .await
+            .expect("receipt lookup succeeds"));
+    }
 }

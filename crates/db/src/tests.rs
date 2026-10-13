@@ -1,9 +1,9 @@
 use crate::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, validate_uuid_v4, ActorKind,
-    AgentListQuery, AgentProfileRepo, AgentRepo, AgentStatus, AgentTaskListQuery,
-    ClaimDomainEvents, ClaimOrchestratorWake, CompleteDomainEvent, CoordinationMode, CreateAgent,
-    CreateAgentIdentity, CreateAgentProfile, CreateDomainEvent, CreateEvidence, CreateExecution,
-    CreateOrchestratorWake, CreateProject, CreateProjectMember,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, run_migrations_from,
+    validate_uuid_v4, ActorKind, AgentListQuery, AgentProfileRepo, AgentRepo, AgentStatus,
+    AgentTaskListQuery, ClaimDomainEvents, ClaimOrchestratorWake, CompleteDomainEvent,
+    CoordinationMode, CreateAgent, CreateAgentIdentity, CreateAgentProfile, CreateDomainEvent,
+    CreateEvidence, CreateExecution, CreateOrchestratorWake, CreateProject, CreateProjectMember,
     CreateProviderAuthorizationOperation, CreateRepo, CreateRoleMembership, CreateSkill,
     CreateTask, CreateTaskRole, CreateTerminalSession, CreateValidationRun,
     CreateValidationRunArtifact, CreateWorkspace, CreateWorkspaceLease, CredentialHandleRepo,
@@ -11,16 +11,39 @@ use crate::{
     FinishValidationRun, NotificationListQuery, NotificationRepo, OrchestratorWakeRepo,
     PageRequest, ProjectMemberRepo, ProjectRepo, ProviderAuthorizationRepo, RepoRepo,
     ReserveOrchestratorAction, RoleMembershipRepo, RoleMembershipStatus, SelectAgentProfile,
-    SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskDependencyRepo, TaskListQuery, TaskRepo,
-    TaskRoleRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent, UpdateExecution,
-    UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo, UpdateRoleMembership,
-    UpdateSkill, UpdateTask, UpdateTaskRole, UpdateTerminalSessionStatus, UpsertDaemon,
-    ValidationRunRepo, ValidationRunStatus, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
-    WorkspaceStatus,
+    SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskDependencyRepo, TaskLifecycleRepo,
+    TaskListQuery, TaskRepo, TaskRoleRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
+    UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo,
+    UpdateRoleMembership, UpdateSkill, UpdateTask, UpdateTaskRole, UpdateTerminalSessionStatus,
+    UpsertDaemon, ValidationRunRepo, ValidationRunStatus, WorkMode, WorkspaceLeaseRepo,
+    WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use sha2::Digest as _;
 use sqlx::Row;
+use std::{fs, path::Path};
+
+fn copy_migrations_through(limit: i64, destination: &Path) {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(source).expect("migration directory") {
+        let path = entry.expect("migration entry").path();
+        let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((version, _)) = stem.split_once("__") else {
+            continue;
+        };
+        let version = version
+            .strip_prefix('V')
+            .expect("migration prefix")
+            .parse::<i64>()
+            .expect("migration version");
+        if version <= limit {
+            fs::copy(&path, destination.join(path.file_name().expect("filename")))
+                .expect("migration copied");
+        }
+    }
+}
 
 fn page(limit: i64) -> PageRequest {
     PageRequest {
@@ -4635,18 +4658,79 @@ async fn migration_creates_schema_and_enforces_foreign_keys() {
     .await
     .expect("agent inserts");
 
-    sqlx::query(
-        "INSERT INTO task (id, project_id, repo_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+    TaskRepo::create(
+        &db,
+        CreateTask {
+            id: task_id.clone(),
+            project_id: project_id.clone(),
+            repo_id: Some(repo_id.clone()),
+            parent_task_id: None,
+            title: "Build DB foundation".to_owned(),
+            description: None,
+            task_type: "implementation".to_owned(),
+            lifecycle_state: crate::TaskLifecycleState::Ready,
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
     )
-    .bind(&task_id)
-    .bind(&project_id)
-    .bind(&repo_id)
-    .bind("Build DB foundation")
-    .bind(&now)
-    .bind(&now)
+    .await
+    .expect("canonical task and lifecycle create");
+    assert_eq!(
+        TaskLifecycleRepo::get_task_lifecycle(&db, &task_id)
+            .await
+            .expect("TaskLifecycle lookup succeeds")
+            .expect("canonical Task has TaskLifecycle")
+            .state,
+        crate::TaskLifecycleState::Ready
+    );
+
+    let rejected_task_id = new_uuid_v4();
+    sqlx::query(&format!(
+        "CREATE TRIGGER reject_task_lifecycle_for_test
+         BEFORE INSERT ON task_lifecycle WHEN NEW.task_id = '{rejected_task_id}'
+         BEGIN SELECT RAISE(ABORT, 'injected lifecycle insert failure'); END"
+    ))
     .execute(&pool)
     .await
-    .expect("task inserts");
+    .expect("failure injection trigger creates");
+    let rejected = TaskRepo::create(
+        &db,
+        CreateTask {
+            id: rejected_task_id.clone(),
+            project_id: project_id.clone(),
+            repo_id: Some(repo_id.clone()),
+            parent_task_id: None,
+            title: "Must roll back without lifecycle".to_owned(),
+            description: None,
+            task_type: "implementation".to_owned(),
+            lifecycle_state: crate::TaskLifecycleState::Ready,
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await;
+    assert!(
+        rejected.is_err(),
+        "injected lifecycle write must abort creation"
+    );
+    assert!(TaskRepo::get_by_id(&db, &rejected_task_id, true)
+        .await
+        .expect("rejected Task lookup succeeds")
+        .is_none());
+    assert!(
+        TaskLifecycleRepo::get_task_lifecycle(&db, &rejected_task_id)
+            .await
+            .expect("rejected lifecycle lookup succeeds")
+            .is_none()
+    );
 
     sqlx::query(
         "INSERT INTO execution (id, task_id, agent_id, role, status, logs_path, created_at, updated_at) VALUES (?, ?, ?, 'executor', 'running', ?, ?, ?)",
@@ -6812,40 +6896,66 @@ async fn refresh_token_expired_cleanup() {
 
 #[tokio::test]
 async fn test_normalize_failure_kinds_migration_backfill() {
+    let temp = tempfile::tempdir().expect("migration fixture temp directory");
+    let baseline_dir = temp.path().join("v055");
+    let normalized_dir = temp.path().join("v056");
+    fs::create_dir_all(&baseline_dir).expect("V055 migration directory");
+    fs::create_dir_all(&normalized_dir).expect("V056 migration directory");
+    copy_migrations_through(55, &baseline_dir);
+    copy_migrations_through(56, &normalized_dir);
     let pool = create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
-    run_migrations(&pool).await.expect("migrations run");
-
-    // Seed legacy rows below the FK layer, then re-apply V056 over them.
-    let mut conn = pool.acquire().await.expect("connection acquires");
-    sqlx::query("PRAGMA foreign_keys = OFF")
-        .execute(&mut *conn)
+    run_migrations_from(&pool, &baseline_dir)
         .await
-        .expect("fk off");
+        .expect("legacy V055 baseline");
+
     let now = now_rfc3339();
-    let insert = |id: &str,
-                  error_annotation: Option<&str>,
-                  blocked: Option<&str>,
-                  failed: Option<&str>| {
-        sqlx::query(
-            "INSERT INTO task (id, project_id, repo_id, title, status, error_annotation, blocked_json, failed_json, created_at, updated_at)
-             VALUES (?, 'p', 'r', 'legacy', 'blocked', ?, ?, ?, ?, ?)",
-        )
-        .bind(id.to_owned())
-        .bind(error_annotation.map(str::to_owned))
-        .bind(blocked.map(str::to_owned))
-        .bind(failed.map(str::to_owned))
-        .bind(now.clone())
-        .bind(now.clone())
-    };
+    sqlx::query(
+        "INSERT INTO project (id, name, settings, created_at, updated_at)
+         VALUES ('p', 'Failure kinds', '{}', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("legacy Project");
+    sqlx::query(
+        "INSERT INTO repo (
+             id, project_id, name, remote_url, local_path, work_mode,
+             default_branch, created_at, updated_at
+         ) VALUES ('r', 'p', 'repo', 'https://example.invalid/repo.git',
+                  '/tmp/repo', 'direct_merge', 'main', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("legacy Repo");
+
+    // Seed genuine pre-V056 rows, then let V056 normalize only mapped values.
+    let insert =
+        |id: &str, error_annotation: Option<&str>, blocked: Option<&str>, failed: Option<&str>| {
+            sqlx::query(
+                "INSERT INTO task (
+                 id, project_id, repo_id, title, status, error_annotation,
+                 blocked_json, failed_json, created_at, updated_at
+             ) VALUES (?, 'p', 'r', 'legacy', 'blocked', ?, ?, ?, ?, ?)",
+            )
+            .bind(id.to_owned())
+            .bind(error_annotation.map(str::to_owned))
+            .bind(blocked.map(str::to_owned))
+            .bind(failed.map(str::to_owned))
+            .bind(now.clone())
+            .bind(now.clone())
+        };
     insert(
         "t-alias",
         Some(r#"{"type":"retry_budget_exhausted","blocking_reason":"x"}"#),
         None,
         None,
     )
-    .execute(&mut *conn)
+    .execute(&pool)
     .await
     .expect("alias row inserts");
     insert(
@@ -6854,7 +6964,7 @@ async fn test_normalize_failure_kinds_migration_backfill() {
         Some(r#"{"reason":"review retry budget exhausted after 3 attempts","created_at":"2026-01-01T00:00:00Z"}"#),
         None,
     )
-    .execute(&mut *conn)
+    .execute(&pool)
     .await
     .expect("prose row inserts");
     insert(
@@ -6863,7 +6973,7 @@ async fn test_normalize_failure_kinds_migration_backfill() {
         None,
         Some(r#"{"reason":"crashed","created_at":"2026-01-01T00:00:00Z","kind":"crash"}"#),
     )
-    .execute(&mut *conn)
+    .execute(&pool)
     .await
     .expect("crash row inserts");
     insert(
@@ -6872,7 +6982,7 @@ async fn test_normalize_failure_kinds_migration_backfill() {
         Some("also not json"),
         None,
     )
-    .execute(&mut *conn)
+    .execute(&pool)
     .await
     .expect("malformed row inserts");
     insert(
@@ -6881,20 +6991,13 @@ async fn test_normalize_failure_kinds_migration_backfill() {
         Some(r#"{"reason":"strange","created_at":"2026-01-01T00:00:00Z","kind":"从未见过"}"#),
         None,
     )
-    .execute(&mut *conn)
+    .execute(&pool)
     .await
     .expect("unknown row inserts");
-    sqlx::query("PRAGMA foreign_keys = ON")
-        .execute(&mut *conn)
-        .await
-        .expect("fk on");
-    drop(conn);
 
-    sqlx::query("DELETE FROM _migration WHERE version = 56")
-        .execute(&pool)
+    run_migrations_from(&pool, &normalized_dir)
         .await
-        .expect("migration marker clears");
-    run_migrations(&pool).await.expect("migration re-applies");
+        .expect("V056 normalization migration applies");
 
     let field = |id: &str, column: &str| {
         let sql = format!("SELECT {column} FROM task WHERE id = ?");

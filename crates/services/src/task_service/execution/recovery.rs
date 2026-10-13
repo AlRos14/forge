@@ -65,7 +65,10 @@ impl TaskService {
         }
     }
 
-    fn recovery_annotation(&self, task: &Task) -> Result<api_types::TaskBlockingAnnotation> {
+    pub(super) fn recovery_annotation(
+        &self,
+        task: &Task,
+    ) -> Result<api_types::TaskBlockingAnnotation> {
         if let Some(annotation) = self.parse_blocking_annotation(task) {
             if annotation.blocked_execution_id.is_some()
                 && annotation.annotation_type != api_types::FailureKind::Unknown
@@ -299,6 +302,14 @@ impl TaskService {
                 "resume_session requires an Execution bound to its exact open WorkUnit and Workspace",
             ));
         }
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        if lifecycle.state != db::TaskLifecycleState::Blocked {
+            return Err(ServiceError::invalid_operation(
+                "recovery requires a blocked TaskLifecycle",
+            ));
+        }
         let work_unit_id = blocked_execution.work_unit_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation(
                 "resume_session cannot infer a WorkUnit from Task or Workspace identity",
@@ -455,23 +466,21 @@ impl TaskService {
             updated_snapshot
         };
         self.ensure_task_runnable(&task).await?;
-        let updated_task = self.activate_task_for_execution(task).await?;
-        let updated_task = self.clear_blocking_metadata(&updated_task.id).await?;
         let now = now_rfc3339();
-        let execution = self
-            .create_running_work_unit_execution_with_artifact_inputs(
+        let (updated_task, execution) = self
+            .admit_recovery_work_unit_execution_with_artifact_inputs(
+                &task,
+                &lifecycle,
+                &blocked_execution.id,
                 work_unit_id,
                 work_unit.version,
                 CreateExecution {
                     id: new_uuid_v4(),
-                    task_id: updated_task.id.clone(),
+                    task_id: task.id.clone(),
                     agent_id: Some(agent_id.clone()),
                     actor_ref: Some(db::ActorRef::Agent(agent_id)),
                     purpose: Some(blocked_execution.purpose.clone().unwrap_or_else(|| {
-                        execution_purpose_for_task_type(
-                            &updated_task.task_type,
-                            &blocked_execution.role,
-                        )
+                        execution_purpose_for_task_type(&task.task_type, &blocked_execution.role)
                     })),
                     harness_session_id,
                     role: blocked_execution.role.clone(),

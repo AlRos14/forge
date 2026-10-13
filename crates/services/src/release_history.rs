@@ -192,7 +192,7 @@ impl HistoricalReleaseReader {
             render_digest: Some(charter.try_get("rendered_digest")?),
         };
 
-        let evidence_pins = self
+        let (frozen_evidence_pins, projected_evidence_pins) = self
             .release_pins(
                 &record.project_id,
                 &record.id,
@@ -213,7 +213,7 @@ impl HistoricalReleaseReader {
         };
         validate_persisted_authorization(&authorization, "project.milestone.release")?;
 
-        let snapshot = ReleaseSnapshot {
+        let mut snapshot = ReleaseSnapshot {
             schema_version: record.schema_version.clone(),
             project_id: record.project_id.clone(),
             milestone_id: record.milestone_id.clone(),
@@ -254,7 +254,7 @@ impl HistoricalReleaseReader {
                 &record.git_references_json,
                 "release git_references",
             )?,
-            evidence_pins,
+            evidence_pins: frozen_evidence_pins,
             waived_check_ids: parse_json_required(&record.waivers_json, "release waivers")?,
             release_policy_revision: record.release_policy_revision.clone(),
             release_policy_digest: record.release_policy_digest.clone(),
@@ -274,6 +274,10 @@ impl HistoricalReleaseReader {
         }
         self.validate_release_references(&record.id, &snapshot)
             .await?;
+        // Availability is a read-time overlay from immutable tombstones. Keep
+        // the stored pin projection in the digest input, then expose the
+        // current audited projection after the frozen snapshot has verified.
+        snapshot.evidence_pins = projected_evidence_pins;
         Ok(ProjectRelease {
             id: record.id,
             project_id: record.project_id,
@@ -433,7 +437,7 @@ impl HistoricalReleaseReader {
         project_id: &str,
         release_id: &str,
         frozen_evidence_json: &str,
-    ) -> crate::Result<Vec<api_types::EvidencePin>> {
+    ) -> crate::Result<(Vec<api_types::EvidencePin>, Vec<api_types::EvidencePin>)> {
         let frozen: Vec<api_types::EvidencePin> =
             parse_json_required(frozen_evidence_json, "release evidence_references")?;
         let rows = sqlx::query(
@@ -505,7 +509,7 @@ impl HistoricalReleaseReader {
                         "immutable release pin digest does not match its metadata",
                     ));
                 }
-                Ok(api_types::EvidencePin {
+                let projected_pin = api_types::EvidencePin {
                     id,
                     release_id: row.try_get("release_id")?,
                     attachment_id,
@@ -517,7 +521,8 @@ impl HistoricalReleaseReader {
                     task_media_id: frozen_pin.task_media_id.clone(),
                     stable_project_url: frozen_pin.stable_project_url.clone(),
                     pinned_at: row.try_get("created_at")?,
-                })
+                };
+                Ok((frozen_pin.clone(), projected_pin))
             })
             .collect::<crate::Result<Vec<_>>>()?;
         if pins.len() != frozen.len() {
@@ -525,7 +530,8 @@ impl HistoricalReleaseReader {
                 "release evidence pin set does not match frozen metadata",
             ));
         }
-        Ok(pins)
+        let (frozen, projected): (Vec<_>, Vec<_>) = pins.into_iter().unzip();
+        Ok((frozen, projected))
     }
 }
 

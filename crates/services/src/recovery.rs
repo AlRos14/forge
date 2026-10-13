@@ -1776,7 +1776,7 @@ mod tests {
                 parent_work_unit_id: None,
                 title: "Recovery fixture".to_owned(),
                 scope: "exact recovery target".to_owned(),
-                role: "coder".to_owned(),
+                role: "implementer".to_owned(),
                 assigned_actor: Some(actor.clone()),
                 requires_integration: false,
                 provenance: None,
@@ -1813,7 +1813,7 @@ mod tests {
                     actor_ref: Some(actor),
                     purpose: Some(db::ExecutionPurpose::Implement),
                     harness_session_id: None,
-                    role: "coder".to_owned(),
+                    role: "implementer".to_owned(),
                     status: ExecutionStatus::Running,
                     stop_reason: None,
                     stopped_by: None,
@@ -1965,15 +1965,19 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let (project_id, repo_id) = seed_project_repo(&db).await;
-        let task = seed_task(&db, project_id, repo_id, "blocked".to_owned(), None).await;
-        sqlx::query(
-            "UPDATE task_lifecycle SET reason_kind = 'ambiguous_review', reason_ref = ? WHERE task_id = ?",
-        )
-        .bind(&task.id)
-        .bind(&task.id)
-        .execute(db.pool())
-        .await
-        .expect("historical ambiguity receipt is seeded exactly");
+        let task = seed_task(&db, project_id, repo_id, "active".to_owned(), None).await;
+        crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .block(
+                &task.id,
+                crate::task_lifecycle::LifecycleCause::System(
+                    api_types::SystemComponent::TaskDispatcher,
+                ),
+                "ambiguous_review",
+                task.id.clone(),
+                format!("historical-ambiguity:{}", task.id),
+            )
+            .await
+            .expect("historical ambiguity is recorded with an exact lifecycle receipt");
 
         let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)
             .run_recovery()

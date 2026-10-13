@@ -533,10 +533,34 @@ impl TaskService {
             None => None,
         };
         self.ensure_task_runnable(&task).await?;
-        let mut task = self.activate_task_for_execution(task).await?;
-        if clear_recovery_metadata {
-            task = self.clear_blocking_metadata(&task.id).await?;
-        }
+        let recovery_lifecycle = if clear_recovery_metadata {
+            let annotation = self.recovery_annotation(&task)?;
+            if annotation.blocked_execution_id.as_deref() != Some(parent_execution.id.as_str())
+                || !annotation
+                    .recovery_actions
+                    .contains(&api_types::RecoveryAction::Reexecute)
+            {
+                return Err(ServiceError::invalid_operation(
+                    "re-execute parent does not match the exact current recovery annotation",
+                ));
+            }
+            let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+            if lifecycle.state != db::TaskLifecycleState::Blocked {
+                return Err(ServiceError::invalid_operation(
+                    "recovery requires a blocked TaskLifecycle",
+                ));
+            }
+            Some(lifecycle)
+        } else {
+            None
+        };
+        let task = if recovery_lifecycle.is_none() {
+            self.activate_task_for_execution(task).await?
+        } else {
+            task
+        };
         let executor_config_snapshot_json = build_executor_config_snapshot(
             &self.db,
             &task,
@@ -561,44 +585,59 @@ impl TaskService {
             .inherit_plan_artifact_inputs(&parent_execution.id, &task.id)
             .await?;
         let now = now_rfc3339();
-        let execution = self
-            .create_running_work_unit_execution_with_artifact_inputs(
+        let execution_input = CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent.id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
+            purpose: Some(parent_execution.purpose.clone().unwrap_or_else(|| {
+                execution_purpose_for_task_type(&task.task_type, &work_unit.role)
+            })),
+            harness_session_id: None,
+            role: work_unit.role.clone(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: Some(parent_execution.id.clone()),
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some(summary),
+            logs_path: None,
+            before_sha: workspace
+                .as_ref()
+                .and_then(|workspace| workspace.before_sha.clone())
+                .or_else(|| parent_execution.before_sha.clone()),
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json,
+            workspace_id: parent_execution.workspace_id.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let (task, execution) = if let Some(lifecycle) = recovery_lifecycle.as_ref() {
+            self.admit_recovery_work_unit_execution_with_artifact_inputs(
+                &task,
+                lifecycle,
+                &parent_execution.id,
                 work_unit_id,
                 work_unit.version,
-                CreateExecution {
-                    id: new_uuid_v4(),
-                    task_id: task.id.clone(),
-                    agent_id: Some(agent.id.clone()),
-                    actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
-                    purpose: Some(parent_execution.purpose.clone().unwrap_or_else(|| {
-                        execution_purpose_for_task_type(&task.task_type, &work_unit.role)
-                    })),
-                    harness_session_id: None,
-                    role: work_unit.role.clone(),
-                    status: ExecutionStatus::Running,
-                    stop_reason: None,
-                    stopped_by: None,
-                    resume_policy: None,
-                    stopped_at: None,
-                    parent_execution_id: Some(parent_execution.id.clone()),
-                    agent_message_id: None,
-                    last_activity_at: None,
-                    summary: Some(summary),
-                    logs_path: None,
-                    before_sha: workspace
-                        .as_ref()
-                        .and_then(|workspace| workspace.before_sha.clone())
-                        .or_else(|| parent_execution.before_sha.clone()),
-                    after_sha: None,
-                    error: None,
-                    executor_config_snapshot_json,
-                    workspace_id: parent_execution.workspace_id.clone(),
-                    created_at: now.clone(),
-                    updated_at: now,
-                },
+                execution_input,
                 artifact_input_ids,
             )
-            .await?;
+            .await?
+        } else {
+            let execution = self
+                .create_running_work_unit_execution_with_artifact_inputs(
+                    work_unit_id,
+                    work_unit.version,
+                    execution_input,
+                    artifact_input_ids,
+                )
+                .await?;
+            (task, execution)
+        };
 
         tracing::info!(
             task_id = %task.id,

@@ -314,6 +314,15 @@ async fn parent_mutations_keep_parent_and_subtask_order_coherent() {
     assert_eq!(children_a[1].subtask_order, Some(1));
     assert_eq!(children_b[0].subtask_order, Some(0));
     assert_eq!(children_b[1].subtask_order, Some(1));
+    for child in children_a.iter().chain(&children_b) {
+        assert!(
+            db::TaskLifecycleRepo::get_task_lifecycle(&*db, &child.id)
+                .await
+                .expect("subtask lifecycle lookup succeeds")
+                .is_some(),
+            "canonical subtask creation commits TaskLifecycle"
+        );
+    }
 
     let root_x = create_root(&service, &project_id, "Root X").await;
     let attached = service

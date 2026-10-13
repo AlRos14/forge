@@ -41,24 +41,39 @@ pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
 
+    test_app_with_pool(pool, workspace_root, prefix).await
+}
+
+pub async fn test_app_with_pool(
+    pool: sqlx::SqlitePool,
+    workspace_root: &Path,
+    prefix: &str,
+) -> Harness {
     let db = Arc::new(db::SqliteDb::new(pool));
 
     // Seed the JWT test user so project membership FK constraints succeed.
-    let now = db::now_rfc3339();
-    db::UserRepo::create_user(
-        &*db,
-        &db::User {
-            id: "test-user-id".to_owned(),
-            email: "test@example.com".to_owned(),
-            password_hash: "$2b$04$placeholder".to_owned(),
-            display_name: None,
-            is_admin: false,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("seed test user");
+    let user_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user WHERE id = 'test-user-id')")
+            .fetch_one(db.pool())
+            .await
+            .expect("test user lookup succeeds");
+    if !user_exists {
+        let now = db::now_rfc3339();
+        db::UserRepo::create_user(
+            &*db,
+            &db::User {
+                id: "test-user-id".to_owned(),
+                email: "test@example.com".to_owned(),
+                password_hash: "$2b$04$placeholder".to_owned(),
+                display_name: None,
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("seed test user");
+    }
 
     let adapter_registry = Arc::new(cli_adapters::default_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)

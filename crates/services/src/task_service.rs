@@ -417,6 +417,230 @@ impl TaskService {
         Ok(write.record)
     }
 
+    /// Recovery admission changes the blocked Task to Active and creates its
+    /// exact child Execution in one SQLite transaction. Preflight checks here
+    /// provide useful errors; the repository transaction and SQL guards repeat
+    /// the authority checks at the durable boundary.
+    pub(crate) async fn admit_recovery_work_unit_execution_with_artifact_inputs(
+        &self,
+        task: &Task,
+        lifecycle: &db::TaskLifecycle,
+        blocked_execution_id: &str,
+        work_unit_id: &str,
+        expected_work_unit_version: i64,
+        input: CreateExecution,
+        artifact_input_ids: Vec<String>,
+    ) -> Result<(Task, Execution)> {
+        if lifecycle.state != db::TaskLifecycleState::Blocked
+            || input.task_id != task.id
+            || input.parent_execution_id.as_deref() != Some(blocked_execution_id)
+            || input.status != ExecutionStatus::Running
+            || input.purpose.is_none()
+        {
+            return Err(ServiceError::invalid_operation(
+                "recovery admission requires the exact blocked Task, parent Execution, and WorkUnit target",
+            ));
+        }
+        let work_unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("work_unit", work_unit_id.to_owned()))?;
+        if work_unit.task_id != task.id
+            || work_unit.version != expected_work_unit_version
+            || work_unit.status != db::WorkUnitStatus::Open
+            || work_unit.role != input.role
+        {
+            return Err(ServiceError::Db(db::DbError::VersionConflict));
+        }
+        let actor = input.actor_ref.as_ref().ok_or_else(|| {
+            ServiceError::invalid_operation("recovery Execution requires an exact ActorRef")
+        })?;
+        if work_unit.assigned_actor.as_ref() != Some(actor) {
+            return Err(ServiceError::AuthorizationDenied {
+                message: "recovery Actor does not match the exact WorkUnit assignment".to_owned(),
+            });
+        }
+        match actor {
+            db::ActorRef::Agent(agent_id) if input.agent_id.as_deref() != Some(agent_id) => {
+                return Err(ServiceError::invalid_operation(
+                    "recovery Agent Execution agent_id must match its ActorRef",
+                ));
+            }
+            db::ActorRef::Human(_) if input.agent_id.is_some() => {
+                return Err(ServiceError::invalid_operation(
+                    "Human recovery Execution cannot carry an Agent identity",
+                ));
+            }
+            _ => {}
+        }
+        if let db::ActorRef::Agent(agent_id) = actor {
+            let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
+            if !crate::agent_capacity::has_running_execution_capacity(&self.db, &agent).await? {
+                return Err(db::DbError::AgentAtCapacity.into());
+            }
+        }
+        self.ensure_task_runnable(task).await?;
+
+        // The lifecycle transition increments the Task version once in the
+        // same transaction. The lease records that post-transition version.
+        let admitted_task_version = task.version.checked_add(1).ok_or_else(|| {
+            ServiceError::invalid_operation("Task version cannot be incremented for recovery")
+        })?;
+        let admitted_lifecycle_version = lifecycle.version.checked_add(1).ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "TaskLifecycle version cannot be incremented for recovery",
+            )
+        })?;
+        let mut admitted_task = task.clone();
+        admitted_task.version = admitted_task_version;
+        let workspace_lease = if work_unit.requires_integration {
+            let workspace_id = input.workspace_id.as_deref().ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "repository recovery requires the exact WorkUnit Workspace",
+                )
+            })?;
+            let _workspace_guard = if let Some(locks) = self.workspace_exec_locks.as_ref() {
+                Some(locks.acquire(workspace_id).await)
+            } else {
+                None
+            };
+            let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+            if workspace.task_id != task.id
+                || workspace.status != WorkspaceStatus::Ready
+                || scope.task_id != task.id
+                || scope.kind != db::WorkspaceScopeKind::WorkUnit
+                || scope.work_unit_id.as_deref() != Some(work_unit_id)
+            {
+                return Err(ServiceError::invalid_operation(
+                    "recovery Workspace is not ready for the exact WorkUnit",
+                ));
+            }
+            Some(
+                self.prepare_work_unit_workspace_lease(
+                    &admitted_task,
+                    &work_unit,
+                    &workspace,
+                    &input,
+                    actor,
+                )
+                .await?,
+            )
+        } else {
+            if input.workspace_id.is_some()
+                || WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, work_unit_id)
+                    .await?
+                    .is_some()
+            {
+                return Err(ServiceError::invalid_operation(
+                    "non-repository recovery cannot select a WorkUnit Workspace",
+                ));
+            }
+            None
+        };
+
+        let updated_at = now_rfc3339();
+        let idempotency_key = format!("recovery:{}:active", blocked_execution_id);
+        let lifecycle_event = CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "task.lifecycle_changed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: task.id.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: task.id.clone(),
+            correlation_id: idempotency_key.clone(),
+            causation_id: Some(blocked_execution_id.to_owned()),
+            causation_depth: 1,
+            dedupe_key: Some(format!("task-lifecycle:{}:{}", task.id, idempotency_key)),
+            payload_json: json!({
+                "task_id": task.id,
+                "from_state": db::TaskLifecycleState::Blocked,
+                "to_state": db::TaskLifecycleState::Active,
+                "from_version": lifecycle.version,
+                "to_version": admitted_lifecycle_version,
+                "cause_kind": "execution",
+                "cause_ref": blocked_execution_id,
+                "gate_evaluation_id": null,
+                "reason_kind": "execution_recovery",
+                "reason_ref": blocked_execution_id,
+            })
+            .to_string(),
+            created_at: updated_at.clone(),
+        };
+        let lifecycle_transition = db::TransitionTaskLifecycle {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            expected_task_version: task.version,
+            expected_lifecycle_version: lifecycle.version,
+            expected_state: db::TaskLifecycleState::Blocked,
+            to_state: db::TaskLifecycleState::Active,
+            cause_kind: "execution".to_owned(),
+            cause_ref: Some(blocked_execution_id.to_owned()),
+            reason_kind: Some("execution_recovery".to_owned()),
+            reason_ref: Some(blocked_execution_id.to_owned()),
+            gate_evaluation_id: None,
+            idempotency_key,
+            updated_at: updated_at.clone(),
+            event: lifecycle_event,
+        };
+        let execution_event = execution_domain_event(&input, "execution.started");
+        let write = db::WorkUnitExecutionRepo::admit_recovery_for_work_unit_with_artifact_inputs(
+            &*self.db,
+            db::RecoverWorkUnitExecution {
+                admission: db::CreateWorkUnitExecution {
+                    execution: input.clone(),
+                    work_unit_id: work_unit.id.clone(),
+                    work_unit_version: expected_work_unit_version,
+                    workspace_lease,
+                },
+                lifecycle_transition,
+                expected_error_annotation: task.error_annotation.clone(),
+                expected_blocked_json: task.blocked_json.clone(),
+                expected_metadata_json: task.metadata_json.clone(),
+            },
+            artifact_input_ids,
+            execution_event,
+        )
+        .await?;
+        self.publish_committed_domain_event(&write.lifecycle_event);
+        self.publish_committed_domain_event(&write.execution_event);
+
+        let mut recovered_task = admitted_task;
+        recovered_task.lifecycle_state = db::TaskLifecycleState::Active;
+        recovered_task.error_annotation = None;
+        recovered_task.blocked_json = None;
+        recovered_task.updated_at = updated_at;
+        if task.blocked_json.is_some() {
+            let previous_reason = task
+                .blocked_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|metadata| {
+                    metadata
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+            self.publish(ForgeEvent {
+                event_type: "task.unblocked".to_owned(),
+                entity_id: recovered_task.id.clone(),
+                timestamp: event_timestamp(),
+                context: EventContext::TaskUnblocked {
+                    project_id: recovered_task.project_id.clone(),
+                    previous_reason,
+                },
+            });
+        }
+        Ok((recovered_task, write.execution))
+    }
+
     pub(crate) async fn inherit_plan_artifact_inputs(
         &self,
         parent_execution_id: &str,

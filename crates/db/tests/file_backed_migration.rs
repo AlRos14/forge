@@ -1674,6 +1674,235 @@ fn migration_version(filename: &str) -> Option<i64> {
 }
 
 #[tokio::test]
+async fn pr13_v129_rejects_and_rolls_back_a_historical_task_without_lifecycle() {
+    let baseline_dir = unique_temp_path("pr13-v128-lifecycle-migrations");
+    let cutover_dir = unique_temp_path("pr13-v129-lifecycle-migrations");
+    fs::create_dir_all(&baseline_dir).expect("V128 migration dir creates");
+    fs::create_dir_all(&cutover_dir).expect("V129 migration dir creates");
+    copy_migrations_up_to(128, &baseline_dir);
+    copy_migrations_up_to(129, &cutover_dir);
+
+    let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+    run_migrations_from(&pool, &baseline_dir)
+        .await
+        .expect("V128 baseline applies");
+    sqlx::query("DROP TRIGGER task_lifecycle_insert_for_new_task")
+        .execute(&pool)
+        .await
+        .expect("simulate an incomplete historical direct Task writer");
+    sqlx::query(
+        "INSERT INTO project (id, name, settings, created_at, updated_at)
+         VALUES ('pr13-orphan-project', 'Lifecycle cutover', '{}', '2026-10-13T00:00:00Z', '2026-10-13T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("historical Project");
+    sqlx::query(
+        "INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at)
+         VALUES ('pr13-orphan-task', 'pr13-orphan-project', 'Orphan fixture', 'implementation', 'todo', '2026-10-13T00:00:00Z', '2026-10-13T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("historical Task without lifecycle");
+
+    let cutover = run_migrations_from(&pool, &cutover_dir).await;
+    assert!(
+        cutover.is_err(),
+        "V129 must fail closed on a missing lifecycle"
+    );
+
+    let orphan_task_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task WHERE id = 'pr13-orphan-task' AND status = 'todo'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("historical Task survives failed cutover");
+    assert_eq!(orphan_task_count, 1);
+    let lifecycle_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_lifecycle WHERE task_id = 'pr13-orphan-task'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("TaskLifecycle remains absent");
+    assert_eq!(lifecycle_count, 0);
+    let receipt_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _migration WHERE version = 129")
+            .fetch_one(&pool)
+            .await
+            .expect("V129 receipt lookup");
+    assert_eq!(receipt_count, 0);
+    let status_column: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('task') WHERE name = 'status'")
+            .fetch_one(&pool)
+            .await
+            .expect("legacy Task schema remains after rollback");
+    assert_eq!(status_column, 1);
+    let lifecycle_trigger: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'trigger' AND name = 'task_lifecycle_insert_for_new_task'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("pre-cutover TaskLifecycle trigger remains");
+    assert_eq!(lifecycle_trigger, 0, "the deliberate fixture drop persists");
+    let foreign_key_violations: Vec<(String, i64, String, i64)> =
+        sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .expect("foreign_key_check runs after rollback");
+    assert!(foreign_key_violations.is_empty());
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&pool)
+        .await
+        .expect("integrity_check runs after rollback");
+    assert_eq!(integrity, "ok");
+    let foreign_keys_enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .expect("foreign_keys state reads after rollback");
+    assert_eq!(foreign_keys_enabled, 1);
+
+    let _ = fs::remove_dir_all(baseline_dir);
+    let _ = fs::remove_dir_all(cutover_dir);
+}
+
+#[tokio::test]
+async fn pr13_lifecycle_cutover_accepts_restart_with_no_new_receipts_or_rows() {
+    let migration_dir = unique_temp_path("pr13-v132-lifecycle-restart");
+    fs::create_dir_all(&migration_dir).expect("V132 migration dir creates");
+    copy_migrations_up_to(132, &migration_dir);
+    let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("first V1-V132 migration pass");
+    let first_receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("first migration receipt count");
+    let first_lifecycle_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_lifecycle")
+        .fetch_one(&pool)
+        .await
+        .expect("first lifecycle row count");
+
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("restart migration pass is idempotent");
+    let second_receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("second migration receipt count");
+    let second_lifecycle_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_lifecycle")
+        .fetch_one(&pool)
+        .await
+        .expect("second lifecycle row count");
+    assert_eq!(second_receipts, first_receipts);
+    assert_eq!(second_lifecycle_rows, first_lifecycle_rows);
+
+    let foreign_keys_enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .expect("foreign_keys PRAGMA reads after restart");
+    let legacy_alter_table: i64 = sqlx::query_scalar("PRAGMA legacy_alter_table")
+        .fetch_one(&pool)
+        .await
+        .expect("legacy_alter_table PRAGMA reads after restart");
+    assert_eq!(foreign_keys_enabled, 1);
+    assert_eq!(legacy_alter_table, 0);
+
+    let foreign_key_violations: Vec<(String, i64, String, i64)> =
+        sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .expect("foreign_key_check runs after restart");
+    assert!(foreign_key_violations.is_empty());
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&pool)
+        .await
+        .expect("integrity_check runs after restart");
+    assert_eq!(integrity, "ok");
+
+    let _ = fs::remove_dir_all(migration_dir);
+}
+
+#[tokio::test]
+async fn pr13_v120_empty_database_upgrades_and_restarts_cleanly() {
+    let baseline_dir = unique_temp_path("pr13-v120-empty-baseline");
+    let final_dir = unique_temp_path("pr13-v132-empty-upgrade");
+    fs::create_dir_all(&baseline_dir).expect("V120 migration dir creates");
+    fs::create_dir_all(&final_dir).expect("V132 migration dir creates");
+    copy_migrations_up_to(120, &baseline_dir);
+    copy_migrations_up_to(132, &final_dir);
+
+    let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+    run_migrations_from(&pool, &baseline_dir)
+        .await
+        .expect("empty database reaches V120");
+    let v120_max_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("V120 migration head loads");
+    let v120_receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("V120 receipt count loads");
+    assert_eq!(v120_max_version, 120);
+
+    run_migrations_from(&pool, &final_dir)
+        .await
+        .expect("empty V120 database upgrades to V132");
+    let first_max_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("V132 migration head loads");
+    let first_receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("V132 receipt count loads");
+    assert_eq!(first_max_version, 132);
+    assert_eq!(first_receipts, v120_receipts + 12);
+    run_migrations_from(&pool, &final_dir)
+        .await
+        .expect("restart leaves V132 schema unchanged");
+    let second_receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("restart receipt count loads");
+    assert_eq!(second_receipts, first_receipts);
+
+    let release_history_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project_release_history_definition')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Release history storage lookup");
+    assert_eq!(release_history_exists, 1);
+    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .expect("foreign_keys reads after upgrade");
+    let legacy_alter_table: i64 = sqlx::query_scalar("PRAGMA legacy_alter_table")
+        .fetch_one(&pool)
+        .await
+        .expect("legacy_alter_table reads after upgrade");
+    assert_eq!(foreign_keys, 1);
+    assert_eq!(legacy_alter_table, 0);
+    let violations: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .expect("foreign_key_check runs after upgrade");
+    assert!(violations.is_empty());
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&pool)
+        .await
+        .expect("integrity_check runs after upgrade");
+    assert_eq!(integrity, "ok");
+
+    let _ = fs::remove_dir_all(baseline_dir);
+    let _ = fs::remove_dir_all(final_dir);
+}
+
+#[tokio::test]
 async fn singular_agent_chat_migration_merges_threads_and_recovers_turns() {
     let migration_dir = unique_temp_path("singular-chat-matrix-migrations");
     fs::create_dir_all(&migration_dir).expect("temp migration dir creates");
@@ -2263,15 +2492,22 @@ async fn merged_chat_id_for(pool: &db::SqlitePool, project_id: &str) -> String {
 }
 
 #[tokio::test]
-async fn pr13_fresh_database_has_no_legacy_vertical_storage_or_archive_rows() {
+async fn pr13_fresh_database_drops_legacy_storage_and_keeps_exact_builtin_skill_archive() {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
 
+    for table in ["user", "project", "agent_identity", "agent_profile"] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .expect("target storage presence lookup");
+        assert_eq!(count, 1, "target storage table remains: {table}");
+    }
+
     for table in [
-        "user",
-        "project",
-        "agent_identity",
-        "agent_profile",
         "account_main_agent_binding",
         "project_agent_binding",
         "agent_chat",
@@ -2279,6 +2515,8 @@ async fn pr13_fresh_database_has_no_legacy_vertical_storage_or_archive_rows() {
         "agent_chat_turn_job",
         "agent_chat_source_ref",
         "memory_item",
+        "operating_skill",
+        "operating_skill_revision",
         "project_charter",
         "project_milestone",
         "project_readiness_snapshot",
@@ -2292,9 +2530,109 @@ async fn pr13_fresh_database_has_no_legacy_vertical_storage_or_archive_rows() {
         .expect("legacy table presence lookup");
         assert_eq!(count, 0, "fresh schema must drop legacy table {table}");
     }
-    let legacy_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pr13_legacy_record_history")
-        .fetch_one(&pool)
-        .await
-        .expect("migration-only legacy archive exists");
-    assert_eq!(legacy_rows, 0, "fresh DB has no synthetic legacy history");
+    let schema_objects: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT type, name, lower(sql) FROM sqlite_master
+         WHERE type IN ('trigger', 'index', 'view') AND sql IS NOT NULL",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("remaining trigger, index and view definitions load");
+    for retired_name in [
+        "account_main_agent_binding",
+        "agent_action",
+        "agent_chat",
+        "agent_context_scope",
+        "attention_projection",
+        "legacy_room",
+        "memory_item",
+        "operating_skill",
+        "product_genesis_session",
+        "project_agent_binding",
+        "project_charter",
+        "project_document",
+        "project_execution_baseline",
+        "project_milestone",
+        "project_readiness_snapshot",
+        "project_media_attachment",
+        "protected_legacy_session_ref",
+    ] {
+        let references: Vec<_> = schema_objects
+            .iter()
+            .filter(|(_, _, sql)| sql.contains(retired_name))
+            .collect();
+        assert!(
+            references.is_empty(),
+            "retained schema object references retired table {retired_name}: {references:?}"
+        );
+    }
+    for retired_column in [
+        "agent_session_id",
+        "assignee_type",
+        "assignee_id",
+        "task_state_config",
+        "entry_barrier_json",
+        "review_passed_at",
+        "default_assignee_type",
+        "default_assignee_id",
+        "workflow_definition",
+        "workflow_template_name",
+        "charter_status",
+        "charter_setup_required",
+        "current_charter_id",
+        "current_charter_revision_id",
+        "current_charter_version",
+        "primary_milestone_id",
+    ] {
+        let references: Vec<_> = schema_objects
+            .iter()
+            .filter(|(_, _, sql)| sql.contains(retired_column))
+            .collect();
+        assert!(
+            references.is_empty(),
+            "retained schema object references retired column {retired_column}: {references:?}"
+        );
+    }
+    let legacy_sources: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT source_table, COUNT(*) FROM pr13_legacy_record_history GROUP BY source_table ORDER BY source_table",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("migration-only legacy archive sources");
+    assert_eq!(
+        legacy_sources,
+        vec![
+            ("operating_skill".to_owned(), 2),
+            ("operating_skill_revision".to_owned(), 2),
+        ],
+        "fresh DB archives only the two exact V076 built-in operating skills and revisions"
+    );
+    let legacy_identities: Vec<(String, String)> = sqlx::query_as(
+        "SELECT source_table, source_identity FROM pr13_legacy_record_history
+         ORDER BY source_table, source_identity",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("built-in skill archive identities");
+    assert_eq!(
+        legacy_identities,
+        vec![
+            (
+                "operating_skill".to_owned(),
+                "forge.main.project-discovery/v2".to_owned(),
+            ),
+            (
+                "operating_skill".to_owned(),
+                "forge.project.orchestration/v1".to_owned(),
+            ),
+            (
+                "operating_skill_revision".to_owned(),
+                "forge.main.project-discovery/v2@1".to_owned(),
+            ),
+            (
+                "operating_skill_revision".to_owned(),
+                "forge.project.orchestration/v1@1".to_owned(),
+            ),
+        ],
+        "migration archives the original built-in identities without synthesis"
+    );
 }

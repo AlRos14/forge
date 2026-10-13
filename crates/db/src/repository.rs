@@ -554,6 +554,15 @@ pub trait WorkUnitExecutionRepo: Send + Sync {
         artifact_input_ids: Vec<String>,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<Execution>>;
+    /// Atomically clear a blocked Task's recovery projection, transition its
+    /// canonical lifecycle to Active, and admit the exact follow-up Execution.
+    /// A rejected admission leaves the previous recovery annotation intact.
+    async fn admit_recovery_for_work_unit_with_artifact_inputs(
+        &self,
+        input: RecoverWorkUnitExecution,
+        artifact_input_ids: Vec<String>,
+        execution_event: CreateDomainEvent,
+    ) -> Result<RecoveryWorkUnitExecutionWrite>;
 }
 
 #[async_trait]
@@ -1718,6 +1727,22 @@ pub struct CreateWorkUnitExecution {
     pub work_unit_id: String,
     pub work_unit_version: i64,
     pub workspace_lease: Option<CreateWorkspaceLease>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverWorkUnitExecution {
+    pub admission: CreateWorkUnitExecution,
+    pub lifecycle_transition: TransitionTaskLifecycle,
+    pub expected_error_annotation: Option<String>,
+    pub expected_blocked_json: Option<String>,
+    pub expected_metadata_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryWorkUnitExecutionWrite {
+    pub execution: Execution,
+    pub lifecycle_event: DomainEvent,
+    pub execution_event: DomainEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
