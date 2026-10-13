@@ -147,6 +147,7 @@ Results recorded from this implementation session; commands use cached
 | `cargo test -p services --lib parent_mutations_keep_parent_and_subtask_order_coherent --locked --offline` | PASS, 1 test. |
 | `cargo test -p services --lib recovery_uses_the_parent_work_units_workspace_when_task_has_siblings --locked --offline` | PASS, 1 test; exact parent Workspace accepted, sibling Workspace rejected. |
 | `cargo test -p services --lib merge_service::tests:: --locked --offline` | PASS, 2 tests; legacy entry requires exact Gate evaluation and Task without WorkUnits cannot infer a merge source by recency. |
+| GitHub Actions for `feat/plan-pr13-destructive-persistence-cleanup` | NOT RUN: the repository lists active CI, CodeQL, Release and OpenSSF Scorecard workflows, but no run entries were returned for the PR13 branch. No remote CI pass is claimed. |
 
 One earlier broad recovery filter returned 13 passes and 6 failures in
 pre-existing legacy test fixtures (five used the retired `coder` alias and one
@@ -167,7 +168,8 @@ index or view references to retired names.
 Deliberately not run: `cargo test --workspace`, all-crate DB/API suites,
 `cargo build --workspace`, `cargo clippy --workspace`, and `cargo clean`.
 Focused tests cover the reviewed cutovers; workspace-wide results are not
-claimed. Remote CI is reported only from the PR state read at publication.
+claimed. No PR currently exists for the branch, and no GitHub Actions run was
+available for it at publication.
 
 ## Remaining bounded risks
 
@@ -197,3 +199,10 @@ BUG_STILL_LIVE = 0
 
 PR13 is ready for independent review after the final branch push and remote ref
 verification. This ledger does not authorize merge.
+
+## PR publication
+
+No PR exists for this branch as of publication, so no PR body was changed and
+none was opened. Create it from:
+
+`https://github.com/AlRos14/forge/compare/main...feat/plan-pr13-destructive-persistence-cleanup?expand=1`
