@@ -2582,7 +2582,15 @@ mod tests {
             .await
             .expect("Task loads before lifecycle transition")
             .expect("Task exists");
-        crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task_id)
+            .await
+            .expect("TaskLifecycle loads before repository Execution setup")
+            .expect("TaskLifecycle exists");
+        if lifecycle.state != db::TaskLifecycleState::Active {
+            crate::task_lifecycle::TaskLifecycleService::new(
+                Arc::clone(&db),
+                Arc::clone(&event_bus),
+            )
             .transition(crate::task_lifecycle::TransitionLifecycleInput {
                 task_id: task_id.clone(),
                 expected_task_version: task.version,
@@ -2597,6 +2605,7 @@ mod tests {
             })
             .await
             .expect("TaskLifecycle admits repository Execution");
+        }
         let retryable_unit = service
             .create(
                 CollaborationActorSource::Human(human_id.clone()),

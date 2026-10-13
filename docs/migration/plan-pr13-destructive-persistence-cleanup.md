@@ -146,6 +146,7 @@ Results recorded from this implementation session; commands use cached
 | Focused recovery admission cases: artifact binding rollback, WorkUnit version race, membership loss, unusable Workspace, concurrent duplicate admission and provider failure after durable admission | PASS in the filtered recovery run; rejected paths preserve TaskLifecycle, annotations, WorkUnit, parent lineage, Workspace and receipts. |
 | `cargo test -p services --lib parent_mutations_keep_parent_and_subtask_order_coherent --locked --offline` | PASS, 1 test. |
 | `cargo test -p services --lib recovery_uses_the_parent_work_units_workspace_when_task_has_siblings --locked --offline` | PASS, 1 test; exact parent Workspace accepted, sibling Workspace rejected. |
+| `cargo test -p services --lib integration_pins_success_and_aborts_conflict_without_losing_workunit_workspace --locked --offline` | PASS, 1 test; cleanup preserves the WorkUnit branch/workspace. The fixture now requests `Active` only when lifecycle is not already `Active`. |
 | `cargo test -p services --lib merge_service::tests:: --locked --offline` | PASS, 2 tests; legacy entry requires exact Gate evaluation and Task without WorkUnits cannot infer a merge source by recency. |
 | GitHub Actions for `feat/plan-pr13-destructive-persistence-cleanup` | NOT RUN: the repository lists active CI, CodeQL, Release and OpenSSF Scorecard workflows, but no run entries were returned for the PR13 branch. No remote CI pass is claimed. |
 
@@ -154,6 +155,12 @@ pre-existing legacy test fixtures (five used the retired `coder` alias and one
 changed lifecycle state without its required receipt). Those fixtures were
 updated; the focused crash-recovery rerun passed. This is retained here so the
 intermediate run is not misreported as green.
+
+The first supplementary WorkUnit cleanup run exposed an already-Active Task
+after prior integration steps; the fixture attempted an `Active` to `Active`
+transition, which the lifecycle transition graph rejects. The fixture now
+checks the persisted lifecycle first and only transitions when necessary. The
+same focused test then passed; production lifecycle behavior was not changed.
 
 The first run of the empty V120 upgrade test also failed on its test assertion:
 it assumed receipt count equaled the maximum migration version. The V120
