@@ -1,48 +1,21 @@
-use db::{
-    DbError, ExecutionRepo, ExecutionStatus, Project, ResumePolicy, StopReason, TaskLifecycleRepo,
-    TaskLifecycleState,
-};
+use db::{DbError, ExecutionRepo, ExecutionStatus, ResumePolicy, StopReason};
 
 use crate::{Result, ServiceError};
 
 use super::TaskDispatcher;
 
 impl TaskDispatcher {
-    /// Resume only an exact Task-scoped Execution that the shutdown/recovery
-    /// authority explicitly marked for automatic recovery. Task lifecycle,
-    /// TaskType, workflow state, and retry receipts never direct rework here.
-    pub(super) async fn recover_auto_cancelled_tasks(&self, project: &Project) -> Result<u64> {
-        let tasks = self
-            .list_tasks(&project.id, vec!["in_progress".to_owned()])
-            .await?;
-        let task_ids = tasks
-            .iter()
-            .map(|task| task.id.as_str())
-            .collect::<Vec<_>>();
-        let latest_executions =
-            ExecutionRepo::list_latest_executions_for_tasks(&*self.db, &task_ids).await?;
-        let latest_by_task = latest_executions
-            .into_iter()
-            .map(|execution| (execution.task_id.clone(), execution))
-            .collect::<std::collections::HashMap<_, _>>();
-
+    /// Resume only exact WorkUnit-bound Executions explicitly marked for
+    /// automatic recovery. Candidate discovery is by Execution identity and
+    /// never depends on Task status or latest-per-Task selection.
+    pub(super) async fn recover_auto_cancelled_work_unit_executions(&self) -> Result<u64> {
+        let candidates = ExecutionRepo::list_work_unit_auto_recovery_candidates(&*self.db).await?;
         let mut resumed = 0;
-        for task in tasks {
+        for execution in candidates {
             if self.is_stopped() {
                 break;
             }
-            let Some(lifecycle) =
-                TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id).await?
-            else {
-                continue;
-            };
-            if lifecycle.state != TaskLifecycleState::Active {
-                continue;
-            }
-            let Some(execution) = latest_by_task.get(&task.id) else {
-                continue;
-            };
-            if !is_exact_auto_recovery_candidate(execution) {
+            if !is_exact_auto_recovery_candidate(&execution) {
                 continue;
             }
 
@@ -62,14 +35,14 @@ impl TaskDispatcher {
                 Err(ServiceError::Db(DbError::VersionConflict))
                 | Err(ServiceError::Db(DbError::TaskVersionConflict { .. })) => {
                     tracing::debug!(
-                        task_id = %task.id,
+                        task_id = %execution.task_id,
                         execution_id = %execution.id,
                         "automatic execution recovery lost a version race"
                     );
                 }
                 Err(error) => {
                     tracing::warn!(
-                        task_id = %task.id,
+                        task_id = %execution.task_id,
                         execution_id = %execution.id,
                         %error,
                         "automatic execution recovery failed"
@@ -82,7 +55,7 @@ impl TaskDispatcher {
 }
 
 fn is_exact_auto_recovery_candidate(execution: &db::Execution) -> bool {
-    execution.work_unit_id.is_none()
+    execution.work_unit_id.is_some()
         && execution.status == ExecutionStatus::Cancelled
         && execution.resume_policy == Some(ResumePolicy::Auto)
         && matches!(
@@ -97,7 +70,7 @@ mod tests {
     use db::{ExecutionStatus, ResumePolicy, StopReason};
 
     #[test]
-    fn automatic_recovery_requires_exact_cancelled_task_execution_and_authorized_stop_reason() {
+    fn automatic_recovery_requires_exact_work_unit_execution_and_authorized_stop_reason() {
         let mut execution = db::Execution {
             id: "execution".to_owned(),
             task_id: "task".to_owned(),
@@ -112,7 +85,6 @@ mod tests {
             resume_policy: Some(ResumePolicy::Auto),
             stopped_at: Some("2026-01-01T00:00:00Z".to_owned()),
             parent_execution_id: None,
-            agent_session_id: None,
             harness_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
@@ -124,8 +96,8 @@ mod tests {
             error: None,
             executor_config_snapshot_json: None,
             workspace_id: None,
-            work_unit_id: None,
-            work_unit_version: None,
+            work_unit_id: Some("work-unit".to_owned()),
+            work_unit_version: Some(1),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
         };
@@ -137,7 +109,7 @@ mod tests {
         execution.status = ExecutionStatus::Failed;
         assert!(!is_exact_auto_recovery_candidate(&execution));
         execution.status = ExecutionStatus::Cancelled;
-        execution.work_unit_id = Some("work-unit".to_owned());
+        execution.work_unit_id = None;
         assert!(!is_exact_auto_recovery_candidate(&execution));
     }
 }

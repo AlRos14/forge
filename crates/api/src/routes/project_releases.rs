@@ -4,7 +4,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
-use services::MilestoneRuntime;
+use services::HistoricalReleaseReader;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -26,7 +26,7 @@ pub async fn get_release(
     Path((project_id, release_id)): Path<(String, String)>,
 ) -> ApiResult<Json<ProjectRelease>> {
     ensure_project_access(&state, &project_id, &user.user_id).await?;
-    let release = MilestoneRuntime::new(state.db.clone())
+    let release = HistoricalReleaseReader::new(state.db.clone())
         .get_release(&project_id, &release_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project_release", release_id))?;
@@ -41,7 +41,7 @@ pub async fn list_releases(
     Query(query): Query<ReleaseListQuery>,
 ) -> ApiResult<Json<ProjectReleaseListResponse>> {
     ensure_project_access(&state, &project_id, &user.user_id).await?;
-    let mut items = MilestoneRuntime::new(state.db.clone())
+    let mut items = HistoricalReleaseReader::new(state.db.clone())
         .list_releases(&project_id, &milestone_id)
         .await?;
     if let Some((revision, id)) = decode_cursor(query.cursor.as_deref())? {

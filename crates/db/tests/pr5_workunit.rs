@@ -88,7 +88,6 @@ fn running_execution(
         resume_policy: None,
         stopped_at: None,
         parent_execution_id: None,
-        agent_session_id: None,
         harness_session_id: None,
         agent_message_id: None,
         last_activity_at: None,
@@ -187,7 +186,6 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
             id: fixture.project_id.clone(),
             name: "WorkUnit cleanup admission".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: Some(fixture.human_id.clone()),
             created_at: now.clone(),
@@ -260,15 +258,12 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
             repo_id: Some(fixture.repo_id.clone()),
             parent_task_id: None,
             subtask_order: None,
-            assignee_type: None,
-            assignee_id: None,
             title: "Cleanup race".to_owned(),
             description: None,
             task_type: "implementation".to_owned(),
-            status: "todo".to_owned(),
+            lifecycle_state: db::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -355,6 +350,109 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
     fixture
 }
 
+#[tokio::test]
+async fn integration_lookup_stays_exact_with_multiple_work_unit_workspaces() {
+    let db = database().await;
+    let root = TempDir::new().expect("temporary directory");
+    let fixture = cleanup_admission_fixture(&db, root.path()).await;
+    let now = now_rfc3339();
+
+    let integration_workspace = WorkspaceRepo::create(
+        &db,
+        CreateWorkspace {
+            id: new_uuid_v4(),
+            task_id: fixture.task_id.clone(),
+            repo_id: fixture.repo_id.clone(),
+            worktree_path: root
+                .path()
+                .join("integration")
+                .to_string_lossy()
+                .into_owned(),
+            branch: format!("forge/task-integration/{}", fixture.task_id),
+            status: WorkspaceStatus::Ready,
+            before_sha: Some("integration-sha".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("integration Workspace");
+
+    let second_work_unit_id = new_uuid_v4();
+    WorkUnitRepo::create(
+        &db,
+        CreateWorkUnit {
+            id: second_work_unit_id.clone(),
+            task_id: fixture.task_id.clone(),
+            parent_work_unit_id: None,
+            title: "Second isolated unit".to_owned(),
+            scope: "Independent repository work".to_owned(),
+            role: "implementer".to_owned(),
+            assigned_actor: Some(ActorRef::Agent(fixture.agent_id.clone())),
+            requires_integration: true,
+            provenance: None,
+            created_by: ActorRef::Human(fixture.human_id.clone()),
+            created_at: now.clone(),
+        },
+        event(
+            "work_unit.created",
+            "work_unit",
+            &second_work_unit_id,
+            &fixture.task_id,
+            &fixture.human_id,
+        ),
+    )
+    .await
+    .expect("second WorkUnit");
+    let second_workspace = WorkUnitWorkspaceRepo::create_for_work_unit(
+        &db,
+        CreateWorkUnitWorkspace {
+            workspace: CreateWorkspace {
+                id: new_uuid_v4(),
+                task_id: fixture.task_id.clone(),
+                repo_id: fixture.repo_id.clone(),
+                worktree_path: root
+                    .path()
+                    .join("second-work-unit")
+                    .to_string_lossy()
+                    .into_owned(),
+                branch: format!(
+                    "forge/work-unit/{}/{}/second",
+                    fixture.task_id, second_work_unit_id
+                ),
+                status: WorkspaceStatus::Ready,
+                before_sha: Some("second-unit-sha".to_owned()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            work_unit_id: second_work_unit_id.clone(),
+        },
+    )
+    .await
+    .expect("second WorkUnit Workspace");
+
+    let selected_integration = WorkspaceRepo::get_integration_by_task_id(&db, &fixture.task_id)
+        .await
+        .expect("integration scope lookup")
+        .expect("canonical integration Workspace");
+    assert_eq!(selected_integration.id, integration_workspace.id);
+
+    let first_unit_workspace =
+        WorkUnitWorkspaceRepo::get_by_work_unit_id(&db, &fixture.work_unit_id)
+            .await
+            .expect("first exact WorkUnit Workspace lookup")
+            .expect("first WorkUnit Workspace");
+    assert_eq!(first_unit_workspace.id, fixture.workspace_id);
+    let selected_second_unit =
+        WorkUnitWorkspaceRepo::get_by_work_unit_id(&db, &second_work_unit_id)
+            .await
+            .expect("second exact WorkUnit Workspace lookup")
+            .expect("second WorkUnit Workspace");
+    assert_eq!(selected_second_unit.id, second_workspace.id);
+    assert_ne!(selected_second_unit.id, selected_integration.id);
+    assert_ne!(selected_second_unit.id, first_unit_workspace.id);
+}
+
 fn cleanup_admission_attempt(
     fixture: &CleanupAdmissionFixture,
 ) -> (CreateWorkUnitExecution, CreateDomainEvent) {
@@ -429,7 +527,7 @@ async fn execution_admission_wins_over_cleanup_claim_across_sqlite_pools() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            agent_session_id: None,
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -575,7 +673,6 @@ async fn work_unit_task_binding_is_immutable_without_provenance() {
             id: project_id.clone(),
             name: "PR5 WorkUnit Task binding".into(),
             settings: "{}".into(),
-            workflow_definition: "{}".into(),
             primary_repo_id: None,
             owner_id: Some(human_id.clone()),
             created_at: now.clone(),
@@ -607,16 +704,13 @@ async fn work_unit_task_binding_is_immutable_without_provenance() {
                 project_id: project_id.clone(),
                 repo_id: None,
                 parent_task_id: None,
-                assignee_type: None,
-                assignee_id: None,
                 title: "Task".into(),
                 description: None,
                 task_type: "implementation".into(),
-                status: "todo".into(),
+                lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
                 subtask_order: None,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -701,7 +795,6 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
             id: project_id.clone(),
             name: "PR5 DAG".into(),
             settings: "{}".into(),
-            workflow_definition: "{}".into(),
             primary_repo_id: None,
             owner_id: Some(human_id.clone()),
             created_at: now.clone(),
@@ -788,16 +881,13 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
                 project_id: project_id.clone(),
                 repo_id: Some(repo_id.clone()),
                 parent_task_id: None,
-                assignee_type: None,
-                assignee_id: None,
                 title: "Task".into(),
                 description: None,
                 task_type: "implementation".into(),
-                status: "todo".into(),
+                lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
                 subtask_order: None,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -854,7 +944,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            agent_session_id: None,
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -1018,7 +1108,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            agent_session_id: None,
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -1584,7 +1674,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            agent_session_id: None,
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,

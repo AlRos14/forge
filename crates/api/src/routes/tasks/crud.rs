@@ -29,7 +29,6 @@ pub async fn create_task(
             task_type,
             None,
             None,
-            None,
         )
         .await?;
     Ok(Json(task_response(&state.db, task).await?))
@@ -70,12 +69,10 @@ pub async fn list_tasks(
                 project_id: project_id.clone(),
                 q: params.q.clone(),
                 lifecycle_states: lifecycle_states.clone(),
-                statuses: Vec::new(),
                 agent_ids: Vec::new(),
                 assignee_types: Vec::new(),
                 assignee_ids: Vec::new(),
                 priority: params.priority,
-                include_archived: false,
                 include_cancelled: true,
                 include_deleted: false,
                 page: task_page_request(&params)?,
@@ -134,7 +131,6 @@ pub async fn update_task(
             error_annotation: None,
             blocked_json: None,
             failed_json: None,
-            task_state_config: None,
             parent_task_id: request.parent_task_id,
             updated_at: now_rfc3339(),
         })

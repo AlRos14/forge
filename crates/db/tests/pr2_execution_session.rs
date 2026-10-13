@@ -217,7 +217,7 @@ fn execution_input(
     purpose: ExecutionPurpose,
     workspace_id: Option<&str>,
     harness_session_id: Option<String>,
-    agent_session_id: Option<String>,
+    _legacy_external_session_hint: Option<String>,
 ) -> CreateExecution {
     CreateExecution {
         id: id.to_owned(),
@@ -232,7 +232,6 @@ fn execution_input(
         resume_policy: None,
         stopped_at: None,
         parent_execution_id: None,
-        agent_session_id,
         harness_session_id,
         agent_message_id: None,
         last_activity_at: None,
@@ -266,7 +265,7 @@ fn result_update(execution_id: &str, external_session_id: Option<&str>) -> Updat
         stopped_by: None,
         resume_policy: None,
         stopped_at: None,
-        agent_session_id: Some(external_session_id.map(str::to_owned)),
+        external_session_id: Some(external_session_id.map(str::to_owned)),
         agent_message_id: None,
         last_activity_at: None,
         summary: None,
@@ -350,7 +349,6 @@ async fn fresh_agent_execution_has_one_pending_session_and_atomic_result_project
         activated.harness_session_id.as_deref(),
         Some(session_id.as_str())
     );
-    assert_eq!(activated.agent_session_id.as_deref(), Some("thread-1"));
     let active = HarnessSessionRepo::get_by_id(&db, &session_id)
         .await
         .expect("session loads")
@@ -358,15 +356,13 @@ async fn fresh_agent_execution_has_one_pending_session_and_atomic_result_project
     assert_eq!(active.status, HarnessSessionStatus::Active);
     assert_eq!(active.external_session_id.as_deref(), Some("thread-1"));
 
-    let direct_projection_divergence =
-        sqlx::query("UPDATE execution SET agent_session_id = 'different-thread' WHERE id = ?")
-            .bind(execution_id)
-            .execute(db.pool())
-            .await
-            .expect_err("legacy projection cannot diverge from HarnessSession authority");
-    assert!(direct_projection_divergence
-        .to_string()
-        .contains("projection diverges"));
+    let remaining_projection_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('execution') WHERE name = 'agent_session_id'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("inspect Execution schema");
+    assert_eq!(remaining_projection_columns, 0);
 
     let active_to_pending = HarnessSessionRepo::update(
         &db,
@@ -650,7 +646,6 @@ async fn unresolved_route_result_cannot_bind_to_the_primary_candidate() {
         .expect("execution reloads")
         .expect("execution exists");
     assert_eq!(unchanged.harness_session_id, None);
-    assert_eq!(unchanged.agent_session_id, None);
 }
 
 #[tokio::test]
@@ -865,7 +860,6 @@ async fn routed_sessionless_candidate_does_not_fabricate_continuity() {
         .await
         .expect("sessionless route result persists");
     assert_eq!(completed.harness_session_id, None);
-    assert_eq!(completed.agent_session_id, None);
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM harness_session WHERE agent_id = 'pr2-agent-routed-shell'",
     )
@@ -904,7 +898,6 @@ async fn human_execution_has_real_actor_and_no_agent_or_harness_session() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             harness_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
@@ -952,7 +945,6 @@ async fn human_execution_has_real_actor_and_no_agent_or_harness_session() {
                 resume_policy: None,
                 stopped_at: None,
                 parent_execution_id: None,
-                agent_session_id: None,
                 harness_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,

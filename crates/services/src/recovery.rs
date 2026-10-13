@@ -1,19 +1,19 @@
 use crate::{
     daemon_transport::DaemonConnectionRegistry, embedded_daemon::is_embedded_daemon_machine,
-    DomainEventService, Result, ServiceError, TaskService,
+    Result, ServiceError, TaskService,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use db::{
     now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentStatus, Daemon, DaemonRepo, Execution,
     ExecutionRepo, ExecutionStatus, PageRequest, Project, ProjectRepo, ResumePolicy, SortBy,
     SortOrder, SqliteDb, StopReason, Task, TaskLifecycleRepo, TaskLifecycleState, TaskListQuery,
-    TaskRepo, UpdateAgent, UpdateExecution, UpdateTaskStatus, WorkspaceLeaseRepo, WorkspaceRepo,
+    TaskRepo, UpdateAgent, UpdateExecution, UpdateTask, WorkspaceLeaseRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -44,21 +44,25 @@ impl CrashRecovery {
         // pass below then sees the still-running attempt and requeues/blocks
         // it through the normal crash-recovery state machine.
         expire_workspace_leases(&self.db, &self.event_bus, None, None, None, false).await?;
-        let tasks = self.list_in_progress_tasks(None).await?;
+        let executions = ExecutionRepo::list_running(self.db.as_ref()).await?;
+        let executions_by_task = group_executions_by_task(executions);
         let mut recovered = 0;
 
-        for task in tasks {
-            let outcome = recover_task(
+        for (task_id, executions) in executions_by_task {
+            let Some(task) = TaskRepo::get_by_id(self.db.as_ref(), &task_id, false).await? else {
+                continue;
+            };
+            let outcome = recover_executions(
                 &self.db,
                 &self.event_bus,
                 task,
+                executions,
                 StopReason::CrashRecovery,
                 &api_types::Actor::system(api_types::SystemComponent::CrashRecovery),
             )
             .await?;
 
             if outcome.annotated {
-                publish_task_status_event(&self.db, &self.event_bus, &outcome.task).await;
                 self.publish(ForgeEvent {
                     event_type: "task.recovered".to_owned(),
                     entity_id: outcome.task.id,
@@ -72,15 +76,10 @@ impl CrashRecovery {
             }
         }
 
-        recovered += sweep_stale_recovery_annotations(&self.db, &self.event_bus).await?;
+        recovered += sweep_stale_recovery_annotations(&self.db).await?;
 
         tracing::info!(recovered_tasks = recovered, "crash recovery completed");
         Ok(recovered)
-    }
-
-    #[tracing::instrument(skip(self), fields(agent_id = agent_id.unwrap_or("any")))]
-    async fn list_in_progress_tasks(&self, agent_id: Option<&str>) -> Result<Vec<Task>> {
-        list_in_progress_tasks(&self.db, agent_id).await
     }
 
     fn publish(&self, event: ForgeEvent) {
@@ -240,18 +239,26 @@ impl HeartbeatMonitor {
                 },
             });
 
-            for task in list_in_progress_tasks(&self.db, Some(&agent.id)).await? {
-                let outcome = recover_task(
+            let timed_out_executions = ExecutionRepo::list_running(self.db.as_ref())
+                .await?
+                .into_iter()
+                .filter(|execution| execution.agent_id.as_deref() == Some(agent.id.as_str()));
+            for (task_id, executions) in group_executions_by_task(timed_out_executions) {
+                let Some(task) = TaskRepo::get_by_id(self.db.as_ref(), &task_id, false).await?
+                else {
+                    continue;
+                };
+                let outcome = recover_executions(
                     &self.db,
                     &self.event_bus,
                     task,
+                    executions,
                     StopReason::AgentTimeout,
                     &api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor),
                 )
                 .await?;
 
                 if outcome.annotated {
-                    publish_task_status_event(&self.db, &self.event_bus, &outcome.task).await;
                     self.publish(ForgeEvent {
                         event_type: "task.recovered".to_owned(),
                         entity_id: outcome.task.id.clone(),
@@ -368,7 +375,7 @@ impl HeartbeatMonitor {
                     )),
                     resume_policy: Some(Some(ResumePolicy::Manual)),
                     stopped_at: Some(Some(now.clone())),
-                    agent_session_id: None,
+                    external_session_id: None,
                     agent_message_id: None,
                     last_activity_at: Some(Some(now.clone())),
                     summary: None,
@@ -616,7 +623,7 @@ async fn expire_workspace_leases(
                 )),
                 resume_policy: Some(Some(ResumePolicy::Manual)),
                 stopped_at: Some(Some(now.clone())),
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: Some(Some(now.clone())),
                 summary: None,
@@ -722,6 +729,7 @@ async fn revoke_active_workspace_lease(db: &SqliteDb, execution_id: &str) {
 pub(crate) struct CancelledExecution {
     pub execution_id: String,
     pub resumable_external_session_id: Option<String>,
+    pub exact_work_unit_target: bool,
 }
 
 pub(crate) struct RecoverTaskOutcome {
@@ -729,69 +737,30 @@ pub(crate) struct RecoverTaskOutcome {
     pub annotated: bool,
 }
 
-async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result<Vec<Task>> {
-    let mut tasks = Vec::new();
-    for project in list_projects(db).await? {
-        let mut cursor = None;
-        loop {
-            let page = TaskRepo::list(
-                db,
-                TaskListQuery {
-                    project_id: project.id.clone(),
-                    q: None,
-                    lifecycle_states: Vec::new(),
-                    statuses: vec![TaskLifecycleState::Active.legacy_projection().to_owned()],
-                    agent_ids: agent_id.map(str::to_owned).into_iter().collect(),
-                    assignee_types: Vec::new(),
-                    assignee_ids: Vec::new(),
-                    priority: None,
-                    include_archived: false,
-                    include_cancelled: false,
-                    include_deleted: false,
-                    page: page_request(cursor),
-                },
-            )
-            .await?;
-            for task in page
-                .items
-                .into_iter()
-                .filter(|task| task.assignee_type.as_deref() != Some("user"))
-            {
-                if TaskLifecycleRepo::get_task_lifecycle(db, &task.id)
-                    .await?
-                    .is_some_and(|lifecycle| lifecycle.state == TaskLifecycleState::Active)
-                {
-                    tasks.push(task);
-                }
-            }
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                break;
-            }
-        }
+fn group_executions_by_task(
+    executions: impl IntoIterator<Item = Execution>,
+) -> BTreeMap<String, Vec<Execution>> {
+    let mut grouped = BTreeMap::<String, Vec<Execution>>::new();
+    for execution in executions {
+        grouped
+            .entry(execution.task_id.clone())
+            .or_default()
+            .push(execution);
     }
-    Ok(tasks)
+    grouped
 }
 
-async fn recover_task(
+async fn recover_executions(
     db: &Arc<SqliteDb>,
     event_bus: &Arc<EventBus>,
     task: Task,
+    executions: Vec<Execution>,
     stop_reason: StopReason,
     stopped_by: &api_types::Actor,
 ) -> Result<RecoverTaskOutcome> {
-    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(db.as_ref(), &task.id)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
-    if lifecycle.state != TaskLifecycleState::Active {
-        return Err(ServiceError::invalid_operation(format!(
-            "cannot recover execution for Task lifecycle {}",
-            lifecycle.state
-        )));
-    }
-    let cancelled = cancel_running_executions(
+    let cancelled = cancel_execution_records(
         db,
-        &task.id,
+        &executions,
         stop_reason.clone(),
         stopped_by,
         ResumePolicy::Manual,
@@ -812,14 +781,11 @@ async fn recover_task(
         });
     }
 
-    let mut has_resumable_execution = false;
-    let should_auto_resume = stop_reason == StopReason::CrashRecovery;
-    for execution in cancelled
-        .iter()
-        .filter(|execution| execution.resumable_external_session_id.is_some())
-    {
-        has_resumable_execution = true;
-        if should_auto_resume {
+    let every_execution_is_resumable = cancelled.iter().all(|execution| {
+        execution.exact_work_unit_target && execution.resumable_external_session_id.is_some()
+    });
+    if stop_reason == StopReason::CrashRecovery && every_execution_is_resumable {
+        for execution in &cancelled {
             ExecutionRepo::update(
                 db.as_ref(),
                 UpdateExecution {
@@ -829,7 +795,7 @@ async fn recover_task(
                     stopped_by: None,
                     resume_policy: Some(Some(ResumePolicy::Auto)),
                     stopped_at: None,
-                    agent_session_id: None,
+                    external_session_id: None,
                     agent_message_id: None,
                     last_activity_at: None,
                     summary: None,
@@ -843,12 +809,17 @@ async fn recover_task(
             )
             .await?;
         }
+        return Ok(RecoverTaskOutcome {
+            task,
+            annotated: false,
+        });
     }
-    if has_resumable_execution {
+
+    if stop_reason == StopReason::AgentTimeout && every_execution_is_resumable {
         tracing::warn!(
             task_id = %task.id,
             execution_count = cancelled.len(),
-            "recovered task left in current state because a resumable execution was cancelled"
+            "recovered task without an automatic session restart after Agent timeout"
         );
         return Ok(RecoverTaskOutcome {
             task,
@@ -856,15 +827,26 @@ async fn recover_task(
         });
     }
 
-    let (blocking_reason, message) = if stop_reason == StopReason::AgentTimeout {
-        ("agent_timeout", "Recovered after agent heartbeat timeout")
+    let exact_recovery_target = if cancelled.len() == 1 && cancelled[0].exact_work_unit_target {
+        Some(cancelled[0].execution_id.clone())
     } else {
-        ("crash_recovery", "Recovered after server restart")
+        None
     };
-    let blocked_execution_id = cancelled
-        .first()
-        .map(|execution| execution.execution_id.clone());
-    let artifact = blocked_execution_id.as_ref().map(|execution_id| {
+    let (blocking_reason, message) = match (exact_recovery_target.is_some(), cancelled.len()) {
+        (true, _) if stop_reason == StopReason::AgentTimeout => {
+            ("agent_timeout", "Recovered after agent heartbeat timeout")
+        }
+        (true, _) => ("crash_recovery", "Recovered after server restart"),
+        (false, 1) => (
+            "recovery_target_unavailable",
+            "Recovery stopped an Execution without a provable open WorkUnit target",
+        ),
+        (false, _) => (
+            "recovery_target_ambiguous",
+            "Recovery stopped multiple Executions; choose an exact WorkUnit target before retrying",
+        ),
+    };
+    let artifact = exact_recovery_target.as_ref().map(|execution_id| {
         json!({
             "kind": "execution",
             "id": execution_id,
@@ -876,19 +858,32 @@ async fn recover_task(
         "blocking_reason": blocking_reason,
         "blocked_by": stopped_by.display(),
         "blocked_at": now_rfc3339(),
-        "blocked_execution_id": blocked_execution_id,
+        "blocked_execution_id": exact_recovery_target,
         "artifact": artifact,
         "message": message,
-        "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],
+        "recovery_actions": if exact_recovery_target.is_some() {
+            vec!["reexecute", "cancel_task"]
+        } else {
+            Vec::new()
+        },
     })
     .to_string();
-    let reason_ref = blocked_execution_id
+    let reason_ref = exact_recovery_target
         .clone()
         .unwrap_or_else(|| format!("task-version:{}", task.version));
-    let cause = blocked_execution_id
+    let cause = exact_recovery_target
         .clone()
         .map(crate::task_lifecycle::LifecycleCause::Execution)
         .unwrap_or_else(|| crate::task_lifecycle::LifecycleCause::Actor(stopped_by.clone()));
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(db.as_ref(), &task.id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+    if lifecycle.state != TaskLifecycleState::Active {
+        return Ok(RecoverTaskOutcome {
+            task,
+            annotated: false,
+        });
+    }
     let task =
         crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(db), Arc::clone(event_bus))
             .block(
@@ -903,16 +898,19 @@ async fn recover_task(
             )
             .await?
             .task;
-    let task = TaskRepo::update_status(
+    let task = TaskRepo::update(
         db.as_ref(),
-        UpdateTaskStatus {
+        UpdateTask {
             id: task.id.clone(),
             expected_version: task.version,
-            status: task.status.clone(),
-            assignee_id: None,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
             error_annotation: Some(Some(annotation)),
             blocked_json: None,
             failed_json: None,
+            parent_task_id: None,
             updated_at: now_rfc3339(),
         },
     )
@@ -924,10 +922,7 @@ async fn recover_task(
     })
 }
 
-async fn sweep_stale_recovery_annotations(
-    db: &Arc<SqliteDb>,
-    event_bus: &Arc<EventBus>,
-) -> Result<u64> {
+async fn sweep_stale_recovery_annotations(db: &Arc<SqliteDb>) -> Result<u64> {
     let mut cleared = 0_u64;
 
     for project in list_projects(db).await? {
@@ -939,12 +934,10 @@ async fn sweep_stale_recovery_annotations(
                     project_id: project.id.clone(),
                     q: None,
                     lifecycle_states: Vec::new(),
-                    statuses: vec![],
                     agent_ids: Vec::new(),
                     assignee_types: Vec::new(),
                     assignee_ids: Vec::new(),
                     priority: None,
-                    include_archived: false,
                     include_cancelled: false,
                     include_deleted: false,
                     page: page_request(cursor),
@@ -976,7 +969,9 @@ async fn sweep_stale_recovery_annotations(
                     });
 
                 let should_clear = match blocked_execution_id {
-                    None => true,
+                    // Ambiguous recovery records stay blocked until an
+                    // explicit exact-target decision resolves them.
+                    None => false,
                     Some(execution_id) => {
                         match ExecutionRepo::get_by_id(db.as_ref(), execution_id).await? {
                             None => true,
@@ -989,21 +984,23 @@ async fn sweep_stale_recovery_annotations(
                     continue;
                 }
 
-                let updated = TaskRepo::update_status(
+                TaskRepo::update(
                     db.as_ref(),
-                    UpdateTaskStatus {
+                    UpdateTask {
                         id: task.id.clone(),
                         expected_version: task.version,
-                        status: task.status.clone(),
-                        assignee_id: None,
+                        title: None,
+                        description: None,
+                        priority: None,
+                        merge_config: None,
                         error_annotation: Some(None),
                         blocked_json: None,
                         failed_json: None,
+                        parent_task_id: None,
                         updated_at: now_rfc3339(),
                     },
                 )
                 .await?;
-                publish_task_status_event(db, event_bus, &updated).await;
                 cleared += 1;
             }
 
@@ -1015,14 +1012,6 @@ async fn sweep_stale_recovery_annotations(
     }
 
     Ok(cleared)
-}
-
-async fn publish_task_status_event(db: &Arc<SqliteDb>, event_bus: &Arc<EventBus>, task: &Task) {
-    let service = DomainEventService::new(Arc::clone(db), Arc::clone(event_bus));
-    let dedupe_key = format!("task-status-update:{}:{}", task.id, task.version);
-    if let Err(error) = service.publish_by_dedupe(&dedupe_key).await {
-        tracing::warn!(task_id = %task.id, %error, "failed to mirror task status domain event");
-    }
 }
 
 fn execution_awaits_recovery(execution: &db::Execution) -> bool {
@@ -1037,40 +1026,71 @@ pub(crate) async fn cancel_running_executions(
     stopped_by: &api_types::Actor,
     resume_policy: ResumePolicy,
 ) -> Result<Vec<CancelledExecution>> {
-    let page = ExecutionRepo::list_by_task(
-        db,
-        task_id,
-        PageRequest {
-            cursor: None,
-            limit: 100,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await?;
-    let current_workspace_id = WorkspaceRepo::get_by_task_id(db, task_id)
-        .await?
-        .map(|workspace| workspace.id);
+    let mut cursor = None;
+    let mut running = Vec::new();
+    loop {
+        let page = ExecutionRepo::list_by_task(
+            db,
+            task_id,
+            PageRequest {
+                cursor,
+                limit: 500,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Asc,
+            },
+        )
+        .await?;
+        running.extend(
+            page.items
+                .into_iter()
+                .filter(|execution| execution.status == ExecutionStatus::Running),
+        );
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    cancel_execution_records(db, &running, stop_reason, stopped_by, resume_policy).await
+}
+
+async fn cancel_execution_records(
+    db: &SqliteDb,
+    executions: &[Execution],
+    stop_reason: StopReason,
+    stopped_by: &api_types::Actor,
+    resume_policy: ResumePolicy,
+) -> Result<Vec<CancelledExecution>> {
     let mut cancelled = Vec::new();
-    for execution in page.items {
+    for execution in executions {
         if execution.status != ExecutionStatus::Running {
             continue;
         }
-        let resumable_external_session_id = crate::task_service::resumable_external_session(
+        let exact_work_unit_target = crate::task_service::execution::has_exact_work_unit_target(
             db,
-            &execution,
-            execution.agent_id.as_deref(),
-            current_workspace_id.as_deref(),
+            &execution.task_id,
+            execution,
         )
         .await?;
+        let resumable_external_session_id = if exact_work_unit_target {
+            crate::task_service::resumable_external_session(
+                db,
+                execution,
+                execution.agent_id.as_deref(),
+                execution.workspace_id.as_deref(),
+            )
+            .await?
+        } else {
+            None
+        };
         let cancelled_execution = CancelledExecution {
             execution_id: execution.id.clone(),
             resumable_external_session_id,
+            exact_work_unit_target,
         };
         let now = now_rfc3339();
         let event = crate::task_service::execution_status_domain_event(
-            &execution,
+            execution,
             &ExecutionStatus::Cancelled,
             &now,
         );
@@ -1083,7 +1103,7 @@ pub(crate) async fn cancel_running_executions(
                 stopped_by: Some(Some(stopped_by.display())),
                 resume_policy: Some(Some(resume_policy.clone())),
                 stopped_at: Some(Some(now.clone())),
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,
@@ -1132,7 +1152,7 @@ fn page_request(cursor: Option<String>) -> PageRequest {
 fn stalled_execution_should_block_task(execution: &db::Execution) -> bool {
     matches!(
         execution.role.as_str(),
-        "interactive" | "executor" | crate::workflow::default_roles::CODER
+        "interactive" | "executor" | "coder"
     )
 }
 
@@ -1230,7 +1250,7 @@ pub(crate) async fn fail_execution_daemon_disconnected(
             stopped_by: Some(Some(stopped_by.to_owned())),
             resume_policy: Some(Some(ResumePolicy::Manual)),
             stopped_at: Some(Some(now.clone())),
-            agent_session_id: None,
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: Some(Some(now.clone())),
             summary: None,
@@ -1417,13 +1437,13 @@ mod tests {
     use crate::{
         daemon_service::{DaemonReportInput, DaemonService, DetectedCliInput},
         daemon_transport::{DaemonConnection, DaemonConnectionRegistry},
-        workflow::default_roles,
         TaskService,
     };
     use db::{
         create_sqlite_pool, new_uuid_v4, run_migrations, CreateAgent, CreateExecution,
-        CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment, DaemonRepo, DaemonStatus,
-        RepoRepo, TaskRoleAssignmentRepo, TaskStatus, UpdateProject, UpsertDaemon,
+        CreateProject, CreateRepo, CreateRoleMembership, CreateTask, CreateTaskRole, DaemonRepo,
+        DaemonStatus, RepoRepo, RoleMembershipRepo, RoleMembershipStatus, TaskLifecycleState,
+        TaskRoleRepo, UpdateProject, UpsertDaemon, User, UserRepo,
     };
     use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError};
     use serde_json::Value;
@@ -1477,7 +1497,6 @@ mod tests {
                 id: project_id.clone(),
                 name: "Forge".to_owned(),
                 settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
                 primary_repo_id: None,
                 owner_id: None,
                 created_at: now.clone(),
@@ -1587,21 +1606,33 @@ mod tests {
         .expect("agent creates")
     }
 
+    fn recovery_fixture_state(label: &str) -> TaskLifecycleState {
+        match label {
+            "backlog" => TaskLifecycleState::Backlog,
+            "ready" => TaskLifecycleState::Ready,
+            "active" => TaskLifecycleState::Active,
+            "blocked" => TaskLifecycleState::Blocked,
+            "done" => TaskLifecycleState::Done,
+            "cancelled" => TaskLifecycleState::Cancelled,
+            other => panic!("unknown recovery fixture lifecycle label: {other}"),
+        }
+    }
+
     async fn seed_task(
         db: &SqliteDb,
         project_id: String,
         repo_id: String,
-        status: TaskStatus,
+        state_label: impl AsRef<str>,
         agent_id: Option<String>,
     ) -> Task {
-        seed_task_with_assignee(db, project_id, repo_id, status, "agent", agent_id).await
+        seed_task_with_assignee(db, project_id, repo_id, state_label, "agent", agent_id).await
     }
 
     async fn seed_task_with_assignee(
         db: &SqliteDb,
         project_id: String,
         repo_id: String,
-        status: TaskStatus,
+        state_label: impl AsRef<str>,
         assignee_type: &str,
         assignee_id: Option<String>,
     ) -> Task {
@@ -1614,15 +1645,12 @@ mod tests {
                 repo_id: Some(repo_id),
                 parent_task_id: None,
                 subtask_order: None,
-                assignee_type: assignee_id.as_ref().map(|_| assignee_type.to_owned()),
-                assignee_id: assignee_id.clone(),
                 title: "Recover me".to_owned(),
                 description: None,
                 task_type: "implementation".to_owned(),
-                status,
+                lifecycle_state: recovery_fixture_state(state_label.as_ref()),
                 is_automation: false,
                 priority: 0,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -1630,23 +1658,53 @@ mod tests {
         )
         .await
         .expect("task creates");
-        if assignee_type == "agent" {
-            if let Some(agent_id) = assignee_id {
-                TaskRoleAssignmentRepo::assign(
-                    db,
-                    CreateTaskRoleAssignment {
-                        id: new_uuid_v4(),
-                        task_id: task.id.clone(),
-                        role_name: default_roles::CODER.to_owned(),
-                        assignee_type: Some(db::AssigneeKind::Agent),
-                        assignee_id: Some(agent_id),
-                        created_at: now.clone(),
-                        updated_at: now,
-                    },
-                )
-                .await
-                .expect("role assignment creates");
-            }
+        if let Some(actor_id) = assignee_id {
+            let actor_kind = if assignee_type == "agent" {
+                db::ActorKind::Agent
+            } else {
+                let user = User {
+                    id: actor_id.clone(),
+                    email: format!("{actor_id}@test.invalid"),
+                    password_hash: "test-only".to_owned(),
+                    display_name: Some("Recovery Human".to_owned()),
+                    is_admin: false,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                };
+                UserRepo::create_user(db, &user)
+                    .await
+                    .expect("Human Actor creates");
+                db::ActorKind::Human
+            };
+            let role = TaskRoleRepo::create(
+                db,
+                CreateTaskRole {
+                    id: new_uuid_v4(),
+                    task_id: task.id.clone(),
+                    role: db::canonical_task_role_name("coder")
+                        .expect("coder resolves to canonical implementer"),
+                    coordination_mode: None,
+                    policy_json: "{}".to_owned(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("TaskRole creates");
+            RoleMembershipRepo::add(
+                db,
+                CreateRoleMembership {
+                    id: new_uuid_v4(),
+                    task_role_id: role.id,
+                    actor_kind,
+                    actor_id,
+                    status: RoleMembershipStatus::Active,
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            )
+            .await
+            .expect("RoleMembership creates");
         }
         task
     }
@@ -1707,51 +1765,110 @@ mod tests {
             "unsupported"
         };
         let now = now_rfc3339();
-        let mut execution = ExecutionRepo::create(
+        let execution_id = new_uuid_v4();
+        let work_unit_id = new_uuid_v4();
+        let actor = db::ActorRef::Agent(agent_id.clone());
+        let work_unit = db::WorkUnitRepo::create(
             db,
-            CreateExecution {
-                id: new_uuid_v4(),
-                task_id,
-                agent_id: Some(agent_id.clone()),
-                actor_ref: Some(db::ActorRef::Agent(agent_id)),
-                purpose: Some(db::ExecutionPurpose::Implement),
-                harness_session_id: None,
+            db::CreateWorkUnit {
+                id: work_unit_id.clone(),
+                task_id: task_id.clone(),
+                parent_work_unit_id: None,
+                title: "Recovery fixture".to_owned(),
+                scope: "exact recovery target".to_owned(),
                 role: "coder".to_owned(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: Some(
-                    serde_json::json!({
-                        "executor_type": agent.executor_type,
-                        "config": {},
-                        "agent_id": agent.id,
-                        "agent_daemon_id": agent.daemon_id,
-                        "resolved_daemon_id": resolved_daemon_id,
-                        "harness_capabilities": {
-                            "schema_version": 1,
-                            "capabilities": { "resume": resume_support }
-                        }
-                    })
-                    .to_string(),
-                ),
-                workspace_id: None,
+                assigned_actor: Some(actor.clone()),
+                requires_integration: false,
+                provenance: None,
+                created_by: actor.clone(),
                 created_at: now.clone(),
-                updated_at: now,
+            },
+            db::CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "work_unit.created".to_owned(),
+                entity_type: "work_unit".to_owned(),
+                entity_id: work_unit_id.clone(),
+                actor_type: "agent".to_owned(),
+                actor_id: Some(agent_id.clone()),
+                scope_type: "task".to_owned(),
+                scope_id: task_id.clone(),
+                correlation_id: work_unit_id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!("recovery-work-unit:{work_unit_id}")),
+                payload_json: serde_json::json!({"work_unit_id": work_unit_id}).to_string(),
+                created_at: now.clone(),
             },
         )
         .await
-        .expect("execution creates");
+        .expect("exact WorkUnit creates")
+        .record;
+        let mut execution = db::WorkUnitExecutionRepo::create_for_work_unit(
+            db,
+            db::CreateWorkUnitExecution {
+                execution: CreateExecution {
+                    id: execution_id.clone(),
+                    task_id,
+                    agent_id: Some(agent_id.clone()),
+                    actor_ref: Some(actor),
+                    purpose: Some(db::ExecutionPurpose::Implement),
+                    harness_session_id: None,
+                    role: "coder".to_owned(),
+                    status: ExecutionStatus::Running,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: None,
+                    stopped_at: None,
+                    parent_execution_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    summary: None,
+                    logs_path: None,
+                    before_sha: None,
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json: Some(
+                        serde_json::json!({
+                            "executor_type": agent.executor_type,
+                            "config": {},
+                            "agent_id": agent.id,
+                            "agent_daemon_id": agent.daemon_id,
+                            "resolved_daemon_id": resolved_daemon_id,
+                            "harness_capabilities": {
+                                "schema_version": 1,
+                                "capabilities": { "resume": resume_support }
+                            }
+                        })
+                        .to_string(),
+                    ),
+                    workspace_id: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+                work_unit_id,
+                work_unit_version: work_unit.version,
+                workspace_lease: None,
+            },
+            db::CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "execution.started".to_owned(),
+                entity_type: "execution".to_owned(),
+                entity_id: execution_id.clone(),
+                actor_type: "agent".to_owned(),
+                actor_id: Some(agent_id),
+                scope_type: "task".to_owned(),
+                scope_id: work_unit.task_id.clone(),
+                correlation_id: execution_id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!("execution.started:{execution_id}")),
+                payload_json: serde_json::json!({"work_unit_id": work_unit.id}).to_string(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("WorkUnit Execution creates")
+        .record;
         if let Some(external_session_id) = agent_session_id {
             execution = ExecutionRepo::record_harness_session_result(
                 db,
@@ -1776,11 +1893,11 @@ mod tests {
             &db,
             project_id.clone(),
             repo_id.clone(),
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent.id),
         )
         .await;
-        let todo = seed_task(&db, project_id, repo_id, "todo".to_owned(), None).await;
+        let todo = seed_task(&db, project_id, repo_id, "ready".to_owned(), None).await;
 
         let recovery = CrashRecovery::new(Arc::clone(&db), event_bus);
         let recovered = recovery.run_recovery().await.expect("recovery runs");
@@ -1790,9 +1907,19 @@ mod tests {
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(recovered_task.status, "in_progress".to_owned());
-        assert_eq!(recovered_task.assignee_id, in_progress.assignee_id);
+        assert_eq!(recovered_task.lifecycle_state, TaskLifecycleState::Active);
         assert_eq!(recovered_task.error_annotation, None);
+        let implementer = TaskRoleRepo::get_by_task_and_role(&*db, &in_progress.id, "implementer")
+            .await
+            .expect("implementer TaskRole loads")
+            .expect("implementer TaskRole exists");
+        let members = RoleMembershipRepo::list_by_role(&*db, &implementer.id, false)
+            .await
+            .expect("RoleMemberships load");
+        assert!(members.iter().any(|member| {
+            member.actor_kind == db::ActorKind::Agent
+                && member.status == RoleMembershipStatus::Active
+        }));
 
         let unchanged = TaskRepo::get_by_id(&*db, &todo.id, false)
             .await
@@ -1813,7 +1940,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             "user",
             Some("human-user".to_owned()),
         )
@@ -1827,18 +1954,26 @@ mod tests {
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(unchanged.status, "in_progress");
+        assert_eq!(unchanged.lifecycle_state, TaskLifecycleState::Active);
         assert_eq!(unchanged.error_annotation, None);
 
         assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn crash_recovery_keeps_ambiguous_legacy_review_blocked() {
+    async fn crash_recovery_keeps_historical_ambiguous_lifecycle_blocked() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let (project_id, repo_id) = seed_project_repo(&db).await;
-        let task = seed_task(&db, project_id, repo_id, "review".to_owned(), None).await;
+        let task = seed_task(&db, project_id, repo_id, "blocked".to_owned(), None).await;
+        sqlx::query(
+            "UPDATE task_lifecycle SET reason_kind = 'ambiguous_review', reason_ref = ? WHERE task_id = ?",
+        )
+        .bind(&task.id)
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .expect("historical ambiguity receipt is seeded exactly");
 
         let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)
             .run_recovery()
@@ -1850,8 +1985,7 @@ mod tests {
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(recovered_task.status, "blocked");
-        assert_eq!(recovered_task.entry_barrier_json, None);
+        assert_eq!(recovered_task.lifecycle_state, TaskLifecycleState::Blocked);
         let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
             .await
             .expect("lifecycle loads")
@@ -1872,7 +2006,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent.id.clone()),
         )
         .await;
@@ -1896,8 +2030,18 @@ mod tests {
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(recovered_task.status, "blocked");
-        assert_eq!(recovered_task.assignee_id, task.assignee_id);
+        assert_eq!(recovered_task.lifecycle_state, TaskLifecycleState::Blocked);
+        let implementer = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
+            .await
+            .expect("implementer role loads")
+            .expect("implementer role exists");
+        let membership = RoleMembershipRepo::list_by_role(&*db, &implementer.id, true)
+            .await
+            .expect("membership history loads")
+            .into_iter()
+            .find(|member| member.status == RoleMembershipStatus::Active)
+            .expect("the exact active membership remains");
+        assert_eq!(membership.actor_id, agent.id);
         let annotation: Value =
             serde_json::from_str(recovered_task.error_annotation.as_deref().unwrap()).unwrap();
         assert_eq!(annotation["type"], "recovery_required");
@@ -1947,7 +2091,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent_id.clone()),
         )
         .await;
@@ -2012,7 +2156,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent_id.clone()),
         )
         .await;
@@ -2026,7 +2170,7 @@ mod tests {
                 stopped_by: None,
                 resume_policy: None,
                 stopped_at: None,
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: Some(Some("1970-01-01T00:00:00+00:00".to_owned())),
                 summary: None,
@@ -2080,12 +2224,6 @@ mod tests {
             .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
             .unwrap_or(Value::Null);
         assert!(metadata.get("execution_retry_count").is_none());
-        assert!(metadata
-            .get("deferred_dispatch")
-            .and_then(Value::as_object)
-            .is_none_or(|dispatch| dispatch.get("reason").and_then(Value::as_str)
-                != Some("execution retry (attempt 1)")));
-
         let mut event_types = Vec::new();
         for _ in 0..3 {
             event_types.push(rx.recv().await.expect("event receives").event_type);
@@ -2117,15 +2255,6 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let (project_id, repo_id) = seed_project_repo(&db).await;
-        sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
-            .bind(
-                serde_json::to_string(&crate::workflow::default_workflow::default_workflow())
-                    .unwrap(),
-            )
-            .bind(&project_id)
-            .execute(db.pool())
-            .await
-            .expect("project workflow updates");
         let agent = seed_agent(
             &db,
             AgentStatus::Busy,
@@ -2137,7 +2266,7 @@ mod tests {
             &db,
             project_id.clone(),
             repo_id.clone(),
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent.id.clone()),
         )
         .await;
@@ -2145,7 +2274,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "merge_failed".to_owned(),
+            "blocked".to_owned(),
             Some(agent.id),
         )
         .await;
@@ -2158,13 +2287,13 @@ mod tests {
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(t1.status, "in_progress");
+        assert_eq!(t1.lifecycle_state, TaskLifecycleState::Active);
 
         let t2 = TaskRepo::get_by_id(&*db, &task_merge_failed.id, false)
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(t2.status, "blocked");
+        assert_eq!(t2.lifecycle_state, TaskLifecycleState::Blocked);
     }
 
     #[tokio::test]
@@ -2177,7 +2306,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent.id.clone()),
         )
         .await;
@@ -2191,7 +2320,7 @@ mod tests {
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(updated_task.status, "blocked");
+        assert_eq!(updated_task.lifecycle_state, TaskLifecycleState::Blocked);
         let annotation: Value =
             serde_json::from_str(updated_task.error_annotation.as_deref().unwrap()).unwrap();
         assert_eq!(annotation["blocked_execution_id"], execution.id);
@@ -2217,7 +2346,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent.id.clone()),
         )
         .await;
@@ -2259,7 +2388,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent.id.clone()),
         )
         .await;
@@ -2280,17 +2409,25 @@ mod tests {
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(updated_task.status, "in_progress");
+        assert_eq!(updated_task.lifecycle_state, TaskLifecycleState::Active);
 
         let updated_execution = ExecutionRepo::get_by_id(&*db, &execution.id)
             .await
             .expect("execution loads")
             .expect("execution exists");
         assert_eq!(updated_execution.status, ExecutionStatus::Cancelled);
-        assert_eq!(
-            updated_execution.agent_session_id.as_deref(),
-            Some("session-123")
-        );
+        let external_session_id: Option<String> =
+            sqlx::query_scalar("SELECT external_session_id FROM harness_session WHERE id = ?")
+                .bind(
+                    updated_execution
+                        .harness_session_id
+                        .as_deref()
+                        .expect("exact HarnessSession link"),
+                )
+                .fetch_one(db.pool())
+                .await
+                .expect("HarnessSession identity loads");
+        assert_eq!(external_session_id.as_deref(), Some("session-123"));
         assert_eq!(updated_execution.resume_policy, Some(ResumePolicy::Auto));
     }
 
@@ -2306,7 +2443,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent.id.clone()),
         )
         .await;
@@ -2327,7 +2464,7 @@ mod tests {
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(updated_task.status, "in_progress");
+        assert_eq!(updated_task.lifecycle_state, TaskLifecycleState::Active);
 
         let executions = ExecutionRepo::list_by_task(
             &*db,
@@ -2364,19 +2501,22 @@ mod tests {
                 "log_path": null,
             })),
             "message": "Recovered after server restart",
-            "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],
+            "recovery_actions": ["reexecute", "cancel_task"],
         })
         .to_string();
-        TaskRepo::update_status(
+        TaskRepo::update(
             db,
-            UpdateTaskStatus {
+            UpdateTask {
                 id: task.id.clone(),
                 expected_version: task.version,
-                status: task.status.clone(),
-                assignee_id: None,
+                title: None,
+                description: None,
+                priority: None,
+                merge_config: None,
                 error_annotation: Some(Some(annotation)),
                 blocked_json: None,
                 failed_json: None,
+                parent_task_id: None,
                 updated_at: now_rfc3339(),
             },
         )
@@ -2385,24 +2525,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_recovery_clears_stale_recovery_annotations_without_execution() {
+    async fn crash_recovery_preserves_recovery_annotations_without_an_exact_execution() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let (project_id, repo_id) = seed_project_repo(&db).await;
-        let task = seed_task(&db, project_id, repo_id, "in_progress".to_owned(), None).await;
+        let task = seed_task(&db, project_id, repo_id, "active".to_owned(), None).await;
         stamp_recovery_annotation(&db, &task, None).await;
 
         let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)
             .run_recovery()
             .await
             .expect("recovery runs");
-        assert_eq!(recovered, 1);
+        assert_eq!(recovered, 0);
 
         let updated = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(updated.error_annotation, None);
+        assert!(updated.error_annotation.is_some());
     }
 
     #[tokio::test]
@@ -2415,7 +2555,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent.id.clone()),
         )
         .await;
@@ -2429,7 +2569,7 @@ mod tests {
                 stopped_by: Some(Some("system:crash_recovery".to_owned())),
                 resume_policy: Some(Some(ResumePolicy::Manual)),
                 stopped_at: Some(Some(now_rfc3339())),
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,
@@ -2469,7 +2609,7 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let (project_id, repo_id) = seed_project_repo(&db).await;
-        let task = seed_task(&db, project_id, repo_id, "in_progress".to_owned(), None).await;
+        let task = seed_task(&db, project_id, repo_id, "active".to_owned(), None).await;
         stamp_recovery_annotation(&db, &task, Some("missing-execution-id")).await;
 
         let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)
@@ -2562,7 +2702,7 @@ mod tests {
                 stopped_by: None,
                 resume_policy: None,
                 stopped_at: None,
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,
@@ -2600,7 +2740,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent_id.clone()),
         )
         .await;
@@ -2635,7 +2775,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent_id.clone()),
         )
         .await;
@@ -2668,7 +2808,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent_id.clone()),
         )
         .await;
@@ -2707,7 +2847,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent_id.clone()),
         )
         .await;
@@ -2744,7 +2884,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent_a_id.clone()),
         )
         .await;
@@ -2831,7 +2971,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent_id.clone()),
         )
         .await;
@@ -2845,7 +2985,7 @@ mod tests {
                 stopped_by: None,
                 resume_policy: None,
                 stopped_at: None,
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: Some(Some("1970-01-01T00:00:00+00:00".to_owned())),
                 summary: None,
@@ -2914,7 +3054,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent.id.clone()),
         )
         .await;
@@ -2928,7 +3068,7 @@ mod tests {
                 stopped_by: None,
                 resume_policy: None,
                 stopped_at: None,
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: Some(Some("1970-01-01T00:00:00+00:00".to_owned())),
                 summary: None,
@@ -2975,7 +3115,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent_id.clone()),
         )
         .await;
@@ -3027,7 +3167,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent_id.clone()),
         )
         .await;
@@ -3072,7 +3212,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent_id.clone()),
         )
         .await;
@@ -3120,7 +3260,7 @@ mod tests {
             &db,
             project_id,
             repo_id,
-            "in_progress".to_owned(),
+            "active".to_owned(),
             Some(agent.id.clone()),
         )
         .await;
@@ -3134,7 +3274,7 @@ mod tests {
                 stopped_by: None,
                 resume_policy: None,
                 stopped_at: Some(Some(now_rfc3339())),
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,

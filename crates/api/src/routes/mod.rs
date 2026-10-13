@@ -181,7 +181,7 @@ async fn task_response_inner(db: &db::SqliteDb, task: Task) -> ApiResult<TaskRes
         created_at: lifecycle.created_at,
         updated_at: lifecycle.updated_at,
     };
-    let workspace = WorkspaceRepo::get_by_task_id(db, &task.id)
+    let workspace = WorkspaceRepo::get_integration_by_task_id(db, &task.id)
         .await?
         .map(workspace_response);
     let execution_observability = task_execution_observability(db, &task.id).await?;

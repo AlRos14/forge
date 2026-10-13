@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use db::{
-    new_uuid_v4, now_rfc3339, CreateNotification, Notification, NotificationRepo, ReviewRepo,
+    new_uuid_v4, now_rfc3339, CreateNotification, DomainEventRepo, Notification, NotificationRepo,
     SqliteDb, TaskRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
@@ -49,34 +49,32 @@ impl NotificationService {
 
     async fn handle_event(&self, event: ForgeEvent) -> crate::Result<()> {
         match event.context {
-            EventContext::TaskStatusChanged {
-                project_id,
-                new_status,
-                ..
-            } if new_status == crate::workflow::default_states::DONE => {
-                let Some(task) = TaskRepo::get_by_id(&*self.db, &event.entity_id, true).await?
-                else {
-                    return Ok(());
-                };
-                self.create_and_publish(
-                    project_id,
-                    Some(task.id),
-                    "task.done".to_owned(),
-                    task.title,
-                    None,
-                )
-                .await?;
-            }
-            EventContext::TaskMoved(payload)
-                if payload.old_status != payload.new_status
-                    && payload.new_status == crate::workflow::default_states::DONE =>
+            EventContext::DomainEventCommitted { .. }
+                if event.event_type == "domain_event.committed" =>
             {
-                let Some(task) = TaskRepo::get_by_id(&*self.db, &event.entity_id, true).await?
+                let Some(domain_event) =
+                    DomainEventRepo::get_event(&*self.db, &event.entity_id).await?
+                else {
+                    return Ok(());
+                };
+                if domain_event.entity_type != "task"
+                    || domain_event.event_type != "task.lifecycle_changed"
+                    || serde_json::from_str::<serde_json::Value>(&domain_event.payload_json)
+                        .ok()
+                        .and_then(|payload| payload.get("to_state").cloned())
+                        .and_then(|state| state.as_str().map(str::to_owned))
+                        .as_deref()
+                        != Some("done")
+                {
+                    return Ok(());
+                }
+                let Some(task) =
+                    TaskRepo::get_by_id(&*self.db, &domain_event.entity_id, true).await?
                 else {
                     return Ok(());
                 };
                 self.create_and_publish(
-                    payload.project_id,
+                    task.project_id,
                     Some(task.id),
                     "task.done".to_owned(),
                     task.title,
@@ -133,37 +131,6 @@ impl NotificationService {
                     "task.recovery_required".to_owned(),
                     task.title,
                     Some(recovery_reason_message(&reason)),
-                )
-                .await?;
-            }
-            EventContext::ReviewPassed { task_id, .. } => {
-                let Some(task) = TaskRepo::get_by_id(&*self.db, &task_id, true).await? else {
-                    return Ok(());
-                };
-                self.create_and_publish(
-                    task.project_id,
-                    Some(task.id),
-                    "review.passed".to_owned(),
-                    format!("Review passed: {}", task.title),
-                    None,
-                )
-                .await?;
-            }
-            EventContext::ReviewFailed {
-                task_id, review_id, ..
-            } => {
-                let Some(task) = TaskRepo::get_by_id(&*self.db, &task_id, true).await? else {
-                    return Ok(());
-                };
-                let reason = ReviewRepo::get_by_id(&*self.db, &review_id)
-                    .await?
-                    .and_then(|review| extract_review_failure_reason(&review.step_results_json));
-                self.create_and_publish(
-                    task.project_id,
-                    Some(task.id),
-                    "review.failed".to_owned(),
-                    format!("Review failed: {}", task.title),
-                    reason,
                 )
                 .await?;
             }
@@ -230,13 +197,4 @@ fn recovery_reason_message(reason: &str) -> String {
         "agent_timeout" => "Needs manual recovery after an agent heartbeat timeout".to_owned(),
         other => format!("Needs manual recovery: {other}"),
     }
-}
-
-fn extract_review_failure_reason(step_results_json: &str) -> Option<String> {
-    let details = serde_json::from_str::<serde_json::Value>(step_results_json).ok()?;
-    details
-        .get("auditor")
-        .and_then(|auditor| auditor.get("reason"))
-        .and_then(|reason| reason.as_str())
-        .map(|reason| reason.to_owned())
 }

@@ -1,12 +1,10 @@
 use super::*;
 use api_types::ActorRef;
 use db::{
-    canonical_task_role_name, new_uuid_v4, now_rfc3339, ActorKind, AssigneeKind, CoordinationMode,
-    CreateTaskRole, CreateTaskRoleAssignment, ProjectRepo, RoleMembership, RoleMembershipRepo,
-    RoleMembershipStatus, TaskRole, TaskRoleAssignment, TaskRoleAssignmentRepo, TaskRoleRepo,
-    UpdateTaskRole, UserRepo,
+    canonical_task_role_name, new_uuid_v4, now_rfc3339, ActorKind, CoordinationMode,
+    CreateRoleMembership, CreateTaskRole, ProjectRepo, RoleMembership, RoleMembershipRepo,
+    RoleMembershipStatus, TaskRole, TaskRoleRepo, UpdateRoleMembership, UpdateTaskRole, UserRepo,
 };
-use sqlx::{Row, Sqlite, Transaction};
 
 use crate::agent_service::{compute_effective_status, EffectiveStatus};
 use crate::project_actor_scope;
@@ -123,39 +121,20 @@ impl TaskService {
             ));
         }
         self.validate_actor_for_task(&task, &actor_ref).await?;
-        let fallback_role = self
-            .legacy_projection_role_name(&task, &task_role.role)
-            .await?;
         let now = now_rfc3339();
-        let membership_id = new_uuid_v4();
-        let mut transaction = self.db.pool().begin().await?;
-        sqlx::query(
-            "INSERT INTO role_membership
-                (id, task_role_id, actor_kind, actor_id, status, version, created_at, updated_at, ended_at)
-             VALUES (?, ?, ?, ?, 'active', 1, ?, ?, NULL)",
-        )
-        .bind(&membership_id)
-        .bind(&task_role.id)
-        .bind(actor_kind(&actor_ref).to_string())
-        .bind(actor_id(&actor_ref))
-        .bind(&now)
-        .bind(&now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(map_membership_write_error)?;
-        self.sync_legacy_role_projection_in_tx(
-            &mut transaction,
-            &task,
-            &task_role.id,
-            &task_role.role,
-            fallback_role.as_deref(),
-            None,
+        let membership = RoleMembershipRepo::add(
+            &*self.db,
+            CreateRoleMembership {
+                id: new_uuid_v4(),
+                task_role_id: task_role.id,
+                actor_kind: actor_kind(&actor_ref),
+                actor_id: actor_id(&actor_ref).to_owned(),
+                status: RoleMembershipStatus::Active,
+                created_at: now.clone(),
+                updated_at: now,
+            },
         )
         .await?;
-        transaction.commit().await?;
-        let membership = RoleMembershipRepo::get(&*self.db, &membership_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("role_membership", membership_id.clone()))?;
         self.publish(ForgeEvent {
             event_type: "task.updated".to_owned(),
             entity_id: task.id,
@@ -165,179 +144,6 @@ impl TaskService {
             },
         });
         Ok(membership)
-    }
-
-    /// Translate a legacy singleton assignment into the authoritative
-    /// TaskRole/RoleMembership representation. The compatibility rows are
-    /// projections maintained by the same transaction.
-    pub(crate) async fn assign_role_membership(
-        &self,
-        input: CreateTaskRoleAssignment,
-    ) -> Result<TaskRoleAssignment> {
-        let Some(canonical_role) = canonical_task_role_name(&input.role_name) else {
-            // interactive/merge_fixer/system remain execution labels, not
-            // TaskRole vocabulary, until their later execution migration.
-            return TaskRoleAssignmentRepo::assign(&*self.db, input)
-                .await
-                .map_err(Into::into);
-        };
-        if input.assignee_type.as_ref() == Some(&AssigneeKind::User)
-            && input.assignee_id.as_deref() == Some("human")
-        {
-            // The pre-existing project-settings sentinel means "manual Human"
-            // rather than a real user identity. Keep it in the bounded legacy
-            // path; it must never become ActorRef::Human("human"). A
-            // replacement TaskRole cannot accept the sentinel because it would
-            // otherwise bypass authoritative Actor validation.
-            let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("task", input.task_id.clone()))?;
-            if current_role_memberships_authoritative(&self.db, &task.id, &canonical_role)
-                .await?
-                .is_some()
-            {
-                return Err(ServiceError::invalid_operation(
-                    "the human sentinel cannot be assigned to a replacement TaskRole",
-                ));
-            }
-            return TaskRoleAssignmentRepo::assign(&*self.db, input)
-                .await
-                .map_err(Into::into);
-        }
-        let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", input.task_id.clone()))?;
-        let actor_ref = match (input.assignee_type.clone(), input.assignee_id.as_deref()) {
-            (Some(AssigneeKind::Agent), Some(id)) => Some(ActorRef::Agent(id.to_owned())),
-            (Some(AssigneeKind::User), Some(id)) => Some(ActorRef::Human(id.to_owned())),
-            (None, None) => None,
-            _ => {
-                return Err(ServiceError::invalid_operation(
-                    "role assignment actor type and id must be provided together",
-                ));
-            }
-        };
-        if let Some(actor_ref) = actor_ref.as_ref() {
-            self.validate_actor_for_task(&task, actor_ref).await?;
-        }
-        let fallback_role = self
-            .legacy_projection_role_name(&task, &canonical_role)
-            .await?;
-
-        let mut transaction = self.db.pool().begin().await?;
-        let task_role_id = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM task_role WHERE task_id = ? AND role = ?",
-        )
-        .bind(&task.id)
-        .bind(&canonical_role)
-        .fetch_optional(&mut *transaction)
-        .await?;
-        let task_role_id = if let Some(task_role_id) = task_role_id {
-            task_role_id
-        } else {
-            let task_role_id = new_uuid_v4();
-            sqlx::query(
-                "INSERT INTO task_role
-                    (id, task_id, role, coordination_mode, policy_json, version, created_at, updated_at)
-                 VALUES (?, ?, ?, NULL, '{}', 1, ?, ?)",
-            )
-            .bind(&task_role_id)
-            .bind(&task.id)
-            .bind(&canonical_role)
-            .bind(&input.created_at)
-            .bind(&input.updated_at)
-            .execute(&mut *transaction)
-            .await
-            .map_err(map_membership_write_error)?;
-            task_role_id
-        };
-
-        let current_members = sqlx::query(
-            "SELECT actor_kind, actor_id, status
-             FROM role_membership
-             WHERE task_role_id = ? AND status IN ('active', 'suspended')
-             ORDER BY created_at, id",
-        )
-        .bind(&task_role_id)
-        .fetch_all(&mut *transaction)
-        .await?;
-        let same_active = actor_ref.as_ref().is_some_and(|actor| {
-            current_members.iter().any(|row| {
-                row.get::<String, _>("actor_kind") == actor_kind(actor).to_string()
-                    && row.get::<String, _>("actor_id") == actor_id(actor)
-                    && row.get::<String, _>("status") == "active"
-            })
-        });
-        if same_active {
-            self.sync_legacy_role_projection_in_tx(
-                &mut transaction,
-                &task,
-                &task_role_id,
-                &canonical_role,
-                fallback_role.as_deref(),
-                Some(&input.role_name),
-            )
-            .await?;
-            transaction.commit().await?;
-            return self
-                .legacy_assignment_projection(&task.id, &input.role_name)
-                .await;
-        }
-        if current_members.len() > 1 {
-            return Err(ServiceError::conflict(
-                "legacy singleton role mutation cannot replace multiple current memberships",
-            ));
-        }
-
-        sqlx::query(
-            "UPDATE role_membership
-             SET status = 'ended', ended_at = ?, updated_at = ?, version = version + 1
-             WHERE task_role_id = ? AND status IN ('active', 'suspended')",
-        )
-        .bind(&input.updated_at)
-        .bind(&input.updated_at)
-        .bind(&task_role_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(map_membership_write_error)?;
-        if let Some(actor_ref) = actor_ref.as_ref() {
-            sqlx::query(
-                "INSERT INTO role_membership
-                    (id, task_role_id, actor_kind, actor_id, status, version, created_at, updated_at, ended_at)
-                 VALUES (?, ?, ?, ?, 'active', 1, ?, ?, NULL)",
-            )
-            .bind(new_uuid_v4())
-            .bind(&task_role_id)
-            .bind(actor_kind(actor_ref).to_string())
-            .bind(actor_id(actor_ref))
-            .bind(&input.created_at)
-            .bind(&input.updated_at)
-            .execute(&mut *transaction)
-            .await
-            .map_err(map_membership_write_error)?;
-        }
-        self.sync_legacy_role_projection_in_tx(
-            &mut transaction,
-            &task,
-            &task_role_id,
-            &canonical_role,
-            fallback_role.as_deref(),
-            Some(&input.role_name),
-        )
-        .await?;
-        transaction.commit().await?;
-        self.legacy_assignment_projection(&task.id, &input.role_name)
-            .await
-    }
-
-    async fn legacy_assignment_projection(
-        &self,
-        task_id: &str,
-        role_name: &str,
-    ) -> Result<TaskRoleAssignment> {
-        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, role_name)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task_role_assignment", role_name.to_owned()))
     }
 
     pub async fn update_task_role_member(
@@ -367,48 +173,19 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let fallback_role = self.legacy_projection_role_name(&task, &role.role).await?;
         let updated_at = now_rfc3339();
         let ended_at = (status == RoleMembershipStatus::Ended).then(|| updated_at.clone());
-        let mut transaction = self.db.pool().begin().await?;
-        let result = sqlx::query(
-            "UPDATE role_membership
-             SET status = ?, version = version + 1, updated_at = ?, ended_at = ?
-             WHERE id = ? AND version = ?",
-        )
-        .bind(status.to_string())
-        .bind(&updated_at)
-        .bind(ended_at.as_deref())
-        .bind(&membership.id)
-        .bind(expected_version)
-        .execute(&mut *transaction)
-        .await
-        .map_err(map_membership_write_error)?;
-        if result.rows_affected() == 0 {
-            let exists: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM role_membership WHERE id = ?")
-                    .bind(&membership.id)
-                    .fetch_one(&mut *transaction)
-                    .await?;
-            return Err(if exists == 0 {
-                ServiceError::Db(db::DbError::NotFound)
-            } else {
-                ServiceError::Db(db::DbError::VersionConflict)
-            });
-        }
-        self.sync_legacy_role_projection_in_tx(
-            &mut transaction,
-            &task,
-            &role.id,
-            &role.role,
-            fallback_role.as_deref(),
-            None,
+        let updated = RoleMembershipRepo::update(
+            &*self.db,
+            UpdateRoleMembership {
+                id: membership.id.clone(),
+                expected_version,
+                status,
+                updated_at,
+                ended_at,
+            },
         )
         .await?;
-        transaction.commit().await?;
-        let updated = RoleMembershipRepo::get(&*self.db, &membership.id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("role_membership", membership.id.clone()))?;
         self.publish(ForgeEvent {
             event_type: "task.updated".to_owned(),
             entity_id: task.id,
@@ -482,67 +259,11 @@ impl TaskService {
         }
         Ok(())
     }
-
-    pub(crate) async fn ensure_agent_membership_for_role(
-        &self,
-        task_id: &str,
-        role: &str,
-        agent_id: &str,
-    ) -> Result<()> {
-        if canonical_task_role_name(role).is_none() {
-            return Ok(());
-        }
-        if let Some(memberships) =
-            current_role_memberships_authoritative(&self.db, task_id, role).await?
-        {
-            if active_agent_membership(&memberships, agent_id).is_none() {
-                return Err(ServiceError::conflict(format!(
-                    "Agent {agent_id} is not an active member of role {role}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    async fn sync_legacy_role_projection_in_tx(
-        &self,
-        transaction: &mut Transaction<'_, Sqlite>,
-        task: &db::Task,
-        task_role_id: &str,
-        canonical_role: &str,
-        fallback_role: Option<&str>,
-        preferred_projection_role: Option<&str>,
-    ) -> Result<()> {
-        project_actor_scope::sync_legacy_role_projection_in_tx(
-            transaction,
-            &task.id,
-            task_role_id,
-            canonical_role,
-            fallback_role,
-            preferred_projection_role,
-        )
-        .await
-    }
-
-    async fn legacy_projection_role_name(
-        &self,
-        _task: &db::Task,
-        canonical: &str,
-    ) -> Result<Option<String>> {
-        // The legacy role row is a one-way projection. Use a fixed historical
-        // spelling for implementer; project WorkflowDefinitions do not choose
-        // role identity or membership eligibility.
-        let projected = match canonical {
-            "implementer" => "coder",
-            role => role,
-        };
-        Ok(Some(projected.to_owned()))
-    }
 }
 
-/// `None` means this task has not yet acquired a replacement TaskRole record;
-/// callers may use the bounded legacy projection for that pre-migration
-/// fixture/data case. `Some(empty)` is authoritative unassigned membership.
+/// Canonical roles always resolve to the target membership set. A missing
+/// TaskRole is an empty set; it never falls back to a singular assignment.
+/// `None` is reserved for execution labels outside TaskRole vocabulary.
 pub async fn current_role_memberships_authoritative(
     db: &db::SqliteDb,
     task_id: &str,
@@ -556,7 +277,7 @@ pub async fn current_role_memberships_authoritative(
         return Ok(None);
     };
     let Some(task_role) = TaskRoleRepo::get_by_task_and_role(db, task_id, &role).await? else {
-        return Ok(None);
+        return Ok(Some(Vec::new()));
     };
     RoleMembershipRepo::list_by_role(db, &task_role.id, false)
         .await
@@ -564,27 +285,20 @@ pub async fn current_role_memberships_authoritative(
         .map_err(Into::into)
 }
 
-/// Check current Human authority from the replacement TaskRole when it
-/// exists. The singleton assignment is consulted only for Tasks that have not
-/// acquired that replacement authority yet.
+/// Check current Human authority from the target TaskRole membership set.
 pub(crate) async fn human_is_active_role_member_authoritative(
     db: &db::SqliteDb,
     task_id: &str,
     role: &str,
     user_id: &str,
 ) -> Result<bool> {
-    if let Some(memberships) = current_role_memberships_authoritative(db, task_id, role).await? {
-        return Ok(memberships.iter().any(|membership| {
-            membership.actor_kind == db::ActorKind::Human
-                && membership.actor_id == user_id
-                && membership.status == db::RoleMembershipStatus::Active
-        }));
-    }
-
-    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(db, task_id, role).await?;
-    Ok(assignment.is_some_and(|assignment| {
-        assignment.assignee_type == Some(db::AssigneeKind::User)
-            && assignment.assignee_id.as_deref() == Some(user_id)
+    let Some(memberships) = current_role_memberships_authoritative(db, task_id, role).await? else {
+        return Ok(false);
+    };
+    Ok(memberships.iter().any(|membership| {
+        membership.actor_kind == db::ActorKind::Human
+            && membership.actor_id == user_id
+            && membership.status == db::RoleMembershipStatus::Active
     }))
 }
 
@@ -720,21 +434,4 @@ fn validate_policy_json(policy_json: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn map_membership_write_error(error: sqlx::Error) -> ServiceError {
-    if let sqlx::Error::Database(database_error) = &error {
-        if database_error.message().contains("UNIQUE") {
-            return ServiceError::conflict("actor already has a current membership in this role");
-        }
-        if database_error
-            .message()
-            .contains("coordination_mode is required")
-        {
-            return ServiceError::invalid_operation(
-                "set coordination_mode before adding a second current member",
-            );
-        }
-    }
-    ServiceError::Db(db::DbError::Sqlx(error))
 }

@@ -1,14 +1,8 @@
 use db::{
-    create_sqlite_pool, run_migrations, run_migrations_from, AgentActionPolicyResult,
-    AgentActionRepo, AgentActionStatus, AgentChatRepo, AgentCommitmentRepo, AgentCommitmentStatus,
-    AgentContextScopeRepo, AgentInboxKind, AgentInboxRepo, AgentInboxStatus, AgentLcmRepo,
-    AgentRepo, AgentSessionRepo, AgentStatus, CreateAgent, CreateAgentAction,
-    CreateAgentCommitment, CreateAgentContextScope, CreateAgentInboxItem, CreateAgentLcmTimeline,
-    CreateAgentSession, CreateContextManifest, CreateContextManifestSource, CreateDomainEvent,
-    CreateForgeMemorySourceBinding, CreateProject, CreateTask, CreateTaskIntegrationOperation,
-    DomainEventRepo, MemoryItem, ProjectRepo, ScopedMemoryRepository, SqliteDb,
-    TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskIntegrationOperationStatus,
-    TaskRepo, User, UserRepo,
+    create_sqlite_pool, run_migrations, run_migrations_from, AgentRepo, AgentStatus, CreateAgent,
+    CreateDomainEvent, CreateProject, CreateTask, CreateTaskIntegrationOperation, DomainEventRepo,
+    ProjectRepo, SqliteDb, TaskIntegrationOperationKind, TaskIntegrationOperationRepo,
+    TaskIntegrationOperationStatus, TaskRepo, User, UserRepo,
 };
 use std::{
     fs,
@@ -42,7 +36,6 @@ async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_
             id: project_id.clone(),
             name: "Durable Task operation claim".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),
@@ -58,16 +51,13 @@ async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_
             project_id,
             repo_id: None,
             parent_task_id: None,
-            assignee_type: None,
-            assignee_id: None,
             title: "integration target".to_owned(),
             description: None,
             task_type: "implementation".to_owned(),
-            status: "todo".to_owned(),
+            lifecycle_state: db::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,
             subtask_order: None,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -143,7 +133,6 @@ async fn pr9_migration_maps_legacy_task_states_conservatively_and_audits_ambigui
             id: project_id.clone(),
             name: "PR9 lifecycle migration".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),
@@ -170,30 +159,19 @@ async fn pr9_migration_maps_legacy_task_states_conservatively_and_audits_ambigui
     let mut task_ids = Vec::new();
     for (legacy_state, _, _) in expected {
         let task_id = db::new_uuid_v4();
-        TaskRepo::create(
-            &db,
-            CreateTask {
-                id: task_id.clone(),
-                project_id: project_id.clone(),
-                repo_id: None,
-                parent_task_id: None,
-                assignee_type: None,
-                assignee_id: None,
-                title: format!("legacy {legacy_state}"),
-                description: None,
-                task_type: "implementation".to_owned(),
-                status: legacy_state.to_owned(),
-                is_automation: false,
-                priority: 0,
-                subtask_order: None,
-                task_state_config: Some("{\"legacy\":true}".to_owned()),
-                merge_config: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
+        sqlx::query(
+            "INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at)
+             VALUES (?, ?, ?, 'implementation', ?, ?, ?)",
         )
+        .bind(&task_id)
+        .bind(&project_id)
+        .bind(format!("legacy {legacy_state}"))
+        .bind(legacy_state)
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
         .await
-        .expect("legacy Task");
+        .expect("legacy Task row inserts before V100");
         task_ids.push((task_id, legacy_state));
     }
     let review_task_id = task_ids
@@ -214,16 +192,13 @@ async fn pr9_migration_maps_legacy_task_states_conservatively_and_audits_ambigui
             project_id: project_id.clone(),
             repo_id: None,
             parent_task_id: None,
-            assignee_type: None,
-            assignee_id: None,
             title: "active Task with legacy block metadata".to_owned(),
             description: None,
             task_type: "implementation".to_owned(),
-            status: "in_progress".to_owned(),
+            lifecycle_state: db::TaskLifecycleState::Active,
             is_automation: false,
             priority: 0,
             subtask_order: None,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -312,7 +287,6 @@ async fn pr5_rebuild_preserves_legacy_workspace_as_task_integration_scope() {
             id: project_id.clone(),
             name: "Legacy Workspace".into(),
             settings: "{}".into(),
-            workflow_definition: "{}".into(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.into(),
@@ -344,16 +318,13 @@ async fn pr5_rebuild_preserves_legacy_workspace_as_task_integration_scope() {
             project_id,
             repo_id: Some(repo_id.clone()),
             parent_task_id: None,
-            assignee_type: None,
-            assignee_id: None,
             title: "legacy task".into(),
             description: None,
             task_type: "implementation".into(),
-            status: "todo".into(),
+            lifecycle_state: db::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,
             subtask_order: None,
-            task_state_config: None,
             merge_config: None,
             created_at: now.into(),
             updated_at: now.into(),
@@ -499,7 +470,7 @@ async fn pr5_rebuild_preserves_legacy_workspace_as_task_integration_scope() {
     .await
     .expect("legacy scope");
     assert_eq!(scope, ("integration".into(), None));
-    let canonical = db::WorkspaceRepo::get_by_task_id(&db, &task_id)
+    let canonical = db::WorkspaceRepo::get_integration_by_task_id(&db, &task_id)
         .await
         .expect("legacy get")
         .expect("integration workspace");
@@ -723,6 +694,7 @@ async fn agent_identity_profile_membership_migration_preserves_operational_histo
         "room_message",
         "agent_turn_job",
         "project_agent_membership",
+        "task_role_assignment",
     ] {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -772,21 +744,34 @@ async fn agent_identity_profile_membership_migration_preserves_operational_histo
         )
     );
 
-    let task_assignee: Option<String> =
-        sqlx::query_scalar("SELECT assignee_id FROM task WHERE id = 'task-1'")
-            .fetch_one(&pool)
-            .await
-            .expect("task assignee loads");
+    let historical_membership: (String, String, String) = sqlx::query_as(
+        "SELECT rm.id, rm.actor_id, rm.status
+         FROM role_membership rm
+         JOIN task_role tr ON tr.id = rm.task_role_id
+         WHERE tr.task_id = 'task-1' AND tr.role = 'implementer'
+           AND rm.actor_kind = 'agent'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("target membership history loads");
+    let membership_issue: String = sqlx::query_scalar(
+        "SELECT details_json FROM pr11_vertical_migration_issue
+         WHERE source_kind = 'role_membership' AND source_id = ?",
+    )
+    .bind(&historical_membership.0)
+    .fetch_one(&pool)
+    .await
+    .expect("PR11 migration provenance loads");
     let execution_agent: Option<String> =
         sqlx::query_scalar("SELECT agent_id FROM execution WHERE id = 'execution-1'")
             .fetch_one(&pool)
             .await
             .expect("execution agent loads");
     let execution_session: Option<String> =
-        sqlx::query_scalar("SELECT agent_session_id FROM execution WHERE id = 'execution-1'")
+        sqlx::query_scalar("SELECT external_session_id FROM pr13_execution_session_projection_history WHERE execution_id = 'execution-1'")
             .fetch_one(&pool)
             .await
-            .expect("execution session loads");
+            .expect("execution session provenance loads");
     let room_responder: Option<String> = sqlx::query_scalar(
         "SELECT default_responder_identity_id FROM legacy_room WHERE id = 'conversation-1'",
     )
@@ -833,7 +818,31 @@ async fn agent_identity_profile_membership_migration_preserves_operational_histo
     .fetch_one(&pool)
     .await
     .expect("Room events load");
-    assert_eq!(task_assignee.as_deref(), Some("agent-1"));
+    assert_eq!(historical_membership.1, "agent-1");
+    assert_eq!(historical_membership.2, "ended");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&membership_issue)
+            .expect("migration provenance is JSON")["agent_id"],
+        "agent-1"
+    );
+    let archived_assignment: (String, String, String, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT id, task_id, role_name, assignee_type, assignee_id
+             FROM task_role_assignment_history WHERE id = 'role-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("singleton provenance remains as history");
+    assert_eq!(
+        archived_assignment,
+        (
+            "role-1".to_owned(),
+            "task-1".to_owned(),
+            "worker".to_owned(),
+            None,
+            None,
+        )
+    );
     assert_eq!(execution_agent.as_deref(), Some("agent-1"));
     assert_eq!(execution_session.as_deref(), Some("task-session-1"));
     assert_eq!(room_responder.as_deref(), Some("agent-1"));
@@ -963,16 +972,13 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
             project_id: "discovery-project".to_owned(),
             repo_id: Some("discovery-repo".to_owned()),
             parent_task_id: None,
-            assignee_type: None,
-            assignee_id: None,
             title: "Discover product direction".to_owned(),
             description: Some("Genesis discovery".to_owned()),
             task_type: "discovery".to_owned(),
-            status: "todo".to_owned(),
+            lifecycle_state: db::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,
             subtask_order: None,
-            task_state_config: None,
             merge_config: None,
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
@@ -1003,11 +1009,9 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
         "idx_task_status_project",
         "idx_task_parent",
         "idx_task_repo",
-        "idx_task_assignee",
         "idx_task_parent_subtask_order",
         "idx_task_project_archived",
         "idx_task_project_automation",
-        "task_insert_requires_assignee_id",
         "task_board_revision_after_insert",
         "task_board_revision_after_delete",
         "task_board_revision_after_update",
@@ -1031,27 +1035,37 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
 }
 
 #[tokio::test]
-async fn agent_chat_scope_rebuild_preserves_legacy_rows_and_relationships() {
-    let migration_dir = unique_temp_path("agent-chat-scope-migrations");
-    fs::create_dir_all(&migration_dir).expect("temp migration dir creates");
-    copy_migrations_up_to(73, &migration_dir);
+async fn pr13_archives_legacy_agent_context_before_dropping_tables() {
+    let historical_dir = unique_temp_path("pr13-v117-migrations");
+    let baseline_dir = unique_temp_path("pr13-v120-migrations");
+    let final_dir = unique_temp_path("pr13-v132-migrations");
+    fs::create_dir_all(&historical_dir).expect("V117 migration dir");
+    fs::create_dir_all(&baseline_dir).expect("V120 migration dir");
+    fs::create_dir_all(&final_dir).expect("V132 migration dir");
+    copy_migrations_up_to(117, &historical_dir);
+    copy_migrations_up_to(120, &baseline_dir);
+    copy_migrations_up_to(132, &final_dir);
 
-    let db_path = unique_temp_path("agent-chat-scope-db").with_extension("db");
+    let db_path = unique_temp_path("pr13-legacy-agent-context-db").with_extension("db");
     let url = format!("sqlite://{}", db_path.display());
     let pool = create_sqlite_pool(&url).await.expect("pool");
-    run_migrations_from(&pool, &migration_dir)
+    run_migrations_from(&pool, &historical_dir)
         .await
-        .expect("pre-Agent Chat migrations apply");
+        .expect("V117 historical baseline applies");
     let db = SqliteDb::new(pool.clone());
     let now = "2026-08-13T00:00:00Z";
-    let account_id = "scope-rebuild-account";
-    let identity_id = "scope-rebuild-identity";
+    let account_id = "pr13-legacy-account";
+    let message_id = "pr13-legacy-chat-message";
+    let memory_id = "pr13-legacy-memory";
+    let content = "legacy message bytes with { raw JSON text }";
+    let raw_provenance = "{ \"source\" : \"legacy\", \"revision\" : 7 }";
+    let raw_metadata = "[\"legacy\", { \"opaque\" : true }]";
 
     UserRepo::create_user(
         &db,
         &User {
             id: account_id.to_owned(),
-            email: "scope-rebuild@example.test".to_owned(),
+            email: "pr13-legacy@example.test".to_owned(),
             password_hash: "test".to_owned(),
             display_name: None,
             is_admin: false,
@@ -1061,445 +1075,156 @@ async fn agent_chat_scope_rebuild_preserves_legacy_rows_and_relationships() {
     )
     .await
     .expect("account creates");
-    let identity = AgentRepo::create(
-        &db,
-        CreateAgent {
-            id: identity_id.to_owned(),
-            name: "Scope Rebuild Agent".to_owned(),
-            description: None,
-            executor_type: "null".to_owned(),
-            model: None,
-            reasoning_effort: None,
-            permission_policy: None,
-            prompt_template: None,
-            capabilities_json: "{}".to_owned(),
-            config_json: "{}".to_owned(),
-            credential_ref: None,
-            daemon_id: None,
-            max_concurrent_tasks: 1,
-            heartbeat_interval_seconds: 30,
-            max_missed_heartbeats: 3,
-            status: AgentStatus::Idle,
-            last_heartbeat_at: None,
-            is_default: false,
-            paused: false,
-            owner_id: Some(account_id.to_owned()),
-            visibility: "account".to_owned(),
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
-        },
-    )
-    .await
-    .expect("identity creates");
-    let chat = AgentChatRepo::get_main_chat(&db, account_id)
-        .await
-        .expect("main chat lookup")
-        .expect("main chat exists");
-    assert_eq!(chat.account_id.as_deref(), Some(account_id));
-    let scope = AgentContextScopeRepo::create_context_scope(
-        &db,
-        CreateAgentContextScope {
-            id: "scope-rebuild-context".to_owned(),
-            identity_id: identity.id.clone(),
-            scope_type: "account".to_owned(),
-            scope_id: account_id.to_owned(),
-            project_id: None,
-            task_id: None,
-            task_role: None,
-            workspace_access: "deny".to_owned(),
-            authority_json: "{}".to_owned(),
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
-        },
-    )
-    .await
-    .expect("legacy context scope creates");
-    let session = AgentSessionRepo::create_agent_session(
-        &db,
-        CreateAgentSession {
-            id: "scope-rebuild-session".to_owned(),
-            identity_id: identity.id.clone(),
-            profile_id: identity.profile_id.clone(),
-            context_scope_id: scope.id.clone(),
-            backend_kind: "cli".to_owned(),
-            runtime_session_id: None,
-            status: "ready".to_owned(),
-            capabilities_json: "{}".to_owned(),
-            connection_status: "unknown".to_owned(),
-            predecessor_session_id: None,
-            last_activity_at: None,
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
-        },
-    )
-    .await
-    .expect("legacy session creates");
-    let timeline = AgentLcmRepo::create_or_get_lcm_timeline(
-        &db,
-        CreateAgentLcmTimeline {
-            id: "scope-rebuild-lcm".to_owned(),
-            identity_id: identity.id.clone(),
-            scope_type: "account".to_owned(),
-            scope_id: account_id.to_owned(),
-            authorization_revision: "auth-legacy".to_owned(),
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
-        },
-    )
-    .await
-    .expect("legacy LCM timeline creates");
-    let memory = MemoryItem {
-        row_id: 0,
-        id: "scope-rebuild-memory".to_owned(),
-        project_id: None,
-        task_id: None,
-        execution_id: None,
-        scope_type: "account".to_owned(),
-        scope_id: account_id.to_owned(),
-        visibility: "account".to_owned(),
-        owner_identity_id: Some(identity.id.clone()),
-        authority: "observation".to_owned(),
-        sensitivity: "internal".to_owned(),
-        retention_priority: 1,
-        provenance_json: "{}".to_owned(),
-        publication_source_id: None,
-        supersedes_id: None,
-        valid_from: None,
-        valid_until: None,
-        source_event_id: None,
-        source_scope_type: Some("account".to_owned()),
-        source_scope_id: Some(account_id.to_owned()),
-        source_revision: Some("legacy".to_owned()),
-        source_type: "native".to_owned(),
-        kind: "observation".to_owned(),
-        title: "Legacy scope memory".to_owned(),
-        summary: None,
-        body: "Preserve this body".to_owned(),
-        metadata_json: "{\"source_ref\":\"scope-rebuild-memory-source\"}".to_owned(),
-        confidence: None,
-        quality_score: None,
-        created_by_type: Some("agent".to_owned()),
-        created_by_id: Some(identity.id.clone()),
-        created_at: now.to_owned(),
-    };
-    db::MemoryRepository::insert_memory_item(&db, &memory)
-        .await
-        .expect("legacy memory creates");
-    sqlx::query(
-        "INSERT INTO memory_source_receipt (
-            source_type, source_scope_type, source_scope_id, source_ref,
-            memory_item_id, created_at
-         ) VALUES ('native', 'account', ?, 'scope-rebuild-memory-source', ?, ?)",
-    )
-    .bind(account_id)
-    .bind(&memory.id)
-    .bind(now)
-    .execute(&pool)
-    .await
-    .expect("legacy memory source receipt creates");
-    ScopedMemoryRepository::create_memory_source_binding(
-        &db,
-        CreateForgeMemorySourceBinding {
-            id: "scope-rebuild-binding".to_owned(),
-            identity_id: identity.id.clone(),
-            context_scope_id: scope.id.clone(),
-            scope_type: "account".to_owned(),
-            scope_id: account_id.to_owned(),
-            account_id: Some(account_id.to_owned()),
-            project_id: None,
-            task_id: None,
-            policy_revision: "legacy-policy".to_owned(),
-            created_at: now.to_owned(),
-        },
-    )
-    .await
-    .expect("legacy memory binding creates");
-    let manifest = ScopedMemoryRepository::create_context_manifest(
-        &db,
-        CreateContextManifest {
-            id: "scope-rebuild-manifest".to_owned(),
-            identity_id: identity.id.clone(),
-            agent_session_id: Some(session.id.clone()),
-            context_scope_id: scope.id.clone(),
-            scope_type: "account".to_owned(),
-            scope_id: account_id.to_owned(),
-            policy_revision: "legacy-policy".to_owned(),
-            domain_revision: "legacy-domain".to_owned(),
-            lcm_binding_revision: Some(timeline.revision.to_string()),
-            runtime_manifest_id: None,
-            runtime_manifest_fingerprint: None,
-            combined_fingerprint: "legacy-combined".to_owned(),
-            request_fingerprint: "legacy-request".to_owned(),
-            created_at: now.to_owned(),
-        },
-    )
-    .await
-    .expect("legacy manifest creates");
-    ScopedMemoryRepository::append_context_manifest_source(
-        &db,
-        CreateContextManifestSource {
-            manifest_id: manifest.id,
-            ordinal: 0,
-            source_id: memory.id.clone(),
-            source_type: "memory_item".to_owned(),
-            source_revision: "legacy".to_owned(),
-            selection_reason: "legacy source".to_owned(),
-            disposition: "included".to_owned(),
-            retention_priority: 1,
-            fragment_fingerprint: "legacy-fragment".to_owned(),
-        },
-    )
-    .await
-    .expect("legacy manifest source creates");
-    AgentActionRepo::create_action(
-        &db,
-        CreateAgentAction {
-            id: "scope-rebuild-action".to_owned(),
-            actor_identity_id: identity.id.clone(),
-            scope_type: "account".to_owned(),
-            scope_id: account_id.to_owned(),
-            operation: "legacy.observe".to_owned(),
-            payload_json: "{}".to_owned(),
-            payload_hash: "legacy-action-hash".to_owned(),
-            dedupe_key: "legacy-action-dedupe".to_owned(),
-            correlation_id: "legacy-correlation".to_owned(),
-            causation_id: None,
-            causation_depth: 0,
-            requested_permission: "account.read".to_owned(),
-            policy_result: AgentActionPolicyResult::Allowed,
-            policy_reason: None,
-            status: AgentActionStatus::Proposed,
-            target_type: None,
-            target_id: None,
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
-        },
-    )
-    .await
-    .expect("legacy action creates");
-    AgentCommitmentRepo::create_commitment(
-        &db,
-        CreateAgentCommitment {
-            id: "scope-rebuild-commitment".to_owned(),
-            owner_identity_id: identity.id.clone(),
-            scope_type: "account".to_owned(),
-            scope_id: account_id.to_owned(),
-            title: "Legacy commitment".to_owned(),
-            description: None,
-            status: AgentCommitmentStatus::Open,
-            due_at: None,
-            correlation_id: "legacy-correlation".to_owned(),
-            originating_action_id: None,
-            originating_task_id: None,
-            evidence_required: false,
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
-        },
-    )
-    .await
-    .expect("legacy commitment creates");
-    AgentInboxRepo::create_inbox_item(
-        &db,
-        CreateAgentInboxItem {
-            id: "scope-rebuild-inbox".to_owned(),
-            recipient_identity_id: identity.id.clone(),
-            scope_type: "account".to_owned(),
-            scope_id: account_id.to_owned(),
-            kind: AgentInboxKind::Message,
-            status: AgentInboxStatus::Unread,
-            title: "Legacy inbox".to_owned(),
-            body: "Legacy inbox body".to_owned(),
-            payload_json: "{}".to_owned(),
-            source_type: None,
-            source_id: None,
-            correlation_id: "legacy-correlation".to_owned(),
-            causation_id: None,
-            dedupe_key: "legacy-inbox-dedupe".to_owned(),
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
-        },
-    )
-    .await
-    .expect("legacy inbox creates");
-    AgentInboxRepo::create_question_with_inbox(
-        &db,
-        CreateAgentInboxItem {
-            id: "scope-rebuild-question-inbox".to_owned(),
-            recipient_identity_id: identity.id.clone(),
-            scope_type: "account".to_owned(),
-            scope_id: account_id.to_owned(),
-            kind: AgentInboxKind::Question,
-            status: AgentInboxStatus::Unread,
-            title: "Legacy question".to_owned(),
-            body: "Legacy question body".to_owned(),
-            payload_json: "{}".to_owned(),
-            source_type: None,
-            source_id: None,
-            correlation_id: "legacy-correlation".to_owned(),
-            causation_id: None,
-            dedupe_key: "legacy-question-dedupe".to_owned(),
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
-        },
-        db::CreateAgentQuestion {
-            id: "scope-rebuild-question".to_owned(),
-            recipient_identity_id: identity.id.clone(),
-            scope_type: "account".to_owned(),
-            scope_id: account_id.to_owned(),
-            question: "Legacy question?".to_owned(),
-            context_json: "{}".to_owned(),
-            asked_by_type: "agent".to_owned(),
-            asked_by_id: identity.id.clone(),
-            inbox_item_id: Some("scope-rebuild-question-inbox".to_owned()),
-            due_at: None,
-            correlation_id: "legacy-correlation".to_owned(),
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
-        },
-    )
-    .await
-    .expect("legacy question creates");
-    sqlx::query(
-        "INSERT INTO agent_wake_lease (
-            identity_id, scope_type, scope_id, incident_key, lease_owner,
-            leased_until, reaction_depth, updated_at
-         ) VALUES (?, 'account', ?, 'legacy-incident', 'legacy-worker', ?, 0, ?)",
-    )
-    .bind(&identity.id)
-    .bind(account_id)
-    .bind(now)
-    .bind(now)
-    .execute(&pool)
-    .await
-    .expect("legacy wake lease creates");
-    sqlx::query(
-        "INSERT INTO agent_wake_budget_window (
-            identity_id, scope_type, scope_id, window_started_at, updated_at
-         ) VALUES (?, 'account', ?, ?, ?)",
-    )
-    .bind(&identity.id)
-    .bind(account_id)
-    .bind(now)
-    .bind(now)
-    .execute(&pool)
-    .await
-    .expect("legacy wake budget creates");
-    DomainEventRepo::append_event(
-        &db,
-        CreateDomainEvent {
-            id: "scope-rebuild-event".to_owned(),
-            event_type: "legacy.observed".to_owned(),
-            entity_type: "agent".to_owned(),
-            entity_id: identity.id.clone(),
-            actor_type: "agent".to_owned(),
-            actor_id: Some(identity.id.clone()),
-            scope_type: "account".to_owned(),
-            scope_id: account_id.to_owned(),
-            correlation_id: "legacy-correlation".to_owned(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some("scope-rebuild-event-dedupe".to_owned()),
-            payload_json: "{}".to_owned(),
-            created_at: now.to_owned(),
-        },
-    )
-    .await
-    .expect("legacy event creates");
 
-    run_migrations(&pool)
-        .await
-        .expect("Agent Chat scope migration applies");
-
-    for (table, id_column, id) in [
-        ("agent_context_scope", "id", "scope-rebuild-context"),
-        ("agent_session", "id", "scope-rebuild-session"),
-        ("agent_lcm_timeline", "id", "scope-rebuild-lcm"),
-        ("memory_item", "id", "scope-rebuild-memory"),
-        ("forge_memory_source_binding", "id", "scope-rebuild-binding"),
-        ("agent_action", "id", "scope-rebuild-action"),
-        ("agent_commitment", "id", "scope-rebuild-commitment"),
-        ("agent_inbox_item", "id", "scope-rebuild-inbox"),
-        ("agent_question", "id", "scope-rebuild-question"),
-        ("domain_event", "id", "scope-rebuild-event"),
-    ] {
-        let sql = format!("SELECT COUNT(*) FROM {table} WHERE {id_column} = ?");
-        let count: i64 = sqlx::query_scalar(&sql)
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .expect("preserved row lookup");
-        assert_eq!(count, 1, "{table}.{id_column} {id} should survive");
-    }
-    let body: String =
-        sqlx::query_scalar("SELECT body FROM memory_item WHERE id = 'scope-rebuild-memory'")
-            .fetch_one(&pool)
-            .await
-            .expect("preserved memory body");
-    assert_eq!(body, "Preserve this body");
-    let receipt_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM memory_source_receipt WHERE memory_item_id = 'scope-rebuild-memory'",
+    let chat_id: String = sqlx::query_scalar(
+        "SELECT id FROM agent_chat WHERE account_id = ? AND kind = 'account_main'",
     )
+    .bind(account_id)
     .fetch_one(&pool)
     .await
-    .expect("preserved memory source receipt lookup");
-    assert_eq!(receipt_count, 1);
-    let fts_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM memory_item_fts WHERE memory_item_fts MATCH 'Preserve'",
+    .expect("legacy account chat exists");
+
+    sqlx::query(
+        "INSERT INTO agent_chat_message (
+            id, chat_id, sequence, author_type, content, status, correlation_id, created_at
+         ) VALUES (?, ?, 0, 'user', ?, 'complete', 'legacy-correlation', ?)",
     )
+    .bind(message_id)
+    .bind(&chat_id)
+    .bind(content)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("legacy chat message fixture inserts");
+    sqlx::query(
+        "INSERT INTO memory_item (
+            id, scope_type, scope_id, visibility, provenance_json, source_type,
+            kind, title, body, metadata_json, created_at
+         ) VALUES (?, 'account', ?, 'account', ?, 'native', 'observation',
+                   'Legacy memory', 'preserve exact body', ?, ?)",
+    )
+    .bind(memory_id)
+    .bind(account_id)
+    .bind(raw_provenance)
+    .bind(raw_metadata)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("legacy memory fixture inserts");
+
+    run_migrations_from(&pool, &baseline_dir)
+        .await
+        .expect("V118 through V120 upgrade historical database");
+
+    let expected_chat: String = sqlx::query_scalar(
+        "SELECT json_object(
+            'id', id, 'kind', kind, 'account_id', account_id, 'project_id', project_id,
+            'status', status, 'instruction_revision', instruction_revision,
+            'message_count', message_count, 'last_message_at', last_message_at,
+            'version', version, 'created_at', created_at, 'updated_at', updated_at
+         ) FROM agent_chat WHERE id = ?",
+    )
+    .bind(&chat_id)
     .fetch_one(&pool)
     .await
-    .expect("preserved memory FTS lookup");
-    assert_eq!(fts_count, 1);
+    .expect("chat snapshot captured");
+    let expected_message: String = sqlx::query_scalar(
+        "SELECT json_object(
+            'id', id, 'chat_id', chat_id, 'sequence', sequence,
+            'author_type', author_type, 'author_id', author_id, 'content', content,
+            'content_guard_json', content_guard_json, 'sensitivity', sensitivity,
+            'status', status, 'outcome', outcome, 'model', model, 'profile_id', profile_id,
+            'session_id', session_id, 'context_manifest_id', context_manifest_id,
+            'token_usage_json', token_usage_json, 'duration_ms', duration_ms, 'error', error,
+            'correlation_id', correlation_id, 'causation_id', causation_id,
+            'handoff_id', handoff_id, 'source_type', source_type, 'source_id', source_id,
+            'source_message_id', source_message_id, 'source_room_id', source_room_id,
+            'source_conversation_id', source_conversation_id,
+            'source_sequence', source_sequence, 'source_metadata_json', source_metadata_json,
+            'created_at', created_at
+         ) FROM agent_chat_message WHERE id = ?",
+    )
+    .bind(message_id)
+    .fetch_one(&pool)
+    .await
+    .expect("chat message snapshot captured");
 
-    for object in [
-        "idx_domain_event_dedupe",
-        "idx_domain_event_scope_sequence",
-        "idx_domain_event_entity_sequence",
-        "idx_domain_event_type_sequence",
-        "idx_agent_context_scope_scope",
-        "agent_context_scope_identity_profile_guard",
-        "agent_context_scope_identity_profile_guard_update",
-        "idx_agent_lcm_timeline_scope",
-        "idx_memory_item_project",
-        "idx_memory_item_task",
-        "idx_memory_item_room",
-        "idx_memory_item_scope",
-        "idx_memory_item_owner",
-        "idx_memory_item_authority",
-        "idx_memory_item_source_scope",
-        "idx_memory_item_created_at",
-        "memory_item_ai",
-        "memory_item_ad",
-        "memory_item_immutable_update",
-        "forge_memory_source_binding_immutable_update",
-        "forge_memory_source_binding_immutable_delete",
-        "context_manifest_immutable_update",
-        "context_manifest_immutable_delete",
-        "context_manifest_source_immutable_update",
-        "context_manifest_source_immutable_delete",
-        "idx_agent_commitment_owner_status",
-        "idx_agent_commitment_scope_status",
-        "idx_agent_commitment_originating_task",
-        "idx_agent_inbox_recipient_status",
-        "idx_agent_inbox_scope",
-        "idx_agent_question_recipient_status",
-        "idx_agent_question_scope_status",
-        "idx_agent_question_inbox_item",
-        "idx_agent_action_scope_status",
-        "idx_agent_action_actor_status",
-        "idx_agent_wake_budget_window_updated",
+    run_migrations_from(&pool, &final_dir)
+        .await
+        .expect("PR13 migrations apply");
+
+    for table in [
+        "agent_chat",
+        "agent_chat_message",
+        "agent_context_scope",
+        "memory_item",
+        "agent_lcm_timeline",
+        "project_charter",
+        "project_milestone",
+        "project_readiness_snapshot",
     ] {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = ?")
-            .bind(object)
-            .fetch_one(&pool)
-            .await
-            .expect("recreated schema object lookup");
-        assert_eq!(
-            count, 1,
-            "schema object {object} should survive scope rebuild"
-        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .expect("table presence query");
+        assert_eq!(count, 0, "legacy table {table} is physically dropped");
     }
 
+    for (source_table, source_identity, expected) in [
+        ("agent_chat", chat_id.as_str(), expected_chat),
+        ("agent_chat_message", message_id, expected_message),
+    ] {
+        let archived: String = sqlx::query_scalar(
+            "SELECT row_json FROM pr13_legacy_record_history
+             WHERE source_table = ? AND source_identity = ?",
+        )
+        .bind(source_table)
+        .bind(source_identity)
+        .fetch_one(&pool)
+        .await
+        .expect("legacy row archived");
+        assert_eq!(archived, expected, "{source_table} snapshot stays exact");
+    }
+    let archived_memory: String = sqlx::query_scalar(
+        "SELECT row_json FROM pr13_legacy_record_history
+         WHERE source_table = 'memory_item' AND json_extract(row_json, '$.id') = ?",
+    )
+    .bind(memory_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy memory archived");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT json_extract(?, '$.body')")
+            .bind(&archived_memory)
+            .fetch_one(&pool)
+            .await
+            .expect("memory body extracted"),
+        "preserve exact body"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT json_extract(?, '$.provenance_json')")
+            .bind(&archived_memory)
+            .fetch_one(&pool)
+            .await
+            .expect("memory provenance extracted"),
+        raw_provenance
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT json_extract(?, '$.metadata_json')")
+            .bind(&archived_memory)
+            .fetch_one(&pool)
+            .await
+            .expect("memory metadata extracted"),
+        raw_metadata
+    );
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&pool)
+        .await
+        .expect("integrity check runs");
+    assert_eq!(integrity, "ok");
     let foreign_key_violations: Vec<(String, i64, String, i64)> =
         sqlx::query_as("PRAGMA foreign_key_check")
             .fetch_all(&pool)
@@ -1508,7 +1233,9 @@ async fn agent_chat_scope_rebuild_preserves_legacy_rows_and_relationships() {
     assert!(foreign_key_violations.is_empty());
 
     let _ = fs::remove_file(db_path);
-    let _ = fs::remove_dir_all(migration_dir);
+    let _ = fs::remove_dir_all(historical_dir);
+    let _ = fs::remove_dir_all(baseline_dir);
+    let _ = fs::remove_dir_all(final_dir);
 }
 
 #[tokio::test]
@@ -1542,7 +1269,6 @@ async fn v114_preserves_legacy_pr_outcomes_without_granting_admission_authority(
             id: project_id.clone(),
             name: "Existing PR migration".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),
@@ -1591,16 +1317,13 @@ async fn v114_preserves_legacy_pr_outcomes_without_granting_admission_authority(
                 project_id: repo_project_id.clone(),
                 repo_id: Some(repo_id.clone()),
                 parent_task_id: None,
-                assignee_type: None,
-                assignee_id: None,
                 title: format!("Task with historical {pr_state} PR"),
                 description: None,
                 task_type: "implementation".to_owned(),
-                status: "todo".to_owned(),
+                lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
                 subtask_order: None,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -1715,7 +1438,6 @@ async fn v114_recovers_v110_terminal_pr_outcome_from_its_exact_result_event() {
             id: project_id.clone(),
             name: "V110 terminal PR recovery".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),
@@ -1747,16 +1469,13 @@ async fn v114_recovers_v110_terminal_pr_outcome_from_its_exact_result_event() {
             project_id,
             repo_id: Some(repo_id),
             parent_task_id: None,
-            assignee_type: None,
-            assignee_id: None,
             title: "V110 PR merge".to_owned(),
             description: None,
             task_type: "implementation".to_owned(),
-            status: "todo".to_owned(),
+            lifecycle_state: db::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,
             subtask_order: None,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -2280,9 +1999,10 @@ async fn singular_agent_chat_migration_merges_threads_and_recovers_turns() {
         .expect("legacy turn job inserts");
     }
 
-    run_migrations(&pool)
+    copy_migrations_up_to(120, &migration_dir);
+    run_migrations_from(&pool, &migration_dir)
         .await
-        .expect("singular Agent Chat migrations apply");
+        .expect("PR11-era Agent Chat history and fences apply through V120");
 
     for table in [
         "room",
@@ -2543,27 +2263,38 @@ async fn merged_chat_id_for(pool: &db::SqlitePool, project_id: &str) -> String {
 }
 
 #[tokio::test]
-async fn singular_agent_chat_empty_database_has_no_synthetic_records() {
+async fn pr13_fresh_database_has_no_legacy_vertical_storage_or_archive_rows() {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
 
-    for (table, predicate) in [
-        ("user", "1 = 1"),
-        ("project", "1 = 1"),
-        ("agent_identity", "1 = 1"),
-        ("agent_profile", "1 = 1"),
-        ("account_main_agent_binding", "1 = 1"),
-        ("project_agent_binding", "1 = 1"),
-        ("agent_chat", "1 = 1"),
-        ("agent_chat_message", "1 = 1"),
-        ("agent_chat_turn_job", "1 = 1"),
-        ("agent_chat_source_ref", "1 = 1"),
+    for table in [
+        "user",
+        "project",
+        "agent_identity",
+        "agent_profile",
+        "account_main_agent_binding",
+        "project_agent_binding",
+        "agent_chat",
+        "agent_chat_message",
+        "agent_chat_turn_job",
+        "agent_chat_source_ref",
+        "memory_item",
+        "project_charter",
+        "project_milestone",
+        "project_readiness_snapshot",
     ] {
-        let sql = format!("SELECT COUNT(*) FROM {table} WHERE {predicate}");
-        let count: i64 = sqlx::query_scalar(&sql)
-            .fetch_one(&pool)
-            .await
-            .expect("empty table lookup");
-        assert_eq!(count, 0, "empty migration must not synthesize {table} rows");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .expect("legacy table presence lookup");
+        assert_eq!(count, 0, "fresh schema must drop legacy table {table}");
     }
+    let legacy_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pr13_legacy_record_history")
+        .fetch_one(&pool)
+        .await
+        .expect("migration-only legacy archive exists");
+    assert_eq!(legacy_rows, 0, "fresh DB has no synthetic legacy history");
 }

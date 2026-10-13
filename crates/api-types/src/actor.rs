@@ -185,15 +185,7 @@ impl fmt::Display for RecoveryAction {
         let value = match self {
             Self::ResumeSession => "resume_session",
             Self::Reexecute => "reexecute",
-            Self::ResetToInitial => "reset_to_initial",
             Self::CancelTask => "cancel_task",
-            Self::MarkReviewed => "mark_reviewed",
-            Self::RetryHook => "retry_hook",
-            Self::ResumeProcess => "resume_process",
-            Self::UpdateWorkspaceAndRetryHook => "update_workspace_and_retry_hook",
-            Self::SkipHookOnce => "skip_hook_once",
-            Self::ProceedOnce => "proceed_once",
-            Self::OpenInteractive => "open_interactive",
         };
         f.write_str(value)
     }
@@ -213,8 +205,8 @@ mod tests {
             "system:task_dispatcher"
         );
         assert_eq!(
-            Actor::user(UserActionSource::Recovery(RecoveryAction::ResumeProcess)).display(),
-            "user:recovery:resume_process"
+            Actor::user(UserActionSource::Recovery(RecoveryAction::Reexecute)).display(),
+            "user:recovery:reexecute"
         );
         assert_eq!(
             Actor::user(UserActionSource::Api).into_override().display(),

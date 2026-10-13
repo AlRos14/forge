@@ -17,11 +17,11 @@ use axum::{
     Router,
 };
 use db::{
-    AgentRepo, AgentStatus, AssigneeKind, CreateAgent, CreateExecution, CreateProject, CreateRepo,
-    CreateTask, CreateTaskRoleAssignment, CreateWorkspace, CreateWorkspaceLease, DaemonRepo,
-    DaemonStatus, Execution, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo,
-    TaskRoleAssignmentRepo, UpsertDaemon, UserRepo, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
-    WorkspaceStatus,
+    AgentRepo, AgentStatus, CreateAgent, CreateExecution, CreateProject, CreateRepo,
+    CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkspace, CreateWorkspaceLease,
+    DaemonRepo, DaemonStatus, Execution, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo,
+    RoleMembershipRepo, RoleMembershipStatus, TaskRepo, TaskRoleRepo, UpsertDaemon, UserRepo,
+    WorkMode, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -463,7 +463,6 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
             id: project_id.clone(),
             name: "Execution Ownership".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: Some(FAKE_DAEMON_USER_ID.to_owned()),
             created_at: now.clone(),
@@ -479,16 +478,13 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
             project_id: project_id.clone(),
             repo_id: None,
             parent_task_id: None,
-            assignee_type: Some("agent".to_owned()),
-            assignee_id: Some(agent_id.clone()),
             title: "Owned execution".to_owned(),
             description: None,
             task_type: "implementation".to_owned(),
-            status: "in_progress".to_owned(),
+            lifecycle_state: db::TaskLifecycleState::Active,
             is_automation: false,
             priority: 0,
             subtask_order: None,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -542,7 +538,6 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: Some(now.clone()),
             summary: None,
@@ -597,7 +592,6 @@ pub async fn seed_startable_execution_for_daemon(
             id: project_id.clone(),
             name: "Execution Start".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: Some(FAKE_DAEMON_USER_ID.to_owned()),
             created_at: now.clone(),
@@ -629,16 +623,13 @@ pub async fn seed_startable_execution_for_daemon(
             project_id: project_id.clone(),
             repo_id: Some(repo_id.clone()),
             parent_task_id: None,
-            assignee_type: Some("agent".to_owned()),
-            assignee_id: Some(agent_id.clone()),
             title: "Start remote execution".to_owned(),
             description: Some(prompt.to_owned()),
             task_type: "implementation".to_owned(),
-            status: "in_progress".to_owned(),
+            lifecycle_state: db::TaskLifecycleState::Active,
             is_automation: false,
             priority: 0,
             subtask_order: None,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -708,7 +699,6 @@ pub async fn seed_startable_execution_for_daemon(
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: Some(now.clone()),
             summary: None,
@@ -795,7 +785,6 @@ pub async fn seed_terminal_task_for_daemon(
             id: project_id.clone(),
             name: "Terminal Ownership".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),
@@ -827,16 +816,13 @@ pub async fn seed_terminal_task_for_daemon(
             project_id,
             repo_id: Some(repo_id.clone()),
             parent_task_id: None,
-            assignee_type: None,
-            assignee_id: None,
             title: "Daemon terminal".to_owned(),
             description: None,
             task_type: "implementation".to_owned(),
-            status: "in_progress".to_owned(),
+            lifecycle_state: db::TaskLifecycleState::Active,
             is_automation: false,
             priority: 0,
             subtask_order: None,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -874,20 +860,34 @@ pub async fn seed_terminal_task_for_daemon(
     )
     .await
     .expect("agent creates");
-    TaskRoleAssignmentRepo::assign(
+    let role = TaskRoleRepo::create(
         &*state.db,
-        CreateTaskRoleAssignment {
+        CreateTaskRole {
             id: uuid::Uuid::new_v4().to_string(),
-            task_id: task_id.clone(),
-            role_name: services::workflow::default_roles::CODER.to_owned(),
-            assignee_type: Some(AssigneeKind::Agent),
-            assignee_id: Some(agent_id),
+            task_id: task_id.to_owned(),
+            role: "implementer".to_owned(),
+            coordination_mode: None,
+            policy_json: "{}".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
     )
     .await
-    .expect("role assignment creates");
+    .expect("implementer TaskRole creates");
+    RoleMembershipRepo::add(
+        &*state.db,
+        CreateRoleMembership {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_role_id: role.id,
+            actor_kind: db::ActorKind::Agent,
+            actor_id: agent_id,
+            status: RoleMembershipStatus::Active,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Agent joins implementer TaskRole");
 
     let workspace_root = state.cleanup_scheduler.workspace_root().to_path_buf();
     std::fs::create_dir_all(&workspace_root).expect("workspace root exists");

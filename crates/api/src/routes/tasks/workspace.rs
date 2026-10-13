@@ -6,19 +6,9 @@ pub async fn get_task_workspace(
     user: AuthenticatedUser,
 ) -> ApiResult<Json<WorkspaceResponse>> {
     require_task_visible(&state, &id, &user).await?;
-    let workspace = WorkspaceRepo::get_by_task_id(&*state.db, &id)
+    let workspace = WorkspaceRepo::get_integration_by_task_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("workspace", id))?;
-    Ok(Json(workspace_response(workspace)))
-}
-
-pub async fn reset_task_workspace(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    user: AuthenticatedUser,
-) -> ApiResult<Json<WorkspaceResponse>> {
-    require_task_mutable(&state, &id, &user).await?;
-    let workspace = state.task_service.reset_task_workspace(&id).await?;
     Ok(Json(workspace_response(workspace)))
 }
 

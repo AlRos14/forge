@@ -1,31 +1,24 @@
 use crate::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, validate_uuid_v4, ActorKind,
-    AgentContextScopeRepo, AgentListQuery, AgentProfileRepo, AgentRepo, AgentSessionRepo,
-    AgentStatus, AgentTaskListQuery, ArchiveTask, ClaimDomainEvents, ClaimOrchestratorWake,
-    ClaimTask, CompareAndMoveTask, CompleteDomainEvent, CoordinationMode, CreateAgent,
-    CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
-    CreateDomainEvent, CreateEvidence, CreateExecution, CreateOrchestratorWake, CreateProject,
-    CreateProjectCharter, CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
-    CreateProjectMember, CreateProviderAuthorizationOperation, CreateRepo, CreateReview,
-    CreateRoleMembership, CreateSkill, CreateTask, CreateTaskRole, CreateTaskRoleAssignment,
-    CreateTerminalSession, CreateValidationRun, CreateValidationRunArtifact, CreateWorkspace,
-    CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo,
-    ExecutionRepo, ExecutionStatus, FinishValidationRun, MemoryAccessQuery, MemoryConfidence,
-    MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant, MemorySourceType,
-    MoveTaskIdentity, MoveTaskPersistence, NotificationListQuery, NotificationRepo,
-    OrchestratorWakeRepo, PageRequest, ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo,
-    ProviderAuthorizationRepo, RepoRepo, ReserveOrchestratorAction, ReviewRepo, ReviewStatus,
-    RoleMembershipRepo, RoleMembershipStatus, RotateAgentSession, ScopedMemoryRepository,
-    SelectAgentProfile, SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskBoardRepo,
-    TaskDependencyRepo, TaskListQuery, TaskRepo, TaskRoleAssignmentRepo, TaskRoleRepo,
-    TerminalSessionRepo, TerminalSessionStatus, UpdateAgent, UpdateExecution, UpdateProject,
-    UpdateProviderAuthorizationOperation, UpdateRepo, UpdateRoleMembership, UpdateSkill,
-    UpdateTask, UpdateTaskRole, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon,
+    AgentListQuery, AgentProfileRepo, AgentRepo, AgentStatus, AgentTaskListQuery,
+    ClaimDomainEvents, ClaimOrchestratorWake, CompleteDomainEvent, CoordinationMode, CreateAgent,
+    CreateAgentIdentity, CreateAgentProfile, CreateDomainEvent, CreateEvidence, CreateExecution,
+    CreateOrchestratorWake, CreateProject, CreateProjectMember,
+    CreateProviderAuthorizationOperation, CreateRepo, CreateRoleMembership, CreateSkill,
+    CreateTask, CreateTaskRole, CreateTerminalSession, CreateValidationRun,
+    CreateValidationRunArtifact, CreateWorkspace, CreateWorkspaceLease, CredentialHandleRepo,
+    DaemonRepo, DaemonStatus, DbError, DomainEventRepo, ExecutionRepo, ExecutionStatus,
+    FinishValidationRun, NotificationListQuery, NotificationRepo, OrchestratorWakeRepo,
+    PageRequest, ProjectMemberRepo, ProjectRepo, ProviderAuthorizationRepo, RepoRepo,
+    ReserveOrchestratorAction, RoleMembershipRepo, RoleMembershipStatus, SelectAgentProfile,
+    SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskDependencyRepo, TaskListQuery, TaskRepo,
+    TaskRoleRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent, UpdateExecution,
+    UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo, UpdateRoleMembership,
+    UpdateSkill, UpdateTask, UpdateTaskRole, UpdateTerminalSessionStatus, UpsertDaemon,
     ValidationRunRepo, ValidationRunStatus, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
     WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::Digest as _;
 use sqlx::Row;
 
@@ -273,216 +266,6 @@ async fn provider_credential_migration_preserves_legacy_handle_defaults() {
 }
 
 #[tokio::test]
-async fn atomic_first_charter_revision_rolls_back_new_ownership_on_failure() {
-    let db = sqlite_db().await;
-    let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO project (id, name, settings, created_at, updated_at)
-         VALUES (?, ?, '{}', ?, ?)",
-    )
-    .bind("charter-rollback-project")
-    .bind("Charter rollback project")
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("project fixture inserts");
-
-    let result = ProjectOrchestrationRepo::create_project_charter_revision_atomically(
-        &db,
-        CreateProjectCharterRevisionAtomically {
-            project_id: Some("charter-rollback-project".to_owned()),
-            genesis_session_id: None,
-            account_id: "test-user-id".to_owned(),
-            charter: CreateProjectCharter {
-                id: "charter-rollback".to_owned(),
-                account_id: "test-user-id".to_owned(),
-                genesis_session_id: None,
-                project_mode: "compact".to_owned(),
-                maturity: "mvp".to_owned(),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-            revision: CreateProjectCharterRevision {
-                id: "charter-rollback-revision".to_owned(),
-                charter_id: "charter-rollback".to_owned(),
-                expected_charter_version: 1,
-                project_mode: "compact".to_owned(),
-                maturity: "mvp".to_owned(),
-                base_revision: 0,
-                base_revision_id: None,
-                lifecycle: "proposed".to_owned(),
-                schema_version: "forge.project-charter/v1".to_owned(),
-                render_version: "forge.project-charter-render/v1".to_owned(),
-                content_json: "not-json".to_owned(),
-                rendered_view: "invalid".to_owned(),
-                change_summary: "rollback fixture".to_owned(),
-                author_type: "user".to_owned(),
-                author_id: Some("test-user-id".to_owned()),
-                source_message_id: None,
-                source_turn_job_id: None,
-                source_refs_json: "[]".to_owned(),
-                content_digest: "content-digest".to_owned(),
-                rendered_digest: "rendered-digest".to_owned(),
-                created_at: now,
-            },
-        },
-    )
-    .await;
-    assert!(result.is_err());
-
-    let charter_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM project_charter WHERE id = 'charter-rollback'")
-            .fetch_one(db.pool())
-            .await
-            .expect("charter count queries");
-    let revision_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM project_charter_revision
-         WHERE charter_id = 'charter-rollback'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .expect("revision count queries");
-    assert_eq!(charter_count, 0);
-    assert_eq!(revision_count, 0);
-}
-
-#[tokio::test]
-async fn project_delete_tears_down_charter_and_immutable_milestone_rows() {
-    let migration_dir = tempfile::tempdir().expect("migration directory creates");
-    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    for entry in std::fs::read_dir(&source_dir).expect("migration source reads") {
-        let path = entry.expect("migration entry reads").path();
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("migration filename is UTF-8");
-        let version = filename
-            .strip_prefix('V')
-            .and_then(|version| version.split_once("__"))
-            .and_then(|(version, _)| version.parse::<i64>().ok())
-            .expect("migration name has a version");
-        if version <= 117 {
-            std::fs::copy(&path, migration_dir.path().join(filename))
-                .expect("pre-cutover migration copies");
-        }
-    }
-    let pool = create_sqlite_pool("sqlite::memory:")
-        .await
-        .expect("pool creates");
-    crate::run_migrations_from(&pool, migration_dir.path())
-        .await
-        .expect("database migrates through V117");
-    let db = SqliteDb::new(pool);
-    let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO user (id, email, password_hash, created_at, updated_at)
-         VALUES ('delete-user', 'delete@example.test', 'test', ?, ?)",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("user fixture");
-    let project_id = seed_project(&db, "Charter teardown", Some("delete-user".to_owned())).await;
-    sqlx::query(
-        "INSERT INTO project_charter
-         (id, account_id, project_id, project_mode, maturity, lifecycle, created_at, updated_at)
-         VALUES ('delete-charter', 'delete-user', ?, 'standard', 'mvp', 'attached', ?, ?)",
-    )
-    .bind(&project_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("charter fixture");
-    sqlx::query(
-        "INSERT INTO project_charter_revision
-         (id, charter_id, revision, lifecycle, schema_version, render_version,
-          content_json, rendered_view, author_type, author_id, content_digest,
-          rendered_digest, created_at)
-         VALUES ('delete-charter-r1', 'delete-charter', 1, 'approved', 'test', 'test',
-                 '{}', 'charter', 'user', 'delete-user', 'content', 'rendered', ?)",
-    )
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("charter revision fixture");
-    sqlx::query(
-        "INSERT INTO project_milestone
-         (id, project_id, milestone_sequence, milestone_key, lifecycle, created_at, updated_at)
-         VALUES ('delete-milestone', ?, 1, 'M001', 'planned', ?, ?)",
-    )
-    .bind(&project_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("milestone fixture");
-    sqlx::query(
-        "INSERT INTO project_milestone_revision
-         (id, milestone_id, revision, base_revision, lifecycle, outcome,
-          included_scope_json, excluded_scope_json, document_revisions_json,
-          task_selection_json, dependencies_json, risks_json, acceptance_checks_json,
-          evidence_requirements_json, known_issues_json, change_summary, schema_version,
-          render_version, rendered_view, content_digest, rendered_digest,
-          author_type, source_refs_json, created_at)
-         VALUES ('delete-milestone-r1', 'delete-milestone', 1, 0, 'approved', 'outcome',
-                 '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '',
-                 'test', 'test', 'milestone', 'content', 'rendered', 'user', '[]', ?)",
-    )
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("milestone revision fixture");
-
-    for entry in std::fs::read_dir(&source_dir).expect("migration source reads") {
-        let path = entry.expect("migration entry reads").path();
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("migration filename is UTF-8");
-        let version = filename
-            .strip_prefix('V')
-            .and_then(|version| version.split_once("__"))
-            .and_then(|(version, _)| version.parse::<i64>().ok())
-            .expect("migration name has a version");
-        if version <= 119 {
-            std::fs::copy(&path, migration_dir.path().join(filename))
-                .expect("cutover migrations copy");
-        }
-    }
-    crate::run_migrations_from(db.pool(), migration_dir.path())
-        .await
-        .expect("historical fixture migrates through V119");
-
-    assert!(
-        sqlx::query("DELETE FROM project_milestone_revision WHERE id = 'delete-milestone-r1'")
-            .execute(db.pool())
-            .await
-            .is_err()
-    );
-    ProjectRepo::delete(&db, &project_id)
-        .await
-        .expect("guarded Project teardown succeeds");
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project WHERE id = ?")
-            .bind(&project_id)
-            .fetch_one(db.pool())
-            .await
-            .expect("project count"),
-        0
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project_deletion_guard")
-            .fetch_one(db.pool())
-            .await
-            .expect("guard count"),
-        0
-    );
-}
-
-#[tokio::test]
 async fn cli_agent_creation_gets_scope_bounded_permission_layers() {
     let pool = create_sqlite_pool("sqlite::memory:")
         .await
@@ -534,6 +317,21 @@ async fn cli_agent_creation_gets_scope_bounded_permission_layers() {
         assert!(permissions.iter().any(|value| value == "propose_task"));
         assert!(permissions.iter().any(|value| value == "task_write"));
         assert!(!permissions.iter().any(|value| value == "approve_actions"));
+        for retired in [
+            "read_agent_chat",
+            "read_memory",
+            "propose_discovery",
+            "propose_project",
+            "propose_handoff",
+            "propose_message",
+            "propose_review",
+            "propose_commitment",
+            "propose_memory",
+            "propose_decision",
+            "propose_session",
+        ] {
+            assert!(!permissions.iter().any(|value| value == retired));
+        }
     }
 }
 
@@ -576,7 +374,6 @@ async fn seed_project_repo_agent(db: &SqliteDb) -> (String, String, String) {
             id: project_id.clone(),
             name: "Forge".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_string(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),
@@ -657,7 +454,6 @@ async fn seed_project(db: &SqliteDb, name: &str, owner_id: Option<String>) -> St
             id: project_id.clone(),
             name: name.to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id,
             created_at: now.clone(),
@@ -667,505 +463,6 @@ async fn seed_project(db: &SqliteDb, name: &str, owner_id: Option<String>) -> St
     .await
     .expect("project creates");
     project_id
-}
-
-fn memory_item(project_id: &str, title: &str, body: &str) -> MemoryItem {
-    MemoryItem {
-        row_id: 0,
-        id: new_uuid_v4(),
-        project_id: Some(project_id.to_owned()),
-        task_id: None,
-        execution_id: None,
-        scope_type: "project".to_owned(),
-        scope_id: project_id.to_owned(),
-        visibility: "project".to_owned(),
-        owner_identity_id: None,
-        authority: "observation".to_owned(),
-        sensitivity: "internal".to_owned(),
-        retention_priority: 10,
-        provenance_json: "{}".to_owned(),
-        publication_source_id: None,
-        supersedes_id: None,
-        valid_from: None,
-        valid_until: None,
-        source_event_id: None,
-        source_scope_type: Some("project".to_owned()),
-        source_scope_id: Some(project_id.to_owned()),
-        source_revision: None,
-        source_type: MemorySourceType::Comment.to_string(),
-        kind: MemoryKind::Observation.to_string(),
-        title: title.to_owned(),
-        summary: None,
-        body: body.to_owned(),
-        metadata_json: "{}".to_owned(),
-        confidence: Some(MemoryConfidence::Confirmed.to_string()),
-        quality_score: None,
-        created_by_type: None,
-        created_by_id: None,
-        created_at: now_rfc3339(),
-    }
-}
-
-fn memory_cursor(item: &MemoryItem) -> String {
-    URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&serde_json::json!({
-            "created_at": &item.created_at,
-            "id": &item.id,
-        }))
-        .expect("memory cursor serializes"),
-    )
-}
-
-#[tokio::test]
-async fn test_memory_insert_and_fts_search() {
-    let db = sqlite_db().await;
-    let project_id = seed_project(&db, "Memory search", None).await;
-    let item = memory_item(
-        &project_id,
-        "Lantern handoff",
-        "The execution found a durable lantern clue.",
-    );
-    MemoryRepository::insert_memory_item(&db, &item)
-        .await
-        .expect("memory item inserts");
-
-    let (items, has_more) =
-        MemoryRepository::search_memory_items(&db, &project_id, "lantern", 10, None)
-            .await
-            .expect("memory search succeeds");
-
-    assert!(!has_more);
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].id, item.id);
-    assert!(items[0].row_id > 0);
-}
-
-#[tokio::test]
-async fn test_memory_search_escapes_fts_query_syntax() {
-    let db = sqlite_db().await;
-    let project_id = seed_project(&db, "Memory punctuation search", None).await;
-    let item = memory_item(
-        &project_id,
-        "Punctuation handoff",
-        "A user's note says can't reproduce foo or AND yet.",
-    );
-    MemoryRepository::insert_memory_item(&db, &item)
-        .await
-        .expect("memory item inserts");
-
-    let (apostrophe_items, apostrophe_has_more) =
-        MemoryRepository::search_memory_items(&db, &project_id, "can't", 10, None)
-            .await
-            .expect("apostrophe search succeeds");
-    let (operator_items, operator_has_more) =
-        MemoryRepository::search_memory_items(&db, &project_id, "foo or AND", 10, None)
-            .await
-            .expect("operator-looking search succeeds");
-
-    assert!(!apostrophe_has_more);
-    assert_eq!(apostrophe_items.len(), 1);
-    assert_eq!(apostrophe_items[0].id, item.id);
-    assert!(!operator_has_more);
-    assert_eq!(operator_items.len(), 1);
-    assert_eq!(operator_items[0].id, item.id);
-}
-
-#[tokio::test]
-async fn test_memory_search_cursor_uses_same_order_as_results() {
-    let db = sqlite_db().await;
-    let project_id = seed_project(&db, "Memory pagination", None).await;
-    let mut oldest = memory_item(
-        &project_id,
-        "Pager oldest",
-        "pagerneedle pagerneedle pagerneedle pagerneedle",
-    );
-    oldest.created_at = "2026-06-08T00:00:00Z".to_owned();
-    oldest.id = "00000000-0000-4000-8000-000000000001".to_owned();
-    let mut middle = memory_item(&project_id, "Pager middle", "pagerneedle");
-    middle.created_at = "2026-06-08T00:00:01Z".to_owned();
-    middle.id = "00000000-0000-4000-8000-000000000002".to_owned();
-    let mut newest = memory_item(&project_id, "Pager newest", "pagerneedle");
-    newest.created_at = "2026-06-08T00:00:02Z".to_owned();
-    newest.id = "00000000-0000-4000-8000-000000000003".to_owned();
-
-    for item in [&oldest, &middle, &newest] {
-        MemoryRepository::insert_memory_item(&db, item)
-            .await
-            .expect("memory item inserts");
-    }
-
-    let (page_one, page_one_has_more) =
-        MemoryRepository::search_memory_items(&db, &project_id, "pagerneedle", 1, None)
-            .await
-            .expect("first page succeeds");
-    assert!(page_one_has_more);
-    assert_eq!(page_one[0].id, newest.id);
-
-    let (page_two, page_two_has_more) = MemoryRepository::search_memory_items(
-        &db,
-        &project_id,
-        "pagerneedle",
-        1,
-        Some(memory_cursor(&page_one[0])),
-    )
-    .await
-    .expect("second page succeeds");
-    assert!(page_two_has_more);
-    assert_eq!(page_two[0].id, middle.id);
-    assert_ne!(page_two[0].id, page_one[0].id);
-
-    let (page_three, page_three_has_more) = MemoryRepository::search_memory_items(
-        &db,
-        &project_id,
-        "pagerneedle",
-        1,
-        Some(memory_cursor(&page_two[0])),
-    )
-    .await
-    .expect("third page succeeds");
-    assert!(!page_three_has_more);
-    assert_eq!(page_three[0].id, oldest.id);
-}
-
-#[tokio::test]
-async fn test_memory_source_exists_uses_source_ref_field() {
-    let db = sqlite_db().await;
-    let project_id = seed_project(&db, "Memory source exists", None).await;
-    let mut item = memory_item(&project_id, "Source ref", "source ref body");
-    item.source_type = MemorySourceType::Review.to_string();
-    item.metadata_json = serde_json::json!({
-        "source_ref": "review-1",
-        "extra": true,
-    })
-    .to_string();
-    MemoryRepository::insert_memory_item(&db, &item)
-        .await
-        .expect("memory item inserts");
-
-    assert!(MemoryRepository::memory_source_exists(
-        &db,
-        &project_id,
-        &MemorySourceType::Review.to_string(),
-        "review-1"
-    )
-    .await
-    .expect("source exists check succeeds"));
-}
-
-#[tokio::test]
-async fn test_memory_source_exists_with_confidence_filters_source_ref_and_confidence() {
-    let db = sqlite_db().await;
-    let project_id = seed_project(&db, "Memory source confidence exists", None).await;
-    let mut item = memory_item(&project_id, "Source ref", "source ref body");
-    item.source_type = MemorySourceType::Review.to_string();
-    item.metadata_json = serde_json::json!({
-        "source_ref": "review-1",
-        "extra": true,
-    })
-    .to_string();
-    item.confidence = Some(MemoryConfidence::Partial.to_string());
-    MemoryRepository::insert_memory_item(&db, &item)
-        .await
-        .expect("memory item inserts");
-
-    assert!(MemoryRepository::memory_source_exists_with_confidence(
-        &db,
-        &project_id,
-        &MemorySourceType::Review.to_string(),
-        "review-1",
-        &MemoryConfidence::Partial.to_string()
-    )
-    .await
-    .expect("source confidence check succeeds"));
-    assert!(!MemoryRepository::memory_source_exists_with_confidence(
-        &db,
-        &project_id,
-        &MemorySourceType::Review.to_string(),
-        "review-1",
-        &MemoryConfidence::Confirmed.to_string()
-    )
-    .await
-    .expect("source confidence check succeeds"));
-}
-
-#[tokio::test]
-async fn test_memory_project_isolation() {
-    let db = sqlite_db().await;
-    let project_a = seed_project(&db, "Memory A", None).await;
-    let project_b = seed_project(&db, "Memory B", None).await;
-    let item_a = memory_item(&project_a, "Shared needle A", "sharedneedle belongs to A");
-    let item_b = memory_item(&project_b, "Shared needle B", "sharedneedle belongs to B");
-    MemoryRepository::insert_memory_item(&db, &item_a)
-        .await
-        .expect("project A memory inserts");
-    MemoryRepository::insert_memory_item(&db, &item_b)
-        .await
-        .expect("project B memory inserts");
-
-    let (items, has_more) =
-        MemoryRepository::search_memory_items(&db, &project_a, "sharedneedle", 10, None)
-            .await
-            .expect("project-scoped memory search succeeds");
-
-    assert!(!has_more);
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].project_id.as_deref(), Some(project_a.as_str()));
-    assert_eq!(items[0].id, item_a.id);
-}
-
-#[tokio::test]
-async fn test_scoped_memory_search_is_acl_first_and_bounded() {
-    let db = sqlite_db().await;
-    let project_a = seed_project(&db, "Scoped memory A", None).await;
-    let project_b = seed_project(&db, "Scoped memory B", None).await;
-    let mut private = memory_item(&project_a, "Private marker", "private-sharedneedle");
-    private.visibility = "private".to_owned();
-    private.metadata_json = serde_json::json!({"source_ref": "private-1"}).to_string();
-    let project = memory_item(&project_a, "Project marker", "project-sharedneedle");
-    let other = memory_item(&project_b, "Other marker", "sharedneedle");
-    for item in [&private, &project, &other] {
-        MemoryRepository::insert_memory_item(&db, item)
-            .await
-            .expect("scoped memory inserts");
-    }
-
-    let grant = MemoryScopeGrant {
-        scope_type: "project".to_owned(),
-        scope_id: project_a.clone(),
-        visibility: vec!["project".to_owned()],
-        identity_id: Some("identity-b".to_owned()),
-    };
-    let (items, has_more) = ScopedMemoryRepository::search_memory_items_scoped(
-        &db,
-        MemoryAccessQuery {
-            identity_id: Some("identity-b".to_owned()),
-            grants: vec![grant.clone()],
-            query: "sharedneedle".to_owned(),
-            limit: 1,
-            cursor: None,
-            include_retracted: false,
-        },
-    )
-    .await
-    .expect("scoped search succeeds");
-    assert!(!has_more);
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].id, project.id);
-    assert_ne!(items[0].id, private.id);
-    assert_ne!(items[0].id, other.id);
-
-    let private_grant = MemoryScopeGrant {
-        scope_type: "project".to_owned(),
-        scope_id: project_a,
-        visibility: vec!["project".to_owned()],
-        identity_id: Some("identity-b".to_owned()),
-    };
-    let hidden = ScopedMemoryRepository::get_memory_item_scoped(
-        &db,
-        MemoryGetQuery {
-            id: private.id,
-            identity_id: Some("identity-b".to_owned()),
-            grants: vec![private_grant],
-            include_retracted: false,
-        },
-    )
-    .await
-    .expect("scoped get succeeds");
-    assert!(hidden.is_none());
-}
-
-#[tokio::test]
-async fn test_scoped_memory_lifecycle_excludes_retracted_and_keeps_audit() {
-    let db = sqlite_db().await;
-    let project_id = seed_project(&db, "Scoped lifecycle", None).await;
-    let item = memory_item(&project_id, "Lifecycle marker", "lifecycle-sharedneedle");
-    MemoryRepository::insert_memory_item(&db, &item)
-        .await
-        .expect("lifecycle item inserts");
-    ScopedMemoryRepository::insert_memory_lifecycle_assertion(
-        &db,
-        crate::CreateMemoryLifecycleAssertion {
-            id: new_uuid_v4(),
-            memory_item_id: item.id.clone(),
-            assertion_type: "retracted".to_owned(),
-            related_memory_id: None,
-            reason: Some("invalidated by evidence".to_owned()),
-            evidence_json: "{\"ticket\":\"e-1\"}".to_owned(),
-            asserted_by_type: "user".to_owned(),
-            asserted_by_id: Some("user-1".to_owned()),
-            source_event_id: None,
-            created_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("lifecycle assertion inserts");
-    let grant = MemoryScopeGrant {
-        scope_type: "project".to_owned(),
-        scope_id: project_id,
-        visibility: vec!["project".to_owned()],
-        identity_id: None,
-    };
-    let (items, _) = ScopedMemoryRepository::search_memory_items_scoped(
-        &db,
-        MemoryAccessQuery {
-            identity_id: None,
-            grants: vec![grant],
-            query: "sharedneedle".to_owned(),
-            limit: 10,
-            cursor: None,
-            include_retracted: false,
-        },
-    )
-    .await
-    .expect("lifecycle search succeeds");
-    assert!(items.is_empty());
-    let assertions = ScopedMemoryRepository::list_memory_lifecycle_assertions(&db, &item.id)
-        .await
-        .expect("lifecycle audit loads");
-    assert_eq!(assertions.len(), 1);
-    assert_eq!(assertions[0].assertion_type, "retracted");
-}
-
-#[tokio::test]
-async fn test_scoped_memory_cursor_replays_ranked_pages() {
-    let db = sqlite_db().await;
-    let project_id = seed_project(&db, "Scoped pagination", None).await;
-    let mut first = memory_item(&project_id, "First ranked", "ranked-sharedneedle");
-    first.id = "00000000-0000-4000-8000-000000000011".to_owned();
-    first.created_at = "2026-08-12T00:00:01Z".to_owned();
-    let mut second = memory_item(&project_id, "Second ranked", "ranked-sharedneedle");
-    second.id = "00000000-0000-4000-8000-000000000012".to_owned();
-    second.created_at = "2026-08-12T00:00:02Z".to_owned();
-    for item in [&first, &second] {
-        MemoryRepository::insert_memory_item(&db, item)
-            .await
-            .expect("ranked memory inserts");
-    }
-    let grant = MemoryScopeGrant {
-        scope_type: "project".to_owned(),
-        scope_id: project_id,
-        visibility: vec!["project".to_owned()],
-        identity_id: None,
-    };
-    let (page_one, more) = ScopedMemoryRepository::search_memory_items_scoped(
-        &db,
-        MemoryAccessQuery {
-            identity_id: None,
-            grants: vec![grant.clone()],
-            query: "sharedneedle".to_owned(),
-            limit: 1,
-            cursor: None,
-            include_retracted: false,
-        },
-    )
-    .await
-    .expect("first scoped page succeeds");
-    assert!(more);
-    let cursor = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&serde_json::json!({
-            "rank": page_one[0].retention_priority + 100,
-            "created_at": page_one[0].created_at,
-            "id": page_one[0].id,
-        }))
-        .expect("scoped cursor serializes"),
-    );
-    let (page_two, more) = ScopedMemoryRepository::search_memory_items_scoped(
-        &db,
-        MemoryAccessQuery {
-            identity_id: None,
-            grants: vec![grant],
-            query: "sharedneedle".to_owned(),
-            limit: 1,
-            cursor: Some(cursor),
-            include_retracted: false,
-        },
-    )
-    .await
-    .expect("second scoped page succeeds");
-    assert!(!more);
-    assert_eq!(page_two.len(), 1);
-    assert_ne!(page_one[0].id, page_two[0].id);
-}
-
-#[tokio::test]
-async fn test_memory_cascade_delete() {
-    let db = sqlite_db().await;
-    let project_id = seed_project(&db, "Memory cascade", None).await;
-    let item = memory_item(
-        &project_id,
-        "Cascade marker",
-        "cascadeneedle should disappear from memory FTS",
-    );
-    MemoryRepository::insert_memory_item(&db, &item)
-        .await
-        .expect("memory item inserts");
-
-    ProjectRepo::delete(&db, &project_id)
-        .await
-        .expect("project deletes");
-
-    let loaded = MemoryRepository::get_memory_item(&db, &item.id)
-        .await
-        .expect("memory item lookup succeeds");
-    assert!(loaded.is_none());
-    let fts_count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM memory_item_fts WHERE memory_item_fts MATCH ?",
-    )
-    .bind("cascadeneedle")
-    .fetch_one(db.pool())
-    .await
-    .expect("memory fts count succeeds");
-    assert_eq!(fts_count, 0);
-}
-
-#[test]
-fn test_memory_no_update_path() {
-    fn assert_append_only_repository<T: MemoryRepository + ?Sized>() {}
-
-    assert_append_only_repository::<SqliteDb>();
-    // MemoryRepository intentionally exposes insert/get/search/list only; there is no update method.
-}
-
-#[test]
-fn test_memory_enum_round_trips() {
-    let kinds = [
-        MemoryKind::Observation,
-        MemoryKind::Decision,
-        MemoryKind::Handoff,
-        MemoryKind::Failure,
-        MemoryKind::ReviewResult,
-        MemoryKind::ExecutionSummary,
-        MemoryKind::Comment,
-        MemoryKind::Transition,
-        MemoryKind::Artifact,
-        MemoryKind::Lesson,
-        MemoryKind::ContextPack,
-    ];
-    for kind in kinds {
-        let value = kind.to_string();
-        assert_eq!(value.parse::<MemoryKind>().unwrap(), kind);
-    }
-
-    let source_types = [
-        MemorySourceType::Execution,
-        MemorySourceType::Review,
-        MemorySourceType::Comment,
-        MemorySourceType::Transition,
-    ];
-    for source_type in source_types {
-        let value = source_type.to_string();
-        assert_eq!(value.parse::<MemorySourceType>().unwrap(), source_type);
-    }
-
-    let confidences = [
-        MemoryConfidence::Confirmed,
-        MemoryConfidence::Partial,
-        MemoryConfidence::Unconfirmed,
-    ];
-    for confidence in confidences {
-        let value = confidence.to_string();
-        assert_eq!(value.parse::<MemoryConfidence>().unwrap(), confidence);
-    }
 }
 
 async fn seed_agent(
@@ -1207,95 +504,6 @@ async fn seed_agent(
     .await
     .expect("agent creates");
     agent_id
-}
-
-#[tokio::test]
-async fn test_agent_session_rotation_is_atomic_and_preserves_lineage() {
-    let db = sqlite_db().await;
-    let identity_id = seed_agent(&db, "rotating agent", "account", None).await;
-    let identity = AgentRepo::get_by_id(&db, &identity_id)
-        .await
-        .expect("identity lookup succeeds")
-        .expect("identity exists");
-    let now = now_rfc3339();
-    let scope = AgentContextScopeRepo::create_context_scope(
-        &db,
-        CreateAgentContextScope {
-            id: new_uuid_v4(),
-            identity_id: identity_id.clone(),
-            scope_type: "account".to_owned(),
-            scope_id: "account-owner".to_owned(),
-            project_id: None,
-            task_id: None,
-            task_role: None,
-            workspace_access: "deny".to_owned(),
-            authority_json: "{}".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("account scope creates");
-    let original_id = new_uuid_v4();
-    let original = AgentSessionRepo::create_agent_session(
-        &db,
-        CreateAgentSession {
-            id: original_id.clone(),
-            identity_id: identity_id.clone(),
-            profile_id: identity.profile_id.clone(),
-            context_scope_id: scope.id.clone(),
-            backend_kind: "cli".to_owned(),
-            runtime_session_id: Some("runtime-original".to_owned()),
-            status: "ready".to_owned(),
-            capabilities_json: "{}".to_owned(),
-            connection_status: "healthy".to_owned(),
-            predecessor_session_id: None,
-            last_activity_at: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("original session creates");
-    let replacement_id = new_uuid_v4();
-    let replacement = AgentSessionRepo::rotate_agent_session(
-        &db,
-        RotateAgentSession {
-            previous_session_id: original.id.clone(),
-            expected_version: original.version,
-            replacement: CreateAgentSession {
-                id: replacement_id.clone(),
-                identity_id,
-                profile_id: identity.profile_id,
-                context_scope_id: scope.id,
-                backend_kind: "cli".to_owned(),
-                runtime_session_id: Some("runtime-replacement".to_owned()),
-                status: "ready".to_owned(),
-                capabilities_json: "{}".to_owned(),
-                connection_status: "healthy".to_owned(),
-                predecessor_session_id: Some(original_id.clone()),
-                last_activity_at: None,
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        },
-    )
-    .await
-    .expect("session rotates");
-    assert_eq!(replacement.id, replacement_id);
-    assert_eq!(
-        replacement.predecessor_session_id.as_deref(),
-        Some(original_id.as_str())
-    );
-    let replaced = AgentSessionRepo::get_agent_session(&db, &original_id)
-        .await
-        .expect("original session loads")
-        .expect("original session remains");
-    assert_eq!(replaced.status, "replaced");
-    assert_eq!(
-        replaced.replaced_by_session_id.as_deref(),
-        Some(replacement_id.as_str())
-    );
 }
 
 #[tokio::test]
@@ -1371,15 +579,22 @@ async fn seed_task(
             repo_id: Some(repo_id.to_owned()),
             parent_task_id: None,
             subtask_order: None,
-            assignee_type: None,
-            assignee_id: None,
             title: title.to_owned(),
             description: None,
             task_type: "implementation".to_owned(),
-            status,
+            lifecycle_state: match status.as_str() {
+                "backlog" => crate::TaskLifecycleState::Backlog,
+                "todo" | "ready" => crate::TaskLifecycleState::Ready,
+                "planning" | "in_progress" | "working" => crate::TaskLifecycleState::Active,
+                "blocked" | "review" | "merge_failed" | "merging" => {
+                    crate::TaskLifecycleState::Blocked
+                }
+                "done" => crate::TaskLifecycleState::Done,
+                "cancelled" => crate::TaskLifecycleState::Cancelled,
+                other => panic!("unsupported lifecycle test state: {other}"),
+            },
             is_automation: false,
             priority: 0,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1388,20 +603,35 @@ async fn seed_task(
     .await
     .expect("task creates");
     if let Some(agent_id) = agent_id {
-        TaskRoleAssignmentRepo::assign(
+        let task_role_id = new_uuid_v4();
+        TaskRoleRepo::create(
             db,
-            CreateTaskRoleAssignment {
-                id: new_uuid_v4(),
+            CreateTaskRole {
+                id: task_role_id.clone(),
                 task_id: task_id.clone(),
-                role_name: "coder".to_owned(),
-                assignee_type: Some(crate::AssigneeKind::Agent),
-                assignee_id: Some(agent_id.to_owned()),
+                role: "implementer".to_owned(),
+                coordination_mode: None,
+                policy_json: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("TaskRole creates");
+        RoleMembershipRepo::add(
+            db,
+            CreateRoleMembership {
+                id: new_uuid_v4(),
+                task_role_id,
+                actor_kind: ActorKind::Agent,
+                actor_id: agent_id.to_owned(),
+                status: RoleMembershipStatus::Active,
                 created_at: now.clone(),
                 updated_at: now,
             },
         )
         .await
-        .expect("role assignment creates");
+        .expect("role membership creates");
     }
     task_id
 }
@@ -1443,21 +673,48 @@ async fn seed_pr8_human_reviewer_role(
     (role.id, membership.id)
 }
 
-async fn seed_pr8_legacy_human_reviewer_assignment(db: &SqliteDb, task_id: &str, user_id: &str) {
+async fn seed_agent_task_role_member(
+    db: &SqliteDb,
+    task_id: &str,
+    role_name: &str,
+    agent_id: &str,
+) {
     let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO task_role_assignment
-         (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
-         VALUES (?, ?, 'reviewer', 'user', ?, ?, ?)",
+    let role_name = crate::canonical_task_role_name(role_name).expect("canonical TaskRole");
+    let role = match TaskRoleRepo::get_by_task_and_role(db, task_id, &role_name)
+        .await
+        .expect("TaskRole lookup succeeds")
+    {
+        Some(role) => role,
+        None => TaskRoleRepo::create(
+            db,
+            CreateTaskRole {
+                id: new_uuid_v4(),
+                task_id: task_id.to_owned(),
+                role: role_name,
+                coordination_mode: None,
+                policy_json: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("TaskRole creates"),
+    };
+    RoleMembershipRepo::add(
+        db,
+        CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id: role.id,
+            actor_kind: ActorKind::Agent,
+            actor_id: agent_id.to_owned(),
+            status: RoleMembershipStatus::Active,
+            created_at: now.clone(),
+            updated_at: now,
+        },
     )
-    .bind(new_uuid_v4())
-    .bind(task_id)
-    .bind(user_id)
-    .bind(now.clone())
-    .bind(now)
-    .execute(db.pool())
     .await
-    .expect("legacy Human reviewer assignment creates");
+    .expect("Agent RoleMembership creates");
 }
 
 fn pr8_human_review_start_inputs(
@@ -1488,7 +745,6 @@ fn pr8_human_review_start_inputs(
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -1820,7 +1076,6 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             harness_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
@@ -1895,7 +1150,7 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            agent_session_id: None,
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -2134,7 +1389,6 @@ async fn pr6_wake_admission_is_deduplicated_and_lease_expiry_is_retryable() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             harness_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
@@ -2238,15 +1492,12 @@ async fn pr6_cross_task_event_cannot_admit_an_orchestrator_wake() {
             repo_id: source_task.repo_id,
             parent_task_id: None,
             subtask_order: None,
-            assignee_type: None,
-            assignee_id: None,
             title: "Different Task scope".to_owned(),
             description: None,
             task_type: "implementation".to_owned(),
-            status: "todo".to_owned(),
+            lifecycle_state: crate::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,
-            task_state_config: None,
             merge_config: None,
             created_at: now_rfc3339(),
             updated_at: now_rfc3339(),
@@ -2496,7 +1747,6 @@ async fn pr6_action_reservation_reuses_one_uuid_and_rejects_changed_replay() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             harness_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
@@ -2541,7 +1791,7 @@ async fn pr6_action_reservation_reuses_one_uuid_and_rejects_changed_replay() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            agent_session_id: None,
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some(Some(r#"{"actions":[]}"#.to_owned())),
@@ -2639,17 +1889,9 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
         "Long-running repository task",
     )
     .await;
-    sqlx::query(
-        "UPDATE task SET assignee_type = 'agent', assignee_id = ?, version = version + 1 WHERE id = ?",
-    )
-    .bind(&agent_id)
-    .bind(&task_id)
-    .execute(db.pool())
-    .await
-    .expect("seed the legacy task fallback assignment");
     let task = TaskRepo::get_by_id(&db, &task_id, true)
         .await
-        .expect("task lookup after assignment")
+        .expect("task lookup after target membership seeding")
         .expect("task exists after assignment");
     let now = chrono::Utc::now();
     let execution = ExecutionRepo::create(
@@ -2658,17 +1900,16 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
             id: new_uuid_v4(),
             task_id: task_id.clone(),
             agent_id: Some(agent_id.clone()),
-            actor_ref: None,
-            purpose: None,
+            actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
+            purpose: Some(crate::ExecutionPurpose::General),
             harness_session_id: None,
-            role: "coder".to_owned(),
+            role: "implementer".to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: Some(now.to_rfc3339()),
             summary: None,
@@ -2782,14 +2023,8 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
     .expect("authority change is skipped instead of poisoning the heartbeat pass");
     assert!(rejected.is_empty());
 
-    // Removing the stale singleton projection does not restore authority: the
-    // replacement TaskRole remains authoritative even when it has no current
-    // eligible Agent membership.
-    sqlx::query("DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = 'coder'")
-        .bind(&renewed[0].task_id)
-        .execute(db.pool())
-        .await
-        .expect("remove explicit role assignment");
+    // Ending the exact membership is sufficient to revoke authority; there is
+    // no singleton assignment row that can restore it.
     let fallback_renewal = WorkspaceLeaseRepo::renew_active(
         &db,
         &(now + chrono::Duration::seconds(3)).to_rfc3339(),
@@ -2806,7 +2041,6 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
 async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
     let db = sqlite_db().await;
     let (project_id, repo_id, role_agent_id) = seed_project_repo_agent(&db).await;
-    let stale_legacy_agent_id = seed_agent(&db, "stale interactive assignee", "global", None).await;
     let task_id = seed_task(
         &db,
         &project_id,
@@ -2816,14 +2050,6 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
         "Interactive TaskRole lease",
     )
     .await;
-    sqlx::query(
-        "UPDATE task SET assignee_type = 'agent', assignee_id = ?, version = version + 1 WHERE id = ?",
-    )
-    .bind(&stale_legacy_agent_id)
-    .bind(&task_id)
-    .execute(db.pool())
-    .await
-    .expect("legacy singleton assignment creates");
     let task = TaskRepo::get_by_id(&db, &task_id, true)
         .await
         .expect("task loads")
@@ -2874,7 +2100,6 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: Some(now.to_rfc3339()),
             summary: None,
@@ -2931,15 +2156,6 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
     )
     .await
     .expect("canonical TaskRole and matching Execution Actor authorize lease");
-    sqlx::query(
-        "UPDATE task SET assignee_type = 'agent', assignee_id = ?, version = version + 1 WHERE id = ?",
-    )
-    .bind(&stale_legacy_agent_id)
-    .bind(&task_id)
-    .execute(db.pool())
-    .await
-    .expect("contradictory legacy projection is restored for trigger coverage");
-
     let ended_at = (now + chrono::Duration::seconds(1)).to_rfc3339();
     sqlx::query(
         "UPDATE role_membership
@@ -2991,153 +2207,6 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
     assert!(error
         .to_string()
         .contains("Workspace lease Task is stale or lacks current TaskRole/Execution authority"));
-}
-
-#[tokio::test]
-async fn prebaseline_discovery_task_is_admitted_to_running_execution() {
-    let db = sqlite_db().await;
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
-    let now = now_rfc3339();
-    let user_id = new_uuid_v4();
-    sqlx::query(
-        "INSERT INTO user (id, email, password_hash, created_at, updated_at)
-         VALUES (?, ?, 'test', ?, ?)",
-    )
-    .bind(&user_id)
-    .bind(format!("{user_id}@example.test"))
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("user fixture");
-    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
-        .bind(&user_id)
-        .bind(&project_id)
-        .execute(db.pool())
-        .await
-        .expect("Project owner fixture");
-    let charter_id = new_uuid_v4();
-    let charter_revision_id = new_uuid_v4();
-    sqlx::query(
-        "INSERT INTO project_charter
-         (id, account_id, project_id, project_mode, maturity, lifecycle, created_at, updated_at)
-         VALUES (?, ?, ?, 'standard', 'mvp', 'attached', ?, ?)",
-    )
-    .bind(&charter_id)
-    .bind(&user_id)
-    .bind(&project_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("charter fixture");
-    sqlx::query(
-        "INSERT INTO project_charter_revision
-         (id, charter_id, revision, lifecycle, schema_version, render_version,
-          content_json, rendered_view, author_type, author_id, content_digest,
-          rendered_digest, created_at)
-         VALUES (?, ?, 1, 'approved', 'test', 'test', '{}', 'charter',
-                 'user', ?, 'content', 'rendered', ?)",
-    )
-    .bind(&charter_revision_id)
-    .bind(&charter_id)
-    .bind(&user_id)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("charter revision fixture");
-    sqlx::query("UPDATE project_charter SET current_approved_revision_id = ? WHERE id = ?")
-        .bind(&charter_revision_id)
-        .bind(&charter_id)
-        .execute(db.pool())
-        .await
-        .expect("charter pointer");
-    sqlx::query(
-        "UPDATE project
-         SET charter_status = 'charter_backed', charter_setup_required = 0,
-             current_charter_id = ?, current_charter_revision_id = ?,
-             current_charter_version = 1
-         WHERE id = ?",
-    )
-    .bind(&charter_id)
-    .bind(&charter_revision_id)
-    .bind(&project_id)
-    .execute(db.pool())
-    .await
-    .expect("Project Charter binding");
-    let task_id = new_uuid_v4();
-    TaskRepo::create(
-        &db,
-        CreateTask {
-            id: task_id.clone(),
-            project_id: project_id.clone(),
-            repo_id: Some(repo_id),
-            parent_task_id: None,
-            subtask_order: None,
-            assignee_type: None,
-            assignee_id: None,
-            title: "Read-only discovery".to_owned(),
-            description: None,
-            task_type: "discovery".to_owned(),
-            status: "in_progress".to_owned(),
-            is_automation: false,
-            priority: 0,
-            task_state_config: None,
-            merge_config: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("discovery Task");
-    sqlx::query(
-        "INSERT INTO project_task_governance
-         (task_id, project_id, charter_revision_id, capability_class, risk_class,
-          runnable, created_at, updated_at)
-         VALUES (?, ?, ?, 'repository_read', 'low', 0, ?, ?)",
-    )
-    .bind(&task_id)
-    .bind(&project_id)
-    .bind(&charter_revision_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("prebaseline governance");
-
-    let execution = ExecutionRepo::create(
-        &db,
-        CreateExecution {
-            id: new_uuid_v4(),
-            task_id,
-            agent_id: Some(agent_id),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: "coder".to_owned(),
-            status: ExecutionStatus::Running,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: Some(now.clone()),
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("prebaseline discovery execution is admitted");
-    assert_eq!(execution.status, ExecutionStatus::Running);
 }
 
 async fn seed_terminal_session(
@@ -3525,15 +2594,12 @@ async fn seed_ordered_task(
             repo_id: Some(repo_id.to_owned()),
             parent_task_id: parent_task_id.map(str::to_owned),
             subtask_order,
-            assignee_type: None,
-            assignee_id: None,
             title: title.to_owned(),
             description: None,
             task_type: "implementation".to_owned(),
-            status: "todo".to_owned(),
+            lifecycle_state: crate::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,
-            task_state_config: None,
             merge_config: None,
             created_at: created_at.to_owned(),
             updated_at: created_at.to_owned(),
@@ -3544,7 +2610,7 @@ async fn seed_ordered_task(
 }
 
 #[tokio::test]
-async fn task_list_hides_cancelled_and_archived_by_default() {
+async fn task_list_hides_cancelled_by_default() {
     let db = sqlite_db().await;
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let visible_id = seed_task(
@@ -3565,30 +2631,6 @@ async fn task_list_hides_cancelled_and_archived_by_default() {
         "Cancelled",
     )
     .await;
-    let archived_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        Some(&agent_id),
-        "done".to_owned(),
-        "Archived",
-    )
-    .await;
-    let archived = TaskRepo::get_by_id(&db, &archived_id, false)
-        .await
-        .unwrap()
-        .unwrap();
-    TaskRepo::archive(
-        &db,
-        ArchiveTask {
-            id: archived_id.clone(),
-            expected_version: archived.version,
-            archived_at: now_rfc3339(),
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .unwrap();
 
     let default_page = TaskRepo::list(
         &db,
@@ -3596,59 +2638,57 @@ async fn task_list_hides_cancelled_and_archived_by_default() {
             project_id: project_id.clone(),
             q: None,
             lifecycle_states: Vec::new(),
-            statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: Vec::new(),
             assignee_ids: Vec::new(),
             priority: None,
-            include_archived: false,
             include_cancelled: false,
             include_deleted: false,
             page: page(10),
         },
     )
     .await
-    .unwrap();
-    let default_ids = default_page
-        .items
-        .iter()
-        .map(|task| task.id.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(default_ids, vec![visible_id.as_str()]);
+    .expect("default Task list loads");
+    assert_eq!(
+        default_page
+            .items
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![visible_id.as_str()]
+    );
 
-    let included_page = TaskRepo::list(
+    let including_cancelled = TaskRepo::list(
         &db,
         TaskListQuery {
             project_id,
             q: None,
             lifecycle_states: Vec::new(),
-            statuses: Vec::new(),
             agent_ids: vec![agent_id],
             assignee_types: Vec::new(),
             assignee_ids: Vec::new(),
             priority: None,
-            include_archived: true,
             include_cancelled: true,
             include_deleted: false,
             page: page(10),
         },
     )
     .await
-    .unwrap();
-    let included_ids = included_page
+    .expect("cancelled Tasks list loads");
+    let listed = including_cancelled
         .items
         .iter()
         .map(|task| task.id.as_str())
         .collect::<Vec<_>>();
-    assert!(included_ids.contains(&visible_id.as_str()));
-    assert!(included_ids.contains(&cancelled_id.as_str()));
-    assert!(included_ids.contains(&archived_id.as_str()));
+    assert!(listed.contains(&visible_id.as_str()));
+    assert!(listed.contains(&cancelled_id.as_str()));
 }
 
 #[tokio::test]
 async fn task_list_filters_by_user_assignee() {
     let db = sqlite_db().await;
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let user_id = seed_user(&db).await;
     let human_task_id = seed_task(
         &db,
         &project_id,
@@ -3667,14 +2707,29 @@ async fn task_list_filters_by_user_assignee() {
         "Agent task",
     )
     .await;
-    TaskRoleAssignmentRepo::assign(
+    let task_role_id = new_uuid_v4();
+    TaskRoleRepo::create(
         &db,
-        CreateTaskRoleAssignment {
-            id: new_uuid_v4(),
+        CreateTaskRole {
+            id: task_role_id.clone(),
             task_id: human_task_id.clone(),
-            role_name: "coder".to_owned(),
-            assignee_type: Some(crate::AssigneeKind::User),
-            assignee_id: Some("human".to_owned()),
+            role: "implementer".to_owned(),
+            coordination_mode: None,
+            policy_json: "{}".to_owned(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    RoleMembershipRepo::add(
+        &db,
+        CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id,
+            actor_kind: ActorKind::Human,
+            actor_id: user_id.clone(),
+            status: RoleMembershipStatus::Active,
             created_at: now_rfc3339(),
             updated_at: now_rfc3339(),
         },
@@ -3688,12 +2743,10 @@ async fn task_list_filters_by_user_assignee() {
             project_id: project_id.clone(),
             q: None,
             lifecycle_states: Vec::new(),
-            statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: vec!["user".to_owned()],
             assignee_ids: Vec::new(),
             priority: None,
-            include_archived: false,
             include_cancelled: false,
             include_deleted: false,
             page: page(10),
@@ -3710,12 +2763,10 @@ async fn task_list_filters_by_user_assignee() {
             project_id,
             q: None,
             lifecycle_states: Vec::new(),
-            statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: vec!["user".to_owned()],
-            assignee_ids: vec!["human".to_owned()],
+            assignee_ids: vec![user_id],
             priority: None,
-            include_archived: false,
             include_cancelled: false,
             include_deleted: false,
             page: page(10),
@@ -3794,7 +2845,6 @@ async fn task_list_filters_by_search_query() {
             error_annotation: None,
             blocked_json: None,
             failed_json: None,
-            task_state_config: None,
             parent_task_id: None,
             updated_at: now_rfc3339(),
         },
@@ -3808,12 +2858,10 @@ async fn task_list_filters_by_search_query() {
             project_id: project_id.clone(),
             q: Some("release".to_owned()),
             lifecycle_states: Vec::new(),
-            statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: Vec::new(),
             assignee_ids: Vec::new(),
             priority: None,
-            include_archived: false,
             include_cancelled: false,
             include_deleted: false,
             page: page(10),
@@ -3830,12 +2878,10 @@ async fn task_list_filters_by_search_query() {
             project_id: project_id.clone(),
             q: Some("needle".to_owned()),
             lifecycle_states: Vec::new(),
-            statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: Vec::new(),
             assignee_ids: Vec::new(),
             priority: None,
-            include_archived: false,
             include_cancelled: false,
             include_deleted: false,
             page: page(10),
@@ -3852,12 +2898,10 @@ async fn task_list_filters_by_search_query() {
             project_id,
             q: Some("100%".to_owned()),
             lifecycle_states: Vec::new(),
-            statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: Vec::new(),
             assignee_ids: Vec::new(),
             priority: None,
-            include_archived: false,
             include_cancelled: false,
             include_deleted: false,
             page: page(10),
@@ -3902,8 +2946,6 @@ async fn pr8_validation_run_evidence_and_report_are_exact_atomic_and_actor_free(
         assert!(!columns.iter().any(|column| column == forbidden));
     }
     for table in [
-        "review",
-        "review_evidence_bundle",
         "legacy_review_artifact_migration",
         "legacy_ci_validation_migration",
     ] {
@@ -3914,7 +2956,29 @@ async fn pr8_validation_run_evidence_and_report_are_exact_atomic_and_actor_free(
         .fetch_one(db.pool())
         .await
         .expect("legacy/audit table lookup");
-        assert_eq!(exists, 1, "{table} remains physically present");
+        assert_eq!(exists, 1, "{table} retains migration provenance");
+    }
+    for table in ["review", "review_evidence_bundle"] {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(db.pool())
+        .await
+        .expect("retired Review storage lookup");
+        assert_eq!(exists, 0, "{table} is physically retired");
+    }
+    for table in [
+        "legacy_review_artifact_migration",
+        "legacy_ci_validation_migration",
+    ] {
+        let source_fks: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('{table}') WHERE \"from\" = 'review_id'"
+        ))
+        .fetch_one(db.pool())
+        .await
+        .expect("Review source-FK count loads");
+        assert_eq!(source_fks, 0, "{table} remains detached from Review");
     }
 
     let started_at = now_rfc3339();
@@ -4231,7 +3295,6 @@ async fn pr8_review_report_is_exact_human_execution_output_before_completion() {
             stopped_at: None,
             parent_execution_id: None,
             harness_session_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -4322,7 +3385,7 @@ async fn pr8_review_report_is_exact_human_execution_output_before_completion() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            agent_session_id: None,
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -4367,7 +3430,6 @@ async fn pr8_review_report_is_exact_human_execution_output_before_completion() {
             stopped_at: None,
             parent_execution_id: None,
             harness_session_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -4392,7 +3454,7 @@ async fn pr8_review_report_is_exact_human_execution_output_before_completion() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            agent_session_id: None,
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -4464,7 +3526,6 @@ async fn pr8_review_subject_is_immutable_and_report_digest_must_match() {
             stopped_at: None,
             parent_execution_id: None,
             harness_session_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -4591,7 +3652,7 @@ async fn pr8_review_subject_is_immutable_and_report_digest_must_match() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            agent_session_id: None,
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -4651,7 +3712,6 @@ async fn pr8_human_review_writes_recheck_authority_inside_their_transactions() {
             .is_some()
     );
 
-    seed_pr8_legacy_human_reviewer_assignment(&db, &task_id, &user_id).await;
     RoleMembershipRepo::update(
         &db,
         UpdateRoleMembership {
@@ -4848,9 +3908,7 @@ async fn pr8_human_review_writes_recheck_authority_inside_their_transactions() {
         start_event,
     )
     .await
-    .expect_err(
-        "replacement TaskRole blocks its stale legacy projection after membership revocation",
-    );
+    .expect_err("replacement TaskRole blocks Human review after membership revocation");
     assert!(matches!(
         creation_write,
         DbError::Check(message) if message.contains("current authoritative reviewer membership")
@@ -4885,7 +3943,6 @@ async fn pr8_human_review_writes_recheck_authority_inside_their_transactions() {
     )
     .await;
     let legacy_workspace_id = seed_workspace_for_task(&db, &legacy_task_id, &repo_id).await;
-    seed_pr8_legacy_human_reviewer_assignment(&db, &legacy_task_id, &user_id).await;
     let legacy_execution_id = new_uuid_v4();
     let (execution_input, subject_input, start_event) = pr8_human_review_start_inputs(
         &legacy_task_id,
@@ -4901,8 +3958,11 @@ async fn pr8_human_review_writes_recheck_authority_inside_their_transactions() {
         start_event,
     )
     .await
-    .expect("exact legacy assignment remains valid without a replacement TaskRole");
-    assert_eq!(legacy_write.execution.id, legacy_execution_id);
+    .expect_err("a missing TaskRole membership does not infer Human authority");
+    assert!(matches!(
+        legacy_write,
+        DbError::Check(message) if message.contains("current authoritative reviewer membership")
+    ));
 }
 
 #[tokio::test]
@@ -4920,7 +3980,6 @@ async fn pr8_workspace_free_human_review_start_rechecks_authority_transactionall
     )
     .await;
     let (_, membership_id) = seed_pr8_human_reviewer_role(&db, &task_id, &user_id).await;
-    seed_pr8_legacy_human_reviewer_assignment(&db, &task_id, &user_id).await;
     RoleMembershipRepo::update(
         &db,
         UpdateRoleMembership {
@@ -4932,7 +3991,7 @@ async fn pr8_workspace_free_human_review_start_rechecks_authority_transactionall
         },
     )
     .await
-    .expect("membership suspension leaves the stale legacy row in place");
+    .expect("Human reviewer membership suspends");
 
     let rejected_id = new_uuid_v4();
     let (execution, event) = pr8_workspace_free_human_review_start_inputs(
@@ -4974,7 +4033,6 @@ async fn pr8_workspace_free_human_review_start_rechecks_authority_transactionall
         "Workspace-free legacy Human Review fallback",
     )
     .await;
-    seed_pr8_legacy_human_reviewer_assignment(&db, &legacy_task_id, &user_id).await;
     let legacy_execution_id = new_uuid_v4();
     let (execution, event) = pr8_workspace_free_human_review_start_inputs(
         &legacy_task_id,
@@ -4982,13 +4040,14 @@ async fn pr8_workspace_free_human_review_start_rechecks_authority_transactionall
         &legacy_execution_id,
         &now_rfc3339(),
     );
-    let (created, committed_event) =
+    let rejected =
         ExecutionRepo::create_human_review_execution_without_subject(&db, execution, event)
             .await
-            .expect("exact legacy assignment is used when no replacement TaskRole exists");
-    assert_eq!(created.id, legacy_execution_id);
-    assert!(created.workspace_id.is_none());
-    assert_eq!(committed_event.event_type, "execution.started");
+            .expect_err("a missing TaskRole membership does not infer Human authority");
+    assert!(matches!(
+        rejected,
+        DbError::Check(message) if message.contains("current authoritative reviewer membership")
+    ));
 }
 
 async fn insert_pr8_review_report(
@@ -5119,7 +4178,6 @@ async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_i
                 stopped_at: None,
                 parent_execution_id: None,
                 harness_session_id: None,
-                agent_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,
@@ -5516,7 +4574,6 @@ async fn migration_creates_schema_and_enforces_foreign_keys() {
     let agent_id = new_uuid_v4();
     let task_id = new_uuid_v4();
     let execution_id = new_uuid_v4();
-    let review_id = new_uuid_v4();
     let db = SqliteDb::new(pool.clone());
     let daemon_id = seed_daemon(&db).await;
 
@@ -5604,19 +4661,6 @@ async fn migration_creates_schema_and_enforces_foreign_keys() {
     .await
     .expect("execution inserts");
 
-    sqlx::query(
-        "INSERT INTO review (id, task_id, execution_id, attempt_number, status, step_results_json, started_at, created_at, updated_at) VALUES (?, ?, ?, 1, 'running', '[]', ?, ?, ?)",
-    )
-    .bind(&review_id)
-    .bind(&task_id)
-    .bind(&execution_id)
-    .bind(&now)
-    .bind(&now)
-    .bind(&now)
-    .execute(&pool)
-    .await
-    .expect("review inserts");
-
     let bad_execution_result = sqlx::query(
         "INSERT INTO execution (id, task_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
     )
@@ -5627,18 +4671,13 @@ async fn migration_creates_schema_and_enforces_foreign_keys() {
     .execute(&pool)
     .await;
     assert!(bad_execution_result.is_err());
-
-    let bad_review_result = sqlx::query(
-        "INSERT INTO review (id, task_id, execution_id, attempt_number, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)",
+    let legacy_review_table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'review'",
     )
-    .bind(new_uuid_v4())
-    .bind(&task_id)
-    .bind(new_uuid_v4())
-    .bind(&now)
-    .bind(&now)
-    .execute(&pool)
-    .await;
-    assert!(bad_review_result.is_err());
+    .fetch_one(&pool)
+    .await
+    .expect("legacy Review schema lookup");
+    assert_eq!(legacy_review_table_count, 0);
 }
 
 #[tokio::test]
@@ -5690,7 +4729,6 @@ async fn delete_lifecycle_foreign_keys_match_repository_operations() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -5706,16 +4744,6 @@ async fn delete_lifecycle_foreign_keys_match_repository_operations() {
     )
     .await
     .expect("execution creates");
-
-    sqlx::query(
-        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, created_at) VALUES (?, ?, 'todo', 'in_progress', NULL, 'system', 'test', ?)",
-    )
-    .bind(new_uuid_v4())
-    .bind(&task_id)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("transition log creates");
 
     WorkspaceRepo::delete(&db, &workspace_id)
         .await
@@ -5737,15 +4765,6 @@ async fn delete_lifecycle_foreign_keys_match_repository_operations() {
             .expect("task count"),
         0
     );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM transition_log WHERE task_id = ?")
-            .bind(&task_id)
-            .fetch_one(db.pool())
-            .await
-            .expect("transition count"),
-        0
-    );
-
     let (project_id, repo_id, _agent_id) = seed_project_repo_agent(&db).await;
     let task_id = seed_task(
         &db,
@@ -5790,7 +4809,6 @@ async fn sqlite_repo_create_round_trips_local_path() {
             id: project_id.clone(),
             name: "Forge".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_string(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),
@@ -5835,7 +4853,6 @@ async fn sqlite_repo_create_round_trips_remote_url() {
             id: project_id.clone(),
             name: "Forge".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_string(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),
@@ -5879,7 +4896,6 @@ async fn sqlite_repo_create_rejects_missing_remote_url() {
             id: project_id.clone(),
             name: "Forge".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_string(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),
@@ -5938,7 +4954,6 @@ async fn sqlite_execution_role_auditor_round_trips() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -6002,7 +5017,6 @@ async fn running_execution_admission_is_fenced_after_terminal_task_lifecycle() {
         resume_policy: None,
         stopped_at: None,
         parent_execution_id: None,
-        agent_session_id: None,
         agent_message_id: None,
         last_activity_at: None,
         summary: None,
@@ -6038,7 +5052,7 @@ async fn running_execution_admission_is_fenced_after_terminal_task_lifecycle() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            agent_session_id: None,
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -6150,249 +5164,6 @@ async fn task_board_revision_migration_preserves_tasks_and_tracks_board_changes(
             .expect("revision loads"),
         3
     );
-}
-
-#[tokio::test]
-async fn compare_and_move_is_atomic_versioned_and_idempotent() {
-    let db = sqlite_db().await;
-    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
-    let first_id = seed_task(&db, &project_id, &repo_id, None, "todo".to_owned(), "first").await;
-    let moved_id = seed_task(&db, &project_id, &repo_id, None, "todo".to_owned(), "moved").await;
-    let moved = TaskRepo::get_by_id(&db, &moved_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    let operation_id = new_uuid_v4();
-    let board_revision = TaskBoardRepo::board_revision(&db, &project_id)
-        .await
-        .expect("revision loads");
-    let input = CompareAndMoveTask {
-        operation_id: operation_id.clone(),
-        project_id: project_id.clone(),
-        task_id: moved_id.clone(),
-        task_version: moved.version,
-        board_revision,
-        target_status: "todo".to_owned(),
-        target_column_statuses: vec!["todo".to_owned()],
-        before_id: None,
-        after_id: Some(first_id),
-        entry_barrier_json: None,
-        transition_log_id: new_uuid_v4(),
-        trigger_name: None,
-        triggered_by: "user:board_drag".to_owned(),
-        trigger_reason: "board reorder".to_owned(),
-        rejection: false,
-        updated_at: now_rfc3339(),
-    };
-
-    let committed = TaskBoardRepo::compare_and_move_task(&db, input.clone())
-        .await
-        .expect("move commits");
-    let result = match committed {
-        MoveTaskPersistence::Committed { result, .. } => result,
-        MoveTaskPersistence::Replayed(_) => panic!("first move must commit"),
-    };
-    assert_eq!(result.task.version, moved.version + 1);
-    assert!(result.task.board_position < moved.board_position);
-    assert!(result.board_revision > board_revision);
-    TaskBoardRepo::complete_move_operation(&db, &operation_id, &result, &now_rfc3339())
-        .await
-        .expect("operation completes");
-
-    let replayed = TaskBoardRepo::replay_move_task(&db, &operation_id, &input.identity())
-        .await
-        .expect("replay loads")
-        .expect("completed result exists");
-    assert_eq!(replayed, *result);
-    let loaded = TaskRepo::get_by_id(&db, &moved_id, false)
-        .await
-        .expect("task reloads")
-        .expect("task exists");
-    assert_eq!(loaded.version, result.task.version);
-
-    let conflicting_identity = MoveTaskIdentity {
-        before_id: Some(new_uuid_v4()),
-        ..input.identity()
-    };
-    assert!(matches!(
-        TaskBoardRepo::replay_move_task(&db, &operation_id, &conflicting_identity).await,
-        Err(DbError::MoveOperationConflict { .. })
-    ));
-
-    let stale_task = CompareAndMoveTask {
-        operation_id: new_uuid_v4(),
-        task_version: moved.version,
-        board_revision: result.board_revision,
-        before_id: None,
-        after_id: None,
-        ..input.clone()
-    };
-    assert!(matches!(
-        TaskBoardRepo::compare_and_move_task(&db, stale_task).await,
-        Err(DbError::TaskVersionConflict { .. })
-    ));
-
-    let stale_board = CompareAndMoveTask {
-        operation_id: new_uuid_v4(),
-        task_version: loaded.version,
-        board_revision,
-        before_id: None,
-        after_id: None,
-        ..input
-    };
-    assert!(matches!(
-        TaskBoardRepo::compare_and_move_task(&db, stale_board).await,
-        Err(DbError::BoardRevisionConflict { .. })
-    ));
-}
-
-#[tokio::test]
-async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
-    let db = sqlite_db().await;
-    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
-    let before_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "before",
-    )
-    .await;
-    let after_id = seed_task(&db, &project_id, &repo_id, None, "todo".to_owned(), "after").await;
-    let moved_id = seed_task(&db, &project_id, &repo_id, None, "todo".to_owned(), "moved").await;
-    sqlx::query("UPDATE task SET board_position = 1.0 WHERE id = ?")
-        .bind(&before_id)
-        .execute(db.pool())
-        .await
-        .expect("before position sets");
-    sqlx::query("UPDATE task SET board_position = 1.000000000001 WHERE id = ?")
-        .bind(&after_id)
-        .execute(db.pool())
-        .await
-        .expect("after position sets");
-    sqlx::query("UPDATE task SET board_position = 3.0 WHERE id = ?")
-        .bind(&moved_id)
-        .execute(db.pool())
-        .await
-        .expect("moved position sets");
-    let moved = TaskRepo::get_by_id(&db, &moved_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    let revision = TaskBoardRepo::board_revision(&db, &project_id)
-        .await
-        .expect("revision loads");
-    let renormalized = TaskBoardRepo::compare_and_move_task(
-        &db,
-        CompareAndMoveTask {
-            operation_id: new_uuid_v4(),
-            project_id: project_id.clone(),
-            task_id: moved_id.clone(),
-            task_version: moved.version,
-            board_revision: revision,
-            target_status: "todo".to_owned(),
-            target_column_statuses: vec!["todo".to_owned()],
-            before_id: Some(before_id.clone()),
-            after_id: Some(after_id.clone()),
-            entry_barrier_json: None,
-            transition_log_id: new_uuid_v4(),
-            trigger_name: None,
-            triggered_by: "user:board_drag".to_owned(),
-            trigger_reason: "board reorder".to_owned(),
-            rejection: false,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("tight gap move commits");
-    let result = match renormalized {
-        MoveTaskPersistence::Committed { result, .. } => result,
-        MoveTaskPersistence::Replayed(_) => panic!("move must commit"),
-    };
-    assert_eq!(result.task.board_position, 1.5);
-    assert!(result.board_revision > revision + 1);
-
-    let source_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "source",
-    )
-    .await;
-    let source = TaskRepo::get_by_id(&db, &source_id, false)
-        .await
-        .expect("source loads")
-        .expect("source exists");
-    let revision = TaskBoardRepo::board_revision(&db, &project_id)
-        .await
-        .expect("revision loads");
-    let empty_move = TaskBoardRepo::compare_and_move_task(
-        &db,
-        CompareAndMoveTask {
-            operation_id: new_uuid_v4(),
-            project_id: project_id.clone(),
-            task_id: source_id,
-            task_version: source.version,
-            board_revision: revision,
-            target_status: "review".to_owned(),
-            target_column_statuses: vec!["review".to_owned()],
-            before_id: None,
-            after_id: None,
-            entry_barrier_json: None,
-            transition_log_id: new_uuid_v4(),
-            trigger_name: None,
-            triggered_by: "user:board_drag".to_owned(),
-            trigger_reason: "board move".to_owned(),
-            rejection: false,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("empty destination accepts null neighbors");
-    assert!(matches!(empty_move, MoveTaskPersistence::Committed { .. }));
-
-    let another_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "another",
-    )
-    .await;
-    let another = TaskRepo::get_by_id(&db, &another_id, false)
-        .await
-        .expect("another loads")
-        .expect("another exists");
-    let revision = TaskBoardRepo::board_revision(&db, &project_id)
-        .await
-        .expect("revision loads");
-    let nonempty = TaskBoardRepo::compare_and_move_task(
-        &db,
-        CompareAndMoveTask {
-            operation_id: new_uuid_v4(),
-            project_id,
-            task_id: another_id,
-            task_version: another.version,
-            board_revision: revision,
-            target_status: "review".to_owned(),
-            target_column_statuses: vec!["review".to_owned()],
-            before_id: None,
-            after_id: None,
-            entry_barrier_json: None,
-            transition_log_id: new_uuid_v4(),
-            trigger_name: None,
-            triggered_by: "user:board_drag".to_owned(),
-            trigger_reason: "board move".to_owned(),
-            rejection: false,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await;
-    assert!(matches!(nonempty, Err(DbError::InvalidTaskMove(_))));
 }
 
 #[tokio::test]
@@ -6664,15 +5435,12 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             repo_id: Some(repo_id.clone()),
             parent_task_id: None,
             subtask_order: None,
-            assignee_type: None,
-            assignee_id: None,
             title: "Implement repo".to_owned(),
             description: Some("SQLite".to_owned()),
             task_type: "implementation".to_owned(),
-            status: "todo".to_string(),
+            lifecycle_state: crate::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 10,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -6680,25 +5448,7 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
     )
     .await
     .expect("task creates");
-    TaskRoleAssignmentRepo::assign(
-        &db,
-        CreateTaskRoleAssignment {
-            id: new_uuid_v4(),
-            task_id: task_id.clone(),
-            role_name: "coder".to_owned(),
-            assignee_type: Some(crate::AssigneeKind::Agent),
-            assignee_id: Some(agent_id.clone()),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("role assignment creates");
-    sqlx::query("UPDATE task SET plan = 'Map rows manually' WHERE id = ?")
-        .bind(&task_id)
-        .execute(db.pool())
-        .await
-        .expect("legacy Task.plan fixture is stored");
+    seed_agent_task_role_member(&db, &task_id, "implementer", &agent_id).await;
     let task = TaskRepo::update(
         &db,
         UpdateTask {
@@ -6711,7 +5461,6 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             error_annotation: None,
             blocked_json: None,
             failed_json: None,
-            task_state_config: None,
             parent_task_id: None,
             updated_at: now.clone(),
         },
@@ -6719,13 +5468,6 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
     .await
     .expect("task updates");
     assert_eq!(task.version, 2);
-    let preserved_legacy_plan: Option<String> =
-        sqlx::query_scalar("SELECT plan FROM task WHERE id = ?")
-            .bind(&task_id)
-            .fetch_one(db.pool())
-            .await
-            .expect("physical legacy plan field remains");
-    assert_eq!(preserved_legacy_plan.as_deref(), Some("Map rows manually"));
 
     let execution_id = new_uuid_v4();
     ExecutionRepo::create(
@@ -6744,7 +5486,6 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("initial prompt".to_owned()),
@@ -6769,7 +5510,7 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            agent_session_id: Some(Some("session".to_owned())),
+            external_session_id: Some(Some("session".to_owned())),
             agent_message_id: None,
             last_activity_at: None,
             summary: Some(Some("done".to_owned())),
@@ -6792,51 +5533,6 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             .expect("logs path loads"),
         Some("logs/run.jsonl".to_owned())
     );
-
-    let review_id = new_uuid_v4();
-    ReviewRepo::create(
-        &db,
-        CreateReview {
-            id: review_id.clone(),
-            task_id: task_id.clone(),
-            execution_id: execution_id.clone(),
-            attempt_number: 1,
-            status: ReviewStatus::Running,
-            step_results_json: "[]".to_owned(),
-            started_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("review creates");
-    assert_eq!(
-        ReviewRepo::next_attempt_number(&db, &task_id)
-            .await
-            .expect("next attempt loads"),
-        2
-    );
-    let review = ReviewRepo::update_status(
-        &db,
-        &review_id,
-        ReviewStatus::Passed,
-        r#"[{"index":0,"exit_code":0}]"#.to_owned(),
-        Some(now.clone()),
-        &now,
-    )
-    .await
-    .expect("review updates");
-    assert_eq!(review.status, ReviewStatus::Passed);
-    assert_eq!(review.step_results_json, r#"[{"index":0,"exit_code":0}]"#);
-    assert_eq!(review.finished_at, Some(now.clone()));
-    let review_events = DomainEventRepo::list_events_after(&db, 0, 100)
-        .await
-        .expect("review outcome event lists");
-    assert!(review_events.iter().any(|event| {
-        event.event_type == "review.status_changed"
-            && event.entity_id == review_id
-            && event.scope_id == task_id
-    }));
 
     let workspace_id = new_uuid_v4();
     let workspace = WorkspaceRepo::create(
@@ -6915,12 +5611,10 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
                 project_id,
                 q: None,
                 lifecycle_states: Vec::new(),
-                statuses: vec!["todo".to_string()],
                 agent_ids: vec![agent_id],
                 assignee_types: Vec::new(),
                 assignee_ids: Vec::new(),
                 priority: Some(20),
-                include_archived: false,
                 include_cancelled: false,
                 include_deleted: false,
                 page: page(10),
@@ -6937,10 +5631,6 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             .unwrap()
             .items
             .len(),
-        1
-    );
-    assert_eq!(
-        ReviewRepo::list_by_task(&db, &task_id).await.unwrap().len(),
         1
     );
 }
@@ -7223,12 +5913,10 @@ async fn task_list_orders_equal_board_positions_by_created_at() {
             project_id,
             q: None,
             lifecycle_states: Vec::new(),
-            statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: Vec::new(),
             assignee_ids: Vec::new(),
             priority: None,
-            include_archived: false,
             include_cancelled: false,
             include_deleted: false,
             page: PageRequest {
@@ -7248,7 +5936,7 @@ async fn task_list_orders_equal_board_positions_by_created_at() {
 }
 
 #[tokio::test]
-async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
+async fn sqlite_repositories_enforce_versions_and_cursors() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
@@ -7261,15 +5949,12 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
             repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
-            assignee_type: None,
-            assignee_id: None,
             title: "Claim me".to_owned(),
             description: None,
             task_type: "implementation".to_owned(),
-            status: "todo".to_string(),
+            lifecycle_state: crate::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -7277,20 +5962,7 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
     )
     .await
     .expect("task creates");
-    TaskRoleAssignmentRepo::assign(
-        &db,
-        CreateTaskRoleAssignment {
-            id: new_uuid_v4(),
-            task_id: task_id.clone(),
-            role_name: "coder".to_owned(),
-            assignee_type: Some(crate::AssigneeKind::Agent),
-            assignee_id: Some(agent_id.clone()),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("role assignment creates");
+    seed_agent_task_role_member(&db, &task_id, "implementer", &agent_id).await;
 
     let bad_update = TaskRepo::update(
         &db,
@@ -7304,66 +5976,12 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
             error_annotation: None,
             blocked_json: None,
             failed_json: None,
-            task_state_config: None,
             parent_task_id: None,
             updated_at: now.clone(),
         },
     )
     .await;
     assert!(matches!(bad_update, Err(DbError::VersionConflict)));
-
-    let mut tx = db.pool().begin().await.expect("transaction starts");
-    let claimed = TaskRepo::claim(
-        &db,
-        &mut tx,
-        ClaimTask {
-            task_id: task_id.clone(),
-            assignee_type: "agent".to_owned(),
-            assignee_id: Some(agent_id.clone()),
-            expected_version: 1,
-            source_status: "todo".to_owned(),
-            target_status: "in_progress".to_owned(),
-            execution: CreateExecution {
-                id: new_uuid_v4(),
-                task_id: task_id.clone(),
-                agent_id: Some(agent_id.clone()),
-                actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
-                purpose: Some(crate::ExecutionPurpose::Implement),
-                harness_session_id: None,
-                role: "executor".to_string(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: None,
-                workspace_id: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-            max_concurrent_tasks: 1,
-            claimed_at: now.clone(),
-        },
-    )
-    .await
-    .expect("task claims");
-    tx.commit().await.expect("claim commits");
-    assert_eq!(claimed.task.status, "in_progress".to_string());
-    assert_eq!(
-        AgentRepo::count_running_executions(&db, &agent_id)
-            .await
-            .unwrap(),
-        1
-    );
 
     let invalid_cursor = ProjectRepo::list(
         &db,
@@ -7447,7 +6065,6 @@ async fn agent_active_execution_count_counts_only_exact_running_executions() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -7480,7 +6097,7 @@ async fn agent_active_execution_count_counts_only_exact_running_executions() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: Some(Some(now.clone())),
-            agent_session_id: None,
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -7541,7 +6158,6 @@ async fn agent_task_list_uses_execution_history() {
             resume_policy: None,
             stopped_at: Some(now.clone()),
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -7562,7 +6178,6 @@ async fn agent_task_list_uses_execution_history() {
         &db,
         AgentTaskListQuery {
             agent_id,
-            include_archived: false,
             include_cancelled: true,
             include_deleted: false,
             page: PageRequest {
@@ -7580,95 +6195,6 @@ async fn agent_task_list_uses_execution_history() {
     assert_eq!(page.total_count, Some(1));
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].id, executed_task_id);
-}
-
-#[tokio::test]
-async fn task_claim_rejects_active_entry_barrier() {
-    let db = sqlite_db().await;
-    let now = now_rfc3339();
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
-    let task_id = new_uuid_v4();
-    let task = TaskRepo::create(
-        &db,
-        CreateTask {
-            id: task_id.clone(),
-            project_id,
-            repo_id: Some(repo_id),
-            parent_task_id: None,
-            subtask_order: None,
-            assignee_type: None,
-            assignee_id: None,
-            title: "Barrier claim".to_owned(),
-            description: None,
-            task_type: "implementation".to_owned(),
-            status: "todo".to_owned(),
-            is_automation: false,
-            priority: 0,
-            task_state_config: None,
-            merge_config: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("task creates");
-    let task = TaskRepo::set_entry_barrier(
-        &db,
-        &task.id,
-        task.version,
-        Some(
-            r#"{"state":"todo","status":"running","started_at":"2026-04-28T00:00:00Z"}"#.to_owned(),
-        ),
-        &now,
-    )
-    .await
-    .expect("barrier sets");
-
-    let mut tx = db.pool().begin().await.expect("transaction starts");
-    let result = TaskRepo::claim(
-        &db,
-        &mut tx,
-        ClaimTask {
-            task_id: task_id.clone(),
-            assignee_type: "agent".to_owned(),
-            assignee_id: Some(agent_id.clone()),
-            expected_version: task.version,
-            source_status: "todo".to_owned(),
-            target_status: "in_progress".to_owned(),
-            execution: CreateExecution {
-                id: new_uuid_v4(),
-                task_id,
-                agent_id: Some(agent_id),
-                actor_ref: None,
-                purpose: None,
-                harness_session_id: None,
-                role: "executor".to_string(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: None,
-                workspace_id: None,
-                created_at: now.clone(),
-                updated_at: now,
-            },
-            max_concurrent_tasks: 1,
-            claimed_at: now_rfc3339(),
-        },
-    )
-    .await;
-
-    assert!(matches!(result, Err(DbError::InvalidTransition)));
 }
 
 #[tokio::test]
@@ -7743,144 +6269,6 @@ async fn test_add_dependency_cycle_rejected() {
     let result = TaskDependencyRepo::add_dependency(&db, &first_id, &second_id, &now).await;
 
     assert!(matches!(result, Err(DbError::CycleDetected)));
-}
-
-#[tokio::test]
-async fn test_dependency_gate_blocks_non_context_holder() {
-    let db = sqlite_db().await;
-    let now = now_rfc3339();
-    let (project_id, repo_id, context_agent_id) = seed_project_repo_agent(&db).await;
-    let other_agent_id = new_uuid_v4();
-    let other_daemon_id = seed_daemon(&db).await;
-    AgentRepo::create(
-        &db,
-        CreateAgent {
-            id: other_agent_id.clone(),
-            name: "other".to_owned(),
-            description: None,
-            executor_type: "shell".to_owned(),
-            model: None,
-            reasoning_effort: None,
-            permission_policy: None,
-            capabilities_json: "[]".to_owned(),
-            config_json: "{}".to_owned(),
-            credential_ref: None,
-            daemon_id: Some(other_daemon_id),
-            max_concurrent_tasks: 1,
-            heartbeat_interval_seconds: 30,
-            max_missed_heartbeats: 3,
-            status: AgentStatus::Idle,
-            last_heartbeat_at: None,
-            is_default: false,
-            paused: false,
-            owner_id: None,
-            visibility: "global".to_owned(),
-            prompt_template: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("second agent creates");
-    let dependency_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        Some(&context_agent_id),
-        "review".to_string(),
-        "Dependency",
-    )
-    .await;
-    let task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_string(),
-        "Dependent",
-    )
-    .await;
-    ExecutionRepo::create(
-        &db,
-        CreateExecution {
-            id: new_uuid_v4(),
-            task_id: dependency_id.clone(),
-            agent_id: Some(context_agent_id),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: "executor".to_string(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("dependency execution creates");
-    TaskDependencyRepo::add_dependency(&db, &task_id, &dependency_id, &now)
-        .await
-        .expect("dependency adds");
-
-    let mut tx = db.pool().begin().await.expect("transaction starts");
-    let result = TaskRepo::claim(
-        &db,
-        &mut tx,
-        ClaimTask {
-            task_id: task_id.clone(),
-            assignee_type: "agent".to_owned(),
-            assignee_id: Some(other_agent_id.clone()),
-            expected_version: 1,
-            source_status: "todo".to_owned(),
-            target_status: "in_progress".to_owned(),
-            execution: CreateExecution {
-                id: new_uuid_v4(),
-                task_id,
-                agent_id: Some(other_agent_id),
-                actor_ref: None,
-                purpose: None,
-                harness_session_id: None,
-                role: "executor".to_string(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: None,
-                workspace_id: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-            max_concurrent_tasks: 1,
-            claimed_at: now,
-        },
-    )
-    .await;
-
-    assert!(matches!(result, Err(DbError::DependencyGate)));
 }
 
 #[tokio::test]
@@ -7996,7 +6384,6 @@ async fn pr7_migration_preserves_legacy_plan_history_and_maps_only_verifiable_au
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -8068,7 +6455,7 @@ async fn pr7_migration_preserves_legacy_plan_history_and_maps_only_verifiable_au
     )
     .bind(&task_id)
     .bind(&digest)
-    .bind(user_id)
+    .bind(&user_id)
     .bind(&now)
     .execute(db.pool())
     .await
@@ -8150,6 +6537,58 @@ async fn pr7_migration_preserves_legacy_plan_history_and_maps_only_verifiable_au
     );
     assert_eq!(statuses[2].0, "legacy-planner-ready");
     assert_eq!(statuses[2].1, "migrated");
+
+    std::fs::copy(
+        source_dir.join("V125__preserve_and_remove_v081_task_plan_storage.sql"),
+        migration_dir
+            .path()
+            .join("V125__preserve_and_remove_v081_task_plan_storage.sql"),
+    )
+    .expect("V125 migration copies");
+    crate::run_migrations_from(db.pool(), migration_dir.path())
+        .await
+        .expect("V125 archives exact V081 history before dropping its schema");
+    let archived_plan: (String, String) = sqlx::query_as(
+        "SELECT source_identity, row_json FROM pr13_legacy_record_history
+         WHERE source_table = 'task_plan_revision'
+           AND source_identity = 'legacy-no-author'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("unattributed V081 row survives in the immutable archive");
+    assert_eq!(archived_plan.0, "legacy-no-author");
+    let archived_plan: serde_json::Value =
+        serde_json::from_str(&archived_plan.1).expect("archived plan JSON parses");
+    assert_eq!(archived_plan["markdown"], "# Unattributed\n");
+    assert_eq!(archived_plan["content_digest"], "unattributed-digest");
+    let archived_approval: String = sqlx::query_scalar(
+        "SELECT row_json FROM pr13_legacy_record_history
+         WHERE source_table = 'task_plan_approval'
+           AND source_identity = 'legacy-approval-event'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("V081 approval history is preserved");
+    let archived_approval: serde_json::Value =
+        serde_json::from_str(&archived_approval).expect("archived approval JSON parses");
+    assert_eq!(archived_approval["principal_id"], user_id);
+    assert_eq!(archived_approval["decision"], "approved");
+    let retained_ledger_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM legacy_task_plan_artifact_migration
+         WHERE plan_revision_id IN ('legacy-planner-ready', 'legacy-approved', 'legacy-no-author')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("V098 provenance ledger remains queryable");
+    assert_eq!(retained_ledger_rows, 3);
+    let removed_sources: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+         AND name IN ('task_plan_revision', 'task_plan_approval', 'review_evidence_bundle')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("V081 sources are removed");
+    assert_eq!(removed_sources, 0);
 }
 
 #[tokio::test]
@@ -8934,345 +7373,4 @@ async fn domain_event_append_in_tx_rolls_back_with_the_mutation() {
         .await
         .expect("event lookup succeeds")
         .is_none());
-}
-
-#[tokio::test]
-async fn direct_task_status_updates_emit_a_ledger_event_atomically() {
-    let db = sqlite_db().await;
-    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
-    let task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "ledger task",
-    )
-    .await;
-    let task = TaskRepo::get_by_id(&db, &task_id, false)
-        .await
-        .expect("task lookup succeeds")
-        .expect("task exists");
-    let updated = TaskRepo::update_status(
-        &db,
-        UpdateTaskStatus {
-            id: task_id.clone(),
-            expected_version: task.version,
-            status: "in_progress".to_owned(),
-            assignee_id: None,
-            error_annotation: None,
-            blocked_json: None,
-            failed_json: None,
-            updated_at: "2026-08-12T20:00:00Z".to_owned(),
-        },
-    )
-    .await
-    .expect("task status updates");
-    assert_eq!(updated.status, "in_progress");
-    let events = DomainEventRepo::list_events_after(&db, 0, 100)
-        .await
-        .expect("task event lists");
-    let event = events
-        .iter()
-        .find(|event| event.event_type == "task.status_changed" && event.entity_id == task_id)
-        .expect("task status event exists");
-    let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
-    assert_eq!(payload["from_status"], "todo");
-    assert_eq!(payload["to_status"], "in_progress");
-}
-
-#[tokio::test]
-async fn stale_execution_baseline_cannot_mint_a_running_execution_after_read_gate() {
-    let db = sqlite_db().await;
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
-    let task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "baseline race task",
-    )
-    .await;
-    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
-    let now = now_rfc3339();
-    let charter_id = new_uuid_v4();
-    let charter_revision_id = new_uuid_v4();
-    let baseline_id = new_uuid_v4();
-    let baseline_revision_id = new_uuid_v4();
-    let approval_id = new_uuid_v4();
-    let user_id = new_uuid_v4();
-
-    sqlx::query(
-        "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
-         VALUES (?, ?, 'test', 'Baseline Race User', ?, ?)",
-    )
-    .bind(&user_id)
-    .bind(format!("{user_id}@example.test"))
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("user creates");
-    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
-        .bind(&user_id)
-        .bind(&project_id)
-        .execute(db.pool())
-        .await
-        .expect("Project owner updates");
-    sqlx::query(
-        "INSERT INTO project_charter
-         (id, account_id, project_id, project_mode, maturity, lifecycle, created_at, updated_at)
-         VALUES (?, ?, ?, 'standard', 'mvp', 'attached', ?, ?)",
-    )
-    .bind(&charter_id)
-    .bind(&user_id)
-    .bind(&project_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("Charter creates");
-    sqlx::query(
-        "INSERT INTO project_charter_revision
-         (id, charter_id, revision, base_revision, lifecycle, schema_version,
-          render_version, content_json, rendered_view, author_type, author_id,
-          content_digest, rendered_digest, created_at)
-         VALUES (?, ?, 1, 0, 'approved', 'test-schema', 'test-render', '{}',
-                 'approved Charter', 'user', ?, 'charter-content-digest',
-                 'charter-render-digest', ?)",
-    )
-    .bind(&charter_revision_id)
-    .bind(&charter_id)
-    .bind(&user_id)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("Charter revision creates");
-    sqlx::query(
-        "UPDATE project_charter
-         SET current_approved_revision_id = ?, version = 2, updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(&charter_revision_id)
-    .bind(&now)
-    .bind(&charter_id)
-    .execute(db.pool())
-    .await
-    .expect("Charter approval pointer updates");
-    sqlx::query(
-        "UPDATE project
-         SET charter_status = 'charter_backed', charter_setup_required = 0,
-             current_charter_id = ?, current_charter_revision_id = ?,
-             current_charter_version = 2, updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(&charter_id)
-    .bind(&charter_revision_id)
-    .bind(&now)
-    .bind(&project_id)
-    .execute(db.pool())
-    .await
-    .expect("Project becomes Charter-backed");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline
-         (id, project_id, current_revision_id, lifecycle, version, created_at, updated_at)
-         VALUES (?, ?, ?, 'active', 1, ?, ?)",
-    )
-    .bind(&baseline_id)
-    .bind(&project_id)
-    .bind(&baseline_revision_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("active baseline creates");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_revision
-         (id, baseline_id, revision, base_revision, lifecycle, charter_revision_id,
-          release_policy_revision, release_policy_digest, schema_version, render_version,
-          rendered_view, content_digest, rendered_digest, created_at)
-         VALUES (?, ?, 1, 0, 'approved', ?, 'policy-1', 'policy-digest',
-                 'schema-1', 'render-1', 'approved baseline', 'content-digest',
-                 'render-digest', ?)",
-    )
-    .bind(&baseline_revision_id)
-    .bind(&baseline_id)
-    .bind(&charter_revision_id)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("approved baseline revision creates");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_approval
-         (id, baseline_id, revision_id, expected_project_version, principal_type,
-          principal_id, authorization_basis, authorization_action,
-          authorization_occurred_at, explicit_event, content_digest,
-          rendered_digest, lifecycle, idempotency_key, created_at, updated_at)
-         VALUES (?, ?, ?, 1, 'user', ?, 'test',
-                 'project.execution_baseline.approve', '2026-08-13T00:00:00Z',
-                 'approve exact baseline',
-                 'content-digest', 'render-digest', 'consumed', ?, ?, ?)",
-    )
-    .bind(&approval_id)
-    .bind(&baseline_id)
-    .bind(&baseline_revision_id)
-    .bind(&user_id)
-    .bind(format!("approval-{approval_id}"))
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("baseline approval creates");
-    sqlx::query(
-        "INSERT INTO project_task_governance
-         (task_id, project_id, charter_revision_id, baseline_id, baseline_revision_id,
-          runnable, provenance_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 1, '{}', ?, ?)",
-    )
-    .bind(&task_id)
-    .bind(&project_id)
-    .bind(&charter_revision_id)
-    .bind(&baseline_id)
-    .bind(&baseline_revision_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("runnable governance creates");
-
-    // This represents the race after the service's read-only admission gate:
-    // the exact baseline is superseded before the authoritative execution
-    // INSERT transaction starts.
-    sqlx::query(
-        "UPDATE project_execution_baseline
-         SET lifecycle = 'superseded', version = version + 1, updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(&now)
-    .bind(&baseline_id)
-    .execute(db.pool())
-    .await
-    .expect("baseline supersedes");
-    sqlx::query(
-        "UPDATE project_task_governance
-         SET runnable = 0, version = version + 1, updated_at = ?
-         WHERE task_id = ?",
-    )
-    .bind(&now)
-    .bind(&task_id)
-    .execute(db.pool())
-    .await
-    .expect("governance is revoked");
-
-    let task_before = TaskRepo::get_by_id(&db, &task_id, false)
-        .await
-        .expect("task reads")
-        .expect("task exists");
-    let mut claim_transaction = db.pool().begin().await.expect("claim transaction begins");
-    let claim = TaskRepo::claim(
-        &db,
-        &mut claim_transaction,
-        ClaimTask {
-            task_id: task_id.clone(),
-            assignee_type: "agent".to_owned(),
-            assignee_id: Some(agent_id.clone()),
-            expected_version: task_before.version,
-            source_status: "todo".to_owned(),
-            target_status: "in_progress".to_owned(),
-            execution: CreateExecution {
-                id: new_uuid_v4(),
-                task_id: task_id.clone(),
-                agent_id: Some(agent_id.clone()),
-                actor_ref: None,
-                purpose: None,
-                harness_session_id: None,
-                role: "executor".to_owned(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: None,
-                workspace_id: Some(workspace_id.clone()),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-            max_concurrent_tasks: 1,
-            claimed_at: now.clone(),
-        },
-    )
-    .await;
-    assert!(matches!(claim, Err(DbError::InvalidTransition)));
-    claim_transaction
-        .rollback()
-        .await
-        .expect("claim transaction rolls back");
-    let task_after = TaskRepo::get_by_id(&db, &task_id, false)
-        .await
-        .expect("task rereads")
-        .expect("task remains");
-    assert_eq!(task_after.version, task_before.version);
-    assert_eq!(task_after.status, "todo");
-    assert!(task_after.assignee_id.is_none());
-
-    let execution = ExecutionRepo::create(
-        &db,
-        CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task_id.clone(),
-            agent_id: Some(agent_id),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: "executor".to_owned(),
-            status: ExecutionStatus::Running,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: Some(workspace_id.clone()),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await;
-    assert!(matches!(execution, Err(DbError::InvalidTransition)));
-    let execution_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'running'",
-    )
-    .bind(&task_id)
-    .fetch_one(db.pool())
-    .await
-    .expect("execution count reads");
-    assert_eq!(execution_count, 0, "stale baseline must not mint execution");
-    let workspace_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM workspace WHERE task_id = ?")
-            .bind(&task_id)
-            .fetch_one(db.pool())
-            .await
-            .expect("workspace count reads");
-    assert_eq!(
-        workspace_count, 1,
-        "race guard does not duplicate a workspace"
-    );
 }

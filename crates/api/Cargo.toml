@@ -20,7 +20,6 @@ hex = "0.4"
 git = { path = "../git" }
 mcp-server = { path = "../mcp-server" }
 rand = "0.8"
-review = { path = "../review" }
 schemars = "0.8"
 serde = { version = "1", features = ["derive"] }
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }

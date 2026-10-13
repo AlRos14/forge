@@ -8,9 +8,7 @@ impl TaskService {
         &self,
         execution: Execution,
     ) -> Result<Execution> {
-        if execution.role != crate::workflow::default_roles::REVIEWER
-            || execution.purpose != Some(ExecutionPurpose::Review)
-        {
+        if execution.role != "reviewer" || execution.purpose != Some(ExecutionPurpose::Review) {
             return Ok(execution);
         }
         let Some(workspace_id) = execution.workspace_id.as_deref() else {
@@ -146,7 +144,7 @@ impl TaskService {
                 "only running executions can be started",
             ));
         }
-        if execution.role == crate::workflow::default_roles::REVIEWER
+        if execution.role == "reviewer"
             && execution.purpose == Some(ExecutionPurpose::Review)
             && self
                 .reconcile_existing_review_report(&execution, None, None)
@@ -179,9 +177,7 @@ impl TaskService {
             return Err(error);
         }
         let result = async {
-            if execution.role == crate::workflow::default_roles::REVIEWER
-                && execution.purpose == Some(ExecutionPurpose::Review)
-            {
+            if execution.role == "reviewer" && execution.purpose == Some(ExecutionPurpose::Review) {
                 self.verify_execution_workspace_authority(&execution)
                     .await?;
             }
@@ -235,9 +231,7 @@ impl TaskService {
                 "only running executions can be executed",
             ));
         }
-        if execution.role == crate::workflow::default_roles::REVIEWER
-            && execution.purpose == Some(ExecutionPurpose::Review)
-        {
+        if execution.role == "reviewer" && execution.purpose == Some(ExecutionPurpose::Review) {
             if let Some((completed, _report)) = self
                 .reconcile_existing_review_report(&execution, None, None)
                 .await?
@@ -304,7 +298,7 @@ impl TaskService {
             })?;
         let mut agent_config = parse_json_value("executor config snapshot", snapshot)?;
         crate::task_service::config::validate_agent_routing_snapshot(&agent_config)?;
-        if execution.role == crate::workflow::default_roles::REVIEWER
+        if execution.role == "reviewer"
             || matches!(
                 task.task_type.as_str(),
                 "planning" | "discovery" | "review" | "validation"
@@ -418,8 +412,7 @@ impl TaskService {
             return Err(error);
         }
 
-        let is_review_execution = execution_before_launch.role
-            == crate::workflow::default_roles::REVIEWER
+        let is_review_execution = execution_before_launch.role == "reviewer"
             && execution_before_launch.purpose == Some(ExecutionPurpose::Review);
         let mut review_worktree_snapshot = None;
         let mut review_snapshot_digest = None;
@@ -535,7 +528,7 @@ impl TaskService {
                 stopped_by: None,
                 resume_policy: None,
                 stopped_at: None,
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: Some(Some(launch_activity_at)),
                 summary: None,
@@ -928,7 +921,7 @@ impl TaskService {
             }
         }
 
-        if current_execution.role == crate::workflow::default_roles::REVIEWER
+        if current_execution.role == "reviewer"
             && current_execution.purpose == Some(ExecutionPurpose::Review)
             && result.status == ExecutionOutcome::Completed
         {
@@ -1062,7 +1055,7 @@ impl TaskService {
                 stopped_by,
                 resume_policy,
                 stopped_at,
-                agent_session_id: Some(result.agent_session_id),
+                external_session_id: Some(result.agent_session_id),
                 agent_message_id: None,
                 last_activity_at: Some(Some(now.clone())),
                 summary: Some(result.summary),
@@ -1286,7 +1279,7 @@ impl TaskService {
             })?;
         let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
         crate::task_service::config::validate_agent_routing_snapshot(&executor_config)?;
-        if execution.role == crate::workflow::default_roles::REVIEWER
+        if execution.role == "reviewer"
             || matches!(
                 task.task_type.as_str(),
                 "planning" | "discovery" | "review" | "validation"
@@ -1380,89 +1373,20 @@ impl TaskService {
         execution: &Execution,
         max_turns: Option<u32>,
     ) -> Result<()> {
-        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
         let message = match max_turns {
             Some(limit) => format!("Execution stopped after reaching max_turns={limit}"),
             None => "Execution stopped after reaching max_turns".to_owned(),
         };
-        let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: api_types::FailureKind::MaxTurnsExceeded,
-            blocking_reason: "max_turns_exceeded".to_owned(),
-            blocked_by: Some(
-                api_types::Actor::system(api_types::SystemComponent::Executor).display(),
-            ),
-            blocked_at: Some(now_rfc3339()),
-            blocked_execution_id: Some(execution.id.clone()),
-            artifact: Some(api_types::BlockingArtifact {
-                kind: "execution".to_owned(),
-                id: Some(execution.id.clone()),
-                log_path: execution.logs_path.clone(),
-            }),
-            message: Some(message.clone()),
-            hook: None,
-            recovery_actions: vec![
-                api_types::RecoveryAction::ResetToInitial,
-                api_types::RecoveryAction::CancelTask,
-            ],
-        };
-        let blocked_meta = json!({
-            "reason": message,
-            "created_at": now_rfc3339(),
-            "kind": "max_turns_exceeded",
-            "execution_id": execution.id,
-        });
-        let updated = TaskRepo::update_status(
-            &*self.db,
-            db::UpdateTaskStatus {
-                id: task.id.clone(),
-                expected_version: task.version,
-                status: task.status,
-                assignee_id: None,
-                error_annotation: Some(Some(serde_json::to_string(&annotation).map_err(
-                    |error| {
-                        ServiceError::invalid_operation(format!(
-                            "failed to serialize max-turns annotation: {error}"
-                        ))
-                    },
-                )?)),
-                blocked_json: Some(Some(blocked_meta.to_string())),
-                failed_json: Some(None),
-                updated_at: now_rfc3339(),
-            },
+        self.annotate_execution_block(
+            execution,
+            api_types::FailureKind::MaxTurnsExceeded,
+            message,
+            None,
         )
-        .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            updated.id, updated.version
-        ))
-        .await;
-        self.publish(ForgeEvent {
-            event_type: "task.blocked".to_owned(),
-            entity_id: updated.id,
-            timestamp: event_timestamp(),
-            context: EventContext::TaskBlocked {
-                project_id: updated.project_id,
-                reason: "max_turns_exceeded".to_owned(),
-                kind: Some(api_types::FailureKind::MaxTurnsExceeded),
-                source: None,
-                execution_id: Some(execution.id.clone()),
-            },
-        });
-        Ok(())
+        .await
     }
 
     async fn resolve_max_turns(&self, task: &Task) -> Result<Option<u32>> {
-        if let Some(value) = task
-            .task_state_config
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-            .and_then(|value| max_turns_from_value(&value))
-        {
-            return Ok(Some(value));
-        }
-
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;

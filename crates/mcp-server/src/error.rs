@@ -218,9 +218,6 @@ impl From<ServiceError> for McpToolError {
             ServiceError::Git(error) => Self::new(-32603, "git error").with_data(json!({
                 "details": error.to_string()
             })),
-            ServiceError::Review(error) => Self::new(-32603, "review error").with_data(json!({
-                "details": error.to_string()
-            })),
             ServiceError::GuardRejection { guard, reason } => {
                 if reason.starts_with("SUBTASK_SEQUENCE_NOT_COMPLETE") {
                     Self::new(-32029, "subtask sequence is not complete").with_data(json!({

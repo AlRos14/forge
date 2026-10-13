@@ -53,12 +53,6 @@ impl ExecutionProvider for EmbeddedExecutionProvider {
                         .await;
                     return;
                 }
-                if let Err(error) = task_service
-                    .maybe_cascade_executor_completion(&execution_id)
-                    .await
-                {
-                    tracing::error!(%error, "embedded execution cascade failed");
-                }
             }
             .instrument(dispatch_span),
         );

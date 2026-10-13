@@ -10,8 +10,10 @@ Validation, Evidence, Gate, and TaskLifecycle records.
 Plan PR12 is a breaking public-surface change. Main/Project Agent, Product
 Genesis, Agent Chat, Attention, Charter, baseline, milestone governance,
 legacy review rows, workflow state, and native runtime controls are not
-operational REST resources. Their historical storage remains preserved for
-PR13. Unknown `/api/v1` paths return the normal API `404 not_found` response;
+operational REST resources. PR13 migrations V121–V132 removed their retired
+runtime schemas after exact-history cutovers; preserved records live only in
+dedicated immutable history and migration-ledger tables. Unknown `/api/v1`
+paths return the normal API `404 not_found` response;
 removed routes are not retained as aliases or `410` dispatchers. Request DTOs
 reject unknown legacy fields.
 
@@ -99,8 +101,9 @@ state-driven lifecycle hook settings are preserved as history but are no
 longer dispatched. Generic Project hook rules are a separate target surface.
 
 External issue integration secrets are accepted only on create/update and are
-never returned. Historical default-state and default-assignee columns remain
-unchanged for PR13, but do not control newly imported Tasks.
+never returned. Legacy integration default-state and singular-assignee values
+are no longer runtime columns; V123 preserves exact source values as migration
+provenance and active defaults use an exact `default_implementer` ActorRef.
 
 ## Tasks and TaskLifecycle
 
@@ -111,7 +114,7 @@ unchanged for PR13, but do not control newly imported Tasks.
 | `GET /tasks/{id}`, `PATCH /tasks/{id}`, `DELETE /tasks/{id}` | Read, update, or delete a Task. Updates require the Task `version`. |
 | `POST /tasks/{id}/subtasks/reorder` | Reorder exact child Task IDs. |
 | `GET /tasks/{id}/dependencies`, `POST /tasks/{id}/dependencies`, `DELETE /tasks/{id}/dependencies/{dep_id}`, `GET /tasks/{id}/dependents` | Read and update Task dependencies. |
-| `GET /tasks/{id}/workspace`, `POST /tasks/{id}/workspace/reset`, `GET /tasks/{id}/diff` | Read or reset the Task workspace, or inspect its current diff. |
+| `GET /tasks/{id}/workspace`, `GET /tasks/{id}/diff` | Read the Task integration workspace or inspect its current diff. Workspace mutation and recovery require an exact WorkUnit and Workspace identity. |
 | `GET /tasks/{id}/lifecycle` | Read the authoritative aggregate TaskLifecycle and its version. |
 | `POST /tasks/{id}/lifecycle` | Request a deterministic TaskLifecycle edge with `to_state`, `expected_lifecycle_version`, and `idempotency_key`; use `gate_evaluation_id` for an edge admitted by that exact evaluation. `reason_kind` and `reason_ref` must be supplied together, with non-empty values, or both omitted. |
 | `GET /tasks/{id}/lifecycle/transitions` | Read exact durable transition receipts and facts. |
@@ -132,18 +135,18 @@ move, detach, or delete those subtasks first. New attachments and reparents
 append at the next destination `subtask_order`; detach clears both fields. An
 ordinary Task update leaves the existing structure untouched.
 
-TaskLifecycle is aggregate progress. The database `task.status` column remains
-only as a one-way storage projection pending PR13; REST lists, filters, task
-responses, and transitions do not read it as authority. Workflow templates,
-workflow states, transition logs, and legacy GateConfig do not advance
-TaskLifecycle.
+TaskLifecycle is aggregate progress and the sole persisted Task state
+authority. V129 removed `task.status`, task state configuration, and entry
+barrier compatibility columns after archiving their exact values. Workflow
+templates, transition logs, and legacy GateConfig do not advance TaskLifecycle;
+their source records remain only in migration history where preserved.
 
 ## Executions and HarnessSessions
 
 | Method and path | Contract |
 | --- | --- |
 | `GET /tasks/{id}/executions` | List exact historical Task Executions. |
-| `POST /tasks/{id}/executions` | Start an Agent Execution. The request must name `agent_id`, exact `role`, `purpose`, unrewritten `prompt`, and optional exact `input_artifact_ids`. The Agent must be an active member of that TaskRole. A Task with WorkUnits is rejected until an explicit WorkUnit-scoped start is available. |
+| `POST /tasks/{id}/executions` | Start an Agent Execution from `work_unit_id` and `expected_work_unit_version`, with explicit `purpose`, `prompt`, and optional exact `input_artifact_ids` and overrides. Role and Actor come from the allocated WorkUnit. Repository execution prepares and binds that WorkUnit's exact isolated Workspace. |
 | `GET /executions/{id}` | Read one exact Execution, including its Actor, role, purpose, HarnessSession reference, frozen execution configuration, and workspace identity. |
 | `POST /executions/{id}/follow-up` | Create a child from the exact parent Execution. `agent_id` is required. A same-Agent continuation can reuse only the exact compatible HarnessSession; it never substitutes a current role member or latest Execution. |
 | `POST /executions/{id}/cancel` | Cancel the exact Execution. |
@@ -164,7 +167,7 @@ decision or satisfy a Gate.
 
 | Method and path | Contract |
 | --- | --- |
-| `POST /tasks/{id}/review-executions` | Start a Human Review Execution. The response names that exact Execution. |
+| `POST /tasks/{id}/review-executions` | Start a Human Review Execution. `workspace_id`, when supplied, must name the exact Ready Workspace to review; `null` starts a Workspace-free review and never selects a Task Workspace implicitly. The response names that exact Execution. |
 | `GET /tasks/{id}/review-executions` | List exact reviewer+review Executions and their ReviewReport Artifact outputs. |
 | `GET /review-executions/{id}` | Read one exact formal Review Execution and report. |
 | `POST /review-executions/{id}` | Submit a ReviewReport to that exact reviewer+review Execution. |
@@ -241,8 +244,10 @@ OAuth endpoints for MCP clients are `/oauth/register`, `/oauth/authorize`,
 ProjectRelease snapshots and pinned references. They do not recompute
 readiness, create or mutate a Release, or authorize current Gate or Task work.
 These are `HISTORICAL_READ_ONLY` and use the normal Project owner/member
-visibility rule, including public ownerless system Projects; physical Release
-storage remains for PR13.
+visibility rule, including public ownerless system Projects. The reader uses
+`project_release` plus self-contained `project_release_history_*` snapshots,
+shared media assets, and tombstones; it does not query Project OS tables or
+recompute a snapshot.
 
 ## Server-Sent Events
 

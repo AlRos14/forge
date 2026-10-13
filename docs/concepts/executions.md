@@ -27,18 +27,18 @@ The role is historical context, not an Actor subtype.
 
 ## Plan PR2 persistence
 
-The additive persistence shape currently stores `actor_kind` and `actor_id` as
-the physical form of `actor_ref`, plus one of these exact purposes:
+The current persistence stores `actor_kind` and `actor_id` as the physical
+form of `actor_ref`, plus one of these exact purposes:
 `plan`, `implement`, `review`, `validate`, `investigate`, `orchestrate`, or
 `general`. Purpose is supplied by the semantic creation path; it is not a
 permanent alias for a Role or for the transitional executor
 `permission_policy: plan` value.
 
-The old `execution.agent_id` and `execution.agent_session_id` columns remain
-nullable compatibility projections. For a new Agent Execution,
-`actor_ref = Agent(agent_id)` and the Agent id is projected to `agent_id`. A
-new Human Execution stores the real user id, has no Agent projection, and has
-no HarnessSession.
+`actor_kind` and `actor_id` are the canonical ActorRef. `execution.agent_id`
+remains an Agent-only lookup projection for Agent execution statistics;
+`execution.agent_session_id` was removed by V124 after exact provenance capture.
+A new Human Execution stores the real user id, has no Agent projection, and
+has no HarnessSession.
 
 ## Purpose and permission
 
@@ -78,8 +78,6 @@ In PR2, the continuity authority is:
 
 ~~~text
 Execution.harness_session_id -> HarnessSession -> external_session_id
-                                                     |
-                                      legacy agent_session_id projection
 ~~~
 
 The generic HarnessSession records the Agent, opaque harness kind, effective
@@ -88,9 +86,10 @@ and a small `pending`/`active`/`ended`/`failed` lifecycle. Its Agent and
 harness identity are immutable. A pending session is not resumable until an
 executor result supplies the external identity.
 
-Plan PR10 removed resume from a legacy `execution.agent_session_id` value
-without an explicit `harness_session_id`. Historical executions with only that
-projection remain readable and re-execute through a fresh Start.
+V124 copied old `execution.agent_session_id` values to immutable
+`pr13_execution_session_projection_history` and removed the field. Those
+values are never a Resume fallback. Without an exact reusable HarnessSession,
+the Execution cannot Resume; any new attempt needs its explicit target context.
 
 Plan PR3 snapshots effective `harness_capabilities` separately from the legacy
 Agent `capabilities_json` tags/filters. The historical HarnessSession snapshot

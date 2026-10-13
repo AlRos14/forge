@@ -65,12 +65,13 @@ pub struct ClaimTaskRequest {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct StartExecutionRequest {
-    pub agent_id: String,
-    pub role: String,
+    pub work_unit_id: String,
+    pub expected_work_unit_version: i64,
     pub purpose: ExecutionPurpose,
     pub prompt: String,
     #[serde(default)]
     pub input_artifact_ids: Vec<String>,
+    pub overrides: Option<ExecutionOverridesRequest>,
 }
 
 pub type ExecutionOverridesRequest = ClaimOverrides;

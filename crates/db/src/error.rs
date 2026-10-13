@@ -13,6 +13,9 @@ pub enum DbError {
     #[error("repository has associated tasks")]
     RepoInUse,
 
+    #[error("Project has immutable Releases")]
+    ProjectHasReleases,
+
     #[error("version conflict")]
     VersionConflict,
 
@@ -30,15 +33,6 @@ pub enum DbError {
 
     #[error("board revision conflict: expected {expected}, actual {actual}")]
     BoardRevisionConflict { expected: i64, actual: i64 },
-
-    #[error("move operation conflict: {operation_id}")]
-    MoveOperationConflict { operation_id: String },
-
-    #[error("move operation is incomplete: {operation_id}")]
-    MoveOperationIncomplete { operation_id: String },
-
-    #[error("invalid task move: {0}")]
-    InvalidTaskMove(String),
 
     #[error("invalid transition")]
     InvalidTransition,

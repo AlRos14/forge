@@ -787,7 +787,7 @@ mod tests {
             .bind(&now).bind(&now)
             .execute(db.pool()).await.unwrap();
 
-        sqlx::query("INSERT INTO project (id, name, settings, workflow_definition, created_at, updated_at) VALUES ('p1', 'proj1', '{}', '{}', ?, ?)")
+        sqlx::query("INSERT INTO project (id, name, settings, created_at, updated_at) VALUES ('p1', 'proj1', '{}', ?, ?)")
             .bind(&now).bind(&now)
             .execute(db.pool()).await.unwrap();
 

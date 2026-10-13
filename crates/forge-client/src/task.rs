@@ -45,9 +45,9 @@ pub enum TaskCmd {
     Execute {
         id: String,
         #[arg(long)]
-        agent_id: String,
+        work_unit_id: String,
         #[arg(long)]
-        role: String,
+        expected_work_unit_version: i64,
         #[arg(long, value_enum)]
         purpose: PurposeArg,
         #[arg(long)]
@@ -235,18 +235,19 @@ impl TaskArgs {
             }
             TaskCmd::Execute {
                 id,
-                agent_id,
-                role,
+                work_unit_id,
+                expected_work_unit_version,
                 purpose,
                 prompt,
                 input_artifact_ids,
             } => {
                 let request = StartExecutionRequest {
-                    agent_id: agent_id.clone(),
-                    role: role.clone(),
+                    work_unit_id: work_unit_id.clone(),
+                    expected_work_unit_version: *expected_work_unit_version,
                     purpose: (*purpose).into(),
                     prompt: prompt.clone(),
                     input_artifact_ids: input_artifact_ids.clone(),
+                    overrides: None,
                 };
                 let execution: ExecutionResponse = client
                     .post(&format!("/api/v1/tasks/{id}/executions"), &request)

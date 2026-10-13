@@ -366,30 +366,16 @@ mod tests {
     }
 
     #[test]
-    fn runtime_task_status_and_chat_hints_are_not_public() {
+    fn runtime_task_status_hint_is_not_public() {
         let task_status = events::ForgeEvent {
             event_type: "task.status_changed".to_owned(),
             entity_id: "task-1".to_owned(),
             timestamp: "2026-10-10T12:00:00Z".to_owned(),
-            context: events::EventContext::TaskStatusChanged {
+            context: events::EventContext::TaskUpdated {
                 project_id: "project-1".to_owned(),
-                old_status: "todo".to_owned(),
-                new_status: "in_progress".to_owned(),
             },
         };
         assert!(project_runtime_hint(&task_status).is_none());
-
-        let chat = events::ForgeEvent {
-            event_type: "agent_chat.turn_progress".to_owned(),
-            entity_id: "chat-1".to_owned(),
-            timestamp: "2026-10-10T12:00:00Z".to_owned(),
-            context: events::EventContext::AgentChatTurnProgress {
-                chat_id: "chat-1".to_owned(),
-                turn_job_id: "turn-1".to_owned(),
-                delta: "private model output".to_owned(),
-            },
-        };
-        assert!(project_runtime_hint(&chat).is_none());
     }
 
     #[test]
@@ -435,7 +421,6 @@ mod tests {
                 id: "private-project".to_owned(),
                 name: "Private".to_owned(),
                 settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
                 primary_repo_id: None,
                 owner_id: Some("owner-a".to_owned()),
                 created_at: now.clone(),
@@ -451,16 +436,13 @@ mod tests {
                 project_id: "private-project".to_owned(),
                 repo_id: None,
                 parent_task_id: None,
-                assignee_type: None,
-                assignee_id: None,
                 title: "Private Task".to_owned(),
                 description: None,
                 task_type: "implementation".to_owned(),
-                status: "todo".to_owned(),
+                lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
                 subtask_order: None,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now,

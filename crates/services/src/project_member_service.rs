@@ -227,7 +227,7 @@ mod tests {
     async fn seed_project(db: &SqliteDb, project_id: &str) {
         let now = now_rfc3339();
         sqlx::query(
-            "INSERT INTO project (id, name, settings, workflow_definition, owner_id, created_at, updated_at) VALUES (?, 'p', '{}', '{}', ?, ?, ?)",
+            "INSERT INTO project (id, name, settings, owner_id, created_at, updated_at) VALUES (?, 'p', '{}', ?, ?, ?)",
         )
         .bind(project_id)
         .bind("u_owner")

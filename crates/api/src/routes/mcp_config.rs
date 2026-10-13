@@ -925,7 +925,6 @@ command = "other"
                 id: project_id.clone(),
                 name: "Project".to_owned(),
                 settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
                 primary_repo_id: None,
                 owner_id: None,
                 created_at: now.clone(),

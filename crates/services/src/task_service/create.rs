@@ -1,5 +1,4 @@
 use super::*;
-use api_types::ActorRef;
 
 impl TaskService {
     #[allow(clippy::too_many_arguments)]
@@ -11,9 +10,8 @@ impl TaskService {
         parent_task_id: Option<String>,
         priority: Option<i64>,
         task_type: Option<String>,
-        task_state_config: Option<String>,
+        initial_lifecycle_state: Option<db::TaskLifecycleState>,
         merge_config: Option<Value>,
-        role_assignments: Option<Vec<api_types::InitialRoleAssignment>>,
     ) -> Result<Task> {
         self.create_task_inner(
             project_id,
@@ -22,9 +20,8 @@ impl TaskService {
             parent_task_id,
             priority,
             task_type,
-            task_state_config,
+            initial_lifecycle_state,
             merge_config,
-            role_assignments,
         )
         .await
     }
@@ -38,9 +35,8 @@ impl TaskService {
         parent_task_id: Option<String>,
         priority: Option<i64>,
         task_type: Option<String>,
-        task_state_config: Option<String>,
+        initial_lifecycle_state: Option<db::TaskLifecycleState>,
         merge_config: Option<Value>,
-        role_assignments: Option<Vec<api_types::InitialRoleAssignment>>,
     ) -> Result<Task> {
         let project_id = project_id.into();
         let title = title.into();
@@ -64,43 +60,6 @@ impl TaskService {
             ));
         }
         let now = now_rfc3339();
-        let validated_assignments = if let Some(ref assignments) = role_assignments {
-            let mut validated = Vec::with_capacity(assignments.len());
-            for assignment in assignments {
-                if db::canonical_task_role_name(&assignment.role_name).is_none() {
-                    return Err(ServiceError::invalid_operation(format!(
-                        "role is not a TaskRole: {}",
-                        assignment.role_name
-                    )));
-                }
-                let assignee_type: AssigneeKind = match assignment.assignee_type {
-                    api_types::assignee::AssigneeKind::Agent => AssigneeKind::Agent,
-                    api_types::assignee::AssigneeKind::User => AssigneeKind::User,
-                };
-                let assignee_id = assignment
-                    .assignee_id
-                    .clone()
-                    .filter(|id| !id.trim().is_empty())
-                    .ok_or_else(|| {
-                        ServiceError::invalid_operation(format!(
-                            "role assignment for '{}' requires assignee_id",
-                            assignment.role_name
-                        ))
-                    })?;
-                validated.push((assignment.role_name.clone(), assignee_type, assignee_id));
-            }
-            Some(validated)
-        } else {
-            None
-        };
-        if let Some(assignments) = validated_assignments.as_deref() {
-            for (_, assignee_type, assignee_id) in assignments {
-                if let Some(actor_ref) = actor_ref_for_assignment(assignee_type, assignee_id) {
-                    self.validate_actor_for_project(&project, &actor_ref)
-                        .await?;
-                }
-            }
-        }
         let metadata_json = if is_subtask {
             let metadata = TaskMetadata {
                 ..TaskMetadata::default()
@@ -136,22 +95,23 @@ impl TaskService {
         // New Task progress starts in the aggregate lifecycle directly. A
         // project workflow state name must not decide whether the Task is
         // ready, active, or blocked.
-        let initial_status = if no_repo { "backlog" } else { "todo" }.to_owned();
+        let lifecycle_state = initial_lifecycle_state.unwrap_or(if no_repo {
+            db::TaskLifecycleState::Backlog
+        } else {
+            db::TaskLifecycleState::Ready
+        });
         let create_task = CreateTask {
             id: new_uuid_v4(),
             project_id,
             repo_id,
             parent_task_id,
             subtask_order,
-            assignee_type: None,
-            assignee_id: None,
             title,
             description,
             task_type: effective_task_type,
-            status: initial_status,
+            lifecycle_state,
             is_automation: false,
             priority: priority.unwrap_or(0),
-            task_state_config,
             merge_config: serialize_config(merge_config)?,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -181,21 +141,6 @@ impl TaskService {
             task.metadata_json = metadata_json;
         }
 
-        if let Some(assignments) = validated_assignments {
-            for (role_name, assignee_type, assignee_id) in assignments {
-                self.assign_role_membership(CreateTaskRoleAssignment {
-                    id: new_uuid_v4(),
-                    task_id: task.id.clone(),
-                    role_name,
-                    assignee_type: Some(assignee_type),
-                    assignee_id: Some(assignee_id),
-                    created_at: now.clone(),
-                    updated_at: now.clone(),
-                })
-                .await?;
-            }
-        }
-
         self.publish(ForgeEvent {
             event_type: "task.created".to_owned(),
             entity_id: task.id.clone(),
@@ -216,7 +161,7 @@ impl TaskService {
         title: impl Into<String>,
         description: Option<String>,
         task_type: Option<String>,
-        task_state_config: Option<String>,
+        initial_lifecycle_state: Option<db::TaskLifecycleState>,
         merge_config: Option<Value>,
     ) -> Result<Task> {
         let project_id = project_id.into();
@@ -228,7 +173,11 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
         let repo_id = project.primary_repo_id.clone();
-        let initial_status = if repo_id.is_none() { "backlog" } else { "todo" }.to_owned();
+        let lifecycle_state = initial_lifecycle_state.unwrap_or(if repo_id.is_none() {
+            db::TaskLifecycleState::Backlog
+        } else {
+            db::TaskLifecycleState::Ready
+        });
 
         let now = now_rfc3339();
         let effective_task_type = task_type.unwrap_or_else(|| "implementation".to_owned());
@@ -238,15 +187,12 @@ impl TaskService {
             repo_id,
             parent_task_id: None,
             subtask_order: None,
-            assignee_type: None,
-            assignee_id: None,
             title,
             description,
             task_type: effective_task_type,
-            status: initial_status,
+            lifecycle_state,
             is_automation: true,
             priority: 0,
-            task_state_config,
             merge_config: serialize_config(merge_config)?,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -280,28 +226,15 @@ impl TaskService {
                 None,
                 Some(source.priority),
                 Some(source.task_type),
-                source.task_state_config,
+                None,
                 source
                     .merge_config
                     .as_deref()
                     .and_then(|s| serde_json::from_str(s).ok()),
-                None,
             )
             .await?;
         TaskRepo::get_by_id(&*self.db, &task.id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task.id))
-    }
-}
-
-fn actor_ref_for_assignment(assignee_type: &AssigneeKind, assignee_id: &str) -> Option<ActorRef> {
-    match assignee_type {
-        AssigneeKind::Agent => Some(ActorRef::Agent(assignee_id.to_owned())),
-        AssigneeKind::User if assignee_id != "human" => {
-            Some(ActorRef::Human(assignee_id.to_owned()))
-        }
-        // The pre-existing "human" project-settings sentinel is a bounded
-        // legacy/manual path, not a persisted ActorRef.
-        AssigneeKind::User => None,
     }
 }

@@ -13,7 +13,6 @@ async fn new_project_has_no_agent_chat_or_project_binding() {
             id: "project-without-agent-os".to_owned(),
             name: "Ordinary Project".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),
@@ -24,11 +23,14 @@ async fn new_project_has_no_agent_chat_or_project_binding() {
     .expect("ordinary Project creates");
 
     for table in ["agent_chat", "project_agent_binding"] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(db.pool())
-            .await
-            .expect("count retired rows");
-        assert_eq!(count, 0, "Project creation must not create {table}");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(db.pool())
+        .await
+        .expect("retired table presence query");
+        assert_eq!(count, 0, "PR13 drops {table} storage");
     }
 
     let denied = sqlx::query(
@@ -42,9 +44,4 @@ async fn new_project_has_no_agent_chat_or_project_binding() {
     .execute(db.pool())
     .await;
     assert!(denied.is_err(), "retired Chat writes fail at SQLite");
-    let chats: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat")
-        .fetch_one(db.pool())
-        .await
-        .expect("chat count after rejected write");
-    assert_eq!(chats, 0);
 }

@@ -1,15 +1,16 @@
 use crate::Result;
 use db::{
     new_uuid_v4, now_rfc3339, AgentListQuery, AgentRepo, AgentStatus, CreateAgent, CreateProject,
-    CreateRepo, CreateTask, CreateTaskRoleAssignment, DaemonRepo, DaemonStatus, PageRequest,
-    Project, ProjectRepo, Repo, RepoRepo, SortBy, SortOrder, SqliteDb, TaskRepo,
-    TaskRoleAssignmentRepo, UpdateDaemonReport, UpdateTask, UpsertDaemon,
+    CreateRepo, CreateRoleMembership, CreateTask, CreateTaskRole, DaemonRepo, DaemonStatus,
+    PageRequest, Project, ProjectRepo, Repo, RepoRepo, RoleMembershipRepo, SortBy, SortOrder,
+    SqliteDb, TaskLifecycleState, TaskRepo, TaskRoleRepo, UpdateDaemonReport, UpdateTask,
+    UpsertDaemon,
 };
 
 struct DemoTask {
     title: &'static str,
     description: &'static str,
-    status: &'static str,
+    lifecycle_state: TaskLifecycleState,
     priority: i64,
     error_annotation: Option<&'static str>,
 }
@@ -18,91 +19,91 @@ const DEMO_TASKS: &[DemoTask] = &[
     DemoTask {
         title: "Set up CI pipeline",
         description: "Configure GitHub Actions for lint, test, and build.",
-        status: "backlog",
+        lifecycle_state: TaskLifecycleState::Backlog,
         priority: 3,
         error_annotation: None,
     },
     DemoTask {
         title: "Add rate limiting to API",
         description: "Implement token-bucket rate limiting on public endpoints.",
-        status: "backlog",
+        lifecycle_state: TaskLifecycleState::Backlog,
         priority: 5,
         error_annotation: None,
     },
     DemoTask {
         title: "Design database schema for notifications",
         description: "Create tables for user notification preferences and delivery log.",
-        status: "todo",
+        lifecycle_state: TaskLifecycleState::Ready,
         priority: 7,
         error_annotation: None,
     },
     DemoTask {
         title: "Implement user settings page",
         description: "Build the frontend settings UI with theme toggle and profile editing.",
-        status: "todo",
+        lifecycle_state: TaskLifecycleState::Ready,
         priority: 5,
         error_annotation: None,
     },
     DemoTask {
         title: "Write integration tests for auth flow",
         description: "Cover login, token refresh, and logout with end-to-end tests.",
-        status: "todo",
+        lifecycle_state: TaskLifecycleState::Ready,
         priority: 6,
         error_annotation: None,
     },
     DemoTask {
         title: "Refactor error handling middleware",
         description: "Unify error responses across all API routes with proper status codes.",
-        status: "in_progress",
+        lifecycle_state: TaskLifecycleState::Active,
         priority: 8,
         error_annotation: None,
     },
     DemoTask {
         title: "Add WebSocket support for live updates",
         description: "Implement real-time task status notifications via WebSocket.",
-        status: "in_progress",
+        lifecycle_state: TaskLifecycleState::Active,
         priority: 7,
         error_annotation: None,
     },
     DemoTask {
         title: "Optimize database queries for task listing",
         description: "Add indexes and rewrite slow queries identified in profiling.",
-        status: "review",
+        lifecycle_state: TaskLifecycleState::Blocked,
         priority: 6,
         error_annotation: None,
     },
     DemoTask {
         title: "Fix pagination cursor encoding",
         description: "Cursor was double-encoding base64, causing 400 errors on page 2+.",
-        status: "review",
+        lifecycle_state: TaskLifecycleState::Blocked,
         priority: 9,
         error_annotation: None,
     },
     DemoTask {
         title: "Add dark mode support",
         description: "Implement CSS custom properties for theme switching.",
-        status: "done",
+        lifecycle_state: TaskLifecycleState::Done,
         priority: 4,
         error_annotation: None,
     },
     DemoTask {
         title: "Set up logging infrastructure",
         description: "Structured JSON logging with request ID propagation.",
-        status: "done",
+        lifecycle_state: TaskLifecycleState::Done,
         priority: 8,
         error_annotation: None,
     },
     DemoTask {
         title: "Initial project scaffolding",
         description: "Workspace structure, CI config, and dev tooling.",
-        status: "done",
+        lifecycle_state: TaskLifecycleState::Done,
         priority: 10,
         error_annotation: None,
     },
     DemoTask {
         title: "Migrate user sessions to Redis",
         description: "Move session storage from in-memory to Redis for horizontal scaling.",
-        status: "blocked",
+        lifecycle_state: TaskLifecycleState::Blocked,
         priority: 6,
         error_annotation: Some(
             r#"{"type":"workspace_reset_required","message":"workspace reset required: task branch no longer exists in repo"}"#,
@@ -111,7 +112,7 @@ const DEMO_TASKS: &[DemoTask] = &[
     DemoTask {
         title: "Upgrade OpenAPI spec generator",
         description: "Update codegen tooling to v4 for better TypeScript output.",
-        status: "blocked",
+        lifecycle_state: TaskLifecycleState::Blocked,
         priority: 4,
         error_annotation: Some(
             r#"{"type":"workspace_error","message":"workspace error: repository directory not found on disk"}"#,
@@ -147,7 +148,6 @@ async fn find_or_create_demo_project(db: &SqliteDb, now: &str) -> Result<Project
             id: new_uuid_v4(),
             name: "Demo".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.to_owned(),
@@ -284,12 +284,10 @@ async fn install_demo_tasks(
             project_id: project_id.to_owned(),
             q: None,
             lifecycle_states: Vec::new(),
-            statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: Vec::new(),
             assignee_ids: Vec::new(),
             priority: None,
-            include_archived: false,
             include_cancelled: false,
             include_deleted: false,
             page: page_request(),
@@ -304,7 +302,7 @@ async fn install_demo_tasks(
             continue;
         }
 
-        let is_active = matches!(demo_task.status, "in_progress" | "review");
+        let is_active = demo_task.lifecycle_state == TaskLifecycleState::Active;
 
         let task_id = new_uuid_v4();
         TaskRepo::create(
@@ -318,15 +316,12 @@ async fn install_demo_tasks(
                 // Demo data uses the same membership writer as normal Task
                 // creation.  The task-level fields are a projection, not an
                 // independent assignment source.
-                assignee_type: None,
-                assignee_id: None,
                 title: demo_task.title.to_owned(),
                 description: Some(demo_task.description.to_owned()),
                 task_type: "implementation".to_owned(),
-                status: demo_task.status.to_owned(),
+                lifecycle_state: demo_task.lifecycle_state,
                 is_automation: false,
                 priority: demo_task.priority,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.to_owned(),
                 updated_at: now.to_owned(),
@@ -335,14 +330,28 @@ async fn install_demo_tasks(
         .await?;
 
         if is_active {
-            TaskRoleAssignmentRepo::assign(
+            let task_role_id = new_uuid_v4();
+            TaskRoleRepo::create(
                 db,
-                CreateTaskRoleAssignment {
-                    id: new_uuid_v4(),
+                CreateTaskRole {
+                    id: task_role_id.clone(),
                     task_id: task_id.clone(),
-                    role_name: "coder".to_owned(),
-                    assignee_type: Some(db::AssigneeKind::Agent),
-                    assignee_id: Some(agent_id.to_owned()),
+                    role: "implementer".to_owned(),
+                    coordination_mode: None,
+                    policy_json: "{}".to_owned(),
+                    created_at: now.to_owned(),
+                    updated_at: now.to_owned(),
+                },
+            )
+            .await?;
+            RoleMembershipRepo::add(
+                db,
+                CreateRoleMembership {
+                    id: new_uuid_v4(),
+                    task_role_id,
+                    actor_kind: db::ActorKind::Agent,
+                    actor_id: agent_id.to_owned(),
+                    status: db::RoleMembershipStatus::Active,
                     created_at: now.to_owned(),
                     updated_at: now.to_owned(),
                 },
@@ -363,7 +372,6 @@ async fn install_demo_tasks(
                     error_annotation: Some(Some(annotation.to_owned())),
                     blocked_json: None,
                     failed_json: None,
-                    task_state_config: None,
                     parent_task_id: None,
                     updated_at: now.to_owned(),
                 },
@@ -465,12 +473,10 @@ mod tests {
                     project_id: project_id.clone(),
                     q: None,
                     lifecycle_states: Vec::new(),
-                    statuses: vec![status.to_owned()],
                     agent_ids: Vec::new(),
                     assignee_types: Vec::new(),
                     assignee_ids: Vec::new(),
                     priority: None,
-                    include_archived: false,
                     include_cancelled: false,
                     include_deleted: false,
                     page: page_request(),

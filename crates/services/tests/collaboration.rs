@@ -1,15 +1,13 @@
 use std::sync::Arc;
 
 use db::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ActorKind,
-    AgentChatMessageAuthorType, AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo,
-    AgentHandoffRepo, AgentRepo, AgentStatus, ArtifactKind, ArtifactStorageKind, CollaborationRepo,
-    CollaborationTarget, CoordinationMode, CreateAgentChatMessage, CreateAgentHandoff,
-    CreateAgentIdentity, CreateAgentProfile, CreateArtifact, CreateDomainEvent,
-    CreateProjectDecision, CreateRoleMembership, CreateTaskRole, CreateWorkspace, DecisionOutcome,
-    DomainEventRepo, HandoffIntent, HandoffStatus, ProjectOrchestrationRepo, ProjectRepo,
-    ProposalTarget, ProposalTargetKind, RoleMembershipRepo, RoleMembershipStatus, SqliteDb,
-    TaskRoleRepo, UserRepo, WorkspaceRepo, WorkspaceStatus,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ActorKind, AgentRepo,
+    AgentStatus, ArtifactKind, ArtifactStorageKind, CollaborationRepo, CollaborationTarget,
+    CoordinationMode, CreateAgentIdentity, CreateAgentProfile, CreateArtifact, CreateDomainEvent,
+    CreateRoleMembership, CreateTaskRole, CreateWorkspace, DecisionOutcome, DomainEventRepo,
+    HandoffIntent, HandoffStatus, ProjectRepo, ProposalTarget, ProposalTargetKind,
+    RoleMembershipRepo, RoleMembershipStatus, SqliteDb, TaskRoleRepo, UserRepo, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use events::EventBus;
 use services::{
@@ -913,11 +911,14 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
         "agent_handoff",
         "project_decision",
     ] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {legacy_table}"))
-            .fetch_one(f.db.pool())
-            .await
-            .expect("legacy table exists");
-        assert_eq!(count, 0, "generic writers do not dual-write {legacy_table}");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(legacy_table)
+        .fetch_one(f.db.pool())
+        .await
+        .expect("legacy table presence query");
+        assert_eq!(count, 0, "PR13 removes legacy table {legacy_table}");
     }
 
     ProjectRepo::delete(&*f.db, &f.project_id)
@@ -2517,128 +2518,4 @@ async fn collaboration_message_cursor_pages_stably_through_timestamp_ties() {
     .await
     .expect_err("invalid cursor is rejected");
     assert!(matches!(invalid_cursor, db::DbError::InvalidCursor));
-}
-
-#[tokio::test]
-async fn project_os_legacy_writers_do_not_project_into_generic_collaboration() {
-    let f = fixture().await;
-    let now = now_rfc3339();
-    let main_chat = AgentChatRepo::get_main_chat(&*f.db, &f.user_id)
-        .await
-        .expect("legacy Main Agent Chat lookup")
-        .expect("legacy Main Agent Chat exists");
-    let project_chat = AgentChatRepo::get_project_chat(&*f.db, &f.project_id)
-        .await
-        .expect("legacy Project Agent Chat lookup")
-        .expect("legacy Project Agent Chat exists");
-    AgentChatMessageRepo::append_agent_chat_message(
-        &*f.db,
-        CreateAgentChatMessage {
-            id: "pr4-legacy-chat-message".to_owned(),
-            chat_id: main_chat.id.clone(),
-            sequence: 1,
-            author_type: AgentChatMessageAuthorType::User,
-            author_id: Some(f.user_id.clone()),
-            content: "legacy Agent Chat message".to_owned(),
-            content_guard_json: "{}".to_owned(),
-            sensitivity: "internal".to_owned(),
-            status: AgentChatMessageStatus::Complete,
-            outcome: None,
-            model: None,
-            profile_id: None,
-            session_id: None,
-            context_manifest_id: None,
-            token_usage_json: None,
-            duration_ms: None,
-            error: None,
-            correlation_id: "pr4-legacy-chat-correlation".to_owned(),
-            causation_id: None,
-            handoff_id: None,
-            source_type: "native".to_owned(),
-            source_id: None,
-            source_message_id: None,
-            source_room_id: None,
-            source_conversation_id: None,
-            source_sequence: None,
-            source_metadata_json: "{}".to_owned(),
-            created_at: now.clone(),
-        },
-    )
-    .await
-    .expect("legacy Agent Chat message writer");
-    AgentHandoffRepo::create_agent_handoff(
-        &*f.db,
-        CreateAgentHandoff {
-            id: "pr4-legacy-agent-handoff".to_owned(),
-            source_chat_id: main_chat.id,
-            target_chat_id: project_chat.id,
-            source_message_id: None,
-            source_turn_job_id: None,
-            author_identity_id: None,
-            content: "legacy Agent Handoff".to_owned(),
-            content_guard_json: "{}".to_owned(),
-            source_revisions_json: "[]".to_owned(),
-            correlation_id: "pr4-legacy-handoff-correlation".to_owned(),
-            causation_id: None,
-            dedupe_key: "pr4-legacy-handoff-dedupe".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("legacy Agent Handoff writer");
-
-    let project = ProjectRepo::get_by_id(&*f.db, &f.project_id)
-        .await
-        .expect("Project lookup")
-        .expect("Project exists");
-    ProjectOrchestrationRepo::append_project_decision(
-        &*f.db,
-        CreateProjectDecision {
-            id: "pr4-legacy-project-decision".to_owned(),
-            project_id: f.project_id.clone(),
-            expected_project_version: project.version,
-            state: "active".to_owned(),
-            decision_class: "project_implementation".to_owned(),
-            question: "legacy Project Decision".to_owned(),
-            context_json: "{}".to_owned(),
-            options_json: "[]".to_owned(),
-            selected_outcome: "keep-legacy".to_owned(),
-            rationale: "legacy decision writer".to_owned(),
-            principal_type: "human".to_owned(),
-            principal_id: f.user_id.clone(),
-            authority_basis: "explicit-user-choice".to_owned(),
-            authorization_action: "project.decision.record".to_owned(),
-            explicit_event: "legacy-explicit-event".to_owned(),
-            authorization_occurred_at: now.clone(),
-            charter_revision_id: None,
-            baseline_revision_id: None,
-            source_refs_json: "[]".to_owned(),
-            affected_records_json: "{}".to_owned(),
-            supersedes_decision_id: None,
-            created_at: now,
-        },
-    )
-    .await
-    .expect("legacy Project Decision writer");
-
-    let legacy_counts = [
-        ("agent_chat_message", "agent_chat_message"),
-        ("agent_handoff", "agent_handoff"),
-        ("project_decision", "project_decision"),
-    ];
-    for (table, _) in legacy_counts {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(f.db.pool())
-            .await
-            .expect("legacy rows remain written");
-        assert_eq!(count, 1, "legacy production writer populated {table}");
-    }
-    for table in ["artifact", "message", "handoff", "proposal", "decision"] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(f.db.pool())
-            .await
-            .expect("generic table exists");
-        assert_eq!(count, 0, "legacy writer did not project to generic {table}");
-    }
 }

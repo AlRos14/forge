@@ -2,177 +2,9 @@ use super::super::*;
 use crate::ProjectMemberService;
 use api_types::ActorRef;
 use db::{
-    CoordinationMode, CreateProjectMember, ProjectMemberRepo, RoleMembershipRepo, TaskRoleRepo,
+    CoordinationMode, CreateProjectMember, ProjectMemberRepo, RoleMembershipRepo,
+    TaskLifecycleRepo, TaskRoleRepo,
 };
-
-#[tokio::test]
-async fn reassign_role_updates_assignment_and_emits_event() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let _ = rx.recv().await.expect("initial event emits");
-
-    let updated = service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_b.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("role reassignment succeeds");
-
-    assert_eq!(updated.assignee_type, Some(db::AssigneeKind::Agent));
-    assert_eq!(updated.assignee_id.as_deref(), Some(agent_b.as_str()));
-    let event = rx.recv().await.expect("reassignment event emits");
-    assert_eq!(event.event_type, "task.role_reassigned");
-    assert_eq!(event.entity_id, task.id);
-}
-
-#[tokio::test]
-async fn reassign_role_cancels_running_active_executor() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let execution_id = new_uuid_v4();
-    let now = now_rfc3339();
-    ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: execution_id.clone(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_a),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: "executor".to_owned(),
-            status: ExecutionStatus::Running,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("execution creates");
-
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_b), None),
-            false,
-            false,
-        )
-        .await
-        .expect("role reassignment succeeds");
-    let execution = ExecutionRepo::get_by_id(&*db, &execution_id)
-        .await
-        .expect("execution loads")
-        .expect("execution exists");
-    assert_eq!(execution.status, ExecutionStatus::Cancelled);
-    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(task_after.status, "todo");
-    let transition_logs = TransitionLogRepo::list_by_task(&*db, &task.id)
-        .await
-        .expect("transition logs load");
-    assert!(transition_logs.iter().any(|log| {
-        log.from_state == "in_progress"
-            && log.to_state == "todo"
-            && log.triggered_by == "user:reassignment"
-            && log.trigger_reason == "coder reassigned"
-            && !log.rejection
-    }));
-}
-
-#[tokio::test]
-async fn user_transition_cancels_running_active_executor_before_status_change() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let execution = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
-
-    let result = service
-        .transition(task.id.clone(), "review".to_owned(), (task.version, None))
-        .await
-        .expect("user transition succeeds");
-
-    assert_eq!(result.task.status, "review");
-    let execution_after = ExecutionRepo::get_by_id(&*db, &execution.id)
-        .await
-        .expect("execution loads")
-        .expect("execution exists");
-    assert_eq!(execution_after.status, ExecutionStatus::Cancelled);
-    assert_eq!(
-        execution_after.error.as_deref(),
-        Some("cancelled by user transition")
-    );
-
-    let mut relevant_events = Vec::new();
-    for _ in 0..8 {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .expect("event emits")
-            .expect("event bus receives");
-        if event.event_type == "task.execution_cancelled"
-            || event.event_type == "task.status_changed"
-        {
-            relevant_events.push(event.event_type);
-        }
-        if relevant_events.len() == 2 {
-            break;
-        }
-    }
-    assert_eq!(
-        relevant_events,
-        vec![
-            "task.execution_cancelled".to_owned(),
-            "task.status_changed".to_owned()
-        ]
-    );
-}
 
 #[tokio::test]
 async fn cancel_execution_invokes_task_executor_cancel() {
@@ -182,7 +14,7 @@ async fn cancel_execution_invokes_task_executor_cancel() {
     let service = TaskService::new(Arc::clone(&db), event_bus).with_task_executor(executor.clone());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let execution = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
 
     service
@@ -202,7 +34,7 @@ async fn cancel_task_cancels_running_execution() {
     let service = TaskService::new(Arc::clone(&db), event_bus).with_task_executor(executor.clone());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let execution = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
 
     let cancelled_task = service
@@ -210,7 +42,11 @@ async fn cancel_task_cancels_running_execution() {
         .await
         .expect("task cancels");
 
-    assert_eq!(cancelled_task.status, "cancelled");
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &cancelled_task.id)
+        .await
+        .expect("TaskLifecycle loads")
+        .expect("TaskLifecycle exists");
+    assert_eq!(lifecycle.state, db::TaskLifecycleState::Cancelled);
     let cancelled = executor.cancelled.lock().expect("cancel log lock").clone();
     assert_eq!(cancelled, vec![execution.id.clone()]);
     let execution_after = ExecutionRepo::get_by_id(&*db, &execution.id)
@@ -218,178 +54,6 @@ async fn cancel_task_cancels_running_execution() {
         .expect("execution loads")
         .expect("execution exists");
     assert_eq!(execution_after.status, ExecutionStatus::Cancelled);
-}
-
-#[tokio::test]
-async fn run_execution_rechecks_cancelled_status_before_adapter_launch() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let locks = Arc::new(WorkspaceExecutionLockManager::new());
-    let executor = Arc::new(CountingExecutor::default());
-    let service = TaskService::new(Arc::clone(&db), event_bus)
-        .with_task_executor(executor.clone())
-        .with_workspace_exec_locks(Arc::clone(&locks));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 2 WHERE id = ?")
-        .bind(&agent_id)
-        .execute(db.pool())
-        .await
-        .expect("agent capacity updates");
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let workspace_root = TempDir::new().expect("workspace root creates");
-    let workspace_id = seed_workspace_for_task(&db, &task, workspace_root.path()).await;
-    let execution = {
-        let now = now_rfc3339();
-        service
-            .create_running_execution(
-                db::CreateExecution {
-                    id: new_uuid_v4(),
-                    task_id: task.id.clone(),
-                    agent_id: Some(agent_id),
-                    actor_ref: None,
-                    purpose: None,
-                    harness_session_id: None,
-                    role: "executor".to_owned(),
-                    status: ExecutionStatus::Running,
-                    stop_reason: None,
-                    stopped_by: None,
-                    resume_policy: None,
-                    stopped_at: None,
-                    parent_execution_id: None,
-                    agent_session_id: None,
-                    agent_message_id: None,
-                    last_activity_at: None,
-                    summary: Some("echo should-not-run".to_owned()),
-                    logs_path: None,
-                    before_sha: None,
-                    after_sha: None,
-                    error: None,
-                    executor_config_snapshot_json: Some(
-                        r#"{"executor_type":"shell","config":{}}"#.to_owned(),
-                    ),
-                    workspace_id: Some(workspace_id.clone()),
-                    created_at: now.clone(),
-                    updated_at: now,
-                },
-                false,
-            )
-            .await
-            .expect("lease-backed execution creates")
-    };
-    let guard = locks.acquire(&workspace_id).await;
-    let service_for_run = service.clone();
-    let executor_for_run = executor.clone();
-    let execution_id = execution.id.clone();
-    let run = tokio::spawn(async move {
-        service_for_run
-            .run_execution(execution_id, executor_for_run.as_ref())
-            .await
-    });
-    wait_until_execution_has_logs_path(&db, &execution.id).await;
-
-    service
-        .cancel_task(task.id.clone())
-        .await
-        .expect("task cancels while execution waits");
-    drop(guard);
-
-    let updated = run.await.expect("run joins").expect("run succeeds");
-    assert_eq!(updated.status, ExecutionStatus::Cancelled);
-    assert_eq!(
-        executor.calls.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "adapter must not launch after the execution was cancelled"
-    );
-}
-
-#[tokio::test]
-async fn system_transition_does_not_cancel_running_active_executor() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let execution = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
-
-    service
-        .transition(task.id.clone(), "review".to_owned(), task.version)
-        .await
-        .expect("system transition succeeds");
-
-    let execution_after = ExecutionRepo::get_by_id(&*db, &execution.id)
-        .await
-        .expect("execution loads")
-        .expect("execution exists");
-    assert_eq!(execution_after.status, ExecutionStatus::Running);
-    assert_eq!(execution_after.error, None);
-}
-
-#[tokio::test]
-async fn reassign_role_rejects_terminal_task() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "done".to_owned()).await;
-
-    let error = service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_id), None),
-            false,
-            false,
-        )
-        .await
-        .expect_err("terminal reassignment rejects");
-
-    assert!(matches!(error, ServiceError::InvalidOperation { .. }));
-}
-
-#[tokio::test]
-async fn reassign_role_same_assignee_does_not_emit_event() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_id.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let _ = rx.recv().await.expect("initial event emits");
-
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_id), None),
-            false,
-            false,
-        )
-        .await
-        .expect("same role assignment succeeds");
-
-    let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
-        .await
-        .expect("TaskRole loads")
-        .expect("TaskRole exists");
-    let memberships = RoleMembershipRepo::list_by_role(&*db, &role.id, true)
-        .await
-        .expect("membership history loads");
-    assert_eq!(
-        memberships.len(),
-        1,
-        "same assignment must not create history"
-    );
-    assert_eq!(memberships[0].status, db::RoleMembershipStatus::Active);
-
-    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -406,7 +70,7 @@ async fn authoritative_memberships_preserve_multi_actor_cross_role_and_human_par
         .execute(db.pool())
         .await
         .expect("project owner updates");
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
 
     for role in ["planner", "orchestrator", "reviewer"] {
         service
@@ -487,7 +151,7 @@ async fn membership_lifecycle_ends_one_member_without_removing_another() {
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     service
         .create_task_role(
             &task.id,
@@ -557,7 +221,7 @@ async fn unusable_first_agent_does_not_hide_later_usable_membership() {
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     service
         .create_task_role(
             &task.id,
@@ -607,94 +271,6 @@ async fn unusable_first_agent_does_not_hide_later_usable_membership() {
 }
 
 #[tokio::test]
-async fn membership_does_not_transfer_workspace_lease_authority() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let workspace_root = TempDir::new().expect("workspace root creates");
-    let service = TaskService::new(Arc::clone(&db), event_bus)
-        .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
-        .await
-        .expect("TaskRole loads")
-        .expect("TaskRole exists");
-    service
-        .update_task_role(
-            &task.id,
-            "implementer",
-            role.version,
-            Some(CoordinationMode::Collaborative),
-            None,
-        )
-        .await
-        .expect("coordination mode updates");
-    service
-        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_b.clone()))
-        .await
-        .expect("second membership creates");
-    let workspace_id = seed_workspace_for_task(&db, &task, workspace_root.path()).await;
-    let now = now_rfc3339();
-    let execution = service
-        .create_running_execution(
-            db::CreateExecution {
-                id: new_uuid_v4(),
-                task_id: task.id.clone(),
-                agent_id: Some(agent_a.clone()),
-                actor_ref: None,
-                purpose: None,
-                harness_session_id: None,
-                role: "coder".to_owned(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: Some(
-                    r#"{"executor_type":"shell","config":{}}"#.to_owned(),
-                ),
-                workspace_id: Some(workspace_id.clone()),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-            false,
-        )
-        .await
-        .expect("Agent A execution and lease create");
-    let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
-        .await
-        .expect("workspace loads")
-        .expect("workspace exists");
-
-    let result = service
-        .verify_active_workspace_lease(&task, &workspace, "coder", Some(&agent_b), &execution.id)
-        .await;
-    assert!(
-        result.is_err(),
-        "membership alone must not transfer A's lease to B"
-    );
-}
-
-#[tokio::test]
 async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_independently() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
@@ -702,7 +278,7 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     service
         .create_task_role(
             &task.id,
@@ -827,7 +403,6 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             harness_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
@@ -878,6 +453,32 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
     let (unit_b, workspace_b, execution_b) =
         create_running_work_unit(&db, &service, &task, &repo_id, &agent_b, &now).await;
     assert_ne!(workspace_a.id, workspace_b.id);
+    let execution_count_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Task Execution count loads");
+    let recovery = service
+        .recover_task(
+            task.id.clone(),
+            api_types::RecoveryAction::ResumeSession,
+            None,
+            None,
+        )
+        .await
+        .expect_err("Task recovery cannot infer one target from multiple WorkUnits");
+    assert!(recovery
+        .to_string()
+        .contains("no blocking recovery annotation"));
+    let execution_count_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Task Execution count reloads");
+    assert_eq!(execution_count_after, execution_count_before);
+
     let lease_a = db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &unit_a.id)
         .await
         .expect("A lease loads")
@@ -941,7 +542,6 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
         resume_policy: None,
         stopped_at: None,
         parent_execution_id: None,
-        agent_session_id: None,
         harness_session_id: None,
         agent_message_id: None,
         last_activity_at: None,
@@ -997,7 +597,7 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            agent_session_id: None,
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -1037,7 +637,7 @@ async fn actor_validation_requires_project_human_and_rejects_sentinel() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let human_id = seed_human_user(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     service
         .create_task_role(
             &task.id,
@@ -1141,7 +741,7 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
         .await
         .expect("Agent pauses");
 
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     for role in ["planner", "implementer", "reviewer", "orchestrator"] {
         service
             .create_task_role(
@@ -1180,7 +780,7 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
 }
 
 #[tokio::test]
-async fn task_creation_rejects_invalid_explicit_actor_before_task_insert() {
+async fn invalid_actor_cannot_join_a_target_task_role() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -1205,38 +805,40 @@ async fn task_creation_rejects_invalid_explicit_actor_before_task_insert() {
     .await
     .expect("outsider Agent scope updates");
 
-    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
-        .bind(&project_id)
-        .fetch_one(db.pool())
-        .await
-        .expect("task count loads");
-    let result = service
+    let task = service
         .create_task(
             project_id.clone(),
-            "reject invalid explicit Actor",
+            "explicit membership validation",
             None,
             None,
             None,
             None,
             None,
             None,
-            Some(vec![api_types::InitialRoleAssignment {
-                role_name: "coder".to_owned(),
-                assignee_type: api_types::assignee::AssigneeKind::Agent,
-                assignee_id: Some(invalid_agent),
-            }]),
         )
-        .await;
-    assert!(result.is_err());
-    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
-        .bind(&project_id)
-        .fetch_one(db.pool())
         .await
-        .expect("task count loads");
-    assert_eq!(
-        after, before,
-        "invalid explicit Actor must not persist a Task"
-    );
+        .expect("Task is independent of membership changes");
+    service
+        .create_task_role(
+            &task.id,
+            "implementer",
+            CoordinationMode::Independent,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("target TaskRole creates");
+    assert!(service
+        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(invalid_agent))
+        .await
+        .is_err());
+    let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
+        .await
+        .expect("TaskRole lookup succeeds")
+        .expect("TaskRole is present");
+    assert!(RoleMembershipRepo::list_by_role(&*db, &role.id, false)
+        .await
+        .expect("membership list loads")
+        .is_empty());
 }
 
 #[tokio::test]
@@ -1265,7 +867,6 @@ async fn task_creation_ignores_legacy_project_role_defaults() {
         .create_task(
             project_id.clone(),
             "ordinary Task ignores old defaults",
-            None,
             None,
             None,
             None,
@@ -1307,850 +908,6 @@ async fn task_creation_ignores_legacy_project_role_defaults() {
 }
 
 #[tokio::test]
-async fn legacy_singleton_mutations_cannot_collapse_multi_member_role() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(32));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let agent_c = seed_agent_with_executor_type(&db, "cursor", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial singleton assignment succeeds");
-    service
-        .update_task_role(
-            &task.id,
-            "implementer",
-            1,
-            Some(CoordinationMode::Collaborative),
-            None,
-        )
-        .await
-        .expect("coordination mode updates");
-    service
-        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_b))
-        .await
-        .expect("second membership creates");
-
-    let execution = seed_running_coder_execution(&db, &task.id, Some(agent_a), None).await;
-
-    let reassignment = service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_c), None),
-            false,
-            false,
-        )
-        .await;
-    assert!(matches!(reassignment, Err(ServiceError::Conflict(_))));
-    let execution_after_reassign = ExecutionRepo::get_by_id(&*db, &execution.id)
-        .await
-        .expect("execution loads")
-        .expect("execution exists");
-    assert_eq!(execution_after_reassign.status, ExecutionStatus::Running);
-    let removal = service.remove_role(&task.id, "coder", false, false).await;
-    assert!(matches!(removal, Err(ServiceError::Conflict(_))));
-    let execution_after_remove = ExecutionRepo::get_by_id(&*db, &execution.id)
-        .await
-        .expect("execution loads")
-        .expect("execution exists");
-    assert_eq!(execution_after_remove.status, ExecutionStatus::Running);
-}
-
-#[tokio::test]
-async fn invalid_legacy_reassignment_preserves_running_execution() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let valid_agent = seed_agent(&db).await;
-    let outsider = seed_human_user(&db).await;
-    let invalid_agent = seed_agent(&db).await;
-    sqlx::query(
-        "UPDATE agent_identity
-         SET visibility = 'account', owner_id = ?
-         WHERE id = ?",
-    )
-    .bind(&outsider)
-    .bind(&invalid_agent)
-    .execute(db.pool())
-    .await
-    .expect("outsider Agent scope updates");
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(valid_agent.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial singleton assignment succeeds");
-    let execution = seed_running_coder_execution(&db, &task.id, Some(valid_agent), None).await;
-
-    let result = service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(invalid_agent), None),
-            false,
-            false,
-        )
-        .await;
-    assert!(result.is_err());
-    let execution_after = ExecutionRepo::get_by_id(&*db, &execution.id)
-        .await
-        .expect("execution loads")
-        .expect("execution exists");
-    assert_eq!(execution_after.status, ExecutionStatus::Running);
-}
-
-#[tokio::test]
-async fn membership_projection_failure_rolls_back_authority_and_projection() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial assignment succeeds");
-    let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
-        .await
-        .expect("TaskRole loads")
-        .expect("TaskRole exists");
-    service
-        .update_task_role(
-            &task.id,
-            "implementer",
-            role.version,
-            Some(CoordinationMode::Collaborative),
-            None,
-        )
-        .await
-        .expect("coordination mode updates");
-    sqlx::query(
-        "CREATE TRIGGER fail_role_projection
-         BEFORE UPDATE ON task_role_assignment
-         WHEN NEW.task_id = OLD.task_id
-         BEGIN SELECT RAISE(ABORT, 'forced projection failure'); END",
-    )
-    .execute(db.pool())
-    .await
-    .expect("projection failure trigger creates");
-
-    let result = service
-        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_b))
-        .await;
-    assert!(result.is_err());
-    let current = RoleMembershipRepo::list_by_role(&*db, &role.id, false)
-        .await
-        .expect("memberships load");
-    assert_eq!(current.len(), 1);
-    assert_eq!(current[0].actor_id, agent_a);
-    let projection = db::TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &task.id, "coder")
-        .await
-        .expect("projection loads")
-        .expect("projection exists");
-    assert_eq!(projection.assignee_id.as_deref(), Some(agent_a.as_str()));
-}
-
-#[tokio::test]
-async fn reassign_coder_clears_review_passed_at_on_non_running_task() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let _ = next_role_reassigned_event(&mut rx).await;
-    TaskRepo::set_review_passed_at(
-        &*db,
-        &task.id,
-        Some("2026-04-10T00:00:00Z".to_owned()),
-        &now_rfc3339(),
-    )
-    .await
-    .expect("review_passed_at seeds");
-
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_b), None),
-            false,
-            false,
-        )
-        .await
-        .expect("role reassignment succeeds");
-
-    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert!(task_after.review_passed_at.is_none());
-    let event = next_role_reassigned_event(&mut rx).await;
-    match event.context {
-        EventContext::TaskRoleReassigned {
-            reset_workspace,
-            reset_worktree,
-            transitioned_to_todo,
-            triggered_cancellation,
-            ..
-        } => {
-            assert!(!reset_workspace);
-            assert!(!reset_worktree);
-            assert!(!transitioned_to_todo);
-            assert!(!triggered_cancellation);
-        }
-        other => panic!("unexpected event context: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn reassign_mid_exec_coder_with_reset_worktree_flag_in_event() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let workspace_root = TempDir::new().expect("workspace root creates");
-    let service = TaskService::new(Arc::clone(&db), event_bus)
-        .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let _ = next_role_reassigned_event(&mut rx).await;
-    seed_running_coder_execution(&db, &task.id, Some(agent_a), None).await;
-
-    let result = service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_b), None),
-            false,
-            true,
-        )
-        .await;
-
-    match result {
-        Ok(_) => {
-            let event = next_role_reassigned_event(&mut rx).await;
-            match event.context {
-                EventContext::TaskRoleReassigned {
-                    reset_workspace,
-                    reset_worktree,
-                    transitioned_to_todo,
-                    triggered_cancellation,
-                    ..
-                } => {
-                    assert!(!reset_workspace);
-                    assert!(reset_worktree);
-                    assert!(transitioned_to_todo);
-                    assert!(triggered_cancellation);
-                }
-                other => panic!("unexpected event context: {other:?}"),
-            }
-        }
-        Err(ServiceError::InvalidOperation { message })
-            if message.contains("worktree") || message.contains("workspace") =>
-        {
-            // This unit test does not build a real Forge worktree. The current reset_worktree
-            // path reaches WorkspaceManager and reports the missing workspace infrastructure.
-            assert!(message.contains("workspace"));
-        }
-        Err(error) => panic!("unexpected reassignment result: {error:?}"),
-    }
-}
-
-#[tokio::test]
-async fn reassign_coder_with_workspace_allows_reset_workspace() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let workspace_root = TempDir::new().expect("workspace root creates");
-    let cleanup_scheduler = Arc::new(WorkspaceCleanupScheduler::new(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-        workspace_root.path().to_path_buf(),
-    ));
-    let service =
-        TaskService::new(Arc::clone(&db), event_bus).with_cleanup_scheduler(cleanup_scheduler);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let _ = next_role_reassigned_event(&mut rx).await;
-    let workspace_id = seed_workspace_for_task(&db, &task, workspace_root.path()).await;
-    seed_running_coder_execution(&db, &task.id, Some(agent_a), Some(workspace_id)).await;
-
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_b), None),
-            true,
-            false,
-        )
-        .await
-        .expect("coder reassignment succeeds");
-
-    let event = next_role_reassigned_event(&mut rx).await;
-    match event.context {
-        EventContext::TaskRoleReassigned {
-            reset_workspace,
-            reset_worktree,
-            transitioned_to_todo,
-            triggered_cancellation,
-            ..
-        } => {
-            assert!(reset_workspace);
-            assert!(!reset_worktree);
-            assert!(transitioned_to_todo);
-            assert!(triggered_cancellation);
-        }
-        other => panic!("unexpected event context: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn reassign_coder_with_workspace_allows_both_reset_flags() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let workspace_root = TempDir::new().expect("workspace root creates");
-    let cleanup_scheduler = Arc::new(WorkspaceCleanupScheduler::new(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-        workspace_root.path().to_path_buf(),
-    ));
-    let service =
-        TaskService::new(Arc::clone(&db), event_bus).with_cleanup_scheduler(cleanup_scheduler);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let _ = next_role_reassigned_event(&mut rx).await;
-    let workspace_id = seed_workspace_for_task(&db, &task, workspace_root.path()).await;
-    seed_running_coder_execution(&db, &task.id, Some(agent_a), Some(workspace_id)).await;
-
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_b), None),
-            true,
-            true,
-        )
-        .await
-        .expect("coder reassignment succeeds");
-
-    let event = next_role_reassigned_event(&mut rx).await;
-    match event.context {
-        EventContext::TaskRoleReassigned {
-            reset_workspace,
-            reset_worktree,
-            transitioned_to_todo,
-            triggered_cancellation,
-            ..
-        } => {
-            assert!(reset_workspace);
-            assert!(!reset_worktree);
-            assert!(transitioned_to_todo);
-            assert!(triggered_cancellation);
-        }
-        other => panic!("unexpected event context: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn reassign_coder_to_human_mid_execution_cancels_and_moves_to_todo() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let human_id = seed_human_user(&db).await;
-    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
-        .bind(&human_id)
-        .bind(&project_id)
-        .execute(db.pool())
-        .await
-        .expect("project owner updates");
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let _ = next_role_reassigned_event(&mut rx).await;
-    let execution = seed_running_coder_execution(&db, &task.id, Some(agent_a), None).await;
-
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", None, Some(human_id.clone())),
-            false,
-            false,
-        )
-        .await
-        .expect("role reassignment succeeds");
-
-    let execution_after = ExecutionRepo::get_by_id(&*db, &execution.id)
-        .await
-        .expect("execution loads")
-        .expect("execution exists");
-    assert_eq!(execution_after.status, ExecutionStatus::Cancelled);
-    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(task_after.status, "todo");
-    let event = next_role_reassigned_event(&mut rx).await;
-    match event.context {
-        EventContext::TaskRoleReassigned {
-            new_assignment,
-            triggered_cancellation,
-            transitioned_to_todo,
-            ..
-        } => {
-            let new_assignment = new_assignment.expect("new assignment exists");
-            assert_eq!(new_assignment.assignee_type.as_deref(), Some("user"));
-            assert_eq!(
-                new_assignment.assignee_id.as_deref(),
-                Some(human_id.as_str())
-            );
-            assert!(triggered_cancellation);
-            assert!(transitioned_to_todo);
-        }
-        other => panic!("unexpected event context: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn reassign_non_coder_role_does_not_cancel_or_transition() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "reviewer", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial reviewer assignment succeeds");
-    let _ = next_role_reassigned_event(&mut rx).await;
-    TaskRepo::set_review_passed_at(
-        &*db,
-        &task.id,
-        Some("2026-04-10T00:00:00Z".to_owned()),
-        &now_rfc3339(),
-    )
-    .await
-    .expect("review_passed_at seeds");
-    let execution =
-        seed_running_role_execution(&db, &task.id, Some(agent_a), "reviewer", None).await;
-
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "reviewer", Some(agent_b), None),
-            false,
-            false,
-        )
-        .await
-        .expect("reviewer reassignment succeeds");
-
-    let execution_after = ExecutionRepo::get_by_id(&*db, &execution.id)
-        .await
-        .expect("execution loads")
-        .expect("execution exists");
-    assert_eq!(execution_after.status, ExecutionStatus::Running);
-    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(task_after.status, "in_progress");
-    assert_eq!(
-        task_after.review_passed_at.as_deref(),
-        Some("2026-04-10T00:00:00Z")
-    );
-    let event = next_role_reassigned_event(&mut rx).await;
-    match event.context {
-        EventContext::TaskRoleReassigned {
-            reset_workspace,
-            reset_worktree,
-            transitioned_to_todo,
-            triggered_cancellation,
-            ..
-        } => {
-            assert!(!reset_workspace);
-            assert!(!reset_worktree);
-            assert!(!transitioned_to_todo);
-            assert!(!triggered_cancellation);
-        }
-        other => panic!("unexpected event context: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn on_agent_deleted_clears_coder_assignee_id_and_preserves_agent_type() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_id.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("coder role assignment succeeds");
-
-    service
-        .on_agent_deleted(&agent_id)
-        .await
-        .expect("agent deletion sweep succeeds");
-
-    let row = sqlx::query(
-        "SELECT assignee_type, assignee_id FROM task_role_assignment WHERE task_id = ? AND role_name = 'coder'",
-    )
-    .bind(&task.id)
-    .fetch_one(db.pool())
-    .await
-    .expect("assignment row loads");
-    let assignee_type: Option<String> = row.try_get("assignee_type").expect("type reads");
-    let assignee_id: Option<String> = row.try_get("assignee_id").expect("id reads");
-    assert_eq!(assignee_type.as_deref(), Some("agent"));
-    assert_eq!(assignee_id, None);
-}
-
-#[tokio::test]
-async fn reassign_non_coder_role_ignores_reset_flags() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "reviewer", Some(agent_a), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial reviewer assignment succeeds");
-    let _ = next_role_reassigned_event(&mut rx).await;
-
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "reviewer", Some(agent_b), None),
-            false,
-            true,
-        )
-        .await
-        .expect("reviewer reassignment succeeds");
-
-    let event = next_role_reassigned_event(&mut rx).await;
-    match event.context {
-        EventContext::TaskRoleReassigned {
-            reset_workspace,
-            reset_worktree,
-            transitioned_to_todo,
-            triggered_cancellation,
-            ..
-        } => {
-            assert!(!reset_workspace);
-            assert!(!reset_worktree);
-            assert!(!transitioned_to_todo);
-            assert!(!triggered_cancellation);
-        }
-        other => panic!("unexpected event context: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn remove_coder_role_clears_review_passed_at() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let _ = next_role_reassigned_event(&mut rx).await;
-    TaskRepo::set_review_passed_at(
-        &*db,
-        &task.id,
-        Some("2026-04-10T00:00:00Z".to_owned()),
-        &now_rfc3339(),
-    )
-    .await
-    .expect("review_passed_at seeds");
-
-    service
-        .remove_role(&task.id, "coder", false, false)
-        .await
-        .expect("coder role removal succeeds");
-
-    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert!(task_after.review_passed_at.is_none());
-    let event = next_role_reassigned_event(&mut rx).await;
-    match event.context {
-        EventContext::TaskRoleReassigned { new_assignment, .. } => {
-            assert!(new_assignment.is_none());
-        }
-        other => panic!("unexpected event context: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn remove_coder_role_rejects_after_subtask_sequence_started() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let _ = next_role_reassigned_event(&mut rx).await;
-    let _subtask = seed_subtask_with_status(&db, &task, "sub", "in_progress".to_owned(), 0).await;
-
-    let result = service.remove_role(&task.id, "coder", false, false).await;
-
-    assert!(matches!(
-        result,
-        Err(ServiceError::TaskSequenceAlreadyStarted { task_id }) if task_id == task.id
-    ));
-    assert!(rx.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn reassign_subtask_coder_is_rejected() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&root.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("root coder assignment succeeds");
-    let subtask = seed_subtask_with_status(&db, &root, "sub", "todo".to_owned(), 0).await;
-
-    let result = service
-        .reassign_role(
-            role_assignment_input(&subtask.id, "coder", Some(agent_b.clone()), None),
-            false,
-            false,
-        )
-        .await;
-
-    assert!(matches!(result, Err(ServiceError::InvalidOperation { .. })));
-    let child_assignment = TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &subtask.id, "coder")
-        .await
-        .expect("child assignment loads");
-    assert!(child_assignment.is_none());
-}
-
-#[tokio::test]
-async fn reassign_parent_coder_rejects_when_subtask_in_progress() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&root.id, "coder", Some(agent_a), None),
-            false,
-            false,
-        )
-        .await
-        .expect("root coder assignment succeeds");
-    seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
-
-    let result = service
-        .reassign_role(
-            role_assignment_input(&root.id, "coder", Some(agent_b), None),
-            false,
-            false,
-        )
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(ServiceError::TaskSequenceAlreadyStarted { .. })
-    ));
-}
-
-#[tokio::test]
-async fn remove_non_coder_role_does_not_clear_review_passed_at() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "reviewer", Some(agent_a), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial reviewer assignment succeeds");
-    let _ = next_role_reassigned_event(&mut rx).await;
-    TaskRepo::set_review_passed_at(
-        &*db,
-        &task.id,
-        Some("2026-04-10T00:00:00Z".to_owned()),
-        &now_rfc3339(),
-    )
-    .await
-    .expect("review_passed_at seeds");
-
-    service
-        .remove_role(&task.id, "reviewer", false, false)
-        .await
-        .expect("reviewer role removal succeeds");
-
-    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(
-        task_after.review_passed_at.as_deref(),
-        Some("2026-04-10T00:00:00Z")
-    );
-}
-
-#[tokio::test]
-async fn reassign_same_coder_noop_preserves_review_passed_at() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let mut rx = event_bus.subscribe();
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let _ = next_role_reassigned_event(&mut rx).await;
-    TaskRepo::set_review_passed_at(
-        &*db,
-        &task.id,
-        Some("2026-04-10T00:00:00Z".to_owned()),
-        &now_rfc3339(),
-    )
-    .await
-    .expect("review_passed_at seeds");
-
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a), None),
-            true,
-            true,
-        )
-        .await
-        .expect("same role assignment succeeds");
-
-    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(
-        task_after.review_passed_at.as_deref(),
-        Some("2026-04-10T00:00:00Z")
-    );
-    assert!(rx.try_recv().is_err());
-}
-
-#[tokio::test]
 async fn project_member_removal_ends_human_membership_and_preserves_history() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
@@ -2160,7 +917,7 @@ async fn project_member_removal_ends_human_membership_and_preserves_history() {
     let member_id = seed_human_user(&db).await;
     configure_project_scope(&db, &project_id, &owner_id, &[&member_id]).await;
 
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     let role = service
         .create_task_role(
             &task.id,
@@ -2216,7 +973,7 @@ async fn project_member_removal_ends_owned_account_agent_membership() {
     let agent_id = seed_agent(&db).await;
     set_account_agent_owner(&db, &agent_id, &member_id).await;
 
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     let role = service
         .create_task_role(
             &task.id,
@@ -2245,82 +1002,6 @@ async fn project_member_removal_ends_owned_account_agent_membership() {
 }
 
 #[tokio::test]
-async fn project_member_removal_rebuilds_projection_from_surviving_member() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let owner_id = seed_human_user(&db).await;
-    let member_id = seed_human_user(&db).await;
-    configure_project_scope(&db, &project_id, &owner_id, &[&member_id]).await;
-    let removed_agent = seed_agent(&db).await;
-    set_account_agent_owner(&db, &removed_agent, &member_id).await;
-    let surviving_agent = seed_agent_with_executor_type(&db, "codex", "{}").await;
-
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(removed_agent.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial legacy assignment succeeds");
-    let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
-        .await
-        .expect("TaskRole loads")
-        .expect("implementer role exists");
-    service
-        .update_task_role(
-            &task.id,
-            "implementer",
-            role.version,
-            Some(CoordinationMode::Collaborative),
-            None,
-        )
-        .await
-        .expect("coordination mode updates");
-    service
-        .add_task_role_member(
-            &task.id,
-            "implementer",
-            ActorRef::Agent(surviving_agent.clone()),
-        )
-        .await
-        .expect("surviving Agent membership creates");
-
-    let projection = TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &task.id, "coder")
-        .await
-        .expect("legacy projection loads")
-        .expect("legacy projection exists");
-    assert_eq!(
-        projection.assignee_id.as_deref(),
-        Some(removed_agent.as_str())
-    );
-
-    ProjectMemberService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
-        .remove_member(&project_id, &owner_id, &member_id)
-        .await
-        .expect("Project member removal succeeds");
-
-    let current = RoleMembershipRepo::list_by_role(&*db, &role.id, false)
-        .await
-        .expect("current memberships load");
-    assert_eq!(current.len(), 1);
-    assert_eq!(current[0].actor_id, surviving_agent);
-    let projection = TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &task.id, "coder")
-        .await
-        .expect("rebuilt projection loads")
-        .expect("rebuilt projection exists");
-    assert_eq!(projection.assignee_id, Some(current[0].actor_id.clone()));
-    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(task_after.assignee_id, Some(current[0].actor_id.clone()));
-}
-
-#[tokio::test]
 async fn project_member_removal_ends_agent_membership_without_project_eligibility() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
@@ -2331,7 +1012,7 @@ async fn project_member_removal_ends_agent_membership_without_project_eligibilit
     let agent_id = seed_agent(&db).await;
     set_account_agent_owner(&db, &agent_id, &member_id).await;
 
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     let role = service
         .create_task_role(
             &task.id,

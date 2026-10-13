@@ -164,7 +164,7 @@ impl WorkUnitService {
             ));
         }
         if let Some(integration_workspace) =
-            WorkspaceRepo::get_by_task_id(&*self.db, &task.id).await?
+            WorkspaceRepo::get_integration_by_task_id(&*self.db, &task.id).await?
         {
             if integration_workspace.status == WorkspaceStatus::Cleaning {
                 return Err(invalid(
@@ -1501,7 +1501,6 @@ mod tests {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             harness_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
@@ -1569,7 +1568,6 @@ mod tests {
                 id: project_id.clone(),
                 name: "PR5 integration".to_owned(),
                 settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
                 primary_repo_id: None,
                 owner_id: Some(human_id.clone()),
                 created_at: now.clone(),
@@ -1655,16 +1653,13 @@ mod tests {
                 project_id: project_id.clone(),
                 repo_id: Some(repo_id.clone()),
                 parent_task_id: None,
-                assignee_type: None,
-                assignee_id: None,
                 title: "Task".to_owned(),
                 description: None,
                 task_type: "implementation".to_owned(),
-                status: "todo".to_owned(),
+                lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
                 subtask_order: None,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -1886,7 +1881,7 @@ mod tests {
                     stopped_by: None,
                     resume_policy: None,
                     stopped_at: None,
-                    agent_session_id: None,
+                    external_session_id: None,
                     agent_message_id: None,
                     last_activity_at: None,
                     summary: None,
@@ -2583,12 +2578,25 @@ mod tests {
         .with_repo_cache_locks(Arc::clone(&repo_cache_locks));
         cleanup.set_workspace_exec_locks(Arc::clone(&integration_locks));
 
-        sqlx::query("UPDATE task SET status = 'in_progress', version = version + 1, updated_at = ? WHERE id = ?")
-            .bind(now_rfc3339())
-            .bind(&task_id)
-            .execute(db.pool())
+        let task = TaskRepo::get_by_id(&*db, &task_id, false)
             .await
-            .expect("Task admits repository Execution");
+            .expect("Task loads before lifecycle transition")
+            .expect("Task exists");
+        crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .transition(crate::task_lifecycle::TransitionLifecycleInput {
+                task_id: task_id.clone(),
+                expected_task_version: task.version,
+                to_state: db::TaskLifecycleState::Active,
+                cause: crate::task_lifecycle::LifecycleCause::Actor(api_types::Actor::User {
+                    user_id: Some(human_id.clone()),
+                    source: api_types::UserActionSource::Api,
+                }),
+                reason_kind: Some("work_unit_integration_test".to_owned()),
+                reason_ref: Some("repository Execution setup".to_owned()),
+                idempotency_key: format!("activate-before-recovery:{task_id}"),
+            })
+            .await
+            .expect("TaskLifecycle admits repository Execution");
         let retryable_unit = service
             .create(
                 CollaborationActorSource::Human(human_id.clone()),
@@ -2659,7 +2667,7 @@ mod tests {
                 stopped_by: None,
                 resume_policy: None,
                 stopped_at: None,
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,
@@ -2784,7 +2792,7 @@ mod tests {
                 stopped_by: None,
                 resume_policy: None,
                 stopped_at: None,
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,

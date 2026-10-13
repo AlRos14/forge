@@ -678,6 +678,16 @@ impl WorkUnitExecutionRepo for SqliteDb {
         input: CreateWorkUnitExecution,
         event_input: CreateDomainEvent,
     ) -> Result<CollaborationWrite<Execution>> {
+        self.create_for_work_unit_with_artifact_inputs(input, Vec::new(), event_input)
+            .await
+    }
+
+    async fn create_for_work_unit_with_artifact_inputs(
+        &self,
+        input: CreateWorkUnitExecution,
+        artifact_input_ids: Vec<String>,
+        event_input: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<Execution>> {
         let mut tx = self.pool.begin().await?;
         let requires_integration = sqlx::query_scalar::<_, i64>(
             "SELECT requires_integration FROM work_unit WHERE id = ? AND task_id = ?",
@@ -723,6 +733,15 @@ impl WorkUnitExecutionRepo for SqliteDb {
             Some((&input.work_unit_id, input.work_unit_version)),
         )
         .await?;
+        for artifact_id in artifact_input_ids {
+            super::collaboration::pin_execution_artifact_input_in_tx(
+                &mut tx,
+                &input.execution.id,
+                &artifact_id,
+                &input.execution.created_at,
+            )
+            .await?;
+        }
         if let Some(lease) = input.workspace_lease {
             super::workspace_lease::insert_workspace_lease_in_tx(&mut tx, lease).await?;
         }

@@ -60,7 +60,6 @@ async fn unpinned_remote_agent_usage_uses_the_actual_execution_observation() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: Some(now.clone()),
             summary: None,

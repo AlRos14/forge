@@ -70,14 +70,12 @@ then the session's `external_session_id`. A session is not inferred from a
 Role, Task, model, or latest Execution, and a session scoped to one workspace
 is not silently reused in another. Human Executions have no HarnessSession.
 
-The existing `agent_session` table and `AgentSession` model are deliberately
-different. They preserve history from the retired embedded Agent Runtime and
-remain readable for audit and connection-health projections. No new embedded
-execution may create or resume one, and it is never the generic Execution
-continuity authority. `agent_context_scope` remains the foreign-key scope for
-server-owned Chat context manifests; those deny-workspace rows do not authorize
-runtime tools. Protected runtime state, LCM state, and runtime context manifests
-have no post-PR10 cognition consumer and remain historical until Plan PR13.
+The native-runtime `AgentSession` remains distinct from generic `HarnessSession`.
+V126 renames its store to `agent_session_history`; credential-usage accounting
+is its only current reader. V132 removes `agent_context_scope` and retired
+context-manifest runtime tables after preserving their exact rows in
+`pr13_legacy_record_history`. The detached native-session `context_scope_id`
+is opaque history and grants no runtime authority.
 
 The final persistence shape is owned by Plan PR1/Plan PR2. Regardless of
 representation, each Execution snapshots the exact effective profile,
@@ -150,12 +148,10 @@ binding or daemon availability cannot silently move the Execution to another hos
 invalid host fails closed. Reconnecting the same daemon is allowed and remains
 subject to PR3's connection-generation checks.
 
-## Agent Chat transition (Plan PR10)
+## Retired Agent Chat storage
 
-Agent Chat messages, durable turn jobs, binding/profile provenance,
-operating-context provenance, retry state, and historical reads remain
-available as historical reads. PR11 now prevents all Main and Project Agent
-Chat turn claims and invocations. Prompt text and a temporary directory do not
-establish a no-filesystem boundary. The removed native typed Forge tool
-catalog is not available through Chat. Their transcripts and binding history
-are read-only pending PR12 surface removal and PR13 schema cleanup.
+V132 preserves exact Agent Chat messages, turn jobs, binding/profile and
+operating-context provenance, retry state, and related Main/Project Agent
+records in `pr13_legacy_record_history`, then drops their runtime tables.
+There is no historical API reader or turn dispatcher. These rows cannot
+authorize Task membership, Workspace leases, or native tool execution.

@@ -52,9 +52,6 @@ async fn update_task_fields_in_tx(
             task.blocked_json = None;
         }
     }
-    if let Some(task_state_config) = input.task_state_config {
-        task.task_state_config = task_state_config;
-    }
     let has_parent_structure = parent_structure.is_some();
     if let Some((parent_task_id, subtask_order)) = parent_structure {
         task.parent_task_id = parent_task_id;
@@ -84,9 +81,6 @@ async fn update_task_fields_in_tx(
             .push(", failed_json = ")
             .push_bind(task.failed_json.as_deref());
     }
-    query
-        .push(", task_state_config = ")
-        .push_bind(task.task_state_config.as_deref());
     if has_parent_structure {
         query
             .push(", parent_task_id = ")
@@ -123,21 +117,17 @@ impl TaskRepo for SqliteDb {
         transaction: &mut Transaction<'_, Sqlite>,
         input: CreateTask,
     ) -> Result<Task> {
-        sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(board_position), 0.0) + 1.0, ?, ?, ?, ?, ?, ? FROM task WHERE project_id = ?")
+        sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, title, description, task_type, is_automation, priority, board_position, subtask_order, merge_config, metadata_json, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(board_position), 0.0) + 1.0, ?, ?, ?, ?, ? FROM task WHERE project_id = ?")
             .bind(&input.id)
             .bind(&input.project_id)
             .bind(input.repo_id.as_deref())
             .bind(input.parent_task_id.as_deref())
-            .bind(input.assignee_type.as_deref())
-            .bind(input.assignee_id.as_deref())
             .bind(&input.title)
             .bind(input.description.as_deref())
             .bind(&input.task_type)
-            .bind(&input.status)
             .bind(if input.is_automation { 1 } else { 0 })
             .bind(input.priority)
             .bind(input.subtask_order)
-            .bind(input.task_state_config.as_deref())
             .bind(input.merge_config.as_deref())
             .bind(Option::<&str>::None)
             .bind(&input.created_at)
@@ -145,6 +135,15 @@ impl TaskRepo for SqliteDb {
             .bind(&input.project_id)
             .execute(&mut **transaction)
             .await?;
+        sqlx::query(
+            "INSERT INTO task_lifecycle (task_id, state, version, reason_kind, reason_ref, created_at, updated_at) VALUES (?, ?, 1, NULL, NULL, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(input.lifecycle_state.to_string())
+        .bind(&input.created_at)
+        .bind(&input.updated_at)
+        .execute(&mut **transaction)
+        .await?;
         let row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&input.id)
             .fetch_one(&mut **transaction)
@@ -191,13 +190,9 @@ impl TaskRepo for SqliteDb {
         if !query.include_deleted {
             where_parts.push("deleted_at IS NULL");
         }
-        if !query.include_archived {
-            where_parts.push("archived_at IS NULL");
-        }
         let explicitly_includes_cancelled = query
             .lifecycle_states
-            .contains(&crate::TaskLifecycleState::Cancelled)
-            || query.statuses.iter().any(|status| status == "cancelled");
+            .contains(&crate::TaskLifecycleState::Cancelled);
         if !query.include_cancelled && !explicitly_includes_cancelled {
             where_parts
                 .push("id IN (SELECT task_id FROM task_lifecycle WHERE state != 'cancelled')");
@@ -206,9 +201,6 @@ impl TaskRepo for SqliteDb {
             where_parts.push(
                 "id IN (SELECT task_id FROM task_lifecycle WHERE state IN (__LIFECYCLE_STATES__))",
             );
-        }
-        if !query.statuses.is_empty() {
-            where_parts.push("status IN (__STATUSES__)");
         }
         if !query.agent_ids.is_empty() {
             where_parts.push(
@@ -219,15 +211,6 @@ impl TaskRepo for SqliteDb {
                 WHERE role_membership.actor_kind = 'agent'
                   AND role_membership.status = 'active'
                   AND role_membership.actor_id IN (__AGENTS__)
-                UNION
-                SELECT legacy.task_id
-                FROM task_role_assignment AS legacy
-                WHERE legacy.assignee_type = 'agent'
-                  AND legacy.assignee_id IN (__AGENTS__)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM task_role
-                      WHERE task_role.task_id = legacy.task_id
-                  )
             )",
             );
         }
@@ -240,15 +223,6 @@ impl TaskRepo for SqliteDb {
                 WHERE (__ASSIGNEE_TYPE_FILTER_MEMBERSHIP__)
                   AND (__ASSIGNEE_ID_FILTER_MEMBERSHIP__)
                   AND role_membership.status IN ('active', 'suspended')
-                UNION
-                SELECT legacy.task_id
-                FROM task_role_assignment AS legacy
-                WHERE (__ASSIGNEE_TYPE_FILTER_LEGACY__)
-                  AND (__ASSIGNEE_ID_FILTER_LEGACY__)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM task_role
-                      WHERE task_role.task_id = legacy.task_id
-                  )
             )",
             );
         }
@@ -264,25 +238,16 @@ impl TaskRepo for SqliteDb {
         if search_pattern.is_some() {
             where_parts.push("(LOWER(title) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ? ESCAPE '\\')");
         }
-        let status_placeholders = vec!["?"; query.statuses.len()].join(", ");
         let lifecycle_placeholders = vec!["?"; query.lifecycle_states.len()].join(", ");
         let agent_placeholders = vec!["?"; query.agent_ids.len()].join(", ");
         let assignee_type_placeholders = vec!["?"; query.assignee_types.len()].join(", ");
         let assignee_id_placeholders = vec!["?"; query.assignee_ids.len()].join(", ");
-        let assignee_type_filter_legacy = if query.assignee_types.is_empty() {
-            "1 = 1".to_owned()
-        } else {
-            format!("assignee_type IN ({assignee_type_placeholders})")
-        };
         let assignee_type_filter_membership = if query.assignee_types.is_empty() {
             "1 = 1".to_owned()
         } else {
-            format!("CASE role_membership.actor_kind WHEN 'human' THEN 'user' ELSE 'agent' END IN ({assignee_type_placeholders})")
-        };
-        let assignee_id_filter_legacy = if query.assignee_ids.is_empty() {
-            "1 = 1".to_owned()
-        } else {
-            format!("assignee_id IN ({assignee_id_placeholders})")
+            format!(
+                "CASE role_membership.actor_kind WHEN 'human' THEN 'user' ELSE 'agent' END IN ({assignee_type_placeholders})"
+            )
         };
         let assignee_id_filter_membership = if query.assignee_ids.is_empty() {
             "1 = 1".to_owned()
@@ -291,7 +256,6 @@ impl TaskRepo for SqliteDb {
         };
         let where_sql = where_parts
             .join(" AND ")
-            .replace("__STATUSES__", &status_placeholders)
             .replace("__LIFECYCLE_STATES__", &lifecycle_placeholders)
             .replace("__AGENTS__", &agent_placeholders)
             .replace(
@@ -301,38 +265,21 @@ impl TaskRepo for SqliteDb {
             .replace(
                 "__ASSIGNEE_ID_FILTER_MEMBERSHIP__",
                 &assignee_id_filter_membership,
-            )
-            .replace(
-                "__ASSIGNEE_TYPE_FILTER_LEGACY__",
-                &assignee_type_filter_legacy,
-            )
-            .replace("__ASSIGNEE_ID_FILTER_LEGACY__", &assignee_id_filter_legacy);
+            );
         let sql = format!(
             "SELECT {TASK_COLUMNS} FROM task WHERE {} ORDER BY {} LIMIT ? OFFSET ?",
             where_sql,
             order_clause(&query.page)
         );
         let mut q = sqlx::query(&sql).bind(&query.project_id);
-        for status in &query.statuses {
-            q = q.bind(status);
-        }
         for state in &query.lifecycle_states {
             q = q.bind(state.to_string());
         }
         for agent_id in &query.agent_ids {
             q = q.bind(agent_id);
         }
-        for agent_id in &query.agent_ids {
-            q = q.bind(agent_id);
-        }
         for assignee_type in &query.assignee_types {
             q = q.bind(assignee_type);
-        }
-        for assignee_type in &query.assignee_types {
-            q = q.bind(assignee_type);
-        }
-        for assignee_id in &query.assignee_ids {
-            q = q.bind(assignee_id);
         }
         for assignee_id in &query.assignee_ids {
             q = q.bind(assignee_id);
@@ -352,26 +299,14 @@ impl TaskRepo for SqliteDb {
         let total = if query.page.include_total {
             let count_sql = format!("SELECT COUNT(*) FROM task WHERE {}", where_sql);
             let mut q = sqlx::query_scalar::<_, i64>(&count_sql).bind(&query.project_id);
-            for status in &query.statuses {
-                q = q.bind(status);
-            }
             for state in &query.lifecycle_states {
                 q = q.bind(state.to_string());
             }
             for agent_id in &query.agent_ids {
                 q = q.bind(agent_id);
             }
-            for agent_id in &query.agent_ids {
-                q = q.bind(agent_id);
-            }
             for assignee_type in &query.assignee_types {
                 q = q.bind(assignee_type);
-            }
-            for assignee_type in &query.assignee_types {
-                q = q.bind(assignee_type);
-            }
-            for assignee_id in &query.assignee_ids {
-                q = q.bind(assignee_id);
             }
             for assignee_id in &query.assignee_ids {
                 q = q.bind(assignee_id);
@@ -395,9 +330,6 @@ impl TaskRepo for SqliteDb {
             vec!["id IN (SELECT DISTINCT task_id FROM execution WHERE agent_id = ?)".to_owned()];
         if !query.include_deleted {
             where_parts.push("deleted_at IS NULL".to_owned());
-        }
-        if !query.include_archived {
-            where_parts.push("archived_at IS NULL".to_owned());
         }
         if !query.include_cancelled {
             where_parts.push(
@@ -551,45 +483,36 @@ impl TaskRepo for SqliteDb {
         update_task_fields_in_tx(transaction, input, Some((parent_task_id, subtask_order))).await
     }
 
-    async fn set_review_passed_at(
+    async fn soft_delete_in_tx(
         &self,
-        id: &str,
-        review_passed_at: Option<String>,
-        updated_at: &str,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: crate::SoftDeleteTask,
     ) -> Result<Task> {
-        let result = sqlx::query(
-            "UPDATE task SET review_passed_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
-        )
-        .bind(review_passed_at.as_deref())
-        .bind(updated_at)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound);
-        }
-        TaskRepo::get_by_id(self, id, true)
+        let mut task = TaskRepo::get_by_id_in_tx(self, transaction, &input.id, true)
             .await?
-            .ok_or(DbError::NotFound)
-    }
-
-    async fn archive(&self, input: crate::ArchiveTask) -> Result<Task> {
-        let mut task = self.get_task_required(&input.id, true).await?;
-        if task.deleted_at.is_some() {
+            .ok_or(DbError::NotFound)?;
+        if task.deleted_at.is_some()
+            || matches!(
+                task.lifecycle_state,
+                TaskLifecycleState::Active
+                    | TaskLifecycleState::ReadyToMerge
+                    | TaskLifecycleState::Merging
+            )
+        {
             return Err(DbError::InvalidSoftDelete);
         }
         if task.version != input.expected_version {
             return Err(DbError::VersionConflict);
         }
-        task.archived_at = Some(input.archived_at);
+        task.deleted_at = Some(input.deleted_at);
         task.updated_at = input.updated_at;
         task.version += 1;
-        let result = sqlx::query("UPDATE task SET archived_at = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL")
-            .bind(task.archived_at.as_deref())
+        let result = sqlx::query("UPDATE task SET deleted_at = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL")
+            .bind(task.deleted_at.as_deref())
             .bind(&task.updated_at)
             .bind(&task.id)
             .bind(input.expected_version)
-            .execute(&self.pool)
+            .execute(&mut **transaction)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
@@ -637,394 +560,6 @@ impl TaskRepo for SqliteDb {
         }
         Ok(())
     }
-
-    async fn set_entry_barrier(
-        &self,
-        id: &str,
-        expected_version: i64,
-        entry_barrier_json: Option<String>,
-        updated_at: &str,
-    ) -> Result<Task> {
-        if entry_barrier_json.is_some() {
-            return Err(DbError::InvalidTransition);
-        }
-        let result = sqlx::query(
-            "UPDATE task SET entry_barrier_json = NULL, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL",
-        )
-        .bind(updated_at)
-        .bind(id)
-        .bind(expected_version)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::VersionConflict);
-        }
-        TaskRepo::get_by_id(self, id, true)
-            .await?
-            .ok_or(DbError::NotFound)
-    }
-
-    async fn soft_delete_in_tx(
-        &self,
-        transaction: &mut Transaction<'_, Sqlite>,
-        input: crate::SoftDeleteTask,
-    ) -> Result<Task> {
-        let mut task = TaskRepo::get_by_id_in_tx(self, transaction, &input.id, true)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        if task.deleted_at.is_some()
-            || matches!(task.status.as_str(), "in_progress" | "review" | "merging")
-        {
-            return Err(DbError::InvalidSoftDelete);
-        }
-        if task.version != input.expected_version {
-            return Err(DbError::VersionConflict);
-        }
-        task.deleted_at = Some(input.deleted_at);
-        task.updated_at = input.updated_at;
-        task.version += 1;
-        let result = sqlx::query("UPDATE task SET deleted_at = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL")
-            .bind(task.deleted_at.as_deref())
-            .bind(&task.updated_at)
-            .bind(&task.id)
-            .bind(input.expected_version)
-            .execute(&mut **transaction)
-            .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::VersionConflict);
-        }
-        Ok(task)
-    }
-
-    async fn claim(
-        &self,
-        transaction: &mut Transaction<'_, Sqlite>,
-        input: ClaimTask,
-    ) -> Result<ClaimedTask> {
-        let sql = format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ? AND deleted_at IS NULL");
-        let row = sqlx::query(&sql)
-            .bind(&input.task_id)
-            .fetch_optional(&mut **transaction)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        let mut task = map_task(row)?;
-        if task.version != input.expected_version {
-            return Err(DbError::VersionConflict);
-        }
-        if task.status != input.source_status {
-            return Err(DbError::InvalidTransition);
-        }
-        // Claim and its Running execution are one transaction. Re-check the
-        // active baseline here, before mutating Task assignment/status; the
-        // service's earlier read gate is only an optimization for avoiding
-        // workspace side effects.
-        if input.execution.status == ExecutionStatus::Running
-            && input.execution.workspace_id.is_some()
-        {
-            Self::ensure_execution_admission_in_tx(transaction, &input.task_id).await?;
-        }
-
-        let assignee_agent_id = match input.assignee_type.as_str() {
-            "agent" => {
-                let agent_id = input
-                    .execution
-                    .agent_id
-                    .as_deref()
-                    .ok_or(DbError::InvalidTransition)?;
-                Some(agent_id)
-            }
-            "user" => {
-                if input.assignee_id.is_none() {
-                    return Err(DbError::InvalidTransition);
-                }
-                None
-            }
-            _ => return Err(DbError::InvalidTransition),
-        };
-
-        let unsatisfied_dependencies =
-            Self::unsatisfied_dependencies_in_tx(transaction, &input.task_id).await?;
-        if !unsatisfied_dependencies.is_empty() && input.assignee_type == "agent" {
-            let agent_id = assignee_agent_id.ok_or(DbError::InvalidTransition)?;
-            let mut context_holder_match = false;
-            for depends_on_id in &unsatisfied_dependencies {
-                let context_holder = sqlx::query_scalar::<_, Option<String>>(
-                    "SELECT agent_id FROM execution WHERE task_id = ? AND role = 'executor' ORDER BY created_at DESC LIMIT 1",
-                )
-                .bind(depends_on_id)
-                .fetch_optional(&mut **transaction)
-                .await?
-                .flatten();
-                if context_holder.as_deref() == Some(agent_id) {
-                    context_holder_match = true;
-                    break;
-                }
-            }
-            if !context_holder_match {
-                return Err(DbError::DependencyGate);
-            }
-        }
-
-        if let Some(agent_id) = assignee_agent_id {
-            let active_count = sqlx::query_scalar::<_, i64>(
-                "SELECT
-                    (
-                        SELECT COUNT(DISTINCT task.id) FROM task
-                        JOIN task_lifecycle lifecycle ON lifecycle.task_id = task.id
-                        WHERE (
-                            EXISTS (
-                            SELECT 1
-                            FROM task_role
-                            JOIN role_membership
-                              ON role_membership.task_role_id = task_role.id
-                            WHERE task_role.task_id = task.id
-                              AND role_membership.actor_kind = 'agent'
-                              AND role_membership.actor_id = ?
-                              AND role_membership.status = 'active'
-                            )
-                            OR (
-                            NOT EXISTS (SELECT 1 FROM task_role WHERE task_role.task_id = task.id)
-                            AND EXISTS (
-                                SELECT 1 FROM task_role_assignment
-                                WHERE task_role_assignment.task_id = task.id
-                                  AND task_role_assignment.assignee_type = 'agent'
-                                  AND task_role_assignment.assignee_id = ?
-                            )
-                            )
-                        )
-                          AND task.id != ?
-                          AND task.deleted_at IS NULL
-                          AND lifecycle.state = 'active'
-                    )",
-            )
-            .bind(agent_id)
-            .bind(agent_id)
-            .bind(&input.task_id)
-            .fetch_one(&mut **transaction)
-            .await?;
-            if active_count >= input.max_concurrent_tasks {
-                return Err(DbError::AgentAtCapacity);
-            }
-        }
-
-        let target_lifecycle = TaskLifecycleState::from_legacy_status(&input.target_status)
-            .ok_or(DbError::InvalidTransition)?;
-        if target_lifecycle != TaskLifecycleState::Active {
-            return Err(DbError::InvalidTransition);
-        }
-        let lifecycle_row = sqlx::query(
-            "SELECT task_id, state, version, reason_kind, reason_ref, created_at, updated_at
-             FROM task_lifecycle WHERE task_id = ?",
-        )
-        .bind(&input.task_id)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or(DbError::NotFound)?;
-        let lifecycle = super::gate_lifecycle::map_task_lifecycle(&lifecycle_row)?;
-        if lifecycle.state != target_lifecycle {
-            let actor = input.execution.actor_ref.as_ref();
-            let event_key = format!("task-claim:{}:{}", input.task_id, input.execution.id);
-            let event = CreateDomainEvent {
-                id: new_uuid_v4(),
-                event_type: "task.lifecycle_changed".to_owned(),
-                entity_type: "task".to_owned(),
-                entity_id: input.task_id.clone(),
-                actor_type: actor
-                    .map(|actor| actor.kind().to_string())
-                    .unwrap_or_else(|| "system".to_owned()),
-                actor_id: actor.map(|actor| actor.id().to_owned()),
-                scope_type: "task".to_owned(),
-                scope_id: input.task_id.clone(),
-                correlation_id: event_key.clone(),
-                causation_id: Some(input.execution.id.clone()),
-                causation_depth: 1,
-                dedupe_key: Some(event_key.clone()),
-                payload_json: serde_json::json!({
-                    "task_id": input.task_id,
-                    "from_state": lifecycle.state,
-                    "to_state": target_lifecycle,
-                    "cause_kind": "execution",
-                    "cause_ref": input.execution.id,
-                })
-                .to_string(),
-                created_at: input.claimed_at.clone(),
-            };
-            super::gate_lifecycle::record_lifecycle_transition_in_tx(
-                self,
-                transaction,
-                &TransitionTaskLifecycle {
-                    id: new_uuid_v4(),
-                    task_id: input.task_id.clone(),
-                    expected_task_version: input.expected_version,
-                    expected_lifecycle_version: lifecycle.version,
-                    expected_state: lifecycle.state,
-                    to_state: target_lifecycle,
-                    cause_kind: "execution".to_owned(),
-                    cause_ref: Some(input.execution.id.clone()),
-                    reason_kind: Some("task_claim".to_owned()),
-                    reason_ref: Some(input.execution.id.clone()),
-                    gate_evaluation_id: None,
-                    idempotency_key: event_key,
-                    updated_at: input.claimed_at.clone(),
-                    event,
-                },
-            )
-            .await?;
-        }
-
-        let result = sqlx::query("UPDATE task SET assignee_type = ?, assignee_id = ?, status = ?, entry_barrier_json = NULL, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL")
-            .bind(&input.assignee_type)
-            .bind(input.assignee_id.as_deref())
-            .bind(target_lifecycle.legacy_projection())
-            .bind(&input.claimed_at)
-            .bind(&input.task_id)
-            .bind(input.expected_version)
-            .execute(&mut **transaction)
-            .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::VersionConflict);
-        }
-        task.assignee_type = Some(input.assignee_type);
-        task.assignee_id = input.assignee_id;
-        task.status = target_lifecycle.legacy_projection().to_owned();
-        task.entry_barrier_json = None;
-        task.version += 1;
-        task.updated_at = input.claimed_at;
-        let execution = Self::create_execution_in_tx(transaction, &input.execution, None).await?;
-        Ok(ClaimedTask { task, execution })
-    }
-
-    async fn update_status(&self, input: UpdateTaskStatus) -> Result<Task> {
-        let mut transaction = self.pool.begin().await?;
-        let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
-            .bind(&input.id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        let mut task = map_task(task_row)?;
-        if task.deleted_at.is_some() {
-            return Err(DbError::InvalidSoftDelete);
-        }
-        if task.version != input.expected_version {
-            return Err(DbError::VersionConflict);
-        }
-        let previous_status = task.status.clone();
-        let target_state = TaskLifecycleState::from_legacy_status(&input.status)
-            .ok_or(DbError::InvalidTransition)?;
-        let target_status = target_state.legacy_projection().to_owned();
-        let lifecycle_row = sqlx::query(
-            "SELECT task_id, state, version, reason_kind, reason_ref, created_at, updated_at
-             FROM task_lifecycle WHERE task_id = ?",
-        )
-        .bind(&task.id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(DbError::NotFound)?;
-        let lifecycle = super::gate_lifecycle::map_task_lifecycle(&lifecycle_row)?;
-        if lifecycle.state != target_state {
-            return Err(DbError::InvalidTransition);
-        }
-        task.status = target_status;
-        // After V088 the task-level assignee is only the bounded projection of
-        // the implementer TaskRole.  A status/recovery caller may still pass
-        // the legacy "clear assignee" signal, but it must not erase that
-        // projection while an authoritative replacement role exists.
-        let has_authoritative_implementer: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(
-                 SELECT 1 FROM task_role
-                 WHERE task_id = ? AND role = 'implementer'
-             )",
-        )
-        .bind(&task.id)
-        .fetch_one(&mut *transaction)
-        .await?;
-        if input.assignee_id.is_some() && has_authoritative_implementer == 0 {
-            task.assignee_type = None;
-            task.assignee_id = None;
-        }
-        if let Some(error_annotation) = input.error_annotation {
-            task.error_annotation = error_annotation;
-        }
-        let blocked_json_update = input.blocked_json;
-        let failed_json_update = input.failed_json;
-        let set_blocked_json = blocked_json_update.is_some();
-        let set_failed_json = failed_json_update.is_some();
-        let clear_failed_json = matches!(blocked_json_update, Some(Some(_)));
-        let clear_blocked_json = matches!(failed_json_update, Some(Some(_)));
-        if let Some(blocked_json) = blocked_json_update {
-            task.blocked_json = blocked_json;
-            if task.blocked_json.is_some() {
-                task.failed_json = None;
-            }
-        }
-        if let Some(failed_json) = failed_json_update {
-            task.failed_json = failed_json;
-            if task.failed_json.is_some() {
-                task.blocked_json = None;
-            }
-        }
-        task.updated_at = input.updated_at;
-        task.entry_barrier_json = None;
-        task.version += 1;
-        let mut query = sqlx::QueryBuilder::<Sqlite>::new("UPDATE task SET status = ");
-        query
-            .push_bind(&task.status)
-            .push(", assignee_type = ")
-            .push_bind(task.assignee_type.as_deref())
-            .push(", assignee_id = ")
-            .push_bind(task.assignee_id.as_deref())
-            .push(", error_annotation = ")
-            .push_bind(task.error_annotation.as_deref());
-        if set_blocked_json || clear_blocked_json {
-            query
-                .push(", blocked_json = ")
-                .push_bind(task.blocked_json.as_deref());
-        }
-        if set_failed_json || clear_failed_json {
-            query
-                .push(", failed_json = ")
-                .push_bind(task.failed_json.as_deref());
-        }
-        query
-            .push(", entry_barrier_json = NULL")
-            .push(", version = version + 1, updated_at = ")
-            .push_bind(&task.updated_at)
-            .push(" WHERE id = ")
-            .push_bind(&task.id)
-            .push(" AND version = ")
-            .push_bind(input.expected_version)
-            .push(" AND deleted_at IS NULL");
-        let result = query.build().execute(&mut *transaction).await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::VersionConflict);
-        }
-
-        let event_id = new_uuid_v4();
-        let event = CreateDomainEvent {
-            id: event_id.clone(),
-            event_type: "task.status_changed".to_owned(),
-            entity_type: "task".to_owned(),
-            entity_id: task.id.clone(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
-            scope_type: "task".to_owned(),
-            scope_id: task.id.clone(),
-            correlation_id: event_id.clone(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some(format!("task-status-update:{}:{}", task.id, task.version)),
-            payload_json: serde_json::json!({
-                "from_status": previous_status,
-                "to_status": task.status,
-                "task_version": task.version,
-            })
-            .to_string(),
-            created_at: task.updated_at.clone(),
-        };
-        DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
-        transaction.commit().await?;
-        Ok(task)
-    }
 }
 
 fn search_like_pattern(term: &str) -> String {
@@ -1038,4 +573,15 @@ fn search_like_pattern(term: &str) -> String {
     }
     pattern.push('%');
     pattern
+}
+
+#[async_trait]
+impl crate::TaskBoardRepo for SqliteDb {
+    async fn board_revision(&self, project_id: &str) -> Result<i64> {
+        sqlx::query_scalar("SELECT board_revision FROM project WHERE id = ?")
+            .bind(project_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(DbError::NotFound)
+    }
 }

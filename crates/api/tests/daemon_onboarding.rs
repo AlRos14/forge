@@ -174,7 +174,7 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
     assert_eq!(running_execution.role, "implementer");
     assert_eq!(running_execution.purpose, Some(ExecutionPurpose::Implement));
 
-    let workspace = db::WorkspaceRepo::get_by_task_id(&*state.db, &task.id)
+    let workspace = db::WorkspaceRepo::get_integration_by_task_id(&*state.db, &task.id)
         .await
         .expect("workspace query succeeds")
         .expect("claim created a workspace");

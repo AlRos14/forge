@@ -8,6 +8,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Task Execution start now requires an explicitly allocated WorkUnit and expected WorkUnit version. Task-level Agent/role selection and Task-level Start are retired; repository Executions use the exact WorkUnit Workspace.
+- Human Review start now uses only the explicitly supplied Workspace ID; `workspace_id: null` starts a Workspace-free Review and does not infer the Task integration Workspace.
+- Plan PR13 removes legacy persistence after exact-history cutovers. TaskLifecycle replaces Task status/configuration, TaskRole/RoleMembership replaces singleton assignment, WorkUnit identity replaces Task-scoped workspace recovery and reset, and the old workflow, transition-log, task-move, Review, V081 Task Plan, and active native AgentSession runtime stores are retired. Exact historical rows and V099 migration provenance remain in dedicated history tables; ProjectRelease GET reads use self-contained snapshots.
+- The obsolete Project OS API type graph is removed. The public historical ProjectRelease snapshot types remain, with no Charter, baseline, milestone, readiness, document, or decision runtime DTOs.
+
 - Plan PR12 aligns public REST, MCP, `forge-ctl`, web, generated TypeScript, and
   SSE contracts with Architecture V2. Removed retired Main/Project Agent,
   Product Genesis, Agent Chat, Attention, Charter/baseline, milestone/readiness,
@@ -27,9 +32,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `active_execution_count`, which counts only running Executions attributed to
   the exact Agent Actor, not active Tasks or RoleMemberships.
   Ordinary Task creation no longer applies `ProjectSettings.default_role_assignments`
-  from historical Project rows. Legacy state-driven lifecycle hook scripts and
-  their EventBus emitter no longer run or block new Executions; their stored
-  settings remain intact, and generic durable Project hooks remain supported.
+  from historical Project rows. V130 preserves the exact old setting in
+  migration history and removes it from active Project settings. Legacy
+  state-driven lifecycle hook scripts and their EventBus emitter no longer run
+  or block new Executions; generic durable Project hooks remain supported.
   REST and MCP Project lists now filter before pagination, and Project reads,
   mutations, and derived MCP resources enforce the authenticated user's
   Project authority. Reads retain owner/member/viewer visibility and public
@@ -65,8 +71,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Removed the unused `public_search` server configuration and its environment
   variables with the retired chat tool; a saved top-level `public_search`
   setting is rejected during config loading.
-  No storage is dropped; physical cleanup remains PR13 and general
-  naming/branding remains PR14.
+  General naming and branding remain PR14.
 
 - Plan PR11 retires Main Agent, Project Agent, Agent Chat cognition, Product
   Genesis, bespoke Agent actions/commitments/inbox/questions, semantic Agent
@@ -80,7 +85,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   TaskRole/RoleMembership, Execution, Gate, and WorkspaceLease authority.
   Legacy REST writes return HTTP 410 `operation_retired`; retired MCP mutation
   tools return `operation_retired`. Safe historical reads remain until PR12,
-  and physical cleanup remains PR13. The retired Task governance request field
+  and this branch implements their assigned physical cleanup in PR13. The
+  retired Task governance request field
   returns HTTP 410; normal Project and Task creation no longer requires Charter
   or baseline setup.
 

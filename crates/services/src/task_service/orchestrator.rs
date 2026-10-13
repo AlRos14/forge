@@ -234,7 +234,6 @@ impl TaskService {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id,
-            agent_session_id: None,
             harness_session_id: None,
             agent_message_id: None,
             last_activity_at: None,

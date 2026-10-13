@@ -13,7 +13,6 @@ use db::{
     ProjectRepo, SortBy, SortOrder, UpdateProject,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
-use services::workflow::default_workflow::default_workflow;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -29,8 +28,6 @@ pub async fn create_project(
 ) -> ApiResult<Response> {
     let now = now_rfc3339();
     let settings = serde_json::json!({});
-    let workflow_definition = serde_json::to_string(&default_workflow())
-        .map_err(|error| ApiError::internal(format!("serialize default workflow: {error}")))?;
     let settings = serialize_settings(&settings)?;
     let project = ProjectRepo::create(
         &*state.db,
@@ -38,7 +35,6 @@ pub async fn create_project(
             id: new_uuid_v4(),
             name: request.name,
             settings,
-            workflow_definition,
             primary_repo_id: None,
             owner_id: Some(user.user_id.clone()),
             created_at: now.clone(),

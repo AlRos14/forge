@@ -137,7 +137,7 @@ async fn forge_happy_path_end_to_end() {
     poll_until_workspace_written(&harness.app, &task_id, &greeting_path).await;
     poll_until_execution_completed(&harness.state.db, &execution_id).await;
 
-    let workspace = WorkspaceRepo::get_by_task_id(&*harness.state.db, &task_id)
+    let workspace = WorkspaceRepo::get_integration_by_task_id(&*harness.state.db, &task_id)
         .await
         .expect("Task Workspace lookup succeeds")
         .expect("worker Execution created a Workspace");
@@ -316,13 +316,6 @@ async fn forge_happy_path_end_to_end() {
             .expect("Validation Evidence loads")
             .len(),
         1
-    );
-    assert!(
-        db::ReviewRepo::list_by_task(&*harness.state.db, &task_id)
-            .await
-            .expect("legacy Review rows load")
-            .is_empty(),
-        "new deterministic checks do not write legacy Review rows"
     );
     let validation_event_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM domain_event WHERE event_type = 'validation_run.completed' AND entity_id = ?",
@@ -674,11 +667,6 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
     ));
-    let review_runner = Arc::new(review::ReviewRunner::new(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-        Arc::clone(&adapter_registry),
-    ));
     let mut state = AppState::with_adapter_registry_services_and_shutdown(
         db,
         Arc::clone(&event_bus),
@@ -686,7 +674,6 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
         adapter_registry,
         merge_service,
         cleanup_scheduler,
-        review_runner,
         api::state::ShutdownSignal::new(),
         api::state::test_workflows_dir(),
         api::state::test_jwt_secret(),

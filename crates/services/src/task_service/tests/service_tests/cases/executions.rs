@@ -3,6 +3,21 @@ use api_types::ActorRef;
 use db::{CollaborationRepo, CoordinationMode, ProjectMemberRepo, TaskLifecycleRepo, TaskRoleRepo};
 use serde_json::Value;
 
+async fn execution_external_session_id(
+    db: &db::SqliteDb,
+    execution: &db::Execution,
+) -> Option<String> {
+    let Some(session_id) = execution.harness_session_id.as_deref() else {
+        return None;
+    };
+    sqlx::query_scalar("SELECT external_session_id FROM harness_session WHERE id = ?")
+        .bind(session_id)
+        .fetch_optional(db.pool())
+        .await
+        .expect("exact HarnessSession loads")
+        .flatten()
+}
+
 async fn add_human_reviewer(
     db: &db::SqliteDb,
     service: &TaskService,
@@ -43,23 +58,6 @@ async fn add_human_reviewer(
         .await
         .expect("Human joins the reviewer TaskRole");
     (user_id, membership)
-}
-
-async fn assign_legacy_human_reviewer(db: &db::SqliteDb, task_id: &str, user_id: &str) {
-    let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO task_role_assignment
-         (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
-         VALUES (?, ?, 'reviewer', 'user', ?, ?, ?)",
-    )
-    .bind(db::new_uuid_v4())
-    .bind(task_id)
-    .bind(user_id)
-    .bind(now.clone())
-    .bind(now)
-    .execute(db.pool())
-    .await
-    .expect("legacy Human reviewer projection fixture writes");
 }
 
 fn human_review_request(
@@ -269,7 +267,7 @@ async fn start_execution_uses_frozen_daemon_after_agent_is_rebound() {
         .clone()
         .expect("initial daemon binding");
     let daemon_b = add_remote_executor_daemon(&db, "frozen-host-replacement").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let registry = routing_test_registry();
     let _outbound_a = register_routing_test_daemon(&registry, &daemon_a);
     let outbound_b = register_routing_test_daemon(&registry, &daemon_b);
@@ -363,7 +361,7 @@ async fn unpinned_start_fails_closed_when_frozen_daemon_disappears() {
         .execute(db.pool())
         .await
         .expect("daemon B follows daemon A");
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let registry = routing_test_registry();
     let outbound_b = register_routing_test_daemon(&registry, &daemon_b);
     let workspace_root = TempDir::new().expect("workspace root creates");
@@ -452,84 +450,6 @@ async fn unpinned_start_fails_closed_when_frozen_daemon_disappears() {
     );
 }
 
-#[tokio::test]
-async fn cancel_execution_uses_frozen_daemon_after_agent_is_rebound() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(32));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let daemon_a = AgentRepo::get_by_id(&*db, &agent_id)
-        .await
-        .expect("Agent loads")
-        .expect("Agent exists")
-        .daemon_id
-        .expect("initial daemon binding");
-    let daemon_b = add_remote_executor_daemon(&db, "cancel-host-replacement").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let registry = routing_test_registry();
-    let outbound_a = register_routing_test_daemon(&registry, &daemon_a);
-    let outbound_b = register_routing_test_daemon(&registry, &daemon_b);
-    let workspace_root = TempDir::new().expect("workspace root creates");
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
-        .with_workspace_root(workspace_root.path().to_path_buf())
-        .with_daemon_connections(Arc::clone(&registry));
-    let agent_at_admission = AgentRepo::get_by_id(&*db, &agent_id)
-        .await
-        .expect("Agent loads")
-        .expect("Agent exists");
-    let snapshot = crate::task_service::config::build_executor_config_snapshot(
-        &db,
-        &task,
-        &agent_at_admission,
-        None,
-        None,
-    )
-    .await
-    .expect("Execution snapshot builds")
-    .expect("Agent snapshot exists");
-    let (execution, _workspace) = create_running_repository_execution(
-        &db,
-        &service,
-        &task,
-        &agent_id,
-        "implementer",
-        db::ExecutionPurpose::Implement,
-        workspace_root.path(),
-        Some("frozen host cancel".to_owned()),
-        Some(snapshot),
-    )
-    .await;
-    change_agent_daemon(&db, &agent_id, Some(&daemon_b)).await;
-
-    let responder_a = tokio::spawn(answer_routing_test_daemon(
-        Arc::clone(&registry),
-        daemon_a,
-        outbound_a,
-        std::time::Duration::from_secs(2),
-    ));
-    let responder_b = tokio::spawn(answer_routing_test_daemon(
-        Arc::clone(&registry),
-        daemon_b,
-        outbound_b,
-        std::time::Duration::from_millis(150),
-    ));
-    service
-        .cancel_execution_with_provider(&execution, "test cancellation")
-        .await
-        .expect("Cancel is sent through the admitted daemon");
-    assert_eq!(
-        responder_a.await.expect("daemon A responder joins"),
-        vec![api_types::METHOD_EXECUTION_CANCEL]
-    );
-    assert!(
-        responder_b
-            .await
-            .expect("daemon B observer joins")
-            .is_empty(),
-        "mutable Agent daemon B received no Cancel request"
-    );
-}
-
 async fn create_claimed_review_execution(
     db: &db::SqliteDb,
     event_bus: Arc<EventBus>,
@@ -550,15 +470,12 @@ async fn create_claimed_review_execution(
             repo_id: Some(repo_id.to_owned()),
             parent_task_id: None,
             subtask_order: None,
-            assignee_type: None,
-            assignee_id: None,
             title: "Read-only exact Review fixture".to_owned(),
             description: Some("Review a dirty Workspace snapshot".to_owned()),
             task_type: "review".to_owned(),
-            status: "in_progress".to_owned(),
+            lifecycle_state: db::TaskLifecycleState::Active,
             is_automation: false,
             priority: 0,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now,
@@ -579,16 +496,71 @@ async fn create_claimed_review_execution(
         .add_task_role_member(&task.id, "reviewer", ActorRef::Agent(agent_id.to_owned()))
         .await
         .expect("Agent joins the reviewer TaskRole");
-    let (workspace, workspace_created_by_attempt) =
-        crate::task_service::workspace::prepare_workspace_owned(
-            db,
-            workspace_root,
-            &task,
-            &task.id,
-            None,
+
+    let repo = db::RepoRepo::get_by_id(db, repo_id)
+        .await
+        .expect("review Repo loads")
+        .expect("review Repo exists");
+    let repo_path = std::path::PathBuf::from(
+        repo.local_path
+            .as_deref()
+            .expect("review Repo has a local path"),
+    );
+    if !repo_path.join(".git").exists() {
+        run_workspace_git(&repo_path, &["init", "-b", "main"]);
+        run_workspace_git(&repo_path, &["config", "user.email", "test@forge.dev"]);
+        run_workspace_git(&repo_path, &["config", "user.name", "Forge Test"]);
+        std::fs::write(repo_path.join("README.md"), "review fixture base\n")
+            .expect("review Repo base file writes");
+        run_workspace_git(&repo_path, &["add", "README.md"]);
+        run_workspace_git(&repo_path, &["commit", "-m", "review fixture base"]);
+    }
+
+    let human_id = seed_human_user(db).await;
+    let now = now_rfc3339();
+    ProjectMemberRepo::add_member(
+        db,
+        db::CreateProjectMember {
+            id: db::new_uuid_v4(),
+            project_id: project_id.to_owned(),
+            user_id: human_id.clone(),
+            role: "member".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Workspace preparer joins the Project");
+    let work_unit_service = crate::work_unit_service::WorkUnitService::new(
+        Arc::new(db.clone()),
+        Arc::new(EventBus::new(16)),
+        workspace_root.to_path_buf(),
+        Arc::new(::workspace::RepoCacheLockManager::new()),
+        Arc::new(crate::WorkspaceExecutionLockManager::new()),
+    );
+    let work_unit = work_unit_service
+        .create(
+            crate::collaboration_service::CollaborationActorSource::Human(human_id.clone()),
+            crate::work_unit_service::CreateWorkUnitInput {
+                task_id: task.id.clone(),
+                title: "Exact Review workspace".to_owned(),
+                scope: "Read-only Review fixture".to_owned(),
+                role: "reviewer".to_owned(),
+                parent_work_unit_id: None,
+                assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
+                requires_integration: true,
+                provenance: None,
+            },
         )
         .await
-        .expect("review Workspace prepares");
+        .expect("Review WorkUnit creates");
+    let workspace = work_unit_service
+        .prepare_workspace(
+            crate::collaboration_service::CollaborationActorSource::Human(human_id),
+            &work_unit.id,
+        )
+        .await
+        .expect("exact WorkUnit Review workspace prepares");
     let agent = AgentRepo::get_by_id(db, agent_id)
         .await
         .expect("review Agent loads")
@@ -599,7 +571,9 @@ async fn create_claimed_review_execution(
             .expect("review executor snapshot builds");
     let now = now_rfc3339();
     let execution = service
-        .create_running_execution(
+        .create_running_work_unit_execution_with_artifact_inputs(
+            &work_unit.id,
+            work_unit.version,
             db::CreateExecution {
                 id: db::new_uuid_v4(),
                 task_id: task.id.clone(),
@@ -614,7 +588,6 @@ async fn create_claimed_review_execution(
                 resume_policy: None,
                 stopped_at: None,
                 parent_execution_id: None,
-                agent_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: Some("Review the exact Workspace subject".to_owned()),
@@ -627,10 +600,10 @@ async fn create_claimed_review_execution(
                 created_at: now.clone(),
                 updated_at: now,
             },
-            workspace_created_by_attempt,
+            Vec::new(),
         )
         .await
-        .expect("running Review Execution and WorkspaceLease create");
+        .expect("running Review Execution binds to its exact WorkUnit and Workspace");
     let workspace = db::WorkspaceRepo::get_by_id(db, &workspace.id)
         .await
         .expect("Workspace loads")
@@ -668,7 +641,8 @@ async fn create_running_repository_execution(
         .await
         .expect("TaskRole memberships load")
         .is_some_and(|memberships| {
-            crate::task_service::active_agent_membership(&memberships, agent_id).is_none()
+            crate::task_service::memberships::active_agent_membership(&memberships, agent_id)
+                .is_none()
         })
         || crate::task_service::current_role_memberships_authoritative(db, &task.id, role)
             .await
@@ -680,18 +654,76 @@ async fn create_running_repository_execution(
             .await
             .expect("Agent joins the Execution TaskRole");
     }
-    let (workspace, created_by_attempt) = crate::task_service::workspace::prepare_workspace_owned(
+    let repo = db::RepoRepo::get_by_id(db, task.repo_id.as_deref().expect("Task Repo binds"))
+        .await
+        .expect("Execution Repo loads")
+        .expect("Execution Repo exists");
+    let repo_path = std::path::PathBuf::from(
+        repo.local_path
+            .as_deref()
+            .expect("Execution Repo has a local path"),
+    );
+    if !repo_path.join(".git").exists() {
+        run_workspace_git(&repo_path, &["init", "-b", "main"]);
+        run_workspace_git(&repo_path, &["config", "user.email", "test@forge.dev"]);
+        run_workspace_git(&repo_path, &["config", "user.name", "Forge Test"]);
+        std::fs::write(repo_path.join("README.md"), "execution fixture base\n")
+            .expect("Execution Repo base file writes");
+        run_workspace_git(&repo_path, &["add", "README.md"]);
+        run_workspace_git(&repo_path, &["commit", "-m", "execution fixture base"]);
+    }
+    let work_unit_service = crate::work_unit_service::WorkUnitService::new(
+        Arc::new(db.clone()),
+        Arc::new(EventBus::new(16)),
+        workspace_root.to_path_buf(),
+        Arc::new(::workspace::RepoCacheLockManager::new()),
+        Arc::new(crate::WorkspaceExecutionLockManager::new()),
+    );
+    // The exact WorkUnit is created by a Project member, then assigned to the
+    // Agent whose active TaskRole membership was established above.
+    let human_id = seed_human_user(db).await;
+    let now = now_rfc3339();
+    db::ProjectMemberRepo::add_member(
         db,
-        workspace_root,
-        task,
-        &task.id,
-        None,
+        db::CreateProjectMember {
+            id: db::new_uuid_v4(),
+            project_id: task.project_id.clone(),
+            user_id: human_id.clone(),
+            role: "member".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
     )
     .await
-    .expect("Execution Workspace prepares");
+    .expect("Workspace preparer joins the Project");
+    let work_unit = work_unit_service
+        .create(
+            crate::collaboration_service::CollaborationActorSource::Human(human_id.clone()),
+            crate::work_unit_service::CreateWorkUnitInput {
+                task_id: task.id.clone(),
+                title: "Exact repository Execution".to_owned(),
+                scope: "Execution test fixture".to_owned(),
+                role: role.to_owned(),
+                parent_work_unit_id: None,
+                assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
+                requires_integration: true,
+                provenance: None,
+            },
+        )
+        .await
+        .expect("Execution WorkUnit creates");
+    let workspace = work_unit_service
+        .prepare_workspace(
+            crate::collaboration_service::CollaborationActorSource::Human(human_id),
+            &work_unit.id,
+        )
+        .await
+        .expect("exact Execution WorkUnit workspace prepares");
     let now = now_rfc3339();
     let execution = service
-        .create_running_execution(
+        .create_running_work_unit_execution_with_artifact_inputs(
+            &work_unit.id,
+            work_unit.version,
             db::CreateExecution {
                 id: db::new_uuid_v4(),
                 task_id: task.id.clone(),
@@ -706,7 +738,6 @@ async fn create_running_repository_execution(
                 resume_policy: None,
                 stopped_at: None,
                 parent_execution_id: None,
-                agent_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary,
@@ -719,10 +750,10 @@ async fn create_running_repository_execution(
                 created_at: now.clone(),
                 updated_at: now,
             },
-            created_by_attempt,
+            Vec::new(),
         )
         .await
-        .expect("Running Execution receives its exact WorkspaceLease");
+        .expect("Running Execution receives its exact WorkUnit WorkspaceLease");
     (execution, workspace)
 }
 
@@ -1146,7 +1177,6 @@ async fn create_remote_execution_fixture(
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -1170,7 +1200,7 @@ async fn pr8_agent_review_execution_materializes_one_exact_review_report() {
     let event_bus = Arc::new(EventBus::new(16));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let now = now_rfc3339();
     let execution = db::ExecutionRepo::create(
         &*db,
@@ -1188,7 +1218,6 @@ async fn pr8_agent_review_execution_materializes_one_exact_review_report() {
             stopped_at: None,
             parent_execution_id: None,
             harness_session_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -1241,31 +1270,16 @@ async fn pr8_agent_review_execution_materializes_one_exact_review_report() {
 }
 
 #[tokio::test]
-async fn pr8_human_review_uses_plural_active_memberships_over_legacy_projection() {
+async fn pr8_human_review_uses_only_plural_active_memberships() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let (human_a, membership_a) = add_human_reviewer(&db, &service, &task).await;
     let (human_b, membership_b) = add_human_reviewer(&db, &service, &task).await;
 
     assert_eq!(membership_a.status, db::RoleMembershipStatus::Active);
     assert_eq!(membership_b.status, db::RoleMembershipStatus::Active);
-    let projected_user: Option<String> = sqlx::query_scalar(
-        "SELECT assignee_id FROM task_role_assignment
-         WHERE task_id = ? AND role_name = 'reviewer'",
-    )
-    .bind(&task.id)
-    .fetch_optional(db.pool())
-    .await
-    .expect("legacy projection lookup succeeds");
-    assert_eq!(projected_user.as_deref(), Some(human_a.as_str()));
-
-    sqlx::query("DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = 'reviewer'")
-        .bind(&task.id)
-        .execute(db.pool())
-        .await
-        .expect("legacy projection is absent for the membership-only check");
     let execution_a = service
         .start_human_review_execution(&task.id, &human_a, None)
         .await
@@ -1284,7 +1298,6 @@ async fn pr8_human_review_uses_plural_active_memberships_over_legacy_projection(
             .is_none()
     );
 
-    assign_legacy_human_reviewer(&db, &task.id, &human_a).await;
     let execution_b = service
         .start_human_review_execution(&task.id, &human_b, None)
         .await
@@ -1304,7 +1317,7 @@ async fn pr8_suspended_and_ended_humans_cannot_start_review() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let (suspended_user, suspended_membership) = add_human_reviewer(&db, &service, &task).await;
     let (ended_user, ended_membership) = add_human_reviewer(&db, &service, &task).await;
     service
@@ -1336,13 +1349,13 @@ async fn pr8_suspended_and_ended_humans_cannot_start_review() {
 }
 
 #[tokio::test]
-async fn pr8_human_review_uses_legacy_only_without_replacement_task_role() {
+async fn pr8_human_review_requires_an_exact_active_membership() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let user_id = seed_human_user(&db).await;
     let replacement_task =
-        seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+        seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     service
         .create_task_role(
             &replacement_task.id,
@@ -1352,21 +1365,19 @@ async fn pr8_human_review_uses_legacy_only_without_replacement_task_role() {
         )
         .await
         .expect("replacement reviewer TaskRole exists with no members");
-    assign_legacy_human_reviewer(&db, &replacement_task.id, &user_id).await;
     let denied = service
         .start_human_review_execution(&replacement_task.id, &user_id, None)
         .await
         .expect_err("contradictory singleton cannot grant replacement-role authority");
     assert!(matches!(denied, ServiceError::AuthorizationDenied { .. }));
 
-    let legacy_task =
-        seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    assign_legacy_human_reviewer(&db, &legacy_task.id, &user_id).await;
-    let execution = service
-        .start_human_review_execution(&legacy_task.id, &user_id, None)
+    let unassigned_task =
+        seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
+    let denied = service
+        .start_human_review_execution(&unassigned_task.id, &user_id, None)
         .await
-        .expect("bounded singleton fallback works before replacement TaskRole exists");
-    assert_eq!(execution.actor_ref(), Some(db::ActorRef::Human(user_id)));
+        .expect_err("missing TaskRole membership does not infer Human authority");
+    assert!(matches!(denied, ServiceError::AuthorizationDenied { .. }));
 }
 
 #[tokio::test]
@@ -1374,7 +1385,7 @@ async fn pr8_completed_human_report_retry_survives_later_membership_change() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let (user_id, membership) = add_human_reviewer(&db, &service, &task).await;
     let execution = service
         .start_human_review_execution(&task.id, &user_id, None)
@@ -1410,7 +1421,7 @@ async fn pr8_human_review_report_rejects_a_different_human_actor() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let (assigned_human, _) = add_human_reviewer(&db, &service, &task).await;
     let execution = service
         .start_human_review_execution(&task.id, &assigned_human, None)
@@ -1444,7 +1455,7 @@ async fn pr8_running_human_report_reconciles_after_membership_and_workspace_chan
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)))
         .with_workspace_exec_locks(Arc::new(crate::WorkspaceExecutionLockManager::new()));
     let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let (user_id, membership) = add_human_reviewer(&db, &service, &task).await;
     let workspace_root = TempDir::new().expect("Human Review workspace root creates");
     let worktree = workspace_root.path().join("worktree");
@@ -1550,7 +1561,7 @@ async fn pr8_conflicting_human_report_retry_fails_without_replacing_artifact() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let (user_id, _membership) = add_human_reviewer(&db, &service, &task).await;
     let execution = service
         .start_human_review_execution(&task.id, &user_id, None)
@@ -1670,7 +1681,7 @@ async fn pr8_review_subject_uses_exact_workunit_workspace_and_matching_evidence(
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     service
         .create_task_role(
             &task.id,
@@ -1808,7 +1819,6 @@ async fn pr8_review_subject_uses_exact_workunit_workspace_and_matching_evidence(
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             harness_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
@@ -1877,7 +1887,7 @@ async fn pr8_human_review_subject_change_rejects_report_without_pins() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
     let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let (user_id, _) = add_human_reviewer(&db, &service, &task).await;
     let workspace_root = TempDir::new().expect("Human review workspace root creates");
     let worktree_path = workspace_root.path().join("human-review");
@@ -1957,7 +1967,7 @@ async fn pr8_human_review_inputs_and_report_commit_atomically_and_retry_exactly(
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let (user_id, membership) = add_human_reviewer(&db, &service, &task).await;
     let workspace_root = TempDir::new().expect("Human review workspace root creates");
     let worktree_path = workspace_root.path().join("human-review-atomic");
@@ -2187,7 +2197,7 @@ async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
         .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "shell", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     sqlx::query("UPDATE task SET description = 'printf service-run-ok' WHERE id = ?")
         .bind(&task.id)
         .execute(db.pool())
@@ -2308,7 +2318,7 @@ async fn run_cursor_execution_does_not_poll_or_persist_usage() {
         .with_task_executor(task_executor);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "cursor", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let agent = AgentRepo::get_by_id(&*db, &agent_id)
         .await
         .expect("Cursor Agent loads")
@@ -2370,7 +2380,7 @@ async fn run_execution_emits_terminal_execution_event() {
     let workspace_root = TempDir::new().expect("workspace root creates");
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let (running_execution, _workspace) = create_running_repository_execution(
         &db,
         &service,
@@ -2419,7 +2429,7 @@ async fn run_execution_rejects_when_terminal_active_in_workspace() {
         .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let (running_execution, workspace) = create_running_repository_execution(
         &db,
         &service,
@@ -2459,7 +2469,7 @@ async fn run_execution_batches_execution_log_events() {
     let workspace_root = TempDir::new().expect("workspace root creates");
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let (running_execution, _workspace) = create_running_repository_execution(
         &db,
         &service,
@@ -2517,55 +2527,16 @@ async fn run_execution_batches_execution_log_events() {
 }
 
 #[tokio::test]
-async fn launch_execution_creates_interactive_execution_and_workspace() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task = service
-        .create_task(
-            project_id,
-            "Launch interactive",
-            Some("printf launch-ok".to_owned()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("task creates");
-
-    let launched = service
-        .launch_execution(task.id.clone(), agent_id.clone(), None, None)
-        .await
-        .expect("interactive launch succeeds");
-
-    assert_eq!(launched.task.status, "in_progress".to_owned());
-    assert_eq!(launched.execution.role, "interactive".to_owned());
-    assert_eq!(launched.execution.status, ExecutionStatus::Running);
-    assert_eq!(
-        launched.execution.agent_id.as_deref(),
-        Some(agent_id.as_str())
-    );
-    assert_eq!(launched.workspace.task_id, task.id);
-}
-
-#[tokio::test]
-async fn interactive_workspace_lease_uses_the_canonical_task_role_when_present() {
+async fn task_scoped_execution_entrypoints_fail_closed_without_storage() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let role_agent_id = seed_agent(&db).await;
-    let stale_legacy_agent_id = seed_agent(&db).await;
+    let agent_id = seed_agent(&db).await;
     let task = service
         .create_task(
             project_id,
-            "Interactive launch follows TaskRole",
-            Some("printf role-authority".to_owned()),
-            None,
+            "Task-scoped launch rejection",
+            Some("unused".to_owned()),
             None,
             None,
             None,
@@ -2573,408 +2544,44 @@ async fn interactive_workspace_lease_uses_the_canonical_task_role_when_present()
             None,
         )
         .await
-        .expect("task creates");
-    service
-        .create_task_role(
-            &task.id,
-            "implementer",
-            CoordinationMode::Collaborative,
-            "{}".to_owned(),
-        )
-        .await
-        .expect("canonical implementer role creates");
-    service
-        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(role_agent_id))
-        .await
-        .expect("canonical implementer member is active");
-    sqlx::query(
-        "UPDATE task
-         SET assignee_type = 'agent', assignee_id = ?, version = version + 1
-         WHERE id = ?",
-    )
-    .bind(&stale_legacy_agent_id)
-    .bind(&task.id)
-    .execute(db.pool())
-    .await
-    .expect("legacy assignee projection is made contradictory");
+        .expect("Task creates");
 
-    let result = service
-        .launch_execution(task.id.clone(), stale_legacy_agent_id, None, None)
-        .await;
-
-    let error = match result {
-        Ok(_) => panic!("legacy assignee cannot bypass TaskRole"),
-        Err(error) => error,
-    };
-    assert!(error
+    let launch_error = service
+        .launch_execution(task.id.clone(), agent_id.clone(), None, None)
+        .await
+        .err()
+        .expect("Task identity cannot select a Workspace or Execution target");
+    assert!(launch_error
         .to_string()
-        .contains("WorkspaceLease principal is not an active TaskRole member"));
-    let failed_execution_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'failed'",
-    )
-    .bind(&task.id)
-    .fetch_one(db.pool())
-    .await
-    .expect("failed Execution count reads");
-    let running_execution_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'running'",
-    )
-    .bind(&task.id)
-    .fetch_one(db.pool())
-    .await
-    .expect("running Execution count reads");
-    let lease_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM workspace_lease WHERE task_id = ?")
-            .bind(&task.id)
-            .fetch_one(db.pool())
-            .await
-            .expect("WorkspaceLease count reads");
-    assert_eq!(failed_execution_count, 1);
-    assert_eq!(running_execution_count, 0);
-    assert_eq!(lease_count, 0);
-}
-
-#[tokio::test]
-async fn dispatch_initial_role_execution_creates_and_starts_execution() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let workspace_root = TempDir::new().expect("workspace temp dir creates");
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let agent = AgentRepo::get_by_id(&*db, &agent_id)
-        .await
-        .expect("Agent loads")
-        .expect("Agent exists");
-    let daemon_id = agent.daemon_id.expect("Agent daemon binding");
-    let registry = routing_test_registry();
-    let outbound = register_routing_test_daemon(&registry, &daemon_id);
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
-        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
-        .with_workspace_root(workspace_root.path().to_path_buf())
-        .with_daemon_connections(Arc::clone(&registry));
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .create_task_role(
-            &task.id,
-            "implementer",
-            CoordinationMode::Independent,
-            "{}".to_owned(),
-        )
-        .await
-        .expect("implementer TaskRole creates");
-    service
-        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_id.clone()))
-        .await
-        .expect("Agent joins implementer TaskRole");
-    let responder = tokio::spawn(answer_routing_test_daemon(
-        Arc::clone(&registry),
-        daemon_id,
-        outbound,
-        std::time::Duration::from_secs(2),
-    ));
-
-    let execution = service
+        .contains("Task-scoped launch is retired"));
+    let dispatch_error = service
         .dispatch_initial_role_execution(
             &task.id,
             &agent_id,
             "implementer",
             db::ExecutionPurpose::Implement,
-            "implement the task".to_owned(),
+            "legacy workflow dispatch".to_owned(),
         )
         .await
-        .expect("initial role dispatch succeeds");
+        .expect_err("workflow role dispatch cannot infer a WorkUnit");
+    assert!(dispatch_error
+        .to_string()
+        .contains("workflow dispatch is retired"));
 
-    assert_eq!(execution.role, "implementer");
-    assert_eq!(execution.status, ExecutionStatus::Running);
-    assert_eq!(
-        execution.actor_ref(),
-        Some(db::ActorRef::Agent(agent_id.clone()))
-    );
-    assert_eq!(execution.agent_id.as_deref(), Some(agent_id.as_str()));
-    assert_eq!(execution.purpose, Some(db::ExecutionPurpose::Implement));
-    assert_eq!(execution.summary.as_deref(), Some("implement the task"));
-    assert!(execution.harness_session_id.is_none());
-    assert_eq!(
-        responder.await.expect("daemon responder joins"),
-        vec![
-            api_types::METHOD_PROTOCOL_CAPABILITIES,
-            api_types::METHOD_EXECUTION_START
-        ]
-    );
-    let current = ExecutionRepo::get_by_id(&*db, &execution.id)
-        .await
-        .expect("Execution reloads")
-        .expect("Execution exists");
-    assert_eq!(current.status, ExecutionStatus::Running);
-}
-
-#[tokio::test]
-async fn plan_executions_create_immutable_artifacts_for_agent_and_human_authors() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let workspace_root = TempDir::new().expect("workspace temp dir creates");
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
-        .with_task_executor(Arc::new(PlanOutputExecutor))
-        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
-        .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let human_id = seed_human_user(&db).await;
-    let now = now_rfc3339();
-    ProjectMemberRepo::add_member(
-        &*db,
-        CreateProjectMember {
-            id: db::new_uuid_v4(),
-            project_id: project_id.clone(),
-            user_id: human_id.clone(),
-            role: "member".to_owned(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("Human Project membership creates");
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        crate::workflow::default_states::PLANNING.to_owned(),
-    )
-    .await;
-    service
-        .create_task_role(
-            &task.id,
-            crate::workflow::default_roles::PLANNER,
-            CoordinationMode::Collaborative,
-            "{}".to_owned(),
-        )
-        .await
-        .expect("planner TaskRole creates");
-    service
-        .add_task_role_member(
-            &task.id,
-            crate::workflow::default_roles::PLANNER,
-            ActorRef::Agent(agent_id.clone()),
-        )
-        .await
-        .expect("Agent planner membership creates");
-    service
-        .add_task_role_member(
-            &task.id,
-            crate::workflow::default_roles::PLANNER,
-            ActorRef::Human(human_id.clone()),
-        )
-        .await
-        .expect("Human planner membership creates");
-
-    let execution = service
-        .dispatch_initial_role_execution(
-            &task.id,
-            &agent_id,
-            crate::workflow::default_roles::PLANNER,
-            db::ExecutionPurpose::Plan,
-            "plan the task".to_owned(),
-        )
-        .await
-        .expect("Plan Execution dispatch succeeds");
-
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let current = ExecutionRepo::get_by_id(&*db, &execution.id)
-                .await
-                .expect("execution loads")
-                .expect("execution exists");
-            if current.status == ExecutionStatus::Completed {
-                break current;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("Plan Execution completes");
-    assert_eq!(completed.purpose, Some(db::ExecutionPurpose::Plan));
-    assert_eq!(
-        completed.actor_ref(),
-        Some(db::ActorRef::Agent(agent_id.clone()))
-    );
-
-    let first = CollaborationRepo::get_execution_artifact_output(
-        &*db,
-        &completed.id,
-        db::ArtifactKind::Plan,
-    )
-    .await
-    .expect("Plan output loads")
-    .expect("Plan output exists");
-    assert_eq!(first.task_id, task.id);
-    assert!(matches!(
-        &first.producer,
-        db::ArtifactProducer::Execution { execution_id, actor: db::ActorRef::Agent(id) }
-            if execution_id == &completed.id && id == &agent_id
-    ));
-    assert_eq!(first.content.as_deref(), Some("- [x] verify plan\n"));
-
-    let downstream = db::ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: db::new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id.clone()),
-            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-            role: crate::workflow::default_roles::CODER.to_owned(),
-            purpose: Some(db::ExecutionPurpose::Implement),
-            status: ExecutionStatus::Running,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: Some(completed.id.clone()),
-            agent_session_id: None,
-            harness_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("Implement from the selected plan".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: None,
-            created_at: now_rfc3339(),
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("downstream Execution creates");
-    let collaboration = crate::CollaborationService::new(Arc::clone(&db), Arc::clone(&event_bus));
-    collaboration
-        .pin_execution_artifact_input(&downstream.id, &first.id)
-        .await
-        .expect("downstream input pins exact Artifact");
-    sqlx::query("UPDATE execution SET status = 'completed', updated_at = ? WHERE id = ?")
-        .bind(now_rfc3339())
-        .bind(&downstream.id)
-        .execute(db.pool())
-        .await
-        .expect("downstream fixture completes");
-
-    let second_execution = service
-        .dispatch_initial_role_execution(
-            &task.id,
-            &agent_id,
-            crate::workflow::default_roles::PLANNER,
-            db::ExecutionPurpose::Plan,
-            "plan the task again".to_owned(),
-        )
-        .await
-        .expect("second Plan Execution dispatches");
-    let second_execution = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let current = ExecutionRepo::get_by_id(&*db, &second_execution.id)
-                .await
-                .expect("second Execution loads")
-                .expect("second Execution exists");
-            if current.status == ExecutionStatus::Completed {
-                break current;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("second Plan Execution completes");
-    let second = CollaborationRepo::get_execution_artifact_output(
-        &*db,
-        &second_execution.id,
-        db::ArtifactKind::Plan,
-    )
-    .await
-    .expect("second Plan output loads")
-    .expect("second Plan output exists");
-    assert_ne!(first.id, second.id);
-    assert_eq!(first.content.as_deref(), Some("- [x] verify plan\n"));
-    assert!(matches!(
-        &second.producer,
-        db::ArtifactProducer::Execution { execution_id, .. }
-            if execution_id == &second_execution.id
-    ));
-
-    let retry = collaboration
-        .create_plan_artifact_from_execution(&completed.id, "- [x] verify plan\n")
-        .await
-        .expect("same Plan output retry succeeds");
-    assert_eq!(retry.id, first.id);
-
-    let pinned = CollaborationRepo::list_execution_artifact_inputs(&*db, &downstream.id)
-        .await
-        .expect("pinned inputs load");
-    assert_eq!(pinned.len(), 1);
-    assert_eq!(pinned[0].artifact_id, first.id);
-    assert_eq!(pinned[0].digest, first.digest);
-
-    let human_execution = collaboration
-        .start_human_plan_execution(&task.id, &human_id)
-        .await
-        .expect("Human Plan Execution starts");
-    assert_eq!(human_execution.purpose, Some(db::ExecutionPurpose::Plan));
-    assert_eq!(
-        human_execution.actor_ref(),
-        Some(db::ActorRef::Human(human_id.clone()))
-    );
-    assert!(human_execution.agent_id.is_none());
-    assert!(human_execution.harness_session_id.is_none());
-    let human_artifact = collaboration
-        .complete_human_plan_execution(
-            &human_execution.id,
-            &human_id,
-            "- [ ] Human-authored plan\n",
-        )
-        .await
-        .expect("Human Plan Execution completes");
-    assert_eq!(human_artifact.task_id, task.id);
-    assert!(matches!(
-        &human_artifact.producer,
-        db::ArtifactProducer::Execution { execution_id, actor: db::ActorRef::Human(id) }
-            if execution_id == &human_execution.id && id == &human_id
-    ));
-
-    let artifact_count_before_lifecycle_observation: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM artifact WHERE task_id = ? AND kind = 'plan'")
+    let execution_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
             .bind(&task.id)
             .fetch_one(db.pool())
             .await
-            .expect("Plan Artifact count loads before lifecycle observation");
-    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
-        .await
-        .expect("Task lifecycle loads")
-        .expect("Task lifecycle exists");
-    assert_eq!(lifecycle.state, db::TaskLifecycleState::Active);
-    let artifact_count_after_lifecycle_observation: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM artifact WHERE task_id = ? AND kind = 'plan'")
+            .expect("Execution count reads");
+    let workspace_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workspace WHERE task_id = ?")
             .bind(&task.id)
             .fetch_one(db.pool())
             .await
-            .expect("Plan Artifact count loads after lifecycle observation");
-    assert_eq!(
-        artifact_count_after_lifecycle_observation, artifact_count_before_lifecycle_observation,
-        "aggregate progress observes planning activity without rewriting its artifact"
-    );
-
-    let revision_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_plan_revision")
-        .fetch_one(db.pool())
-        .await
-        .expect("legacy revisions count");
-    let approval_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_plan_approval")
-        .fetch_one(db.pool())
-        .await
-        .expect("legacy approvals count");
-    assert_eq!(revision_count, 0);
-    assert_eq!(approval_count, 0);
-    let legacy_task_plan: Option<String> = sqlx::query_scalar("SELECT plan FROM task WHERE id = ?")
-        .bind(&task.id)
-        .fetch_one(db.pool())
-        .await
-        .expect("physical legacy Task.plan field remains");
-    assert!(legacy_task_plan.is_none());
+            .expect("Workspace count reads");
+    assert_eq!(execution_count, 0);
+    assert_eq!(workspace_count, 0);
 }
 
 #[tokio::test]
@@ -2995,7 +2602,8 @@ async fn plan_artifact_output_is_idempotent_across_sqlite_connections() {
     ));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&first_db).await;
     let agent_id = seed_agent(&first_db).await;
-    let task = seed_task_with_status(&first_db, &project_id, &repo_id, "planning".to_owned()).await;
+    let task =
+        seed_task_with_status(&first_db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let now = now_rfc3339();
     let execution_id = db::new_uuid_v4();
     db::ExecutionRepo::create(
@@ -3014,7 +2622,6 @@ async fn plan_artifact_output_is_idempotent_across_sqlite_connections() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("plan complete".to_owned()),
@@ -3083,7 +2690,8 @@ async fn execution_start_event_and_initial_artifact_inputs_commit_atomically() {
     ));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&first_db).await;
     let agent_id = seed_agent(&first_db).await;
-    let task = seed_task_with_status(&first_db, &project_id, &repo_id, "planning".to_owned()).await;
+    let task =
+        seed_task_with_status(&first_db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let producer_id = db::new_uuid_v4();
     db::ExecutionRepo::create(
         &*first_db,
@@ -3101,7 +2709,6 @@ async fn execution_start_event_and_initial_artifact_inputs_commit_atomically() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -3138,7 +2745,6 @@ async fn execution_start_event_and_initial_artifact_inputs_commit_atomically() {
         resume_policy: None,
         stopped_at: None,
         parent_execution_id: Some(producer_id),
-        agent_session_id: None,
         agent_message_id: None,
         last_activity_at: None,
         summary: Some("uses selected plan".to_owned()),
@@ -3222,7 +2828,6 @@ async fn execution_start_event_and_initial_artifact_inputs_commit_atomically() {
         resume_policy: None,
         stopped_at: None,
         parent_execution_id: None,
-        agent_session_id: None,
         agent_message_id: None,
         last_activity_at: None,
         summary: None,
@@ -3277,7 +2882,7 @@ async fn remote_plan_completion_materializes_output_before_terminal_state_and_re
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "planning".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let execution =
         create_remote_execution_fixture(&db, &task.id, &agent_id, db::ExecutionPurpose::Plan).await;
     let full_output = "# Complete plan\n- Inspect the migration\n- Verify recovery\n";
@@ -3341,7 +2946,7 @@ async fn remote_plan_completion_requires_full_output_and_non_plan_completion_is_
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "planning".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let plan_execution =
         create_remote_execution_fixture(&db, &task.id, &agent_id, db::ExecutionPurpose::Plan).await;
 
@@ -3416,7 +3021,7 @@ async fn role_dispatch_ignores_legacy_state_hook_settings() {
         .execute(db.pool())
         .await
         .expect("historical Project settings update");
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     service
         .create_task_role(
             &task.id,
@@ -3478,369 +3083,13 @@ async fn role_dispatch_ignores_legacy_state_hook_settings() {
 }
 
 #[tokio::test]
-async fn retired_workflow_recovery_actions_cannot_run_hooks_or_dispatch() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    let before = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
-        .await
-        .expect("lifecycle loads")
-        .expect("lifecycle exists");
-
-    for action in [
-        api_types::RecoveryAction::RetryHook,
-        api_types::RecoveryAction::UpdateWorkspaceAndRetryHook,
-        api_types::RecoveryAction::SkipHookOnce,
-    ] {
-        let error = service
-            .recover_task(task.id.clone(), action, None, None)
-            .await
-            .expect_err("legacy workflow hook recovery is retired");
-        assert!(error
-            .to_string()
-            .contains("legacy workflow recovery actions are retired"));
-    }
-
-    let current = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("Task reloads")
-        .expect("Task exists");
-    let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
-        .await
-        .expect("lifecycle reloads")
-        .expect("lifecycle exists");
-    assert_eq!(current.status, task.status);
-    assert_eq!(lifecycle.state, before.state);
-    assert_eq!(lifecycle.version, before.version);
-    assert!(ExecutionRepo::list_by_task(
-        &*db,
-        &task.id,
-        PageRequest {
-            cursor: None,
-            limit: 10,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await
-    .expect("execution list loads")
-    .items
-    .is_empty());
-}
-
-#[tokio::test]
-async fn reviewer_dispatch_creates_formal_review_execution_without_legacy_review() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let workspace_root = TempDir::new().expect("workspace temp dir creates");
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let agent = AgentRepo::get_by_id(&*db, &agent_id)
-        .await
-        .expect("Agent loads")
-        .expect("Agent exists");
-    let daemon_id = agent.daemon_id.expect("Agent daemon binding");
-    let registry = routing_test_registry();
-    let outbound = register_routing_test_daemon(&registry, &daemon_id);
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
-        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
-        .with_workspace_root(workspace_root.path().to_path_buf())
-        .with_daemon_connections(Arc::clone(&registry));
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    sqlx::query("UPDATE task SET task_type = 'review' WHERE id = ?")
-        .bind(&task.id)
-        .execute(db.pool())
-        .await
-        .expect("fixture marks this Task as a read-only Review operation");
-
-    service
-        .create_task_role(
-            &task.id,
-            crate::workflow::default_roles::REVIEWER,
-            CoordinationMode::Collaborative,
-            "{}".to_owned(),
-        )
-        .await
-        .expect("reviewer TaskRole creates");
-    service
-        .add_task_role_member(
-            &task.id,
-            crate::workflow::default_roles::REVIEWER,
-            ActorRef::Agent(agent_id.clone()),
-        )
-        .await
-        .expect("Agent joins reviewer TaskRole");
-    let responder = tokio::spawn(answer_routing_test_daemon(
-        Arc::clone(&registry),
-        daemon_id,
-        outbound,
-        std::time::Duration::from_secs(2),
-    ));
-
-    let execution = service
-        .dispatch_initial_role_execution(
-            &task.id,
-            &agent_id,
-            crate::workflow::default_roles::REVIEWER,
-            db::ExecutionPurpose::Review,
-            "review the task".to_owned(),
-        )
-        .await
-        .expect("reviewer dispatch succeeds");
-    assert_eq!(
-        responder.await.expect("daemon responder joins"),
-        vec![
-            api_types::METHOD_PROTOCOL_CAPABILITIES,
-            api_types::METHOD_EXECUTION_START
-        ]
-    );
-
-    let current = ExecutionRepo::get_by_id(&*db, &execution.id)
-        .await
-        .expect("Review Execution reloads")
-        .expect("Review Execution exists");
-    assert_eq!(current.role, crate::workflow::default_roles::REVIEWER);
-    assert_eq!(current.purpose, Some(db::ExecutionPurpose::Review));
-    assert_eq!(current.actor_ref(), Some(db::ActorRef::Agent(agent_id)));
-    assert_eq!(current.status, ExecutionStatus::Running);
-    let legacy_review_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM review WHERE task_id = ?")
-            .bind(&task.id)
-            .fetch_one(db.pool())
-            .await
-            .expect("legacy Review row count");
-    assert_eq!(
-        legacy_review_count, 0,
-        "Review Execution creates no legacy row"
-    );
-}
-
-#[tokio::test]
-async fn failed_review_execution_does_not_mutate_legacy_review_or_lifecycle() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let now = now_rfc3339();
-    let execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id.clone()),
-            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(db::ExecutionPurpose::Review),
-            harness_session_id: None,
-            role: crate::workflow::default_roles::REVIEWER.to_owned(),
-            status: ExecutionStatus::Failed,
-            stop_reason: Some(db::StopReason::ExecutorFailed),
-            stopped_by: Some("system:executor".to_owned()),
-            resume_policy: Some(db::ResumePolicy::Manual),
-            stopped_at: Some(now.clone()),
-            parent_execution_id: None,
-            // This historical fixture has no HarnessSession authority.
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("reviewer quit before verdict".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: Some("claude-code exited with status exit status: 1".to_owned()),
-            executor_config_snapshot_json: None,
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("failed reviewer execution creates");
-    ReviewRepo::create(
-        &*db,
-        db::CreateReview {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            execution_id: execution.id.clone(),
-            attempt_number: 1,
-            status: ReviewStatus::Running,
-            step_results_json: json!({ "ci_steps": [] }).to_string(),
-            started_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("running review creates");
-
-    let lifecycle_before = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
-        .await
-        .expect("lifecycle loads")
-        .expect("lifecycle exists");
-    service
-        .maybe_cascade_executor_completion(&execution.id)
-        .await
-        .expect("legacy completion check is harmless");
-
-    let reviews = ReviewRepo::list_by_task(&*db, &task.id)
-        .await
-        .expect("reviews load");
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, ReviewStatus::Running);
-    assert!(reviews[0].finished_at.is_none());
-    let current = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(current.status, "in_progress");
-    let lifecycle_after = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
-        .await
-        .expect("lifecycle reloads")
-        .expect("lifecycle exists");
-    assert_eq!(lifecycle_after.state, lifecycle_before.state);
-    assert_eq!(lifecycle_after.version, lifecycle_before.version);
-    let current_execution = ExecutionRepo::get_by_id(&*db, &execution.id)
-        .await
-        .expect("execution loads")
-        .expect("execution exists");
-    assert_eq!(
-        current_execution.resume_policy,
-        Some(db::ResumePolicy::Manual),
-        "retry ownership is not assigned by the retired review cascade"
-    );
-}
-
-#[tokio::test]
-async fn legacy_review_approval_gate_does_not_authorize_a_decision_or_lifecycle_move() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let mut workflow = crate::workflow::default_workflow::default_workflow();
-    workflow
-        .states
-        .iter_mut()
-        .find(|state| state.name == crate::workflow::default_states::REVIEW)
-        .and_then(|state| state.gate_config.as_mut())
-        .expect("review gate config")
-        .requires_user_approval = Some(true);
-    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
-        .bind(serde_json::to_string(&workflow).expect("workflow serializes"))
-        .bind(&project_id)
-        .execute(db.pool())
-        .await
-        .expect("project workflow updates");
-    let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let now = now_rfc3339();
-    let execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id.clone()),
-                    actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-                    purpose: Some(db::ExecutionPurpose::Review),
-                    harness_session_id: None,
-            role: crate::workflow::default_roles::REVIEWER.to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            // This historical fixture has no HarnessSession authority.
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("Looks good.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"clear\",\"findings\":[],\"questions\":[]}".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("completed reviewer execution creates");
-    ReviewRepo::create(
-        &*db,
-        db::CreateReview {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            execution_id: execution.id.clone(),
-            attempt_number: 1,
-            status: ReviewStatus::Running,
-            step_results_json: json!({ "ci_steps": [] }).to_string(),
-            started_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("running review creates");
-
-    let lifecycle_before = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
-        .await
-        .expect("lifecycle loads")
-        .expect("lifecycle exists");
-    service
-        .maybe_cascade_executor_completion(&execution.id)
-        .await
-        .expect("legacy completion check is harmless");
-
-    let reviews = ReviewRepo::list_by_task(&*db, &task.id)
-        .await
-        .expect("reviews load");
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, ReviewStatus::Running);
-    assert!(reviews[0].finished_at.is_none());
-    let current = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(current.status, "in_progress");
-    let lifecycle_after = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
-        .await
-        .expect("lifecycle reloads")
-        .expect("lifecycle exists");
-    assert_eq!(lifecycle_after.state, lifecycle_before.state);
-    assert_eq!(lifecycle_after.version, lifecycle_before.version);
-    assert!(db::GateRepo::list_active_gate_policies(&*db, &task.id)
-        .await
-        .expect("Gate policies load")
-        .is_empty());
-    let comments = TaskCommentRepo::list_comments(
-        &*db,
-        &task.id,
-        PageRequest {
-            cursor: None,
-            limit: 10,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Asc,
-        },
-    )
-    .await
-    .expect("comments list");
-    assert!(comments.items.is_empty());
-}
-
-#[tokio::test]
 async fn follow_up_execution_reuses_explicit_harness_session() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "claude_code", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let message = "Please continue with the remaining edge cases".to_owned();
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
@@ -3859,7 +3108,6 @@ async fn follow_up_execution_reuses_explicit_harness_session() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("parent execution".to_owned()),
@@ -3902,7 +3150,9 @@ async fn follow_up_execution_reuses_explicit_harness_session() {
         parent_execution.harness_session_id
     );
     assert_eq!(
-        result.execution.agent_session_id.as_deref(),
+        execution_external_session_id(&db, &result.execution)
+            .await
+            .as_deref(),
         Some("test-session")
     );
     let snapshot: serde_json::Value = serde_json::from_str(
@@ -3923,11 +3173,13 @@ async fn follow_up_execution_reuses_explicit_harness_session() {
 }
 
 #[tokio::test]
-async fn legacy_execution_session_id_never_authorizes_resume_or_actions() {
+async fn follow_up_without_exact_work_unit_fails_closed() {
     let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let now = now_rfc3339();
     let execution = ExecutionRepo::create(
         &*db,
@@ -3938,14 +3190,13 @@ async fn legacy_execution_session_id_never_authorizes_resume_or_actions() {
             actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
             purpose: Some(db::ExecutionPurpose::Implement),
             harness_session_id: None,
-            role: "coder".to_owned(),
+            role: "implementer".to_owned(),
             status: ExecutionStatus::Completed,
             stop_reason: None,
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -3958,294 +3209,33 @@ async fn legacy_execution_session_id_never_authorizes_resume_or_actions() {
             ),
             workspace_id: None,
             created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("historical-shaped execution creates");
-    sqlx::query("UPDATE execution SET agent_session_id = 'legacy-thread' WHERE id = ?")
-        .bind(&execution.id)
-        .execute(db.pool())
-        .await
-        .expect("legacy session projection is seeded");
-    let historical = ExecutionRepo::get_by_id(&*db, &execution.id)
-        .await
-        .expect("execution loads")
-        .expect("execution exists");
-
-    let legacy_only =
-        crate::task_service::resumable_external_session(&db, &historical, Some(&agent_id), None)
-            .await
-            .expect("legacy projection lookup succeeds without becoming authority");
-    assert_eq!(legacy_only, None);
-
-    sqlx::query(
-        "INSERT INTO execution_session_migration_issue
-         (id, execution_id, issue_kind, details_json, created_at)
-         VALUES (?, ?, 'historical_session_ambiguous', '{}', ?)",
-    )
-    .bind(new_uuid_v4())
-    .bind(&execution.id)
-    .bind(now_rfc3339())
-    .execute(db.pool())
-    .await
-    .expect("historical ambiguity marker is inserted");
-
-    let ambiguous =
-        crate::task_service::resumable_external_session(&db, &historical, Some(&agent_id), None)
-            .await
-            .expect("ambiguous lookup fails closed without error");
-    assert_eq!(ambiguous, None);
-
-    let workflow = crate::workflow::default_workflow::default_workflow();
-    let annotation = api_types::TaskBlockingAnnotation {
-        annotation_type: api_types::FailureKind::ExecutorFailed,
-        blocking_reason: "executor failed".to_owned(),
-        blocked_by: Some("system".to_owned()),
-        blocked_at: Some(now_rfc3339()),
-        blocked_execution_id: Some(historical.id.clone()),
-        artifact: None,
-        message: None,
-        hook: None,
-        recovery_actions: vec![api_types::RecoveryAction::ResumeSession],
-    };
-    let actions =
-        crate::task_service::action_resolver::resolve_execution_actions_with_session_state(
-            &task,
-            &workflow,
-            &[historical],
-            Some(&annotation),
-            Some(&std::collections::HashSet::new()),
-        );
-    let session_follow_up = actions
-        .iter()
-        .find(|action| action.action == api_types::ExecutionActionKind::SessionFollowUp)
-        .expect("session follow-up action exists");
-    assert!(!session_follow_up.enabled);
-    let workflow_resume = actions
-        .iter()
-        .find(|action| action.action == api_types::ExecutionActionKind::WorkflowResume)
-        .expect("workflow resume action exists");
-    assert!(!workflow_resume.enabled);
-}
-
-#[tokio::test]
-async fn role_follow_up_keeps_active_lineage_agent_over_legacy_projection() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let workspace_root = TempDir::new().expect("workspace root creates");
-    let service = TaskService::new(Arc::clone(&db), event_bus)
-        .with_task_executor(Arc::new(NoDiffExecutor))
-        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
-        .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
-        .await
-        .expect("TaskRole loads")
-        .expect("TaskRole exists");
-    service
-        .update_task_role(
-            &task.id,
-            "implementer",
-            role.version,
-            Some(CoordinationMode::Collaborative),
-            None,
-        )
-        .await
-        .expect("coordination mode updates");
-    service
-        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_b.clone()))
-        .await
-        .expect("second membership creates");
-    let workspace_id = seed_workspace_for_task(&db, &task, workspace_root.path()).await;
-    let now = now_rfc3339();
-    let parent_execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_b.clone()),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: "coder".to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("parent execution".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"codex","config":{},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
-            ),
-            workspace_id: Some(workspace_id),
-            created_at: now.clone(),
             updated_at: now,
         },
     )
     .await
-    .expect("parent execution creates");
+    .expect("historical-shaped Execution creates");
 
-    let follow_up = service
-        .dispatch_role_follow_up(
-            &task.id,
-            "coder",
-            parent_execution.id.clone(),
-            "continue current work".to_owned(),
-            "test",
-            db::ExecutionPurpose::Implement,
-        )
-        .await
-        .expect("role follow-up succeeds");
-
-    assert_eq!(follow_up.agent_id.as_deref(), Some(agent_b.as_str()));
-    let historical_parent = ExecutionRepo::get_by_id(&*db, &parent_execution.id)
-        .await
-        .expect("historical parent loads")
-        .expect("historical parent exists");
-    assert_eq!(
-        historical_parent.agent_id.as_deref(),
-        Some(agent_b.as_str())
-    );
-}
-
-#[tokio::test]
-async fn role_follow_up_does_not_reuse_suspended_lineage_agent() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let workspace_root = TempDir::new().expect("workspace root creates");
-    let service = TaskService::new(Arc::clone(&db), event_bus)
-        .with_task_executor(Arc::new(NoDiffExecutor))
-        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
-        .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
-        .await
-        .expect("TaskRole loads")
-        .expect("TaskRole exists");
-    service
-        .update_task_role(
-            &task.id,
-            "implementer",
-            role.version,
-            Some(CoordinationMode::Collaborative),
+    let error = service
+        .follow_up_execution(
+            execution.id,
+            "continue without an exact WorkUnit".to_owned(),
+            Some(agent_id),
             None,
         )
         .await
-        .expect("coordination mode updates");
-    let membership_b = service
-        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_b.clone()))
-        .await
-        .expect("second membership creates");
-    service
-        .update_task_role_member(
-            &task.id,
-            &membership_b.id,
-            membership_b.version,
-            db::RoleMembershipStatus::Suspended,
-        )
-        .await
-        .expect("lineage membership suspends");
-    let workspace_id = seed_workspace_for_task(&db, &task, workspace_root.path()).await;
-    let now = now_rfc3339();
-    let parent_execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_b.clone()),
-            actor_ref: Some(db::ActorRef::Agent(agent_b.clone())),
-            purpose: Some(db::ExecutionPurpose::Implement),
-            harness_session_id: None,
-            role: "coder".to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("parent execution".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"codex","config":{}}"#.to_owned(),
-            ),
-            workspace_id: Some(workspace_id),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("parent execution creates");
-    let parent_execution = ExecutionRepo::record_harness_session_result(
-        &*db,
-        &parent_execution.id,
-        "suspended-lineage-thread",
-        &now_rfc3339(),
-    )
-    .await
-    .expect("parent harness session activates");
+        .err()
+        .expect("Task and session identity cannot supply a missing WorkUnit target");
+    assert!(error.to_string().contains("exact WorkUnit and Workspace"));
 
-    let follow_up = service
-        .dispatch_role_follow_up(
-            &task.id,
-            "coder",
-            parent_execution.id.clone(),
-            "continue with the current eligible Agent".to_owned(),
-            "test",
-            db::ExecutionPurpose::Implement,
-        )
-        .await
-        .expect("role follow-up succeeds");
-
-    assert_eq!(follow_up.agent_id.as_deref(), Some(agent_a.as_str()));
-    assert_ne!(
-        follow_up.harness_session_id,
-        parent_execution.harness_session_id
-    );
-    assert!(follow_up.agent_session_id.is_none());
-    let historical_parent = ExecutionRepo::get_by_id(&*db, &parent_execution.id)
-        .await
-        .expect("historical parent loads")
-        .expect("historical parent exists");
+    let execution_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Execution count reads");
     assert_eq!(
-        historical_parent.agent_id.as_deref(),
-        Some(agent_b.as_str())
+        execution_count, 1,
+        "no synthetic follow-up Execution is created"
     );
 }
 
@@ -4256,7 +3246,7 @@ async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "claude_code", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let now = now_rfc3339();
     let parent = ExecutionRepo::create(
         &*db,
@@ -4274,7 +3264,6 @@ async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: Some("failed-session".to_owned()),
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -4308,7 +3297,6 @@ async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -4366,7 +3354,7 @@ async fn follow_up_execution_codex_resumes_explicit_harness_session() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let message = "Please continue with the remaining edge cases".to_owned();
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
@@ -4385,7 +3373,6 @@ async fn follow_up_execution_codex_resumes_explicit_harness_session() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("parent execution".to_owned()),
@@ -4424,7 +3411,9 @@ async fn follow_up_execution_codex_resumes_explicit_harness_session() {
         parent_execution.harness_session_id
     );
     assert_eq!(
-        result.execution.agent_session_id.as_deref(),
+        execution_external_session_id(&db, &result.execution)
+            .await
+            .as_deref(),
         Some("codex-thread")
     );
     let snapshot: serde_json::Value = serde_json::from_str(
@@ -4457,7 +3446,7 @@ async fn follow_up_execution_rejects_running_parent() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -4475,7 +3464,6 @@ async fn follow_up_execution_rejects_running_parent() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("running parent".to_owned()),
@@ -4507,7 +3495,7 @@ async fn follow_up_on_cancelled_execution_reuses_active_harness_session() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -4525,7 +3513,6 @@ async fn follow_up_on_cancelled_execution_reuses_active_harness_session() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("cancelled parent".to_owned()),
@@ -4562,7 +3549,9 @@ async fn follow_up_on_cancelled_execution_reuses_active_harness_session() {
         parent_execution.harness_session_id
     );
     assert_eq!(
-        child.execution.agent_session_id.as_deref(),
+        execution_external_session_id(&db, &child.execution)
+            .await
+            .as_deref(),
         Some("test-session")
     );
 }
@@ -4574,7 +3563,7 @@ async fn follow_up_on_cancelled_execution_without_session_starts_new_execution()
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -4592,7 +3581,6 @@ async fn follow_up_on_cancelled_execution_without_session_starts_new_execution()
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("cancelled parent".to_owned()),
@@ -4622,17 +3610,19 @@ async fn follow_up_on_cancelled_execution_without_session_starts_new_execution()
         Some(parent_id.as_str())
     );
     assert!(child.execution.harness_session_id.is_none());
-    assert!(child.execution.agent_session_id.is_none());
+    assert!(execution_external_session_id(&db, &child.execution)
+        .await
+        .is_none());
 }
 
 #[tokio::test]
-async fn follow_up_execution_with_legacy_projection_starts_fresh_execution() {
+async fn follow_up_without_exact_harness_session_starts_fresh_execution() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -4650,7 +3640,6 @@ async fn follow_up_execution_with_legacy_projection_starts_fresh_execution() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("completed parent".to_owned()),
@@ -4668,12 +3657,6 @@ async fn follow_up_execution_with_legacy_projection_starts_fresh_execution() {
     )
     .await
     .expect("parent execution creates");
-    sqlx::query("UPDATE execution SET agent_session_id = 'legacy-thread' WHERE id = ?")
-        .bind(&parent_execution.id)
-        .execute(db.pool())
-        .await
-        .expect("legacy projection is added to the historical execution");
-
     let parent_id = parent_execution.id.clone();
     let result = service
         .follow_up_execution(parent_execution.id, "continue".to_owned(), None, None)
@@ -4685,7 +3668,9 @@ async fn follow_up_execution_with_legacy_projection_starts_fresh_execution() {
         Some(parent_id.as_str())
     );
     assert!(child.execution.harness_session_id.is_none());
-    assert!(child.execution.agent_session_id.is_none());
+    assert!(execution_external_session_id(&db, &child.execution)
+        .await
+        .is_none());
     assert_eq!(
         crate::task_service::execution::harness_invocation_for_execution(
             &db,
@@ -4693,7 +3678,7 @@ async fn follow_up_execution_with_legacy_projection_starts_fresh_execution() {
             None,
         )
         .await
-        .expect("legacy projection does not change Start into Resume"),
+        .expect("missing external identity does not change Start into Resume"),
         api_types::HarnessInvocation::Start
     );
 }
@@ -4705,7 +3690,7 @@ async fn follow_up_execution_rejects_terminal_task() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "done".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Done).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -4723,7 +3708,6 @@ async fn follow_up_execution_rejects_terminal_task() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: Some("test-session".to_owned()),
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("completed parent".to_owned()),
@@ -4756,7 +3740,7 @@ async fn follow_up_execution_on_blocked_task() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     TaskRepo::update(
         &*db,
         db::UpdateTask {
@@ -4772,7 +3756,6 @@ async fn follow_up_execution_on_blocked_task() {
                     .to_owned(),
             )),
             failed_json: None,
-            task_state_config: None,
             parent_task_id: None,
             updated_at: db::now_rfc3339(),
         },
@@ -4796,7 +3779,6 @@ async fn follow_up_execution_on_blocked_task() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("completed parent".to_owned()),
@@ -4829,7 +3811,11 @@ async fn follow_up_execution_on_blocked_task() {
         .expect("follow-up succeeds");
 
     assert_eq!(result.execution.role, "interactive".to_owned());
-    assert_eq!(result.task.status, "in_progress".to_owned());
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &result.task.id)
+        .await
+        .expect("TaskLifecycle loads")
+        .expect("TaskLifecycle exists");
+    assert_eq!(lifecycle.state, db::TaskLifecycleState::Active);
 }
 
 #[tokio::test]
@@ -4840,7 +3826,7 @@ async fn follow_up_execution_rejects_executor_mismatch() {
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let shell_agent_id = seed_agent(&db).await;
     let codex_agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -4858,7 +3844,6 @@ async fn follow_up_execution_rejects_executor_mismatch() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: Some("test-session".to_owned()),
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("completed parent".to_owned()),
@@ -4894,112 +3879,13 @@ async fn follow_up_execution_rejects_executor_mismatch() {
 }
 
 #[tokio::test]
-async fn re_execute_uses_current_membership_not_legacy_projection() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("initial role assignment succeeds");
-    let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
-        .await
-        .expect("TaskRole loads")
-        .expect("TaskRole exists");
-    service
-        .update_task_role(
-            &task.id,
-            "implementer",
-            role.version,
-            Some(CoordinationMode::Collaborative),
-            None,
-        )
-        .await
-        .expect("coordination mode updates");
-    service
-        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_b.clone()))
-        .await
-        .expect("second membership creates");
-    let projection = TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &task.id, "coder")
-        .await
-        .expect("legacy projection loads")
-        .expect("legacy projection exists");
-    assert_eq!(projection.assignee_id.as_deref(), Some(agent_a.as_str()));
-    let now = now_rfc3339();
-    let parent_execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_b.clone()),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: "coder".to_owned(),
-            status: ExecutionStatus::Cancelled,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: Some("test-session".to_owned()),
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("cancelled parent".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("parent execution creates");
-
-    let result = service
-        .re_execute_execution(parent_execution.id.clone())
-        .await
-        .expect("re-execute succeeds");
-
-    assert_eq!(result.execution.role, "coder".to_owned());
-    assert_eq!(result.execution.status, ExecutionStatus::Running);
-    assert_eq!(result.execution.agent_id.as_deref(), Some(agent_b.as_str()));
-    assert_eq!(
-        result.execution.parent_execution_id.as_deref(),
-        Some(parent_execution.id.as_str())
-    );
-    assert_eq!(result.execution.agent_session_id, None);
-    let historical_parent = ExecutionRepo::get_by_id(&*db, &parent_execution.id)
-        .await
-        .expect("historical parent loads")
-        .expect("historical parent exists");
-    assert_eq!(
-        historical_parent.agent_id.as_deref(),
-        Some(agent_b.as_str())
-    );
-}
-
-#[tokio::test]
 async fn re_execute_rejects_running_parent() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -5017,7 +3903,6 @@ async fn re_execute_rejects_running_parent() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: Some("test-session".to_owned()),
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("running parent".to_owned()),
@@ -5052,7 +3937,7 @@ async fn re_execute_rejects_concurrent_running_execution() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -5070,7 +3955,6 @@ async fn re_execute_rejects_concurrent_running_execution() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: Some("test-session".to_owned()),
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("cancelled parent".to_owned()),
@@ -5104,7 +3988,6 @@ async fn re_execute_rejects_concurrent_running_execution() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some("running sibling".to_owned()),
@@ -5133,52 +4016,6 @@ async fn re_execute_rejects_concurrent_running_execution() {
 }
 
 #[tokio::test]
-async fn interactive_execution_completion_does_not_trigger_review_cascade() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task = service
-        .create_task(
-            project_id,
-            "Interactive no cascade",
-            Some("printf no-cascade".to_owned()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("task creates");
-    let launched = service
-        .launch_execution(task.id.clone(), agent_id, None, None)
-        .await
-        .expect("launch succeeds");
-
-    let registry = Arc::new(cli_adapters::default_registry());
-    let executor = executors::AdapterExecutor::new(registry);
-    let execution = service
-        .run_execution(launched.execution.id.clone(), &executor)
-        .await
-        .expect("interactive execution runs");
-    assert_eq!(execution.status, ExecutionStatus::Completed);
-
-    service
-        .maybe_cascade_executor_completion(&launched.execution.id)
-        .await
-        .expect("cascade check succeeds");
-
-    let current = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(current.status, "in_progress".to_owned());
-}
-
-#[tokio::test]
 async fn recover_reexecute_without_blocked_execution_dispatches_current_state_role() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
@@ -5189,7 +4026,7 @@ async fn recover_reexecute_without_blocked_execution_dispatches_current_state_ro
         .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     service
         .create_task_role(
             &task.id,
@@ -5203,17 +4040,6 @@ async fn recover_reexecute_without_blocked_execution_dispatches_current_state_ro
         .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_id.clone()))
         .await
         .expect("Agent joins the authoritative implementer TaskRole");
-    TaskRoleAssignmentRepo::assign(
-        &*db,
-        role_assignment_input(
-            &task.id,
-            crate::workflow::default_roles::CODER,
-            Some(agent_id.clone()),
-            None,
-        ),
-    )
-    .await
-    .expect("coder assignment created");
     let annotation = json!({
         "type": "recovery_required",
         "blocking_reason": "crash_recovery",
@@ -5235,7 +4061,6 @@ async fn recover_reexecute_without_blocked_execution_dispatches_current_state_ro
             error_annotation: Some(Some(annotation)),
             blocked_json: None,
             failed_json: None,
-            task_state_config: None,
             parent_task_id: None,
             updated_at: now_rfc3339(),
         },
@@ -5253,7 +4078,11 @@ async fn recover_reexecute_without_blocked_execution_dispatches_current_state_ro
         .await
         .expect("reexecute recovers");
 
-    assert_eq!(recovered.status, "in_progress");
+    let recovered_lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+        .await
+        .expect("recovered TaskLifecycle loads")
+        .expect("recovered TaskLifecycle exists");
+    assert_eq!(recovered_lifecycle.state, db::TaskLifecycleState::Active);
     assert_eq!(recovered.error_annotation, None);
     let executions = ExecutionRepo::list_by_task(
         &*db,
@@ -5297,254 +4126,74 @@ impl TaskExecutor for PendingExecutor {
     }
 }
 
-#[tokio::test]
-async fn parent_execution_completion_does_not_recursively_dispatch_subtask_work() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let subtask = seed_subtask_with_status(&db, &task, "child", "todo".to_owned(), 0).await;
-    let workspace = seed_workspace_with_plan(&db, &task, "- [x] parent work\n").await;
-
-    let plan_execution =
-        create_remote_execution_fixture(&db, &task.id, &agent_id, db::ExecutionPurpose::Plan).await;
-    let plan_artifact =
-        crate::CollaborationService::new(Arc::clone(&db), Arc::new(EventBus::new(8)))
-            .create_plan_artifact_from_execution(&plan_execution.id, "# Exact task plan\n")
-            .await
-            .expect("Plan Artifact creates");
-
-    let mut harness_capabilities = api_types::HarnessCapabilities::unknown();
-    harness_capabilities.resume = api_types::CapabilitySupport::Native;
-    let harness_session_id = db::new_uuid_v4();
+async fn launch_work_unit_for_override_snapshot(
+    db: &SqliteDb,
+    service: &TaskService,
+    task: &Task,
+    agent_id: &str,
+    overrides: Option<ExecutionOverrides>,
+) -> db::Execution {
     let now = now_rfc3339();
-    db::HarnessSessionRepo::create(
-        &*db,
-        db::CreateHarnessSession {
-            id: harness_session_id.clone(),
-            agent_id: agent_id.clone(),
-            harness_kind: "codex".to_owned(),
-            external_session_id: Some("test-session".to_owned()),
-            profile_id: None,
-            profile_snapshot_json: json!({
-                "executor_type": "codex",
-                "config": {},
-                "credential_ref": null
+    let work_unit_id = db::new_uuid_v4();
+    let work_unit = db::WorkUnitRepo::create(
+        db,
+        db::CreateWorkUnit {
+            id: work_unit_id.clone(),
+            task_id: task.id.clone(),
+            parent_work_unit_id: None,
+            title: "Snapshot test WorkUnit".to_owned(),
+            scope: "Exact assigned execution target".to_owned(),
+            role: "implementer".to_owned(),
+            assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
+            requires_integration: false,
+            provenance: None,
+            created_by: db::ActorRef::Agent(agent_id.to_owned()),
+            created_at: now.clone(),
+        },
+        db::CreateDomainEvent {
+            id: db::new_uuid_v4(),
+            event_type: "work_unit.created".to_owned(),
+            entity_type: "work_unit".to_owned(),
+            entity_id: work_unit_id.clone(),
+            actor_type: "agent".to_owned(),
+            actor_id: Some(agent_id.to_owned()),
+            scope_type: "task".to_owned(),
+            scope_id: task.id.clone(),
+            correlation_id: work_unit_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("work-unit-created:{work_unit_id}")),
+            payload_json: json!({
+                "work_unit_id": work_unit_id,
+                "task_id": task.id,
+                "version": 1,
+                "status": "open"
             })
             .to_string(),
-            capabilities_snapshot_json: serde_json::to_string(&harness_capabilities.snapshot())
-                .expect("HarnessSession capabilities serialize"),
-            workspace_id: Some(workspace.id.clone()),
-            status: db::HarnessSessionStatus::Active,
-            predecessor_session_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-            last_activity_at: Some(now.clone()),
+            created_at: now,
         },
     )
     .await
-    .expect("active HarnessSession creates");
-
-    let parent_input = db::CreateExecution {
-        id: db::new_uuid_v4(),
-        task_id: task.id.clone(),
-        agent_id: Some(agent_id.clone()),
-        actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-        purpose: Some(db::ExecutionPurpose::Implement),
-        harness_session_id: Some(harness_session_id.clone()),
-        role: crate::workflow::default_roles::CODER.to_owned(),
-        status: ExecutionStatus::Running,
-        stop_reason: None,
-        stopped_by: None,
-        resume_policy: None,
-        stopped_at: None,
-        parent_execution_id: None,
-        agent_session_id: Some("test-session".to_owned()),
-        agent_message_id: None,
-        last_activity_at: None,
-        summary: Some("implemented the change".to_owned()),
-        logs_path: None,
-        before_sha: None,
-        after_sha: None,
-        error: None,
-        executor_config_snapshot_json: Some(
-            r#"{"executor_type":"codex","config":{},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
-        ),
-        workspace_id: Some(workspace.id.clone()),
-        created_at: now.clone(),
-        updated_at: now.clone(),
-    };
-    let execution = db::ExecutionRepo::create_with_artifact_inputs_and_event(
-        &*db,
-        parent_input.clone(),
-        vec![plan_artifact.id.clone()],
-        crate::task_service::execution_domain_event(&parent_input, "execution.started"),
-    )
-    .await
-    .expect("parent Execution and exact Plan input create atomically")
-    .0;
-    sqlx::query("UPDATE execution SET status = 'completed', updated_at = ? WHERE id = ?")
-        .bind(now_rfc3339())
-        .bind(&execution.id)
-        .execute(db.pool())
-        .await
-        .expect("parent Execution completes");
-
+    .expect("exact WorkUnit creates")
+    .record;
     service
-        .maybe_cascade_executor_completion(&execution.id)
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "snapshot override test".to_owned(),
+            Vec::new(),
+            overrides,
+        )
         .await
-        .expect("legacy completion check is harmless");
-
-    let executions = ExecutionRepo::list_by_task(
-        &*db,
-        &task.id,
-        PageRequest {
-            cursor: None,
-            limit: 20,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await
-    .expect("executions load");
-    assert_eq!(executions.items.len(), 2);
-    assert!(executions
-        .items
-        .iter()
-        .any(|item| { item.id == execution.id && item.status == ExecutionStatus::Completed }));
-    assert!(executions
-        .items
-        .iter()
-        .any(|item| item.id == plan_execution.id));
-    assert!(executions
-        .items
-        .iter()
-        .all(|item| item.id == execution.id || item.id == plan_execution.id));
-    let parent_lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
-        .await
-        .expect("parent lifecycle loads")
-        .expect("parent lifecycle exists");
-    assert_eq!(parent_lifecycle.state, db::TaskLifecycleState::Active);
-    let subtask_lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &subtask.id)
-        .await
-        .expect("subtask lifecycle loads")
-        .expect("subtask lifecycle exists");
-    assert_eq!(subtask_lifecycle.state, db::TaskLifecycleState::Ready);
+        .expect("exact WorkUnit Execution launches")
+        .execution
 }
 
 #[tokio::test]
-async fn execution_completion_does_not_implicitly_publish_a_comment_or_move_lifecycle() {
+async fn work_unit_launch_records_execution_permission_policy_override_in_snapshot() {
     let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let now = now_rfc3339();
-    let execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id.clone()),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: "executor".to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: Some("test-session".to_owned()),
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("implemented the change".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("execution creates");
-
-    let lifecycle_before = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
-        .await
-        .expect("lifecycle loads")
-        .expect("lifecycle exists");
-    service
-        .maybe_cascade_executor_completion(&execution.id)
-        .await
-        .expect("legacy completion check is harmless");
-
-    let comments = TaskCommentRepo::list_comments(
-        &*db,
-        &task.id,
-        PageRequest {
-            cursor: None,
-            limit: 10,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Asc,
-        },
-    )
-    .await
-    .expect("comments list");
-    assert!(comments.items.is_empty());
-    let lifecycle_after = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
-        .await
-        .expect("lifecycle reloads")
-        .expect("lifecycle exists");
-    assert_eq!(lifecycle_after.state, lifecycle_before.state);
-    assert_eq!(lifecycle_after.version, lifecycle_before.version);
-}
-
-async fn seed_workspace_with_plan(db: &SqliteDb, task: &Task, plan: &str) -> Workspace {
-    let workspace_dir = std::env::temp_dir()
-        .join(format!("forge-guard-plan-{}", new_uuid_v4()))
-        .join(&task.id);
-    let worktree_path = workspace_dir.join("worktree");
-    std::fs::create_dir_all(&worktree_path).expect("worktree creates");
-    std::fs::write(workspace_dir.join("plan.md"), plan).expect("plan writes");
-    git::init(&worktree_path).await.expect("git init succeeds");
-    std::fs::write(worktree_path.join("README.md"), "# Test\n").expect("readme writes");
-    git::commit_all(&worktree_path, "initial commit")
-        .await
-        .expect("initial commit creates");
-    WorkspaceRepo::create(
-        db,
-        CreateWorkspace {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            repo_id: task.repo_id.clone().unwrap(),
-            worktree_path: worktree_path.to_string_lossy().into_owned(),
-            branch: ::workspace::task_branch_name(&task.id),
-            status: WorkspaceStatus::Ready,
-            before_sha: None,
-            created_at: now_rfc3339(),
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("workspace creates")
-}
-
-#[tokio::test]
-async fn claim_task_records_execution_permission_policy_override_in_snapshot() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id =
         seed_shell_agent_with_config(&db, r#"{"command":"echo","args":["profile-default"]}"#).await;
@@ -5558,27 +4207,21 @@ async fn claim_task_records_execution_permission_policy_override_in_snapshot() {
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("task creates");
-
-    let claimed = service
-        .claim_task(
-            task.id,
-            Assignee::Agent(agent_id),
-            Some(ExecutionOverrides {
-                model_id: None,
-                reasoning_effort: None,
-                permission_policy: Some("auto".to_owned()),
-            }),
-        )
-        .await
-        .expect("task claims");
-    let execution = ExecutionRepo::get_by_id(&*db, &claimed.execution.id)
-        .await
-        .expect("execution loads")
-        .expect("execution exists");
+    let execution = launch_work_unit_for_override_snapshot(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        Some(ExecutionOverrides {
+            model_id: None,
+            reasoning_effort: None,
+            permission_policy: Some("auto".to_owned()),
+        }),
+    )
+    .await;
     let snapshot: Value = serde_json::from_str(
         execution
             .executor_config_snapshot_json
@@ -5597,10 +4240,9 @@ async fn claim_task_records_execution_permission_policy_override_in_snapshot() {
 }
 
 #[tokio::test]
-async fn claim_task_records_codex_overrides_in_normalized_snapshot() {
+async fn work_unit_launch_records_codex_overrides_in_normalized_snapshot() {
     let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(
         &db,
@@ -5618,26 +4260,23 @@ async fn claim_task_records_codex_overrides_in_normalized_snapshot() {
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("task creates");
-
-    let claimed = service
-        .claim_task(
-            task.id,
-            Assignee::Agent(agent_id),
-            Some(ExecutionOverrides {
-                model_id: Some("gpt-5-codex".to_owned()),
-                reasoning_effort: Some("high".to_owned()),
-                permission_policy: Some("auto".to_owned()),
-            }),
-        )
-        .await
-        .expect("task claims");
+    let execution = launch_work_unit_for_override_snapshot(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        Some(ExecutionOverrides {
+            model_id: Some("gpt-5-codex".to_owned()),
+            reasoning_effort: Some("high".to_owned()),
+            permission_policy: Some("auto".to_owned()),
+        }),
+    )
+    .await;
     let snapshot: Value = serde_json::from_str(
-        claimed
-            .execution
+        execution
             .executor_config_snapshot_json
             .as_deref()
             .expect("snapshot recorded"),
@@ -5663,7 +4302,7 @@ async fn claim_task_records_codex_overrides_in_normalized_snapshot() {
 
     let execution_keys = snapshot["overrides_applied"]["execution"]
         .as_array()
-        .expect("execution keys are recorded");
+        .expect("execution override keys are recorded");
     assert!(execution_keys
         .iter()
         .any(|key| key.as_str() == Some("model")));

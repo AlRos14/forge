@@ -1,19 +1,77 @@
 use super::*;
 use crate::agent_capacity::count_running_executions;
-use crate::workflow::dispatch::{
-    build_effective_prompt, effective_prompt_selection, loader::load_agent_dispatch_context,
+use db::{
+    ExecutionUsageRepo, UpdateTask, WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo,
+    WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
 };
-use db::{ExecutionUsageRepo, UpdateTask, UpdateTaskStatus};
 
-mod cascade;
+mod failure_annotations;
 mod follow_up;
 mod guards;
 mod launch;
 mod recovery;
 mod runner;
-pub(in crate::task_service) mod subtasks;
 
-pub(super) use cascade::should_block_task_for_failed_execution;
+pub(crate) fn should_block_task_for_failed_execution(execution: &Execution) -> bool {
+    matches!(
+        execution.role.as_str(),
+        "interactive" | "executor" | "implementer" | "coder" | "worker"
+    )
+}
+
+/// Confirm that a historical Execution still names its exact target WorkUnit
+/// and, when repository work is required, its exact ready WorkUnit Workspace.
+/// A Task-scoped Workspace is never substituted for a missing WorkUnit link.
+pub(crate) async fn has_exact_work_unit_target(
+    db: &db::SqliteDb,
+    task_id: &str,
+    execution: &Execution,
+) -> Result<bool> {
+    if execution.task_id != task_id {
+        return Ok(false);
+    }
+    let Some(work_unit_id) = execution.work_unit_id.as_deref() else {
+        return Ok(false);
+    };
+    let Some(work_unit) = WorkUnitRepo::get_by_id(db, work_unit_id).await? else {
+        return Ok(false);
+    };
+    if work_unit.task_id != task_id
+        || work_unit.status != WorkUnitStatus::Open
+        || execution.work_unit_version != Some(work_unit.version)
+        || work_unit.role != execution.role
+        || work_unit.assigned_actor.as_ref() != execution.actor_ref().as_ref()
+    {
+        return Ok(false);
+    }
+    match execution.actor_ref() {
+        Some(db::ActorRef::Agent(agent_id))
+            if execution.agent_id.as_deref() == Some(agent_id.as_str()) => {}
+        Some(db::ActorRef::Human(_)) if execution.agent_id.is_none() => {}
+        _ => return Ok(false),
+    }
+    if work_unit.requires_integration {
+        let Some(workspace_id) = execution.workspace_id.as_deref() else {
+            return Ok(false);
+        };
+        let Some(workspace) = WorkspaceRepo::get_by_id(db, workspace_id).await? else {
+            return Ok(false);
+        };
+        let Some(scope) = WorkUnitWorkspaceRepo::get_scope_by_id(db, workspace_id).await? else {
+            return Ok(false);
+        };
+        Ok(workspace.task_id == task_id
+            && workspace.status == WorkspaceStatus::Ready
+            && scope.task_id == task_id
+            && scope.kind == WorkspaceScopeKind::WorkUnit
+            && scope.work_unit_id.as_deref() == Some(work_unit_id))
+    } else {
+        Ok(execution.workspace_id.is_none()
+            && WorkUnitWorkspaceRepo::get_by_work_unit_id(db, work_unit_id)
+                .await?
+                .is_none())
+    }
+}
 
 /// Runtime writers choose purpose from the semantic operation. This helper is
 /// intentionally only a small compatibility mapping for existing role-driven
@@ -52,51 +110,9 @@ pub(crate) fn execution_purpose_for_task_type(task_type: &str, role: &str) -> Ex
     }
 }
 
-/// Resolve the responsible TaskRole from the Task's requested operation type.
-/// Project workflow states do not select execution roles.
-pub(crate) fn task_role_for_task_type(task_type: &str) -> &'static str {
-    match task_type.trim().to_ascii_lowercase().as_str() {
-        "planning" => "planner",
-        "review" => "reviewer",
-        "validation" => "validator",
-        "discovery" => "investigator",
-        _ => "implementer",
-    }
-}
-
-/// Resolve purpose from the workflow operation at dispatch time. The default
-/// planning state is an explicit Plan operation; a planner role in another
-/// state does not turn that Execution into planning. The `interactive` label
-/// keeps General purpose across states.
-pub(crate) fn execution_purpose_for_workflow_state(
-    task_type: &str,
-    state_name: &str,
-    role: &str,
-) -> ExecutionPurpose {
-    if role.trim().eq_ignore_ascii_case("interactive") {
-        return ExecutionPurpose::General;
-    }
-
-    match state_name.trim().to_ascii_lowercase().as_str() {
-        "planning" => ExecutionPurpose::Plan,
-        "review" => ExecutionPurpose::Review,
-        "validation" => ExecutionPurpose::Validate,
-        "discovery" | "investigation" | "investigate" => ExecutionPurpose::Investigate,
-        _ => match task_type.trim().to_ascii_lowercase().as_str() {
-            "planning" => ExecutionPurpose::Plan,
-            "review" => ExecutionPurpose::Review,
-            "validation" => ExecutionPurpose::Validate,
-            "discovery" | "investigation" | "investigate" => ExecutionPurpose::Investigate,
-            "implementation" => ExecutionPurpose::Implement,
-            _ if role.trim().eq_ignore_ascii_case("planner") => ExecutionPurpose::General,
-            _ => execution_purpose_for_role(role),
-        },
-    }
-}
-
 /// Resolve generic continuity only through the Execution's explicit
-/// HarnessSession reference. The legacy `agent_session_id` field is a
-/// projection for history and never authorizes Resume.
+/// HarnessSession reference. Legacy external session identifiers are retained
+/// as historical provenance and never authorize Resume.
 pub async fn resumable_external_session(
     db: &SqliteDb,
     execution: &Execution,
@@ -164,10 +180,6 @@ pub async fn resumable_external_session(
             .as_deref()
             .is_some_and(|harness_kind| harness_kind != session.harness_kind)
         || (session.workspace_id.is_some() && session.workspace_id.as_deref() != workspace_id)
-        || execution
-            .agent_session_id
-            .as_deref()
-            .is_some_and(|legacy_id| Some(legacy_id) != session.external_session_id.as_deref())
     {
         return Ok(None);
     }
@@ -383,10 +395,6 @@ pub(crate) async fn reusable_harness_session_for_agent(
             execution.executor_config_snapshot_json.as_deref(),
         )
         || (session.workspace_id.is_some() && session.workspace_id.as_deref() != workspace_id)
-        || execution
-            .agent_session_id
-            .as_deref()
-            .is_some_and(|legacy_id| session.external_session_id.as_deref() != Some(legacy_id))
     {
         return Ok(None);
     }
@@ -534,22 +542,17 @@ mod purpose_tests {
             ExecutionPurpose::Implement
         );
 
-        for (task_type, state_name) in [
-            ("implementation", "in_progress"),
-            ("planning", "planning"),
-            ("review", "review"),
-            ("validation", "validation"),
-            ("discovery", "discovery"),
+        for task_type in [
+            "implementation",
+            "planning",
+            "review",
+            "validation",
+            "discovery",
         ] {
             assert_eq!(
                 execution_purpose_for_task_type(task_type, "interactive"),
                 ExecutionPurpose::General,
                 "interactive purpose for {task_type} Task"
-            );
-            assert_eq!(
-                execution_purpose_for_workflow_state(task_type, state_name, "interactive"),
-                ExecutionPurpose::General,
-                "interactive purpose for {task_type} Task at {state_name}"
             );
         }
     }
@@ -598,11 +601,7 @@ pub(super) async fn clear_execution_retry_metadata(db: &SqliteDb, task: &Task) -
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
     let mut changed = false;
-    for key in [
-        "execution_retry_count",
-        "last_execution_failure_at",
-        "deferred_dispatch",
-    ] {
+    for key in ["execution_retry_count", "last_execution_failure_at"] {
         changed |= metadata.extra.remove(key).is_some();
     }
     if changed {

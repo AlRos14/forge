@@ -12,9 +12,9 @@ use db::{
     CollaborationTarget, CompleteDomainEvent, CoordinationMode, CreateOrchestratorWake,
     DomainEvent, DomainEventRepo, ExecutionPurpose, ExecutionRepo, ExecutionStatus, GateRepo,
     OrchestratorWake, OrchestratorWakeExecution, OrchestratorWakeRepo, OrchestratorWakeState,
-    PageRequest, ProposalTarget, ProposalTargetKind, ReviewRepo, ReviewStatus, RoleMembership,
-    RoleMembershipRepo, RoleMembershipStatus, SortBy, SortOrder, TaskRepo, TaskRole, TaskRoleRepo,
-    WorkUnit, WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo,
+    PageRequest, ProposalTarget, ProposalTargetKind, RoleMembership, RoleMembershipRepo,
+    RoleMembershipStatus, SortBy, SortOrder, TaskRepo, TaskRole, TaskRoleRepo, WorkUnit,
+    WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo,
 };
 use events::{EventBus, ForgeEvent};
 use serde_json::{json, Value};
@@ -628,42 +628,9 @@ impl OrchestratorRuntime {
                     target: WakeTarget::Actor(proposal.proposer),
                 }
             }
-            "review.status_changed" => {
-                if event.entity_type != "review" {
-                    return Ok(None);
-                }
-                let Some(review) = ReviewRepo::get_by_id(&*self.db, &event.entity_id).await? else {
-                    return Ok(None);
-                };
-                if review.task_id != task_id || review.status != ReviewStatus::Failed {
-                    return Ok(None);
-                }
-                let Some(execution) =
-                    ExecutionRepo::get_by_id(&*self.db, &review.execution_id).await?
-                else {
-                    return Ok(None);
-                };
-                if execution.task_id != task_id {
-                    return Ok(None);
-                }
-                WakeSignal {
-                    work_unit_id: execution.work_unit_id,
-                    target: WakeTarget::Task,
-                }
-            }
-            "task.transitioned" | "task.status_changed" | "task.updated" => {
+            "task.transitioned" | "task.updated" => {
                 if event.entity_type != "task" || event.entity_id != task.id {
                     return Ok(None);
-                }
-                if event.event_type == "task.status_changed" {
-                    let payload = parse_payload(event);
-                    if payload
-                        .get("from_status")
-                        .zip(payload.get("to_status"))
-                        .is_some_and(|(from, to)| from == to)
-                    {
-                        return Ok(None);
-                    }
                 }
                 WakeSignal {
                     work_unit_id: None,
@@ -1340,7 +1307,8 @@ impl OrchestratorRuntime {
             }));
         }
         let page = recent_page(MAX_CONTEXT_ROWS);
-        let task_integration_workspace = WorkspaceRepo::get_by_task_id(&*self.db, &task.id).await?;
+        let task_integration_workspace =
+            WorkspaceRepo::get_integration_by_task_id(&*self.db, &task.id).await?;
         let work_unit_workspace = match wake.work_unit_id.as_deref() {
             Some(id) => WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, id).await?,
             None => None,
@@ -1416,7 +1384,7 @@ impl OrchestratorRuntime {
                 "project_id": task.project_id,
                 "title": truncate(&task.title, 512),
                 "description": task.description.as_deref().map(|value| truncate(value, 16 * 1024)),
-                "status": task.status,
+                "lifecycle_state": task.lifecycle_state,
                 "task_type": task.task_type,
                 "version": task.version,
             },
@@ -2570,7 +2538,6 @@ mod tests {
                 id: id.clone(),
                 name: "PR6 durable wake fixture".to_owned(),
                 settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
                 primary_repo_id: None,
                 owner_id: Some(owner_id.to_owned()),
                 created_at: now.clone(),
@@ -2592,16 +2559,13 @@ mod tests {
                 project_id: project_id.to_owned(),
                 repo_id: None,
                 parent_task_id: None,
-                assignee_type: None,
-                assignee_id: None,
                 title: title.to_owned(),
                 description: None,
                 task_type: "implementation".to_owned(),
-                status: "todo".to_owned(),
+                lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
                 subtask_order: None,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now,
@@ -2727,7 +2691,6 @@ mod tests {
                 id: project_id.clone(),
                 name: "PR6 Human wake".to_owned(),
                 settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
                 primary_repo_id: None,
                 owner_id: Some(human_id.clone()),
                 created_at: now.clone(),
@@ -2744,16 +2707,13 @@ mod tests {
                 project_id,
                 repo_id: None,
                 parent_task_id: None,
-                assignee_type: None,
-                assignee_id: None,
                 title: "Handle a durable orchestration wake".to_owned(),
                 description: None,
                 task_type: "implementation".to_owned(),
-                status: "todo".to_owned(),
+                lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
                 subtask_order: None,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -2910,7 +2870,6 @@ mod tests {
                 resume_policy: None,
                 stopped_at: Some(now.clone()),
                 parent_execution_id: None,
-                agent_session_id: None,
                 harness_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
@@ -3035,8 +2994,8 @@ mod tests {
                 .await
                 .expect("Task query succeeds")
                 .expect("Task exists")
-                .status,
-            "in_progress",
+                .lifecycle_state,
+            db::TaskLifecycleState::Active,
             "the retry's own lifecycle transition must not invalidate its wake"
         );
         assert!(
@@ -3578,7 +3537,6 @@ mod tests {
                 resume_policy: None,
                 stopped_at: None,
                 parent_execution_id: None,
-                agent_session_id: None,
                 harness_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
@@ -3640,7 +3598,7 @@ mod tests {
                 stopped_by: None,
                 resume_policy: None,
                 stopped_at: None,
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,
@@ -4376,7 +4334,6 @@ mod tests {
                 id: project_id.clone(),
                 name: "PR6 Agent wake".to_owned(),
                 settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
                 primary_repo_id: None,
                 owner_id: None,
                 created_at: now.clone(),
@@ -4393,16 +4350,13 @@ mod tests {
                 project_id,
                 repo_id: None,
                 parent_task_id: None,
-                assignee_type: None,
-                assignee_id: None,
                 title: "Create bounded work and request merge approval".to_owned(),
                 description: Some("Only a small task-scoped action set is authorized.".to_owned()),
                 task_type: "implementation".to_owned(),
-                status: "todo".to_owned(),
+                lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
                 subtask_order: None,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -4488,7 +4442,6 @@ mod tests {
                 resume_policy: None,
                 stopped_at: None,
                 parent_execution_id: None,
-                agent_session_id: None,
                 harness_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
@@ -4605,7 +4558,7 @@ mod tests {
                 stopped_by: None,
                 resume_policy: None,
                 stopped_at: None,
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: Some(Some("worker done".to_owned())),
@@ -4724,7 +4677,7 @@ mod tests {
             .await
             .expect("task loads")
             .expect("task exists");
-        assert_eq!(task.status, "todo");
+        assert_eq!(task.lifecycle_state, db::TaskLifecycleState::Ready);
         let total_executions: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'orchestrator' AND purpose = 'orchestrate'",
         )
@@ -5140,7 +5093,6 @@ mod tests {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: Some("parent-1".to_owned()),
-            agent_session_id: None,
             harness_session_id: None,
             agent_message_id: None,
             last_activity_at: None,

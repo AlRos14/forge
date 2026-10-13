@@ -76,6 +76,7 @@ successful integration. Direct merge requires the completed source Execution
 in the evaluated Workspace. MergeService holds the cross-process Task
 integration lock while it checks the current evaluation and source commit.
 
-REST/MCP/UI projection replacement belongs to PR12. Physical removal of
-`task.status`, workflow tables, and historical transition data belongs to
-PR13.
+REST/MCP/UI projection replacement belongs to PR12. V129–V130 remove `task.status`
+and workflow/transition runtime storage after copying exact source values to
+immutable migration history. Only TaskLifecycle and its exact transition
+receipts authorize current lifecycle decisions.

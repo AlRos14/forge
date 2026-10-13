@@ -19,7 +19,6 @@ impl HookTrigger for AllWorkCompletedTrigger {
              LEFT JOIN task_lifecycle AS lifecycle ON lifecycle.task_id = task.id \
              WHERE task.project_id = ? \
                AND task.is_automation = 0 \
-               AND task.archived_at IS NULL \
                AND task.deleted_at IS NULL",
         )
         .bind(&context.project.id)

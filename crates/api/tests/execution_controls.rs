@@ -40,7 +40,6 @@ async fn task_response_exposes_execution_aggregates_without_latest_identity() {
             resume_policy: None,
             stopped_at: Some(stopped_at.clone()),
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: Some(stopped_at.clone()),
             summary: None,

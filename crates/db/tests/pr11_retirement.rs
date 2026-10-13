@@ -1,9 +1,10 @@
 use db::{
-    create_sqlite_pool, now_rfc3339, run_migrations, run_migrations_from, AgentRepo, AgentStatus,
-    CreateAgent, CreateWorkspaceLease, WorkspaceLeaseRepo,
+    create_sqlite_pool, now_rfc3339, run_migrations_from, AgentRepo, AgentStatus, CreateAgent,
+    CreateWorkspaceLease, WorkspaceLeaseRepo,
 };
 use sqlx::SqlitePool;
 use std::{collections::BTreeSet, fs, path::Path};
+use tempfile::TempDir;
 
 fn copy_migrations_through(limit: i64, destination: &Path) {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
@@ -62,9 +63,11 @@ async fn v118_removes_database_bootstrap_and_fences_vertical_writes() {
     let pool = create_sqlite_pool("sqlite::memory:")
         .await
         .expect("in-memory database");
-    run_migrations(&pool)
+    let migrations = TempDir::new().expect("V120 migration fixture creates");
+    copy_migrations_through(120, migrations.path());
+    run_migrations_from(&pool, migrations.path())
         .await
-        .expect("all migrations including V118");
+        .expect("migrations through V120 apply");
 
     let now = now_rfc3339();
     sqlx::query(
@@ -620,23 +623,19 @@ async fn v118_preserves_history_and_revokes_only_binding_only_memberships() {
     )
     .fetch_one(&pool)
     .await
-    .expect("Task compatibility projection remains valid");
-    assert_eq!(
-        task_projection,
-        (None, None, 2),
-        "no Actor is assigned as replacement and Task version advances"
-    );
+    .expect("V120 Task compatibility projection remains valid");
+    assert_eq!(task_projection, (None, None, 2));
     let role_projection: (Option<String>, Option<String>) = sqlx::query_as(
         "SELECT assignee_type, assignee_id FROM task_role_assignment
          WHERE id = 'pr11-binding-assignment'",
     )
     .fetch_one(&pool)
     .await
-    .expect("TaskRole compatibility projection remains valid");
+    .expect("V120 singleton role projection remains inspectable");
     assert_eq!(
         role_projection,
         (None, None),
-        "legacy singleton is cleared, not reassigned"
+        "V118 clears revoked role projections without inventing a replacement"
     );
     let pending_job_status: String =
         sqlx::query_scalar("SELECT status FROM agent_chat_turn_job WHERE id = 'pr11-pending-turn'")
@@ -1758,12 +1757,16 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
         },
     ];
 
+    let temp = tempfile::tempdir().expect("V120 migration fixture directory");
+    let migrations = temp.path().join("migrations");
+    fs::create_dir_all(&migrations).expect("migration dir");
+    copy_migrations_through(120, &migrations);
     let pool = create_sqlite_pool("sqlite::memory:")
         .await
         .expect("in-memory database");
-    run_migrations(&pool)
+    run_migrations_from(&pool, &migrations)
         .await
-        .expect("all migrations through V120");
+        .expect("migrations through V120");
     let db = db::SqliteDb::new(pool.clone());
     let base = chrono::Utc::now() + chrono::Duration::minutes(10);
     let base_text = base.to_rfc3339();
@@ -1852,16 +1855,14 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
         let task_time = (base + chrono::Duration::seconds(index as i64)).to_rfc3339();
         sqlx::query(
             "INSERT INTO task
-             (id, project_id, repo_id, title, task_type, status, assignee_type,
-              assignee_id, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, 'in_progress', 'agent', ?, ?, ?)",
+             (id, project_id, repo_id, title, task_type, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?)",
         )
         .bind(&task_id)
         .bind(&project_id)
         .bind(&repo_id)
         .bind(format!("V120 {} task", case.execution_role))
         .bind(case.task_type)
-        .bind(&stale_assignee_actor)
         .bind(&task_time)
         .bind(&task_time)
         .execute(&pool)
@@ -2048,7 +2049,7 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             )
             .await
             .is_err(),
-            "stale task.assignee_id does not authorize {} + {}",
+            "Execution Actor without an exact active RoleMembership does not authorize {} + {}",
             case.execution_role,
             case.task_type
         );

@@ -117,9 +117,8 @@ async fn create_human_review_execution(
 }
 
 /// Recheck current Human role authority inside the same SQLite transaction as
-/// an authoritative Review write. Once the replacement TaskRole exists, the
-/// membership is the sole authority; the legacy singleton is used only when
-/// that TaskRole has not been created.
+/// an authoritative Review write. Only a current target TaskRole membership
+/// can authorize it.
 pub(super) async fn human_has_current_role_authority_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     task_id: &str,
@@ -130,34 +129,19 @@ pub(super) async fn human_has_current_role_authority_in_tx(
         return Ok(false);
     };
     let authorized: i64 = sqlx::query_scalar(
-        "SELECT CASE
-            WHEN EXISTS (
-                SELECT 1 FROM task_role
-                WHERE task_id = ? AND role = ?
-            ) THEN EXISTS (
-                SELECT 1
-                FROM task_role AS role
-                JOIN role_membership AS membership
-                  ON membership.task_role_id = role.id
-                WHERE role.task_id = ? AND role.role = ?
-                  AND membership.actor_kind = 'human'
-                  AND membership.actor_id = ?
-                  AND membership.status = 'active'
-            )
-            ELSE EXISTS (
-                SELECT 1 FROM task_role_assignment
-                WHERE task_id = ? AND role_name = ?
-                  AND assignee_type = 'user' AND assignee_id = ?
-            )
-         END",
+        "SELECT EXISTS (
+            SELECT 1
+            FROM task_role AS role
+            JOIN role_membership AS membership
+              ON membership.task_role_id = role.id
+            WHERE role.task_id = ? AND role.role = ?
+              AND membership.actor_kind = 'human'
+              AND membership.actor_id = ?
+              AND membership.status = 'active'
+         )",
     )
     .bind(task_id)
     .bind(&canonical_role)
-    .bind(task_id)
-    .bind(&canonical_role)
-    .bind(user_id)
-    .bind(task_id)
-    .bind(role)
     .bind(user_id)
     .fetch_one(&mut **tx)
     .await?;
@@ -582,6 +566,20 @@ impl ExecutionRepo for SqliteDb {
         rows.into_iter().map(map_execution).collect()
     }
 
+    async fn list_work_unit_auto_recovery_candidates(&self) -> Result<Vec<Execution>> {
+        let rows = sqlx::query(
+            "SELECT * FROM execution
+             WHERE work_unit_id IS NOT NULL
+               AND status = 'cancelled'
+               AND resume_policy = 'auto'
+               AND stop_reason IN ('crash_recovery', 'graceful_shutdown')
+             ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(map_execution).collect()
+    }
+
     async fn list_by_task_and_role(
         &self,
         task_id: &str,
@@ -803,12 +801,7 @@ async fn update_execution_in_tx(
     if let Some(status) = input.status {
         push_assignment!("status", status.to_string());
     }
-    let legacy_session_update = input.agent_session_id.clone();
-    if matches!(legacy_session_update.as_ref(), Some(None))
-        && execution.harness_session_id.is_none()
-    {
-        push_assignment!("agent_session_id", None::<String>);
-    }
+    let external_session_update = input.external_session_id.clone();
     if let Some(agent_message_id) = input.agent_message_id {
         push_assignment!("agent_message_id", agent_message_id);
     }
@@ -861,7 +854,7 @@ async fn update_execution_in_tx(
     query.push("updated_at = ").push_bind(input.updated_at);
     query.push(" WHERE id = ").push_bind(&input.id);
     query.build().execute(&mut **transaction).await?;
-    if let Some(Some(external_session_id)) = legacy_session_update.as_ref() {
+    if let Some(Some(external_session_id)) = external_session_update.as_ref() {
         bind_external_session_in_tx(transaction, &input.id, external_session_id, &now_rfc3339())
             .await?;
     }
@@ -913,17 +906,6 @@ async fn bind_external_session_in_tx(
         .map(super::map_execution)
         .transpose()?
         .ok_or(DbError::NotFound)?;
-
-    if execution
-        .agent_session_id
-        .as_deref()
-        .is_some_and(|existing| existing != external_session_id)
-    {
-        return Err(DbError::Check(
-            "Execution legacy session projection disagrees with the returned external identity"
-                .to_owned(),
-        ));
-    }
 
     if execution.actor_kind == Some(ActorKind::Human) {
         return Err(DbError::Check(
@@ -1023,188 +1005,11 @@ async fn bind_external_session_in_tx(
         .bind(harness_session_id)
         .execute(&mut **transaction)
         .await?;
-        sqlx::query(
-            "UPDATE execution
-             SET agent_session_id = ?, updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(external_session_id)
-        .bind(updated_at)
-        .bind(execution_id)
-        .execute(&mut **transaction)
-        .await?;
         return Ok(());
     }
 
-    if execution.actor_kind.is_none()
-        && execution
-            .agent_id
-            .as_deref()
-            .is_some_and(|agent_id| agent_id.eq_ignore_ascii_case("human"))
-    {
-        // The reserved sentinel is historical compatibility only. Preserve its
-        // old projection without turning it into a generic Actor or session.
-        sqlx::query("UPDATE execution SET agent_session_id = ?, updated_at = ? WHERE id = ?")
-            .bind(external_session_id)
-            .bind(updated_at)
-            .bind(execution_id)
-            .execute(&mut **transaction)
-            .await?;
-        return Ok(());
-    }
-
-    let Some(agent_id) = execution.agent_id.as_deref() else {
-        // Historical/system-shaped rows have no generic Agent authority. Keep
-        // their bounded legacy projection rather than inventing a principal.
-        sqlx::query("UPDATE execution SET agent_session_id = ?, updated_at = ? WHERE id = ?")
-            .bind(external_session_id)
-            .bind(updated_at)
-            .bind(execution_id)
-            .execute(&mut **transaction)
-            .await?;
-        return Ok(());
-    };
-    if execution.actor_kind != Some(ActorKind::Agent)
-        || execution.actor_id.as_deref() != Some(agent_id)
-    {
-        return Err(DbError::Check(
-            "cannot materialize HarnessSession without an Agent ActorRef".to_owned(),
-        ));
-    }
-
-    let historical_ambiguity: Option<i64> = sqlx::query_scalar(
-        "SELECT 1
-         FROM execution_session_migration_issue
-         WHERE execution_id = ? AND issue_kind = 'historical_session_ambiguous'
-         LIMIT 1",
-    )
-    .bind(execution_id)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    if historical_ambiguity.is_some() {
-        // Contradictory historical evidence stays on the bounded legacy
-        // projection. Do not silently choose a generic session during a
-        // result callback.
-        sqlx::query("UPDATE execution SET agent_session_id = ?, updated_at = ? WHERE id = ?")
-            .bind(external_session_id)
-            .bind(updated_at)
-            .bind(execution_id)
-            .execute(&mut **transaction)
-            .await?;
-        return Ok(());
-    }
-
-    let snapshot_json = execution
-        .executor_config_snapshot_json
-        .as_deref()
-        .unwrap_or("{}");
-    let snapshot = serde_json::from_str::<serde_json::Value>(snapshot_json).unwrap_or_default();
-    let harness_kind = snapshot
-        .get("executor_type")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("legacy")
-        .to_owned();
-    if harness_kind != "legacy" {
-        harness_session::validate_agent_harness_identity_in_tx(
-            transaction,
-            agent_id,
-            &harness_kind,
-        )
-        .await?;
-    }
-    let profile_id =
-        harness_session::profile_id_for_snapshot_in_tx(transaction, agent_id, &snapshot).await?;
-    let capabilities_snapshot_json = snapshot
-        .get("harness_capabilities")
-        .map(ToString::to_string)
-        .unwrap_or_else(|| r#"{"schema_version":1,"capabilities":{}}"#.to_owned());
-    let existing = sqlx::query(
-        "SELECT id, status, workspace_id FROM harness_session
-         WHERE agent_id = ? AND harness_kind = ? AND external_session_id = ?
-         LIMIT 1",
-    )
-    .bind(agent_id)
-    .bind(&harness_kind)
-    .bind(external_session_id)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    let harness_session_id = if let Some(existing) = existing {
-        let existing_status: HarnessSessionStatus =
-            parse_enum(existing.try_get::<String, _>("status")?)?;
-        if matches!(
-            &existing_status,
-            HarnessSessionStatus::Ended | HarnessSessionStatus::Failed
-        ) {
-            return Err(DbError::Check(
-                "external session identity belongs to an ended or failed HarnessSession".to_owned(),
-            ));
-        }
-        let existing_workspace_id: Option<String> = existing.try_get("workspace_id")?;
-        if existing_workspace_id.is_some()
-            && existing_workspace_id.as_deref() != execution.workspace_id.as_deref()
-        {
-            return Err(DbError::Check(
-                "external session identity is workspace-incompatible".to_owned(),
-            ));
-        }
-        let existing_id = existing.try_get::<String, _>("id")?;
-        if matches!(&existing_status, HarnessSessionStatus::Pending)
-            && snapshot.get("harness_capabilities").is_some()
-        {
-            sqlx::query(
-                "UPDATE harness_session SET capabilities_snapshot_json = ? WHERE id = ? AND status = 'pending'",
-            )
-            .bind(&capabilities_snapshot_json)
-            .bind(&existing_id)
-            .execute(&mut **transaction)
-            .await?;
-        }
-        existing_id
-    } else {
-        let id = crate::new_uuid_v4();
-        sqlx::query(
-            "INSERT INTO harness_session (
-                 id, agent_id, harness_kind, external_session_id, profile_id,
-                 profile_snapshot_json, capabilities_snapshot_json, workspace_id,
-                 status, predecessor_session_id, created_at, updated_at, last_activity_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(agent_id)
-        .bind(&harness_kind)
-        .bind(external_session_id)
-        .bind(profile_id.as_deref())
-        .bind(snapshot_json)
-        .bind(&capabilities_snapshot_json)
-        .bind(execution.workspace_id.as_deref())
-        .bind(&execution.created_at)
-        .bind(updated_at)
-        .bind(updated_at)
-        .execute(&mut **transaction)
-        .await?;
-        id
-    };
-    sqlx::query(
-        "UPDATE harness_session
-         SET status = 'active', last_activity_at = ?, updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(updated_at)
-    .bind(updated_at)
-    .bind(&harness_session_id)
-    .execute(&mut **transaction)
-    .await?;
-    sqlx::query(
-        "UPDATE execution
-         SET harness_session_id = ?, agent_session_id = ?, updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(&harness_session_id)
-    .bind(external_session_id)
-    .bind(updated_at)
-    .bind(execution_id)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
+    Err(DbError::Check(
+        "Execution has no exact HarnessSession authority for this external session result"
+            .to_owned(),
+    ))
 }

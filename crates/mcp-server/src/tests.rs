@@ -2,11 +2,12 @@ use std::{future::Future, sync::Arc};
 
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, Agent, AgentRepo, AgentStatus,
-    AssigneeKind, CreateAgent, CreateExecution, CreateProject, CreateProjectMember, CreateRepo,
-    CreateTask, CreateTaskRoleAssignment, CreateWorkspace, DaemonRepo, DaemonStatus,
+    CreateAgent, CreateExecution, CreateProject, CreateProjectMember, CreateRepo,
+    CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkspace, DaemonRepo, DaemonStatus,
     ExecutionPurpose, ExecutionRepo, ExecutionStatus, ProjectMemberRepo, ProjectRepo, RepoRepo,
-    SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpdateTask, UpsertDaemon,
-    User, UserRepo, ValidationRunRepo, WorkspaceRepo, WorkspaceStatus,
+    RoleMembershipRepo, RoleMembershipStatus, SqliteDb, Task, TaskRepo, TaskRoleRepo,
+    UpdateProject, UpdateTask, UpsertDaemon, User, UserRepo, ValidationRunRepo, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use events::EventBus;
 use serde_json::{json, Value};
@@ -72,7 +73,6 @@ async fn seed_project_repo(state: &AppState) -> (String, String) {
             id: new_uuid_v4(),
             name: "Forge".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_string(),
             primary_repo_id: None,
             owner_id: Some("test-user".to_owned()),
             created_at: now.clone(),
@@ -151,7 +151,6 @@ async fn seed_private_project_repo(
             id: new_uuid_v4(),
             name: name.to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: Some(owner_id.to_owned()),
             created_at: now.clone(),
@@ -333,7 +332,6 @@ async fn seed_task_in_project(state: &AppState, project_id: String) -> Task {
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("task creates")
@@ -358,7 +356,6 @@ async fn seed_execution(state: &AppState, task_id: String) -> String {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -398,7 +395,6 @@ async fn seed_task_with_legacy_resume_hint(state: &AppState, ambiguous_history: 
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: None,
@@ -414,13 +410,6 @@ async fn seed_task_with_legacy_resume_hint(state: &AppState, ambiguous_history: 
     )
     .await
     .expect("legacy execution creates");
-    sqlx::query("UPDATE execution SET agent_session_id = ? WHERE id = ?")
-        .bind("legacy-external-thread")
-        .bind(&execution_id)
-        .execute(state.db.pool())
-        .await
-        .expect("legacy external session is recorded");
-
     let annotation = json!({
         "type": "executor_failed",
         "blocking_reason": "execution stopped",
@@ -440,7 +429,6 @@ async fn seed_task_with_legacy_resume_hint(state: &AppState, ambiguous_history: 
             error_annotation: Some(Some(annotation)),
             blocked_json: None,
             failed_json: None,
-            task_state_config: None,
             parent_task_id: None,
             updated_at: now.clone(),
         },
@@ -551,20 +539,34 @@ async fn seed_agent(state: &AppState, name: &str) -> Agent {
 #[allow(dead_code)]
 async fn assign_coder(state: &AppState, task_id: &str, agent_id: &str) {
     let now = now_rfc3339();
-    TaskRoleAssignmentRepo::assign(
+    let role = TaskRoleRepo::create(
         &*state.db,
-        CreateTaskRoleAssignment {
+        CreateTaskRole {
             id: new_uuid_v4(),
             task_id: task_id.to_owned(),
-            role_name: "coder".to_owned(),
-            assignee_type: Some(AssigneeKind::Agent),
-            assignee_id: Some(agent_id.to_owned()),
+            role: "implementer".to_owned(),
+            coordination_mode: None,
+            policy_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("implementer TaskRole creates");
+    RoleMembershipRepo::add(
+        &*state.db,
+        CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id: role.id,
+            actor_kind: db::ActorKind::Agent,
+            actor_id: agent_id.to_owned(),
+            status: RoleMembershipStatus::Active,
             created_at: now.clone(),
             updated_at: now,
         },
     )
     .await
-    .expect("coder assignment creates");
+    .expect("Agent joins implementer TaskRole");
 }
 
 async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Value {
@@ -789,7 +791,7 @@ fn task_role_membership_tools_require_identity_and_keep_exact_actor_ref() {
 
         let context = McpContext {
             project_id: None,
-            user_id: Some("user-1".to_owned()),
+            user_id: Some("test-user".to_owned()),
             is_admin: false,
         };
         let created = dispatch_with_context(
@@ -861,7 +863,6 @@ fn mcp_execution_output_exposes_pr2_authority_fields() {
                 resume_policy: None,
                 stopped_at: None,
                 parent_execution_id: None,
-                agent_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,
@@ -1654,15 +1655,15 @@ fn user_scoped_mcp_isolates_projects_and_derived_resources() {
             &user_a,
             "forge_start_execution",
             json!({
-                "task_id": task_a.id,
+                "work_unit_id": "foreign-work-unit",
+                "expected_work_unit_version": 1,
                 "agent_id": agent_b,
-                "role": "implementer",
                 "purpose": "implement",
                 "prompt": "must not use another user's private Agent"
             }),
         )
         .await;
-        assert_eq!(error.code, -32004);
+        assert_eq!(error.code, -32602);
         let execution_a = seed_execution(&state, task_a.id.clone()).await;
         let error = call_tool_error_as(
             &state,
@@ -1943,7 +1944,6 @@ fn mcp_project_visibility_does_not_grant_mutation_authority() {
                 id: new_uuid_v4(),
                 name: "System Project".to_owned(),
                 settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
                 primary_repo_id: None,
                 owner_id: None,
                 created_at: now.clone(),
@@ -2061,12 +2061,13 @@ fn forge_update_task_updates_mutable_fields() {
         .await
         .expect_err("retired Task plan field is rejected");
         assert_eq!(legacy_plan.code, -32602);
-        let stored_plan: Option<String> = sqlx::query_scalar("SELECT plan FROM task WHERE id = ?")
-            .bind(&task.id)
-            .fetch_one(state.db.pool())
-            .await
-            .expect("legacy Task.plan field remains readable for migration diagnostics");
-        assert!(stored_plan.is_none(), "MCP cannot write legacy Task.plan");
+        let legacy_plan_column: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('task') WHERE name = 'plan'",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .expect("Task schema can be inspected");
+        assert_eq!(legacy_plan_column, 0, "V125 physically retires Task.plan");
     });
 }
 
@@ -2100,15 +2101,12 @@ fn forge_update_task_rejects_cross_repo_parent_without_partial_write() {
                 repo_id: Some(other_repo.id),
                 parent_task_id: None,
                 subtask_order: None,
-                assignee_type: None,
-                assignee_id: None,
                 title: "Parent in other Repo".to_owned(),
                 description: None,
                 task_type: "implementation".to_owned(),
-                status: "todo".to_owned(),
+                lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now,
@@ -2507,16 +2505,13 @@ fn forge_create_sub_tasks_nested_rejected() {
                 project_id: root.project_id.clone(),
                 repo_id: root.repo_id.clone(),
                 parent_task_id: Some(root.id.clone()),
-                assignee_type: None,
-                assignee_id: None,
                 title: "Existing subtask".to_owned(),
                 description: None,
                 task_type: "implementation".to_owned(),
-                status: "todo".to_owned(),
+                lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
                 subtask_order: Some(0),
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now,

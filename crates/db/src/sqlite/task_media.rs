@@ -94,10 +94,8 @@ impl TaskMediaRepo for SqliteDb {
             return Err(DbError::NotFound);
         }
 
-        // V076's legacy trigger marks the additive asset as a candidate, but
-        // it cannot see Project evidence attachments.  Reconcile through the
-        // shared-media repository so a Task delete never clears bytes still
-        // referenced by evidence or an immutable release pin.
+        // Reconcile after the Task row is soft-deleted so exact active Task
+        // references and immutable Release pins determine byte retention.
         if let Some(asset_id) =
             sqlx::query_scalar::<_, String>("SELECT asset_id FROM task_media WHERE id = ?")
                 .bind(id)

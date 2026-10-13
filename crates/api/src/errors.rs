@@ -238,12 +238,6 @@ impl From<ServiceError> for ApiError {
                 message: "git error".to_owned(),
                 details: Some(json!({ "details": error.to_string() })),
             },
-            ServiceError::Review(error) => Self {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "review_error",
-                message: "review error".to_owned(),
-                details: Some(json!({ "details": error.to_string() })),
-            },
             ServiceError::NotFound { entity, id } => Self::not_found(entity, id),
             ServiceError::InvalidOperation { message } => Self::invalid_operation(message),
             ServiceError::AuthorizationDenied { message } => {
@@ -452,6 +446,13 @@ impl From<DbError> for ApiError {
                 message: "repository cannot be deleted while Tasks reference it".to_owned(),
                 details: None,
             },
+            DbError::ProjectHasReleases => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_has_releases",
+                message: "Project cannot be deleted while immutable Releases are retained"
+                    .to_owned(),
+                details: None,
+            },
             DbError::VersionConflict => Self {
                 status: StatusCode::CONFLICT,
                 code: "version_conflict",
@@ -481,25 +482,6 @@ impl From<DbError> for ApiError {
                     "expected_board_revision": expected,
                     "actual_board_revision": actual,
                 })),
-            },
-            DbError::MoveOperationConflict { operation_id } => Self {
-                status: StatusCode::CONFLICT,
-                code: "operation_conflict",
-                message: "operation ID was already used for a different move".to_owned(),
-                details: Some(json!({ "operation_id": operation_id })),
-            },
-            DbError::MoveOperationIncomplete { operation_id } => Self {
-                status: StatusCode::CONFLICT,
-                code: "operation_incomplete",
-                message: "move committed but its workflow result is incomplete; reconcile from board truth"
-                    .to_owned(),
-                details: Some(json!({ "operation_id": operation_id })),
-            },
-            DbError::InvalidTaskMove(message) => Self {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                code: "invalid_task_move",
-                message,
-                details: None,
             },
             DbError::InvalidTransition => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,

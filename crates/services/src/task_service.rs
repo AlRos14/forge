@@ -2,43 +2,30 @@ use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
     merge_service::MergeService,
     terminal_service::TerminalActivityTracker,
-    workflow::{default_states, engine::WorkflowEngine},
     workspace_cleanup::WorkspaceCleanupScheduler,
     workspace_execution_lock::WorkspaceExecutionLockManager,
-    Assignee, Result, ServiceError,
+    Result, ServiceError,
 };
-use ::review::ReviewRunner;
-use ::workspace::{RepoCacheLockManager, WorkspaceManager};
-use api_types::{Actor, ActorRef, UserActionSource};
+use ::workspace::RepoCacheLockManager;
+use api_types::Actor;
 use db::{
-    new_uuid_v4, now_rfc3339, Agent, AgentRepo, ArchiveTask, AssigneeKind, ClaimTask, ClaimedTask,
-    CommentAuthorType, CreateDomainEvent, CreateExecution, CreateTask, CreateTaskComment,
-    CreateTaskRoleAssignment, CreateWorkspace, CreateWorkspaceLease, DbError, Execution,
-    ExecutionPurpose, ExecutionRepo, ExecutionStatus, ExecutionUsageRepo, HarnessSession,
-    HarnessSessionRepo, HarnessSessionStatus, PageRequest, ProjectRepo, RepoRepo, Review,
-    SoftDeleteTask, SortBy, SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo,
-    TaskDependencyRepo, TaskMetadata, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo,
-    TaskStatus, TransitionLogRepo, UpsertExecutionUsage, UserRepo, WorkUnitRepo,
-    WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    new_uuid_v4, now_rfc3339, Agent, AgentRepo, CommentAuthorType, CreateDomainEvent,
+    CreateExecution, CreateTask, CreateTaskComment, CreateWorkspace, CreateWorkspaceLease,
+    Execution, ExecutionPurpose, ExecutionRepo, ExecutionStatus, ExecutionUsageRepo,
+    HarnessSession, HarnessSessionRepo, HarnessSessionStatus, PageRequest, ProjectRepo, RepoRepo,
+    SoftDeleteTask, SortBy, SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo, TaskMetadata,
+    TaskRepo, UpsertExecutionUsage, WorkUnitRepo, WorkUnitWorkspaceRepo, Workspace,
+    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
     ExecutionContext, ExecutionOutcome, ExecutionOverrides, ExecutorKind, TaskExecutor,
 };
 use serde_json::{json, Value};
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 use tokio::process::Command;
-use tokio::sync::Mutex;
-use uuid::Uuid;
 
-pub mod action_resolver;
 mod actions;
-mod claim;
 mod common;
 pub(crate) mod config;
 mod create;
@@ -48,7 +35,6 @@ pub use execution::resumable_external_session;
 mod governance;
 pub(crate) mod logs;
 mod memberships;
-mod move_task;
 mod orchestrator;
 mod reorder_subtasks;
 mod review;
@@ -61,12 +47,10 @@ pub(crate) mod workspace;
 
 pub use actions::TaskActionResult;
 pub use create_subtasks::NewSubtaskInput;
-pub use execution::subtasks::build_first_turn_prompt_from_context;
 pub(crate) use memberships::{
-    active_agent_membership, current_role_memberships_authoritative,
-    human_is_active_role_member_authoritative, is_usable_active_agent, is_usable_repository_agent,
-    repository_worker_identity_is_eligible, select_usable_agent_id,
-    select_usable_repository_agent_id,
+    current_role_memberships_authoritative, human_is_active_role_member_authoritative,
+    is_usable_active_agent, is_usable_repository_agent, repository_worker_identity_is_eligible,
+    select_usable_agent_id, select_usable_repository_agent_id,
 };
 pub use subtask::{is_root_task, is_subtask, root_for};
 
@@ -77,42 +61,21 @@ use self::config::{
 };
 use self::{
     config::{
-        build_executor_config_snapshot, create_failed_execution_record,
-        executor_snapshot_for_fresh_start, executor_snapshot_for_harness_resume, parse_json_value,
+        build_executor_config_snapshot, executor_snapshot_for_harness_resume, parse_json_value,
     },
     logs::execution_logs_path,
     validation::{serialize_config, validate_required},
-    workspace::{default_workspace_root, prepare_workspace, reset_workspace},
+    workspace::default_workspace_root,
 };
 
 pub(super) const DISPATCH_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 pub(super) const DISPATCH_STATUS_WAIT_CEILING: Duration = Duration::from_secs(10 * 60);
-pub(super) fn is_transient_error_annotation(raw_annotation: &str) -> bool {
-    let Ok(annotation) = serde_json::from_str::<Value>(raw_annotation) else {
-        return false;
-    };
-
-    matches!(
-        annotation.get("type").and_then(Value::as_str),
-        Some(
-            "merge_conflict"
-                | "dirty_worktree"
-                | "target_repo_dirty"
-                | "executor_failed"
-                | "review_budget_exhausted"
-                | "merge_fix_budget_exhausted"
-                | "merge_fix_ci_failed"
-        )
-    )
-}
-
 #[derive(Clone)]
 pub struct TaskService {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
     merge_service: Option<Arc<MergeService>>,
     cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
-    review_runner: Option<Arc<ReviewRunner>>,
     task_executor: Option<Arc<dyn TaskExecutor>>,
     adapter_registry: Option<Arc<executors::HarnessAdapterRegistry>>,
     daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
@@ -120,22 +83,7 @@ pub struct TaskService {
     terminal_activity: Option<Arc<TerminalActivityTracker>>,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
     workspace_root: PathBuf,
-    move_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     credential_env: Option<Arc<crate::credential_service::CredentialService>>,
-}
-
-#[derive(Debug)]
-pub struct TransitionResult {
-    pub task: Task,
-    pub review: Option<Review>,
-}
-
-pub struct TransitionOptions {
-    pub version: i64,
-    pub reason: Option<String>,
-    pub triggered_by: Actor,
-    pub rejection: bool,
-    pub defer_dispatch_seconds: Option<i64>,
 }
 
 pub(crate) fn execution_domain_event(
@@ -257,46 +205,10 @@ pub(crate) fn execution_stalled_domain_event(
     event
 }
 
-impl From<i64> for TransitionOptions {
-    fn from(version: i64) -> Self {
-        Self {
-            version,
-            reason: None,
-            triggered_by: Actor::system(api_types::SystemComponent::General),
-            rejection: false,
-            defer_dispatch_seconds: None,
-        }
-    }
-}
-
-impl From<(i64, Option<String>)> for TransitionOptions {
-    fn from((version, reason): (i64, Option<String>)) -> Self {
-        Self {
-            version,
-            reason,
-            triggered_by: Actor::user(UserActionSource::Api),
-            rejection: false,
-            defer_dispatch_seconds: None,
-        }
-    }
-}
-
-impl From<(i64, Option<String>, bool)> for TransitionOptions {
-    fn from((version, reason, rejection): (i64, Option<String>, bool)) -> Self {
-        Self {
-            version,
-            reason,
-            triggered_by: Actor::user(UserActionSource::Api),
-            rejection,
-            defer_dispatch_seconds: None,
-        }
-    }
-}
-
 pub struct LaunchExecutionResult {
     pub task: Task,
     pub execution: Execution,
-    pub workspace: Workspace,
+    pub workspace: Option<Workspace>,
 }
 
 impl TaskService {
@@ -306,7 +218,6 @@ impl TaskService {
             event_bus,
             merge_service: None,
             cleanup_scheduler: None,
-            review_runner: None,
             task_executor: None,
             adapter_registry: None,
             daemon_connections: None,
@@ -314,26 +225,12 @@ impl TaskService {
             terminal_activity: None,
             repo_cache_locks: None,
             workspace_root: default_workspace_root(),
-            move_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             credential_env: None,
         }
     }
 
     pub fn with_merge_service(mut self, merge_service: Arc<MergeService>) -> Self {
         self.merge_service = Some(merge_service);
-        self
-    }
-
-    pub(crate) async fn publish_domain_event_by_dedupe(&self, dedupe_key: &str) {
-        let service =
-            crate::DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
-        if let Err(error) = service.publish_by_dedupe(dedupe_key).await {
-            tracing::warn!(dedupe_key, %error, "failed to mirror committed domain event");
-        }
-    }
-
-    pub fn with_review_runner(mut self, review_runner: Arc<ReviewRunner>) -> Self {
-        self.review_runner = Some(review_runner);
         self
     }
 
@@ -404,105 +301,120 @@ impl TaskService {
         self.event_bus.publish(event);
     }
 
-    /// Create a running execution and remove a freshly prepared workspace if
-    /// the authoritative in-transaction admission guard rejects it. Existing
-    /// workspaces are intentionally retained for retries/recovery; only a
-    /// workspace created by this attempt is rolled back.
-    pub(crate) async fn create_running_execution(
+    /// Create a running Execution under one exact WorkUnit revision. The
+    /// Execution, Artifact inputs, WorkspaceLease, and start event commit in
+    /// the WorkUnit repository transaction.
+    pub(crate) async fn create_running_work_unit_execution_with_artifact_inputs(
         &self,
+        work_unit_id: &str,
+        expected_work_unit_version: i64,
         input: CreateExecution,
-        workspace_created_by_attempt: bool,
-    ) -> Result<Execution> {
-        self.create_running_execution_with_artifact_inputs(
-            input,
-            workspace_created_by_attempt,
-            Vec::new(),
-        )
-        .await
-    }
-
-    pub(crate) async fn create_running_execution_with_artifact_inputs(
-        &self,
-        input: CreateExecution,
-        workspace_created_by_attempt: bool,
         artifact_input_ids: Vec<String>,
     ) -> Result<Execution> {
-        let repository_context = if let Some(workspace_id) = input.workspace_id.as_deref() {
-            let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
+        validate_required("work_unit_id", work_unit_id)?;
+        let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", input.task_id.clone()))?;
+        let work_unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("work_unit", work_unit_id.to_owned()))?;
+        if work_unit.task_id != task.id
+            || work_unit.version != expected_work_unit_version
+            || work_unit.status != db::WorkUnitStatus::Open
+            || work_unit.role != input.role
+            || input.status != ExecutionStatus::Running
+            || input.purpose.is_none()
+        {
+            return Err(ServiceError::Db(db::DbError::VersionConflict));
+        }
+        let actor = input.actor_ref.as_ref().ok_or_else(|| {
+            ServiceError::invalid_operation("WorkUnit Execution requires an exact ActorRef")
+        })?;
+        if work_unit.assigned_actor.as_ref() != Some(actor) {
+            return Err(ServiceError::AuthorizationDenied {
+                message: "Execution Actor does not match the exact WorkUnit assignment".to_owned(),
+            });
+        }
+        match actor {
+            db::ActorRef::Agent(agent_id) if input.agent_id.as_deref() != Some(agent_id) => {
+                return Err(ServiceError::invalid_operation(
+                    "WorkUnit Agent Execution agent_id must match its ActorRef",
+                ));
+            }
+            db::ActorRef::Human(_) if input.agent_id.is_some() => {
+                return Err(ServiceError::invalid_operation(
+                    "Human WorkUnit Execution cannot carry an Agent identity",
+                ));
+            }
+            _ => {}
+        }
+        if let db::ActorRef::Agent(agent_id) = actor {
+            let agent = db::AgentRepo::get_by_id(&*self.db, agent_id)
                 .await?
-                .ok_or_else(|| ServiceError::not_found("task", input.task_id.clone()))?;
+                .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
+            if !crate::agent_capacity::has_running_execution_capacity(&self.db, &agent).await? {
+                return Err(db::DbError::AgentAtCapacity.into());
+            }
+        }
+        self.ensure_task_runnable(&task).await?;
+
+        let workspace_lease = if work_unit.requires_integration {
+            let workspace_id = input.workspace_id.as_deref().ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "repository WorkUnit Execution requires its exact Workspace",
+                )
+            })?;
+            let _workspace_guard = if let Some(locks) = self.workspace_exec_locks.as_ref() {
+                Some(locks.acquire(workspace_id).await)
+            } else {
+                None
+            };
             let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-            Some((task, workspace))
-        } else {
-            let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
+            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, workspace_id)
                 .await?
-                .ok_or_else(|| ServiceError::not_found("task", input.task_id.clone()))?;
-            if task.repo_id.is_some() {
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+            if workspace.task_id != task.id
+                || workspace.status != WorkspaceStatus::Ready
+                || scope.task_id != task.id
+                || scope.kind != db::WorkspaceScopeKind::WorkUnit
+                || scope.work_unit_id.as_deref() != Some(work_unit_id)
+            {
                 return Err(ServiceError::invalid_operation(
-                    "repository execution requires a scheduler WorkspaceLease-backed workspace",
+                    "Execution Workspace does not belong to its exact WorkUnit",
+                ));
+            }
+            Some(
+                self.prepare_work_unit_workspace_lease(
+                    &task, &work_unit, &workspace, &input, actor,
+                )
+                .await?,
+            )
+        } else {
+            if input.workspace_id.is_some() {
+                return Err(ServiceError::invalid_operation(
+                    "non-mutating WorkUnit Execution cannot bind a repository Workspace",
                 ));
             }
             None
         };
 
-        // The lease is FK-bound to the concrete execution attempt.  Create
-        // that attempt first, then issue the authority; a rejected lease is
-        // immediately terminalized so no running execution can exist without
-        // an active scheduler grant.
         let event = execution_domain_event(&input, "execution.started");
-        let (execution, committed_event) =
-            match ExecutionRepo::create_with_artifact_inputs_and_event(
-                &*self.db,
-                input.clone(),
-                artifact_input_ids,
-                event,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    if workspace_created_by_attempt {
-                        self.cleanup_fresh_execution_workspace_by_id(
-                            &input.task_id,
-                            input.workspace_id.as_deref(),
-                        )
-                        .await;
-                    }
-                    return Err(error.into());
-                }
-            };
-        if let Some((task, workspace)) = repository_context.as_ref() {
-            if let Err(error) = self
-                .issue_workspace_lease(
-                    task,
-                    workspace,
-                    &input.role,
-                    input.agent_id.as_deref(),
-                    &input.id,
-                )
-                .await
-            {
-                if let Err(mark_error) = self
-                    .fail_execution_before_dispatch(&execution.id, error.to_string())
-                    .await
-                {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        %mark_error,
-                        "failed to terminalize execution after WorkspaceLease rejection"
-                    );
-                }
-                if workspace_created_by_attempt {
-                    self.cleanup_fresh_execution_workspace(task, workspace)
-                        .await;
-                }
-                return Err(error);
-            }
-        }
-        self.publish_committed_domain_event(&committed_event);
-        Ok(execution)
+        let write = db::WorkUnitExecutionRepo::create_for_work_unit_with_artifact_inputs(
+            &*self.db,
+            db::CreateWorkUnitExecution {
+                execution: input,
+                work_unit_id: work_unit.id,
+                work_unit_version: expected_work_unit_version,
+                workspace_lease,
+            },
+            artifact_input_ids,
+            event,
+        )
+        .await?;
+        self.publish_committed_domain_event(&write.event);
+        Ok(write.record)
     }
 
     pub(crate) async fn inherit_plan_artifact_inputs(
@@ -524,62 +436,6 @@ impl TaskService {
             .publish_committed(event);
     }
 
-    pub(crate) async fn cleanup_fresh_execution_workspace(
-        &self,
-        task: &Task,
-        workspace: &Workspace,
-    ) {
-        self.cleanup_fresh_execution_workspace_by_id(&task.id, Some(&workspace.id))
-            .await;
-    }
-
-    async fn cleanup_fresh_execution_workspace_by_id(
-        &self,
-        task_id: &str,
-        workspace_id: Option<&str>,
-    ) {
-        let mut removed_workspace = false;
-        if let Some(workspace_id) = workspace_id {
-            // Delete only our workspace row and only while no execution has
-            // acquired it. This protects a concurrent launch which reused
-            // the same Task workspace after this attempt lost admission.
-            match sqlx::query(
-                "DELETE FROM workspace
-                 WHERE id = ? AND task_id = ?
-                   AND NOT EXISTS (
-                       SELECT 1 FROM execution
-                       WHERE execution.workspace_id = workspace.id
-                   )",
-            )
-            .bind(workspace_id)
-            .bind(task_id)
-            .execute(self.db.pool())
-            .await
-            {
-                Ok(result) => removed_workspace = result.rows_affected() == 1,
-                Err(cleanup_error) => tracing::warn!(
-                    task_id,
-                    workspace_id,
-                    %cleanup_error,
-                    "failed to remove workspace row after rejected execution"
-                ),
-            }
-        }
-        let mut manager = WorkspaceManager::new(self.workspace_root.clone());
-        if let Some(locks) = self.repo_cache_locks.clone() {
-            manager = manager.with_repo_cache_locks(locks);
-        }
-        if removed_workspace {
-            if let Err(cleanup_error) = manager.cleanup_worktree(task_id).await {
-                tracing::warn!(
-                    task_id,
-                    %cleanup_error,
-                    "failed to remove fresh worktree after rejected execution"
-                );
-            }
-        }
-    }
-
     pub(crate) async fn complete_remote_execution(
         &self,
         notification: api_types::ExecutionTerminalNotification,
@@ -592,7 +448,7 @@ impl TaskService {
                 ServiceError::not_found("execution", notification.execution_id.clone())
             })?;
         if current_execution.status == ExecutionStatus::Running
-            && current_execution.role == crate::workflow::default_roles::REVIEWER
+            && current_execution.role == "reviewer"
             && current_execution.purpose == Some(ExecutionPurpose::Review)
         {
             let expected_output = notification
@@ -607,7 +463,7 @@ impl TaskService {
             }
         }
         let _workspace_review_guard = if current_execution.status == ExecutionStatus::Running
-            && current_execution.role == crate::workflow::default_roles::REVIEWER
+            && current_execution.role == "reviewer"
             && current_execution.purpose == Some(ExecutionPurpose::Review)
         {
             if let (Some(workspace_id), Some(locks)) = (
@@ -666,7 +522,7 @@ impl TaskService {
                 .create_plan_artifact_from_execution(&current_execution.id, assistant_output)
                 .await?;
         }
-        if current_execution.role == crate::workflow::default_roles::REVIEWER
+        if current_execution.role == "reviewer"
             && current_execution.purpose == Some(ExecutionPurpose::Review)
             && outcome == "completed"
         {
@@ -819,7 +675,7 @@ impl TaskService {
                 stopped_by,
                 resume_policy,
                 stopped_at,
-                agent_session_id: notification.agent_session_id.map(Some),
+                external_session_id: notification.agent_session_id.map(Some),
                 agent_message_id: None,
                 last_activity_at: Some(Some(terminal_ts)),
                 summary: notification.summary.map(Some),

@@ -83,6 +83,7 @@ import type {
   SettingsResponse,
   UpdateSettingsRequest,
   Workspace,
+  WorkUnitResponse,
 } from '@/types/generated'
 import { recordUserInitiatedTransition } from '@/lib/notification-toast-suppression'
 
@@ -384,6 +385,14 @@ export function useTaskGatesQuery(taskId: string) {
   })
 }
 
+export function useTaskWorkUnitsQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.workUnits(taskId),
+    queryFn: () => apiFetch<WorkUnitResponse[]>(`/tasks/${taskId}/work-units`),
+    enabled: Boolean(taskId),
+  })
+}
+
 export function useEvaluateGate() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -514,19 +523,6 @@ export function useTaskWorkspace(taskId: string) {
     queryFn: () => apiFetch<Workspace>(`/tasks/${taskId}/workspace`),
     enabled: Boolean(taskId),
     retry: false,
-  })
-}
-
-export function useResetTaskWorkspace() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (taskId: string) =>
-      apiFetch<unknown>(`/tasks/${taskId}/workspace/reset`, {
-        method: 'POST',
-      }),
-    onSuccess: (_, taskId) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
-    },
   })
 }
 
@@ -881,6 +877,7 @@ export function useStartExecution() {
     onSuccess: (execution) => {
       void queryClient.invalidateQueries({ queryKey: qk.executions(execution.task_id) })
       void queryClient.invalidateQueries({ queryKey: qk.task(execution.task_id) })
+      void queryClient.invalidateQueries({ queryKey: qk.workUnits(execution.task_id) })
     },
   })
 }

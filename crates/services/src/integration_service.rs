@@ -134,7 +134,6 @@ impl IntegrationService {
                     None,
                     None,
                     None,
-                    None,
                 )
                 .await?;
 
@@ -238,12 +237,12 @@ impl IntegrationService {
 
 fn integration_default_implementer(integration: &ProjectIntegration) -> Result<Option<ActorRef>> {
     match (
-        integration.default_assignee_type.as_deref(),
-        integration.default_assignee_id.as_deref(),
+        integration.default_implementer_kind.as_deref(),
+        integration.default_implementer_id.as_deref(),
     ) {
         (None, None) => Ok(None),
         (Some("agent"), Some(id)) if !id.is_empty() => Ok(Some(ActorRef::Agent(id.to_owned()))),
-        (Some("user"), Some(id)) if !id.is_empty() => Ok(Some(ActorRef::Human(id.to_owned()))),
+        (Some("human"), Some(id)) if !id.is_empty() => Ok(Some(ActorRef::Human(id.to_owned()))),
         _ => Err(ServiceError::invalid_operation(
             "integration default implementer must be an exact Agent or Human Actor reference",
         )),

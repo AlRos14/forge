@@ -105,17 +105,4 @@ impl TaskService {
         });
         Ok(())
     }
-
-    pub async fn reset_task_workspace(&self, task_id: &str) -> Result<Workspace> {
-        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        reset_workspace(
-            &self.db,
-            &self.workspace_root,
-            &task,
-            self.repo_cache_locks.clone(),
-        )
-        .await
-    }
 }

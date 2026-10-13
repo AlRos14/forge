@@ -10,6 +10,7 @@ import {
   useTaskGatesQuery,
   useTaskLifecycleTransitionsQuery,
   useTaskQuery,
+  useTaskWorkUnitsQuery,
   useTransitionTaskLifecycle,
   useTriggerReview,
   useValidationsQuery,
@@ -67,6 +68,7 @@ export function TaskDetailPage({
   const reviewsQuery = useReviewsQuery(taskId)
   const validationsQuery = useValidationsQuery(taskId)
   const gatesQuery = useTaskGatesQuery(taskId)
+  const workUnitsQuery = useTaskWorkUnitsQuery(taskId)
   const transition = useTransitionTaskLifecycle()
   const evaluateGate = useEvaluateGate()
   const startReview = useTriggerReview()
@@ -75,31 +77,26 @@ export function TaskDetailPage({
   const userId = useAuthStore((state) => state.user?.id)
   const [evaluations, setEvaluations] = useState<Record<string, GateEvaluationResponse>>({})
   const [reportForm, setReportForm] = useState<Record<string, SubmitReviewReportRequest>>({})
+  const [reviewWorkspaceId, setReviewWorkspaceId] = useState('')
   const [executionForm, setExecutionForm] = useState<{
-    role: string
-    agentId: string
+    workUnitId: string
     purpose: ExecutionPurpose | ''
     prompt: string
     artifactIds: string
-  }>({ role: '', agentId: '', purpose: '', prompt: '', artifactIds: '' })
+  }>({ workUnitId: '', purpose: '', prompt: '', artifactIds: '' })
 
   const task = taskQuery.data
   const reviews = reviewsQuery.data ?? []
   const validations = validationsQuery.data ?? []
   const executions = executionsQuery.data?.items ?? []
-  const executableRoles =
-    task?.task_roles.filter((role) =>
-      role.members.some(
-        (member) => member.status === 'active' && member.actor_ref.kind === 'agent',
-      ),
-    ) ?? []
-  const executableAgents =
-    executableRoles
-      .find((role) => role.role === executionForm.role)
-      ?.members.filter(
-        (member) => member.status === 'active' && member.actor_ref.kind === 'agent',
-      )
-      .map((member) => member.actor_ref.id) ?? []
+  const workUnits = workUnitsQuery.data ?? []
+  const selectedWorkUnit = workUnits.find((unit) => unit.id === executionForm.workUnitId)
+  const runnableWorkUnits = workUnits.filter(
+    (unit) =>
+      unit.status === 'open' &&
+      unit.readiness.runnable &&
+      unit.assigned_actor?.kind === 'agent',
+  )
   const reviewerRole = task?.task_roles.find((role) => role.role === 'reviewer')
   const canStartReview = Boolean(
     task?.lifecycle.state === 'active' &&
@@ -153,7 +150,7 @@ export function TaskDetailPage({
     try {
       await startReview.mutateAsync({
         taskId: task.id,
-        body: { workspace_id: task.workspace?.id ?? null },
+        body: { workspace_id: reviewWorkspaceId || null },
       })
     } catch (error) {
       toast.error(getApiErrorMessage(error, 'Review Execution could not start'))
@@ -161,21 +158,22 @@ export function TaskDetailPage({
   }
 
   async function beginExecution() {
-    if (!task || !executionForm.role || !executionForm.agentId || !executionForm.purpose) return
+    if (!task || !selectedWorkUnit || !executionForm.purpose) return
     const body: StartExecutionRequest = {
-      agent_id: executionForm.agentId,
-      role: executionForm.role,
+      work_unit_id: selectedWorkUnit.id,
+      expected_work_unit_version: selectedWorkUnit.version,
       purpose: executionForm.purpose,
       prompt: executionForm.prompt,
       input_artifact_ids: executionForm.artifactIds
         .split('\n')
         .map((value) => value.trim())
         .filter(Boolean),
+      overrides: null,
     }
     try {
       await startExecution.mutateAsync({ taskId: task.id, body })
-      setExecutionForm({ role: '', agentId: '', purpose: '', prompt: '', artifactIds: '' })
-      toast.success('Execution started with the selected Agent and TaskRole')
+      setExecutionForm({ workUnitId: '', purpose: '', prompt: '', artifactIds: '' })
+      toast.success('Execution started for the exact WorkUnit assignment')
     } catch (error) {
       toast.error(getApiErrorMessage(error, 'Execution could not start'))
     }
@@ -320,32 +318,32 @@ export function TaskDetailPage({
       {activeTab === 'executions' ? (
         <section className="space-y-3 rounded-lg border p-4">
           <h2 className="font-semibold">Executions</h2>
-          <p className="text-xs text-muted-foreground">Every start names the exact Agent, active TaskRole, purpose, prompt, and Artifact inputs.</p>
+          <p className="text-xs text-muted-foreground">Every start names the exact runnable WorkUnit revision, purpose, prompt, and Artifact inputs. The WorkUnit assignment supplies the Actor and role.</p>
           <div className="grid gap-3 rounded-md border p-3 md:grid-cols-2">
             <label className="space-y-1 text-sm">
-              <span>TaskRole</span>
+              <span>Runnable WorkUnit</span>
               <select
                 className="h-9 w-full rounded-md border bg-background px-2"
-                value={executionForm.role}
-                onChange={(event) =>
-                  setExecutionForm((current) => ({ ...current, role: event.target.value, agentId: '' }))
-                }
+                value={executionForm.workUnitId}
+                onChange={(event) => setExecutionForm((current) => ({ ...current, workUnitId: event.target.value }))}
               >
-                <option value="">Select a TaskRole</option>
-                {executableRoles.map((role) => <option key={role.id} value={role.role}>{role.role}</option>)}
+                <option value="">Select an exact WorkUnit</option>
+                {runnableWorkUnits.map((unit) => (
+                  <option key={unit.id} value={unit.id}>
+                    {unit.title} · {unit.role} · Agent {unit.assigned_actor?.id}
+                  </option>
+                ))}
               </select>
             </label>
-            <label className="space-y-1 text-sm">
-              <span>Agent membership</span>
-              <select
-                className="h-9 w-full rounded-md border bg-background px-2"
-                value={executionForm.agentId}
-                onChange={(event) => setExecutionForm((current) => ({ ...current, agentId: event.target.value }))}
-              >
-                <option value="">Select an active Agent membership</option>
-                {executableAgents.map((agentId) => <option key={agentId} value={agentId}>{agentId}</option>)}
-              </select>
-            </label>
+            {workUnitsQuery.isLoading ? <p className="text-sm text-muted-foreground">Loading WorkUnits…</p> : null}
+            {!workUnitsQuery.isLoading && runnableWorkUnits.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No runnable Agent-assigned WorkUnit is available. Create or allocate an exact WorkUnit first.</p>
+            ) : null}
+            {selectedWorkUnit ? (
+              <p className="text-xs text-muted-foreground md:col-span-2">
+                WorkUnit {selectedWorkUnit.id} v{String(selectedWorkUnit.version)} · {selectedWorkUnit.role} · Agent {selectedWorkUnit.assigned_actor?.id}
+              </p>
+            ) : null}
             <label className="space-y-1 text-sm">
               <span>Execution purpose</span>
               <select
@@ -384,7 +382,7 @@ export function TaskDetailPage({
             <div className="md:col-span-2">
               <Button
                 size="sm"
-                disabled={startExecution.isPending || !executionForm.role || !executionForm.agentId || !executionForm.purpose || !executionForm.prompt.trim()}
+                disabled={startExecution.isPending || !selectedWorkUnit || !executionForm.purpose || !executionForm.prompt.trim()}
                 onClick={() => void beginExecution()}
               >
                 Start exact Agent Execution
@@ -411,11 +409,29 @@ export function TaskDetailPage({
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-4">
             <div>
               <h2 className="font-semibold">Review Executions</h2>
-              <p className="text-xs text-muted-foreground">Formal Review requires Execution role reviewer and purpose review.</p>
+              <p className="text-xs text-muted-foreground">Formal Review requires Execution role reviewer and purpose review. Choose an exact Workspace from Execution history; an empty selection starts a Workspace-free Review.</p>
             </div>
-            <Button size="sm" disabled={!canStartReview || startReview.isPending} onClick={() => void beginReview()}>
-              Start Human Review Execution
-            </Button>
+            <div className="flex flex-wrap items-center gap-2">
+              <select
+                aria-label="Exact Review Workspace"
+                className="h-9 max-w-sm rounded-md border bg-background px-2 text-sm"
+                value={reviewWorkspaceId}
+                onChange={(event) => setReviewWorkspaceId(event.target.value)}
+              >
+                <option value="">No Workspace</option>
+                {[...new Map(executions
+                  .filter((execution) => execution.workspace_id)
+                  .map((execution) => [execution.workspace_id!, execution])).values()]
+                  .map((execution) => (
+                    <option key={execution.workspace_id} value={execution.workspace_id!}>
+                      Workspace {execution.workspace_id} · Execution {execution.id}
+                    </option>
+                  ))}
+              </select>
+              <Button size="sm" disabled={!canStartReview || startReview.isPending} onClick={() => void beginReview()}>
+                Start Human Review Execution
+              </Button>
+            </div>
           </div>
           {reviewsQuery.isLoading ? <p className="text-sm text-muted-foreground">Loading Review Executions…</p> : null}
           {reviews.map(({ execution, report }) => (
@@ -464,6 +480,7 @@ export function TaskDetailPage({
     </main>
   )
 }
+
 
 export function ReviewExecutionCard({
   review,

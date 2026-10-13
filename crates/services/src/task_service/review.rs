@@ -77,7 +77,7 @@ impl TaskService {
                         stopped_by: None,
                         resume_policy: None,
                         stopped_at: None,
-                        agent_session_id: None,
+                        external_session_id: None,
                         agent_message_id: None,
                         last_activity_at: Some(Some(timestamp.clone())),
                         summary: Some(Some(summary)),
@@ -101,7 +101,6 @@ impl TaskService {
                 ));
             }
         };
-        self.maybe_cascade_executor_completion(&updated.id).await?;
         Ok(Some((updated, report)))
     }
 
@@ -124,13 +123,8 @@ impl TaskService {
                 "Human Review Execution requires an active aggregate Task lifecycle",
             ));
         }
-        if !human_is_active_role_member_authoritative(
-            &self.db,
-            task_id,
-            crate::workflow::default_roles::REVIEWER,
-            user_id,
-        )
-        .await?
+        if !human_is_active_role_member_authoritative(&self.db, task_id, "reviewer", user_id)
+            .await?
         {
             return Err(ServiceError::AuthorizationDenied {
                 message: "Human reviewer is not an active member of the reviewer TaskRole"
@@ -154,13 +148,8 @@ impl TaskService {
                     "Human Review Execution requires an active aggregate Task lifecycle",
                 ));
             }
-            if !human_is_active_role_member_authoritative(
-                &self.db,
-                task_id,
-                crate::workflow::default_roles::REVIEWER,
-                user_id,
-            )
-            .await?
+            if !human_is_active_role_member_authoritative(&self.db, task_id, "reviewer", user_id)
+                .await?
             {
                 return Err(ServiceError::AuthorizationDenied {
                     message: "Human reviewer is not an active member of the reviewer TaskRole"
@@ -227,7 +216,7 @@ impl TaskService {
                 "execution_id": id,
                 "task_id": task_id,
                 "project_id": task.project_id,
-                "role": crate::workflow::default_roles::REVIEWER,
+                "role": "reviewer",
                 "purpose": "review",
                 "actor_kind": "human",
                 "actor_id": user_id,
@@ -244,7 +233,7 @@ impl TaskService {
             task_id: task_id.to_owned(),
             agent_id: None,
             actor_ref: Some(db::ActorRef::Human(user_id.to_owned())),
-            role: crate::workflow::default_roles::REVIEWER.to_owned(),
+            role: "reviewer".to_owned(),
             purpose: Some(ExecutionPurpose::Review),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -252,7 +241,6 @@ impl TaskService {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             harness_session_id: None,
             agent_message_id: None,
             last_activity_at: Some(now.clone()),
@@ -325,7 +313,7 @@ impl TaskService {
         execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;
-        if execution.role != crate::workflow::default_roles::REVIEWER
+        if execution.role != "reviewer"
             || execution.purpose != Some(ExecutionPurpose::Review)
             || execution.actor_ref() != Some(db::ActorRef::Human(user_id.to_owned()))
         {

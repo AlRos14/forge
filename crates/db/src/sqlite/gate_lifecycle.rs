@@ -111,19 +111,6 @@ fn map_evaluation_input(row: &sqlx::sqlite::SqliteRow) -> Result<GateEvaluationI
     })
 }
 
-fn lifecycle_projection(state: TaskLifecycleState) -> &'static str {
-    match state {
-        TaskLifecycleState::Backlog => "backlog",
-        TaskLifecycleState::Ready => "todo",
-        TaskLifecycleState::Active
-        | TaskLifecycleState::ReadyToMerge
-        | TaskLifecycleState::Merging => "in_progress",
-        TaskLifecycleState::Blocked => "blocked",
-        TaskLifecycleState::Done => "done",
-        TaskLifecycleState::Cancelled => "cancelled",
-    }
-}
-
 fn lifecycle_request_digest(input: &TransitionTaskLifecycle) -> String {
     let canonical = serde_json::json!({
         "expected_task_version": input.expected_task_version,
@@ -515,10 +502,9 @@ impl TaskLifecycleRepo for SqliteDb {
         }
 
         let updated_task = sqlx::query(
-            "UPDATE task SET status = ?, version = version + 1, updated_at = ?
+            "UPDATE task SET version = version + 1, updated_at = ?
              WHERE id = ? AND project_id = ? AND version = ? AND deleted_at IS NULL",
         )
-        .bind(lifecycle_projection(input.to_state))
         .bind(&input.updated_at)
         .bind(&input.task_id)
         .bind(&project_id)

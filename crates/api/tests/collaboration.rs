@@ -374,9 +374,9 @@ async fn generic_api_derives_sender_authorizes_ids_and_hides_content_ref() {
     .expect("Project B repo");
     sqlx::query(
         "INSERT INTO task (
-             id, project_id, repo_id, title, task_type, status, created_at, updated_at
+             id, project_id, repo_id, title, task_type, created_at, updated_at
          ) VALUES ('pr4-api-task-b', 'pr4-api-project-b', 'pr4-api-repo-b',
-                   'Project B task', 'implementation', 'in_progress', ?, ?)",
+                   'Project B task', 'implementation', ?, ?)",
     )
     .bind(&now)
     .bind(&now)

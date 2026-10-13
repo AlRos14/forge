@@ -241,7 +241,7 @@ impl MergeService {
                         stopped_by: None,
                         resume_policy: None,
                         stopped_at: None,
-                        agent_session_id: None,
+                        external_session_id: None,
                         agent_message_id: None,
                         last_activity_at: None,
                         summary: None,
@@ -270,7 +270,7 @@ impl MergeService {
                                 stopped_by: None,
                                 resume_policy: None,
                                 stopped_at: None,
-                                agent_session_id: None,
+                                external_session_id: None,
                                 agent_message_id: None,
                                 last_activity_at: None,
                                 summary: None,
@@ -319,7 +319,7 @@ impl MergeService {
                 .ok()
                 .and_then(|configured| configured.clone());
             if let Some(cleanup_scheduler) = cleanup_scheduler {
-                match WorkspaceRepo::get_by_task_id(&*self.db, &task_id).await {
+                match WorkspaceRepo::get_integration_by_task_id(&*self.db, &task_id).await {
                     Ok(Some(workspace)) => {
                         if let Err(error) = cleanup_scheduler.cleanup_now(&workspace.id).await {
                             tracing::warn!(task_id = %task_id, workspace_id = %workspace.id, %error, "post-merge workspace cleanup failed");
@@ -921,7 +921,7 @@ fn merge_operation_status(result: &Result<MergeOutcome>) -> db::TaskIntegrationO
 
 async fn task_merge_source(db: &SqliteDb, task_id: &str) -> Result<TaskMergeSource> {
     if !WorkUnitRepo::list_by_task(db, task_id).await?.is_empty() {
-        let workspace = WorkspaceRepo::get_by_task_id(db, task_id)
+        let workspace = WorkspaceRepo::get_integration_by_task_id(db, task_id)
             .await?
             .ok_or_else(|| {
                 ServiceError::invalid_operation("Task with WorkUnits has no integration workspace")

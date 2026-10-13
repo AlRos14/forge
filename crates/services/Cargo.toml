@@ -14,7 +14,6 @@ db = { path = "../db" }
 events = { path = "../events" }
 executors = { path = "../executors" }
 git = { path = "../git" }
-review = { path = "../review" }
 workspace = { path = "../workspace" }
 async-trait = "0.1"
 base64 = "0.22"

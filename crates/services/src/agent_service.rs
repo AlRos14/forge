@@ -428,9 +428,10 @@ fn validate_positive(field: &str, value: i64) -> Result<()> {
 mod tests {
     use super::*;
     use db::{
-        create_sqlite_pool, run_migrations, CreateExecution, CreateProject, CreateRepo, CreateTask,
-        CreateTaskRoleAssignment, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo,
-        TaskRoleAssignmentRepo, UpdateProject, UpsertDaemon,
+        create_sqlite_pool, run_migrations, CreateExecution, CreateProject, CreateRepo,
+        CreateRoleMembership, CreateTask, CreateTaskRole, ExecutionRepo, ExecutionStatus,
+        ProjectRepo, RepoRepo, RoleMembershipRepo, TaskRepo, TaskRoleRepo, UpdateProject,
+        UpsertDaemon,
     };
 
     async fn sqlite_db() -> SqliteDb {
@@ -566,7 +567,6 @@ mod tests {
                 id: project_id.clone(),
                 name: "Forge".to_owned(),
                 settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
                 primary_repo_id: None,
                 owner_id: None,
                 created_at: now.clone(),
@@ -612,15 +612,12 @@ mod tests {
                 repo_id: Some(repo_id),
                 parent_task_id: None,
                 subtask_order: None,
-                assignee_type: Some("agent".to_owned()),
-                assignee_id: Some(agent_id.to_owned()),
                 title: "Active task".to_owned(),
                 description: None,
                 task_type: "implementation".to_owned(),
-                status: "in_progress".to_owned(),
+                lifecycle_state: db::TaskLifecycleState::Active,
                 is_automation: false,
                 priority: 0,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -628,20 +625,35 @@ mod tests {
         )
         .await
         .expect("task creates");
-        TaskRoleAssignmentRepo::assign(
+        let task_role_id = new_uuid_v4();
+        TaskRoleRepo::create(
             db,
-            CreateTaskRoleAssignment {
-                id: new_uuid_v4(),
+            CreateTaskRole {
+                id: task_role_id.clone(),
                 task_id: task.id.clone(),
-                role_name: "coder".to_owned(),
-                assignee_type: Some(db::AssigneeKind::Agent),
-                assignee_id: Some(agent_id.to_owned()),
+                role: "implementer".to_owned(),
+                coordination_mode: None,
+                policy_json: "{}".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
         )
         .await
-        .expect("role assignment creates");
+        .expect("TaskRole creates");
+        RoleMembershipRepo::add(
+            db,
+            CreateRoleMembership {
+                id: new_uuid_v4(),
+                task_role_id,
+                actor_kind: db::ActorKind::Agent,
+                actor_id: agent_id.to_owned(),
+                status: db::RoleMembershipStatus::Active,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("role membership creates");
         ExecutionRepo::create(
             db,
             CreateExecution {
@@ -658,7 +670,6 @@ mod tests {
                 resume_policy: None,
                 stopped_at: None,
                 parent_execution_id: None,
-                agent_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,

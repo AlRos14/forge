@@ -512,34 +512,6 @@ fn allowed_transition(from: TaskLifecycleState, to: TaskLifecycleState) -> bool 
     )
 }
 
-pub fn lifecycle_state_for_legacy_status(status: &str) -> Option<TaskLifecycleState> {
-    match status {
-        "backlog" => Some(TaskLifecycleState::Backlog),
-        "todo" | "ready" => Some(TaskLifecycleState::Ready),
-        "planning" | "in_progress" | "working" => Some(TaskLifecycleState::Active),
-        "review" => Some(TaskLifecycleState::Blocked),
-        "blocked" | "merge_failed" => Some(TaskLifecycleState::Blocked),
-        "ready_to_merge" => Some(TaskLifecycleState::ReadyToMerge),
-        "merging" => Some(TaskLifecycleState::Merging),
-        "done" => Some(TaskLifecycleState::Done),
-        "cancelled" => Some(TaskLifecycleState::Cancelled),
-        _ => None,
-    }
-}
-
-pub fn legacy_status_projection(state: TaskLifecycleState) -> &'static str {
-    match state {
-        TaskLifecycleState::Backlog => "backlog",
-        TaskLifecycleState::Ready => "todo",
-        TaskLifecycleState::Active
-        | TaskLifecycleState::ReadyToMerge
-        | TaskLifecycleState::Merging => "in_progress",
-        TaskLifecycleState::Blocked => "blocked",
-        TaskLifecycleState::Done => "done",
-        TaskLifecycleState::Cancelled => "cancelled",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,7 +543,6 @@ mod tests {
                 id: project_id.clone(),
                 name: "PR9 Gate and lifecycle test".to_owned(),
                 settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
                 primary_repo_id: None,
                 owner_id: None,
                 created_at: now.clone(),
@@ -604,16 +575,13 @@ mod tests {
                 project_id,
                 repo_id: Some(repo_id),
                 parent_task_id: None,
-                assignee_type: None,
-                assignee_id: None,
                 title: "Lifecycle target".to_owned(),
                 description: None,
                 task_type: "implementation".to_owned(),
-                status: "todo".to_owned(),
+                lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
                 subtask_order: None,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now,
@@ -622,35 +590,6 @@ mod tests {
         .await
         .expect("Task");
         (db, Arc::new(EventBus::new(16)), task)
-    }
-
-    #[test]
-    fn legacy_workflow_labels_collapse_into_aggregate_progress() {
-        assert_eq!(
-            lifecycle_state_for_legacy_status("ready"),
-            Some(TaskLifecycleState::Ready)
-        );
-        assert_eq!(
-            lifecycle_state_for_legacy_status("planning"),
-            Some(TaskLifecycleState::Active)
-        );
-        assert_eq!(
-            lifecycle_state_for_legacy_status("in_progress"),
-            Some(TaskLifecycleState::Active)
-        );
-        assert_eq!(
-            lifecycle_state_for_legacy_status("working"),
-            Some(TaskLifecycleState::Active)
-        );
-        assert_eq!(
-            lifecycle_state_for_legacy_status("review"),
-            Some(TaskLifecycleState::Blocked)
-        );
-        assert_eq!(
-            lifecycle_state_for_legacy_status("merge_failed"),
-            Some(TaskLifecycleState::Blocked)
-        );
-        assert_eq!(lifecycle_state_for_legacy_status("unknown"), None);
     }
 
     #[test]
@@ -727,7 +666,7 @@ mod tests {
         };
         let first = service.transition(input.clone()).await.expect("transition");
         assert_eq!(first.lifecycle.version, 2);
-        assert_eq!(first.task.status, "in_progress");
+        assert_eq!(first.task.lifecycle_state, TaskLifecycleState::Active);
         assert!(!first.transition.as_ref().unwrap().replayed);
 
         let replay = service.transition(input.clone()).await.expect("replay");
@@ -1570,7 +1509,6 @@ mod tests {
                 resume_policy: None,
                 stopped_at: None,
                 parent_execution_id: None,
-                agent_session_id: None,
                 harness_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,

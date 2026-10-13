@@ -36,10 +36,24 @@ pub async fn start_task_execution(
     Json(request): Json<StartExecutionRequest>,
 ) -> ApiResult<Json<ExecutionResponse>> {
     crate::routes::tasks::require_task_mutable(&state, &task_id, &user).await?;
-    if request.role.trim().is_empty() || request.prompt.trim().is_empty() {
+    if request.prompt.trim().is_empty() {
         return Err(ApiError::bad_request(
-            "role and prompt must be non-empty for an Execution",
+            "prompt must be non-empty for an Execution",
         ));
+    }
+    let work_unit = db::WorkUnitRepo::get_by_id(&*state.db, &request.work_unit_id)
+        .await?
+        .filter(|work_unit| work_unit.task_id == task_id)
+        .ok_or_else(|| ApiError::not_found("work_unit", request.work_unit_id.clone()))?;
+    if work_unit.requires_integration {
+        state
+            .work_unit_service
+            .prepare_workspace(
+                services::CollaborationActorSource::Human(user.user_id.clone()),
+                &work_unit.id,
+            )
+            .await
+            .map_err(ApiError::from)?;
     }
     let purpose = match request.purpose {
         api_types::ExecutionPurpose::Plan => db::ExecutionPurpose::Plan,
@@ -50,21 +64,29 @@ pub async fn start_task_execution(
         api_types::ExecutionPurpose::Orchestrate => db::ExecutionPurpose::Orchestrate,
         api_types::ExecutionPurpose::General => db::ExecutionPurpose::General,
     };
-    let execution = state
+    let overrides = request.overrides.map(|overrides| ExecutionOverrides {
+        model_id: overrides.model_id,
+        reasoning_effort: overrides.reasoning_effort,
+        permission_policy: overrides.permission_policy,
+    });
+    let launched = state
         .task_service
-        .dispatch_initial_role_execution_with_artifacts(
-            &task_id,
-            &request.agent_id,
-            &request.role,
+        .launch_work_unit_execution(
+            &work_unit.id,
+            request.expected_work_unit_version,
             purpose,
             request.prompt,
             request.input_artifact_ids,
-            None,
+            overrides,
         )
         .await
         .map_err(ApiError::from)?;
+    state
+        .task_service
+        .start_execution(launched.execution.id.clone())
+        .await?;
     Ok(Json(
-        execution_response_with_usage(&state.db, execution).await?,
+        execution_response_with_usage(&state.db, launched.execution).await?,
     ))
 }
 

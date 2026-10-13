@@ -7,15 +7,9 @@ pub async fn trigger_review(
     Json(request): Json<api_types::StartReviewExecutionRequest>,
 ) -> ApiResult<Json<api_types::ReviewExecutionResponse>> {
     let _task = super::require_task_mutable(&state, &task_id, &user).await?;
-    let workspace_id = match request.workspace_id {
-        Some(workspace_id) => Some(workspace_id),
-        None => WorkspaceRepo::get_by_task_id(&*state.db, &task_id)
-            .await?
-            .map(|workspace| workspace.id),
-    };
     let execution = state
         .task_service
-        .start_human_review_execution(&task_id, &user.user_id, workspace_id.as_deref())
+        .start_human_review_execution(&task_id, &user.user_id, request.workspace_id.as_deref())
         .await?;
     Ok(Json(api_types::ReviewExecutionResponse {
         execution: execution_response(execution),
@@ -45,8 +39,7 @@ pub async fn list_reviews(
     .await?;
     let mut reviews = Vec::new();
     for execution in page.items.into_iter().filter(|execution| {
-        execution.role == services::workflow::default_roles::REVIEWER
-            && execution.purpose == Some(db::ExecutionPurpose::Review)
+        execution.role == "reviewer" && execution.purpose == Some(db::ExecutionPurpose::Review)
     }) {
         let report = db::CollaborationRepo::get_execution_artifact_output(
             &*state.db,
