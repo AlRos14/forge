@@ -161,6 +161,10 @@ after prior integration steps; the fixture attempted an `Active` to `Active`
 transition, which the lifecycle transition graph rejects. The fixture now
 checks the persisted lifecycle first and only transitions when necessary. The
 same focused test then passed; production lifecycle behavior was not changed.
+A preceding `--nocapture` diagnostic attempt briefly failed to compile because
+temporary state-printing instrumentation referenced an unqualified repository
+type; the diagnostic was corrected for inspection and removed before the final
+test run.
 
 The first run of the empty V120 upgrade test also failed on its test assertion:
 it assumed receipt count equaled the maximum migration version. The V120
