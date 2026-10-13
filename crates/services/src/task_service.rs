@@ -86,6 +86,14 @@ pub struct TaskService {
     credential_env: Option<Arc<crate::credential_service::CredentialService>>,
 }
 
+pub(crate) struct WorkUnitAdmissionLifecyclePlan {
+    pub(crate) expected_task_version: i64,
+    pub(crate) lifecycle: db::TaskLifecycle,
+    pub(crate) transitions: Vec<db::TransitionTaskLifecycle>,
+    pub(crate) clear_blocking_metadata: Option<db::ClearTaskBlockingMetadata>,
+    pub(crate) follow_up_receipt: Option<db::CreateFollowUpExecutionReceipt>,
+}
+
 pub(crate) fn execution_domain_event(
     input: &CreateExecution,
     event_type: &str,
@@ -209,6 +217,7 @@ pub struct LaunchExecutionResult {
     pub task: Task,
     pub execution: Execution,
     pub workspace: Option<Workspace>,
+    pub idempotent_replay: bool,
 }
 
 impl TaskService {
@@ -304,6 +313,7 @@ impl TaskService {
     /// Create a running Execution under one exact WorkUnit revision. The
     /// Execution, Artifact inputs, WorkspaceLease, and start event commit in
     /// the WorkUnit repository transaction.
+    #[cfg(test)]
     pub(crate) async fn create_running_work_unit_execution_with_artifact_inputs(
         &self,
         work_unit_id: &str,
@@ -311,6 +321,43 @@ impl TaskService {
         input: CreateExecution,
         artifact_input_ids: Vec<String>,
     ) -> Result<Execution> {
+        self.create_running_work_unit_execution_inner(
+            work_unit_id,
+            expected_work_unit_version,
+            input,
+            artifact_input_ids,
+            None,
+        )
+        .await
+        .map(|(_, execution, _)| execution)
+    }
+
+    pub(crate) async fn admit_running_work_unit_execution_with_artifact_inputs(
+        &self,
+        work_unit_id: &str,
+        expected_work_unit_version: i64,
+        input: CreateExecution,
+        artifact_input_ids: Vec<String>,
+        lifecycle_plan: WorkUnitAdmissionLifecyclePlan,
+    ) -> Result<(Task, Execution, bool)> {
+        self.create_running_work_unit_execution_inner(
+            work_unit_id,
+            expected_work_unit_version,
+            input,
+            artifact_input_ids,
+            Some(lifecycle_plan),
+        )
+        .await
+    }
+
+    async fn create_running_work_unit_execution_inner(
+        &self,
+        work_unit_id: &str,
+        expected_work_unit_version: i64,
+        input: CreateExecution,
+        artifact_input_ids: Vec<String>,
+        lifecycle_plan: Option<WorkUnitAdmissionLifecyclePlan>,
+    ) -> Result<(Task, Execution, bool)> {
         validate_required("work_unit_id", work_unit_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
             .await?
@@ -358,17 +405,55 @@ impl TaskService {
         }
         self.ensure_task_runnable(&task).await?;
 
+        let mut admitted_task = task.clone();
+        if let Some(plan) = lifecycle_plan.as_ref() {
+            if plan.lifecycle.task_id != task.id {
+                return Err(ServiceError::invalid_operation(
+                    "WorkUnit admission lifecycle plan belongs to another Task",
+                ));
+            }
+            if task.version != plan.expected_task_version {
+                return Err(db::DbError::VersionConflict.into());
+            }
+            let current_lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+            if current_lifecycle != plan.lifecycle {
+                return Err(db::DbError::VersionConflict.into());
+            }
+            let lifecycle_steps = i64::try_from(plan.transitions.len()).map_err(|_| {
+                ServiceError::invalid_operation("too many TaskLifecycle activation steps")
+            })?;
+            let metadata_step = i64::from(plan.clear_blocking_metadata.is_some());
+            admitted_task.version = task
+                .version
+                .checked_add(lifecycle_steps + metadata_step)
+                .ok_or_else(|| ServiceError::invalid_operation("Task version overflow"))?;
+            admitted_task.lifecycle_state = db::TaskLifecycleState::Active;
+            if let Some(clear) = plan.clear_blocking_metadata.as_ref() {
+                admitted_task.error_annotation = None;
+                admitted_task.blocked_json = None;
+                admitted_task.metadata_json = clear.replacement_metadata_json.clone();
+            }
+        }
+
+        // Keep the Workspace lock through the durable admission. The outer
+        // launch paths do not hold this lock, so this single guard covers the
+        // final Workspace read, lease preparation, and transaction commit.
+        let _workspace_guard = match (
+            self.workspace_exec_locks.as_ref(),
+            input.workspace_id.as_deref(),
+        ) {
+            (Some(locks), Some(workspace_id)) => Some(locks.acquire(workspace_id).await),
+            _ => None,
+        };
+
         let workspace_lease = if work_unit.requires_integration {
             let workspace_id = input.workspace_id.as_deref().ok_or_else(|| {
                 ServiceError::invalid_operation(
                     "repository WorkUnit Execution requires its exact Workspace",
                 )
             })?;
-            let _workspace_guard = if let Some(locks) = self.workspace_exec_locks.as_ref() {
-                Some(locks.acquire(workspace_id).await)
-            } else {
-                None
-            };
             let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
@@ -387,7 +472,11 @@ impl TaskService {
             }
             Some(
                 self.prepare_work_unit_workspace_lease(
-                    &task, &work_unit, &workspace, &input, actor,
+                    &admitted_task,
+                    &work_unit,
+                    &workspace,
+                    &input,
+                    actor,
                 )
                 .await?,
             )
@@ -400,21 +489,77 @@ impl TaskService {
             None
         };
 
+        let should_publish_unblocked = lifecycle_plan
+            .as_ref()
+            .and_then(|plan| plan.clear_blocking_metadata.as_ref())
+            .is_some()
+            && task.blocked_json.is_some();
+        let previous_unblock_reason = task
+            .blocked_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|metadata| {
+                metadata
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
         let event = execution_domain_event(&input, "execution.started");
-        let write = db::WorkUnitExecutionRepo::create_for_work_unit_with_artifact_inputs(
-            &*self.db,
-            db::CreateWorkUnitExecution {
-                execution: input,
-                work_unit_id: work_unit.id,
-                work_unit_version: expected_work_unit_version,
-                workspace_lease,
-            },
-            artifact_input_ids,
-            event,
-        )
-        .await?;
-        self.publish_committed_domain_event(&write.event);
-        Ok(write.record)
+        let admission = db::CreateWorkUnitExecution {
+            execution: input,
+            work_unit_id: work_unit.id,
+            work_unit_version: expected_work_unit_version,
+            workspace_lease,
+        };
+        let (execution, task, idempotent_replay) = if let Some(plan) = lifecycle_plan {
+            let write = db::WorkUnitExecutionRepo::admit_with_lifecycle_and_artifact_inputs(
+                &*self.db,
+                db::AdmitWorkUnitExecutionWithLifecycle {
+                    admission,
+                    expected_task_version: plan.expected_task_version,
+                    expected_lifecycle_state: plan.lifecycle.state,
+                    expected_lifecycle_version: plan.lifecycle.version,
+                    lifecycle_transitions: plan.transitions,
+                    clear_blocking_metadata: plan.clear_blocking_metadata,
+                    follow_up_receipt: plan.follow_up_receipt,
+                },
+                artifact_input_ids,
+                event,
+            )
+            .await?;
+            for lifecycle_event in &write.lifecycle_events {
+                self.publish_committed_domain_event(lifecycle_event);
+            }
+            if let Some(event) = write.execution_event.as_ref() {
+                self.publish_committed_domain_event(event);
+            }
+            let task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+            (write.execution, task, write.idempotent_replay)
+        } else {
+            let write = db::WorkUnitExecutionRepo::create_for_work_unit_with_artifact_inputs(
+                &*self.db,
+                admission,
+                artifact_input_ids,
+                event,
+            )
+            .await?;
+            self.publish_committed_domain_event(&write.event);
+            (write.record, task, false)
+        };
+        if should_publish_unblocked && !idempotent_replay {
+            self.publish(ForgeEvent {
+                event_type: "task.unblocked".to_owned(),
+                entity_id: task.id.clone(),
+                timestamp: event_timestamp(),
+                context: EventContext::TaskUnblocked {
+                    project_id: task.project_id.clone(),
+                    previous_reason: previous_unblock_reason,
+                },
+            });
+        }
+        Ok((task, execution, idempotent_replay))
     }
 
     /// Recovery admission changes the blocked Task to Active and creates its
@@ -494,17 +639,22 @@ impl TaskService {
         })?;
         let mut admitted_task = task.clone();
         admitted_task.version = admitted_task_version;
+        let _workspace_guard = match (
+            self.workspace_exec_locks.as_ref(),
+            work_unit
+                .requires_integration
+                .then(|| input.workspace_id.as_deref())
+                .flatten(),
+        ) {
+            (Some(locks), Some(workspace_id)) => Some(locks.acquire(workspace_id).await),
+            _ => None,
+        };
         let workspace_lease = if work_unit.requires_integration {
             let workspace_id = input.workspace_id.as_deref().ok_or_else(|| {
                 ServiceError::invalid_operation(
                     "repository recovery requires the exact WorkUnit Workspace",
                 )
             })?;
-            let _workspace_guard = if let Some(locks) = self.workspace_exec_locks.as_ref() {
-                Some(locks.acquire(workspace_id).await)
-            } else {
-                None
-            };
             let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;

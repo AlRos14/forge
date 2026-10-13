@@ -554,6 +554,18 @@ pub trait WorkUnitExecutionRepo: Send + Sync {
         artifact_input_ids: Vec<String>,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<Execution>>;
+    /// Atomically apply the bounded lifecycle receipt(s), optional recovery
+    /// annotation cleanup, and ordinary WorkUnit Execution admission.
+    async fn admit_with_lifecycle_and_artifact_inputs(
+        &self,
+        input: AdmitWorkUnitExecutionWithLifecycle,
+        artifact_input_ids: Vec<String>,
+        execution_event: CreateDomainEvent,
+    ) -> Result<WorkUnitExecutionLifecycleWrite>;
+    async fn get_follow_up_execution_receipt(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<FollowUpExecutionReceipt>>;
     /// Atomically clear a blocked Task's recovery projection, transition its
     /// canonical lifecycle to Active, and admit the exact follow-up Execution.
     /// A rejected admission leaves the previous recovery annotation intact.
@@ -1736,6 +1748,51 @@ pub struct RecoverWorkUnitExecution {
     pub expected_error_annotation: Option<String>,
     pub expected_blocked_json: Option<String>,
     pub expected_metadata_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearTaskBlockingMetadata {
+    pub expected_error_annotation: Option<String>,
+    pub expected_blocked_json: Option<String>,
+    pub expected_metadata_json: Option<String>,
+    pub replacement_metadata_json: Option<String>,
+}
+
+/// A bounded ordinary WorkUnit admission that may activate its Task in the
+/// same commit as the Execution. Lifecycle transitions are supplied as
+/// receipt-bearing PR9 transitions; this is not a second transition engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmitWorkUnitExecutionWithLifecycle {
+    pub admission: CreateWorkUnitExecution,
+    pub expected_task_version: i64,
+    pub expected_lifecycle_state: TaskLifecycleState,
+    pub expected_lifecycle_version: i64,
+    pub lifecycle_transitions: Vec<TransitionTaskLifecycle>,
+    pub clear_blocking_metadata: Option<ClearTaskBlockingMetadata>,
+    pub follow_up_receipt: Option<CreateFollowUpExecutionReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateFollowUpExecutionReceipt {
+    pub idempotency_key: String,
+    pub parent_execution_id: String,
+    pub request_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowUpExecutionReceipt {
+    pub idempotency_key: String,
+    pub parent_execution_id: String,
+    pub request_digest: String,
+    pub execution_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkUnitExecutionLifecycleWrite {
+    pub execution: Execution,
+    pub lifecycle_events: Vec<DomainEvent>,
+    pub execution_event: Option<DomainEvent>,
+    pub idempotent_replay: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

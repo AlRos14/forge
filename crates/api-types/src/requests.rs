@@ -80,6 +80,7 @@ pub type ExecutionOverridesRequest = ClaimOverrides;
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 #[ts(export)]
 pub struct FollowUpRequest {
+    pub idempotency_key: String,
     pub message: String,
     pub agent_id: String,
     #[ts(optional = nullable)]
@@ -257,4 +258,27 @@ pub struct UpdatePrProviderConfigRequest {
     #[ts(type = "string | null")]
     #[ts(optional)]
     pub token: Option<Option<String>>,
+}
+
+#[cfg(test)]
+mod follow_up_request_tests {
+    use super::FollowUpRequest;
+
+    #[test]
+    fn follow_up_requires_a_stable_idempotency_key() {
+        let missing_key = serde_json::json!({
+            "message": "continue",
+            "agent_id": "agent-1"
+        });
+        assert!(serde_json::from_value::<FollowUpRequest>(missing_key).is_err());
+
+        let with_key = serde_json::json!({
+            "idempotency_key": "follow-up-request-1",
+            "message": "continue",
+            "agent_id": "agent-1"
+        });
+        let request = serde_json::from_value::<FollowUpRequest>(with_key)
+            .expect("follow-up request with its operation key deserializes");
+        assert_eq!(request.idempotency_key, "follow-up-request-1");
+    }
 }

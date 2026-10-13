@@ -1,5 +1,6 @@
 use super::*;
 use db::{WorkUnitRepo, WorkspaceRepo};
+use sha2::Digest as _;
 
 impl TaskService {
     /// Prepare a target Execution from one explicitly assigned WorkUnit.
@@ -84,18 +85,24 @@ impl TaskService {
             }
             None
         };
-        let _workspace_guard = match workspace.as_ref() {
-            Some(workspace) => {
-                if let Some(locks) = self.workspace_exec_locks.as_ref() {
-                    Some(locks.acquire(&workspace.id).await)
-                } else {
-                    None
-                }
-            }
-            None => None,
-        };
         self.ensure_task_runnable(&task).await?;
-        let task = self.activate_task_for_execution(task).await?;
+        let lifecycle_service = crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        );
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        let lifecycle_transitions = lifecycle_service
+            .plan_execution_activation(&task, &lifecycle)
+            .await?;
+        let lifecycle_plan = super::WorkUnitAdmissionLifecyclePlan {
+            expected_task_version: task.version,
+            lifecycle,
+            transitions: lifecycle_transitions,
+            clear_blocking_metadata: None,
+            follow_up_receipt: None,
+        };
         let executor_config_snapshot_json = build_executor_config_snapshot(
             &self.db,
             &task,
@@ -105,8 +112,8 @@ impl TaskService {
         )
         .await?;
         let now = now_rfc3339();
-        let execution = self
-            .create_running_work_unit_execution_with_artifact_inputs(
+        let (task, execution, _) = self
+            .admit_running_work_unit_execution_with_artifact_inputs(
                 work_unit_id,
                 expected_work_unit_version,
                 CreateExecution {
@@ -138,6 +145,7 @@ impl TaskService {
                     updated_at: now,
                 },
                 input_artifact_ids,
+                lifecycle_plan,
             )
             .await?;
         self.publish(ForgeEvent {
@@ -154,6 +162,7 @@ impl TaskService {
             task,
             execution,
             workspace,
+            idempotent_replay: false,
         })
     }
 
@@ -225,9 +234,72 @@ impl TaskService {
         message: String,
         agent_id: Option<String>,
         overrides: Option<ExecutionOverrides>,
+        idempotency_key: String,
     ) -> Result<LaunchExecutionResult> {
         let parent_execution_id = parent_execution_id.into();
         validate_required("parent_execution_id", &parent_execution_id)?;
+        validate_required("idempotency_key", &idempotency_key)?;
+        if idempotency_key.len() > 256 {
+            return Err(ServiceError::invalid_operation(
+                "follow-up idempotency key must be at most 256 bytes",
+            ));
+        }
+        let request_bytes = serde_json::to_vec(&(
+            parent_execution_id.as_str(),
+            message.as_str(),
+            agent_id.as_deref(),
+            overrides.as_ref(),
+        ))
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "failed to encode follow-up request identity: {error}"
+            ))
+        })?;
+        let request_digest = hex::encode(sha2::Sha256::digest(request_bytes));
+        if let Some(receipt) =
+            db::WorkUnitExecutionRepo::get_follow_up_execution_receipt(&*self.db, &idempotency_key)
+                .await?
+        {
+            if receipt.parent_execution_id != parent_execution_id
+                || receipt.request_digest != request_digest
+            {
+                return Err(db::DbError::IdempotencyConflict.into());
+            }
+            let parent = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
+                .await?
+                .ok_or_else(|| {
+                    db::DbError::Check("follow-up receipt parent Execution is missing".to_owned())
+                })?;
+            let execution = ExecutionRepo::get_by_id(&*self.db, &receipt.execution_id)
+                .await?
+                .filter(|execution| {
+                    execution.parent_execution_id.as_deref() == Some(parent_execution_id.as_str())
+                        && execution.task_id == parent.task_id
+                })
+                .ok_or_else(|| {
+                    db::DbError::Check(
+                        "follow-up receipt does not resolve to its exact child Execution"
+                            .to_owned(),
+                    )
+                })?;
+            let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+            let workspace = match execution.workspace_id.as_deref() {
+                Some(workspace_id) => Some(
+                    WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("workspace", workspace_id))?,
+                ),
+                None => None,
+            };
+            return Ok(LaunchExecutionResult {
+                task,
+                execution,
+                workspace,
+                idempotent_replay: true,
+            });
+        }
         let parent_execution = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", parent_execution_id.clone()))?;
@@ -286,18 +358,17 @@ impl TaskService {
             ),
             None => None,
         };
-        let _workspace_guard = match workspace.as_ref() {
-            Some(workspace) => {
-                if let Some(locks) = self.workspace_exec_locks.as_ref() {
-                    Some(locks.acquire(&workspace.id).await)
-                } else {
-                    None
-                }
-            }
-            None => None,
-        };
         self.ensure_task_runnable(&task).await?;
-        let task = self.activate_task_for_execution(task).await?;
+        let lifecycle_service = crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        );
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        let lifecycle_transitions = lifecycle_service
+            .plan_execution_activation(&task, &lifecycle)
+            .await?;
         let parent_actor_matches = matches!(
             parent_execution.actor_ref(),
             Some(db::ActorRef::Agent(ref parent_agent_id)) if parent_agent_id == &resolved_agent_id
@@ -354,12 +425,25 @@ impl TaskService {
         let artifact_input_ids = self
             .inherit_plan_artifact_inputs(&parent_execution.id, &task.id)
             .await?;
-        if task.error_annotation.is_some() {
-            self.clear_blocking_metadata(&task.id).await?;
-        }
+        let clear_blocking_metadata = task
+            .error_annotation
+            .is_some()
+            .then(|| blocking_metadata_cleanup_plan(&task))
+            .transpose()?;
+        let lifecycle_plan = super::WorkUnitAdmissionLifecyclePlan {
+            expected_task_version: task.version,
+            lifecycle,
+            transitions: lifecycle_transitions,
+            clear_blocking_metadata,
+            follow_up_receipt: Some(db::CreateFollowUpExecutionReceipt {
+                idempotency_key,
+                parent_execution_id: parent_execution_id.clone(),
+                request_digest,
+            }),
+        };
         let now = now_rfc3339();
-        let execution = self
-            .create_running_work_unit_execution_with_artifact_inputs(
+        let (task, execution, idempotent_replay) = self
+            .admit_running_work_unit_execution_with_artifact_inputs(
                 work_unit_id,
                 work_unit.version,
                 CreateExecution {
@@ -403,33 +487,37 @@ impl TaskService {
                     updated_at: now,
                 },
                 artifact_input_ids,
+                lifecycle_plan,
             )
             .await?;
 
-        tracing::info!(
+        if !idempotent_replay {
+            tracing::info!(
             task_id = %task.id,
             agent_id = %resolved_agent_id,
             execution_id = %execution.id,
             parent_execution_id = %parent_execution.id,
             role = %work_unit.role,
-            "follow-up execution launched"
-        );
+                "follow-up execution launched"
+            );
 
-        self.publish(ForgeEvent {
-            event_type: "task.execution_launched".to_owned(),
-            entity_id: task.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskAssigned {
-                project_id: task.project_id.clone(),
-                agent_id: resolved_agent_id,
-                execution_id: execution.id.clone(),
-            },
-        });
+            self.publish(ForgeEvent {
+                event_type: "task.execution_launched".to_owned(),
+                entity_id: task.id.clone(),
+                timestamp: event_timestamp(),
+                context: EventContext::TaskAssigned {
+                    project_id: task.project_id.clone(),
+                    agent_id: resolved_agent_id,
+                    execution_id: execution.id.clone(),
+                },
+            });
+        }
 
         Ok(LaunchExecutionResult {
             task,
             execution,
             workspace,
+            idempotent_replay,
         })
     }
 
@@ -522,16 +610,6 @@ impl TaskService {
             ),
             None => None,
         };
-        let _workspace_guard = match workspace.as_ref() {
-            Some(workspace) => {
-                if let Some(locks) = self.workspace_exec_locks.as_ref() {
-                    Some(locks.acquire(&workspace.id).await)
-                } else {
-                    None
-                }
-            }
-            None => None,
-        };
         self.ensure_task_runnable(&task).await?;
         let recovery_lifecycle = if clear_recovery_metadata {
             let annotation = self.recovery_annotation(&task)?;
@@ -556,10 +634,26 @@ impl TaskService {
         } else {
             None
         };
-        let task = if recovery_lifecycle.is_none() {
-            self.activate_task_for_execution(task).await?
+        let ordinary_lifecycle_plan = if recovery_lifecycle.is_none() {
+            let lifecycle_service = crate::task_lifecycle::TaskLifecycleService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            );
+            let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+            let lifecycle_transitions = lifecycle_service
+                .plan_execution_activation(&task, &lifecycle)
+                .await?;
+            Some(super::WorkUnitAdmissionLifecyclePlan {
+                expected_task_version: task.version,
+                lifecycle,
+                transitions: lifecycle_transitions,
+                clear_blocking_metadata: None,
+                follow_up_receipt: None,
+            })
         } else {
-            task
+            None
         };
         let executor_config_snapshot_json = build_executor_config_snapshot(
             &self.db,
@@ -616,28 +710,30 @@ impl TaskService {
             created_at: now.clone(),
             updated_at: now,
         };
-        let (task, execution) = if let Some(lifecycle) = recovery_lifecycle.as_ref() {
-            self.admit_recovery_work_unit_execution_with_artifact_inputs(
-                &task,
-                lifecycle,
-                &parent_execution.id,
-                work_unit_id,
-                work_unit.version,
-                execution_input,
-                artifact_input_ids,
-            )
-            .await?
-        } else {
-            let execution = self
-                .create_running_work_unit_execution_with_artifact_inputs(
+        let (task, execution, idempotent_replay) =
+            if let Some(lifecycle) = recovery_lifecycle.as_ref() {
+                let (task, execution) = self
+                    .admit_recovery_work_unit_execution_with_artifact_inputs(
+                        &task,
+                        lifecycle,
+                        &parent_execution.id,
+                        work_unit_id,
+                        work_unit.version,
+                        execution_input,
+                        artifact_input_ids,
+                    )
+                    .await?;
+                (task, execution, false)
+            } else {
+                self.admit_running_work_unit_execution_with_artifact_inputs(
                     work_unit_id,
                     work_unit.version,
                     execution_input,
                     artifact_input_ids,
+                    ordinary_lifecycle_plan.expect("ordinary re-execution plan was prepared"),
                 )
-                .await?;
-            (task, execution)
-        };
+                .await?
+            };
 
         tracing::info!(
             task_id = %task.id,
@@ -647,20 +743,23 @@ impl TaskService {
             role = %execution.role,
             "re-execute execution launched"
         );
-        self.publish(ForgeEvent {
-            event_type: "task.execution_launched".to_owned(),
-            entity_id: task.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskAssigned {
-                project_id: task.project_id.clone(),
-                agent_id,
-                execution_id: execution.id.clone(),
-            },
-        });
+        if !idempotent_replay {
+            self.publish(ForgeEvent {
+                event_type: "task.execution_launched".to_owned(),
+                entity_id: task.id.clone(),
+                timestamp: event_timestamp(),
+                context: EventContext::TaskAssigned {
+                    project_id: task.project_id.clone(),
+                    agent_id,
+                    execution_id: execution.id.clone(),
+                },
+            });
+        }
         Ok(LaunchExecutionResult {
             task,
             execution,
             workspace,
+            idempotent_replay,
         })
     }
 
@@ -795,69 +894,17 @@ impl TaskService {
     }
 }
 
-impl TaskService {
-    pub(super) async fn activate_task_for_execution(&self, mut task: Task) -> Result<Task> {
-        let lifecycle = crate::task_lifecycle::TaskLifecycleService::new(
-            Arc::clone(&self.db),
-            Arc::clone(&self.event_bus),
-        );
-        let mut current = lifecycle
-            .get(&task.id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
-
-        // A backlog Task must first cross the explicit backlog -> ready edge.
-        // If execution startup crashes between edges, replay resumes from the
-        // durable aggregate state.
-        if current.state == db::TaskLifecycleState::Backlog {
-            task = lifecycle
-                .transition(crate::task_lifecycle::TransitionLifecycleInput {
-                    task_id: task.id.clone(),
-                    expected_task_version: task.version,
-                    to_state: db::TaskLifecycleState::Ready,
-                    cause: crate::task_lifecycle::LifecycleCause::System(
-                        api_types::SystemComponent::Executor,
-                    ),
-                    reason_kind: Some("execution_start".to_owned()),
-                    reason_ref: Some(format!("task:{}:backlog-to-ready", task.id)),
-                    idempotency_key: format!("execution-start:{}:backlog", task.id),
-                })
-                .await?
-                .task;
-            current = lifecycle
-                .get(&task.id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
-        }
-
-        if current.state == db::TaskLifecycleState::Active {
-            return Ok(task);
-        }
-        if !matches!(
-            current.state,
-            db::TaskLifecycleState::Ready
-                | db::TaskLifecycleState::Blocked
-                | db::TaskLifecycleState::ReadyToMerge
-        ) {
-            return Err(ServiceError::invalid_operation(format!(
-                "cannot launch an Execution for Task lifecycle {}",
-                current.state
-            )));
-        }
-
-        Ok(lifecycle
-            .transition(crate::task_lifecycle::TransitionLifecycleInput {
-                task_id: task.id.clone(),
-                expected_task_version: task.version,
-                to_state: db::TaskLifecycleState::Active,
-                cause: crate::task_lifecycle::LifecycleCause::System(
-                    api_types::SystemComponent::Executor,
-                ),
-                reason_kind: Some("execution_start".to_owned()),
-                reason_ref: Some(format!("task:{}:active", task.id)),
-                idempotency_key: format!("execution-start:{}:active", task.id),
-            })
-            .await?
-            .task)
+fn blocking_metadata_cleanup_plan(task: &Task) -> Result<db::ClearTaskBlockingMetadata> {
+    let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
+    })?;
+    for key in ["execution_retry_count", "last_execution_failure_at"] {
+        metadata.extra.remove(key);
     }
+    Ok(db::ClearTaskBlockingMetadata {
+        expected_error_annotation: task.error_annotation.clone(),
+        expected_blocked_json: task.blocked_json.clone(),
+        expected_metadata_json: task.metadata_json.clone(),
+        replacement_metadata_json: metadata.to_json(),
+    })
 }

@@ -244,12 +244,20 @@ pub async fn follow_up_execution(
     });
     let launched = state
         .task_service
-        .follow_up_execution(id, request.message, Some(request.agent_id), overrides)
+        .follow_up_execution(
+            id,
+            request.message,
+            Some(request.agent_id),
+            overrides,
+            request.idempotency_key,
+        )
         .await
         .map_err(map_follow_up_error)?;
 
     let execution_id = launched.execution.id.clone();
-    state.task_service.start_execution(execution_id).await?;
+    if !launched.idempotent_replay {
+        state.task_service.start_execution(execution_id).await?;
+    }
     Ok(Json(
         execution_response_with_usage(&state.db, launched.execution).await?,
     ))

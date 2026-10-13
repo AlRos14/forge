@@ -627,6 +627,7 @@ pub(super) async fn forge_follow_up_execution(
         .as_object()
         .ok_or_else(|| McpToolError::new(-32602, "params must be an object"))?;
     let execution_id = required_string_param(params, "execution_id")?;
+    let idempotency_key = required_string_param(params, "idempotency_key")?;
     let message = required_string_param(params, "message")?;
     let agent_id = required_string_param(params, "agent_id")?;
     let overrides = optional_overrides_param(params, "overrides")?;
@@ -639,7 +640,13 @@ pub(super) async fn forge_follow_up_execution(
 
     let launched = state
         .task_service
-        .follow_up_execution(execution_id, message, Some(agent_id), overrides)
+        .follow_up_execution(
+            execution_id,
+            message,
+            Some(agent_id),
+            overrides,
+            idempotency_key,
+        )
         .await?;
     let task = task_public_value(state, launched.task).await?;
 

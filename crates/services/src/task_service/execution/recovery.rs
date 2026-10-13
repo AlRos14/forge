@@ -583,8 +583,11 @@ impl TaskService {
     }
 
     async fn recover_cancel_task(&self, task: Task, _reason: Option<String>) -> Result<Task> {
-        self.clear_blocking_metadata(&task.id).await?;
-        self.cancel_task(task.id).await
+        // Admit cancellation before removing its recovery evidence. If the
+        // lifecycle CAS or cancellation policy rejects the request, retain the
+        // annotation so the Task remains recoverable.
+        let cancelled = self.cancel_task(task.id).await?;
+        self.clear_blocking_metadata(&cancelled.id).await
     }
 }
 

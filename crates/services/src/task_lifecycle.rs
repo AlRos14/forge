@@ -7,7 +7,7 @@ use db::{
     new_uuid_v4, now_rfc3339, CreateDomainEvent, DomainEventRepo, ExecutionRepo,
     GateEvaluationOutcome, GateRepo, SqliteDb, Task, TaskIntegrationOperationRepo, TaskLifecycle,
     TaskLifecycleRepo, TaskLifecycleState, TaskLifecycleTransitionWrite, TaskRepo,
-    TransitionTaskLifecycle, ValidationRunRepo, WorkUnitRepo,
+    ValidationRunRepo, WorkUnitRepo,
 };
 use events::EventBus;
 use serde_json::json;
@@ -57,6 +57,91 @@ impl TaskLifecycleService {
 
     pub async fn get(&self, task_id: &str) -> Result<Option<TaskLifecycle>> {
         Ok(TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id).await?)
+    }
+
+    /// Build the exact PR9 lifecycle receipts required by a WorkUnit Execution
+    /// admission. The caller commits these through WorkUnitExecutionRepo in
+    /// the same transaction as the Execution and its authority records.
+    pub(crate) async fn plan_execution_activation(
+        &self,
+        task: &Task,
+        lifecycle: &db::TaskLifecycle,
+    ) -> Result<Vec<db::TransitionTaskLifecycle>> {
+        if lifecycle.task_id != task.id {
+            return Err(ServiceError::invalid_operation(
+                "TaskLifecycle activation plan belongs to another Task",
+            ));
+        }
+        if crate::task_failure_retry::TaskFailureRetryService::has_exhausted_retry_budget(
+            &self.db, &task.id,
+        )
+        .await?
+        {
+            return Err(ServiceError::invalid_operation(
+                "Task retry budget is exhausted; runnable lifecycle states are fenced",
+            ));
+        }
+
+        let edges = match lifecycle.state {
+            TaskLifecycleState::Backlog => {
+                let ready_version = lifecycle.version.checked_add(1).ok_or_else(|| {
+                    ServiceError::invalid_operation("TaskLifecycle version cannot be incremented")
+                })?;
+                vec![
+                    (
+                        TaskLifecycleState::Ready,
+                        format!("task:{}:backlog-to-ready", task.id),
+                        format!("execution-start:{}:backlog:{}", task.id, lifecycle.version),
+                    ),
+                    (
+                        TaskLifecycleState::Active,
+                        format!("task:{}:active", task.id),
+                        format!("execution-start:{}:active:{}", task.id, ready_version),
+                    ),
+                ]
+            }
+            TaskLifecycleState::Ready | TaskLifecycleState::Blocked => vec![(
+                TaskLifecycleState::Active,
+                format!("task:{}:active", task.id),
+                format!("execution-start:{}:active:{}", task.id, lifecycle.version),
+            )],
+            TaskLifecycleState::Active => return Ok(Vec::new()),
+            state => {
+                return Err(ServiceError::invalid_operation(format!(
+                    "cannot launch an Execution for Task lifecycle {state}"
+                )));
+            }
+        };
+
+        let mut planned = Vec::with_capacity(edges.len());
+        let mut state = lifecycle.state;
+        let mut lifecycle_version = lifecycle.version;
+        let mut task_version = task.version;
+        for (to_state, reason_ref, idempotency_key) in edges {
+            if !allowed_transition(state, to_state) {
+                return Err(ServiceError::Db(db::DbError::InvalidTransition));
+            }
+            let transition = build_lifecycle_transition_record(
+                &task.id,
+                task_version,
+                lifecycle_version,
+                state,
+                to_state,
+                lifecycle_cause(LifecycleCause::System(api_types::SystemComponent::Executor)),
+                Some("execution_start".to_owned()),
+                Some(reason_ref),
+                idempotency_key,
+            );
+            task_version = task_version.checked_add(1).ok_or_else(|| {
+                ServiceError::invalid_operation("Task version cannot be incremented")
+            })?;
+            lifecycle_version = lifecycle_version.checked_add(1).ok_or_else(|| {
+                ServiceError::invalid_operation("TaskLifecycle version cannot be incremented")
+            })?;
+            state = to_state;
+            planned.push(transition);
+        }
+        Ok(planned)
     }
 
     pub async fn block(
@@ -266,60 +351,18 @@ impl TaskLifecycleService {
             ));
         }
 
-        let now = now_rfc3339();
-        let transition_id = new_uuid_v4();
-        let event_id = new_uuid_v4();
-        let event = CreateDomainEvent {
-            id: event_id,
-            event_type: "task.lifecycle_changed".to_owned(),
-            entity_type: "task".to_owned(),
-            entity_id: task.id.clone(),
-            actor_type: cause.actor_type.clone(),
-            actor_id: cause.actor_id.clone(),
-            scope_type: "task".to_owned(),
-            scope_id: task.id.clone(),
-            correlation_id: input.idempotency_key.clone(),
-            causation_id: cause.cause_ref.clone(),
-            causation_depth: 1,
-            dedupe_key: Some(format!(
-                "task-lifecycle:{}:{}",
-                task.id, input.idempotency_key
-            )),
-            payload_json: json!({
-                "task_id": task.id,
-                "from_state": lifecycle.state,
-                "to_state": input.to_state,
-                "from_version": lifecycle.version,
-                "to_version": lifecycle.version + 1,
-                "cause_kind": cause.kind,
-                "cause_ref": cause.cause_ref,
-                "gate_evaluation_id": cause.gate_evaluation_id,
-                "reason_kind": input.reason_kind,
-                "reason_ref": input.reason_ref,
-            })
-            .to_string(),
-            created_at: now.clone(),
-        };
-        let write = TaskLifecycleRepo::transition_task_lifecycle(
-            &*self.db,
-            TransitionTaskLifecycle {
-                id: transition_id,
-                task_id: task.id.clone(),
-                expected_task_version: input.expected_task_version,
-                expected_lifecycle_version: lifecycle.version,
-                expected_state: lifecycle.state,
-                to_state: input.to_state,
-                cause_kind: cause.kind,
-                cause_ref: cause.cause_ref,
-                reason_kind: input.reason_kind,
-                reason_ref: input.reason_ref,
-                gate_evaluation_id: cause.gate_evaluation_id,
-                idempotency_key: input.idempotency_key,
-                updated_at: now,
-                event,
-            },
-        )
-        .await?;
+        let transition = build_lifecycle_transition_record(
+            &task.id,
+            input.expected_task_version,
+            lifecycle.version,
+            lifecycle.state,
+            input.to_state,
+            cause,
+            input.reason_kind,
+            input.reason_ref,
+            input.idempotency_key,
+        );
+        let write = TaskLifecycleRepo::transition_task_lifecycle(&*self.db, transition).await?;
         if let Some(event) = write.event.as_ref() {
             DomainEventService::publish_committed_hint(&self.event_bus, event);
         }
@@ -426,6 +469,64 @@ struct CauseFields {
     actor_id: Option<String>,
 }
 
+fn build_lifecycle_transition_record(
+    task_id: &str,
+    expected_task_version: i64,
+    expected_lifecycle_version: i64,
+    expected_state: TaskLifecycleState,
+    to_state: TaskLifecycleState,
+    cause: CauseFields,
+    reason_kind: Option<String>,
+    reason_ref: Option<String>,
+    idempotency_key: String,
+) -> db::TransitionTaskLifecycle {
+    let now = now_rfc3339();
+    let event = CreateDomainEvent {
+        id: new_uuid_v4(),
+        event_type: "task.lifecycle_changed".to_owned(),
+        entity_type: "task".to_owned(),
+        entity_id: task_id.to_owned(),
+        actor_type: cause.actor_type.clone(),
+        actor_id: cause.actor_id.clone(),
+        scope_type: "task".to_owned(),
+        scope_id: task_id.to_owned(),
+        correlation_id: idempotency_key.clone(),
+        causation_id: cause.cause_ref.clone(),
+        causation_depth: 1,
+        dedupe_key: Some(format!("task-lifecycle:{task_id}:{idempotency_key}")),
+        payload_json: json!({
+            "task_id": task_id,
+            "from_state": expected_state,
+            "to_state": to_state,
+            "from_version": expected_lifecycle_version,
+            "to_version": expected_lifecycle_version + 1,
+            "cause_kind": cause.kind,
+            "cause_ref": cause.cause_ref,
+            "gate_evaluation_id": cause.gate_evaluation_id,
+            "reason_kind": reason_kind,
+            "reason_ref": reason_ref,
+        })
+        .to_string(),
+        created_at: now.clone(),
+    };
+    db::TransitionTaskLifecycle {
+        id: new_uuid_v4(),
+        task_id: task_id.to_owned(),
+        expected_task_version,
+        expected_lifecycle_version,
+        expected_state,
+        to_state,
+        cause_kind: cause.kind,
+        cause_ref: cause.cause_ref,
+        reason_kind,
+        reason_ref,
+        gate_evaluation_id: cause.gate_evaluation_id,
+        idempotency_key,
+        updated_at: now,
+        event,
+    }
+}
+
 fn lifecycle_cause(cause: LifecycleCause) -> CauseFields {
     match cause {
         LifecycleCause::Actor(actor) => match actor {
@@ -529,7 +630,9 @@ mod tests {
     use serde_json::Value;
     use sha2::Digest;
 
-    async fn seeded_ready_task() -> (Arc<SqliteDb>, Arc<EventBus>, Task) {
+    async fn seeded_task(
+        lifecycle_state: TaskLifecycleState,
+    ) -> (Arc<SqliteDb>, Arc<EventBus>, Task) {
         let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
             .expect("SQLite pool");
@@ -578,7 +681,7 @@ mod tests {
                 title: "Lifecycle target".to_owned(),
                 description: None,
                 task_type: "implementation".to_owned(),
-                lifecycle_state: db::TaskLifecycleState::Ready,
+                lifecycle_state,
                 is_automation: false,
                 priority: 0,
                 subtask_order: None,
@@ -590,6 +693,10 @@ mod tests {
         .await
         .expect("Task");
         (db, Arc::new(EventBus::new(16)), task)
+    }
+
+    async fn seeded_ready_task() -> (Arc<SqliteDb>, Arc<EventBus>, Task) {
+        seeded_task(TaskLifecycleState::Ready).await
     }
 
     #[test]
@@ -758,6 +865,195 @@ mod tests {
                 .await
                 .expect("lifecycle transition count");
         assert_eq!(transition_count, 1);
+        let lifecycle_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'task.lifecycle_changed' AND scope_id = ?",
+        )
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("lifecycle event count");
+        assert_eq!(lifecycle_event_count, 1);
+    }
+
+    #[tokio::test]
+    async fn execution_activation_receipts_are_version_scoped_and_replay_exactly() {
+        let (db, event_bus, task) = seeded_ready_task().await;
+        let service = TaskLifecycleService::new(Arc::clone(&db), Arc::clone(&event_bus));
+        let executor = || LifecycleCause::System(api_types::SystemComponent::Executor);
+        let transition_input = |planned: &db::TransitionTaskLifecycle| TransitionLifecycleInput {
+            task_id: planned.task_id.clone(),
+            expected_task_version: planned.expected_task_version,
+            to_state: planned.to_state,
+            cause: executor(),
+            reason_kind: planned.reason_kind.clone(),
+            reason_ref: planned.reason_ref.clone(),
+            idempotency_key: planned.idempotency_key.clone(),
+        };
+
+        let ready = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("Ready lifecycle loads")
+            .expect("Ready lifecycle exists");
+        let first_plan = service
+            .plan_execution_activation(&task, &ready)
+            .await
+            .expect("Ready activation plans");
+        assert_eq!(first_plan.len(), 1);
+        assert_eq!(
+            first_plan[0].idempotency_key,
+            format!("execution-start:{}:active:{}", task.id, ready.version)
+        );
+        let first = service
+            .transition(transition_input(&first_plan[0]))
+            .await
+            .expect("Ready transitions to Active");
+        let original_receipt = first.transition.expect("durable activation receipt");
+        assert!(!original_receipt.replayed);
+
+        // Replaying the same exact request after an uncertain response returns
+        // the original receipt and does not append a second DomainEvent.
+        let replay = service
+            .transition(transition_input(&first_plan[0]))
+            .await
+            .expect("same transition request replays");
+        let replay_receipt = replay.transition.expect("replayed receipt");
+        assert!(replay_receipt.replayed);
+        assert_eq!(replay_receipt.transition_id, original_receipt.transition_id);
+        assert!(replay_receipt.event.is_none());
+        assert_eq!(replay.task.version, task.version + 1);
+        assert_eq!(replay.lifecycle.state, TaskLifecycleState::Active);
+
+        for index in 0..2 {
+            let current_task = TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .expect("Task reload succeeds")
+                .expect("Task exists");
+            let active = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+                .await
+                .expect("Active lifecycle loads")
+                .expect("lifecycle exists");
+            assert_eq!(active.state, TaskLifecycleState::Active);
+            let blocked = service
+                .transition(TransitionLifecycleInput {
+                    task_id: task.id.clone(),
+                    expected_task_version: current_task.version,
+                    to_state: TaskLifecycleState::Blocked,
+                    cause: executor(),
+                    reason_kind: Some("test_block".to_owned()),
+                    reason_ref: Some(format!("activation-cycle:{index}")),
+                    idempotency_key: format!("activation-cycle:{index}:blocked"),
+                })
+                .await
+                .expect("Active leaves for Blocked");
+            assert_eq!(blocked.task.version, current_task.version + 1);
+            assert_eq!(blocked.lifecycle.version, active.version + 1);
+
+            let blocked_plan = service
+                .plan_execution_activation(&blocked.task, &blocked.lifecycle)
+                .await
+                .expect("Blocked activation plans");
+            assert_eq!(blocked_plan.len(), 1);
+            assert_eq!(
+                blocked_plan[0].idempotency_key,
+                format!(
+                    "execution-start:{}:active:{}",
+                    task.id, blocked.lifecycle.version
+                )
+            );
+            assert_ne!(
+                blocked_plan[0].idempotency_key, first_plan[0].idempotency_key,
+                "a later legal Active transition has a distinct receipt key"
+            );
+            let activated = service
+                .transition(transition_input(&blocked_plan[0]))
+                .await
+                .expect("Blocked transitions to Active");
+            assert_eq!(activated.task.version, blocked.task.version + 1);
+            assert_eq!(activated.lifecycle.version, blocked.lifecycle.version + 1);
+            assert_eq!(activated.lifecycle.state, TaskLifecycleState::Active);
+        }
+
+        let current_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("Task reload succeeds")
+            .expect("Task exists");
+        let current_lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("lifecycle reload succeeds")
+            .expect("lifecycle exists");
+        assert_eq!(current_task.version, task.version + 5);
+        assert_eq!(current_lifecycle.version, 6);
+        assert_eq!(current_lifecycle.state, TaskLifecycleState::Active);
+
+        // Reusing the old activation key for a different edge remains a hard
+        // conflict; it cannot authorize a new transition from the current state.
+        let mut changed_reuse = transition_input(&first_plan[0]);
+        changed_reuse.to_state = TaskLifecycleState::Blocked;
+        let conflict = service
+            .transition(changed_reuse)
+            .await
+            .expect_err("old receipt cannot authorize a different transition");
+        assert!(matches!(
+            conflict,
+            ServiceError::Db(db::DbError::IdempotencyConflict)
+        ));
+        let after_conflict = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("lifecycle reload succeeds")
+            .expect("lifecycle exists");
+        assert_eq!(after_conflict, current_lifecycle);
+        assert_eq!(
+            TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .expect("Task reload succeeds")
+                .expect("Task exists"),
+            current_task
+        );
+        let transition_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_lifecycle_transition WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("transition count loads");
+        let lifecycle_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'task.lifecycle_changed' AND scope_id = ?",
+        )
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("lifecycle event count loads");
+        assert_eq!(transition_count, 5);
+        assert_eq!(lifecycle_event_count, 5);
+    }
+
+    #[tokio::test]
+    async fn backlog_execution_activation_binds_both_keys_to_source_versions() {
+        let (db, event_bus, task) = seeded_task(TaskLifecycleState::Backlog).await;
+        let service = TaskLifecycleService::new(Arc::clone(&db), event_bus);
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("Backlog lifecycle loads")
+            .expect("lifecycle exists");
+        let plan = service
+            .plan_execution_activation(&task, &lifecycle)
+            .await
+            .expect("Backlog activation plans");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(
+            plan[0].idempotency_key,
+            format!("execution-start:{}:backlog:{}", task.id, lifecycle.version)
+        );
+        assert_eq!(
+            plan[1].idempotency_key,
+            format!(
+                "execution-start:{}:active:{}",
+                task.id,
+                lifecycle.version + 1
+            )
+        );
+        assert_ne!(plan[0].idempotency_key, plan[1].idempotency_key);
     }
 
     #[tokio::test]

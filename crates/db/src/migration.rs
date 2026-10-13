@@ -56,6 +56,8 @@ use std::{
 // removes their runtime table, and keeps detached V099 provenance ledgers;
 // V132 archives Main/Project Agent, Agent Chat, memory, Attention, Genesis, and
 // Project OS history before dropping those runtime tables and Project columns.
+// V133 records exact follow-up request identities atomically with their child
+// Execution so uncertain retries replay the same admitted child.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

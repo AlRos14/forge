@@ -762,6 +762,15 @@ fn tools_list_returns_descriptors() {
         assert!(tools
             .iter()
             .any(|tool| tool.get("name").is_some() && tool.get("inputSchema").is_some()));
+        let follow_up = tools
+            .iter()
+            .find(|tool| tool["name"] == "forge_follow_up_execution")
+            .expect("follow-up tool descriptor exists");
+        assert!(follow_up["inputSchema"]["required"]
+            .as_array()
+            .expect("follow-up required params are an array")
+            .iter()
+            .any(|required| required == "idempotency_key"));
     });
 }
 
@@ -1401,6 +1410,7 @@ fn scoped_mcp_rejects_execution_id_tool_for_other_project() {
                 "name": "forge_follow_up_execution",
                 "arguments": {
                     "execution_id": execution_id,
+                    "idempotency_key": "cross-project-follow-up",
                     "message": "continue"
                 }
             }),
@@ -1671,6 +1681,7 @@ fn user_scoped_mcp_isolates_projects_and_derived_resources() {
             "forge_follow_up_execution",
             json!({
                 "execution_id": execution_a,
+                "idempotency_key": "wrong-agent-follow-up",
                 "message": "continue",
                 "agent_id": agent_b
             }),

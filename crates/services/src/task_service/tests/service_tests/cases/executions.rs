@@ -3091,51 +3091,27 @@ async fn follow_up_execution_reuses_explicit_harness_session() {
     let agent_id = seed_agent_with_executor_type(&db, "claude_code", "{}").await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let message = "Please continue with the remaining edge cases".to_owned();
-    let now = now_rfc3339();
-    let parent_execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id.clone()),
-            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(db::ExecutionPurpose::Implement),
-            harness_session_id: None,
-            role: "executor".to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("parent execution".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"claude_code","config":{},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
+    let parent_execution = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Completed,
+        Some("test-session"),
+        Some(
+            r#"{"executor_type":"claude_code","config":{},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
+        ),
     )
-    .await
-    .expect("parent execution creates");
-    let parent_execution = ExecutionRepo::record_harness_session_result(
-        &*db,
-        &parent_execution.id,
-        "test-session",
-        &now_rfc3339(),
-    )
-    .await
-    .expect("parent harness session activates");
+    .await;
 
     let result = service
-        .follow_up_execution(parent_execution.id.clone(), message.clone(), None, None)
+        .follow_up_execution(
+            parent_execution.id.clone(),
+            message.clone(),
+            None,
+            None,
+            "follow-up-session-reuse".to_owned(),
+        )
         .await
         .expect("follow-up succeeds");
 
@@ -3144,7 +3120,7 @@ async fn follow_up_execution_reuses_explicit_harness_session() {
         Some(parent_execution.id.as_str())
     );
     assert_eq!(result.execution.summary.as_deref(), Some(message.as_str()));
-    assert_eq!(result.execution.role, "interactive".to_owned());
+    assert_eq!(result.execution.role, "implementer".to_owned());
     assert_eq!(
         result.execution.harness_session_id,
         parent_execution.harness_session_id
@@ -3221,11 +3197,14 @@ async fn follow_up_without_exact_work_unit_fails_closed() {
             "continue without an exact WorkUnit".to_owned(),
             Some(agent_id),
             None,
+            "follow-up-no-work-unit".to_owned(),
         )
         .await
         .err()
         .expect("Task and session identity cannot supply a missing WorkUnit target");
-    assert!(error.to_string().contains("exact WorkUnit and Workspace"));
+    assert!(error
+        .to_string()
+        .contains("exact open WorkUnit and Workspace"));
 
     let execution_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
@@ -3240,91 +3219,52 @@ async fn follow_up_without_exact_work_unit_fails_closed() {
 }
 
 #[tokio::test]
-async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
+async fn follow_up_uses_its_exact_work_unit_while_a_sibling_work_unit_runs() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent_with_executor_type(&db, "claude_code", "{}").await;
+    let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
-    let now = now_rfc3339();
-    let parent = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id.clone()),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: "coder".to_owned(),
-            status: ExecutionStatus::Failed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: Some("failed".to_owned()),
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"claude_code","config":{}}"#.to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
+    let parent = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Failed,
+        None,
+        None,
     )
-    .await
-    .expect("failed parent creates");
-    let running = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: "coder".to_owned(),
-            status: ExecutionStatus::Running,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"claude_code","config":{}}"#.to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("running execution creates");
-
+    .await;
+    let sibling_agent_id = seed_agent_with_executor_type(&db, "shell", "{}").await;
+    let sibling_work_unit =
+        create_simple_execution_work_unit(&db, &service, &task, &sibling_agent_id).await;
+    let sibling = service
+        .launch_work_unit_execution(
+            &sibling_work_unit.id,
+            sibling_work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "Sibling WorkUnit remains in progress".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("sibling WorkUnit launches independently");
     let result = service
-        .follow_up_execution(parent.id, "continue".to_owned(), None, None)
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(ServiceError::InvalidOperation { message })
-            if message.contains("repository execution already running")
-                && message.contains(&running.id)
-    ));
+        .follow_up_execution(
+            parent.id.clone(),
+            "continue".to_owned(),
+            None,
+            None,
+            "follow-up-running-parent".to_owned(),
+        )
+        .await
+        .expect("follow-up admits against its exact parent WorkUnit");
+    assert_eq!(
+        result.execution.parent_execution_id.as_deref(),
+        Some(parent.id.as_str())
+    );
+    assert_eq!(result.execution.work_unit_id, parent.work_unit_id);
     let executions = ExecutionRepo::list_by_task(
         &*db,
         &task.id,
@@ -3338,13 +3278,11 @@ async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
     )
     .await
     .expect("executions list");
-    assert_eq!(executions.items.len(), 2);
-    let unchanged = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(unchanged.version, task.version);
-    assert!(unchanged.error_annotation.is_none());
+    assert_eq!(executions.items.len(), 3);
+    assert!(executions
+        .items
+        .iter()
+        .any(|execution| execution.id == sibling.execution.id));
 }
 
 #[tokio::test]
@@ -3356,52 +3294,27 @@ async fn follow_up_execution_codex_resumes_explicit_harness_session() {
     let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let message = "Please continue with the remaining edge cases".to_owned();
-    let now = now_rfc3339();
-    let parent_execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id.clone()),
-            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(db::ExecutionPurpose::Implement),
-            harness_session_id: None,
-            role: "executor".to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("parent execution".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"codex","config":{"resume_fallback_prompt":"do not send this full prompt"},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#
-                    .to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
+    let parent_execution = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Completed,
+        Some("codex-thread"),
+        Some(
+            r#"{"executor_type":"codex","config":{"resume_fallback_prompt":"do not send this full prompt"},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
+        ),
     )
-    .await
-    .expect("parent execution creates");
-    let parent_execution = ExecutionRepo::record_harness_session_result(
-        &*db,
-        &parent_execution.id,
-        "codex-thread",
-        &now_rfc3339(),
-    )
-    .await
-    .expect("parent harness session activates");
+    .await;
 
     let result = service
-        .follow_up_execution(parent_execution.id.clone(), message.clone(), None, None)
+        .follow_up_execution(
+            parent_execution.id.clone(),
+            message.clone(),
+            None,
+            None,
+            "follow-up-codex-session".to_owned(),
+        )
         .await
         .expect("follow-up succeeds");
 
@@ -3482,7 +3395,13 @@ async fn follow_up_execution_rejects_running_parent() {
     .await
     .expect("parent execution creates");
     let result = service
-        .follow_up_execution(parent_execution.id, "continue".to_owned(), None, None)
+        .follow_up_execution(
+            parent_execution.id,
+            "continue".to_owned(),
+            None,
+            None,
+            "follow-up-running-parent-reject".to_owned(),
+        )
         .await;
 
     assert!(result.is_err());
@@ -3496,51 +3415,27 @@ async fn follow_up_on_cancelled_execution_reuses_active_harness_session() {
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
-    let now = now_rfc3339();
-    let parent_execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id.clone()),
-            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(db::ExecutionPurpose::Implement),
-            harness_session_id: None,
-            role: "executor".to_owned(),
-            status: ExecutionStatus::Cancelled,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("cancelled parent".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"codex","config":{},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
+    let parent_execution = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Cancelled,
+        Some("test-session"),
+        Some(
+            r#"{"executor_type":"codex","config":{},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
+        ),
     )
-    .await
-    .expect("parent execution creates");
-    let parent_execution = ExecutionRepo::record_harness_session_result(
-        &*db,
-        &parent_execution.id,
-        "test-session",
-        &now_rfc3339(),
-    )
-    .await
-    .expect("parent harness session activates");
+    .await;
 
     let result = service
-        .follow_up_execution(parent_execution.id, "continue".to_owned(), None, None)
+        .follow_up_execution(
+            parent_execution.id,
+            "continue".to_owned(),
+            None,
+            None,
+            "follow-up-cancelled-session".to_owned(),
+        )
         .await;
 
     let child = result.expect("follow-up succeeds");
@@ -3564,44 +3459,26 @@ async fn follow_up_on_cancelled_execution_without_session_starts_new_execution()
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
-    let now = now_rfc3339();
-    let parent_execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id.clone()),
-            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(db::ExecutionPurpose::Implement),
-            harness_session_id: None,
-            role: "executor".to_owned(),
-            status: ExecutionStatus::Cancelled,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("cancelled parent".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
+    let parent_execution = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Cancelled,
+        None,
+        None,
     )
-    .await
-    .expect("parent execution creates");
+    .await;
 
     let parent_id = parent_execution.id.clone();
     let result = service
-        .follow_up_execution(parent_execution.id, "continue".to_owned(), None, None)
+        .follow_up_execution(
+            parent_execution.id,
+            "continue".to_owned(),
+            None,
+            None,
+            "follow-up-cancelled-no-session".to_owned(),
+        )
         .await;
 
     let child = result.expect("follow-up starts a fresh execution");
@@ -3623,43 +3500,25 @@ async fn follow_up_without_exact_harness_session_starts_fresh_execution() {
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
-    let now = now_rfc3339();
-    let parent_execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id.clone()),
-            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(db::ExecutionPurpose::Implement),
-            harness_session_id: None,
-            role: "executor".to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("completed parent".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
+    let parent_execution = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Completed,
+        None,
+        None,
     )
-    .await
-    .expect("parent execution creates");
+    .await;
     let parent_id = parent_execution.id.clone();
     let result = service
-        .follow_up_execution(parent_execution.id, "continue".to_owned(), None, None)
+        .follow_up_execution(
+            parent_execution.id,
+            "continue".to_owned(),
+            None,
+            None,
+            "follow-up-no-session".to_owned(),
+        )
         .await;
 
     let child = result.expect("follow-up starts a fresh execution");
@@ -3727,7 +3586,13 @@ async fn follow_up_execution_rejects_terminal_task() {
     .expect("parent execution creates");
 
     let result = service
-        .follow_up_execution(parent_execution.id, "continue".to_owned(), None, None)
+        .follow_up_execution(
+            parent_execution.id,
+            "continue".to_owned(),
+            None,
+            None,
+            "follow-up-terminal-task".to_owned(),
+        )
         .await;
 
     assert!(result.is_err());
@@ -3762,55 +3627,31 @@ async fn follow_up_execution_on_blocked_task() {
     )
     .await
     .expect("set blocked_json");
-    let now = now_rfc3339();
-    let parent_execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id.clone()),
-            actor_ref: Some(db::ActorRef::Agent(agent_id)),
-            purpose: Some(db::ExecutionPurpose::Implement),
-            harness_session_id: None,
-            role: "executor".to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("completed parent".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"codex","config":{},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
+    let parent_execution = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Completed,
+        Some("test-session"),
+        Some(
+            r#"{"executor_type":"codex","config":{},"harness_capabilities":{"schema_version":1,"capabilities":{"resume":"native"}}}"#.to_owned(),
+        ),
     )
-    .await
-    .expect("parent execution creates");
-    let parent_execution = ExecutionRepo::record_harness_session_result(
-        &*db,
-        &parent_execution.id,
-        "test-session",
-        &now_rfc3339(),
-    )
-    .await
-    .expect("parent harness session activates");
+    .await;
 
     let result = service
-        .follow_up_execution(parent_execution.id, "continue".to_owned(), None, None)
+        .follow_up_execution(
+            parent_execution.id,
+            "continue".to_owned(),
+            None,
+            None,
+            "follow-up-blocked-task".to_owned(),
+        )
         .await
         .expect("follow-up succeeds");
 
-    assert_eq!(result.execution.role, "interactive".to_owned());
+    assert_eq!(result.execution.role, "implementer".to_owned());
     let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &result.task.id)
         .await
         .expect("TaskLifecycle loads")
@@ -3819,7 +3660,7 @@ async fn follow_up_execution_on_blocked_task() {
 }
 
 #[tokio::test]
-async fn follow_up_execution_rejects_executor_mismatch() {
+async fn follow_up_execution_rejects_agent_outside_exact_work_unit_assignment() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -3827,40 +3668,16 @@ async fn follow_up_execution_rejects_executor_mismatch() {
     let shell_agent_id = seed_agent(&db).await;
     let codex_agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
-    let now = now_rfc3339();
-    let parent_execution = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(shell_agent_id),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: "executor".to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("completed parent".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
+    let parent_execution = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &shell_agent_id,
+        ExecutionStatus::Completed,
+        None,
+        None,
     )
-    .await
-    .expect("parent execution creates");
+    .await;
 
     let result = service
         .follow_up_execution(
@@ -3868,13 +3685,13 @@ async fn follow_up_execution_rejects_executor_mismatch() {
             "continue".to_owned(),
             Some(codex_agent_id),
             None,
+            "follow-up-executor-mismatch".to_owned(),
         )
         .await;
 
     assert!(matches!(
         result,
-        Err(ServiceError::InvalidOperation { message })
-            if message.contains("same executor type")
+        Err(ServiceError::AuthorizationDenied { .. })
     ));
 }
 
@@ -4095,6 +3912,13 @@ struct BlockedRecoveryFixture {
 }
 
 async fn blocked_recovery_fixture(requires_workspace: bool) -> BlockedRecoveryFixture {
+    blocked_recovery_fixture_for_executor(requires_workspace, "shell").await
+}
+
+async fn blocked_recovery_fixture_for_executor(
+    requires_workspace: bool,
+    executor_type: &str,
+) -> BlockedRecoveryFixture {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(32));
     let workspace_root = TempDir::new().expect("recovery workspace root creates");
@@ -4102,7 +3926,7 @@ async fn blocked_recovery_fixture(requires_workspace: bool) -> BlockedRecoveryFi
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
         .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, executor_type, "{}").await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
 
     let (parent, workspace) = if requires_workspace {
@@ -4907,6 +4731,1299 @@ async fn launch_work_unit_for_override_snapshot(
         .await
         .expect("exact WorkUnit Execution launches")
         .execution
+}
+
+async fn create_simple_execution_work_unit(
+    db: &SqliteDb,
+    service: &TaskService,
+    task: &Task,
+    agent_id: &str,
+) -> db::WorkUnit {
+    if TaskRoleRepo::get_by_task_and_role(db, &task.id, "implementer")
+        .await
+        .expect("implementer TaskRole lookup succeeds")
+        .is_none()
+    {
+        service
+            .create_task_role(
+                &task.id,
+                "implementer",
+                CoordinationMode::Independent,
+                "{}".to_owned(),
+            )
+            .await
+            .expect("implementer TaskRole creates");
+    }
+    if crate::task_service::current_role_memberships_authoritative(db, &task.id, "implementer")
+        .await
+        .expect("TaskRole memberships load")
+        .is_none_or(|memberships| {
+            crate::task_service::memberships::active_agent_membership(&memberships, agent_id)
+                .is_none()
+        })
+    {
+        service
+            .add_task_role_member(
+                &task.id,
+                "implementer",
+                ActorRef::Agent(agent_id.to_owned()),
+            )
+            .await
+            .expect("Agent joins the exact implementer TaskRole");
+    }
+    let now = now_rfc3339();
+    let id = db::new_uuid_v4();
+    db::WorkUnitRepo::create(
+        db,
+        db::CreateWorkUnit {
+            id: id.clone(),
+            task_id: task.id.clone(),
+            parent_work_unit_id: None,
+            title: "Atomic launch target".to_owned(),
+            scope: "Exact launch admission test target".to_owned(),
+            role: "implementer".to_owned(),
+            assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
+            requires_integration: false,
+            provenance: None,
+            created_by: db::ActorRef::Agent(agent_id.to_owned()),
+            created_at: now.clone(),
+        },
+        db::CreateDomainEvent {
+            id: db::new_uuid_v4(),
+            event_type: "work_unit.created".to_owned(),
+            entity_type: "work_unit".to_owned(),
+            entity_id: id.clone(),
+            actor_type: "agent".to_owned(),
+            actor_id: Some(agent_id.to_owned()),
+            scope_type: "task".to_owned(),
+            scope_id: task.id.clone(),
+            correlation_id: id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("work-unit-created:{id}")),
+            payload_json: json!({"work_unit_id": id, "task_id": task.id}).to_string(),
+            created_at: now,
+        },
+    )
+    .await
+    .expect("exact WorkUnit creates")
+    .record
+}
+
+async fn terminal_work_unit_execution(
+    db: &SqliteDb,
+    service: &TaskService,
+    task: &Task,
+    agent_id: &str,
+    terminal_status: ExecutionStatus,
+    external_session_id: Option<&str>,
+    snapshot_override: Option<String>,
+) -> db::Execution {
+    let work_unit = create_simple_execution_work_unit(db, service, task, agent_id).await;
+    let mut execution = service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "exact WorkUnit parent Execution".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("parent Execution admits through its exact WorkUnit")
+        .execution;
+    if let Some(snapshot) = snapshot_override {
+        execution = ExecutionRepo::update(
+            db,
+            db::UpdateExecution {
+                id: execution.id.clone(),
+                status: None,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                external_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: Some(Some(snapshot)),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("parent snapshot override stores");
+    }
+    if let Some(external_session_id) = external_session_id {
+        execution = ExecutionRepo::record_harness_session_result(
+            db,
+            &execution.id,
+            external_session_id,
+            &now_rfc3339(),
+        )
+        .await
+        .expect("exact parent HarnessSession records");
+    }
+    execution = ExecutionRepo::update(
+        db,
+        db::UpdateExecution {
+            id: execution.id.clone(),
+            status: Some(terminal_status),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some(Some(now_rfc3339())),
+            external_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("parent Execution becomes terminal");
+    execution
+}
+
+struct AdmissionSideEffectSnapshot {
+    task: db::Task,
+    lifecycle: db::TaskLifecycle,
+    work_unit: db::WorkUnit,
+    lifecycle_transitions: i64,
+    admission_events: i64,
+    executions: i64,
+    workspace_leases: i64,
+    artifact_inputs: i64,
+}
+
+async fn admission_side_effect_snapshot(
+    db: &SqliteDb,
+    task_id: &str,
+    work_unit_id: &str,
+) -> AdmissionSideEffectSnapshot {
+    AdmissionSideEffectSnapshot {
+        task: TaskRepo::get_by_id(db, task_id, false)
+            .await
+            .expect("Task loads")
+            .expect("Task exists"),
+        lifecycle: TaskLifecycleRepo::get_task_lifecycle(db, task_id)
+            .await
+            .expect("TaskLifecycle loads")
+            .expect("TaskLifecycle exists"),
+        work_unit: db::WorkUnitRepo::get_by_id(db, work_unit_id)
+            .await
+            .expect("WorkUnit loads")
+            .expect("WorkUnit exists"),
+        lifecycle_transitions: sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_lifecycle_transition WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("lifecycle transition count loads"),
+        admission_events: sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE scope_type = 'task' AND scope_id = ?
+               AND event_type IN ('task.lifecycle_changed', 'execution.started')",
+        )
+        .bind(task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("admission event count loads"),
+        executions: sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Execution count loads"),
+        workspace_leases: sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workspace_lease WHERE task_id = ? AND work_unit_id = ?",
+        )
+        .bind(task_id)
+        .bind(work_unit_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("WorkspaceLease count loads"),
+        artifact_inputs: sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution_artifact_input WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("ArtifactInput count loads"),
+    }
+}
+
+async fn assert_admission_side_effects_unchanged(
+    db: &SqliteDb,
+    task_id: &str,
+    work_unit_id: &str,
+    before: &AdmissionSideEffectSnapshot,
+) {
+    assert_eq!(
+        TaskRepo::get_by_id(db, task_id, false)
+            .await
+            .expect("Task reload succeeds")
+            .expect("Task remains present"),
+        before.task
+    );
+    assert_eq!(
+        TaskLifecycleRepo::get_task_lifecycle(db, task_id)
+            .await
+            .expect("TaskLifecycle reload succeeds")
+            .expect("TaskLifecycle remains present"),
+        before.lifecycle
+    );
+    assert_eq!(
+        db::WorkUnitRepo::get_by_id(db, work_unit_id)
+            .await
+            .expect("WorkUnit reload succeeds")
+            .expect("WorkUnit remains present"),
+        before.work_unit
+    );
+    let after = admission_side_effect_snapshot(db, task_id, work_unit_id).await;
+    assert_eq!(after.lifecycle_transitions, before.lifecycle_transitions);
+    assert_eq!(after.admission_events, before.admission_events);
+    assert_eq!(after.executions, before.executions);
+    assert_eq!(after.workspace_leases, before.workspace_leases);
+    assert_eq!(after.artifact_inputs, before.artifact_inputs);
+}
+
+#[tokio::test]
+async fn ordinary_launch_snapshot_failure_does_not_activate_task() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id =
+        seed_agent_with_executor_type(&db, "shell", r#"{"fallbacks":"this must be an array"}"#)
+            .await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
+    let before = admission_side_effect_snapshot(&db, &task.id, &work_unit.id).await;
+
+    let error = match service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "snapshot failure must not activate lifecycle".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("invalid fallback configuration rejects before admission"),
+    };
+    assert!(error.to_string().contains("fallbacks"));
+    assert_admission_side_effects_unchanged(&db, &task.id, &work_unit.id, &before).await;
+}
+
+#[tokio::test]
+async fn ordinary_launch_artifact_rejection_rolls_back_activation_receipt_and_events() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
+    let before = admission_side_effect_snapshot(&db, &task.id, &work_unit.id).await;
+
+    let result = service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "invalid artifact admission".to_owned(),
+            vec!["missing-launch-artifact".to_owned()],
+            None,
+        )
+        .await;
+    assert!(result.is_err(), "unknown ArtifactInput rejects admission");
+    assert_admission_side_effects_unchanged(&db, &task.id, &work_unit.id, &before).await;
+}
+
+#[tokio::test]
+async fn ordinary_provider_start_failure_keeps_one_admitted_execution_and_event() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
+    let admitted = service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "provider start occurs after durable admission".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("Execution admission commits before provider start")
+        .execution;
+
+    let provider_result = service.start_execution(admitted.id.clone()).await;
+    assert!(
+        provider_result.is_err(),
+        "unavailable local provider rejects start"
+    );
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, status FROM execution WHERE task_id = ? AND work_unit_id = ?")
+            .bind(&task.id)
+            .bind(&work_unit.id)
+            .fetch_all(db.pool())
+            .await
+            .expect("admitted Execution rows load");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, admitted.id);
+    let start_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'execution.started' AND entity_id = ?",
+    )
+    .bind(&admitted.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("Execution start event count loads");
+    assert_eq!(start_events, 1);
+    let transitions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_lifecycle_transition
+         WHERE task_id = ? AND idempotency_key = ?",
+    )
+    .bind(&task.id)
+    .bind(format!("execution-start:{}:active:1", task.id))
+    .fetch_one(db.pool())
+    .await
+    .expect("activation receipt count loads");
+    assert_eq!(transitions, 1);
+}
+
+#[tokio::test]
+async fn ordinary_launch_work_unit_version_race_rolls_back_lifecycle() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
+    let before = admission_side_effect_snapshot(&db, &task.id, &work_unit.id).await;
+    let trigger = format!(
+        "CREATE TRIGGER test_launch_work_unit_version_race
+         AFTER UPDATE OF state ON task_lifecycle WHEN NEW.task_id = '{}'
+         BEGIN
+             UPDATE work_unit SET version = version + 1, updated_at = NEW.updated_at
+             WHERE id = '{}';
+         END",
+        task.id, work_unit.id
+    );
+    sqlx::query(&trigger)
+        .execute(db.pool())
+        .await
+        .expect("deterministic WorkUnit race trigger creates");
+
+    let result = service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "version race must roll back activation".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await;
+    assert!(result.is_err(), "stale WorkUnit version rejects admission");
+    assert_admission_side_effects_unchanged(&db, &task.id, &work_unit.id, &before).await;
+}
+
+#[tokio::test]
+async fn ordinary_repository_launch_workspace_readiness_race_rolls_back_lifecycle() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let workspace_root = TempDir::new().expect("Workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_workspace_exec_locks(Arc::new(crate::WorkspaceExecutionLockManager::new()));
+    let (parent, workspace) = create_running_repository_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        "implementer",
+        db::ExecutionPurpose::Implement,
+        workspace_root.path(),
+        Some("workspace readiness race parent".to_owned()),
+        None,
+    )
+    .await;
+    ExecutionRepo::update(
+        &*db,
+        db::UpdateExecution {
+            id: parent.id.clone(),
+            status: Some(ExecutionStatus::Completed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some(Some(now_rfc3339())),
+            external_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("first Execution becomes terminal");
+    service
+        .revoke_active_workspace_lease_for_execution(&task.id, &parent.id)
+        .await;
+    let work_unit = db::WorkUnitRepo::get_by_id(
+        &*db,
+        parent
+            .work_unit_id
+            .as_deref()
+            .expect("parent binds WorkUnit"),
+    )
+    .await
+    .expect("WorkUnit loads")
+    .expect("WorkUnit exists");
+    let before = admission_side_effect_snapshot(&db, &task.id, &work_unit.id).await;
+    let trigger = format!(
+        "CREATE TRIGGER test_launch_workspace_readiness_race
+         AFTER UPDATE OF state ON task_lifecycle WHEN NEW.task_id = '{}'
+         BEGIN
+             UPDATE workspace SET status = 'error', updated_at = NEW.updated_at
+             WHERE id = '{}';
+         END",
+        task.id, workspace.id
+    );
+    sqlx::query(&trigger)
+        .execute(db.pool())
+        .await
+        .expect("deterministic Workspace readiness trigger creates");
+
+    let result = service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "workspace readiness race must roll back activation".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "Workspace that stopped being Ready rejects admission"
+    );
+    assert_admission_side_effects_unchanged(&db, &task.id, &work_unit.id, &before).await;
+    assert_eq!(
+        db::WorkspaceRepo::get_by_id(&*db, &workspace.id)
+            .await
+            .expect("Workspace reload succeeds")
+            .expect("Workspace remains present")
+            .status,
+        db::WorkspaceStatus::Ready,
+        "the race trigger's mutation rolls back with rejected admission"
+    );
+}
+
+#[tokio::test]
+async fn follow_up_rejects_ended_harness_session_without_clearing_recovery_annotation() {
+    let fixture = blocked_recovery_fixture_for_executor(false, "codex").await;
+    let parent = ExecutionRepo::record_harness_session_result(
+        &*fixture.db,
+        &fixture.parent.id,
+        "historical-follow-up-session",
+        &now_rfc3339(),
+    )
+    .await
+    .expect("explicit HarnessSession attaches to exact parent");
+    let session_id = parent
+        .harness_session_id
+        .clone()
+        .expect("parent carries explicit HarnessSession id");
+    db::HarnessSessionRepo::update(
+        &*fixture.db,
+        db::UpdateHarnessSession {
+            id: session_id,
+            status: Some(db::HarnessSessionStatus::Ended),
+            last_activity_at: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("historical HarnessSession becomes nonreusable");
+    let before =
+        admission_side_effect_snapshot(&fixture.db, &fixture.task.id, &fixture.work_unit.id).await;
+
+    let result = fixture
+        .service
+        .follow_up_execution(
+            parent.id,
+            "do not resume an ended session".to_owned(),
+            None,
+            None,
+            "follow-up-ended-session".to_owned(),
+        )
+        .await;
+    assert!(result.is_err(), "ended explicit session rejects follow-up");
+    assert_admission_side_effects_unchanged(
+        &fixture.db,
+        &fixture.task.id,
+        &fixture.work_unit.id,
+        &before,
+    )
+    .await;
+    assert_eq!(before.task.error_annotation, fixture.task.error_annotation);
+}
+
+#[tokio::test]
+async fn rejected_recovery_cancel_preserves_blocking_metadata() {
+    let fixture = blocked_recovery_fixture(false).await;
+    let before =
+        admission_side_effect_snapshot(&fixture.db, &fixture.task.id, &fixture.work_unit.id).await;
+    let trigger = format!(
+        "CREATE TRIGGER test_recovery_cancel_transition_rejection
+         BEFORE INSERT ON task_lifecycle_transition
+         WHEN NEW.task_id = '{}' AND NEW.to_state = 'cancelled'
+         BEGIN SELECT RAISE(ABORT, 'deterministic cancellation transition rejection'); END",
+        fixture.task.id
+    );
+    sqlx::query(&trigger)
+        .execute(fixture.db.pool())
+        .await
+        .expect("cancellation rejection trigger creates");
+
+    let result = fixture
+        .service
+        .recover_task(
+            fixture.task.id.clone(),
+            api_types::RecoveryAction::CancelTask,
+            Some("cancel the blocked Task".to_owned()),
+            None,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "failed lifecycle transition rejects cancellation"
+    );
+    assert_admission_side_effects_unchanged(
+        &fixture.db,
+        &fixture.task.id,
+        &fixture.work_unit.id,
+        &before,
+    )
+    .await;
+    assert_eq!(before.task.error_annotation, fixture.task.error_annotation);
+    assert_eq!(before.task.blocked_json, fixture.task.blocked_json);
+
+    sqlx::query("DROP TRIGGER test_recovery_cancel_transition_rejection")
+        .execute(fixture.db.pool())
+        .await
+        .expect("cancellation rejection trigger drops");
+    let cancelled = fixture
+        .service
+        .recover_task(
+            fixture.task.id.clone(),
+            api_types::RecoveryAction::CancelTask,
+            Some("retry cancellation after policy rejection".to_owned()),
+            None,
+        )
+        .await
+        .expect("authorized recovery cancellation succeeds");
+    assert_eq!(cancelled.lifecycle_state, TaskLifecycleState::Cancelled);
+    assert!(cancelled.error_annotation.is_none());
+    assert!(cancelled.blocked_json.is_none());
+}
+
+#[tokio::test]
+async fn follow_up_membership_change_rejects_child_and_preserves_recovery_annotation() {
+    let fixture = blocked_recovery_fixture(false).await;
+    let membership_id: String = sqlx::query_scalar(
+        "SELECT rm.id FROM role_membership rm
+         JOIN task_role tr ON tr.id = rm.task_role_id
+         WHERE tr.task_id = ? AND tr.role = ? AND rm.actor_id = ? AND rm.status = 'active'",
+    )
+    .bind(&fixture.task.id)
+    .bind(&fixture.work_unit.role)
+    .bind(
+        fixture
+            .parent
+            .agent_id
+            .as_deref()
+            .expect("parent Actor Agent"),
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("exact active RoleMembership loads");
+    let before =
+        admission_side_effect_snapshot(&fixture.db, &fixture.task.id, &fixture.work_unit.id).await;
+    let trigger = format!(
+        "CREATE TRIGGER test_follow_up_membership_change
+         AFTER UPDATE OF state ON task_lifecycle WHEN NEW.task_id = '{}'
+         BEGIN
+             UPDATE role_membership
+             SET status = 'suspended', version = version + 1, updated_at = NEW.updated_at
+             WHERE id = '{}';
+         END",
+        fixture.task.id, membership_id
+    );
+    sqlx::query(&trigger)
+        .execute(fixture.db.pool())
+        .await
+        .expect("deterministic membership change trigger creates");
+
+    let result = fixture
+        .service
+        .follow_up_execution(
+            fixture.parent.id.clone(),
+            "membership change must reject child".to_owned(),
+            None,
+            None,
+            "follow-up-membership-change".to_owned(),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "suspended RoleMembership rejects admission"
+    );
+    assert_admission_side_effects_unchanged(
+        &fixture.db,
+        &fixture.task.id,
+        &fixture.work_unit.id,
+        &before,
+    )
+    .await;
+    let membership_status: String =
+        sqlx::query_scalar("SELECT status FROM role_membership WHERE id = ?")
+            .bind(&membership_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("RoleMembership status reloads");
+    assert_eq!(membership_status, "active");
+    assert_eq!(before.task.error_annotation, fixture.task.error_annotation);
+}
+
+#[tokio::test]
+async fn follow_up_work_unit_version_change_rolls_back_lifecycle_and_metadata() {
+    let fixture = blocked_recovery_fixture(false).await;
+    let before =
+        admission_side_effect_snapshot(&fixture.db, &fixture.task.id, &fixture.work_unit.id).await;
+    let trigger = format!(
+        "CREATE TRIGGER test_follow_up_work_unit_version_change
+         AFTER UPDATE OF state ON task_lifecycle WHEN NEW.task_id = '{}'
+         BEGIN
+             UPDATE work_unit
+             SET version = version + 1, updated_at = NEW.updated_at
+             WHERE id = '{}';
+         END",
+        fixture.task.id, fixture.work_unit.id
+    );
+    sqlx::query(&trigger)
+        .execute(fixture.db.pool())
+        .await
+        .expect("deterministic WorkUnit version race trigger creates");
+
+    let result = fixture
+        .service
+        .follow_up_execution(
+            fixture.parent.id.clone(),
+            "stale WorkUnit version must reject follow-up".to_owned(),
+            None,
+            None,
+            "follow-up-work-unit-version-change".to_owned(),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "changed WorkUnit revision rejects admission"
+    );
+    assert_admission_side_effects_unchanged(
+        &fixture.db,
+        &fixture.task.id,
+        &fixture.work_unit.id,
+        &before,
+    )
+    .await;
+    assert_eq!(before.task.error_annotation, fixture.task.error_annotation);
+    assert_eq!(before.task.blocked_json, fixture.task.blocked_json);
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_follow_up_receipt WHERE idempotency_key = ?",
+    )
+    .bind("follow-up-work-unit-version-change")
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("follow-up receipt count loads");
+    assert_eq!(
+        receipts, 0,
+        "rejected admission writes no follow-up receipt"
+    );
+}
+
+#[tokio::test]
+async fn follow_up_artifact_pin_rejection_preserves_blocking_annotation_and_lifecycle() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
+    let parent = service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Plan,
+            "produce follow-up plan artifact".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("Plan Execution admits")
+        .execution;
+    let collaboration = crate::CollaborationService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let artifact = collaboration
+        .create_plan_artifact_from_execution(
+            &parent.id,
+            "# Exact plan\n\n- Preserve the transaction boundary.\n",
+        )
+        .await
+        .expect("exact Plan Artifact persists");
+    let now = now_rfc3339();
+    ExecutionRepo::update(
+        &*db,
+        db::UpdateExecution {
+            id: parent.id.clone(),
+            status: Some(ExecutionStatus::Completed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some(Some(now.clone())),
+            external_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Plan parent becomes terminal");
+    let blocked =
+        crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .block(
+                &task.id,
+                crate::task_lifecycle::LifecycleCause::Execution(parent.id.clone()),
+                "test_block",
+                parent.id.clone(),
+                format!("test-follow-up-block:{}", parent.id),
+            )
+            .await
+            .expect("TaskLifecycle enters Blocked");
+    let annotation = api_types::TaskBlockingAnnotation {
+        annotation_type: api_types::FailureKind::ExecutorFailed,
+        blocking_reason: "test_block".to_owned(),
+        blocked_by: Some("system:test".to_owned()),
+        blocked_at: Some(now.clone()),
+        blocked_execution_id: Some(parent.id.clone()),
+        artifact: Some(api_types::BlockingArtifact {
+            kind: "execution".to_owned(),
+            id: Some(parent.id.clone()),
+            log_path: None,
+        }),
+        message: Some("preserve until follow-up admission commits".to_owned()),
+        hook: None,
+        recovery_actions: vec![
+            api_types::RecoveryAction::Reexecute,
+            api_types::RecoveryAction::CancelTask,
+        ],
+    };
+    let annotation_json = serde_json::to_string(&annotation).expect("annotation serializes");
+    TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: blocked.task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            error_annotation: Some(Some(annotation_json.clone())),
+            blocked_json: Some(Some(
+                json!({"reason":"test_block", "execution_id":parent.id}).to_string(),
+            )),
+            failed_json: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("blocking annotation persists");
+    let inherited = service
+        .inherit_plan_artifact_inputs(&parent.id, &task.id)
+        .await
+        .expect("exact Plan ArtifactInputs prepare");
+    assert_eq!(inherited, vec![artifact.id]);
+    let before = admission_side_effect_snapshot(&db, &task.id, &work_unit.id).await;
+    let trigger = format!(
+        "CREATE TRIGGER test_follow_up_artifact_pin_failure
+         BEFORE INSERT ON execution_artifact_input
+         WHEN NEW.task_id = '{}'
+         BEGIN SELECT RAISE(ABORT, 'deterministic ArtifactInput admission failure'); END",
+        task.id
+    );
+    sqlx::query(&trigger)
+        .execute(db.pool())
+        .await
+        .expect("ArtifactInput failure trigger creates");
+
+    let result = service
+        .follow_up_execution(
+            parent.id.clone(),
+            "continue with the exact plan".to_owned(),
+            Some(agent_id),
+            None,
+            "follow-up-artifact-pin".to_owned(),
+        )
+        .await;
+    assert!(result.is_err(), "ArtifactInput pin rejects child admission");
+    assert_admission_side_effects_unchanged(&db, &task.id, &work_unit.id, &before).await;
+    assert_eq!(
+        before.task.error_annotation.as_deref(),
+        Some(annotation_json.as_str())
+    );
+    let children: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE parent_execution_id = ?")
+            .bind(&parent.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("follow-up child count loads");
+    assert_eq!(children, 0);
+}
+
+#[tokio::test]
+async fn concurrent_follow_up_retries_replay_one_child_and_one_activation_receipt() {
+    let fixture = blocked_recovery_fixture(false).await;
+    let service_one = fixture.service.clone();
+    let service_two = fixture.service.clone();
+    let parent_id = fixture.parent.id.clone();
+    let one = service_one.follow_up_execution(
+        parent_id.clone(),
+        "same concurrently submitted follow-up".to_owned(),
+        None,
+        None,
+        "same-concurrent-follow-up".to_owned(),
+    );
+    let two = service_two.follow_up_execution(
+        parent_id.clone(),
+        "same concurrently submitted follow-up".to_owned(),
+        None,
+        None,
+        "same-concurrent-follow-up".to_owned(),
+    );
+    let (one, two) = tokio::join!(one, two);
+    let one = one.expect("first concurrent request admits or replays the child");
+    let two = two.expect("same concurrent request replays the admitted child");
+    assert_ne!(one.idempotent_replay, two.idempotent_replay);
+    assert_eq!(one.execution.id, two.execution.id);
+    let children: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, status FROM execution WHERE parent_execution_id = ?")
+            .bind(&parent_id)
+            .fetch_all(fixture.db.pool())
+            .await
+            .expect("follow-up children load");
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].1, "running");
+    let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .expect("Task reload succeeds")
+        .expect("Task exists");
+    assert_eq!(task.version, fixture.task.version + 2);
+    assert_eq!(task.lifecycle_state, TaskLifecycleState::Active);
+    assert!(task.error_annotation.is_none());
+    assert!(task.blocked_json.is_none());
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_lifecycle_transition
+         WHERE task_id = ? AND idempotency_key = ?",
+    )
+    .bind(&task.id)
+    .bind(format!(
+        "execution-start:{}:active:{}",
+        task.id, fixture.lifecycle.version
+    ))
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("activation receipt count loads");
+    assert_eq!(receipts, 1);
+    let lifecycle_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'task.lifecycle_changed' AND scope_id = ?
+           AND correlation_id = ?",
+    )
+    .bind(&task.id)
+    .bind(format!(
+        "execution-start:{}:active:{}",
+        task.id, fixture.lifecycle.version
+    ))
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("activation event count loads");
+    assert_eq!(lifecycle_events, 1);
+    let start_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'execution.started' AND scope_id = ? AND causation_id = ?",
+    )
+    .bind(&task.id)
+    .bind(&parent_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("child start event count loads");
+    assert_eq!(start_events, 1);
+    let operation_receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_follow_up_receipt WHERE idempotency_key = ?",
+    )
+    .bind("same-concurrent-follow-up")
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("follow-up operation receipt count loads");
+    assert_eq!(operation_receipts, 1);
+}
+
+#[tokio::test]
+async fn follow_up_retry_replays_exact_child_and_new_key_authorizes_next_child() {
+    let fixture = blocked_recovery_fixture(false).await;
+    let key = "follow-up-uncertain-response".to_owned();
+    let request_message = "resume after uncertain response".to_owned();
+    let first = fixture
+        .service
+        .follow_up_execution(
+            fixture.parent.id.clone(),
+            request_message.clone(),
+            None,
+            None,
+            key.clone(),
+        )
+        .await
+        .expect("first follow-up commits");
+    assert!(!first.idempotent_replay);
+    let first_task_version = first.task.version;
+    let first_child_id = first.execution.id.clone();
+    let replay = fixture
+        .service
+        .follow_up_execution(
+            fixture.parent.id.clone(),
+            request_message.clone(),
+            None,
+            None,
+            key.clone(),
+        )
+        .await
+        .expect("uncertain response retry replays exact child");
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.execution.id, first_child_id);
+    assert_eq!(replay.task.version, first_task_version);
+
+    let reused_key = fixture
+        .service
+        .follow_up_execution(
+            fixture.parent.id.clone(),
+            "different request body".to_owned(),
+            None,
+            None,
+            key.clone(),
+        )
+        .await;
+    assert!(matches!(
+        reused_key,
+        Err(ServiceError::Db(db::DbError::IdempotencyConflict))
+    ));
+
+    db::ExecutionRepo::update(
+        &*fixture.db,
+        db::UpdateExecution {
+            id: first_child_id.clone(),
+            status: Some(ExecutionStatus::Completed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some(Some(now_rfc3339())),
+            external_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("first child becomes terminal");
+    let next = fixture
+        .service
+        .follow_up_execution(
+            fixture.parent.id.clone(),
+            "separately authorized follow-up".to_owned(),
+            None,
+            None,
+            "follow-up-next-authorization".to_owned(),
+        )
+        .await
+        .expect("new operation key authorizes another child after the first is terminal");
+    assert!(!next.idempotent_replay);
+    assert_ne!(next.execution.id, first_child_id);
+
+    let child_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE parent_execution_id = ?")
+            .bind(&fixture.parent.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("exact parent child count loads");
+    assert_eq!(child_count, 2);
+    let start_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'execution.started'
+         AND entity_type = 'execution' AND scope_id = ? AND causation_id = ?",
+    )
+    .bind(&fixture.task.id)
+    .bind(&fixture.parent.id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("start event count loads");
+    assert_eq!(start_events, 2);
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_follow_up_receipt WHERE parent_execution_id = ?",
+    )
+    .bind(&fixture.parent.id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("follow-up receipt count loads");
+    assert_eq!(receipt_count, 2);
+    db::ProjectRepo::delete(&*fixture.db, &fixture.task.project_id)
+        .await
+        .expect("guarded Project teardown removes immutable follow-up receipts");
+    let teardown_receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_follow_up_receipt WHERE parent_execution_id = ?",
+    )
+    .bind(&fixture.parent.id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("Project teardown receipt count loads");
+    assert_eq!(teardown_receipts, 0);
+}
+
+#[tokio::test]
+async fn ordinary_reexecute_snapshot_failure_keeps_ready_lifecycle_without_child() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
+    let parent = service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "ordinary re-execution source".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("source Execution admits")
+        .execution;
+    ExecutionRepo::update(
+        &*db,
+        db::UpdateExecution {
+            id: parent.id.clone(),
+            status: Some(ExecutionStatus::Completed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some(Some(now_rfc3339())),
+            external_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("source Execution becomes terminal");
+    let active_task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task loads")
+        .expect("Task exists");
+    crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: task.id.clone(),
+            expected_task_version: active_task.version,
+            to_state: TaskLifecycleState::Ready,
+            cause: crate::task_lifecycle::LifecycleCause::System(
+                api_types::SystemComponent::Executor,
+            ),
+            reason_kind: Some("test_reexecute_retry".to_owned()),
+            reason_ref: Some(parent.id.clone()),
+            idempotency_key: format!("test-reexecute-ready:{}", parent.id),
+        })
+        .await
+        .expect("Task returns to Ready before re-execution");
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    AgentRepo::update(
+        &*db,
+        db::UpdateAgent {
+            id: agent.id.clone(),
+            expected_version: agent.version,
+            name: None,
+            description: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: None,
+            config_json: Some(r#"{"fallbacks":"invalid"}"#.to_owned()),
+            daemon_id: None,
+            max_concurrent_tasks: None,
+            heartbeat_interval_seconds: None,
+            max_missed_heartbeats: None,
+            status: None,
+            last_heartbeat_at: None,
+            is_default: None,
+            paused: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("Agent snapshot source becomes invalid");
+    let before = admission_side_effect_snapshot(&db, &task.id, &work_unit.id).await;
+
+    let result = service
+        .re_execute_execution_with_context(parent.id.clone(), None)
+        .await;
+    assert!(
+        result.is_err(),
+        "snapshot failure rejects ordinary re-execution"
+    );
+    assert_admission_side_effects_unchanged(&db, &task.id, &work_unit.id, &before).await;
+    assert_eq!(before.lifecycle.state, TaskLifecycleState::Ready);
+}
+
+#[tokio::test]
+async fn ordinary_reexecute_work_unit_version_race_rolls_back_activation() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
+    let parent = service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "ordinary re-execution source".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("source Execution admits")
+        .execution;
+    ExecutionRepo::update(
+        &*db,
+        db::UpdateExecution {
+            id: parent.id.clone(),
+            status: Some(ExecutionStatus::Completed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some(Some(now_rfc3339())),
+            external_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("source Execution becomes terminal");
+    let active_task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task loads")
+        .expect("Task exists");
+    crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: task.id.clone(),
+            expected_task_version: active_task.version,
+            to_state: TaskLifecycleState::Ready,
+            cause: crate::task_lifecycle::LifecycleCause::System(
+                api_types::SystemComponent::Executor,
+            ),
+            reason_kind: Some("test_reexecute_retry".to_owned()),
+            reason_ref: Some(parent.id.clone()),
+            idempotency_key: format!("test-reexecute-ready:{}", parent.id),
+        })
+        .await
+        .expect("Task returns to Ready before re-execution");
+    let before = admission_side_effect_snapshot(&db, &task.id, &work_unit.id).await;
+    let trigger = format!(
+        "CREATE TRIGGER test_reexecute_work_unit_version_race
+         AFTER UPDATE OF state ON task_lifecycle WHEN NEW.task_id = '{}'
+         BEGIN
+             UPDATE work_unit SET version = version + 1, updated_at = NEW.updated_at
+             WHERE id = '{}';
+         END",
+        task.id, work_unit.id
+    );
+    sqlx::query(&trigger)
+        .execute(db.pool())
+        .await
+        .expect("deterministic re-execution WorkUnit race trigger creates");
+
+    let result = service
+        .re_execute_execution_with_context(parent.id.clone(), None)
+        .await;
+    assert!(
+        result.is_err(),
+        "changed WorkUnit version rejects re-execution"
+    );
+    assert_admission_side_effects_unchanged(&db, &task.id, &work_unit.id, &before).await;
+    assert_eq!(before.lifecycle.state, TaskLifecycleState::Ready);
 }
 
 #[tokio::test]

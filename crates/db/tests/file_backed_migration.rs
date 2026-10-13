@@ -1652,6 +1652,69 @@ async fn v114_recovers_v110_terminal_pr_outcome_from_its_exact_result_event() {
     let _ = fs::remove_dir_all(v114_dir);
 }
 
+#[tokio::test]
+async fn v133_follow_up_receipts_upgrade_from_v132_and_restart_cleanly() {
+    let baseline_dir = unique_temp_path("v132-follow-up-baseline");
+    let final_dir = unique_temp_path("v133-follow-up-upgrade");
+    fs::create_dir_all(&baseline_dir).expect("V132 migration dir creates");
+    fs::create_dir_all(&final_dir).expect("V133 migration dir creates");
+    copy_migrations_up_to(132, &baseline_dir);
+    copy_migrations_up_to(133, &final_dir);
+
+    let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+    run_migrations_from(&pool, &baseline_dir)
+        .await
+        .expect("database reaches V132");
+    let baseline_head: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("V132 head loads");
+    assert_eq!(baseline_head, 132);
+
+    run_migrations_from(&pool, &final_dir)
+        .await
+        .expect("V133 adds follow-up receipts");
+    let receipt_head: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("V133 head loads");
+    assert_eq!(receipt_head, 133);
+    let receipt_table: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_follow_up_receipt')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("follow-up receipt table lookup");
+    assert_eq!(receipt_table, 1);
+
+    let receipt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("migration receipt count loads");
+    run_migrations_from(&pool, &final_dir)
+        .await
+        .expect("restart does not recreate V133");
+    let restarted_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("restarted migration receipt count loads");
+    assert_eq!(restarted_count, receipt_count);
+    let foreign_key_violations: Vec<(String, i64, String, i64)> =
+        sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .expect("foreign_key_check runs after V133");
+    assert!(foreign_key_violations.is_empty());
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&pool)
+        .await
+        .expect("integrity_check runs after V133");
+    assert_eq!(integrity, "ok");
+
+    let _ = fs::remove_dir_all(baseline_dir);
+    let _ = fs::remove_dir_all(final_dir);
+}
+
 fn copy_migrations_up_to(max_version: i64, destination: &Path) {
     let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for entry in fs::read_dir(source_dir).expect("migration dir reads") {

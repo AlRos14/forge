@@ -1,4 +1,5 @@
 use super::*;
+use crate::FollowUpExecutionReceipt;
 
 fn actor_from_columns(kind: Option<String>, id: Option<String>) -> Result<Option<ActorRef>> {
     match (kind, id) {
@@ -159,6 +160,74 @@ async fn append_event(
     event: &CreateDomainEvent,
 ) -> Result<DomainEvent> {
     DomainEventRepo::append_event_in_tx(db, tx, event).await
+}
+
+async fn insert_work_unit_execution_in_tx(
+    db: &SqliteDb,
+    tx: &mut Transaction<'_, Sqlite>,
+    admission: CreateWorkUnitExecution,
+    artifact_input_ids: Vec<String>,
+    event_input: &CreateDomainEvent,
+) -> Result<(Execution, DomainEvent)> {
+    let requires_integration = sqlx::query_scalar::<_, i64>(
+        "SELECT requires_integration FROM work_unit WHERE id = ? AND task_id = ?",
+    )
+    .bind(&admission.work_unit_id)
+    .bind(&admission.execution.task_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(DbError::NotFound)?
+        != 0;
+    if admission.execution.status != ExecutionStatus::Running
+        || requires_integration != admission.workspace_lease.is_some()
+    {
+        return Err(DbError::Check(
+            "WorkUnit Executions require a running Execution and repository work requires an exact WorkspaceLease"
+                .to_owned(),
+        ));
+    }
+    if let Some(lease) = admission.workspace_lease.as_ref() {
+        let actor = admission.execution.actor_ref.as_ref();
+        let expected_lease_role = if admission.execution.role == "reviewer" {
+            "reviewer"
+        } else {
+            "worker"
+        };
+        if lease.task_id != admission.execution.task_id
+            || lease.work_unit_id.as_deref() != Some(admission.work_unit_id.as_str())
+            || lease.workspace_id != admission.execution.workspace_id
+            || lease.execution_id != admission.execution.id
+            || lease.role != expected_lease_role
+            || Some(lease.assigned_principal_type.as_str())
+                != actor.map(|actor| actor.kind().to_string()).as_deref()
+            || actor.map(|actor| actor.id()) != Some(lease.assigned_principal_id.as_str())
+        {
+            return Err(DbError::Check(
+                "WorkUnit WorkspaceLease does not match its Execution binding".to_owned(),
+            ));
+        }
+    }
+
+    let execution = SqliteDb::create_execution_in_tx(
+        tx,
+        &admission.execution,
+        Some((&admission.work_unit_id, admission.work_unit_version)),
+    )
+    .await?;
+    for artifact_id in artifact_input_ids {
+        super::collaboration::pin_execution_artifact_input_in_tx(
+            tx,
+            &admission.execution.id,
+            &artifact_id,
+            &admission.execution.created_at,
+        )
+        .await?;
+    }
+    if let Some(lease) = admission.workspace_lease {
+        super::workspace_lease::insert_workspace_lease_in_tx(tx, lease).await?;
+    }
+    let event = append_event(db, tx, event_input).await?;
+    Ok((execution, event))
 }
 
 fn work_unit_write_error(error: sqlx::Error) -> DbError {
@@ -689,67 +758,446 @@ impl WorkUnitExecutionRepo for SqliteDb {
         event_input: CreateDomainEvent,
     ) -> Result<CollaborationWrite<Execution>> {
         let mut tx = self.pool.begin().await?;
-        let requires_integration = sqlx::query_scalar::<_, i64>(
-            "SELECT requires_integration FROM work_unit WHERE id = ? AND task_id = ?",
-        )
-        .bind(&input.work_unit_id)
-        .bind(&input.execution.task_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(DbError::NotFound)?
-            != 0;
-        if input.execution.status != ExecutionStatus::Running
-            || requires_integration != input.workspace_lease.is_some()
-        {
-            return Err(DbError::Check(
-                "WorkUnit Executions require a running Execution and repository work requires an exact WorkspaceLease"
-                    .to_owned(),
-            ));
-        }
-        if let Some(lease) = input.workspace_lease.as_ref() {
-            let actor = input.execution.actor_ref.as_ref();
-            let expected_lease_role = if input.execution.role == "reviewer" {
-                "reviewer"
-            } else {
-                "worker"
-            };
-            if lease.task_id != input.execution.task_id
-                || lease.work_unit_id.as_deref() != Some(input.work_unit_id.as_str())
-                || lease.workspace_id != input.execution.workspace_id
-                || lease.execution_id != input.execution.id
-                || lease.role != expected_lease_role
-                || Some(lease.assigned_principal_type.as_str())
-                    != actor.map(|actor| actor.kind().to_string()).as_deref()
-                || actor.map(|actor| actor.id()) != Some(lease.assigned_principal_id.as_str())
-            {
-                return Err(DbError::Check(
-                    "WorkUnit WorkspaceLease does not match its Execution binding".to_owned(),
-                ));
-            }
-        }
-        let execution = Self::create_execution_in_tx(
+        let (execution, event) = insert_work_unit_execution_in_tx(
+            self,
             &mut tx,
-            &input.execution,
-            Some((&input.work_unit_id, input.work_unit_version)),
+            input,
+            artifact_input_ids,
+            &event_input,
         )
         .await?;
-        for artifact_id in artifact_input_ids {
-            super::collaboration::pin_execution_artifact_input_in_tx(
-                &mut tx,
-                &input.execution.id,
-                &artifact_id,
-                &input.execution.created_at,
-            )
-            .await?;
-        }
-        if let Some(lease) = input.workspace_lease {
-            super::workspace_lease::insert_workspace_lease_in_tx(&mut tx, lease).await?;
-        }
-        let event = append_event(self, &mut tx, &event_input).await?;
         tx.commit().await?;
         Ok(CollaborationWrite {
             record: execution,
             event,
+        })
+    }
+
+    async fn get_follow_up_execution_receipt(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<FollowUpExecutionReceipt>> {
+        sqlx::query(
+            "SELECT idempotency_key, parent_execution_id, request_digest, execution_id
+             FROM execution_follow_up_receipt WHERE idempotency_key = ?",
+        )
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| {
+            Ok(FollowUpExecutionReceipt {
+                idempotency_key: row.try_get("idempotency_key")?,
+                parent_execution_id: row.try_get("parent_execution_id")?,
+                request_digest: row.try_get("request_digest")?,
+                execution_id: row.try_get("execution_id")?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn admit_with_lifecycle_and_artifact_inputs(
+        &self,
+        input: AdmitWorkUnitExecutionWithLifecycle,
+        artifact_input_ids: Vec<String>,
+        execution_event_input: CreateDomainEvent,
+    ) -> Result<WorkUnitExecutionLifecycleWrite> {
+        let admission = input.admission;
+        let task_id = admission.execution.task_id.as_str();
+        if let Some(receipt) = input.follow_up_receipt.as_ref() {
+            if receipt.idempotency_key.trim().is_empty()
+                || receipt.idempotency_key.len() > 256
+                || receipt.request_digest.len() != 64
+                || !receipt
+                    .request_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                || admission.execution.parent_execution_id.as_deref()
+                    != Some(receipt.parent_execution_id.as_str())
+            {
+                return Err(DbError::Check(
+                    "follow-up receipt must bind a bounded key, digest, and exact parent"
+                        .to_owned(),
+                ));
+            }
+        }
+        if admission.execution.status != ExecutionStatus::Running
+            || admission.execution.purpose.is_none()
+            || execution_event_input.event_type != "execution.started"
+            || execution_event_input.entity_type != "execution"
+            || execution_event_input.entity_id != admission.execution.id
+            || execution_event_input.scope_type != "task"
+            || execution_event_input.scope_id != task_id
+        {
+            return Err(DbError::Check(
+                "ordinary WorkUnit admission requires one exact Running Execution and start event"
+                    .to_owned(),
+            ));
+        }
+
+        let transition_count = i64::try_from(input.lifecycle_transitions.len())
+            .map_err(|_| DbError::Check("too many lifecycle transitions".to_owned()))?;
+        if transition_count > 2 {
+            return Err(DbError::Check(
+                "ordinary WorkUnit admission may apply at most two lifecycle transitions"
+                    .to_owned(),
+            ));
+        }
+        let expected_final_state = if transition_count == 0 {
+            crate::TaskLifecycleState::Active
+        } else {
+            input.lifecycle_transitions.last().unwrap().to_state
+        };
+        if expected_final_state != crate::TaskLifecycleState::Active {
+            return Err(DbError::Check(
+                "ordinary WorkUnit admission must preserve or activate TaskLifecycle".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(receipt) = input.follow_up_receipt.as_ref() {
+            let prior = sqlx::query(
+                "SELECT parent_execution_id, request_digest, execution_id
+                 FROM execution_follow_up_receipt WHERE idempotency_key = ?",
+            )
+            .bind(&receipt.idempotency_key)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(prior) = prior {
+                let parent_execution_id: String = prior.try_get("parent_execution_id")?;
+                let request_digest: String = prior.try_get("request_digest")?;
+                let execution_id: String = prior.try_get("execution_id")?;
+                if parent_execution_id != receipt.parent_execution_id
+                    || request_digest != receipt.request_digest
+                {
+                    return Err(DbError::IdempotencyConflict);
+                }
+                let execution = sqlx::query(
+                    "SELECT * FROM execution
+                     WHERE id = ? AND parent_execution_id = ? AND task_id = ?",
+                )
+                .bind(&execution_id)
+                .bind(&receipt.parent_execution_id)
+                .bind(task_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(super::map_execution)
+                .transpose()?
+                .ok_or_else(|| {
+                    DbError::Check(
+                        "follow-up receipt does not resolve to its exact child Execution"
+                            .to_owned(),
+                    )
+                })?;
+                let has_start_event: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM domain_event
+                        WHERE event_type = 'execution.started'
+                          AND entity_type = 'execution' AND entity_id = ?
+                          AND scope_type = 'task' AND scope_id = ?
+                    )",
+                )
+                .bind(&execution.id)
+                .bind(task_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !has_start_event {
+                    return Err(DbError::Check(
+                        "follow-up receipt child has no durable start event".to_owned(),
+                    ));
+                }
+                tx.commit().await?;
+                return Ok(WorkUnitExecutionLifecycleWrite {
+                    execution,
+                    lifecycle_events: Vec::new(),
+                    execution_event: None,
+                    idempotent_replay: true,
+                });
+            }
+        }
+        let task_row = sqlx::query(
+            "SELECT version, error_annotation, blocked_json, metadata_json
+             FROM task WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        let task_version: i64 = task_row.try_get("version")?;
+        if task_version != input.expected_task_version {
+            return Err(DbError::TaskVersionConflict {
+                expected: input.expected_task_version,
+                actual: task_version,
+            });
+        }
+        let lifecycle_row =
+            sqlx::query("SELECT state, version FROM task_lifecycle WHERE task_id = ?")
+                .bind(task_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DbError::NotFound)?;
+        let current_state =
+            parse_enum::<crate::TaskLifecycleState>(lifecycle_row.try_get("state")?)?;
+        let current_lifecycle_version: i64 = lifecycle_row.try_get("version")?;
+        if current_state != input.expected_lifecycle_state
+            || current_lifecycle_version != input.expected_lifecycle_version
+        {
+            return Err(DbError::VersionConflict);
+        }
+        let retry_budget_exhausted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM task_failure_retry_receipt receipt
+                 WHERE receipt.task_id = ? AND receipt.disposition = 'exhausted'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_retry_override override
+                       WHERE override.exhaustion_receipt_id = receipt.id
+                         AND override.task_id = receipt.task_id
+                         AND override.failure_kind = receipt.failure_kind
+                   )
+             )",
+        )
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if retry_budget_exhausted {
+            return Err(DbError::Check(
+                "Task retry budget is exhausted; WorkUnit Execution admission is fenced".to_owned(),
+            ));
+        }
+        match (current_state, input.lifecycle_transitions.as_slice()) {
+            (crate::TaskLifecycleState::Active, [])
+            | (crate::TaskLifecycleState::Ready | crate::TaskLifecycleState::Blocked, [_])
+            | (crate::TaskLifecycleState::Backlog, [_, _]) => {}
+            _ => {
+                return Err(DbError::Check(
+                    "ordinary WorkUnit admission lifecycle path is outside the bounded activation contract"
+                        .to_owned(),
+                ));
+            }
+        }
+        let mut planned_state = current_state;
+        let mut planned_lifecycle_version = current_lifecycle_version;
+        let mut planned_task_version = input.expected_task_version;
+        for transition in &input.lifecycle_transitions {
+            let expected_idempotency_key = match planned_state {
+                crate::TaskLifecycleState::Backlog => {
+                    format!("execution-start:{task_id}:backlog:{planned_lifecycle_version}")
+                }
+                crate::TaskLifecycleState::Ready | crate::TaskLifecycleState::Blocked => {
+                    format!("execution-start:{task_id}:active:{planned_lifecycle_version}")
+                }
+                _ => String::new(),
+            };
+            let expected_reason_ref = match planned_state {
+                crate::TaskLifecycleState::Backlog => format!("task:{task_id}:backlog-to-ready"),
+                crate::TaskLifecycleState::Ready | crate::TaskLifecycleState::Blocked => {
+                    format!("task:{task_id}:active")
+                }
+                _ => String::new(),
+            };
+            let expected_to_state = if planned_state == crate::TaskLifecycleState::Backlog {
+                crate::TaskLifecycleState::Ready
+            } else {
+                crate::TaskLifecycleState::Active
+            };
+            let event_payload: serde_json::Value =
+                serde_json::from_str(&transition.event.payload_json).map_err(|error| {
+                    DbError::Check(format!("invalid lifecycle event payload: {error}"))
+                })?;
+            if transition.task_id != task_id
+                || transition.expected_state != planned_state
+                || transition.expected_lifecycle_version != planned_lifecycle_version
+                || transition.expected_task_version != planned_task_version
+                || transition.idempotency_key != expected_idempotency_key
+                || transition.to_state != expected_to_state
+                || transition.cause_kind != "system"
+                || transition.cause_ref.as_deref() != Some("executor")
+                || transition.reason_kind.as_deref() != Some("execution_start")
+                || transition.reason_ref.as_deref() != Some(expected_reason_ref.as_str())
+                || transition.gate_evaluation_id.is_some()
+                || transition.event.event_type != "task.lifecycle_changed"
+                || transition.event.entity_type != "task"
+                || transition.event.entity_id != task_id
+                || transition.event.scope_type != "task"
+                || transition.event.scope_id != task_id
+                || transition.event.correlation_id != transition.idempotency_key
+                || transition.event.dedupe_key.as_deref()
+                    != Some(
+                        format!("task-lifecycle:{task_id}:{}", transition.idempotency_key).as_str(),
+                    )
+                || event_payload
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(task_id)
+                || event_payload
+                    .get("from_state")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(planned_state.to_string().as_str())
+                || event_payload
+                    .get("to_state")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(expected_to_state.to_string().as_str())
+                || event_payload
+                    .get("from_version")
+                    .and_then(serde_json::Value::as_i64)
+                    != Some(planned_lifecycle_version)
+                || event_payload
+                    .get("to_version")
+                    .and_then(serde_json::Value::as_i64)
+                    != planned_lifecycle_version.checked_add(1)
+                || event_payload
+                    .get("cause_kind")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("system")
+                || event_payload
+                    .get("cause_ref")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("executor")
+                || event_payload
+                    .get("reason_kind")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("execution_start")
+                || event_payload
+                    .get("reason_ref")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(expected_reason_ref.as_str())
+            {
+                return Err(DbError::Check(
+                    "ordinary WorkUnit admission lifecycle receipt does not match its exact activation edge"
+                        .to_owned(),
+                ));
+            }
+            planned_state = transition.to_state;
+            planned_lifecycle_version = planned_lifecycle_version
+                .checked_add(1)
+                .ok_or_else(|| DbError::Check("TaskLifecycle version overflow".to_owned()))?;
+            planned_task_version = planned_task_version
+                .checked_add(1)
+                .ok_or_else(|| DbError::Check("Task version overflow".to_owned()))?;
+        }
+        if input.lifecycle_transitions.is_empty()
+            && (current_state != crate::TaskLifecycleState::Active
+                || current_lifecycle_version != input.expected_lifecycle_version)
+        {
+            return Err(DbError::VersionConflict);
+        }
+
+        if let Some(parent_execution_id) = admission.execution.parent_execution_id.as_deref() {
+            let parent_is_exact: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM execution
+                    WHERE id = ? AND task_id = ? AND work_unit_id = ?
+                      AND workspace_id IS ?
+                      AND status IN ('completed', 'failed', 'cancelled')
+                )",
+            )
+            .bind(parent_execution_id)
+            .bind(task_id)
+            .bind(&admission.work_unit_id)
+            .bind(admission.execution.workspace_id.as_deref())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !parent_is_exact {
+                return Err(DbError::VersionConflict);
+            }
+        }
+
+        if let Some(clear) = input.clear_blocking_metadata.as_ref() {
+            if clear.expected_error_annotation.is_none()
+                || task_row.try_get::<Option<String>, _>("error_annotation")?
+                    != clear.expected_error_annotation
+                || task_row.try_get::<Option<String>, _>("blocked_json")?
+                    != clear.expected_blocked_json
+                || task_row.try_get::<Option<String>, _>("metadata_json")?
+                    != clear.expected_metadata_json
+            {
+                return Err(DbError::VersionConflict);
+            }
+        }
+
+        let mut lifecycle_events = Vec::with_capacity(input.lifecycle_transitions.len());
+        for transition in &input.lifecycle_transitions {
+            let (_, event) =
+                super::gate_lifecycle::record_lifecycle_transition_in_tx(self, &mut tx, transition)
+                    .await?;
+            let updated_task = sqlx::query(
+                "UPDATE task SET version = version + 1, updated_at = ?
+                 WHERE id = ? AND version = ? AND deleted_at IS NULL",
+            )
+            .bind(&transition.updated_at)
+            .bind(task_id)
+            .bind(transition.expected_task_version)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if updated_task != 1 {
+                return Err(DbError::VersionConflict);
+            }
+            lifecycle_events.push(event);
+        }
+
+        let mut final_task_version = planned_task_version;
+        if let Some(clear) = input.clear_blocking_metadata {
+            let updated_task = sqlx::query(
+                "UPDATE task
+                 SET error_annotation = NULL, blocked_json = NULL,
+                     metadata_json = ?, version = version + 1, updated_at = ?
+                 WHERE id = ? AND version = ? AND error_annotation IS ?
+                   AND blocked_json IS ? AND metadata_json IS ? AND deleted_at IS NULL",
+            )
+            .bind(clear.replacement_metadata_json.as_deref())
+            .bind(&admission.execution.created_at)
+            .bind(task_id)
+            .bind(final_task_version)
+            .bind(clear.expected_error_annotation.as_deref())
+            .bind(clear.expected_blocked_json.as_deref())
+            .bind(clear.expected_metadata_json.as_deref())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if updated_task != 1 {
+                return Err(DbError::VersionConflict);
+            }
+            final_task_version = final_task_version
+                .checked_add(1)
+                .ok_or_else(|| DbError::Check("Task version overflow".to_owned()))?;
+        }
+        if let Some(lease) = admission.workspace_lease.as_ref() {
+            if lease.task_version != final_task_version {
+                return Err(DbError::Check(
+                    "WorkUnit WorkspaceLease Task version does not match lifecycle admission"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        let (execution, execution_event) = insert_work_unit_execution_in_tx(
+            self,
+            &mut tx,
+            admission,
+            artifact_input_ids,
+            &execution_event_input,
+        )
+        .await?;
+        if let Some(receipt) = input.follow_up_receipt {
+            sqlx::query(
+                "INSERT INTO execution_follow_up_receipt
+                    (idempotency_key, parent_execution_id, request_digest, execution_id, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&receipt.idempotency_key)
+            .bind(&receipt.parent_execution_id)
+            .bind(&receipt.request_digest)
+            .bind(&execution.id)
+            .bind(&execution.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(WorkUnitExecutionLifecycleWrite {
+            execution,
+            lifecycle_events,
+            execution_event: Some(execution_event),
+            idempotent_replay: false,
         })
     }
 
@@ -891,25 +1339,14 @@ impl WorkUnitExecutionRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
-        let execution = Self::create_execution_in_tx(
+        let (execution, execution_event) = insert_work_unit_execution_in_tx(
+            self,
             &mut tx,
-            &admission.execution,
-            Some((&admission.work_unit_id, admission.work_unit_version)),
+            admission,
+            artifact_input_ids,
+            &execution_event_input,
         )
         .await?;
-        for artifact_id in artifact_input_ids {
-            super::collaboration::pin_execution_artifact_input_in_tx(
-                &mut tx,
-                &admission.execution.id,
-                &artifact_id,
-                &admission.execution.created_at,
-            )
-            .await?;
-        }
-        if let Some(lease) = admission.workspace_lease {
-            super::workspace_lease::insert_workspace_lease_in_tx(&mut tx, lease).await?;
-        }
-        let execution_event = append_event(self, &mut tx, &execution_event_input).await?;
         tx.commit().await?;
         Ok(RecoveryWorkUnitExecutionWrite {
             execution,

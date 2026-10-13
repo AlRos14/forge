@@ -9,6 +9,7 @@ impl TaskService {
         prompt: String,
         trigger: &str,
         purpose: ExecutionPurpose,
+        idempotency_key: String,
     ) -> Result<Execution> {
         self.dispatch_role_follow_up_exact(
             task_id,
@@ -18,6 +19,7 @@ impl TaskService {
             prompt,
             trigger,
             purpose,
+            idempotency_key,
         )
         .await
     }
@@ -31,6 +33,7 @@ impl TaskService {
         prompt: String,
         trigger: &str,
         purpose: ExecutionPurpose,
+        idempotency_key: String,
     ) -> Result<Execution> {
         self.dispatch_role_follow_up_exact(
             task_id,
@@ -40,6 +43,7 @@ impl TaskService {
             prompt,
             trigger,
             purpose,
+            idempotency_key,
         )
         .await
     }
@@ -53,6 +57,7 @@ impl TaskService {
         prompt: String,
         trigger: &str,
         purpose: ExecutionPurpose,
+        idempotency_key: String,
     ) -> Result<Execution> {
         validate_required("task_id", task_id)?;
         validate_required("role", role)?;
@@ -73,20 +78,22 @@ impl TaskService {
             ));
         }
         let result = self
-            .follow_up_execution(parent.id.clone(), prompt, agent_id, None)
+            .follow_up_execution(parent.id.clone(), prompt, agent_id, None, idempotency_key)
             .await?;
-        self.start_execution(result.execution.id.clone()).await?;
-        self.publish(ForgeEvent {
-            event_type: "follow_up.dispatched".to_owned(),
-            entity_id: task_id.to_owned(),
-            timestamp: event_timestamp(),
-            context: EventContext::FollowUpDispatched {
-                task_id: task_id.to_owned(),
-                parent_execution_id: parent.id,
-                execution_id: result.execution.id.clone(),
-                trigger: trigger.to_owned(),
-            },
-        });
+        if !result.idempotent_replay {
+            self.start_execution(result.execution.id.clone()).await?;
+            self.publish(ForgeEvent {
+                event_type: "follow_up.dispatched".to_owned(),
+                entity_id: task_id.to_owned(),
+                timestamp: event_timestamp(),
+                context: EventContext::FollowUpDispatched {
+                    task_id: task_id.to_owned(),
+                    parent_execution_id: parent.id,
+                    execution_id: result.execution.id.clone(),
+                    trigger: trigger.to_owned(),
+                },
+            });
+        }
         ExecutionRepo::get_by_id(&*self.db, &result.execution.id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", result.execution.id))

@@ -50,13 +50,14 @@ change PR14 branding or introduce PR15 scenarios.
 | V130 | Archives workflow, transition-log, deferred-dispatch, default-role-setting and Task-move history; drops retired columns/tables. |
 | V131 | Archives old Review rows; detaches and preserves V099 migration ledgers; drops the Review table. |
 | V132 | Archives PR11 legacy rows and Project OS fields, checks expected row counts/FKs/integrity, then removes retired tables and authority triggers. |
+| V133 | Adds immutable follow-up operation receipts so one idempotency key replays its exact child Execution and cannot authorize different request content. |
 
 V001–V120 are unchanged. SQLite rebuild migrations use explicit direct-connection
 stages where PRAGMAs require it. Their migration receipt is written inside the
 same durable transaction as the schema change. On a failed direct migration the
 runner rolls back and restores `foreign_keys=ON` and `legacy_alter_table=OFF` on
-the pooled connection. A restart skips committed receipts; a second V120→V132
-pass is idempotent.
+the pooled connection. A restart skips committed receipts. V120→V132 restart
+and V132→V133 restart were verified separately.
 
 ## Preserved invariants and data locations
 
@@ -83,6 +84,10 @@ pass is idempotent.
 - DomainEvents, idempotency receipts and migration ledgers remain history.
   V088, V089, V098, V099, V100 and V118 provenance is retained; V098/V099 source
   FKs are detached only where their source table is removed.
+- Follow-up receipts bind a stable request key and content digest to the exact
+  parent and admitted child. A replay returns that Execution without replaying
+  DomainEvents or provider start. Project teardown removes these immutable
+  receipts only under its existing guarded teardown transaction.
 - PR11 writers and operational readers do not return. `agent_session_history`
   remains only for explicitly retained credential/history reads; no Project OS
   writer, Release creator or readiness evaluator is restored.
@@ -217,3 +222,118 @@ No PR exists for this branch as of publication, so no PR body was changed and
 none was opened. Create it from:
 
 `https://github.com/AlRos14/forge/compare/main...feat/plan-pr13-destructive-persistence-cleanup?expand=1`
+
+## PR13 microfix audit — 2026-10-13
+
+This update is scoped to the two lifecycle/admission P1 findings. It preserves
+the prior PR13 record above and does not start PR14.
+
+### Git checkpoint
+
+- Branch: `feat/plan-pr13-destructive-persistence-cleanup`.
+- Base and merge-base: `origin/main` / `3d3b6b196672568c85e4c3cd2c11f010b1f62d9a`.
+- Microfix initial HEAD: `534e82d1f111890cb3bbadfad1848aae1988d9d6`.
+- Completion report records the microfix commit SHA and remote read-back.
+
+### Findings and fixes
+
+**P1-1 — TaskLifecycle activation reused an entity-wide idempotency key.**
+`execution-start:{task_id}:active` and the Backlog key did not distinguish a
+later valid transition from an earlier receipt. Activation keys now include the
+exact source TaskLifecycle version; the Backlog-to-Ready and Ready-to-Active
+edges use their respective source versions. `TaskLifecycleService` builds the
+same receipt-bearing transition records consumed by the PR9 repository path;
+WorkUnit admission writes them through the existing CAS and content comparison
+in the same transaction as Execution admission. Retries of one transition keep
+the same key and receipt, a later lifecycle version gets a new key, and reuse
+for different content still conflicts. No historical receipt is rewritten.
+
+**P1-2 — ordinary launch and follow-up could persist lifecycle or clear
+recovery metadata before child admission.** The former shared activation helper
+is removed. Initial launch, ordinary re-execute, and follow-up now prepare their
+lifecycle plan, frozen executor snapshot, and ArtifactInputs before writes;
+Task/version, lifecycle receipt(s), optional metadata cleanup, exact Execution,
+ArtifactInputs, WorkspaceLease, and durable events commit together through the
+bounded WorkUnit admission primitive. Recovery continues through its existing
+specialized atomic primitive.
+
+| Path | Preflight | Durable effects before admission | One local commit | External boundary |
+|---|---|---|---|---|
+| Initial WorkUnit launch | Actor, RoleMembership, exact WorkUnit/version, capacity, Task lifecycle, exact ready Workspace, snapshot and ArtifactInputs | None | Lifecycle activation when required, Execution, ArtifactInputs, lease and events | Provider start follows commit |
+| Follow-up | Exact terminal parent, exact WorkUnit/Workspace and assignment, reusable exact HarnessSession, snapshot and inherited ArtifactInputs | None; blocking cleanup is only a plan | Lifecycle activation, metadata cleanup, child lineage, ArtifactInputs, lease, events and V133 request receipt | Provider start follows commit; a repeated key returns the admitted child without starting another provider attempt |
+| Ordinary re-execute | Exact parent, WorkUnit/Workspace, Actor/membership, snapshot and ArtifactInputs | None | Lifecycle activation when required, child lineage, Execution, ArtifactInputs, lease and events | Provider start follows commit |
+| Explicit recovery | Existing exact recovery preflight | None | Existing recovery transaction commits Blocked→Active, annotation cleanup, child, ArtifactInputs, lease and events | Provider start follows commit |
+
+The V133 receipt stores a digest of the stable request fields, exact parent, and
+child ID. Same-key/same-content retries return the recorded child, including
+after an uncertain response. Same-key/different-content attempts return
+`IdempotencyConflict`. A new user-authorized follow-up uses a new key. REST and
+MCP require the key; the web client retains it for a retry of unchanged form
+content and clears it after success. No server-generated random ID is used to
+turn a retry into a new operation.
+
+### Focused evidence
+
+| Command or check | Result |
+|---|---|
+| `cargo test -p services --lib execution_activation --locked --offline -- --test-threads=1` | PASS, 2 lifecycle key/replay tests; verifies versions, receipts, events and conflict on changed content. |
+| `cargo test -p services --lib ordinary_launch_ --locked --offline -- --test-threads=1` | PASS, 3 tests for snapshot, artifact binding, and WorkUnit-version rejection. |
+| `cargo test -p services --lib ordinary_repository_launch_workspace_readiness_race_rolls_back_lifecycle --locked --offline -- --test-threads=1` | PASS, Workspace readiness race leaves no activation. |
+| `cargo test -p services --lib ordinary_provider_start_failure_keeps_one_admitted_execution_and_event --locked --offline -- --test-threads=1` | PASS, post-commit provider failure leaves one admitted Execution and one start event. |
+| `cargo test -p services --lib ordinary_reexecute_ --locked --offline -- --test-threads=1` | PASS, 2 snapshot/version rejection tests. |
+| `cargo test -p services --lib follow_up_retry_replays_exact_child_and_new_key_authorizes_next_child --locked --offline -- --test-threads=1` | PASS; exact retry replay, changed-content conflict, and new-key authorization after the first child is terminal. |
+| `cargo test -p services --lib concurrent_follow_up_retries_replay_one_child_and_one_activation_receipt --locked --offline -- --test-threads=1` | PASS; competing same-key requests return one child with one lifecycle receipt and no duplicate events. |
+| Follow-up rejection tests for ended HarnessSession, RoleMembership change, and ArtifactInput pin failure | PASS, 3 focused tests; TaskLifecycle and recovery annotations remain intact. |
+| `cargo test -p services --lib recovery_admission_ --locked --offline -- --test-threads=1` | PASS, 3 existing recovery transaction race/rollback tests. |
+| `cargo test -p services --lib follow_up_ --locked --offline -- --test-threads=1` | PASS, 17 tests; canonical exact WorkUnit/HarnessSession fixtures, independent sibling WorkUnit progress, idempotent replay, membership/session/artifact rejection, and metadata preservation. |
+| `cargo test -p services --lib follow_up_work_unit_version_change_rolls_back_lifecycle_and_metadata --locked --offline -- --test-threads=1` | PASS; deterministic WorkUnit revision change during admission rolls back lifecycle, recovery metadata, child, event, and follow-up receipt. |
+| `cargo test -p services --lib rejected_recovery_cancel_preserves_blocking_metadata --locked --offline -- --test-threads=1` | PASS; rejected cancellation preserves annotation; accepted cancellation clears it only after lifecycle success. |
+| `cargo test -p db --test file_backed_migration v133_follow_up_receipts_upgrade_from_v132_and_restart_cleanly --locked --offline` | PASS, V132→V133 upgrade/restart, foreign-key check, and integrity check. An initial attempt exposed an unnecessary nested transaction; V133 now relies on the migration runner's transaction. |
+| `cargo test -p api-types --lib follow_up_requires_a_stable_idempotency_key --locked --offline` | PASS; request decoding requires the key. |
+| `cargo test -p mcp-server --lib tools_list_returns_descriptors --locked --offline` | PASS; MCP advertises the required key. |
+| `cargo test -p api --test pr12_public_surface task_and_execution_routes_enforce_project_visibility --locked --offline -- --test-threads=1` | PASS, public route contract and authorization. |
+| `pnpm typecheck` | PASS. |
+| `cargo check -p services -p db -p api -p mcp-server --locked --offline` | PASS. |
+| `cargo fmt --all -- --check`; `git diff --check` | PASS after final edits. |
+
+The first expanded `follow_up_` filter exposed eight stale fixtures or
+assertions: they constructed Task-scoped Executions without the exact
+WorkUnit/HarnessSession required by the existing validation, asserted the
+retired Task-wide running-role restriction, or expected an old error message.
+The fixtures now use canonical WorkUnit admission and exact HarnessSession
+records; the retired restriction test now verifies that a child remains bound
+to its parent WorkUnit while an independent sibling WorkUnit runs. The final
+same filter passed all 17 tests. A subsequent deterministic follow-up
+WorkUnit-version race test also passed and verified no receipt survives the
+rollback. No production authority guard was relaxed.
+No workspace-wide test/build or global clippy run was made, per the task
+constraint. Remote CI was not run.
+
+### Residual risks and final census
+
+- Provider execution remains outside SQLite. If provider start fails after
+  admission, the exact Execution and receipt remain durable; retrying the same
+  follow-up key cannot make a duplicate child or provider start. Provider retry
+  remains an exact Execution/recovery operation.
+- REST/MCP clients must preserve one key across a transport retry and use a new
+  key for a separately authorized follow-up.
+- The static call-site audit found no remaining pre-admission lifecycle
+  activation in initial launch, follow-up, or ordinary re-execute; their
+  lifecycle records are part of WorkUnit admission. Blocking metadata is only
+  cleared through that admission plan or after accepted cancellation. The old
+  entity-wide activation keys are absent, and no legacy Task status, singleton
+  assignee, or recency-based WorkUnit/Workspace/HarnessSession selection was
+  introduced. PR5/PR6/PR9 Actor, RoleMembership, WorkUnit, capacity, Workspace,
+  and receipt guards remain in force.
+- No P0/P1/P2/P3 finding remains in the audited scope.
+
+```text
+P0 = 0
+P1 = 0
+P2 = 0
+P3 = 0
+BUG_STILL_LIVE = 0
+```
+
+Final HEAD, push SHA, remote-ref equality, clean-tree check, and final READY
+decision are recorded in the completion report. Merge remains unauthorized.

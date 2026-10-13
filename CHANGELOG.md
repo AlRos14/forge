@@ -8,6 +8,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Follow-up Execution requests now require `idempotency_key`. Repeating the same key and request replays the exact admitted child; using that key for different request content conflicts. A new authorized follow-up supplies a new key.
 - Task Execution start now requires an explicitly allocated WorkUnit and expected WorkUnit version. Task-level Agent/role selection and Task-level Start are retired; repository Executions use the exact WorkUnit Workspace.
 - Human Review start now uses only the explicitly supplied Workspace ID; `workspace_id: null` starts a Workspace-free Review and does not infer the Task integration Workspace.
 - Plan PR13 removes legacy persistence after exact-history cutovers. TaskLifecycle replaces Task status/configuration, TaskRole/RoleMembership replaces singleton assignment, WorkUnit identity replaces Task-scoped workspace recovery and reset, and the old workflow, transition-log, task-move, Review, V081 Task Plan, and active native AgentSession runtime stores are retired. Exact historical rows and V099 migration provenance remain in dedicated history tables; ProjectRelease GET reads use self-contained snapshots.

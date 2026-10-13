@@ -541,7 +541,9 @@ async fn task_and_execution_routes_enforce_project_visibility() {
         (
             Method::POST,
             format!("/api/v1/executions/{execution_id}/follow-up"),
-            Some(json!({"agent_id": "agent-any", "message": "continue"})),
+            Some(
+                json!({"idempotency_key": "pr12-surface-follow-up", "agent_id": "agent-any", "message": "continue"}),
+            ),
         ),
         (
             Method::POST,

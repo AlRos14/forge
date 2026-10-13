@@ -148,7 +148,7 @@ their source records remain only in migration history where preserved.
 | `GET /tasks/{id}/executions` | List exact historical Task Executions. |
 | `POST /tasks/{id}/executions` | Start an Agent Execution from `work_unit_id` and `expected_work_unit_version`, with explicit `purpose`, `prompt`, and optional exact `input_artifact_ids` and overrides. Role and Actor come from the allocated WorkUnit. Repository execution prepares and binds that WorkUnit's exact isolated Workspace. |
 | `GET /executions/{id}` | Read one exact Execution, including its Actor, role, purpose, HarnessSession reference, frozen execution configuration, and workspace identity. |
-| `POST /executions/{id}/follow-up` | Create a child from the exact parent Execution. `agent_id` is required. A same-Agent continuation can reuse only the exact compatible HarnessSession; it never substitutes a current role member or latest Execution. |
+| `POST /executions/{id}/follow-up` | Create a child from the exact parent Execution. `idempotency_key`, `message`, and `agent_id` are required. Repeating the same key and request replays the exact child; reusing the key with different request content conflicts. A new authorized follow-up uses a new key. A same-Agent continuation can reuse only the exact compatible HarnessSession; it never substitutes a current role member or latest Execution. |
 | `POST /executions/{id}/cancel` | Cancel the exact Execution. |
 | `GET /executions/{id}/logs`, `GET /executions/{id}/hook-logs` | Read the exact Execution's persisted log output and hook logs. |
 | `GET /executions/{id}/usage`, `GET /tasks/{id}/usage` | Read Execution or aggregate Task usage. |
