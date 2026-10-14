@@ -109,32 +109,46 @@ impl TaskService {
             &ExecutionStatus::Failed,
             &failed_at,
         );
-        let (execution, committed_event) = ExecutionRepo::update_with_event(
+        let update = db::UpdateExecution {
+            id: execution_id.to_owned(),
+            status: Some(ExecutionStatus::Failed),
+            stop_reason: Some(Some(db::StopReason::ExecutorFailed)),
+            stopped_by: Some(Some(
+                api_types::Actor::system(api_types::SystemComponent::Dispatch).display(),
+            )),
+            resume_policy: Some(Some(db::ResumePolicy::Manual)),
+            stopped_at: Some(Some(failed_at.clone())),
+            external_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: Some(Some(error)),
+            executor_config_snapshot_json: None,
+            updated_at: failed_at,
+        };
+        let (execution, committed_event) = match ExecutionRepo::fail_pending_provider_start(
             &*self.db,
-            db::UpdateExecution {
-                id: execution_id.to_owned(),
-                status: Some(ExecutionStatus::Failed),
-                stop_reason: Some(Some(db::StopReason::ExecutorFailed)),
-                stopped_by: Some(Some(
-                    api_types::Actor::system(api_types::SystemComponent::Dispatch).display(),
-                )),
-                resume_policy: Some(Some(db::ResumePolicy::Manual)),
-                stopped_at: Some(Some(now_rfc3339())),
-                external_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: Some(Some(error)),
-                executor_config_snapshot_json: None,
-                updated_at: failed_at,
-            },
-            event,
+            execution_id,
+            update.clone(),
+            event.clone(),
         )
-        .await
-        .map_err(ServiceError::from)?;
+        .await?
+        {
+            db::PendingProviderStartFailure::Resolved(execution, event) => (execution, event),
+            db::PendingProviderStartFailure::Attempted(execution)
+            | db::PendingProviderStartFailure::NotRunning(execution) => return Ok(execution),
+            db::PendingProviderStartFailure::NotPending(execution) => {
+                if execution.status != ExecutionStatus::Running {
+                    return Ok(execution);
+                }
+                ExecutionRepo::update_with_event(&*self.db, update, event)
+                    .await
+                    .map_err(ServiceError::from)?
+            }
+        };
         self.publish_committed_domain_event(&committed_event);
         self.revoke_active_workspace_lease_for_execution(&execution.task_id, &execution.id)
             .await;

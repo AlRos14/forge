@@ -207,10 +207,37 @@ impl HeartbeatMonitor {
     #[tracing::instrument(skip(self))]
     pub async fn check_once(&self) -> Result<u64> {
         let agents = self.list_busy_agents().await?;
+        let pending_provider_starts: HashSet<String> =
+            ExecutionRepo::list_pending_provider_starts(&*self.db)
+                .await?
+                .into_iter()
+                .map(|execution| execution.id)
+                .collect();
+        let running_executions = ExecutionRepo::list_running(&*self.db).await?;
         let mut timed_out = 0;
 
         for agent in agents {
             if !agent_timed_out(&agent) {
+                continue;
+            }
+
+            let mut has_pending_provider_start = false;
+            let mut timed_out_executions = Vec::new();
+            for execution in running_executions
+                .iter()
+                .filter(|execution| execution.agent_id.as_deref() == Some(agent.id.as_str()))
+            {
+                if pending_provider_starts.contains(&execution.id) {
+                    has_pending_provider_start = true;
+                } else {
+                    timed_out_executions.push(execution.clone());
+                }
+            }
+            if has_pending_provider_start && timed_out_executions.is_empty() {
+                tracing::debug!(
+                    agent_id = %agent.id,
+                    "skipping heartbeat timeout while the Agent only has queued provider Starts"
+                );
                 continue;
             }
 
@@ -253,10 +280,6 @@ impl HeartbeatMonitor {
                 },
             });
 
-            let timed_out_executions = ExecutionRepo::list_running(self.db.as_ref())
-                .await?
-                .into_iter()
-                .filter(|execution| execution.agent_id.as_deref() == Some(agent.id.as_str()));
             for (task_id, executions) in group_executions_by_task(timed_out_executions) {
                 let Some(task) = TaskRepo::get_by_id(self.db.as_ref(), &task_id, false).await?
                 else {
@@ -460,7 +483,17 @@ impl HeartbeatMonitor {
             return Ok(0);
         };
 
-        let running = ExecutionRepo::list_running(&*self.db).await?;
+        let pending_provider_starts: HashSet<String> =
+            ExecutionRepo::list_pending_provider_starts(&*self.db)
+                .await?
+                .into_iter()
+                .map(|execution| execution.id)
+                .collect();
+        let running: Vec<_> = ExecutionRepo::list_running(&*self.db)
+            .await?
+            .into_iter()
+            .filter(|execution| !pending_provider_starts.contains(&execution.id))
+            .collect();
         let mut running_ids = HashMap::new();
         for execution in &running {
             running_ids.insert(execution.id.clone(), ());
@@ -531,6 +564,13 @@ impl HeartbeatMonitor {
                 },
             )
             .await?;
+            if updated.status == ExecutionStatus::Running {
+                self.disconnect_observed
+                    .lock()
+                    .expect("disconnect observation lock")
+                    .remove(&execution.id);
+                continue;
+            }
             self.disconnect_observed
                 .lock()
                 .expect("disconnect observation lock")
@@ -579,21 +619,32 @@ async fn renew_workspace_leases(db: &SqliteDb) -> Result<u64> {
 /// the execution running long enough for `recover_task` to apply its normal
 /// requeue/block policy; the heartbeat path terminalizes it immediately.
 async fn expire_workspace_leases(
-    db: &SqliteDb,
-    event_bus: &EventBus,
+    db: &Arc<SqliteDb>,
+    event_bus: &Arc<EventBus>,
     daemon_connections: Option<&DaemonConnectionRegistry>,
     task_executor: Option<&dyn TaskExecutor>,
     task_service: Option<&TaskService>,
     terminalize_running: bool,
 ) -> Result<u64> {
-    let expired = WorkspaceLeaseRepo::expire(db, &now_rfc3339(), 500).await?;
+    let expired = WorkspaceLeaseRepo::expire(db.as_ref(), &now_rfc3339(), 500).await?;
     let expired_count = expired.len() as u64;
+    let default_task_service;
+    let authority_task_service = match task_service {
+        Some(task_service) => task_service,
+        None => {
+            default_task_service = TaskService::new(Arc::clone(db), Arc::clone(event_bus));
+            &default_task_service
+        }
+    };
+    let unresolved_pending =
+        resolve_pending_starts_without_authority(db.as_ref(), authority_task_service).await?;
     if !terminalize_running {
-        return Ok(expired_count);
+        return Ok(expired_count + unresolved_pending);
     }
 
     for lease in expired {
-        let Some(execution) = ExecutionRepo::get_by_id(db, &lease.execution_id).await? else {
+        let Some(execution) = ExecutionRepo::get_by_id(db.as_ref(), &lease.execution_id).await?
+        else {
             continue;
         };
         if execution.status != ExecutionStatus::Running {
@@ -626,7 +677,7 @@ async fn expire_workspace_leases(
             &now,
         );
         let updated = match ExecutionRepo::update_with_event(
-            db,
+            db.as_ref(),
             UpdateExecution {
                 id: execution.id.clone(),
                 status: Some(ExecutionStatus::Failed),
@@ -686,19 +737,71 @@ async fn expire_workspace_leases(
                 reason: "workspace_lease_expired".to_owned(),
             },
         });
-        if let Some(task_service) = task_service {
-            if let Err(error) = task_service.annotate_executor_failure_block(&updated).await {
-                tracing::warn!(
-                    execution_id = %updated.id,
-                    task_id = %updated.task_id,
-                    %error,
-                    "failed to cascade expired WorkspaceLease execution"
-                );
-            }
+        if let Err(error) = authority_task_service
+            .annotate_executor_failure_block(&updated)
+            .await
+        {
+            tracing::warn!(
+                execution_id = %updated.id,
+                task_id = %updated.task_id,
+                %error,
+                "failed to cascade expired WorkspaceLease execution"
+            );
         }
     }
 
-    Ok(expired_count)
+    Ok(expired_count + unresolved_pending)
+}
+
+async fn resolve_pending_starts_without_authority(
+    db: &SqliteDb,
+    task_service: &TaskService,
+) -> Result<u64> {
+    let pending = ExecutionRepo::list_pending_provider_starts(db).await?;
+    let mut resolved = 0;
+    for execution in pending {
+        let Err(error) = task_service
+            .verify_execution_workspace_authority(&execution)
+            .await
+        else {
+            continue;
+        };
+        if !is_lost_execution_authority(&error) {
+            return Err(error);
+        }
+
+        let current = ExecutionRepo::get_by_id(db, &execution.id).await?;
+        if !current.is_some_and(|current| current.status == ExecutionStatus::Running) {
+            continue;
+        }
+        let still_pending = ExecutionRepo::list_pending_provider_starts(db)
+            .await?
+            .into_iter()
+            .any(|pending| pending.id == execution.id);
+        if !still_pending {
+            continue;
+        }
+        let resolved_execution = task_service
+            .fail_execution_before_dispatch(
+                &execution.id,
+                format!("provider Start remained pending after its authority was lost: {error}"),
+            )
+            .await?;
+        if resolved_execution.status != ExecutionStatus::Running {
+            resolved += 1;
+        }
+    }
+    Ok(resolved)
+}
+
+fn is_lost_execution_authority(error: &ServiceError) -> bool {
+    matches!(
+        error,
+        ServiceError::InvalidOperation { .. }
+            | ServiceError::NotFound { .. }
+            | ServiceError::Conflict(_)
+            | ServiceError::AuthorizationDenied { .. }
+    )
 }
 
 async fn revoke_active_workspace_lease(db: &SqliteDb, execution_id: &str) {
@@ -1292,35 +1395,49 @@ pub(crate) async fn fail_execution_daemon_disconnected(
         stopped_by,
         reconciliation_reason,
     } = input;
+    let Some(current) = ExecutionRepo::get_by_id(db, &execution.id).await? else {
+        return Err(ServiceError::not_found("execution", execution.id.clone()));
+    };
+    if current.status != ExecutionStatus::Running {
+        return Ok(current);
+    }
     let now = now_rfc3339();
     let event = crate::task_service::execution_status_domain_event(
         execution,
         &ExecutionStatus::Failed,
         &now,
     );
-    let (updated, committed_event) = ExecutionRepo::update_with_event(
-        db,
-        UpdateExecution {
-            id: execution.id.clone(),
-            status: Some(ExecutionStatus::Failed),
-            stop_reason: Some(Some(StopReason::DaemonDisconnected)),
-            stopped_by: Some(Some(stopped_by.to_owned())),
-            resume_policy: Some(Some(ResumePolicy::Manual)),
-            stopped_at: Some(Some(now.clone())),
-            external_session_id: None,
-            agent_message_id: None,
-            last_activity_at: Some(Some(now.clone())),
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: Some(Some(error_message)),
-            executor_config_snapshot_json: None,
-            updated_at: now,
-        },
-        event,
-    )
-    .await?;
+    let update = UpdateExecution {
+        id: execution.id.clone(),
+        status: Some(ExecutionStatus::Failed),
+        stop_reason: Some(Some(StopReason::DaemonDisconnected)),
+        stopped_by: Some(Some(stopped_by.to_owned())),
+        resume_policy: Some(Some(ResumePolicy::Manual)),
+        stopped_at: Some(Some(now.clone())),
+        external_session_id: None,
+        agent_message_id: None,
+        last_activity_at: Some(Some(now.clone())),
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: Some(Some(error_message)),
+        executor_config_snapshot_json: None,
+        updated_at: now,
+    };
+    let (updated, committed_event) =
+        match ExecutionRepo::fail_running_unless_provider_start_pending(
+            db,
+            &execution.id,
+            update,
+            event,
+        )
+        .await?
+        {
+            db::RunningExecutionFailure::Failed(updated, event) => (updated, event),
+            db::RunningExecutionFailure::Pending(current)
+            | db::RunningExecutionFailure::NotRunning(current) => return Ok(current),
+        };
     crate::DomainEventService::publish_committed_hint(event_bus, &committed_event);
 
     revoke_active_workspace_lease(db, &updated.id).await;
@@ -1388,7 +1505,7 @@ pub(crate) async fn reconcile_daemon_report_executions(
 
     let mut interrupted = 0_u64;
     for execution in executions {
-        fail_execution_daemon_disconnected(
+        let updated = fail_execution_daemon_disconnected(
             db,
             event_bus,
             task_service,
@@ -1402,6 +1519,9 @@ pub(crate) async fn reconcile_daemon_report_executions(
             },
         )
         .await?;
+        if updated.status == ExecutionStatus::Running {
+            continue;
+        }
         interrupted += 1;
     }
     Ok(interrupted)
@@ -1798,6 +1918,24 @@ mod tests {
         agent_id: String,
         agent_session_id: Option<String>,
     ) -> db::Execution {
+        seed_work_unit_execution(db, task_id, agent_id, agent_session_id, true).await
+    }
+
+    async fn seed_pending_provider_execution(
+        db: &SqliteDb,
+        task_id: String,
+        agent_id: String,
+    ) -> db::Execution {
+        seed_work_unit_execution(db, task_id, agent_id, None, false).await
+    }
+
+    async fn seed_work_unit_execution(
+        db: &SqliteDb,
+        task_id: String,
+        agent_id: String,
+        agent_session_id: Option<String>,
+        provider_started: bool,
+    ) -> db::Execution {
         let agent = AgentRepo::get_by_id(db, &agent_id)
             .await
             .expect("agent loads")
@@ -1952,23 +2090,28 @@ mod tests {
         .await
         .expect("WorkUnit Execution creates")
         .record;
-        assert_eq!(
-            ExecutionRepo::claim_provider_start(
+        if provider_started {
+            assert_eq!(
+                ExecutionRepo::claim_provider_start(
+                    db,
+                    &execution.id,
+                    provider_start_receipt_for_test(
+                        &execution,
+                        "execution.provider_start_attempted",
+                    ),
+                )
+                .await
+                .expect("fixture records that provider Start was attempted"),
+                db::ProviderStartClaim::Claimed
+            );
+            ExecutionRepo::record_provider_start_outcome(
                 db,
                 &execution.id,
-                provider_start_receipt_for_test(&execution, "execution.provider_start_attempted",),
+                provider_start_receipt_for_test(&execution, "execution.provider_start_accepted"),
             )
             .await
-            .expect("fixture records that provider Start was attempted"),
-            db::ProviderStartClaim::Claimed
-        );
-        ExecutionRepo::record_provider_start_outcome(
-            db,
-            &execution.id,
-            provider_start_receipt_for_test(&execution, "execution.provider_start_accepted"),
-        )
-        .await
-        .expect("fixture records an accepted provider Start");
+            .expect("fixture records an accepted provider Start");
+        }
         if let Some(external_session_id) = agent_session_id {
             execution = ExecutionRepo::record_harness_session_result(
                 db,
@@ -4881,6 +5024,329 @@ mod tests {
             .expect("execution exists");
         assert_eq!(updated.status, ExecutionStatus::Failed);
         assert_eq!(updated.stop_reason, Some(StopReason::DaemonDisconnected));
+    }
+
+    #[tokio::test]
+    async fn daemon_report_does_not_fail_paused_pending_provider_start() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let mut events = event_bus.subscribe();
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, agent) =
+            seed_agent_with_daemon(&db, "remote-machine-pending-report", AgentStatus::Idle).await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "active".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution =
+            seed_pending_provider_execution(&db, task.id.clone(), agent_id.clone()).await;
+        AgentRepo::set_paused(&*db, &agent_id, true)
+            .await
+            .expect("Agent pauses after durable Execution admission");
+        sqlx::query("UPDATE execution SET created_at = ? WHERE id = ?")
+            .bind("1970-01-01T00:00:00+00:00")
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .expect("Execution ages beyond the daemon report grace window");
+
+        let daemon = DaemonRepo::get_by_id(
+            &*db,
+            agent.daemon_id.as_deref().expect("remote Agent daemon"),
+        )
+        .await
+        .expect("daemon loads")
+        .expect("daemon exists");
+        let pending_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE entity_type = 'execution' AND entity_id = ?
+               AND event_type = 'execution.provider_start_pending'
+               AND dedupe_key = 'execution.provider_start_pending:' || ?",
+        )
+        .bind(&execution.id)
+        .bind(&execution.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("pending receipt count loads");
+        let attempts_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE entity_type = 'execution' AND entity_id = ?
+               AND event_type = 'execution.provider_start_attempted'",
+        )
+        .bind(&execution.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("attempt receipt count loads");
+        assert_eq!(pending_before, 1);
+        assert_eq!(attempts_before, 0);
+
+        let interrupted = reconcile_daemon_report_executions(&db, &event_bus, None, &daemon, &[])
+            .await
+            .expect("empty remote daemon report reconciles");
+
+        assert_eq!(interrupted, 0);
+        let unchanged = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("Execution reloads")
+            .expect("Execution exists");
+        assert_eq!(unchanged.status, ExecutionStatus::Running);
+        assert_eq!(unchanged.stop_reason, None);
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("TaskLifecycle loads")
+            .expect("TaskLifecycle exists");
+        assert_eq!(lifecycle.state, TaskLifecycleState::Active);
+        let attempts_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE entity_type = 'execution' AND entity_id = ?
+               AND event_type = 'execution.provider_start_attempted'",
+        )
+        .bind(&execution.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("attempt receipt count reloads");
+        assert_eq!(attempts_after, 0);
+        let failed_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE entity_type = 'execution' AND entity_id = ?
+               AND event_type = 'execution.failed'",
+        )
+        .bind(&execution.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("failed event count loads");
+        assert_eq!(failed_events, 0);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn disconnected_daemon_does_not_fail_pending_provider_start() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let mut events = event_bus.subscribe();
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, _) =
+            seed_agent_with_daemon(&db, "remote-machine-pending-disconnect", AgentStatus::Idle)
+                .await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "active".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution =
+            seed_pending_provider_execution(&db, task.id.clone(), agent_id.clone()).await;
+        AgentRepo::set_paused(&*db, &agent_id, true)
+            .await
+            .expect("Agent pauses while provider Start is pending");
+
+        let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .with_daemon_connections(registry)
+            .with_daemon_disconnect_grace(Duration::ZERO);
+        assert_eq!(
+            monitor
+                .check_once()
+                .await
+                .expect("monitor checks disconnect"),
+            0,
+            "queued work is excluded from daemon disconnect reconciliation"
+        );
+        let agent = AgentRepo::get_by_id(&*db, &agent_id)
+            .await
+            .expect("Agent reloads")
+            .expect("Agent exists");
+        let daemon_id = agent.daemon_id.expect("Agent has its remote daemon");
+        let daemon = DaemonRepo::get_by_id(&*db, &daemon_id)
+            .await
+            .expect("daemon loads")
+            .expect("daemon exists");
+        let stopped_by =
+            api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor).display();
+        let unchanged_by_racing_report = fail_execution_daemon_disconnected(
+            &db,
+            &event_bus,
+            None,
+            FailDaemonDisconnectedExecution {
+                execution: &execution,
+                daemon_id: &daemon.id,
+                error_message: "remote daemon report raced a queued Start".to_owned(),
+                stopped_by: &stopped_by,
+                reconciliation_reason: "daemon_disconnected",
+            },
+        )
+        .await
+        .expect("atomic disconnect reconciliation preserves queued work");
+        assert_eq!(unchanged_by_racing_report.status, ExecutionStatus::Running);
+        let unchanged = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("Execution reloads")
+            .expect("Execution exists");
+        assert_eq!(unchanged.status, ExecutionStatus::Running);
+        assert_eq!(unchanged.stop_reason, None);
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("TaskLifecycle loads")
+            .expect("TaskLifecycle exists");
+        assert_eq!(lifecycle.state, TaskLifecycleState::Active);
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE entity_id = ? AND event_type = 'execution.provider_start_attempted'",
+        )
+        .bind(&execution.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("provider attempt count loads");
+        assert_eq!(attempts, 0);
+        let failed_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE entity_type = 'execution' AND entity_id = ?
+               AND event_type = 'execution.failed'",
+        )
+        .bind(&execution.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("failed event count loads");
+        assert_eq!(failed_events, 0);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn busy_agent_timeout_does_not_recover_pending_provider_start() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let mut events = event_bus.subscribe();
+        let agent = seed_agent_with_harness(
+            &db,
+            AgentStatus::Busy,
+            Some("1970-01-01T00:00:00+00:00".to_owned()),
+            "shell",
+        )
+        .await;
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "active".to_owned(),
+            Some(agent.id.clone()),
+        )
+        .await;
+        let execution =
+            seed_pending_provider_execution(&db, task.id.clone(), agent.id.clone()).await;
+        AgentRepo::set_paused(&*db, &agent.id, true)
+            .await
+            .expect("Agent pauses while provider Start is pending");
+
+        let monitor = HeartbeatMonitor::with_check_interval(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+            Duration::from_millis(1),
+        );
+        assert_eq!(
+            monitor
+                .check_once()
+                .await
+                .expect("monitor checks heartbeat"),
+            0,
+            "a queued provider Start does not count as an Agent heartbeat timeout"
+        );
+
+        let updated_agent = AgentRepo::get_by_id(&*db, &agent.id)
+            .await
+            .expect("Agent reloads")
+            .expect("Agent exists");
+        assert_eq!(updated_agent.status, AgentStatus::Busy);
+        assert!(updated_agent.paused);
+        let unchanged = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("Execution reloads")
+            .expect("Execution exists");
+        assert_eq!(unchanged.status, ExecutionStatus::Running);
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("TaskLifecycle loads")
+            .expect("TaskLifecycle exists");
+        assert_eq!(lifecycle.state, TaskLifecycleState::Active);
+        assert!(
+            events.try_recv().is_err(),
+            "no timeout/recovery event is emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_cancellation_still_resolves_pending_provider_start() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, _) =
+            seed_agent_with_daemon(&db, "remote-machine-pending-cancel", AgentStatus::Idle).await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "active".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution = seed_pending_provider_execution(&db, task.id.clone(), agent_id).await;
+        let executor = Arc::new(RecordingCancelExecutor::default());
+        let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .with_task_executor(executor.clone());
+
+        service
+            .cancel_task(task.id.clone())
+            .await
+            .expect("explicit Task cancellation resolves queued work");
+
+        let cancelled = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("Execution reloads")
+            .expect("Execution exists");
+        assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
+        assert_eq!(cancelled.stop_reason, Some(StopReason::TaskCancelled));
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("TaskLifecycle loads")
+            .expect("TaskLifecycle exists");
+        assert_eq!(lifecycle.state, TaskLifecycleState::Cancelled);
+        let attempt_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE entity_id = ? AND event_type = 'execution.provider_start_attempted'",
+        )
+        .bind(&execution.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("provider attempt count loads");
+        assert_eq!(attempt_count, 0);
+        assert!(executor
+            .cancelled
+            .lock()
+            .expect("provider cancel log loads")
+            .is_empty());
+        let lease_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workspace_lease WHERE execution_id = ?")
+                .bind(&execution.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("WorkspaceLease count loads");
+        assert_eq!(lease_count, 0);
+        let cancelled_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE entity_type = 'execution' AND entity_id = ?
+               AND event_type = 'execution.cancelled'",
+        )
+        .bind(&execution.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("Execution cancellation events load");
+        assert_eq!(cancelled_events, 1);
     }
 
     #[tokio::test]

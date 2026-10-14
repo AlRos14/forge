@@ -1,5 +1,8 @@
 use super::*;
-use crate::{now_rfc3339, AgentExecutionStats, ExecutionPurpose, ExecutionStatus};
+use crate::{
+    now_rfc3339, AgentExecutionStats, ExecutionPurpose, ExecutionStatus,
+    PendingProviderStartFailure, RunningExecutionFailure,
+};
 
 fn map_review_execution_subject(row: SqliteRow) -> Result<ReviewExecutionSubject> {
     Ok(ReviewExecutionSubject {
@@ -652,6 +655,171 @@ impl ExecutionRepo for SqliteDb {
         rows.into_iter().map(map_execution).collect()
     }
 
+    async fn is_provider_start_pending(&self, execution_id: &str) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM execution e
+                WHERE e.id = ? AND e.work_unit_id IS NOT NULL
+                  AND e.actor_kind = 'agent' AND e.agent_id = e.actor_id
+                  AND e.status = 'running'
+                  AND EXISTS (
+                      SELECT 1 FROM domain_event pending
+                      WHERE pending.entity_type = 'execution'
+                        AND pending.entity_id = e.id
+                        AND pending.event_type = 'execution.provider_start_pending'
+                        AND pending.dedupe_key = 'execution.provider_start_pending:' || e.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM domain_event attempt
+                      WHERE attempt.entity_type = 'execution'
+                        AND attempt.entity_id = e.id
+                        AND attempt.event_type = 'execution.provider_start_attempted'
+                        AND attempt.dedupe_key = 'execution.provider_start_attempted:' || e.id
+                  )
+            )",
+        )
+        .bind(execution_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn fail_pending_provider_start(
+        &self,
+        execution_id: &str,
+        update: UpdateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<PendingProviderStartFailure> {
+        if update.id != execution_id
+            || update.status != Some(ExecutionStatus::Failed)
+            || event.event_type != "execution.failed"
+            || event.entity_type != "execution"
+            || event.entity_id != execution_id
+        {
+            return Err(DbError::Check(
+                "pending provider Start failure must target its exact Execution".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
+            .bind(execution_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_execution)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        if execution.status != ExecutionStatus::Running {
+            tx.commit().await?;
+            return Ok(PendingProviderStartFailure::NotRunning(execution));
+        }
+
+        let attempt_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM domain_event
+                WHERE entity_type = 'execution'
+                  AND entity_id = ?
+                  AND event_type = 'execution.provider_start_attempted'
+                  AND dedupe_key = 'execution.provider_start_attempted:' || ?
+            )",
+        )
+        .bind(execution_id)
+        .bind(execution_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if attempt_exists {
+            tx.commit().await?;
+            return Ok(PendingProviderStartFailure::Attempted(execution));
+        }
+
+        let pending_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM domain_event
+                WHERE entity_type = 'execution'
+                  AND entity_id = ?
+                  AND event_type = 'execution.provider_start_pending'
+                  AND dedupe_key = 'execution.provider_start_pending:' || ?
+            )",
+        )
+        .bind(execution_id)
+        .bind(execution_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !pending_exists {
+            tx.commit().await?;
+            return Ok(PendingProviderStartFailure::NotPending(execution));
+        }
+
+        let updated = update_execution_in_tx(&mut tx, update).await?;
+        let committed_event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
+        tx.commit().await?;
+        Ok(PendingProviderStartFailure::Resolved(
+            updated,
+            committed_event,
+        ))
+    }
+
+    async fn fail_running_unless_provider_start_pending(
+        &self,
+        execution_id: &str,
+        update: UpdateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<RunningExecutionFailure> {
+        if update.id != execution_id
+            || update.status != Some(ExecutionStatus::Failed)
+            || event.event_type != "execution.failed"
+            || event.entity_type != "execution"
+            || event.entity_id != execution_id
+        {
+            return Err(DbError::Check(
+                "running Execution failure must target its exact Execution".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
+            .bind(execution_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_execution)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        if execution.status != ExecutionStatus::Running {
+            tx.commit().await?;
+            return Ok(RunningExecutionFailure::NotRunning(execution));
+        }
+
+        let provider_start_pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM domain_event pending
+                WHERE pending.entity_type = 'execution'
+                  AND pending.entity_id = ?
+                  AND pending.event_type = 'execution.provider_start_pending'
+                  AND pending.dedupe_key = 'execution.provider_start_pending:' || ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM domain_event attempt
+                      WHERE attempt.entity_type = 'execution'
+                        AND attempt.entity_id = pending.entity_id
+                        AND attempt.event_type = 'execution.provider_start_attempted'
+                        AND attempt.dedupe_key = 'execution.provider_start_attempted:' || pending.entity_id
+                  )
+            )",
+        )
+        .bind(execution_id)
+        .bind(execution_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if provider_start_pending {
+            tx.commit().await?;
+            return Ok(RunningExecutionFailure::Pending(execution));
+        }
+
+        let updated = update_execution_in_tx(&mut tx, update).await?;
+        let committed_event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
+        tx.commit().await?;
+        Ok(RunningExecutionFailure::Failed(updated, committed_event))
+    }
+
     async fn claim_provider_start(
         &self,
         execution_id: &str,
@@ -751,6 +919,20 @@ impl ExecutionRepo for SqliteDb {
             return Ok(disposition.unwrap_or(ProviderStartClaim::Uncertain));
         }
 
+        let task_is_cancelled: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_lifecycle
+                WHERE task_id = ? AND state = 'cancelled'
+            )",
+        )
+        .bind(&execution.task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if task_is_cancelled {
+            tx.commit().await?;
+            return Ok(ProviderStartClaim::TaskCancelled);
+        }
+
         let agent_id = execution.agent_id.as_deref().ok_or(DbError::NotFound)?;
         let paused: Option<bool> =
             sqlx::query_scalar("SELECT paused FROM agent_current WHERE id = ?")
@@ -764,6 +946,34 @@ impl ExecutionRepo for SqliteDb {
             return Err(DbError::AgentPaused {
                 agent_id: agent_id.to_owned(),
             });
+        }
+
+        if execution.workspace_id.is_some() && execution.work_unit_id.is_none() {
+            tx.commit().await?;
+            return Ok(ProviderStartClaim::AuthorityLost);
+        }
+        if let (Some(work_unit_id), Some(workspace_id)) = (
+            execution.work_unit_id.as_deref(),
+            execution.workspace_id.as_deref(),
+        ) {
+            let lease_is_current: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM workspace_lease
+                    WHERE task_id = ? AND work_unit_id = ? AND workspace_id = ?
+                      AND execution_id = ? AND status = 'active' AND expires_at > ?
+                )",
+            )
+            .bind(&execution.task_id)
+            .bind(work_unit_id)
+            .bind(workspace_id)
+            .bind(&execution.id)
+            .bind(crate::now_rfc3339())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !lease_is_current {
+                tx.commit().await?;
+                return Ok(ProviderStartClaim::AuthorityLost);
+            }
         }
 
         DomainEventRepo::append_event_in_tx(self, &mut tx, &attempt_event).await?;
@@ -970,6 +1180,20 @@ impl ExecutionRepo for SqliteDb {
             sqlx::query(
                 "SELECT e.* FROM execution e
                  WHERE e.status = 'running'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM domain_event pending
+                       WHERE pending.entity_type = 'execution'
+                         AND pending.entity_id = e.id
+                         AND pending.event_type = 'execution.provider_start_pending'
+                         AND pending.dedupe_key = 'execution.provider_start_pending:' || e.id
+                         AND NOT EXISTS (
+                             SELECT 1 FROM domain_event attempt
+                             WHERE attempt.entity_type = 'execution'
+                               AND attempt.entity_id = e.id
+                               AND attempt.event_type = 'execution.provider_start_attempted'
+                               AND attempt.dedupe_key = 'execution.provider_start_attempted:' || e.id
+                         )
+                   )
                    AND CASE
                          WHEN json_valid(e.executor_config_snapshot_json)
                          THEN json_extract(e.executor_config_snapshot_json, '$.resolved_daemon_id')
@@ -990,6 +1214,20 @@ impl ExecutionRepo for SqliteDb {
             let query = format!(
                 "SELECT e.* FROM execution e
                  WHERE e.status = 'running'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM domain_event pending
+                       WHERE pending.entity_type = 'execution'
+                         AND pending.entity_id = e.id
+                         AND pending.event_type = 'execution.provider_start_pending'
+                         AND pending.dedupe_key = 'execution.provider_start_pending:' || e.id
+                         AND NOT EXISTS (
+                             SELECT 1 FROM domain_event attempt
+                             WHERE attempt.entity_type = 'execution'
+                               AND attempt.entity_id = e.id
+                               AND attempt.event_type = 'execution.provider_start_attempted'
+                               AND attempt.dedupe_key = 'execution.provider_start_attempted:' || e.id
+                         )
+                   )
                    AND CASE
                          WHEN json_valid(e.executor_config_snapshot_json)
                          THEN json_extract(e.executor_config_snapshot_json, '$.resolved_daemon_id')

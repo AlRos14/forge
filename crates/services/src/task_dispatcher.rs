@@ -23,6 +23,8 @@ pub struct TaskDispatcher {
     stop_notify: Notify,
     #[cfg(test)]
     after_auto_admission_barrier: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    after_pending_snapshot_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl TaskDispatcher {
@@ -51,6 +53,8 @@ impl TaskDispatcher {
             stop_notify: Notify::new(),
             #[cfg(test)]
             after_auto_admission_barrier: None,
+            #[cfg(test)]
+            after_pending_snapshot_barrier: None,
         }
     }
 
@@ -60,6 +64,15 @@ impl TaskDispatcher {
         barrier: Arc<tokio::sync::Barrier>,
     ) -> Self {
         self.after_auto_admission_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_pending_snapshot_barrier(
+        mut self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.after_pending_snapshot_barrier = Some(barrier);
         self
     }
 

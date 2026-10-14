@@ -268,9 +268,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   attempt receipt prevents duplicate provider effects across concurrent ticks,
   graceful shutdown, restart, and uncertain responses. Startup CrashRecovery and
   the heartbeat monitor preserve an admitted Start until its provider attempt is
-  claimed. V134 replaces the generic WorkUnit admission trigger error with stable
-  cause-specific markers, so capacity is no longer reported for RoleMembership,
-  WorkUnit, Workspace, dependency, or running-child denials.
+  claimed. Daemon reports, disconnect recovery, and timeouts now distinguish a
+  pending Start from an attempted external effect. Lost WorkspaceLease authority
+  terminalizes only an Execution whose pending receipt is still unclaimed, while
+  explicit Task cancellation still resolves pending work locally. V134 replaces
+  the generic WorkUnit admission trigger error with stable cause-specific
+  markers, so capacity is no longer reported for RoleMembership, WorkUnit,
+  Workspace, dependency, or running-child denials.
 
 - `DELETE /repos/{id}` now checks for associated Tasks inside its write
   transaction and returns `409 repo_in_use` while preserving the Repo,

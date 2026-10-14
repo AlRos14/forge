@@ -173,15 +173,23 @@ impl TaskService {
                 "only running executions can be started",
             ));
         }
-        if let Some(agent_id) = execution.agent_id.as_deref() {
-            let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+        let task_is_cancelled =
+            db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &execution.task_id)
                 .await?
-                .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
-            if agent.paused {
-                return Err(ServiceError::AgentPaused {
-                    agent_id: agent_id.to_owned(),
-                });
-            }
+                .is_some_and(|lifecycle| lifecycle.state == db::TaskLifecycleState::Cancelled);
+        if task_is_cancelled {
+            self.cancel_active_execution(
+                &execution,
+                "cancelled by task cancellation",
+                db::StopReason::TaskCancelled,
+                &api_types::Actor::system(api_types::SystemComponent::CancelTask),
+                db::ResumePolicy::None,
+            )
+            .await?;
+            return Ok(api_types::ExecutionStartResult {
+                execution_id: execution.id,
+                accepted: false,
+            });
         }
         if execution.role == "reviewer"
             && execution.purpose == Some(ExecutionPurpose::Review)
@@ -214,6 +222,16 @@ impl TaskService {
                 );
             }
             return Err(error);
+        }
+        if let Some(agent_id) = execution.agent_id.as_deref() {
+            let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
+            if agent.paused {
+                return Err(ServiceError::AgentPaused {
+                    agent_id: agent_id.to_owned(),
+                });
+            }
         }
         let prepared = async {
             if execution.role == "reviewer" && execution.purpose == Some(ExecutionPurpose::Review) {
@@ -275,6 +293,28 @@ impl TaskService {
             db::ProviderStartClaim::Uncertain => {
                 return Err(ServiceError::ExecutionStartUncertain {
                     execution_id: execution.id,
+                });
+            }
+            db::ProviderStartClaim::AuthorityLost => {
+                let error = ServiceError::invalid_operation(
+                    "WorkspaceLease expired before provider Start was claimed",
+                );
+                self.fail_execution_before_dispatch(&execution.id, error.to_string())
+                    .await?;
+                return Err(error);
+            }
+            db::ProviderStartClaim::TaskCancelled => {
+                self.cancel_active_execution(
+                    &execution,
+                    "cancelled by task cancellation",
+                    db::StopReason::TaskCancelled,
+                    &api_types::Actor::system(api_types::SystemComponent::CancelTask),
+                    db::ResumePolicy::None,
+                )
+                .await?;
+                return Ok(api_types::ExecutionStartResult {
+                    execution_id: execution.id,
+                    accepted: false,
                 });
             }
             db::ProviderStartClaim::Claimed => {}

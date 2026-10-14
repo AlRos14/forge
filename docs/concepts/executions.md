@@ -137,3 +137,14 @@ external terminal result or the existing stalled-Execution monitor; it is not
 treated as a fresh provider attempt. A crash after the pending receipt but
 before the attempt claim is recoverable; a crash after the attempt claim is
 fail-closed against a duplicate external effect.
+
+Recovery reconciles provider effects only after the attempted receipt exists.
+An old pending Execution is not failed because it exceeds a timeout or is
+missing from a remote daemon's active-session report. If its exact Workspace,
+WorkUnit assignment, or WorkspaceLease authority is no longer valid, recovery
+fails that still-pending Execution explicitly and blocks the Task. The SQLite
+write is conditional on the pending receipt and absence of an attempt receipt,
+so it cannot overwrite a provider attempt claimed concurrently. It never
+renews or revives an expired lease. Explicit Task cancellation still resolves
+pending Executions locally and does not send a provider cancellation for work
+that was never started.

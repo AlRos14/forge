@@ -91,11 +91,17 @@ impl TaskService {
             task_id: task.id.clone(),
             expected_task_version: task.version,
             to_state: db::TaskLifecycleState::Cancelled,
-            cause: crate::task_lifecycle::LifecycleCause::Actor(actor),
+            cause: crate::task_lifecycle::LifecycleCause::Actor(actor.clone()),
             reason_kind: Some("task_cancelled".to_owned()),
             reason_ref: Some(task.id.clone()),
             idempotency_key: format!("task-cancel:{}:{}", task.id, task.version),
         })
+        .await?;
+        self.cancel_running_executions_for_task(
+            &result.task,
+            "cancelled by task cancellation",
+            actor,
+        )
         .await?;
         let task =
             clear_transient_error_annotation_after_cancel(&self.db, &task, result.task).await?;

@@ -413,7 +413,7 @@ impl TaskService {
         }
     }
 
-    pub(super) async fn verify_execution_workspace_authority(
+    pub(crate) async fn verify_execution_workspace_authority(
         &self,
         execution: &db::Execution,
     ) -> Result<Option<db::WorkspaceLease>> {

@@ -814,6 +814,24 @@ pub trait ExecutionRepo: Send + Sync {
     /// has not been claimed. Older admissions without this receipt are not
     /// inferred to be pending because their external outcome is unknowable.
     async fn list_pending_provider_starts(&self) -> Result<Vec<Execution>>;
+    /// Check the exact durable queued-start contract for one Execution.
+    async fn is_provider_start_pending(&self, execution_id: &str) -> Result<bool>;
+    /// Resolve a queued provider Start only while its durable receipt still
+    /// proves that no external attempt has been claimed.
+    async fn fail_pending_provider_start(
+        &self,
+        execution_id: &str,
+        update: UpdateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<PendingProviderStartFailure>;
+    /// Fail an external execution only if it is still Running and has no
+    /// unattempted provider-start receipt at the serialized write boundary.
+    async fn fail_running_unless_provider_start_pending(
+        &self,
+        execution_id: &str,
+        update: UpdateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<RunningExecutionFailure>;
     /// Atomically claim the one external Start attempt for an admitted
     /// Execution. A paused Agent leaves the admission pending; an existing
     /// attempt is returned as accepted, rejected, or uncertain and is never
@@ -869,6 +887,23 @@ pub enum ProviderStartClaim {
     Accepted,
     Rejected,
     Uncertain,
+    AuthorityLost,
+    TaskCancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingProviderStartFailure {
+    Resolved(Execution, DomainEvent),
+    Attempted(Execution),
+    NotPending(Execution),
+    NotRunning(Execution),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunningExecutionFailure {
+    Failed(Execution, DomainEvent),
+    Pending(Execution),
+    NotRunning(Execution),
 }
 
 /// Generic PR4 collaboration persistence. Every create/lifecycle operation

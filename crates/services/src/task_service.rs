@@ -1045,6 +1045,13 @@ impl TaskService {
                 ServiceError::not_found("execution", notification.execution_id.clone())
             })?;
         if current_execution.status == ExecutionStatus::Running
+            && ExecutionRepo::is_provider_start_pending(&*self.db, &current_execution.id).await?
+        {
+            return Err(ServiceError::invalid_operation(
+                "remote terminal report refers to an Execution whose provider Start was never attempted",
+            ));
+        }
+        if current_execution.status == ExecutionStatus::Running
             && current_execution.role == "reviewer"
             && current_execution.purpose == Some(ExecutionPurpose::Review)
         {

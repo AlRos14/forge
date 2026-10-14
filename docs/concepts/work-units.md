@@ -112,6 +112,15 @@ Execution pending for a later tick; an uncertain provider response cannot
 authorize another external Start. Admission receipts and the WorkspaceLease
 remain attached to the same Execution throughout recovery.
 
+Heartbeat expiry, daemon reports, and restart recovery treat a pending receipt
+as queued work rather than an external provider effect. If a required Workspace
+or lease authority has expired, recovery terminalizes the still-pending
+Execution and blocks the Task without reviving the lease. This write is
+conditional on the absence of the provider-attempt receipt, so a concurrent
+Start attempt keeps its existing uncertain or accepted recovery behavior.
+Explicit Task cancellation still cancels pending work locally and cleans up
+Running Executions even if recovery had already transitioned the Task lifecycle.
+
 ## Isolation
 
 The Task has an integration workspace; each repository-mutating WorkUnit has

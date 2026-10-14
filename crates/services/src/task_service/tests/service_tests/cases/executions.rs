@@ -5059,16 +5059,23 @@ async fn concurrent_dispatcher_ticks_recover_post_commit_auto_start_after_unpaus
             .with_workspace_root(workspace_root.path().to_path_buf())
             .with_workspace_exec_locks(Arc::new(crate::WorkspaceExecutionLockManager::new())),
     );
-    let restarted_dispatcher =
-        crate::TaskDispatcher::new(Arc::clone(&db), Arc::clone(&event_bus), restarted_service);
-    assert_eq!(
-        restarted_dispatcher
-            .check_once()
-            .await
-            .expect("restarted dispatcher resolves pending start"),
-        1,
-        "the exact committed child must start after unpause and restart"
-    );
+    let provider_start_barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let restarted_first = crate::TaskDispatcher::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        Arc::clone(&restarted_service),
+    )
+    .with_after_pending_snapshot_barrier(Arc::clone(&provider_start_barrier));
+    let restarted_second =
+        crate::TaskDispatcher::new(Arc::clone(&db), Arc::clone(&event_bus), restarted_service)
+            .with_after_pending_snapshot_barrier(provider_start_barrier);
+    let (first_dispatch, second_dispatch) =
+        tokio::join!(restarted_first.check_once(), restarted_second.check_once());
+    let accepted_first = first_dispatch.expect("first restarted dispatcher resolves pending start");
+    let accepted_second =
+        second_dispatch.expect("second restarted dispatcher resolves pending start");
+    assert!(accepted_first + accepted_second > 0);
+    assert!(accepted_first + accepted_second <= 2);
 
     tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -5077,6 +5084,15 @@ async fn concurrent_dispatcher_ticks_recover_post_commit_auto_start_after_unpaus
     .await
     .expect("one accepted provider start runs the exact child");
     assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let child_attempt_receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'execution.provider_start_attempted' AND entity_id = ?",
+    )
+    .bind(&child.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("concurrent dispatchers share one attempt receipt");
+    assert_eq!(child_attempt_receipts, 1);
     let child_accepted_receipts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM domain_event
          WHERE event_type = 'execution.provider_start_accepted' AND entity_id = ?",
@@ -5807,6 +5823,28 @@ async fn uncertain_provider_start_retry_never_sends_a_second_external_start() {
         Some(workspace.id)
     );
 
+    service
+        .fail_execution_before_dispatch(
+            &execution.id,
+            "late authority reconciliation must preserve an attempted provider Start".to_owned(),
+        )
+        .await
+        .expect("late pre-dispatch reconciliation preserves claimed external work");
+    let after_late_reconciliation = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("Execution reloads after late reconciliation")
+        .expect("Execution remains present");
+    assert_eq!(after_late_reconciliation.status, ExecutionStatus::Running);
+    let failed_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'execution.failed' AND entity_id = ?",
+    )
+    .bind(&execution.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("late reconciliation emits no failed event");
+    assert_eq!(failed_events, 0);
+
     let retry = service
         .start_execution(execution.id.clone())
         .await
@@ -5842,6 +5880,233 @@ async fn uncertain_provider_start_retry_never_sends_a_second_external_start() {
     .await
     .expect("uncertain outcome remains singular");
     assert_eq!(final_uncertain_receipts, 1);
+
+    AgentRepo::set_paused(&*db, &agent_id, true)
+        .await
+        .expect("Agent pauses before simulated server restart");
+    crate::CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .run_recovery()
+        .await
+        .expect("restart recovery handles the attempted uncertain Execution");
+    let recovered = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("uncertain Execution reloads after restart")
+        .expect("uncertain Execution remains present");
+    assert_eq!(recovered.status, ExecutionStatus::Cancelled);
+    assert_eq!(recovered.stop_reason, Some(db::StopReason::CrashRecovery));
+    assert_eq!(
+        WorkspaceLeaseRepo::get_active_for_work_unit(
+            &*db,
+            execution.work_unit_id.as_deref().expect("WorkUnit id"),
+        )
+        .await
+        .expect("WorkspaceLease state reloads after restart"),
+        None
+    );
+    assert_eq!(
+        TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("TaskLifecycle reloads after restart")
+            .expect("TaskLifecycle exists")
+            .state,
+        TaskLifecycleState::Blocked
+    );
+    let restarted_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
+    assert_eq!(
+        crate::TaskDispatcher::new(Arc::clone(&db), Arc::clone(&event_bus), restarted_service)
+            .check_once()
+            .await
+            .expect("restarted dispatcher ignores attempted uncertain Start"),
+        0
+    );
+    let attempts_after_restart: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'execution.provider_start_attempted' AND entity_id = ?",
+    )
+    .bind(&execution.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("attempt receipt remains singular after restart");
+    assert_eq!(attempts_after_restart, 1);
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| method.as_str() == api_types::METHOD_EXECUTION_START)
+            .count(),
+        1,
+        "pausing and restarting does not repeat the uncertain external Start"
+    );
+}
+
+#[tokio::test]
+async fn crash_recovery_resolves_pending_start_after_its_workspace_lease_expired() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_workspace_exec_locks(Arc::new(crate::WorkspaceExecutionLockManager::new()));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "shell", "{}").await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
+    let (execution, workspace) = create_running_repository_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        "implementer",
+        db::ExecutionPurpose::Implement,
+        workspace_root.path(),
+        Some("provider Start is still pending".to_owned()),
+        None,
+    )
+    .await;
+    let unsolicited_terminal = service
+        .complete_remote_execution(completed_remote_notification(&execution.id, None), None)
+        .await
+        .expect_err("a remote terminal report cannot complete an unattempted provider Start");
+    assert!(unsolicited_terminal
+        .to_string()
+        .contains("provider Start was never attempted"));
+    assert_eq!(
+        ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("pending Execution reloads")
+            .expect("pending Execution exists")
+            .status,
+        ExecutionStatus::Running
+    );
+    AgentRepo::set_paused(&*db, &agent_id, true)
+        .await
+        .expect("Agent pauses before any provider attempt");
+    let lease = WorkspaceLeaseRepo::get_active_for_work_unit(
+        &*db,
+        execution.work_unit_id.as_deref().expect("WorkUnit id"),
+    )
+    .await
+    .expect("WorkspaceLease loads")
+    .expect("admission committed its WorkspaceLease");
+    assert_eq!(lease.execution_id, execution.id);
+    assert_eq!(lease.workspace_id.as_deref(), Some(workspace.id.as_str()));
+    let work_unit_before = db::WorkUnitRepo::get_by_id(
+        &*db,
+        execution.work_unit_id.as_deref().expect("WorkUnit id"),
+    )
+    .await
+    .expect("WorkUnit loads before lease expiry")
+    .expect("WorkUnit exists before lease expiry");
+
+    // Simulate a prior process expiring the lease before it was able to
+    // terminalize the pending admission.
+    let expired = WorkspaceLeaseRepo::expire(&*db, "9999-01-01T00:00:00Z", 500)
+        .await
+        .expect("long restart expires the stale grant");
+    assert!(expired.iter().any(|expired| expired.id == lease.id));
+    AgentRepo::set_paused(&*db, &agent_id, false)
+        .await
+        .expect("fixture enables direct admission-boundary check");
+    assert_eq!(
+        ExecutionRepo::claim_provider_start(
+            &*db,
+            &execution.id,
+            provider_start_receipt_for_test(&execution, "execution.provider_start_attempted",),
+        )
+        .await
+        .expect("expired WorkspaceLease is rejected by the durable claim boundary"),
+        db::ProviderStartClaim::AuthorityLost
+    );
+    AgentRepo::set_paused(&*db, &agent_id, true)
+        .await
+        .expect("Agent remains paused for restart recovery");
+
+    crate::CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .run_recovery()
+        .await
+        .expect("startup recovery resolves pending work without its lease");
+
+    let resolved = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("Execution reloads")
+        .expect("Execution exists");
+    assert_eq!(resolved.status, ExecutionStatus::Failed);
+    assert_eq!(resolved.work_unit_id, execution.work_unit_id);
+    assert_eq!(resolved.workspace_id, execution.workspace_id);
+    assert_eq!(resolved.parent_execution_id, execution.parent_execution_id);
+    assert_eq!(resolved.stop_reason, Some(db::StopReason::ExecutorFailed));
+    assert!(resolved
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("WorkspaceLease")));
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+        .await
+        .expect("TaskLifecycle loads")
+        .expect("TaskLifecycle exists");
+    assert_eq!(lifecycle.state, TaskLifecycleState::Blocked);
+    let blocked_task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task reloads")
+        .expect("Task exists");
+    let annotation: Value = serde_json::from_str(
+        blocked_task
+            .error_annotation
+            .as_deref()
+            .expect("failure block"),
+    )
+    .expect("failure annotation parses");
+    assert_eq!(annotation["blocked_execution_id"], execution.id);
+    assert_eq!(
+        WorkspaceLeaseRepo::get_active_for_work_unit(
+            &*db,
+            execution.work_unit_id.as_deref().expect("WorkUnit id"),
+        )
+        .await
+        .expect("active WorkspaceLease query succeeds"),
+        None,
+        "recovery never revives the expired grant"
+    );
+    let lease_status: String =
+        sqlx::query_scalar("SELECT status FROM workspace_lease WHERE id = ?")
+            .bind(&lease.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("expired lease status loads");
+    assert_eq!(lease_status, "expired");
+    let work_unit_after = db::WorkUnitRepo::get_by_id(
+        &*db,
+        execution.work_unit_id.as_deref().expect("WorkUnit id"),
+    )
+    .await
+    .expect("WorkUnit reloads after lease expiry")
+    .expect("WorkUnit remains present");
+    assert_eq!(work_unit_after.id, work_unit_before.id);
+    assert_eq!(work_unit_after.status, work_unit_before.status);
+    assert_eq!(work_unit_after.version, work_unit_before.version);
+
+    for (event_type, expected) in [
+        ("execution.started", 1_i64),
+        ("execution.provider_start_pending", 1),
+        ("execution.provider_start_attempted", 0),
+        ("execution.failed", 1),
+    ] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event WHERE entity_id = ? AND event_type = ?",
+        )
+        .bind(&execution.id)
+        .bind(event_type)
+        .fetch_one(db.pool())
+        .await
+        .expect("Execution event count loads");
+        assert_eq!(count, expected, "unexpected {event_type} receipt count");
+    }
+
+    let executor = Arc::new(RecoveryDispatchExecutor::default());
+    let dispatcher_service = Arc::new(service.with_task_executor(executor.clone()));
+    crate::TaskDispatcher::new(Arc::clone(&db), Arc::clone(&event_bus), dispatcher_service)
+        .check_once()
+        .await
+        .expect("post-restart dispatcher sees no pending provider Start");
+    assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

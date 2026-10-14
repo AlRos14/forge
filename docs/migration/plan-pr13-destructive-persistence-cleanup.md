@@ -777,3 +777,101 @@ BUG_STILL_LIVE = 0
 This supplement records the pre-publication checkpoint; the final report will
 record the pushed commit and remote-ref verification. No merge was made or
 authorized; PR14 has not started.
+
+## Latest audit — pending provider-start reconciliation — 2026-10-15
+
+The review started at branch HEAD `6aa2f588e24982f9c1159cd7801b7a41552e503b`.
+At that checkpoint the local branch matched `origin/feat/plan-pr13-destructive-persistence-cleanup`
+and the merge-base was `3d3b6b196672568c85e4c3cd2c11f010b1f62d9a`.
+The deterministic red reproduction admitted one Running remote Agent WorkUnit
+Execution with `execution.provider_start_pending`, no
+`execution.provider_start_attempted`, then paused the Agent, aged the Execution
+past the 60-second daemon-report window, and sent an empty daemon report. Before
+the fix, reconciliation returned `interrupted = 1` and changed the queued
+Execution to Failed although no provider request had been sent.
+
+The cause was that some recovery paths treated every Running row as an external
+effect. The stale daemon report path failed rows missing from its active-session
+list; disconnect and Agent heartbeat recovery also selected Running rows;
+startup recovery and lease expiry did not consistently separate queued Starts
+from provider attempts. That contradicted the durable pending/attempt/outcome
+receipts already written by admission and `BEGIN IMMEDIATE` provider claim.
+
+The correction uses those receipts without adding a table, migration, scheduler,
+or lifecycle state:
+
+- CrashRecovery, heartbeat timeout, stall detection, daemon disconnect, and
+  daemon report reconciliation preserve an exact pending/no-attempt Execution.
+  The daemon disconnect write now checks this condition inside `BEGIN IMMEDIATE`
+  with its terminal event, closing the report-versus-dispatch race.
+- A pending Execution whose exact Workspace, WorkUnit assignment, or
+  WorkspaceLease authority is lost is failed explicitly and the Task is
+  blocked. The failure transaction is conditional on the pending receipt and
+  absence of an attempt. If a dispatcher already claimed the attempt, that
+  Execution remains in external-effect recovery. Lease expiry never renews or
+  revives the old grant.
+- The provider claim also checks Task cancellation and the exact current lease.
+  Dispatcher retries call the existing `start_execution()` boundary even when
+  paused: valid pending work receives no provider call while paused; invalid
+  authority can still be terminalized. After unpause, concurrent ticks resolve
+  the same child and the durable attempt receipt allows one external Start.
+- Explicit Task cancellation remains an intentional exception to pending
+  recovery filtering. It changes TaskLifecycle first, then cancels all Running
+  Executions; pending provider work is resolved locally without provider
+  cancellation. A repeated cancellation also reconciles work left Running if
+  the first cleanup was interrupted.
+- A remote terminal notification cannot complete an exact pending/no-attempt
+  Execution. Started or uncertain Executions retain their prior reconciliation
+  behavior.
+
+### Focused evidence
+
+| Check | Result |
+|---|---|
+| Deterministic empty-daemon-report reproduction before fix | FAIL as expected: reconciliation interrupted one admitted pending Execution; provider attempt receipt count was zero. |
+| `cargo test -p services --lib pending_provider_start --locked --offline -- --test-threads=1` | PASS, 4 tests: empty daemon report, disconnected remote daemon, Busy Agent with stale heartbeat, and explicit Task cancellation. Each asserts Execution/lifecycle/receipt/event effects; pending paths make no provider call. |
+| `cargo test -p services --lib crash_recovery_resolves_pending_start_after_its_workspace_lease_expired --locked --offline -- --test-threads=1` | PASS: prolonged-restart expired lease remains expired; pending Execution becomes Failed, TaskLifecycle becomes Blocked, failure receipts are singular, no attempt is created, and dispatcher cannot revive or start it. |
+| `cargo test -p services --lib concurrent_dispatcher_ticks_recover_post_commit_auto_start_after_unpause --locked --offline -- --test-threads=1` | PASS: deterministic post-commit/pre-start pause; two paused ticks send no request; shutdown and restart preserve the same WorkUnit child, lineage, HarnessSession, lease, and admission receipts; after unpause, two dispatchers synchronize on the same pending snapshot and produce one provider attempt and one executor call. |
+| `cargo test -p services --lib uncertain_provider_start_retry_never_sends_a_second_external_start --locked --offline -- --test-threads=1` | PASS: attempted/uncertain receipts remain singular; retry and late pre-dispatch reconciliation do not fail or repeat external work. Pausing before CrashRecovery, then starting a fresh dispatcher, leaves the attempt receipt singular and creates no new provider Start. |
+| `cargo test -p services --lib heartbeat_monitor_fails_remote_execution_when_daemon_stays_disconnected --locked --offline -- --test-threads=1` | PASS: an attempted remote Execution still follows disconnect recovery. |
+| `cargo test -p services --lib heartbeat_monitor_times_out_busy_agents_and_recovers_tasks --locked --offline -- --test-threads=1` | PASS: an accepted/attempted stale Execution still follows Agent heartbeat recovery. |
+| `cargo test -p services --lib daemon_report_reconcile_interrupts_missing_old_running_execution --locked --offline -- --test-threads=1` | PASS: an attempted old Execution absent from a daemon report still reconciles. |
+| `cargo test -p db --test pr5_workunit work_unit_admission_guard_classifies_each_live_rejection_without_partial_rows --locked --offline -- --test-threads=1` | PASS: V134 capacity, RoleMembership, WorkUnit, Workspace, dependency, and concurrent-running cause classification remains distinct and atomic. |
+| `cargo test -p db --test file_backed_migration v134_replaces_admission_guard_on_v133_database_and_restarts_cleanly --locked --offline -- --test-threads=1` | PASS: an existing V133 database receives V134 and restarts with preserved migration receipts and integrity. No historical migration was edited. |
+| `cargo fmt --all -- --check`; `git diff --check` | PASS after the final source and documentation changes. |
+
+The selector census classified broad `list_running()` queries as projections
+or source data; their callers now apply the appropriate receipt contract.
+Stall, daemon report, disconnect, heartbeat, CrashRecovery, and shutdown paths
+exclude pending/no-attempt work. Lease expiry resolves invalid pending authority
+explicitly and leaves attempted external effects to their established cancel or
+recovery paths. Capacity and operator status continue to count admitted Running
+work; workspace cleanup continues to treat it as active. Explicit Task
+cancellation remains able to resolve pending Executions. Auto candidate
+consumption still uses the existing child lineage, and follow-up/manual/ordinary
+launch share the same pending receipt, claim, and outcome path.
+
+The SQLite guard and error-classifier audit found no additional demonstrated
+P0/P1/P2/P3 issue. V134 remains the forward migration for databases that had
+already applied V132/V133. No API response contract changed in this supplement;
+the previously recorded API unit-test dependency/network limitation remains
+explicitly NOT RUN.
+
+The changes follow Architecture V2's exact Execution, Actor, WorkUnit, and
+WorkspaceLease authority and keep provider invocation outside SQLite. They use
+the existing dispatcher and durable DomainEvent receipts to close the admission
+window; they do not introduce a second queue, scheduler, state machine, or
+authority source. This remains within PR13's post-cutover runtime audit and does
+not change the V121–V134 migration sequence.
+
+```text
+P0 = 0
+P1 = 0
+P2 = 0 (pending provider-start reconciliation closed)
+P3 = 0
+BUG_STILL_LIVE = 0
+```
+
+This audit supplement is pre-publication evidence; the final report records the
+commit, push, remote SHA, merge-base, and clean-tree verification. No merge was
+made; PR14 has not started.

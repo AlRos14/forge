@@ -86,15 +86,19 @@ impl TaskService {
         let preserve_harness_context =
             preserve_resume_context || execution.harness_session_id.is_some();
         if self.daemon_connections.is_some() || self.task_executor.is_some() {
-            if let Err(error) = self.cancel_execution_with_provider(execution, reason).await {
-                if matches!(error, ServiceError::DaemonUnavailable { .. }) {
-                    return Err(error);
+            let pending_provider_start =
+                ExecutionRepo::is_provider_start_pending(&*self.db, &execution.id).await?;
+            if !pending_provider_start {
+                if let Err(error) = self.cancel_execution_with_provider(execution, reason).await {
+                    if matches!(error, ServiceError::DaemonUnavailable { .. }) {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        %error,
+                        "executor cancellation failed; marking execution cancelled"
+                    );
                 }
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    %error,
-                    "executor cancellation failed; marking execution cancelled"
-                );
             }
         }
         let now = now_rfc3339();

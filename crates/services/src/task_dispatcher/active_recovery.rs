@@ -10,6 +10,10 @@ impl TaskDispatcher {
     /// receipt fences concurrent ticks and uncertain responses.
     pub(super) async fn recover_pending_provider_starts(&self) -> Result<u64> {
         let executions = ExecutionRepo::list_pending_provider_starts(&*self.db).await?;
+        #[cfg(test)]
+        if let Some(barrier) = self.after_pending_snapshot_barrier.as_ref() {
+            barrier.wait().await;
+        }
         let mut started = 0;
         for execution in executions {
             if self.is_stopped() {
@@ -18,18 +22,9 @@ impl TaskDispatcher {
             let Some(agent_id) = execution.agent_id.as_deref() else {
                 continue;
             };
-            let Some(agent) = AgentRepo::get_by_id(&*self.db, agent_id).await? else {
+            let Some(_agent) = AgentRepo::get_by_id(&*self.db, agent_id).await? else {
                 continue;
             };
-            if agent.paused {
-                tracing::debug!(
-                    task_id = %execution.task_id,
-                    execution_id = %execution.id,
-                    agent_id = %agent_id,
-                    "admitted provider Start remains pending while its Agent is paused"
-                );
-                continue;
-            }
             match self
                 .task_service
                 .start_execution(execution.id.clone())
