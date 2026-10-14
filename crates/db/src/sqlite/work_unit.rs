@@ -321,7 +321,11 @@ async fn insert_work_unit_execution_in_tx(
         &admission.execution,
         Some((&admission.work_unit_id, admission.work_unit_version)),
     )
-    .await?;
+    .await
+    .map_err(|error| match error {
+        DbError::Sqlx(error) => work_unit_write_error(error),
+        error => error,
+    })?;
     for artifact_id in artifact_input_ids {
         super::collaboration::pin_execution_artifact_input_in_tx(
             tx,
@@ -973,6 +977,23 @@ impl WorkUnitExecutionRepo for SqliteDb {
                     "automatic recovery must admit one exact child while TaskLifecycle is Active"
                         .to_owned(),
                 ));
+            }
+            let agent_id = admission
+                .execution
+                .agent_id
+                .as_deref()
+                .ok_or(DbError::VersionConflict)?;
+            let agent_is_unpaused: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM agent_current
+                    WHERE id = ? AND paused = 0
+                )",
+            )
+            .bind(agent_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !agent_is_unpaused {
+                return Err(DbError::VersionConflict);
             }
             let parent = sqlx::query("SELECT * FROM execution WHERE id = ?")
                 .bind(parent_execution_id)

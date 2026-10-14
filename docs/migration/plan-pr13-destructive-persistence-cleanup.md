@@ -591,3 +591,76 @@ BUG_STILL_LIVE = 0
 
 This supplement supersedes the earlier multi-WorkUnit recovery status above.
 PR13 remains subject to independent review; merge is not authorized.
+
+## PR13 microfix audit — paused Agent automatic recovery — 2026-10-14
+
+### Finding and reproduction
+
+P2 reproduced: `compute_effective_status()` treated `Agent.paused` as
+unavailable, and manual recovery rejected a paused Agent, but automatic
+recovery could pass through dispatcher candidate selection, child preparation,
+durable admission, and provider start without consulting that condition. The
+regression fixture has an exact Auto parent and valid reusable HarnessSession.
+In a controlled red run, temporarily removing the dispatcher, service
+preflight, and durable-admission pause guards made
+`paused_agent_keeps_auto_candidate_pending_until_unpaused` fail with one child
+admitted (`left: 1`, expected `0`). The guards were restored and the same test
+passes; the parent remains unchanged and the candidate stays queryable while
+paused.
+
+### Correction and boundary audit
+
+The dispatcher skips a paused Agent before recovery work. The automatic
+re-execution service checks again after loading the Agent, and
+`start_execution()` rejects a paused Agent before provider dispatch. The
+automatic durable-admission transaction also checks `agent_current.paused = 0`
+after `BEGIN IMMEDIATE` and before changing lifecycle metadata or inserting a
+child. A pause that wins before this write transaction causes the existing
+version-conflict path; rollback leaves no child, preserves the Auto parent,
+and keeps the candidate available. No domain state, production service, table,
+or migration was added.
+
+The existing V132 `work_unit_execution_admission_guard` checks active Role
+membership and counts Running Executions for the Agent against
+`max_concurrent_tasks` during the same child insert. `BEGIN IMMEDIATE`
+serializes concurrent writers around that check, so automatic recovery does
+not need a second capacity counter. The existing trigger error is now passed
+through `work_unit_write_error()` so a capacity rejection remains the typed
+`AgentAtCapacity` error. No V121–V133 migration was changed.
+
+The route census found one automatic child writer:
+`TaskDispatcher::recover_auto_cancelled_work_unit_executions()` to
+`re_execute_automatic_recovery_execution()` to durable WorkUnit admission and
+`start_execution()`. RoleMembership and capacity are checked by the existing
+service/SQLite admission contracts; pause is checked at each relevant
+boundary. Manual, mixed, and multi-WorkUnit recovery continue to use their
+existing exact-target rules.
+
+### Focused validation
+
+| Check | Result |
+| --- | --- |
+| Controlled red run of `paused_agent_keeps_auto_candidate_pending_until_unpaused` with dispatcher, service-preflight, and durable-admission guards temporarily removed | Expected FAIL: one paused-Agent child was admitted (`left: 1`, expected `0`); the provider-frontier guard remained active and all files were restored immediately. |
+| `cargo test -p services --lib paused_agent_keeps_auto_candidate_pending_until_unpaused --locked --offline -- --test-threads=1` | PASS: paused candidate creates no child; after unpause the exact candidate admits one child. |
+| `cargo test -p services --lib automatic_recovery --locked --offline -- --test-threads=1` | PASS, 3 tests: exact candidate policy, stale pause rejected before commit, and SQLite capacity rejection. |
+| `cargo test -p services --lib concurrent_dispatcher_ticks_resume_one_exact_auto_child_once --locked --offline -- --test-threads=1` | PASS: two dispatcher ticks admit one child and make one external start. |
+| `cargo test -p services --lib paused_agent --locked --offline -- --test-threads=1` | PASS, 2 tests: candidate stays pending and `start_execution()` makes no provider call for a paused Agent. |
+| `cargo test -p services --lib failed_external_start_after_durable_recovery_does_not_replay_old_attempt --locked --offline -- --test-threads=1` | PASS: a post-admission external start failure does not replay the prior attempt. |
+| `cargo test -p services --lib explicit_recovery_same_key_after_post_commit_crash_replays_without_duplicate --locked --offline -- --test-threads=1` | PASS: same-key post-commit replay returns the one durable child without another start. |
+| `cargo test -p services --lib ambiguous_recovery_remains_selectable_if_annotation_write_is_interrupted --locked --offline -- --test-threads=1` | PASS: exact ambiguous candidate remains selectable after an interrupted annotation write. |
+| `cargo test -p services --lib ordinary_reexecute_ --locked --offline -- --test-threads=1` | PASS, 3 tests: exact manual recovery, snapshot failure, and WorkUnit-version race. |
+| `cargo test -p services --lib explicit_recovery_rolls_back_lifecycle_child_and_receipt_together --locked --offline -- --test-threads=1` | PASS: lifecycle, child, and decision receipt remain atomic. |
+| Focused `services` test-binary regressions: mixed Auto/Manual recovery, two- and three-WorkUnit selection, suspended membership rejection, concurrent admission, block-owner race, sibling follow-up, and multi-WorkUnit workspace/lease separation | PASS: each exact test passed. |
+
+The final census for this microfix is:
+
+```text
+P0 = 0
+P1 = 0
+P2 = 0
+P3 = 0
+BUG_STILL_LIVE = 0
+```
+
+PR13 remains ready only for independent review after the branch push and
+remote-ref verification. Merge remains unauthorized; PR14 has not started.

@@ -3,6 +3,34 @@ use api_types::ActorRef;
 use db::{CollaborationRepo, CoordinationMode, ProjectMemberRepo, TaskLifecycleRepo, TaskRoleRepo};
 use serde_json::Value;
 
+#[derive(Default)]
+struct RecoveryDispatchExecutor {
+    calls: std::sync::atomic::AtomicUsize,
+    started: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl executors::TaskExecutor for RecoveryDispatchExecutor {
+    async fn execute(
+        &self,
+        _ctx: executors::ExecutionContext,
+    ) -> std::result::Result<executors::ExecutionResult, executors::ExecutorError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.started.notify_one();
+        Ok(executors::ExecutionResult {
+            status: executors::ExecutionOutcome::Completed,
+            ..Default::default()
+        })
+    }
+
+    async fn cancel(
+        &self,
+        _execution_id: &str,
+    ) -> std::result::Result<(), executors::ExecutorError> {
+        Ok(())
+    }
+}
+
 async fn execution_external_session_id(
     db: &db::SqliteDb,
     execution: &db::Execution,
@@ -4672,6 +4700,141 @@ async fn explicit_multi_work_unit_recovery_keeps_repository_workspaces_and_lease
     .expect("old lease count loads");
     assert_eq!(old_lease_count, 0);
     drop(repo_dir);
+}
+
+#[tokio::test]
+async fn concurrent_dispatcher_ticks_resume_one_exact_auto_child_once() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let workspace_root = TempDir::new().expect("recovery workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_workspace_exec_locks(Arc::new(crate::WorkspaceExecutionLockManager::new()));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
+    let agent = db::AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    let mut snapshot =
+        crate::task_service::config::build_executor_config_snapshot(&db, &task, &agent, None, None)
+            .await
+            .expect("exact Agent routing snapshot builds")
+            .expect("Agent routing snapshot exists");
+    let mut snapshot_value: Value = serde_json::from_str(&snapshot).expect("snapshot parses");
+    snapshot_value["harness_capabilities"] = json!({
+        "schema_version": 1,
+        "capabilities": { "resume": "native" }
+    });
+    snapshot = snapshot_value.to_string();
+
+    let (parent, workspace) = create_running_repository_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        "implementer",
+        ExecutionPurpose::Implement,
+        workspace_root.path(),
+        Some("automatic recovery dispatcher race".to_owned()),
+        Some(snapshot),
+    )
+    .await;
+    ExecutionRepo::record_harness_session_result(
+        &*db,
+        &parent.id,
+        "codex-session-for-dispatch-race",
+        &now_rfc3339(),
+    )
+    .await
+    .expect("parent receives an exact resumable HarnessSession");
+
+    let daemon_id = agent.daemon_id.as_deref().expect("Agent has its daemon");
+    let changed = sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
+        .bind(crate::embedded_daemon::embedded_machine_id())
+        .bind(daemon_id)
+        .execute(db.pool())
+        .await
+        .expect("fixture daemon selects the embedded provider");
+    assert_eq!(changed.rows_affected(), 1);
+
+    crate::CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .run_recovery()
+        .await
+        .expect("CrashRecovery marks the exact resumable WorkUnit Auto");
+    let stopped_parent = ExecutionRepo::get_by_id(&*db, &parent.id)
+        .await
+        .expect("Auto parent reloads")
+        .expect("Auto parent remains historical");
+    assert_eq!(stopped_parent.status, ExecutionStatus::Cancelled);
+    assert_eq!(stopped_parent.resume_policy, Some(db::ResumePolicy::Auto));
+    assert_eq!(
+        stopped_parent.workspace_id.as_deref(),
+        Some(workspace.id.as_str())
+    );
+    assert_eq!(
+        crate::task_service::resumable_external_session(
+            &db,
+            &stopped_parent,
+            Some(&agent_id),
+            Some(&workspace.id),
+        )
+        .await
+        .expect("HarnessSession resumability preflight succeeds")
+        .as_deref(),
+        Some("codex-session-for-dispatch-race")
+    );
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let executor = Arc::new(RecoveryDispatchExecutor::default());
+    let task_service = Arc::new(
+        service
+            .clone()
+            .with_task_executor(executor.clone())
+            .with_automatic_recovery_precommit_barrier(Arc::clone(&barrier)),
+    );
+    let first = crate::TaskDispatcher::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        Arc::clone(&task_service),
+    );
+    let second = crate::TaskDispatcher::new(Arc::clone(&db), Arc::clone(&event_bus), task_service);
+    let first_tick = tokio::spawn(async move { first.check_once().await });
+    let second_tick = tokio::spawn(async move { second.check_once().await });
+    barrier.wait().await;
+    barrier.wait().await;
+    let first_count = first_tick
+        .await
+        .expect("first dispatcher tick joins")
+        .expect("first dispatcher tick succeeds");
+    let second_count = second_tick
+        .await
+        .expect("second dispatcher tick joins")
+        .expect("second dispatcher tick succeeds");
+    assert_eq!(first_count + second_count, 1);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        executor.started.notified(),
+    )
+    .await
+    .expect("one accepted provider start runs the exact child");
+    assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let children: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE parent_execution_id = ?")
+            .bind(&parent.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("auto child count loads after concurrent ticks");
+    assert_eq!(children, 1);
+    let parent_after = ExecutionRepo::get_by_id(&*db, &parent.id)
+        .await
+        .expect("parent reloads after concurrent recovery")
+        .expect("parent remains historical");
+    assert_eq!(parent_after.status, ExecutionStatus::Cancelled);
+    assert_eq!(parent_after.resume_policy, Some(db::ResumePolicy::Auto));
 }
 
 #[tokio::test]

@@ -1015,6 +1015,9 @@ impl TaskService {
         let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
+        if automatic_recovery && agent.paused {
+            return Err(ServiceError::AgentPaused { agent_id });
+        }
         let workspace = match parent_execution.workspace_id.as_deref() {
             Some(workspace_id) => Some(
                 WorkspaceRepo::get_by_id(&*self.db, workspace_id)
@@ -1170,6 +1173,13 @@ impl TaskService {
             created_at: now.clone(),
             updated_at: now,
         };
+        #[cfg(test)]
+        if automatic_recovery {
+            if let Some(barrier) = self.automatic_recovery_precommit_barrier.as_ref() {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
         let (task, execution, idempotent_replay) =
             if let Some(lifecycle) = recovery_lifecycle.as_ref() {
                 let (task, execution) = self

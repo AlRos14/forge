@@ -84,6 +84,8 @@ pub struct TaskService {
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
     workspace_root: PathBuf,
     credential_env: Option<Arc<crate::credential_service::CredentialService>>,
+    #[cfg(test)]
+    automatic_recovery_precommit_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 pub(crate) struct WorkUnitAdmissionLifecyclePlan {
@@ -246,7 +248,18 @@ impl TaskService {
             repo_cache_locks: None,
             workspace_root: default_workspace_root(),
             credential_env: None,
+            #[cfg(test)]
+            automatic_recovery_precommit_barrier: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_automatic_recovery_precommit_barrier(
+        mut self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.automatic_recovery_precommit_barrier = Some(barrier);
+        self
     }
 
     pub fn with_merge_service(mut self, merge_service: Arc<MergeService>) -> Self {

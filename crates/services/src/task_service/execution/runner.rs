@@ -144,6 +144,16 @@ impl TaskService {
                 "only running executions can be started",
             ));
         }
+        if let Some(agent_id) = execution.agent_id.as_deref() {
+            let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
+            if agent.paused {
+                return Err(ServiceError::AgentPaused {
+                    agent_id: agent_id.to_owned(),
+                });
+            }
+        }
         if execution.role == "reviewer"
             && execution.purpose == Some(ExecutionPurpose::Review)
             && self

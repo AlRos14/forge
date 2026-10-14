@@ -1,4 +1,4 @@
-use db::{DbError, ExecutionRepo, ExecutionStatus, ResumePolicy, StopReason};
+use db::{AgentRepo, DbError, ExecutionRepo, ExecutionStatus, ResumePolicy, StopReason};
 
 use crate::{Result, ServiceError};
 
@@ -16,6 +16,21 @@ impl TaskDispatcher {
                 break;
             }
             if !is_exact_auto_recovery_candidate(&execution) {
+                continue;
+            }
+            let Some(agent_id) = execution.agent_id.as_deref() else {
+                continue;
+            };
+            let Some(agent) = AgentRepo::get_by_id(&*self.db, agent_id).await? else {
+                continue;
+            };
+            if agent.paused {
+                tracing::debug!(
+                    task_id = %execution.task_id,
+                    execution_id = %execution.id,
+                    agent_id = %agent_id,
+                    "Auto recovery remains pending while its Agent is paused"
+                );
                 continue;
             }
             if !crate::task_service::execution::has_exact_work_unit_target(

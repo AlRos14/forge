@@ -1476,7 +1476,7 @@ mod tests {
     use crate::{
         daemon_service::{DaemonReportInput, DaemonService, DetectedCliInput},
         daemon_transport::{DaemonConnection, DaemonConnectionRegistry},
-        TaskService,
+        TaskDispatcher, TaskService,
     };
     use db::{
         create_sqlite_pool, new_uuid_v4, run_migrations, AgentRepo, CreateAgent, CreateExecution,
@@ -1491,6 +1491,31 @@ mod tests {
     #[derive(Default)]
     struct RecordingCancelExecutor {
         cancelled: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[derive(Default)]
+    struct RecoveryStartExecutor {
+        calls: std::sync::atomic::AtomicUsize,
+        started: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskExecutor for RecoveryStartExecutor {
+        async fn execute(
+            &self,
+            _ctx: ExecutionContext,
+        ) -> std::result::Result<ExecutionResult, ExecutorError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.notify_one();
+            Ok(ExecutionResult {
+                status: ExecutionOutcome::Completed,
+                ..Default::default()
+            })
+        }
+
+        async fn cancel(&self, _execution_id: &str) -> std::result::Result<(), ExecutorError> {
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait]
@@ -3131,6 +3156,315 @@ mod tests {
         assert!(final_task.error_annotation.is_none());
         assert!(final_task.blocked_json.is_none());
         assert_eq!(fixture.agents.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn paused_agent_keeps_auto_candidate_pending_until_unpaused() {
+        let fixture =
+            seed_parallel_recovery_fixture(&["codex", "shell"], &[Some("codex-session-a"), None])
+                .await;
+        CrashRecovery::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus))
+            .run_recovery()
+            .await
+            .expect("CrashRecovery records an exact resumable Auto candidate");
+
+        let parent = ExecutionRepo::get_by_id(&*fixture.db, &fixture.executions[0].id)
+            .await
+            .expect("Auto parent reloads")
+            .expect("Auto parent remains historical");
+        assert_eq!(parent.resume_policy, Some(ResumePolicy::Auto));
+        assert_eq!(parent.status, ExecutionStatus::Cancelled);
+
+        let task_service =
+            TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus));
+        let dispatcher = TaskDispatcher::new(
+            Arc::clone(&fixture.db),
+            Arc::clone(&fixture.event_bus),
+            Arc::new(task_service.clone()),
+        );
+
+        AgentRepo::set_paused(&*fixture.db, &fixture.agents[0].id, true)
+            .await
+            .expect("Agent pauses");
+        assert_eq!(
+            dispatcher
+                .check_once()
+                .await
+                .expect("dispatcher tick succeeds"),
+            0,
+            "a paused Agent must not admit or start an Auto child"
+        );
+        let child_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE parent_execution_id = ?")
+                .bind(&parent.id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("child count loads while paused");
+        assert_eq!(child_count, 0);
+        let still_pending = ExecutionRepo::list_work_unit_auto_recovery_candidates(&*fixture.db)
+            .await
+            .expect("paused Auto candidate remains queryable");
+        assert!(still_pending
+            .iter()
+            .any(|candidate| candidate.id == parent.id));
+        let parent_while_paused = ExecutionRepo::get_by_id(&*fixture.db, &parent.id)
+            .await
+            .expect("parent reloads while paused")
+            .expect("parent remains historical");
+        assert_eq!(parent_while_paused.status, parent.status);
+        assert_eq!(parent_while_paused.stop_reason, parent.stop_reason);
+        assert_eq!(parent_while_paused.resume_policy, parent.resume_policy);
+        assert_eq!(
+            parent_while_paused.harness_session_id,
+            parent.harness_session_id
+        );
+        AgentRepo::set_paused(&*fixture.db, &fixture.agents[0].id, false)
+            .await
+            .expect("Agent resumes");
+        let resumed_agent = AgentRepo::get_by_id(&*fixture.db, &fixture.agents[0].id)
+            .await
+            .expect("Agent reloads after resume")
+            .expect("Agent remains");
+        assert!(!resumed_agent.paused);
+        assert!(crate::task_service::execution::has_exact_work_unit_target(
+            &fixture.db,
+            &parent.task_id,
+            &parent
+        )
+        .await
+        .expect("exact Auto WorkUnit target check succeeds"));
+        assert_eq!(
+            crate::task_service::resumable_external_session(
+                &fixture.db,
+                &parent,
+                parent.agent_id.as_deref(),
+                parent.workspace_id.as_deref(),
+            )
+            .await
+            .expect("resumable HarnessSession preflight succeeds")
+            .as_deref(),
+            Some("codex-session-a")
+        );
+        let admitted = task_service
+            .re_execute_automatic_recovery_execution(parent.id.clone())
+            .await
+            .expect("unpaused Agent admits one exact Auto child");
+        assert!(!admitted.idempotent_replay);
+        assert_eq!(
+            admitted.execution.parent_execution_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        let children: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE parent_execution_id = ?")
+                .bind(&parent.id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("child count loads after unpause");
+        assert_eq!(children, 1);
+        let parent_after_admission = ExecutionRepo::get_by_id(&*fixture.db, &parent.id)
+            .await
+            .expect("parent reloads after child admission")
+            .expect("parent remains historical");
+        assert_eq!(parent_after_admission.status, parent.status);
+        assert_eq!(parent_after_admission.stop_reason, parent.stop_reason);
+        assert_eq!(parent_after_admission.resume_policy, parent.resume_policy);
+    }
+
+    #[tokio::test]
+    async fn automatic_recovery_rechecks_pause_after_preflight_before_commit() {
+        let fixture =
+            seed_parallel_recovery_fixture(&["codex", "shell"], &[Some("codex-session-a"), None])
+                .await;
+        CrashRecovery::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus))
+            .run_recovery()
+            .await
+            .expect("CrashRecovery records an exact resumable Auto candidate");
+        let parent_id = fixture.executions[0].id.clone();
+        let parent_before = ExecutionRepo::get_by_id(&*fixture.db, &parent_id)
+            .await
+            .expect("Auto parent reloads")
+            .expect("Auto parent remains");
+        let task_before = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .expect("Task reloads")
+            .expect("Task remains");
+        let lifecycle_before =
+            TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task.id)
+                .await
+                .expect("TaskLifecycle reloads")
+                .expect("TaskLifecycle remains");
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let task_service =
+            TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus))
+                .with_automatic_recovery_precommit_barrier(Arc::clone(&barrier));
+        let recovery_service = task_service.clone();
+        let recovery = tokio::spawn(async move {
+            recovery_service
+                .re_execute_automatic_recovery_execution(parent_id.clone())
+                .await
+        });
+
+        barrier.wait().await;
+        AgentRepo::set_paused(&*fixture.db, &fixture.agents[0].id, true)
+            .await
+            .expect("Agent pauses after service preflight");
+        barrier.wait().await;
+
+        let error = recovery
+            .await
+            .expect("automatic recovery task joins")
+            .err()
+            .expect("durable admission rejects the stale unpaused snapshot");
+        assert!(matches!(
+            error,
+            ServiceError::Db(db::DbError::VersionConflict)
+        ));
+        let child_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE parent_execution_id = ?")
+                .bind(&parent_before.id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("child count remains zero after stale admission");
+        assert_eq!(child_count, 0);
+        let parent_after = ExecutionRepo::get_by_id(&*fixture.db, &parent_before.id)
+            .await
+            .expect("parent reloads after rejected admission")
+            .expect("parent remains historical");
+        assert_eq!(parent_after.status, parent_before.status);
+        assert_eq!(parent_after.stop_reason, parent_before.stop_reason);
+        assert_eq!(parent_after.resume_policy, parent_before.resume_policy);
+        assert_eq!(
+            parent_after.harness_session_id,
+            parent_before.harness_session_id
+        );
+        let task_after = TaskRepo::get_by_id(&*fixture.db, &task_before.id, false)
+            .await
+            .expect("Task reloads after rejected admission")
+            .expect("Task remains");
+        let lifecycle_after = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &task_before.id)
+            .await
+            .expect("TaskLifecycle reloads after rejected admission")
+            .expect("TaskLifecycle remains");
+        assert_eq!(task_after.version, task_before.version);
+        assert_eq!(task_after.error_annotation, task_before.error_annotation);
+        assert_eq!(task_after.blocked_json, task_before.blocked_json);
+        assert_eq!(lifecycle_after, lifecycle_before);
+        assert!(
+            ExecutionRepo::list_work_unit_auto_recovery_candidates(&*fixture.db)
+                .await
+                .expect("Auto candidate remains after rejection")
+                .iter()
+                .any(|candidate| candidate.id == parent_before.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_recovery_capacity_is_enforced_by_sqlite_admission() {
+        let fixture =
+            seed_parallel_recovery_fixture(&["codex", "shell"], &[Some("codex-session-a"), None])
+                .await;
+        CrashRecovery::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus))
+            .run_recovery()
+            .await
+            .expect("CrashRecovery records an exact resumable Auto candidate");
+        let parent = fixture.executions[0].clone();
+        let other_task = seed_task(
+            &fixture.db,
+            fixture.task.project_id.clone(),
+            fixture
+                .task
+                .repo_id
+                .clone()
+                .expect("fixture Task has its Repo"),
+            "active",
+            Some(fixture.agents[0].id.clone()),
+        )
+        .await;
+        let live_execution = seed_running_execution(
+            &fixture.db,
+            other_task.id,
+            fixture.agents[0].id.clone(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            crate::agent_capacity::count_running_executions(&fixture.db, &fixture.agents[0].id)
+                .await
+                .expect("Agent running count loads"),
+            1
+        );
+
+        let task_service =
+            TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus));
+        let error = task_service
+            .re_execute_automatic_recovery_execution(parent.id.clone())
+            .await
+            .err()
+            .expect("SQLite rejects auto recovery at the Agent capacity limit");
+        assert!(matches!(
+            error,
+            ServiceError::Db(db::DbError::AgentAtCapacity)
+        ));
+        let child_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE parent_execution_id = ?")
+                .bind(&parent.id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("capacity-rejected child count loads");
+        assert_eq!(child_count, 0);
+        let parent_after = ExecutionRepo::get_by_id(&*fixture.db, &parent.id)
+            .await
+            .expect("parent reloads after capacity rejection")
+            .expect("parent remains historical");
+        assert_eq!(parent_after.status, ExecutionStatus::Cancelled);
+        assert_eq!(parent_after.resume_policy, Some(ResumePolicy::Auto));
+        assert!(
+            ExecutionRepo::list_work_unit_auto_recovery_candidates(&*fixture.db)
+                .await
+                .expect("capacity-rejected candidate reloads")
+                .iter()
+                .any(|candidate| candidate.id == parent.id)
+        );
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*fixture.db, &live_execution.id)
+                .await
+                .expect("live capacity holder reloads")
+                .expect("live execution remains")
+                .status,
+            ExecutionStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn start_execution_rejects_paused_agent_before_provider_dispatch() {
+        let fixture = seed_parallel_recovery_fixture(&["codex", "shell"], &[None, None]).await;
+        let execution = fixture.executions[0].clone();
+        let executor = Arc::new(RecoveryStartExecutor::default());
+        let service = TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus))
+            .with_task_executor(executor.clone());
+        AgentRepo::set_paused(&*fixture.db, &fixture.agents[0].id, true)
+            .await
+            .expect("Agent pauses before the provider boundary");
+
+        let error = service
+            .start_execution(execution.id.clone())
+            .await
+            .expect_err("paused Agent cannot reach the provider");
+        assert!(matches!(
+            error,
+            ServiceError::AgentPaused { ref agent_id } if agent_id == &fixture.agents[0].id
+        ));
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*fixture.db, &execution.id)
+                .await
+                .expect("Execution reloads after paused dispatch")
+                .expect("Execution remains")
+                .status,
+            ExecutionStatus::Running,
+            "the pause guard does not rewrite the historical/current Execution"
+        );
     }
 
     #[tokio::test]
