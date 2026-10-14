@@ -45,6 +45,16 @@ Execution without destroying the scope. Runnable, blocked, running, and
 awaiting-integration are derived from the WorkUnit, dependencies, Executions,
 Workspaces, and integration outcomes.
 
+TaskLifecycle is an aggregate Task block, so an Execution admission can
+resolve it only when the current block's lifecycle reference, blocking
+annotation (when present), and exact parent Execution identify the same open
+WorkUnit. A follow-up or re-execute for a sibling WorkUnit is rejected while
+another WorkUnit owns the block. `error_annotation` and `blocked_json` carry
+different details; each present field must independently name that exact
+Execution before admission may clear it. Lifecycle activation, metadata
+cleanup, and child admission commit together. A manual lifecycle transition
+cannot bypass pending blocking metadata.
+
 An assigned WorkUnit is runnable only while its Actor still has active
 membership in the WorkUnit's TaskRole. If membership is suspended or ended,
 readiness asks for reallocation; it does not change the historical assignment

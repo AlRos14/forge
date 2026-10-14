@@ -5478,6 +5478,660 @@ async fn follow_up_work_unit_version_change_rolls_back_lifecycle_and_metadata() 
 }
 
 #[tokio::test]
+async fn follow_up_on_sibling_work_unit_preserves_current_block_owner_and_evidence() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let parent_a = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Completed,
+        None,
+        None,
+    )
+    .await;
+    let parent_b = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Failed,
+        None,
+        None,
+    )
+    .await;
+    service
+        .annotate_executor_failure_block(&parent_b)
+        .await
+        .expect("Execution B becomes the exact current Task block");
+    let work_unit_a =
+        db::WorkUnitRepo::get_by_id(&*db, parent_a.work_unit_id.as_deref().expect("A WorkUnit"))
+            .await
+            .expect("A WorkUnit loads")
+            .expect("A WorkUnit exists");
+    let work_unit_b =
+        db::WorkUnitRepo::get_by_id(&*db, parent_b.work_unit_id.as_deref().expect("B WorkUnit"))
+            .await
+            .expect("B WorkUnit loads")
+            .expect("B WorkUnit exists");
+    let before = admission_side_effect_snapshot(&db, &task.id, &work_unit_a.id).await;
+    let lifecycle_before = before.lifecycle.clone();
+    let task_before = before.task.clone();
+    let transition_count_before = before.lifecycle_transitions;
+    let admission_events_before = before.admission_events;
+    let executions_before = before.executions;
+
+    let blocking_annotation: api_types::TaskBlockingAnnotation = serde_json::from_str(
+        task_before
+            .error_annotation
+            .as_deref()
+            .expect("B blocking annotation is present"),
+    )
+    .expect("blocking annotation parses");
+    assert_eq!(
+        blocking_annotation.blocked_execution_id.as_deref(),
+        Some(parent_b.id.as_str())
+    );
+    assert!(blocking_annotation
+        .recovery_actions
+        .contains(&api_types::RecoveryAction::Reexecute));
+    assert_eq!(
+        serde_json::from_str::<Value>(task_before.blocked_json.as_deref().unwrap())
+            .expect("B blocked metadata parses")["execution_id"],
+        parent_b.id
+    );
+    assert_eq!(
+        lifecycle_before.reason_ref.as_deref(),
+        Some(parent_b.id.as_str())
+    );
+
+    let request_key = "sibling-follow-up-must-not-clear-current-block";
+    let result = service
+        .follow_up_execution(
+            parent_a.id.clone(),
+            "continue completed sibling A".to_owned(),
+            None,
+            None,
+            request_key.to_owned(),
+        )
+        .await;
+    assert!(result.is_err(), "A cannot resolve B's aggregate block");
+
+    assert_admission_side_effects_unchanged(&db, &task.id, &work_unit_a.id, &before).await;
+    assert_eq!(
+        db::WorkUnitRepo::get_by_id(&*db, &work_unit_b.id)
+            .await
+            .expect("B WorkUnit reloads")
+            .expect("B WorkUnit remains present"),
+        work_unit_b
+    );
+    let current_task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task reloads")
+        .expect("Task remains present");
+    assert_eq!(current_task, task_before);
+    let current_lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+        .await
+        .expect("TaskLifecycle reloads")
+        .expect("TaskLifecycle remains present");
+    assert_eq!(current_lifecycle, lifecycle_before);
+    let (transition_count_after, admission_events_after, executions_after): (i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM task_lifecycle_transition WHERE task_id = ?),
+                 (SELECT COUNT(*) FROM domain_event WHERE scope_type = 'task' AND scope_id = ?
+                    AND event_type IN ('task.lifecycle_changed', 'execution.started')),
+                 (SELECT COUNT(*) FROM execution WHERE task_id = ?)",
+        )
+        .bind(&task.id)
+        .bind(&task.id)
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("sibling admission receipts and events reload");
+    assert_eq!(transition_count_after, transition_count_before);
+    assert_eq!(admission_events_after, admission_events_before);
+    assert_eq!(executions_after, executions_before);
+    let children_a: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE parent_execution_id = ?")
+            .bind(&parent_a.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("A lineage count loads");
+    assert_eq!(children_a, 0);
+    let children_b: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE parent_execution_id = ?")
+            .bind(&parent_b.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("B lineage count loads");
+    assert_eq!(children_b, 0);
+    let operation_receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_follow_up_receipt WHERE idempotency_key = ?",
+    )
+    .bind(request_key)
+    .fetch_one(db.pool())
+    .await
+    .expect("sibling follow-up receipt count loads");
+    assert_eq!(operation_receipts, 0);
+}
+
+#[tokio::test]
+async fn durable_admission_rejects_block_owner_changed_after_preflight() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let parent_a = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Completed,
+        None,
+        None,
+    )
+    .await;
+    let parent_b = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Failed,
+        None,
+        None,
+    )
+    .await;
+    service
+        .annotate_executor_failure_block(&parent_b)
+        .await
+        .expect("Execution B installs the current block");
+
+    // Model a request that prepared A's identity before the blocker changed
+    // to B. Present the repository with current Task/lifecycle CAS versions so
+    // this assertion exercises its exact-owner check inside BEGIN IMMEDIATE.
+    TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .expect("Task loads before metadata fixture update")
+                .expect("Task exists")
+                .version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            error_annotation: Some(None),
+            blocked_json: Some(None),
+            failed_json: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("remove metadata to isolate lifecycle owner validation");
+    let current_task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("current Task loads")
+        .expect("Task exists");
+    let current_lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+        .await
+        .expect("current TaskLifecycle loads")
+        .expect("TaskLifecycle exists");
+    let work_unit_a = db::WorkUnitRepo::get_by_id(
+        &*db,
+        parent_a
+            .work_unit_id
+            .as_deref()
+            .expect("A WorkUnit identity"),
+    )
+    .await
+    .expect("A WorkUnit loads")
+    .expect("A WorkUnit exists");
+    let work_unit_b = db::WorkUnitRepo::get_by_id(
+        &*db,
+        parent_b
+            .work_unit_id
+            .as_deref()
+            .expect("B WorkUnit identity"),
+    )
+    .await
+    .expect("B WorkUnit loads")
+    .expect("B WorkUnit exists");
+    let lifecycle_transitions =
+        crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .plan_execution_activation(&current_task, &current_lifecycle)
+            .await
+            .expect("current B activation transition prepares");
+    let before = admission_side_effect_snapshot(&db, &task.id, &work_unit_a.id).await;
+    let now = now_rfc3339();
+    let input = db::CreateExecution {
+        id: db::new_uuid_v4(),
+        task_id: task.id.clone(),
+        agent_id: parent_a.agent_id.clone(),
+        actor_ref: parent_a.actor_ref(),
+        purpose: parent_a.purpose.clone(),
+        harness_session_id: None,
+        role: work_unit_a.role.clone(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: Some(parent_a.id.clone()),
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: Some("stale A follow-up plan".to_owned()),
+        logs_path: None,
+        before_sha: parent_a.before_sha.clone(),
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: parent_a.executor_config_snapshot_json.clone(),
+        workspace_id: parent_a.workspace_id.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    let event = crate::task_service::execution_domain_event(&input, "execution.started");
+    let admission = db::WorkUnitExecutionRepo::admit_with_lifecycle_and_artifact_inputs(
+        &*db,
+        db::AdmitWorkUnitExecutionWithLifecycle {
+            admission: db::CreateWorkUnitExecution {
+                execution: input,
+                work_unit_id: work_unit_a.id.clone(),
+                work_unit_version: work_unit_a.version,
+                workspace_lease: None,
+            },
+            expected_task_version: current_task.version,
+            expected_lifecycle_state: current_lifecycle.state,
+            expected_lifecycle_version: current_lifecycle.version,
+            lifecycle_transitions,
+            clear_blocking_metadata: Some(db::ClearTaskBlockingMetadata {
+                blocking_execution_id: parent_a.id.clone(),
+                blocking_work_unit_id: work_unit_a.id.clone(),
+                expected_lifecycle_reason_kind: current_lifecycle
+                    .reason_kind
+                    .clone()
+                    .expect("current block reason kind exists"),
+                expected_error_annotation: None,
+                expected_blocked_json: None,
+                expected_metadata_json: current_task.metadata_json.clone(),
+                replacement_metadata_json: current_task.metadata_json.clone(),
+            }),
+            follow_up_receipt: None,
+        },
+        Vec::new(),
+        event,
+    )
+    .await;
+    assert!(
+        matches!(admission, Err(db::DbError::VersionConflict)),
+        "durable admission rejects a stale blocker identity even with current CAS versions"
+    );
+    assert_admission_side_effects_unchanged(&db, &task.id, &work_unit_a.id, &before).await;
+    assert_eq!(
+        db::WorkUnitRepo::get_by_id(&*db, &work_unit_b.id)
+            .await
+            .expect("B WorkUnit reloads")
+            .expect("B WorkUnit remains present"),
+        work_unit_b
+    );
+    assert_eq!(
+        TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("TaskLifecycle reloads")
+            .expect("TaskLifecycle remains present")
+            .reason_ref
+            .as_deref(),
+        Some(parent_b.id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn secondary_work_unit_failure_does_not_replace_current_block_metadata() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let parent_a = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Failed,
+        None,
+        None,
+    )
+    .await;
+    let parent_b = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Failed,
+        None,
+        None,
+    )
+    .await;
+    service
+        .annotate_executor_failure_block(&parent_a)
+        .await
+        .expect("A installs the current Task block");
+    let before_second_failure = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task loads after A failure")
+        .expect("Task exists");
+    service
+        .annotate_executor_failure_block(&parent_b)
+        .await
+        .expect("B failure is recorded without stealing A's aggregate block");
+    let after_second_failure = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task reloads after B failure")
+        .expect("Task exists");
+    assert_eq!(after_second_failure, before_second_failure);
+    let annotation: api_types::TaskBlockingAnnotation = serde_json::from_str(
+        after_second_failure
+            .error_annotation
+            .as_deref()
+            .expect("A annotation remains present"),
+    )
+    .expect("A blocking annotation parses");
+    assert_eq!(
+        annotation.blocked_execution_id.as_deref(),
+        Some(parent_a.id.as_str())
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(after_second_failure.blocked_json.as_deref().unwrap())
+            .expect("A blocked metadata parses")["execution_id"],
+        parent_a.id
+    );
+    assert_eq!(
+        TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("TaskLifecycle reloads")
+            .expect("TaskLifecycle exists")
+            .reason_ref
+            .as_deref(),
+        Some(parent_a.id.as_str())
+    );
+    let b = ExecutionRepo::get_by_id(&*db, &parent_b.id)
+        .await
+        .expect("B Execution reloads")
+        .expect("B Execution remains present");
+    assert_eq!(b.status, ExecutionStatus::Failed);
+    assert_eq!(b.work_unit_id, parent_b.work_unit_id);
+}
+
+#[tokio::test]
+async fn manual_lifecycle_unblock_cannot_leave_execution_metadata_stale() {
+    let fixture = blocked_recovery_fixture(false).await;
+    let before =
+        admission_side_effect_snapshot(&fixture.db, &fixture.task.id, &fixture.work_unit.id).await;
+    let result = crate::task_lifecycle::TaskLifecycleService::new(
+        Arc::clone(&fixture.db),
+        Arc::new(EventBus::new(8)),
+    )
+    .transition_at_lifecycle_version(
+        crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: fixture.task.id.clone(),
+            expected_task_version: fixture.task.version,
+            to_state: TaskLifecycleState::Active,
+            cause: crate::task_lifecycle::LifecycleCause::Actor(api_types::Actor::user(
+                api_types::UserActionSource::Api,
+            )),
+            reason_kind: Some("manual_unblock".to_owned()),
+            reason_ref: Some("manual-unblock-request".to_owned()),
+            idempotency_key: "manual-unblock-with-pending-execution-metadata".to_owned(),
+        },
+        fixture.lifecycle.version,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "manual lifecycle transition cannot strand execution recovery evidence"
+    );
+    assert_admission_side_effects_unchanged(
+        &fixture.db,
+        &fixture.task.id,
+        &fixture.work_unit.id,
+        &before,
+    )
+    .await;
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .expect("Task reloads")
+        .expect("Task remains present");
+    assert_eq!(current.lifecycle_state, TaskLifecycleState::Blocked);
+    assert_eq!(current.error_annotation, fixture.task.error_annotation);
+    assert_eq!(current.blocked_json, fixture.task.blocked_json);
+}
+
+#[tokio::test]
+async fn task_failure_metadata_cannot_replace_an_exact_execution_block() {
+    let fixture = blocked_recovery_fixture(false).await;
+    let before =
+        admission_side_effect_snapshot(&fixture.db, &fixture.task.id, &fixture.work_unit.id).await;
+    let result = fixture
+        .service
+        .fail_task(
+            fixture.task.id.clone(),
+            "unrelated Task-level failure".to_owned(),
+            None,
+            Some("different-execution".to_owned()),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "Task failure cannot replace the exact block"
+    );
+    assert_admission_side_effects_unchanged(
+        &fixture.db,
+        &fixture.task.id,
+        &fixture.work_unit.id,
+        &before,
+    )
+    .await;
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .expect("Task reloads")
+        .expect("Task remains present");
+    assert_eq!(current.failed_json, None);
+    assert_eq!(current.error_annotation, fixture.task.error_annotation);
+    assert_eq!(current.blocked_json, fixture.task.blocked_json);
+}
+
+#[tokio::test]
+async fn follow_up_clears_exact_blocked_json_when_error_annotation_is_absent() {
+    let fixture = blocked_recovery_fixture(false).await;
+    TaskRepo::update(
+        &*fixture.db,
+        db::UpdateTask {
+            id: fixture.task.id.clone(),
+            expected_version: fixture.task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            error_annotation: Some(None),
+            blocked_json: None,
+            failed_json: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("error_annotation is absent in the blocked_json-only case");
+    let before = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .expect("Task reloads")
+        .expect("Task exists");
+    assert!(before.error_annotation.is_none());
+    assert!(before.blocked_json.is_some());
+
+    let launch = fixture
+        .service
+        .follow_up_execution(
+            fixture.parent.id.clone(),
+            "resolve the exact blocked_json owner".to_owned(),
+            None,
+            None,
+            "follow-up-blocked-json-only".to_owned(),
+        )
+        .await
+        .expect("exact parent follow-up admits with blocked_json-only evidence");
+    assert_eq!(launch.task.lifecycle_state, TaskLifecycleState::Active);
+    assert!(launch.task.error_annotation.is_none());
+    assert!(launch.task.blocked_json.is_none());
+    assert_eq!(
+        launch.execution.parent_execution_id.as_deref(),
+        Some(fixture.parent.id.as_str())
+    );
+    let task_version = launch.task.version;
+    let task_after = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .expect("Task reloads after admission")
+        .expect("Task exists after admission");
+    assert_eq!(task_after.version, task_version);
+    assert!(task_after.error_annotation.is_none());
+    assert!(task_after.blocked_json.is_none());
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task.id)
+        .await
+        .expect("TaskLifecycle reloads")
+        .expect("TaskLifecycle exists");
+    assert_eq!(lifecycle.state, TaskLifecycleState::Active);
+    assert_eq!(lifecycle.version, fixture.lifecycle.version + 1);
+    let child_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE parent_execution_id = ?")
+            .bind(&fixture.parent.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("exact child count loads");
+    assert_eq!(child_count, 1);
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_lifecycle_transition
+         WHERE task_id = ? AND idempotency_key = ?",
+    )
+    .bind(&fixture.task.id)
+    .bind(format!(
+        "execution-start:{}:active:{}",
+        fixture.task.id, fixture.lifecycle.version
+    ))
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("activation receipt count loads");
+    assert_eq!(receipt_count, 1);
+}
+
+#[tokio::test]
+async fn ordinary_reexecute_resolves_only_its_exact_current_block() {
+    let fixture = blocked_recovery_fixture(false).await;
+    let launch = fixture
+        .service
+        .re_execute_execution(fixture.parent.id.clone())
+        .await
+        .expect("ordinary re-execute admits the exact current block parent");
+    assert_eq!(launch.task.lifecycle_state, TaskLifecycleState::Active);
+    assert!(launch.task.error_annotation.is_none());
+    assert!(launch.task.blocked_json.is_none());
+    assert_eq!(
+        launch.execution.parent_execution_id.as_deref(),
+        Some(fixture.parent.id.as_str())
+    );
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task.id)
+        .await
+        .expect("TaskLifecycle reloads")
+        .expect("TaskLifecycle exists");
+    assert_eq!(lifecycle.state, TaskLifecycleState::Active);
+    assert_eq!(lifecycle.version, fixture.lifecycle.version + 1);
+    let children: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE parent_execution_id = ?")
+            .bind(&fixture.parent.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("re-execution lineage count loads");
+    assert_eq!(children, 1);
+    let start_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'execution.started' AND scope_id = ? AND causation_id = ?",
+    )
+    .bind(&fixture.task.id)
+    .bind(&fixture.parent.id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("re-execution start event count loads");
+    assert_eq!(start_events, 1);
+}
+
+#[tokio::test]
+async fn initial_launch_on_sibling_work_unit_preserves_current_block() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let work_unit_a = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
+    let parent_b = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Failed,
+        None,
+        None,
+    )
+    .await;
+    service
+        .annotate_executor_failure_block(&parent_b)
+        .await
+        .expect("Execution B becomes the exact current Task block");
+    let before = admission_side_effect_snapshot(&db, &task.id, &work_unit_a.id).await;
+
+    let result = service
+        .launch_work_unit_execution(
+            &work_unit_a.id,
+            work_unit_a.version,
+            db::ExecutionPurpose::Implement,
+            "launch another WorkUnit while B remains blocked".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "initial launch cannot reactivate a blocked Task"
+    );
+    assert_admission_side_effects_unchanged(&db, &task.id, &work_unit_a.id, &before).await;
+    let blocking_annotation: api_types::TaskBlockingAnnotation = serde_json::from_str(
+        before
+            .task
+            .error_annotation
+            .as_deref()
+            .expect("B annotation remains present"),
+    )
+    .expect("B annotation parses");
+    assert_eq!(
+        blocking_annotation.blocked_execution_id.as_deref(),
+        Some(parent_b.id.as_str())
+    );
+    assert_eq!(
+        before.lifecycle.reason_ref.as_deref(),
+        Some(parent_b.id.as_str())
+    );
+}
+
+#[tokio::test]
 async fn follow_up_artifact_pin_rejection_preserves_blocking_annotation_and_lifecycle() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(32));

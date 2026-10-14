@@ -93,6 +93,11 @@ impl TaskService {
         let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
             .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        if lifecycle.state == db::TaskLifecycleState::Blocked {
+            return Err(ServiceError::invalid_operation(
+                "a new WorkUnit cannot activate a blocked Task without its exact blocking Execution parent",
+            ));
+        }
         let lifecycle_transitions = lifecycle_service
             .plan_execution_activation(&task, &lifecycle)
             .await?;
@@ -366,6 +371,16 @@ impl TaskService {
         let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
             .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        let clear_blocking_metadata = if lifecycle.state == db::TaskLifecycleState::Blocked {
+            Some(blocking_metadata_cleanup_plan(
+                &task,
+                &lifecycle,
+                &parent_execution,
+                work_unit_id,
+            )?)
+        } else {
+            None
+        };
         let lifecycle_transitions = lifecycle_service
             .plan_execution_activation(&task, &lifecycle)
             .await?;
@@ -425,11 +440,6 @@ impl TaskService {
         let artifact_input_ids = self
             .inherit_plan_artifact_inputs(&parent_execution.id, &task.id)
             .await?;
-        let clear_blocking_metadata = task
-            .error_annotation
-            .is_some()
-            .then(|| blocking_metadata_cleanup_plan(&task))
-            .transpose()?;
         let lifecycle_plan = super::WorkUnitAdmissionLifecyclePlan {
             expected_task_version: task.version,
             lifecycle,
@@ -642,6 +652,16 @@ impl TaskService {
             let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+            let clear_blocking_metadata = if lifecycle.state == db::TaskLifecycleState::Blocked {
+                Some(blocking_metadata_cleanup_plan(
+                    &task,
+                    &lifecycle,
+                    &parent_execution,
+                    work_unit_id,
+                )?)
+            } else {
+                None
+            };
             let lifecycle_transitions = lifecycle_service
                 .plan_execution_activation(&task, &lifecycle)
                 .await?;
@@ -649,7 +669,7 @@ impl TaskService {
                 expected_task_version: task.version,
                 lifecycle,
                 transitions: lifecycle_transitions,
-                clear_blocking_metadata: None,
+                clear_blocking_metadata,
                 follow_up_receipt: None,
             })
         } else {
@@ -823,19 +843,30 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let task = crate::task_lifecycle::TaskLifecycleService::new(
+        let lifecycle_reason_kind = format!("manual_stop:{blocking_reason}");
+        let block = crate::task_lifecycle::TaskLifecycleService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
         )
         .block(
             &task.id,
             crate::task_lifecycle::LifecycleCause::Execution(execution.id.clone()),
-            format!("manual_stop:{blocking_reason}"),
+            lifecycle_reason_kind.clone(),
             execution.id.clone(),
             format!("manual-stop:{}:{}", execution.id, blocking_reason),
         )
-        .await?
-        .task;
+        .await?;
+        if block.lifecycle.state != db::TaskLifecycleState::Blocked
+            || block.lifecycle.reason_kind.as_deref() != Some(lifecycle_reason_kind.as_str())
+            || block.lifecycle.reason_ref.as_deref() != Some(execution.id.as_str())
+        {
+            // The cancelled Execution remains historical, but it cannot
+            // replace an unrelated WorkUnit's current aggregate block.
+            return ExecutionRepo::get_by_id(&*self.db, &execution_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("execution", execution_id));
+        }
+        let task = block.task;
         let mut recovery_actions = vec![
             api_types::RecoveryAction::Reexecute,
             api_types::RecoveryAction::CancelTask,
@@ -894,7 +925,68 @@ impl TaskService {
     }
 }
 
-fn blocking_metadata_cleanup_plan(task: &Task) -> Result<db::ClearTaskBlockingMetadata> {
+pub(super) fn validate_task_blocking_metadata_owner(
+    task: &Task,
+    blocking_execution_id: &str,
+) -> Result<()> {
+    if let Some(raw) = task.error_annotation.as_deref() {
+        let annotation =
+            serde_json::from_str::<api_types::TaskAnnotation>(raw).map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "Task {} has an unreadable blocking annotation: {error}",
+                    task.id
+                ))
+            })?;
+        let api_types::TaskAnnotation::Blocking(annotation) = annotation else {
+            return Err(ServiceError::invalid_operation(
+                "Task blocking annotation has no exact Execution identity",
+            ));
+        };
+        if annotation.blocked_execution_id.as_deref() != Some(blocking_execution_id)
+            || annotation.artifact.as_ref().is_some_and(|artifact| {
+                artifact.kind != "execution"
+                    || artifact.id.as_deref() != Some(blocking_execution_id)
+            })
+        {
+            return Err(ServiceError::invalid_operation(
+                "Task blocking annotation belongs to a different or unknown Execution",
+            ));
+        }
+    }
+    if let Some(raw) = task.blocked_json.as_deref() {
+        let metadata: Value = serde_json::from_str(raw).map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "Task {} has unreadable blocked metadata: {error}",
+                task.id
+            ))
+        })?;
+        if metadata.get("execution_id").and_then(Value::as_str) != Some(blocking_execution_id) {
+            return Err(ServiceError::invalid_operation(
+                "Task blocked metadata belongs to a different or unknown Execution",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn blocking_metadata_cleanup_plan(
+    task: &Task,
+    lifecycle: &db::TaskLifecycle,
+    blocking_execution: &Execution,
+    blocking_work_unit_id: &str,
+) -> Result<db::ClearTaskBlockingMetadata> {
+    if lifecycle.state != db::TaskLifecycleState::Blocked
+        || lifecycle.reason_kind.is_none()
+        || lifecycle.reason_ref.as_deref() != Some(blocking_execution.id.as_str())
+        || blocking_execution.task_id != task.id
+        || blocking_execution.work_unit_id.as_deref() != Some(blocking_work_unit_id)
+        || task.failed_json.is_some()
+    {
+        return Err(ServiceError::invalid_operation(
+            "only the exact current Execution block for this WorkUnit can be resolved by admission",
+        ));
+    }
+    validate_task_blocking_metadata_owner(task, &blocking_execution.id)?;
     let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
@@ -902,6 +994,12 @@ fn blocking_metadata_cleanup_plan(task: &Task) -> Result<db::ClearTaskBlockingMe
         metadata.extra.remove(key);
     }
     Ok(db::ClearTaskBlockingMetadata {
+        blocking_execution_id: blocking_execution.id.clone(),
+        blocking_work_unit_id: blocking_work_unit_id.to_owned(),
+        expected_lifecycle_reason_kind: lifecycle
+            .reason_kind
+            .clone()
+            .expect("blocking lifecycle reason kind checked above"),
         expected_error_annotation: task.error_annotation.clone(),
         expected_blocked_json: task.blocked_json.clone(),
         expected_metadata_json: task.metadata_json.clone(),

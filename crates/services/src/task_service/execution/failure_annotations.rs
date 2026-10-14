@@ -115,7 +115,7 @@ impl TaskService {
             "details": details,
         });
 
-        let blocked_task = crate::task_lifecycle::TaskLifecycleService::new(
+        let block = crate::task_lifecycle::TaskLifecycleService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
         )
@@ -126,8 +126,17 @@ impl TaskService {
             execution.id.clone(),
             format!("execution-failure:{}", execution.id),
         )
-        .await?
-        .task;
+        .await?;
+        if block.lifecycle.state != db::TaskLifecycleState::Blocked
+            || block.lifecycle.reason_kind.as_deref() != Some(failure_kind_key(&kind))
+            || block.lifecycle.reason_ref.as_deref() != Some(execution.id.as_str())
+        {
+            // A sibling Execution may fail while another cause already owns
+            // the aggregate block. Keep that block's Task annotation intact;
+            // this failed Execution remains available by its own exact identity.
+            return Ok(());
+        }
+        let blocked_task = block.task;
         let updated = TaskRepo::update(
             &*self.db,
             db::UpdateTask {

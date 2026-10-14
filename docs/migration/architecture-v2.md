@@ -203,6 +203,17 @@ the TaskRole selected by Task type when that role exists, and checks active
 Agent membership on lease issue and renewal. The old singleton fallback stays
 available only when the matching canonical TaskRole does not exist.
 
+An Execution-owned TaskLifecycle block is resolved only by admission of a
+child whose exact parent is the current blocking Execution on the same open
+WorkUnit. The current lifecycle reference and transition receipt, when
+present, plus each present `error_annotation` and `blocked_json` must identify
+that Execution. A sibling WorkUnit admission is rejected while another
+WorkUnit owns the aggregate block. Block cleanup, lifecycle activation, child
+Execution, ArtifactInputs, WorkspaceLease, receipts, and durable events commit
+together. Parentless launch and generic lifecycle transitions cannot bypass
+pending block evidence; Task cancellation remains an explicit Task-wide
+resolution.
+
 V115 repairs the narrowly identifiable historical case where provider Merged
 on a different PR head was turned into automatic Task rework, but only when
 that exact rework still owns the current lifecycle. It preserves the old retry,

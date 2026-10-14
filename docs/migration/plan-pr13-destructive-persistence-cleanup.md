@@ -337,3 +337,118 @@ BUG_STILL_LIVE = 0
 
 Final HEAD, push SHA, remote-ref equality, clean-tree check, and final READY
 decision are recorded in the completion report. Merge remains unauthorized.
+
+## PR13 microfix audit — 2026-10-14
+
+This update closes the follow-up block-ownership finding and the remaining
+Blocked-to-Active metadata gap. It leaves V121–V133 and the earlier PR13
+implementation intact; no migration or PR14 work was added.
+
+### Findings and decisions
+
+**P1 — Follow-up could clear a sibling WorkUnit's current block.**
+`TaskLifecycle` is the Task-wide aggregate block. Its current `reason_ref` and
+the exact transition receipt at the current lifecycle version identify the
+blocking Execution when the block is Execution-owned. The source Execution
+must belong to the same Task and exact open WorkUnit as the new child. Each
+present `error_annotation` and `blocked_json` must separately identify that
+Execution; they may carry different information and are not required to match
+each other. An admission for a sibling WorkUnit is rejected while a different
+Execution owns the current block. Its TaskLifecycle and recovery evidence stay
+unchanged and usable.
+
+The ordinary WorkUnit admission transaction now rechecks the exact current
+lifecycle receipt, source Execution, WorkUnit, parent lineage, each metadata
+identity, Task version, metadata snapshots, and absence of Task-level
+`failed_json`. The existing Task/WorkUnit CAS remains. Initial launch has no
+parent identity and cannot resolve a blocked Task. Follow-up and ordinary
+re-execute may resolve a block only when their exact parent is that block's
+Execution on the same WorkUnit. Cleanup and lifecycle activation remain in the
+same commit as child Execution, ArtifactInputs, WorkspaceLease, receipts, and
+events.
+
+The failure and manual-stop writers now leave an existing sibling block's
+annotation untouched when a second WorkUnit fails or stops. Startup recovery
+also confirms its lifecycle block result before writing its annotation.
+Explicit recovery now checks the same current lifecycle and per-field identity
+under its existing transaction. A generic manual Blocked-to-Ready/Active
+transition is rejected while Task blocking or failure metadata is pending;
+accepted cancellation remains a Task-wide resolution. Task-level failure and
+restart paths fail closed when separate Execution block metadata exists.
+
+**P2 — Blocked activation could leave misleading metadata.**
+The former follow-up guard depended only on `error_annotation`, and ordinary
+initial launch/re-execute could activate without a cleanup plan. Exact
+`blocked_json`-only metadata is now cleared atomically; both present fields
+must resolve independently to the same exact block owner. An Execution block
+without parseable, matching evidence is preserved and cannot be activated
+through an unrelated launch. `failed_json` remains Task-level failure history;
+ordinary admission and explicit Execution recovery do not erase it. Task
+unblocked delivery now covers annotation-only as well as `blocked_json`-only
+resolutions.
+
+### Provider boundary
+
+Provider start stays outside SQLite. A replay of a V133 same-key/same-content
+follow-up returns its durable child with `idempotent_replay`; the REST dispatch
+path does not start that child again. A committed Running Execution left by a
+process crash is covered by startup recovery: exact resumable sessions enter
+the existing automatic recovery candidate path, while an exact non-resumable
+WorkUnit Execution receives a manual recovery annotation and can be retried
+through exact Execution recovery. A live process that leaves an attempt idle
+is covered by stalled-Execution reconciliation and the same exact recovery
+route. No extra dispatch store or provider transaction was introduced.
+
+### Focused evidence
+
+| Command or check | Result |
+|---|---|
+| `cargo test -p services --lib follow_up_ --locked --offline -- --test-threads=1` | PASS, 20 tests, including sibling-block preservation, exact-parent replay/concurrency, `blocked_json`-only cleanup, ArtifactInput rollback, WorkUnit version race, and same-WorkUnit sibling progress. |
+| `cargo test -p services --lib execution_activation_ --locked --offline -- --test-threads=1` | PASS, 2 tests; Backlog keys use exact source versions and repeated legal activation cycles retain stable retries with distinct receipts. |
+| `cargo test -p services --lib durable_admission_rejects_block_owner_changed_after_preflight --locked --offline -- --test-threads=1` | PASS; durable admission rejects stale A ownership using current CAS versions after lifecycle now points to B. |
+| `cargo test -p services --lib ordinary_reexecute_resolves_only_its_exact_current_block --locked --offline -- --test-threads=1` | PASS; exact parent re-execute commits one activation, cleanup, child and start event. |
+| `cargo test -p services --lib initial_launch_on_sibling_work_unit_preserves_current_block --locked --offline -- --test-threads=1` | PASS; a parentless launch cannot clear another WorkUnit's current block. |
+| `cargo test -p services --lib recovery_admission --locked --offline -- --test-threads=1` | PASS, 4 tests; concurrent single-child admission and ArtifactInput, RoleMembership, and WorkUnit-version rollback checks. |
+| `cargo test -p services --lib secondary_work_unit_failure_does_not_replace_current_block_metadata --locked --offline -- --test-threads=1` | PASS; a second failed WorkUnit leaves the current block owner and annotation unchanged. |
+| `cargo test -p services --lib manual_lifecycle_unblock_cannot_leave_execution_metadata_stale --locked --offline -- --test-threads=1` | PASS; manual lifecycle transition preserves evidence and rejects the state change. |
+| `cargo test -p services --lib task_failure_metadata_cannot_replace_an_exact_execution_block --locked --offline -- --test-threads=1` | PASS; Task-level failure metadata cannot replace the exact Execution block. |
+| `cargo test -p services --lib ordinary_provider_start_failure_keeps_one_admitted_execution_and_event --locked --offline -- --test-threads=1` | PASS; provider failure after commit leaves one durable admitted Execution and start event. |
+| `cargo test -p services --lib failed_external_start_after_durable_recovery_does_not_replay_old_attempt --locked --offline -- --test-threads=1` | PASS; failed external recovery start does not replay the old attempt. |
+| `cargo test -p services --lib crash_recovery_cancels_running_executions --locked --offline -- --test-threads=1` | PASS; startup recovery handles committed Running work. |
+| `cargo fmt --all -- --check`; `git diff --check` | PASS after final edits. |
+
+The unmodified V121–V132 migration contracts and API/MCP request schemas were
+not rerun. No workspace-wide tests/build, global clippy, or remote CI run was
+made. Existing PR13 Actor, RoleMembership, WorkUnit, capacity, Workspace,
+ArtifactInput, lease, recovery, event, and immutable-receipt guards remain in
+force.
+
+The existing ordinary admission failure suites were also rerun after this
+microfix: `cargo test -p services --lib ordinary_launch_ --locked --offline --
+--test-threads=1` passed all 3 tests, and
+`cargo test -p services --lib ordinary_reexecute_ --locked --offline --
+--test-threads=1` passed all 3 tests. These cover snapshot failure, artifact
+rejection, WorkUnit-version rollback, and exact blocked-parent resolution.
+Provider failure after durable admission is covered by the separate focused
+test listed above.
+
+### Residual risks and final census
+
+- If provider start is accepted externally but its response is lost, the
+  durable Execution may require the existing crash/stall reconciliation and
+  exact recovery route. Same-key follow-up replay cannot issue a second start.
+- A failed Execution on a sibling WorkUnit remains an independent open-scope
+  attempt; it cannot replace the current Task-wide block. After that block is
+  resolved, the sibling may be explicitly re-executed by its own identity.
+- No P0/P1/P2/P3 finding remains in the audited scope.
+
+```text
+P0 = 0
+P1 = 0
+P2 = 0
+P3 = 0
+BUG_STILL_LIVE = 0
+```
+
+The completion report records final Git SHAs, remote read-back, clean-tree
+verification, and the independent-review status. Merge remains unauthorized.

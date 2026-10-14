@@ -884,7 +884,7 @@ async fn recover_executions(
             annotated: false,
         });
     }
-    let task =
+    let block =
         crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(db), Arc::clone(event_bus))
             .block(
                 &task.id,
@@ -896,8 +896,17 @@ async fn recover_executions(
                     task.id
                 ),
             )
-            .await?
-            .task;
+            .await?;
+    if block.lifecycle.state != TaskLifecycleState::Blocked
+        || block.lifecycle.reason_kind.as_deref() != Some(blocking_reason)
+        || block.lifecycle.reason_ref.as_deref() != Some(reason_ref.as_str())
+    {
+        return Ok(RecoverTaskOutcome {
+            task: block.task,
+            annotated: false,
+        });
+    }
+    let task = block.task;
     let task = TaskRepo::update(
         db.as_ref(),
         UpdateTask {

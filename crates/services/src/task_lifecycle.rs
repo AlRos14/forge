@@ -276,6 +276,19 @@ impl TaskLifecycleService {
         if !allowed_transition(lifecycle.state, input.to_state) {
             return Err(ServiceError::Db(db::DbError::InvalidTransition));
         }
+        if lifecycle.state == TaskLifecycleState::Blocked
+            && matches!(
+                input.to_state,
+                TaskLifecycleState::Ready | TaskLifecycleState::Active
+            )
+            && (task.error_annotation.is_some()
+                || task.blocked_json.is_some()
+                || task.failed_json.is_some())
+        {
+            return Err(ServiceError::invalid_operation(
+                "a Task with pending blocking metadata can leave Blocked only through exact Execution admission or cancellation",
+            ));
+        }
         if lifecycle.state == TaskLifecycleState::ReadyToMerge
             && input.to_state == TaskLifecycleState::Active
             && cause.kind != "gate_evaluation"

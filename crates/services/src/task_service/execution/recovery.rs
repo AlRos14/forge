@@ -42,6 +42,18 @@ impl TaskService {
             )));
         }
         let annotation = self.recovery_annotation(&task)?;
+        let blocking_execution_id =
+            annotation.blocked_execution_id.as_deref().ok_or_else(|| {
+                ServiceError::invalid_operation("blocked Execution identity is missing")
+            })?;
+        if lifecycle.state != db::TaskLifecycleState::Blocked
+            || lifecycle.reason_ref.as_deref() != Some(blocking_execution_id)
+        {
+            return Err(ServiceError::invalid_operation(
+                "recovery annotation does not match the current TaskLifecycle block",
+            ));
+        }
+        super::launch::validate_task_blocking_metadata_owner(&task, blocking_execution_id)?;
         self.validate_recovery_action(&annotation, &action)?;
         match action {
             api_types::RecoveryAction::ResumeSession => {
@@ -169,6 +181,14 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        if task.failed_json.is_some() {
+            return Err(ServiceError::invalid_operation("task has already failed"));
+        }
+        if task.error_annotation.is_some() || task.blocked_json.is_some() {
+            return Err(ServiceError::invalid_operation(
+                "resolve the exact current Execution block before marking the Task failed",
+            ));
+        }
         let reason = reason.into();
         let lifecycle_cause = match execution_id.as_deref() {
             Some(execution_id) => {
@@ -181,19 +201,28 @@ impl TaskService {
         let lifecycle_reason_ref = execution_id
             .clone()
             .unwrap_or_else(|| format!("task-version:{}", task.version));
-        let task = crate::task_lifecycle::TaskLifecycleService::new(
+        let lifecycle_reason_kind = "task_failed";
+        let block = crate::task_lifecycle::TaskLifecycleService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
         )
         .block(
             &task_id,
             lifecycle_cause,
-            "task_failed",
+            lifecycle_reason_kind,
             lifecycle_reason_ref.clone(),
             format!("task-failed:{}:{lifecycle_reason_ref}", task.id),
         )
-        .await?
-        .task;
+        .await?;
+        if block.lifecycle.state != db::TaskLifecycleState::Blocked
+            || block.lifecycle.reason_kind.as_deref() != Some(lifecycle_reason_kind)
+            || block.lifecycle.reason_ref.as_deref() != Some(lifecycle_reason_ref.as_str())
+        {
+            return Err(ServiceError::invalid_operation(
+                "another cause owns the current TaskLifecycle block",
+            ));
+        }
+        let task = block.task;
         let failed_meta = json!({
             "reason": reason,
             "created_at": now_rfc3339(),
@@ -246,6 +275,11 @@ impl TaskService {
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
         if task.failed_json.is_none() {
             return Err(ServiceError::invalid_operation("task has not failed"));
+        }
+        if task.error_annotation.is_some() || task.blocked_json.is_some() {
+            return Err(ServiceError::invalid_operation(
+                "restart cannot clear separate Execution blocking metadata",
+            ));
         }
         let previous_reason = interruption_reason(task.failed_json.as_deref());
         let updated = TaskRepo::update(

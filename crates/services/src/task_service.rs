@@ -489,11 +489,10 @@ impl TaskService {
             None
         };
 
-        let should_publish_unblocked = lifecycle_plan
-            .as_ref()
-            .and_then(|plan| plan.clear_blocking_metadata.as_ref())
-            .is_some()
-            && task.blocked_json.is_some();
+        let should_publish_unblocked = lifecycle_plan.as_ref().is_some_and(|plan| {
+            plan.lifecycle.state == db::TaskLifecycleState::Blocked
+                && plan.clear_blocking_metadata.is_some()
+        });
         let previous_unblock_reason = task
             .blocked_json
             .as_deref()
@@ -503,6 +502,17 @@ impl TaskService {
                     .get("reason")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
+            })
+            .or_else(|| {
+                task.error_annotation
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<api_types::TaskAnnotation>(raw).ok())
+                    .and_then(|annotation| match annotation {
+                        api_types::TaskAnnotation::Blocking(annotation) => {
+                            Some(annotation.blocking_reason)
+                        }
+                        api_types::TaskAnnotation::Legacy(_) => None,
+                    })
             });
         let event = execution_domain_event(&input, "execution.started");
         let admission = db::CreateWorkUnitExecution {
@@ -767,7 +777,7 @@ impl TaskService {
         recovered_task.error_annotation = None;
         recovered_task.blocked_json = None;
         recovered_task.updated_at = updated_at;
-        if task.blocked_json.is_some() {
+        if task.error_annotation.is_some() || task.blocked_json.is_some() {
             let previous_reason = task
                 .blocked_json
                 .as_deref()
@@ -777,6 +787,17 @@ impl TaskService {
                         .get("reason")
                         .and_then(Value::as_str)
                         .map(str::to_owned)
+                })
+                .or_else(|| {
+                    task.error_annotation
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<api_types::TaskAnnotation>(raw).ok())
+                        .and_then(|annotation| match annotation {
+                            api_types::TaskAnnotation::Blocking(annotation) => {
+                                Some(annotation.blocking_reason)
+                            }
+                            api_types::TaskAnnotation::Legacy(_) => None,
+                        })
                 });
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),

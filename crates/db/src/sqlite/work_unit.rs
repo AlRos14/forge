@@ -1,6 +1,114 @@
 use super::*;
 use crate::FollowUpExecutionReceipt;
 
+fn validate_blocking_metadata_execution_identity(
+    error_annotation: Option<&str>,
+    blocked_json: Option<&str>,
+    blocking_execution_id: &str,
+) -> Result<()> {
+    if let Some(raw) = error_annotation {
+        let annotation: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+            DbError::Check(format!("invalid Task blocking annotation JSON: {error}"))
+        })?;
+        if annotation
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+            || annotation
+                .get("blocked_execution_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(blocking_execution_id)
+        {
+            return Err(DbError::VersionConflict);
+        }
+        if let Some(artifact) = annotation.get("artifact").filter(|value| !value.is_null()) {
+            if artifact.get("kind").and_then(serde_json::Value::as_str) != Some("execution")
+                || artifact.get("id").and_then(serde_json::Value::as_str)
+                    != Some(blocking_execution_id)
+            {
+                return Err(DbError::VersionConflict);
+            }
+        }
+    }
+    if let Some(raw) = blocked_json {
+        let metadata: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+            DbError::Check(format!("invalid Task blocked metadata JSON: {error}"))
+        })?;
+        if metadata
+            .get("execution_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(blocking_execution_id)
+        {
+            return Err(DbError::VersionConflict);
+        }
+    }
+    Ok(())
+}
+
+async fn validate_current_execution_block_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    lifecycle_version: i64,
+    lifecycle_reason_kind: Option<&str>,
+    lifecycle_reason_ref: Option<&str>,
+    blocking_execution_id: &str,
+    blocking_work_unit_id: &str,
+) -> Result<()> {
+    if lifecycle_reason_kind.is_none() || lifecycle_reason_ref != Some(blocking_execution_id) {
+        return Err(DbError::VersionConflict);
+    }
+
+    let transition = sqlx::query(
+        "SELECT from_state, to_state, cause_kind, cause_ref, reason_kind, reason_ref
+         FROM task_lifecycle_transition
+         WHERE task_id = ? AND to_version = ?",
+    )
+    .bind(task_id)
+    .bind(lifecycle_version)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(transition) = transition {
+        if transition.try_get::<String, _>("from_state")? == "blocked"
+            || transition.try_get::<String, _>("to_state")? != "blocked"
+            || transition.try_get::<String, _>("cause_kind")? != "execution"
+            || transition
+                .try_get::<Option<String>, _>("cause_ref")?
+                .as_deref()
+                != Some(blocking_execution_id)
+            || transition
+                .try_get::<Option<String>, _>("reason_kind")?
+                .as_deref()
+                != lifecycle_reason_kind
+            || transition
+                .try_get::<Option<String>, _>("reason_ref")?
+                .as_deref()
+                != Some(blocking_execution_id)
+        {
+            return Err(DbError::VersionConflict);
+        }
+    }
+
+    let exact_blocking_execution: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM execution e
+             JOIN work_unit wu ON wu.id = e.work_unit_id
+             WHERE e.id = ? AND e.task_id = ? AND e.work_unit_id = ?
+               AND e.status IN ('completed', 'failed', 'cancelled')
+               AND wu.task_id = ? AND wu.status = 'open'
+         )",
+    )
+    .bind(blocking_execution_id)
+    .bind(task_id)
+    .bind(blocking_work_unit_id)
+    .bind(task_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !exact_blocking_execution {
+        return Err(DbError::VersionConflict);
+    }
+    Ok(())
+}
+
 fn actor_from_columns(kind: Option<String>, id: Option<String>) -> Result<Option<ActorRef>> {
     match (kind, id) {
         (None, None) => Ok(None),
@@ -915,7 +1023,7 @@ impl WorkUnitExecutionRepo for SqliteDb {
             }
         }
         let task_row = sqlx::query(
-            "SELECT version, error_annotation, blocked_json, metadata_json
+            "SELECT version, error_annotation, blocked_json, failed_json, metadata_json
              FROM task WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(task_id)
@@ -929,15 +1037,19 @@ impl WorkUnitExecutionRepo for SqliteDb {
                 actual: task_version,
             });
         }
-        let lifecycle_row =
-            sqlx::query("SELECT state, version FROM task_lifecycle WHERE task_id = ?")
-                .bind(task_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(DbError::NotFound)?;
+        let lifecycle_row = sqlx::query(
+            "SELECT state, version, reason_kind, reason_ref
+             FROM task_lifecycle WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
         let current_state =
             parse_enum::<crate::TaskLifecycleState>(lifecycle_row.try_get("state")?)?;
         let current_lifecycle_version: i64 = lifecycle_row.try_get("version")?;
+        let current_lifecycle_reason_kind: Option<String> = lifecycle_row.try_get("reason_kind")?;
+        let current_lifecycle_reason_ref: Option<String> = lifecycle_row.try_get("reason_ref")?;
         if current_state != input.expected_lifecycle_state
             || current_lifecycle_version != input.expected_lifecycle_version
         {
@@ -1101,17 +1213,54 @@ impl WorkUnitExecutionRepo for SqliteDb {
             }
         }
 
-        if let Some(clear) = input.clear_blocking_metadata.as_ref() {
-            if clear.expected_error_annotation.is_none()
-                || task_row.try_get::<Option<String>, _>("error_annotation")?
-                    != clear.expected_error_annotation
-                || task_row.try_get::<Option<String>, _>("blocked_json")?
-                    != clear.expected_blocked_json
-                || task_row.try_get::<Option<String>, _>("metadata_json")?
-                    != clear.expected_metadata_json
-            {
-                return Err(DbError::VersionConflict);
+        match (current_state, input.clear_blocking_metadata.as_ref()) {
+            (crate::TaskLifecycleState::Blocked, Some(clear)) => {
+                if admission.execution.parent_execution_id.as_deref()
+                    != Some(clear.blocking_execution_id.as_str())
+                    || admission.work_unit_id != clear.blocking_work_unit_id
+                    || current_lifecycle_reason_kind.as_deref()
+                        != Some(clear.expected_lifecycle_reason_kind.as_str())
+                    || task_row.try_get::<Option<String>, _>("error_annotation")?
+                        != clear.expected_error_annotation
+                    || task_row.try_get::<Option<String>, _>("blocked_json")?
+                        != clear.expected_blocked_json
+                    || task_row.try_get::<Option<String>, _>("metadata_json")?
+                        != clear.expected_metadata_json
+                    || task_row
+                        .try_get::<Option<String>, _>("failed_json")?
+                        .is_some()
+                {
+                    return Err(DbError::VersionConflict);
+                }
+                validate_blocking_metadata_execution_identity(
+                    clear.expected_error_annotation.as_deref(),
+                    clear.expected_blocked_json.as_deref(),
+                    &clear.blocking_execution_id,
+                )?;
+                validate_current_execution_block_in_tx(
+                    &mut tx,
+                    task_id,
+                    current_lifecycle_version,
+                    current_lifecycle_reason_kind.as_deref(),
+                    current_lifecycle_reason_ref.as_deref(),
+                    &clear.blocking_execution_id,
+                    &clear.blocking_work_unit_id,
+                )
+                .await?;
             }
+            (crate::TaskLifecycleState::Blocked, None) => {
+                return Err(DbError::Check(
+                    "Blocked Task activation must resolve its exact current Execution block"
+                        .to_owned(),
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(DbError::Check(
+                    "blocking metadata can only be cleared while resolving a Blocked Task"
+                        .to_owned(),
+                ));
+            }
+            (_, None) => {}
         }
 
         let mut lifecycle_events = Vec::with_capacity(input.lifecycle_transitions.len());
@@ -1142,7 +1291,8 @@ impl WorkUnitExecutionRepo for SqliteDb {
                  SET error_annotation = NULL, blocked_json = NULL,
                      metadata_json = ?, version = version + 1, updated_at = ?
                  WHERE id = ? AND version = ? AND error_annotation IS ?
-                   AND blocked_json IS ? AND metadata_json IS ? AND deleted_at IS NULL",
+                   AND blocked_json IS ? AND failed_json IS NULL
+                   AND metadata_json IS ? AND deleted_at IS NULL",
             )
             .bind(clear.replacement_metadata_json.as_deref())
             .bind(&admission.execution.created_at)
@@ -1244,7 +1394,7 @@ impl WorkUnitExecutionRepo for SqliteDb {
         // lifecycle transition and clearing of the old recovery annotation.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let task_row = sqlx::query(
-            "SELECT version, error_annotation, blocked_json, metadata_json
+            "SELECT version, error_annotation, blocked_json, failed_json, metadata_json
              FROM task WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(&admission.execution.task_id)
@@ -1263,9 +1413,45 @@ impl WorkUnitExecutionRepo for SqliteDb {
             || task_row.try_get::<Option<String>, _>("blocked_json")? != input.expected_blocked_json
             || task_row.try_get::<Option<String>, _>("metadata_json")?
                 != input.expected_metadata_json
+            || task_row
+                .try_get::<Option<String>, _>("failed_json")?
+                .is_some()
         {
             return Err(DbError::VersionConflict);
         }
+        let lifecycle_row = sqlx::query(
+            "SELECT state, version, reason_kind, reason_ref
+             FROM task_lifecycle WHERE task_id = ?",
+        )
+        .bind(&admission.execution.task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        let lifecycle_state =
+            parse_enum::<crate::TaskLifecycleState>(lifecycle_row.try_get("state")?)?;
+        let lifecycle_version: i64 = lifecycle_row.try_get("version")?;
+        let lifecycle_reason_kind: Option<String> = lifecycle_row.try_get("reason_kind")?;
+        let lifecycle_reason_ref: Option<String> = lifecycle_row.try_get("reason_ref")?;
+        if lifecycle_state != crate::TaskLifecycleState::Blocked
+            || lifecycle_version != transition.expected_lifecycle_version
+        {
+            return Err(DbError::VersionConflict);
+        }
+        validate_blocking_metadata_execution_identity(
+            input.expected_error_annotation.as_deref(),
+            input.expected_blocked_json.as_deref(),
+            parent_execution_id,
+        )?;
+        validate_current_execution_block_in_tx(
+            &mut tx,
+            &admission.execution.task_id,
+            lifecycle_version,
+            lifecycle_reason_kind.as_deref(),
+            lifecycle_reason_ref.as_deref(),
+            parent_execution_id,
+            &admission.work_unit_id,
+        )
+        .await?;
         let parent_is_exact: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                 SELECT 1 FROM execution
@@ -1327,11 +1513,16 @@ impl WorkUnitExecutionRepo for SqliteDb {
             "UPDATE task
              SET error_annotation = NULL, blocked_json = NULL,
                  version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ? AND deleted_at IS NULL",
+             WHERE id = ? AND version = ? AND error_annotation IS ?
+               AND blocked_json IS ? AND failed_json IS NULL
+               AND metadata_json IS ? AND deleted_at IS NULL",
         )
         .bind(&transition.updated_at)
         .bind(&transition.task_id)
         .bind(transition.expected_task_version)
+        .bind(input.expected_error_annotation.as_deref())
+        .bind(input.expected_blocked_json.as_deref())
+        .bind(input.expected_metadata_json.as_deref())
         .execute(&mut *tx)
         .await?
         .rows_affected();

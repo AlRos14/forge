@@ -1752,6 +1752,12 @@ pub struct RecoverWorkUnitExecution {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClearTaskBlockingMetadata {
+    /// The exact failed Execution whose current TaskLifecycle block this
+    /// admission resolves. The WorkUnit and lifecycle receipt are checked in
+    /// the same SQLite transaction as the child Execution.
+    pub blocking_execution_id: String,
+    pub blocking_work_unit_id: String,
+    pub expected_lifecycle_reason_kind: String,
     pub expected_error_annotation: Option<String>,
     pub expected_blocked_json: Option<String>,
     pub expected_metadata_json: Option<String>,
