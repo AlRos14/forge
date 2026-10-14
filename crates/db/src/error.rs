@@ -43,6 +43,21 @@ pub enum DbError {
     #[error("agent at capacity")]
     AgentAtCapacity,
 
+    #[error("agent is paused: {agent_id}")]
+    AgentPaused { agent_id: String },
+
+    #[error("WorkUnit is not open for Execution admission")]
+    WorkUnitNotOpen,
+
+    #[error("Execution Actor is not an active member of the WorkUnit role")]
+    WorkUnitRoleMembershipInactive,
+
+    #[error("WorkUnit Workspace is not available for Execution admission")]
+    WorkUnitWorkspaceUnavailable,
+
+    #[error("WorkUnit already has a Running Execution")]
+    WorkUnitExecutionAlreadyRunning,
+
     #[error("dependency gate")]
     DependencyGate,
 

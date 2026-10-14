@@ -339,17 +339,45 @@ async fn insert_work_unit_execution_in_tx(
         super::workspace_lease::insert_workspace_lease_in_tx(tx, lease).await?;
     }
     let event = append_event(db, tx, event_input).await?;
+    if let Some(crate::ActorRef::Agent(agent_id)) = admission.execution.actor_ref.as_ref() {
+        if admission.execution.agent_id.as_deref() == Some(agent_id.as_str()) {
+            let pending = CreateDomainEvent {
+                id: crate::new_uuid_v4(),
+                event_type: "execution.provider_start_pending".to_owned(),
+                entity_type: "execution".to_owned(),
+                entity_id: execution.id.clone(),
+                actor_type: "agent".to_owned(),
+                actor_id: Some(agent_id.clone()),
+                scope_type: "task".to_owned(),
+                scope_id: execution.task_id.clone(),
+                correlation_id: execution.id.clone(),
+                causation_id: execution.parent_execution_id.clone(),
+                causation_depth: i64::from(execution.parent_execution_id.is_some()),
+                dedupe_key: Some(format!("execution.provider_start_pending:{}", execution.id)),
+                payload_json: serde_json::json!({
+                    "execution_id": execution.id,
+                    "task_id": execution.task_id,
+                    "work_unit_id": execution.work_unit_id,
+                    "agent_id": agent_id,
+                    "status": "running",
+                })
+                .to_string(),
+                created_at: execution.created_at.clone(),
+            };
+            append_event(db, tx, &pending).await?;
+        }
+    }
     Ok((execution, event))
 }
 
 fn work_unit_write_error(error: sqlx::Error) -> DbError {
+    if let Some(error) = super::work_unit_execution_admission_error(&error) {
+        return error;
+    }
     if let sqlx::Error::Database(database_error) = &error {
         let message = database_error.message().to_ascii_lowercase();
         if message.contains("dependency would create a cycle") {
             return DbError::CycleDetected;
-        }
-        if message.contains("agent reached concurrent execution capacity") {
-            return DbError::AgentAtCapacity;
         }
         if message.contains("unique constraint failed: work_unit_dependency") {
             return DbError::IdempotencyConflict;
@@ -869,7 +897,7 @@ impl WorkUnitExecutionRepo for SqliteDb {
         artifact_input_ids: Vec<String>,
         event_input: CreateDomainEvent,
     ) -> Result<CollaborationWrite<Execution>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let (execution, event) = insert_work_unit_execution_in_tx(
             self,
             &mut tx,

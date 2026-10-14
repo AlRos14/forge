@@ -57,7 +57,9 @@ use std::{
 // V132 archives Main/Project Agent, Agent Chat, memory, Attention, Genesis, and
 // Project OS history before dropping those runtime tables and Project columns.
 // V133 records exact follow-up request identities atomically with their child
-// Execution so uncertain retries replay the same admitted child.
+// Execution so uncertain retries replay the same admitted child. V134 replaces
+// the WorkUnit Execution admission trigger with distinct failure markers so
+// late SQLite guard rejections retain their exact typed cause.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

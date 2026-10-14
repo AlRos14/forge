@@ -262,6 +262,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Agent WorkUnit Execution admission now records an undispatched provider Start
+  in the same transaction as the Execution, lease, and start event. The existing
+  dispatcher resumes that exact Execution after an Agent is unpaused; a durable
+  attempt receipt prevents duplicate provider effects across concurrent ticks,
+  graceful shutdown, restart, and uncertain responses. Startup CrashRecovery and
+  the heartbeat monitor preserve an admitted Start until its provider attempt is
+  claimed. V134 replaces the generic WorkUnit admission trigger error with stable
+  cause-specific markers, so capacity is no longer reported for RoleMembership,
+  WorkUnit, Workspace, dependency, or running-child denials.
+
 - `DELETE /repos/{id}` now checks for associated Tasks inside its write
   transaction and returns `409 repo_in_use` while preserving the Repo,
   primary-Repo selection, and Tasks. Task-free Repo deletion still returns

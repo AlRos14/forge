@@ -158,6 +158,9 @@ pub enum ServiceError {
     #[error("agent {agent_id} is paused and cannot accept new work")]
     AgentPaused { agent_id: String },
 
+    #[error("provider start outcome is uncertain for Execution {execution_id}")]
+    ExecutionStartUncertain { execution_id: String },
+
     #[error("project {project_id} is paused")]
     ProjectPaused { project_id: String },
 
@@ -223,6 +226,7 @@ impl From<db::DbError> for ServiceError {
     fn from(error: db::DbError) -> Self {
         match error {
             db::DbError::DependencyGate => Self::DependencyGate,
+            db::DbError::AgentPaused { agent_id } => Self::AgentPaused { agent_id },
             error => Self::Db(error),
         }
     }

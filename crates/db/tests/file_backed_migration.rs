@@ -1715,6 +1715,85 @@ async fn v133_follow_up_receipts_upgrade_from_v132_and_restart_cleanly() {
     let _ = fs::remove_dir_all(final_dir);
 }
 
+#[tokio::test]
+async fn v134_replaces_admission_guard_on_v133_database_and_restarts_cleanly() {
+    let baseline_dir = unique_temp_path("v133-admission-guard-baseline");
+    let final_dir = unique_temp_path("v134-admission-guard-upgrade");
+    fs::create_dir_all(&baseline_dir).expect("V133 migration dir creates");
+    fs::create_dir_all(&final_dir).expect("V134 migration dir creates");
+    copy_migrations_up_to(133, &baseline_dir);
+    copy_migrations_up_to(134, &final_dir);
+
+    let db_path = final_dir.join("existing-v133.db");
+    let database_url = format!("sqlite://{}", db_path.display());
+    let pool = create_sqlite_pool(&database_url).await.expect("pool");
+    run_migrations_from(&pool, &baseline_dir)
+        .await
+        .expect("existing database reaches V133");
+    let old_trigger: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger'
+         AND name = 'work_unit_execution_admission_guard'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("V132 admission trigger exists before upgrade");
+    assert!(old_trigger.contains("Agent reached concurrent execution capacity"));
+
+    run_migrations_from(&pool, &final_dir)
+        .await
+        .expect("existing V133 database upgrades to V134");
+    let trigger_after_upgrade: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger'
+         AND name = 'work_unit_execution_admission_guard'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("V134 admission trigger exists after upgrade");
+    assert!(trigger_after_upgrade.contains("FORGE_WU_ADMISSION_AGENT_AT_CAPACITY"));
+    assert!(trigger_after_upgrade.contains("FORGE_WU_ADMISSION_ROLE_MEMBERSHIP_INACTIVE"));
+    assert!(!trigger_after_upgrade.contains("Agent reached concurrent execution capacity"));
+    let migration_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("migration count loads after V134");
+    pool.close().await;
+
+    let restarted_pool = create_sqlite_pool(&database_url)
+        .await
+        .expect("database reopens after restart");
+    run_migrations_from(&restarted_pool, &final_dir)
+        .await
+        .expect("restart keeps V134 applied");
+    let restarted_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration")
+        .fetch_one(&restarted_pool)
+        .await
+        .expect("migration count loads after restart");
+    let restarted_trigger: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger'
+         AND name = 'work_unit_execution_admission_guard'",
+    )
+    .fetch_one(&restarted_pool)
+    .await
+    .expect("V134 trigger survives restart");
+    assert_eq!(restarted_count, migration_count);
+    assert_eq!(restarted_trigger, trigger_after_upgrade);
+    let foreign_key_violations: Vec<(String, i64, String, i64)> =
+        sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&restarted_pool)
+            .await
+            .expect("foreign_key_check runs after V134");
+    assert!(foreign_key_violations.is_empty());
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&restarted_pool)
+        .await
+        .expect("integrity_check runs after V134");
+    assert_eq!(integrity, "ok");
+    restarted_pool.close().await;
+
+    let _ = fs::remove_dir_all(baseline_dir);
+    let _ = fs::remove_dir_all(final_dir);
+}
+
 fn copy_migrations_up_to(max_version: i64, destination: &Path) {
     let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for entry in fs::read_dir(source_dir).expect("migration dir reads") {

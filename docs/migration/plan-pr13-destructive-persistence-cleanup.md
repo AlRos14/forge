@@ -664,3 +664,116 @@ BUG_STILL_LIVE = 0
 
 PR13 remains ready only for independent review after the branch push and
 remote-ref verification. Merge remains unauthorized; PR14 has not started.
+
+## PR13 final P2 closure — provider-start recovery and admission errors — 2026-10-14
+
+This supplement supersedes earlier provider-boundary statements above that
+treated every committed Running child as a provider attempt. It preserves the
+prior audit history and does not start PR14.
+
+### P2 — admitted Execution could miss provider dispatch after Agent pause
+
+The dispatcher could commit an Auto child, then `start_execution()` could see
+the newly paused Agent and return `AgentPaused`. That consumed the parent
+candidate while leaving the child Running without a durable indication that
+provider Start was still pending. Unpause did not rediscover the parent. The
+deterministic pre-fix barrier reproduced this exact post-commit/pre-start
+window: there was one committed child, zero provider calls while paused, and a
+fresh dispatcher resolved zero starts (expected one).
+
+Agent WorkUnit admission now writes `execution.provider_start_pending` in the
+same SQLite transaction as the Running Execution, `execution.started`,
+ArtifactInputs, and any WorkspaceLease. The existing dispatcher scans these
+exact Running Agent WorkUnit Executions before Auto candidate recovery. It
+leaves them alone while paused; after unpause it starts the same Execution.
+`BEGIN IMMEDIATE` claims one provider attempt after rechecking pause. Accepted,
+rejected, and uncertain provider results have durable receipts. An uncertain
+attempt is reported as `execution_start_uncertain`, stays Running, and is never
+sent again. The same boundary is used by ordinary launch, follow-up, manual
+recovery, and the MCP WorkUnit start route.
+
+The restart audit found that startup `CrashRecovery`, graceful shutdown, and
+the heartbeat stall scan could otherwise cancel or fail a pending Execution
+before the dispatcher saw it. They now preserve an admission with a pending
+receipt and no attempt receipt. The test crosses the real graceful-shutdown
+and startup-recovery paths while paused, ages the Execution past the stall
+threshold, then unpauses and uses a fresh service/dispatcher; it still dispatches
+the exact child once. Existing recoveries of Executions with an accepted
+provider-start receipt remain covered by the recovery fixtures.
+
+### P2 — V132 admission guard collapsed distinct causes into capacity
+
+V132 raised one message for capacity, suspended RoleMembership, unavailable
+WorkUnit/Workspace, dependency, and already-running-child failures. Rust
+searched for the embedded capacity phrase and mapped every such denial to
+`DbError::AgentAtCapacity`. Historical V132 was not edited. V134 replaces the
+guard with exact stable markers per cause, and the two SQLite classifiers map
+only those exact markers to typed DB errors. The API mappings expose stable
+codes for capacity, inactive membership, closed WorkUnit, unavailable
+Workspace, running-child conflict, dependency, and uncertain provider Start.
+The migration replaces V132's persisted trigger for databases already at
+V132/V133 and preserves their data and migration receipts.
+
+### Adversarial route, authority, and error audit
+
+The durable-admission-to-provider-start census covered Auto dispatch, manual
+crash recovery, ordinary WorkUnit launch/re-execute, follow-up, Task action
+recovery, REST, and MCP. Each Agent WorkUnit admission reaches the shared
+transaction and writes the pending receipt before immediate provider start.
+Same-key follow-up and explicit-recovery retries return their original child;
+the provider attempt receipt prevents a second external Start. Two concurrent
+dispatcher ticks can observe the same pending work, but the SQLite claim allows
+only one provider call. The existing capacity count and RoleMembership remain
+owned by their existing SQLite trigger; no second service authority was added.
+
+The SQLite classifier scan found no other reproduced cause mismatch in the
+focused admission guard path. Existing distinct classifiers for cycle,
+idempotency, immutable operation, and WorkspaceLease constraints were reviewed;
+no additional P0/P1/P2 finding was demonstrated. Previously closed PR13 P1
+activation, launch/re-execute, follow-up, and block-ownership cases were
+rechecked below.
+
+### Focused validation
+
+| Check | Result |
+|---|---|
+| Deterministic pre-fix post-commit/pre-Start reproduction | FAIL as expected: after pause, one durable child existed, provider call count was zero, and restart dispatch count was zero instead of one. |
+| `cargo test -p services --lib concurrent_dispatcher_ticks_recover_post_commit_auto_start_after_unpause --locked --offline -- --test-threads=1` | PASS: barrier after durable admission; two ticks; pause; no external Start; one exact WorkUnit child, lineage, HarnessSession, lease and admission events; graceful shutdown, stall monitor and startup CrashRecovery preserve it; unpause plus fresh dispatcher starts it once. |
+| `cargo test -p services --lib uncertain_provider_start_retry_never_sends_a_second_external_start --locked --offline -- --test-threads=1` | PASS: one daemon `METHOD_EXECUTION_START`, one attempt and uncertain receipt; retry returns uncertainty without another request. |
+| `cargo test -p services --lib explicit_recovery_same_key_after_post_commit_crash_replays_without_duplicate --locked --offline -- --test-threads=1` | PASS: startup recovery preserves the pending Running child; same-key retry returns that same child and one receipt. |
+| `cargo test -p services --lib paused_agent --locked --offline -- --test-threads=1` | PASS, 2 tests: pre-commit pause creates no child; direct paused Start has no provider call. |
+| `cargo test -p services --lib crash_recovery_cancels_running_executions --locked --offline -- --test-threads=1` | PASS: an Execution with a durable accepted Start remains subject to normal crash recovery. |
+| `cargo test -p services --lib heartbeat_monitor_marks_stalled_executions_without_legacy_retry_authority --locked --offline -- --test-threads=1` | PASS: started, stale executions still become Failed through the existing monitor. |
+| `cargo test -p services --lib graceful_shutdown_without_reusable_session_requires_an_exact_human_choice --locked --offline -- --test-threads=1` | PASS: an attempted Execution without reusable session keeps the existing exact Human recovery requirement. |
+| `cargo test -p services --lib ordinary_provider_start_failure_keeps_one_admitted_execution_and_event --locked --offline -- --test-threads=1` | PASS: ordinary launch keeps one durable admitted Execution and does not replay a failed external attempt. |
+| `cargo test -p services --lib follow_up_retry_replays_exact_child_and_new_key_authorizes_next_child --locked --offline -- --test-threads=1` | PASS: exact same-key replay remains unchanged. |
+| `cargo test -p services --lib execution_activation_ --locked --offline -- --test-threads=1` | PASS, 2 tests: prior P1 lifecycle key/version and replay contracts remain fixed. |
+| `cargo test -p services --lib ordinary_launch_ --locked --offline -- --test-threads=1`; `cargo test -p services --lib ordinary_reexecute_ --locked --offline -- --test-threads=1` | PASS, 3 tests each: prior P1 atomic launch, recovery metadata and version-race contracts remain fixed. |
+| `cargo test -p db --test pr5_workunit work_unit_admission_guard_classifies_each_live_rejection_without_partial_rows --locked --offline -- --test-threads=1` | PASS: capacity, suspended membership, closed WorkUnit, unavailable Workspace and unmet dependency reach SQLite and map to distinct errors with no partial Execution, lease or event; the old integration-only Agent Actor guard is preserved. |
+| `cargo test -p db --test pr5_workunit concurrent_work_unit_execution_admission_returns_running_conflict_atomically --locked --offline -- --test-threads=1` | PASS: `BEGIN IMMEDIATE` admits one of two same-WorkUnit writers; loser receives the typed Running conflict and has no partial rows. |
+| `cargo test -p db --test file_backed_migration v134_replaces_admission_guard_on_v133_database_and_restarts_cleanly --locked --offline -- --test-threads=1` | PASS: V133→V134 upgrade, receipt-preserving restart, foreign keys and integrity. |
+| `cargo test -p api --lib work_unit_admission_failures_keep_stable_api_codes --locked --offline` | NOT RUN: offline resolution lacks `alloc-no-stdlib v2.0.4`; the online retry could not resolve `static.crates.io` while downloading `brotli v8.0.4`. API mapping and unit-test source were reviewed, but this API test still needs a runnable dependency cache/network. |
+| `cargo fmt --all -- --check`; `git diff --check` | PASS after final edits. |
+
+Admissions that predate the pending receipt are deliberately not inferred as
+undispatched; their external outcome is unknowable, so existing recovery rules
+remain responsible for them. A crash after the attempt receipt but before a
+provider response is also treated as uncertain and is never automatically
+resent. The API unit test remains unverified until its dependency can be
+resolved.
+
+Workspace-wide tests/build/clippy, full API suite, and remote CI were not run.
+The API unit-test limitation is an environmental validation gap, not a passing
+result. No additional P0/P1/P2/P3 finding was found in this focused closure.
+
+```text
+P0 = 0
+P1 = 0
+P2 = 0 (both reported findings corrected)
+P3 = 0
+BUG_STILL_LIVE = 0
+```
+
+This supplement records the pre-publication checkpoint; the final report will
+record the pushed commit and remote-ref verification. No merge was made or
+authorized; PR14 has not started.

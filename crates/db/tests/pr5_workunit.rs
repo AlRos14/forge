@@ -332,7 +332,10 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
                 id: fixture.workspace_id.clone(),
                 task_id: fixture.task_id.clone(),
                 repo_id: fixture.repo_id.clone(),
-                worktree_path: root.join("worktree").to_string_lossy().into_owned(),
+                worktree_path: root
+                    .join(format!("worktree-{}", fixture.work_unit_id))
+                    .to_string_lossy()
+                    .into_owned(),
                 branch: format!(
                     "forge/work-unit/{}/{}/{}",
                     fixture.task_id, fixture.work_unit_id, fixture.workspace_id
@@ -600,6 +603,371 @@ async fn cleanup_claim_wins_and_database_rejects_work_unit_execution_admission()
     .expect("active lease count");
     assert_eq!(execution_count, 0);
     assert_eq!(lease_count, 0);
+}
+
+async fn assert_failed_admission_has_no_execution_lease_or_event(
+    db: &SqliteDb,
+    attempt: CreateWorkUnitExecution,
+    event_input: CreateDomainEvent,
+    expected: DbError,
+) {
+    let execution_id = attempt.execution.id.clone();
+    let lease_id = attempt
+        .workspace_lease
+        .as_ref()
+        .map(|lease| lease.id.clone());
+    let result = WorkUnitExecutionRepo::create_for_work_unit(db, attempt, event_input).await;
+    assert!(
+        matches!(&result, Err(error) if std::mem::discriminant(error) == std::mem::discriminant(&expected)),
+        "expected {expected:?}, received {result:?}"
+    );
+    let execution_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE id = ?")
+        .bind(&execution_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("execution count");
+    let lease_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workspace_lease WHERE execution_id = ?")
+            .bind(&execution_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("lease count");
+    let event_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE entity_id = ?")
+            .bind(&execution_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("event count");
+    assert_eq!(execution_count, 0, "rejected execution was rolled back");
+    assert_eq!(lease_count, 0, "rejected lease was rolled back");
+    assert_eq!(event_count, 0, "rejected events were rolled back");
+    if let Some(lease_id) = lease_id {
+        let lease_by_id: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workspace_lease WHERE id = ?")
+                .bind(lease_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("lease id count");
+        assert_eq!(lease_by_id, 0, "rejected lease id was rolled back");
+    }
+}
+
+#[tokio::test]
+async fn work_unit_admission_guard_classifies_each_live_rejection_without_partial_rows() {
+    let db = database().await;
+    let root = TempDir::new().expect("temporary directory");
+
+    // Simulate a state change after the caller's preflight; each write still
+    // reaches the SQLite guard and receives the guard's specific cause.
+    let paused_membership = cleanup_admission_fixture(&db, root.path()).await;
+    let membership = RoleMembershipRepo::list_by_task(&db, &paused_membership.task_id, true)
+        .await
+        .expect("current role membership")
+        .into_iter()
+        .find(|(_, membership)| membership.actor_id == paused_membership.agent_id)
+        .expect("Agent membership")
+        .1;
+    RoleMembershipRepo::update(
+        &db,
+        db::UpdateRoleMembership {
+            id: membership.id,
+            expected_version: membership.version,
+            status: RoleMembershipStatus::Suspended,
+            updated_at: now_rfc3339(),
+            ended_at: None,
+        },
+    )
+    .await
+    .expect("membership is suspended after preflight");
+    let (attempt, event_input) = cleanup_admission_attempt(&paused_membership);
+    assert_failed_admission_has_no_execution_lease_or_event(
+        &db,
+        attempt,
+        event_input,
+        DbError::WorkUnitRoleMembershipInactive,
+    )
+    .await;
+
+    let closed_work_unit = cleanup_admission_fixture(&db, root.path()).await;
+    WorkUnitRepo::transition(
+        &db,
+        db::TransitionWorkUnit {
+            id: closed_work_unit.work_unit_id.clone(),
+            expected_version: 1,
+            status: WorkUnitStatus::Cancelled,
+            updated_at: now_rfc3339(),
+        },
+        event(
+            "work_unit.cancelled",
+            "work_unit",
+            &closed_work_unit.work_unit_id,
+            &closed_work_unit.task_id,
+            &closed_work_unit.human_id,
+        ),
+    )
+    .await
+    .expect("WorkUnit closes after preflight");
+    let (attempt, event_input) = cleanup_admission_attempt(&closed_work_unit);
+    assert_failed_admission_has_no_execution_lease_or_event(
+        &db,
+        attempt,
+        event_input,
+        DbError::WorkUnitNotOpen,
+    )
+    .await;
+
+    let unavailable_workspace = cleanup_admission_fixture(&db, root.path()).await;
+    sqlx::query("UPDATE workspace SET status = 'error' WHERE id = ?")
+        .bind(&unavailable_workspace.workspace_id)
+        .execute(db.pool())
+        .await
+        .expect("workspace becomes unavailable after preflight");
+    let (attempt, event_input) = cleanup_admission_attempt(&unavailable_workspace);
+    assert_failed_admission_has_no_execution_lease_or_event(
+        &db,
+        attempt,
+        event_input,
+        DbError::WorkUnitWorkspaceUnavailable,
+    )
+    .await;
+
+    let blocked_dependency = cleanup_admission_fixture(&db, root.path()).await;
+    let dependent_work_unit_id = new_uuid_v4();
+    WorkUnitRepo::create(
+        &db,
+        CreateWorkUnit {
+            id: dependent_work_unit_id.clone(),
+            task_id: blocked_dependency.task_id.clone(),
+            parent_work_unit_id: None,
+            title: "Dependency-gated scope".to_owned(),
+            scope: "No workspace is required for this scope".to_owned(),
+            role: "implementer".to_owned(),
+            assigned_actor: Some(ActorRef::Agent(blocked_dependency.agent_id.clone())),
+            requires_integration: false,
+            provenance: None,
+            created_by: ActorRef::Human(blocked_dependency.human_id.clone()),
+            created_at: now_rfc3339(),
+        },
+        event(
+            "work_unit.created",
+            "work_unit",
+            &dependent_work_unit_id,
+            &blocked_dependency.task_id,
+            &blocked_dependency.human_id,
+        ),
+    )
+    .await
+    .expect("dependency-gated WorkUnit");
+    let prerequisite_id = new_uuid_v4();
+    WorkUnitRepo::create(
+        &db,
+        CreateWorkUnit {
+            id: prerequisite_id.clone(),
+            task_id: blocked_dependency.task_id.clone(),
+            parent_work_unit_id: None,
+            title: "Unmet prerequisite".to_owned(),
+            scope: "The prerequisite remains open".to_owned(),
+            role: "implementer".to_owned(),
+            assigned_actor: Some(ActorRef::Agent(blocked_dependency.agent_id.clone())),
+            requires_integration: false,
+            provenance: None,
+            created_by: ActorRef::Human(blocked_dependency.human_id.clone()),
+            created_at: now_rfc3339(),
+        },
+        event(
+            "work_unit.created",
+            "work_unit",
+            &prerequisite_id,
+            &blocked_dependency.task_id,
+            &blocked_dependency.human_id,
+        ),
+    )
+    .await
+    .expect("open prerequisite");
+    WorkUnitRepo::add_dependency(
+        &db,
+        AddWorkUnitDependency {
+            work_unit_id: dependent_work_unit_id.clone(),
+            depends_on_work_unit_id: prerequisite_id,
+            expected_version: 1,
+            created_by: ActorRef::Human(blocked_dependency.human_id.clone()),
+            created_at: now_rfc3339(),
+        },
+        event(
+            "work_unit.dependency_added",
+            "work_unit",
+            &dependent_work_unit_id,
+            &blocked_dependency.task_id,
+            &blocked_dependency.human_id,
+        ),
+    )
+    .await
+    .expect("unsatisfied dependency added after preflight");
+    let mut execution = running_execution(
+        &blocked_dependency.task_id,
+        "unused",
+        &blocked_dependency.agent_id,
+    );
+    execution.workspace_id = None;
+    let execution_id = execution.id.clone();
+    let attempt = CreateWorkUnitExecution {
+        execution,
+        work_unit_id: dependent_work_unit_id.clone(),
+        work_unit_version: 2,
+        workspace_lease: None,
+    };
+    let event_input = execution_started_event(
+        &blocked_dependency.task_id,
+        &execution_id,
+        &blocked_dependency.agent_id,
+    );
+    assert_failed_admission_has_no_execution_lease_or_event(
+        &db,
+        attempt,
+        event_input,
+        DbError::DependencyGate,
+    )
+    .await;
+
+    let integration_human = cleanup_admission_fixture(&db, root.path()).await;
+    let (mut attempt, mut event_input) = cleanup_admission_attempt(&integration_human);
+    attempt.execution.actor_ref = Some(ActorRef::Human(integration_human.human_id.clone()));
+    attempt.execution.agent_id = None;
+    attempt.workspace_lease = None;
+    event_input.actor_type = "human".to_owned();
+    event_input.actor_id = Some(integration_human.human_id.clone());
+    assert_failed_admission_has_no_execution_lease_or_event(
+        &db,
+        attempt,
+        event_input,
+        DbError::Check("integration Execution must use its assigned Agent".to_owned()),
+    )
+    .await;
+
+    let at_capacity = cleanup_admission_fixture(&db, root.path()).await;
+    for _ in 0..4 {
+        let mut running = running_execution(&at_capacity.task_id, "unused", &at_capacity.agent_id);
+        running.workspace_id = None;
+        ExecutionRepo::create(&db, running)
+            .await
+            .expect("fill the real Agent concurrency limit");
+    }
+    let (attempt, event_input) = cleanup_admission_attempt(&at_capacity);
+    assert_failed_admission_has_no_execution_lease_or_event(
+        &db,
+        attempt,
+        event_input,
+        DbError::AgentAtCapacity,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn concurrent_work_unit_execution_admission_returns_running_conflict_atomically() {
+    let root = TempDir::new().expect("temporary directory");
+    let database_path = root.path().join("work-unit-admission-race.db");
+    let database_url = format!("sqlite://{}", database_path.display());
+    let pool = create_sqlite_pool(&database_url).await.expect("first pool");
+    run_migrations(&pool).await.expect("migrations");
+    let db = SqliteDb::new(pool);
+    let fixture = cleanup_admission_fixture(&db, root.path()).await;
+    let competing_pool = create_sqlite_pool(&database_url)
+        .await
+        .expect("second pool for a competing writer");
+    let competing_db = SqliteDb::new(competing_pool);
+    let (attempt_a, event_a) = cleanup_admission_attempt(&fixture);
+    let (attempt_b, event_b) = cleanup_admission_attempt(&fixture);
+    let execution_a = attempt_a.execution.id.clone();
+    let execution_b = attempt_b.execution.id.clone();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+
+    let submit = |db: SqliteDb,
+                  attempt: CreateWorkUnitExecution,
+                  event_input: CreateDomainEvent,
+                  barrier: std::sync::Arc<tokio::sync::Barrier>| async move {
+        barrier.wait().await;
+        WorkUnitExecutionRepo::create_for_work_unit(&db, attempt, event_input).await
+    };
+    let writer_a = tokio::spawn(submit(
+        db.clone(),
+        attempt_a,
+        event_a,
+        std::sync::Arc::clone(&barrier),
+    ));
+    let writer_b = tokio::spawn(submit(
+        competing_db.clone(),
+        attempt_b,
+        event_b,
+        std::sync::Arc::clone(&barrier),
+    ));
+    barrier.wait().await;
+    let result_a = writer_a.await.expect("first writer joins");
+    let result_b = writer_b.await.expect("second writer joins");
+    let results = [result_a, result_b];
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "BEGIN IMMEDIATE allows exactly one admission"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(DbError::WorkUnitExecutionAlreadyRunning)))
+            .count(),
+        1,
+        "the losing write receives a stable WorkUnit-running conflict"
+    );
+    let (winner_id, loser_id) = if results[0].is_ok() {
+        (&execution_a, &execution_b)
+    } else {
+        (&execution_b, &execution_a)
+    };
+    let winner_execution_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE id = ?")
+            .bind(winner_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("winner execution count");
+    let winner_event_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE entity_id = ?")
+            .bind(winner_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("winner event count");
+    let loser_execution_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE id = ?")
+            .bind(loser_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("loser execution count");
+    let loser_lease_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workspace_lease WHERE execution_id = ?")
+            .bind(loser_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("loser lease count");
+    let loser_event_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE entity_id = ?")
+            .bind(loser_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("loser event count");
+    assert_eq!(winner_execution_count, 1);
+    assert_eq!(
+        winner_event_count, 2,
+        "start and pending receipts are atomic"
+    );
+    assert_eq!(loser_execution_count, 0, "losing execution rolled back");
+    assert_eq!(loser_lease_count, 0, "losing lease rolled back");
+    assert_eq!(loser_event_count, 0, "losing events rolled back");
+    let active_leases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workspace_lease WHERE work_unit_id = ? AND status = 'active'",
+    )
+    .bind(&fixture.work_unit_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("active lease count");
+    assert_eq!(active_leases, 1, "only the winning Execution has a lease");
 }
 
 #[tokio::test]

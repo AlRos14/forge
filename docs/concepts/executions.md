@@ -107,3 +107,33 @@ records. A recovered run either resumes the exact explicitly attached session
 when historical and current adapter capability evidence allow it, or returns
 an explicit unavailable/unsupported result. It never silently changes Actor
 identity or turns Resume into Start.
+
+## Durable admission and provider Start
+
+WorkUnit Execution admission and the external provider Start are separate
+boundaries. One SQLite transaction commits the Running Execution, its exact
+WorkspaceLease when required, `execution.started`, and a
+`execution.provider_start_pending` receipt. The pending receipt means that no
+provider Start attempt has been claimed yet. Admissions created before this
+receipt existed are not inferred to be pending because their provider outcome
+cannot be established from the Execution row alone.
+
+The existing TaskDispatcher discovers pending Agent WorkUnit Executions across
+ordinary launch, manual recovery, follow-up, and Auto recovery. If the Agent is
+paused, the dispatcher leaves the same Execution pending and sends no external
+request. After unpause, a later tick can start that exact Execution without
+creating another child or changing its WorkUnit, parent lineage, HarnessSession,
+WorkspaceLease, or admission events. Graceful shutdown, startup CrashRecovery,
+and the heartbeat stall scan preserve this unattempted admission for the
+dispatcher instead of cancelling it or reporting it as a stalled provider run.
+
+Before crossing the provider boundary, Forge commits one
+`execution.provider_start_attempted` receipt. It then records the observed
+accepted, rejected, or uncertain outcome. Concurrent ticks and retries use the
+same Execution receipt: an accepted or rejected attempt is replayed locally,
+while an uncertain outcome is surfaced as `execution_start_uncertain` and is
+never sent again. An uncertain outcome leaves the Execution Running for an
+external terminal result or the existing stalled-Execution monitor; it is not
+treated as a fresh provider attempt. A crash after the pending receipt but
+before the attempt claim is recoverable; a crash after the attempt claim is
+fail-closed against a duplicate external effect.

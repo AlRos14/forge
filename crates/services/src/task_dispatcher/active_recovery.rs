@@ -5,6 +5,58 @@ use crate::{Result, ServiceError};
 use super::TaskDispatcher;
 
 impl TaskDispatcher {
+    /// Finish admitted Agent WorkUnit Starts that were durably committed but
+    /// have not yet crossed the provider boundary. The provider attempt
+    /// receipt fences concurrent ticks and uncertain responses.
+    pub(super) async fn recover_pending_provider_starts(&self) -> Result<u64> {
+        let executions = ExecutionRepo::list_pending_provider_starts(&*self.db).await?;
+        let mut started = 0;
+        for execution in executions {
+            if self.is_stopped() {
+                break;
+            }
+            let Some(agent_id) = execution.agent_id.as_deref() else {
+                continue;
+            };
+            let Some(agent) = AgentRepo::get_by_id(&*self.db, agent_id).await? else {
+                continue;
+            };
+            if agent.paused {
+                tracing::debug!(
+                    task_id = %execution.task_id,
+                    execution_id = %execution.id,
+                    agent_id = %agent_id,
+                    "admitted provider Start remains pending while its Agent is paused"
+                );
+                continue;
+            }
+            match self
+                .task_service
+                .start_execution(execution.id.clone())
+                .await
+            {
+                Ok(result) if result.accepted => started += 1,
+                Ok(_) => {}
+                Err(ServiceError::AgentPaused { .. }) => {
+                    tracing::debug!(
+                        task_id = %execution.task_id,
+                        execution_id = %execution.id,
+                        "Agent paused before provider Start was claimed"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        task_id = %execution.task_id,
+                        execution_id = %execution.id,
+                        %error,
+                        "pending provider Start could not be dispatched"
+                    );
+                }
+            }
+        }
+        Ok(started)
+    }
+
     /// Resume only exact WorkUnit-bound Executions explicitly marked for
     /// automatic recovery. Candidate discovery is by Execution identity and
     /// never depends on Task status or latest-per-Task selection.
@@ -64,6 +116,11 @@ impl TaskDispatcher {
                 if launch.idempotent_replay {
                     Ok(false)
                 } else {
+                    #[cfg(test)]
+                    if let Some(barrier) = self.after_auto_admission_barrier.as_ref() {
+                        barrier.wait().await;
+                        barrier.wait().await;
+                    }
                     self.task_service
                         .start_execution(launch.execution.id.clone())
                         .await

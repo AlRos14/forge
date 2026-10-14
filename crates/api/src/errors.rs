@@ -300,6 +300,12 @@ impl From<ServiceError> for ApiError {
                 "agent_paused",
                 format!("agent {agent_id} is paused and cannot accept new work"),
             ),
+            ServiceError::ExecutionStartUncertain { execution_id } => Self::conflict_with_code(
+                "execution_start_uncertain",
+                format!(
+                    "provider Start for Execution {execution_id} may have taken effect and will not be retried automatically"
+                ),
+            ),
             ServiceError::ProjectPaused { project_id } => Self::conflict_with_code(
                 "project_paused",
                 format!("project {project_id} is paused"),
@@ -495,6 +501,26 @@ impl From<DbError> for ApiError {
                 message: "agent is at capacity".to_owned(),
                 details: None,
             },
+            DbError::AgentPaused { agent_id } => Self::conflict_with_code(
+                "agent_paused",
+                format!("agent {agent_id} is paused and cannot accept new work"),
+            ),
+            DbError::WorkUnitNotOpen => Self::conflict_with_code(
+                "work_unit_not_open",
+                "WorkUnit must be open to admit an Execution",
+            ),
+            DbError::WorkUnitRoleMembershipInactive => Self::forbidden_with_code(
+                "role_membership_inactive",
+                "Execution Actor is not an active member of the WorkUnit role",
+            ),
+            DbError::WorkUnitWorkspaceUnavailable => Self::conflict_with_code(
+                "work_unit_workspace_unavailable",
+                "WorkUnit Workspace is not ready for Execution admission",
+            ),
+            DbError::WorkUnitExecutionAlreadyRunning => Self::conflict_with_code(
+                "work_unit_execution_running",
+                "WorkUnit already has a Running Execution",
+            ),
             DbError::CycleDetected => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "cycle_detected",
@@ -545,5 +571,59 @@ impl From<serde_json::Error> for ApiError {
 impl From<std::io::Error> for ApiError {
     fn from(error: std::io::Error) -> Self {
         Self::internal(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiError;
+    use axum::http::StatusCode;
+    use db::DbError;
+    use services::ServiceError;
+
+    #[test]
+    fn work_unit_admission_failures_keep_stable_api_codes() {
+        let cases = [
+            (
+                DbError::AgentAtCapacity,
+                StatusCode::CONFLICT,
+                "agent_at_capacity",
+            ),
+            (
+                DbError::WorkUnitRoleMembershipInactive,
+                StatusCode::FORBIDDEN,
+                "role_membership_inactive",
+            ),
+            (
+                DbError::WorkUnitNotOpen,
+                StatusCode::CONFLICT,
+                "work_unit_not_open",
+            ),
+            (
+                DbError::WorkUnitWorkspaceUnavailable,
+                StatusCode::CONFLICT,
+                "work_unit_workspace_unavailable",
+            ),
+            (
+                DbError::WorkUnitExecutionAlreadyRunning,
+                StatusCode::CONFLICT,
+                "work_unit_execution_running",
+            ),
+        ];
+        for (db_error, status, code) in cases {
+            let error = ApiError::from(db_error);
+            assert_eq!(error.status, status);
+            assert_eq!(error.code, code);
+        }
+
+        let dependency = ApiError::from(ServiceError::from(DbError::DependencyGate));
+        assert_eq!(dependency.status, StatusCode::CONFLICT);
+        assert_eq!(dependency.code, "dependency_gate");
+
+        let uncertain = ApiError::from(ServiceError::ExecutionStartUncertain {
+            execution_id: "execution-1".to_owned(),
+        });
+        assert_eq!(uncertain.status, StatusCode::CONFLICT);
+        assert_eq!(uncertain.code, "execution_start_uncertain");
     }
 }

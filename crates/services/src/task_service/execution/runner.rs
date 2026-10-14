@@ -3,6 +3,35 @@ use super::*;
 const EXECUTION_LOG_BATCH_MAX_ENTRIES: usize = 50;
 const EXECUTION_LOG_BATCH_MAX_WAIT: Duration = Duration::from_millis(500);
 
+fn provider_start_receipt_event(execution: &Execution, event_type: &str) -> db::CreateDomainEvent {
+    let actor = execution.actor_ref();
+    db::CreateDomainEvent {
+        id: new_uuid_v4(),
+        event_type: event_type.to_owned(),
+        entity_type: "execution".to_owned(),
+        entity_id: execution.id.clone(),
+        actor_type: actor
+            .as_ref()
+            .map(|actor| actor.kind().to_string())
+            .unwrap_or_else(|| "system".to_owned()),
+        actor_id: actor.as_ref().map(|actor| actor.id().to_owned()),
+        scope_type: "task".to_owned(),
+        scope_id: execution.task_id.clone(),
+        correlation_id: execution.id.clone(),
+        causation_id: execution.parent_execution_id.clone(),
+        causation_depth: i64::from(execution.parent_execution_id.is_some()),
+        dedupe_key: Some(format!("{event_type}:{}", execution.id)),
+        payload_json: serde_json::json!({
+            "execution_id": execution.id,
+            "task_id": execution.task_id,
+            "agent_id": execution.agent_id,
+            "outcome": event_type.strip_prefix("execution.provider_start_").unwrap_or_default(),
+        })
+        .to_string(),
+        created_at: now_rfc3339(),
+    }
+}
+
 impl TaskService {
     pub(crate) async fn freeze_review_subject_and_inputs(
         &self,
@@ -186,7 +215,7 @@ impl TaskService {
             }
             return Err(error);
         }
-        let result = async {
+        let prepared = async {
             if execution.role == "reviewer" && execution.purpose == Some(ExecutionPurpose::Review) {
                 self.verify_execution_workspace_authority(&execution)
                     .await?;
@@ -202,12 +231,12 @@ impl TaskService {
                     ));
                 }
             }
-            provider.start(params).await
+            Ok::<_, ServiceError>((execution, provider, params))
         }
         .await;
 
-        match result {
-            Ok(result) => Ok(result),
+        let (execution, provider, params) = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
                 let failure_message = error.to_string();
                 if let Err(mark_error) = self
@@ -220,7 +249,66 @@ impl TaskService {
                         "failed to mark execution failed after dispatch start error"
                     );
                 }
-                Err(error)
+                return Err(error);
+            }
+        };
+
+        let claim = ExecutionRepo::claim_provider_start(
+            &*self.db,
+            &execution.id,
+            provider_start_receipt_event(&execution, "execution.provider_start_attempted"),
+        )
+        .await?;
+        match claim {
+            db::ProviderStartClaim::Accepted => {
+                return Ok(api_types::ExecutionStartResult {
+                    execution_id: execution.id,
+                    accepted: true,
+                });
+            }
+            db::ProviderStartClaim::Rejected => {
+                return Ok(api_types::ExecutionStartResult {
+                    execution_id: execution.id,
+                    accepted: false,
+                });
+            }
+            db::ProviderStartClaim::Uncertain => {
+                return Err(ServiceError::ExecutionStartUncertain {
+                    execution_id: execution.id,
+                });
+            }
+            db::ProviderStartClaim::Claimed => {}
+        }
+
+        let result = provider.start(params).await;
+        let outcome_event_type = match &result {
+            Ok(result) if result.accepted => "execution.provider_start_accepted",
+            Ok(_) => "execution.provider_start_rejected",
+            Err(_) => "execution.provider_start_uncertain",
+        };
+        if let Err(record_error) = ExecutionRepo::record_provider_start_outcome(
+            &*self.db,
+            &execution.id,
+            provider_start_receipt_event(&execution, outcome_event_type),
+        )
+        .await
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                %record_error,
+                "failed to persist provider Start outcome; the durable attempt receipt prevents replay"
+            );
+        }
+
+        match result {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                tracing::warn!(
+                    %execution_id,
+                    %error,
+                    "provider Start outcome is uncertain; retain the Running Execution and never replay the external request"
+                );
+                Err(ServiceError::ExecutionStartUncertain { execution_id })
             }
         }
     }

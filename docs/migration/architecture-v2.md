@@ -1,7 +1,8 @@
 # Independent orchestration architecture: Plan PR0 contract
 
-Status: accepted migration target. PR13's V121–V132 destructive cutover is
-implemented in the current branch and remains subject to PR review and merge.
+Status: accepted migration target. PR13's V121–V134 destructive cutover and
+admission reliability corrections are implemented in the current branch and
+remain subject to PR review and merge.
 
 This document records the accepted architecture and migration ledger. The
 Plan PR0 baseline and pre-PR13 dependency audit below are historical snapshots;
@@ -675,7 +676,7 @@ that is documented and reviewed.
 
 ## Plan PR13 implementation status
 
-The current branch applies migrations V121–V132 after the PR12 V120 baseline.
+The current branch applies migrations V121–V134 after the PR12 V120 baseline.
 The cutover preserves historical values in dedicated history tables and
 migration receipts; those records do not authorize legacy runtime reads or
 writes.
@@ -690,6 +691,8 @@ writes.
 | V129–V130 | Archive and drop legacy Task status/configuration, workflow definitions, transition logs, deferred dispatch, and task-move storage; TaskLifecycle, Gates, and exact Execution/WorkUnit/Workspace identities remain authoritative. |
 | V131 | Archive and drop special Review persistence while retaining detached V099 Review/Validation provenance; current review uses reviewer Executions, ReviewReport Artifacts, ValidationRuns, and Evidence. |
 | V132 | Preserve Main/Project Agent, Agent Chat, memory, Attention, Room, Genesis, and Project OS rows in exact legacy-record history, then drop their runtime schema and Project columns. |
+| V133 | Add immutable follow-up operation receipts so one idempotency key replays its exact child Execution and cannot authorize different request content. |
+| V134 | Replace the WorkUnit Execution admission trigger with distinct rejection markers, preserving exact typed causes for capacity, RoleMembership, WorkUnit, Workspace, dependency, and concurrent-Execution failures. |
 
 ProjectRelease GETs are read-only and reconstruct only from `project_release`,
 `project_release_history_*`, shared media assets, and tombstones. They validate

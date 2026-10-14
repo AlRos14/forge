@@ -51,6 +51,48 @@ fn review_subject_identity_matches(
         && current.workspace_snapshot_digest == proposed.workspace_snapshot_digest
 }
 
+fn provider_start_event_matches_execution(
+    event: &CreateDomainEvent,
+    execution: &Execution,
+    event_type: &str,
+) -> bool {
+    let actor = execution.actor_ref();
+    let expected_dedupe_key = format!("{event_type}:{}", execution.id);
+    event.event_type == event_type
+        && event.entity_type == "execution"
+        && event.entity_id == execution.id
+        && event.actor_type
+            == actor
+                .as_ref()
+                .map(|actor| actor.kind().to_string())
+                .unwrap_or_default()
+        && event.actor_id.as_deref() == actor.as_ref().map(|actor| actor.id())
+        && event.scope_type == "task"
+        && event.scope_id == execution.task_id
+        && event.correlation_id == execution.id
+        && event.causation_id == execution.parent_execution_id
+        && event.causation_depth == i64::from(execution.parent_execution_id.is_some())
+        && event.dedupe_key.as_deref() == Some(expected_dedupe_key.as_str())
+}
+
+fn provider_start_event_semantics_match(
+    row: &SqliteRow,
+    input: &CreateDomainEvent,
+) -> Result<bool> {
+    Ok(row.try_get::<String, _>("event_type")? == input.event_type
+        && row.try_get::<String, _>("entity_type")? == input.entity_type
+        && row.try_get::<String, _>("entity_id")? == input.entity_id
+        && row.try_get::<String, _>("actor_type")? == input.actor_type
+        && row.try_get::<Option<String>, _>("actor_id")? == input.actor_id
+        && row.try_get::<String, _>("scope_type")? == input.scope_type
+        && row.try_get::<String, _>("scope_id")? == input.scope_id
+        && row.try_get::<String, _>("correlation_id")? == input.correlation_id
+        && row.try_get::<Option<String>, _>("causation_id")? == input.causation_id
+        && row.try_get::<i64, _>("causation_depth")? == input.causation_depth
+        && row.try_get::<Option<String>, _>("dedupe_key")? == input.dedupe_key
+        && row.try_get::<String, _>("payload_json")? == input.payload_json)
+}
+
 async fn create_human_review_execution(
     db: &SqliteDb,
     input: CreateExecution,
@@ -584,6 +626,218 @@ impl ExecutionRepo for SqliteDb {
         rows.into_iter().map(map_execution).collect()
     }
 
+    async fn list_pending_provider_starts(&self) -> Result<Vec<Execution>> {
+        let rows = sqlx::query(
+            "SELECT e.* FROM execution e
+             JOIN domain_event pending
+               ON pending.entity_type = 'execution'
+              AND pending.entity_id = e.id
+              AND pending.event_type = 'execution.provider_start_pending'
+              AND pending.dedupe_key = 'execution.provider_start_pending:' || e.id
+             WHERE e.work_unit_id IS NOT NULL
+               AND e.actor_kind = 'agent'
+               AND e.agent_id = e.actor_id
+               AND e.status = 'running'
+               AND NOT EXISTS (
+                   SELECT 1 FROM domain_event attempt
+                   WHERE attempt.entity_type = 'execution'
+                     AND attempt.entity_id = e.id
+                     AND attempt.event_type = 'execution.provider_start_attempted'
+                     AND attempt.dedupe_key = 'execution.provider_start_attempted:' || e.id
+               )
+             ORDER BY pending.sequence ASC, e.id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(map_execution).collect()
+    }
+
+    async fn claim_provider_start(
+        &self,
+        execution_id: &str,
+        attempt_event: CreateDomainEvent,
+    ) -> Result<ProviderStartClaim> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
+            .bind(execution_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_execution)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        if execution.status != ExecutionStatus::Running
+            || !matches!(execution.actor_ref(), Some(ActorRef::Agent(_)))
+            || execution.agent_id.as_deref() != execution.actor_ref().as_ref().map(ActorRef::id)
+            || !provider_start_event_matches_execution(
+                &attempt_event,
+                &execution,
+                "execution.provider_start_attempted",
+            )
+        {
+            return Err(DbError::Check(
+                "provider start claim requires the exact Running Agent WorkUnit Execution"
+                    .to_owned(),
+            ));
+        }
+
+        let attempt_key = format!("execution.provider_start_attempted:{execution_id}");
+        if let Some(existing_attempt) =
+            sqlx::query("SELECT * FROM domain_event WHERE dedupe_key = ?")
+                .bind(&attempt_key)
+                .fetch_optional(&mut *tx)
+                .await?
+        {
+            if !provider_start_event_semantics_match(&existing_attempt, &attempt_event)? {
+                return Err(DbError::Check(
+                    "provider start attempt receipt conflicts with its Execution".to_owned(),
+                ));
+            }
+            let mut disposition = None;
+            for (event_type, claim) in [
+                (
+                    "execution.provider_start_accepted",
+                    ProviderStartClaim::Accepted,
+                ),
+                (
+                    "execution.provider_start_rejected",
+                    ProviderStartClaim::Rejected,
+                ),
+                (
+                    "execution.provider_start_uncertain",
+                    ProviderStartClaim::Uncertain,
+                ),
+            ] {
+                let outcome_key = format!("{event_type}:{execution_id}");
+                if let Some(outcome) = sqlx::query(
+                    "SELECT event_type, entity_type, entity_id, actor_type, actor_id,
+                            scope_type, scope_id, correlation_id, causation_id,
+                            causation_depth, dedupe_key
+                     FROM domain_event WHERE dedupe_key = ?",
+                )
+                .bind(&outcome_key)
+                .fetch_optional(&mut *tx)
+                .await?
+                {
+                    let actor = execution.actor_ref();
+                    let identity_matches = outcome.try_get::<String, _>("event_type")?
+                        == event_type
+                        && outcome.try_get::<String, _>("entity_type")? == "execution"
+                        && outcome.try_get::<String, _>("entity_id")? == execution.id
+                        && outcome.try_get::<String, _>("actor_type")?
+                            == actor
+                                .as_ref()
+                                .map(|actor| actor.kind().to_string())
+                                .unwrap_or_default()
+                        && outcome.try_get::<Option<String>, _>("actor_id")?
+                            == actor.as_ref().map(|actor| actor.id().to_owned())
+                        && outcome.try_get::<String, _>("scope_type")? == "task"
+                        && outcome.try_get::<String, _>("scope_id")? == execution.task_id
+                        && outcome.try_get::<String, _>("correlation_id")? == execution.id
+                        && outcome.try_get::<Option<String>, _>("causation_id")?
+                            == execution.parent_execution_id
+                        && outcome.try_get::<i64, _>("causation_depth")?
+                            == i64::from(execution.parent_execution_id.is_some())
+                        && outcome.try_get::<Option<String>, _>("dedupe_key")? == Some(outcome_key);
+                    if !identity_matches || disposition.is_some() {
+                        return Err(DbError::Check(
+                            "provider start outcome receipt conflicts with its Execution"
+                                .to_owned(),
+                        ));
+                    }
+                    disposition = Some(claim);
+                }
+            }
+            tx.commit().await?;
+            return Ok(disposition.unwrap_or(ProviderStartClaim::Uncertain));
+        }
+
+        let agent_id = execution.agent_id.as_deref().ok_or(DbError::NotFound)?;
+        let paused: Option<bool> =
+            sqlx::query_scalar("SELECT paused FROM agent_current WHERE id = ?")
+                .bind(agent_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(paused) = paused else {
+            return Err(DbError::NotFound);
+        };
+        if paused {
+            return Err(DbError::AgentPaused {
+                agent_id: agent_id.to_owned(),
+            });
+        }
+
+        DomainEventRepo::append_event_in_tx(self, &mut tx, &attempt_event).await?;
+        tx.commit().await?;
+        Ok(ProviderStartClaim::Claimed)
+    }
+
+    async fn record_provider_start_outcome(
+        &self,
+        execution_id: &str,
+        outcome_event: CreateDomainEvent,
+    ) -> Result<DomainEvent> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
+            .bind(execution_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_execution)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        let allowed = matches!(
+            outcome_event.event_type.as_str(),
+            "execution.provider_start_accepted"
+                | "execution.provider_start_rejected"
+                | "execution.provider_start_uncertain"
+        );
+        if !allowed
+            || !provider_start_event_matches_execution(
+                &outcome_event,
+                &execution,
+                &outcome_event.event_type,
+            )
+        {
+            return Err(DbError::Check(
+                "provider start outcome requires its exact Execution identity".to_owned(),
+            ));
+        }
+        let attempt_key = format!("execution.provider_start_attempted:{execution_id}");
+        let has_attempt: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM domain_event WHERE dedupe_key = ?
+                 AND event_type = 'execution.provider_start_attempted'
+                 AND entity_type = 'execution' AND entity_id = ?)",
+        )
+        .bind(&attempt_key)
+        .bind(execution_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !has_attempt {
+            return Err(DbError::Check(
+                "provider start outcome has no durable attempt receipt".to_owned(),
+            ));
+        }
+        for event_type in [
+            "execution.provider_start_accepted",
+            "execution.provider_start_rejected",
+            "execution.provider_start_uncertain",
+        ] {
+            let outcome_key = format!("{event_type}:{execution_id}");
+            if event_type != outcome_event.event_type
+                && sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM domain_event WHERE dedupe_key = ?)",
+                )
+                .bind(outcome_key)
+                .fetch_one(&mut *tx)
+                .await?
+            {
+                return Err(DbError::VersionConflict);
+            }
+        }
+        let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &outcome_event).await?;
+        tx.commit().await?;
+        Ok(event)
+    }
+
     async fn list_by_task_and_role(
         &self,
         task_id: &str,
@@ -664,13 +918,27 @@ impl ExecutionRepo for SqliteDb {
 
     async fn list_stalled_running(&self, stale_before: &str) -> Result<Vec<Execution>> {
         let rows = sqlx::query(
-            "SELECT * FROM execution
-             WHERE status = 'running'
+            "SELECT e.* FROM execution e
+             WHERE e.status = 'running'
                AND (
-                 (last_activity_at IS NULL AND created_at < ?)
-                 OR (last_activity_at IS NOT NULL AND last_activity_at < ?)
+                 (e.last_activity_at IS NULL AND e.created_at < ?)
+                 OR (e.last_activity_at IS NOT NULL AND e.last_activity_at < ?)
                )
-             ORDER BY COALESCE(last_activity_at, created_at) ASC, id ASC",
+               AND NOT EXISTS (
+                   SELECT 1 FROM domain_event pending
+                   WHERE pending.entity_type = 'execution'
+                     AND pending.entity_id = e.id
+                     AND pending.event_type = 'execution.provider_start_pending'
+                     AND pending.dedupe_key = 'execution.provider_start_pending:' || e.id
+                     AND NOT EXISTS (
+                         SELECT 1 FROM domain_event attempt
+                         WHERE attempt.entity_type = 'execution'
+                           AND attempt.entity_id = e.id
+                           AND attempt.event_type = 'execution.provider_start_attempted'
+                           AND attempt.dedupe_key = 'execution.provider_start_attempted:' || e.id
+                     )
+               )
+             ORDER BY COALESCE(e.last_activity_at, e.created_at) ASC, e.id ASC",
         )
         .bind(stale_before)
         .bind(stale_before)

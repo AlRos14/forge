@@ -810,6 +810,26 @@ pub trait ExecutionRepo: Send + Sync {
     /// an orderly shutdown or process crash. Task-scoped legacy Executions are
     /// intentionally excluded.
     async fn list_work_unit_auto_recovery_candidates(&self) -> Result<Vec<Execution>>;
+    /// Newly admitted Agent WorkUnit Executions whose external provider start
+    /// has not been claimed. Older admissions without this receipt are not
+    /// inferred to be pending because their external outcome is unknowable.
+    async fn list_pending_provider_starts(&self) -> Result<Vec<Execution>>;
+    /// Atomically claim the one external Start attempt for an admitted
+    /// Execution. A paused Agent leaves the admission pending; an existing
+    /// attempt is returned as accepted, rejected, or uncertain and is never
+    /// sent to the provider again.
+    async fn claim_provider_start(
+        &self,
+        execution_id: &str,
+        attempt_event: CreateDomainEvent,
+    ) -> Result<ProviderStartClaim>;
+    /// Persist the provider's observed accepted/rejected result, or record an
+    /// uncertain outcome after the request was attempted.
+    async fn record_provider_start_outcome(
+        &self,
+        execution_id: &str,
+        outcome_event: CreateDomainEvent,
+    ) -> Result<DomainEvent>;
     async fn list_by_task_and_role(
         &self,
         task_id: &str,
@@ -841,6 +861,14 @@ pub trait ExecutionRepo: Send + Sync {
         external_session_id: &str,
         updated_at: &str,
     ) -> Result<Execution>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderStartClaim {
+    Claimed,
+    Accepted,
+    Rejected,
+    Uncertain,
 }
 
 /// Generic PR4 collaboration persistence. Every create/lifecycle operation

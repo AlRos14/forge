@@ -13,7 +13,7 @@ use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
 use serde_json::json;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -44,7 +44,21 @@ impl CrashRecovery {
         // pass below then sees the still-running attempt and requeues/blocks
         // it through the normal crash-recovery state machine.
         expire_workspace_leases(&self.db, &self.event_bus, None, None, None, false).await?;
-        let executions = ExecutionRepo::list_running(self.db.as_ref()).await?;
+        // An admitted WorkUnit Execution whose provider Start has not been
+        // claimed is still queued work, not an interrupted provider attempt.
+        // Leave it Running for TaskDispatcher, which retries the exact
+        // Execution after an Agent is unpaused.
+        let pending_provider_starts: HashSet<String> =
+            ExecutionRepo::list_pending_provider_starts(self.db.as_ref())
+                .await?
+                .into_iter()
+                .map(|execution| execution.id)
+                .collect();
+        let executions: Vec<Execution> = ExecutionRepo::list_running(self.db.as_ref())
+            .await?
+            .into_iter()
+            .filter(|execution| !pending_provider_starts.contains(&execution.id))
+            .collect();
         let executions_by_task = group_executions_by_task(executions);
         let mut recovered = 0;
 
@@ -1053,6 +1067,11 @@ pub(crate) async fn cancel_running_executions(
     stopped_by: &api_types::Actor,
     resume_policy: ResumePolicy,
 ) -> Result<Vec<CancelledExecution>> {
+    let pending_provider_starts: HashSet<String> = ExecutionRepo::list_pending_provider_starts(db)
+        .await?
+        .into_iter()
+        .map(|execution| execution.id)
+        .collect();
     let mut cursor = None;
     let mut running = Vec::new();
     loop {
@@ -1068,11 +1087,10 @@ pub(crate) async fn cancel_running_executions(
             },
         )
         .await?;
-        running.extend(
-            page.items
-                .into_iter()
-                .filter(|execution| execution.status == ExecutionStatus::Running),
-        );
+        running.extend(page.items.into_iter().filter(|execution| {
+            execution.status == ExecutionStatus::Running
+                && !pending_provider_starts.contains(&execution.id)
+        }));
         cursor = page.next_cursor;
         if cursor.is_none() {
             break;
@@ -1934,6 +1952,23 @@ mod tests {
         .await
         .expect("WorkUnit Execution creates")
         .record;
+        assert_eq!(
+            ExecutionRepo::claim_provider_start(
+                db,
+                &execution.id,
+                provider_start_receipt_for_test(&execution, "execution.provider_start_attempted",),
+            )
+            .await
+            .expect("fixture records that provider Start was attempted"),
+            db::ProviderStartClaim::Claimed
+        );
+        ExecutionRepo::record_provider_start_outcome(
+            db,
+            &execution.id,
+            provider_start_receipt_for_test(&execution, "execution.provider_start_accepted"),
+        )
+        .await
+        .expect("fixture records an accepted provider Start");
         if let Some(external_session_id) = agent_session_id {
             execution = ExecutionRepo::record_harness_session_result(
                 db,
@@ -1945,6 +1980,38 @@ mod tests {
             .expect("harness session activates");
         }
         execution
+    }
+
+    fn provider_start_receipt_for_test(
+        execution: &Execution,
+        event_type: &str,
+    ) -> db::CreateDomainEvent {
+        let actor = execution.actor_ref();
+        db::CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: event_type.to_owned(),
+            entity_type: "execution".to_owned(),
+            entity_id: execution.id.clone(),
+            actor_type: actor
+                .as_ref()
+                .map(|actor| actor.kind().to_string())
+                .unwrap_or_else(|| "system".to_owned()),
+            actor_id: actor.as_ref().map(|actor| actor.id().to_owned()),
+            scope_type: "task".to_owned(),
+            scope_id: execution.task_id.clone(),
+            correlation_id: execution.id.clone(),
+            causation_id: execution.parent_execution_id.clone(),
+            causation_depth: i64::from(execution.parent_execution_id.is_some()),
+            dedupe_key: Some(format!("{event_type}:{}", execution.id)),
+            payload_json: serde_json::json!({
+                "execution_id": execution.id,
+                "task_id": execution.task_id,
+                "agent_id": execution.agent_id,
+                "outcome": event_type.strip_prefix("execution.provider_start_").unwrap_or_default(),
+            })
+            .to_string(),
+            created_at: now_rfc3339(),
+        }
     }
 
     struct ParallelRecoveryFixture {
@@ -2958,32 +3025,26 @@ mod tests {
         .expect("child count loads before restart");
         assert_eq!(children_before_restart, 1);
 
-        CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus))
-            .run_recovery()
-            .await
-            .expect("startup recovery reconciles the committed Running child");
+        assert_eq!(
+            CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus))
+                .run_recovery()
+                .await
+                .expect("startup recovery preserves the unattempted committed child"),
+            0,
+            "a pending provider Start is not misclassified as an interrupted provider run"
+        );
         let reconciled_child = ExecutionRepo::get_by_id(&*db, &committed.execution.id)
             .await
             .expect("child reloads after restart")
             .expect("child remains in history");
-        assert_eq!(reconciled_child.status, ExecutionStatus::Cancelled);
-        assert_eq!(
-            reconciled_child.stop_reason,
-            Some(StopReason::CrashRecovery)
-        );
+        assert_eq!(reconciled_child.status, ExecutionStatus::Running);
+        assert_eq!(reconciled_child.stop_reason, None);
         let reconciled_task = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("Task reloads after restart")
             .expect("Task remains");
-        assert_eq!(reconciled_task.lifecycle_state, TaskLifecycleState::Blocked);
-        let annotation: Value = serde_json::from_str(
-            reconciled_task
-                .error_annotation
-                .as_deref()
-                .expect("the interrupted child has an exact recovery annotation"),
-        )
-        .expect("recovery annotation is valid JSON");
-        assert_eq!(annotation["blocked_execution_id"], committed.execution.id);
+        assert_eq!(reconciled_task.lifecycle_state, TaskLifecycleState::Active);
+        assert!(reconciled_task.error_annotation.is_none());
 
         let replay = service
             .recover_work_unit_execution(
@@ -2996,7 +3057,7 @@ mod tests {
             .expect("same-key retry reads the committed receipt after startup recovery");
         assert!(replay.idempotent_replay);
         assert_eq!(replay.execution.id, committed.execution.id);
-        assert_eq!(replay.execution.status, ExecutionStatus::Cancelled);
+        assert_eq!(replay.execution.status, ExecutionStatus::Running);
         let children_after_replay: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM execution
              WHERE task_id = ? AND parent_execution_id IS NOT NULL",

@@ -105,6 +105,13 @@ admitted version. A WorkUnit can have retries or historical attempts, but
 every attempt is a separate Execution with immutable Actor, Role, Purpose,
 WorkUnit, Workspace, and session references.
 
+The Execution admission transaction also records that an Agent provider Start
+is pending. The existing dispatcher may retry only until it atomically records
+the one provider-start attempt. A pause before that claim leaves the committed
+Execution pending for a later tick; an uncertain provider response cannot
+authorize another external Start. Admission receipts and the WorkspaceLease
+remain attached to the same Execution throughout recovery.
+
 ## Isolation
 
 The Task has an integration workspace; each repository-mutating WorkUnit has

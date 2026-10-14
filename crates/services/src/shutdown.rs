@@ -3,6 +3,7 @@ use db::{ExecutionRepo, ResumePolicy, SqliteDb, StopReason};
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
 use std::{
+    collections::HashSet,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -59,6 +60,20 @@ impl GracefulShutdown {
              FROM task
              JOIN execution ON execution.task_id = task.id AND execution.status = 'running'
              WHERE task.deleted_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM domain_event pending
+                   WHERE pending.entity_type = 'execution'
+                     AND pending.entity_id = execution.id
+                     AND pending.event_type = 'execution.provider_start_pending'
+                     AND pending.dedupe_key = 'execution.provider_start_pending:' || execution.id
+                     AND NOT EXISTS (
+                         SELECT 1 FROM domain_event attempt
+                         WHERE attempt.entity_type = 'execution'
+                           AND attempt.entity_id = execution.id
+                           AND attempt.event_type = 'execution.provider_start_attempted'
+                           AND attempt.dedupe_key = 'execution.provider_start_attempted:' || execution.id
+                     )
+               )
              ORDER BY task.id",
         )
         .fetch_all(self.db.pool())
@@ -104,6 +119,12 @@ impl GracefulShutdown {
         if self.task_executor.is_none() && self.task_service.is_none() {
             return Ok(());
         }
+        let pending_provider_starts: HashSet<String> =
+            ExecutionRepo::list_pending_provider_starts(&*self.db)
+                .await?
+                .into_iter()
+                .map(|execution| execution.id)
+                .collect();
         let rows = sqlx::query("SELECT id FROM execution WHERE task_id = ? AND status = 'running'")
             .bind(task_id)
             .fetch_all(self.db.pool())
@@ -112,6 +133,9 @@ impl GracefulShutdown {
             use sqlx::Row;
 
             let execution_id: String = row.get("id");
+            if pending_provider_starts.contains(&execution_id) {
+                continue;
+            }
             let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &execution_id).await? else {
                 continue;
             };

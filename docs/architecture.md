@@ -11,10 +11,12 @@ upstream does not. The migration is intentionally incremental. PR11 retired
 Main Agent, Project Agent, Agent Chat, Product Genesis, Attention, and Project
 OS authority while preserving historical data. PR12 aligns REST, MCP,
 `forge-ctl`, web, generated public types, and SSE with the target domain. This
-branch implements PR13 migrations V121–V132: retired runtime code and schema
+branch implements PR13 migrations V121–V134: retired runtime code and schema
 are removed after exact-history cutovers, and preserved records no longer have
-legacy read or write authority. This document describes the target contract
-and the remaining migration boundary pending review and merge.
+legacy read or write authority. Durable provider-start receipts close the
+post-admission pause window, and V134 keeps late SQLite admission rejections
+typed. This document describes the target contract and the remaining migration
+boundary pending review and merge.
 
 The migration register, invariant definitions, pre-PR13 dependency audit, and
 Plan PR boundaries live in [migration/architecture-v2.md](migration/architecture-v2.md).
@@ -429,7 +431,7 @@ The target responsibility map is:
 | git | Low-level Git operations and deterministic integration | Preserve |
 | config | Configuration precedence and local data paths | Preserve |
 | api-types | Target public request/response/domain types | Keep public DTOs aligned; retain storage models only where internal consumers require them |
-| db | SQLite persistence, repositories, numbered migrations, row mapping | Preserve exact user history through V121–V132 while removing retired runtime schema |
+| db | SQLite persistence, repositories, numbered migrations, row mapping | Preserve exact user history through V121–V134 while removing retired runtime schema |
 | services | Deterministic orchestration domain, scheduling, authority, projections | Keep cognition in harnesses and deterministic policy in small domain services |
 | api | Thin REST/SSE boundary and authentication/authorization mapping | Thin |
 | forge-client | `forge-ctl` REST client for target Project, Repo, TaskLifecycle, Execution, Agent, provider, and daemon operations | Keep commands on exact V2 identities and receipts |

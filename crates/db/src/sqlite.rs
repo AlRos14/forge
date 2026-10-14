@@ -17,7 +17,7 @@ use crate::{
     NotificationRepo, Page, PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig,
     PrProviderConfigRepo, Project, ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus,
     ProjectIntegration, ProjectMediaTombstone, ProjectReleaseMediaPin, ProjectRepo,
-    RecordRemotePrOutcome, RecordWorkUnitIntegration, RecoverWorkUnitExecution,
+    ProviderStartClaim, RecordRemotePrOutcome, RecordWorkUnitIntegration, RecoverWorkUnitExecution,
     RecoveryWorkUnitExecutionWrite, RemotePrAdmission, RemoveWorkUnitDependency, Repo, RepoRepo,
     Result, ReviewExecutionSubject, ReviewExecutionSubjectWrite, Runtime, RuntimeListQuery,
     RuntimeRepo, SelectAgentProfile, SharedMediaRepo, Skill, SkillRepo, SortBy, SortOrder, Task,
@@ -222,16 +222,34 @@ fn check_error(error: sqlx::Error) -> DbError {
 }
 
 fn execution_insert_error(error: sqlx::Error) -> DbError {
-    if let sqlx::Error::Database(database_error) = &error {
-        if database_error
-            .message()
-            .to_ascii_lowercase()
-            .contains("agent reached concurrent execution capacity")
-        {
-            return DbError::AgentAtCapacity;
-        }
+    if let Some(error) = work_unit_execution_admission_error(&error) {
+        return error;
     }
     check_error(error)
+}
+
+pub(super) fn work_unit_execution_admission_error(error: &sqlx::Error) -> Option<DbError> {
+    let sqlx::Error::Database(database_error) = error else {
+        return None;
+    };
+    match database_error.message() {
+        "FORGE_WU_ADMISSION_AGENT_AT_CAPACITY" => Some(DbError::AgentAtCapacity),
+        "FORGE_WU_ADMISSION_AGENT_MISSING" | "FORGE_WU_ADMISSION_WORK_UNIT_MISSING" => {
+            Some(DbError::NotFound)
+        }
+        "FORGE_WU_ADMISSION_WORK_UNIT_NOT_OPEN" => Some(DbError::WorkUnitNotOpen),
+        "FORGE_WU_ADMISSION_ROLE_MEMBERSHIP_INACTIVE" => {
+            Some(DbError::WorkUnitRoleMembershipInactive)
+        }
+        "FORGE_WU_ADMISSION_WORKSPACE_UNAVAILABLE" => Some(DbError::WorkUnitWorkspaceUnavailable),
+        "FORGE_WU_ADMISSION_ALREADY_RUNNING" => Some(DbError::WorkUnitExecutionAlreadyRunning),
+        "FORGE_WU_ADMISSION_DEPENDENCY_UNSATISFIED" => Some(DbError::DependencyGate),
+        "FORGE_WU_ADMISSION_VERSION_CONFLICT" => Some(DbError::VersionConflict),
+        "FORGE_WU_ADMISSION_INVALID" => Some(DbError::Check(
+            "WorkUnit Execution admission has invalid required fields".to_owned(),
+        )),
+        _ => None,
+    }
 }
 
 fn map_project(row: SqliteRow) -> Result<Project> {

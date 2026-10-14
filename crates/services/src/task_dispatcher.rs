@@ -21,6 +21,8 @@ pub struct TaskDispatcher {
     check_interval: Duration,
     stopped: AtomicBool,
     stop_notify: Notify,
+    #[cfg(test)]
+    after_auto_admission_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl TaskDispatcher {
@@ -47,7 +49,18 @@ impl TaskDispatcher {
             check_interval,
             stopped: AtomicBool::new(false),
             stop_notify: Notify::new(),
+            #[cfg(test)]
+            after_auto_admission_barrier: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_auto_admission_barrier(
+        mut self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.after_auto_admission_barrier = Some(barrier);
+        self
     }
 
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -87,7 +100,9 @@ impl TaskDispatcher {
 
     #[tracing::instrument(skip(self))]
     pub async fn check_once(&self) -> Result<u64> {
-        let dispatched = self.recover_auto_cancelled_work_unit_executions().await?;
+        let pending_starts = self.recover_pending_provider_starts().await?;
+        let auto_recovered = self.recover_auto_cancelled_work_unit_executions().await?;
+        let dispatched = pending_starts + auto_recovered;
 
         tracing::info!(
             dispatched_tasks = dispatched,
