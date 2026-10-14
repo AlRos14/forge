@@ -4495,6 +4495,186 @@ async fn recovery_uses_the_parent_work_units_workspace_when_task_has_siblings() 
 }
 
 #[tokio::test]
+async fn explicit_multi_work_unit_recovery_keeps_repository_workspaces_and_leases_separate() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
+    let agent_a = seed_agent_with_executor_type(&db, "shell", "{}").await;
+    let agent_b = seed_agent_with_executor_type(&db, "shell", "{}").await;
+    let (parent_a, workspace_a) = create_running_repository_execution(
+        &db,
+        &service,
+        &task,
+        &agent_a,
+        "implementer",
+        db::ExecutionPurpose::Implement,
+        workspace_root.path(),
+        Some("repository parent A".to_owned()),
+        None,
+    )
+    .await;
+    let (parent_b, workspace_b) = create_running_repository_execution(
+        &db,
+        &service,
+        &task,
+        &agent_b,
+        "implementer",
+        db::ExecutionPurpose::Implement,
+        workspace_root.path(),
+        Some("repository parent B".to_owned()),
+        None,
+    )
+    .await;
+    assert_ne!(parent_a.work_unit_id, parent_b.work_unit_id);
+    assert_ne!(workspace_a.id, workspace_b.id);
+
+    crate::CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .run_recovery()
+        .await
+        .expect("CrashRecovery stops both exact repository Executions");
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task reloads")
+        .expect("Task remains");
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+        .await
+        .expect("TaskLifecycle reloads")
+        .expect("TaskLifecycle remains");
+    assert_eq!(
+        lifecycle.reason_kind.as_deref(),
+        Some("recovery_target_ambiguous")
+    );
+    let work_unit_a = db::WorkUnitRepo::get_by_id(
+        &*db,
+        parent_a
+            .work_unit_id
+            .as_deref()
+            .expect("A WorkUnit identity"),
+    )
+    .await
+    .expect("A WorkUnit loads")
+    .expect("A WorkUnit exists");
+    let child_a = service
+        .recover_work_unit_execution(
+            task.id.clone(),
+            parent_a.id.clone(),
+            api_types::RecoverWorkUnitExecutionRequest {
+                work_unit_id: work_unit_a.id.clone(),
+                expected_task_version: task.version,
+                expected_lifecycle_version: lifecycle.version,
+                expected_work_unit_version: work_unit_a.version,
+                idempotency_key: "repository-recovery-a".to_owned(),
+                context: None,
+            },
+            "repository-recovery-operator",
+        )
+        .await
+        .expect("A admits with its own WorkspaceLease");
+    assert_eq!(
+        child_a.execution.workspace_id.as_deref(),
+        Some(workspace_a.id.as_str())
+    );
+    let lease_a: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT work_unit_id, workspace_id, status FROM workspace_lease
+         WHERE execution_id = ? AND status = 'active'",
+    )
+    .bind(&child_a.execution.id)
+    .fetch_optional(db.pool())
+    .await
+    .expect("A lease loads");
+    assert_eq!(
+        lease_a,
+        Some((
+            work_unit_a.id.clone(),
+            workspace_a.id.clone(),
+            "active".to_owned()
+        ))
+    );
+    let sibling_active_leases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workspace_lease
+         WHERE execution_id = ? AND status = 'active'",
+    )
+    .bind(&parent_b.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("B parent lease status loads");
+    assert_eq!(sibling_active_leases, 0);
+
+    let task_after_a = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task reloads after A")
+        .expect("Task remains");
+    let lifecycle_after_a = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+        .await
+        .expect("lifecycle reloads after A")
+        .expect("lifecycle remains");
+    let work_unit_b = db::WorkUnitRepo::get_by_id(
+        &*db,
+        parent_b
+            .work_unit_id
+            .as_deref()
+            .expect("B WorkUnit identity"),
+    )
+    .await
+    .expect("B WorkUnit loads")
+    .expect("B WorkUnit exists");
+    let child_b = service
+        .recover_work_unit_execution(
+            task.id.clone(),
+            parent_b.id.clone(),
+            api_types::RecoverWorkUnitExecutionRequest {
+                work_unit_id: work_unit_b.id.clone(),
+                expected_task_version: task_after_a.version,
+                expected_lifecycle_version: lifecycle_after_a.version,
+                expected_work_unit_version: work_unit_b.version,
+                idempotency_key: "repository-recovery-b".to_owned(),
+                context: None,
+            },
+            "repository-recovery-operator",
+        )
+        .await
+        .expect("B admits against its own Workspace while Task is Active");
+    assert_eq!(
+        child_b.execution.workspace_id.as_deref(),
+        Some(workspace_b.id.as_str())
+    );
+    let lease_b: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT work_unit_id, workspace_id, status FROM workspace_lease
+         WHERE execution_id = ? AND status = 'active'",
+    )
+    .bind(&child_b.execution.id)
+    .fetch_optional(db.pool())
+    .await
+    .expect("B lease loads");
+    assert_eq!(
+        lease_b,
+        Some((
+            work_unit_b.id.clone(),
+            workspace_b.id.clone(),
+            "active".to_owned()
+        ))
+    );
+    assert_ne!(work_unit_a.id, work_unit_b.id);
+    assert_ne!(workspace_a.id, workspace_b.id);
+    let old_lease_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workspace_lease
+         WHERE execution_id IN (?, ?) AND status = 'active'",
+    )
+    .bind(&parent_a.id)
+    .bind(&parent_b.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("old lease count loads");
+    assert_eq!(old_lease_count, 0);
+    drop(repo_dir);
+}
+
+#[tokio::test]
 async fn concurrent_recovery_admissions_create_one_child_for_one_blocked_execution() {
     let fixture = blocked_recovery_fixture(false).await;
     let service_one = fixture.service.clone();
@@ -5767,6 +5947,7 @@ async fn durable_admission_rejects_block_owner_changed_after_preflight() {
                 replacement_metadata_json: current_task.metadata_json.clone(),
             }),
             follow_up_receipt: None,
+            automatic_recovery_parent_id: None,
         },
         Vec::new(),
         event,

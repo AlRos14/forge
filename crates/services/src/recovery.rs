@@ -781,40 +781,58 @@ async fn recover_executions(
         });
     }
 
+    let has_exact_resumable_crash_recovery = stop_reason == StopReason::CrashRecovery
+        && cancelled.iter().any(|execution| {
+            execution.exact_work_unit_target && execution.resumable_external_session_id.is_some()
+        });
+    if has_exact_resumable_crash_recovery {
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(db.as_ref(), &task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        let task_has_no_blocking_metadata = task.error_annotation.is_none()
+            && task.blocked_json.is_none()
+            && task.failed_json.is_none();
+        if lifecycle.state == TaskLifecycleState::Active && task_has_no_blocking_metadata {
+            // Recovery policy belongs to each exact Execution. A non-resumable
+            // sibling remains Manual while resumable siblings retain their
+            // existing session identity for the automatic dispatcher.
+            for execution in cancelled.iter().filter(|execution| {
+                execution.exact_work_unit_target
+                    && execution.resumable_external_session_id.is_some()
+            }) {
+                ExecutionRepo::update(
+                    db.as_ref(),
+                    UpdateExecution {
+                        id: execution.execution_id.clone(),
+                        status: None,
+                        stop_reason: None,
+                        stopped_by: None,
+                        resume_policy: Some(Some(ResumePolicy::Auto)),
+                        stopped_at: None,
+                        external_session_id: None,
+                        agent_message_id: None,
+                        last_activity_at: None,
+                        summary: None,
+                        logs_path: None,
+                        before_sha: None,
+                        after_sha: None,
+                        error: None,
+                        executor_config_snapshot_json: None,
+                        updated_at: now_rfc3339(),
+                    },
+                )
+                .await?;
+            }
+            return Ok(RecoverTaskOutcome {
+                task,
+                annotated: false,
+            });
+        }
+    }
+
     let every_execution_is_resumable = cancelled.iter().all(|execution| {
         execution.exact_work_unit_target && execution.resumable_external_session_id.is_some()
     });
-    if stop_reason == StopReason::CrashRecovery && every_execution_is_resumable {
-        for execution in &cancelled {
-            ExecutionRepo::update(
-                db.as_ref(),
-                UpdateExecution {
-                    id: execution.execution_id.clone(),
-                    status: None,
-                    stop_reason: None,
-                    stopped_by: None,
-                    resume_policy: Some(Some(ResumePolicy::Auto)),
-                    stopped_at: None,
-                    external_session_id: None,
-                    agent_message_id: None,
-                    last_activity_at: None,
-                    summary: None,
-                    logs_path: None,
-                    before_sha: None,
-                    after_sha: None,
-                    error: None,
-                    executor_config_snapshot_json: None,
-                    updated_at: now_rfc3339(),
-                },
-            )
-            .await?;
-        }
-        return Ok(RecoverTaskOutcome {
-            task,
-            annotated: false,
-        });
-    }
-
     if stop_reason == StopReason::AgentTimeout && every_execution_is_resumable {
         tracing::warn!(
             task_id = %task.id,
@@ -1097,6 +1115,18 @@ async fn cancel_execution_records(
             resumable_external_session_id,
             exact_work_unit_target,
         };
+        let execution_resume_policy = if stop_reason == StopReason::GracefulShutdown
+            && execution.work_unit_id.is_some()
+            && (!exact_work_unit_target
+                || cancelled_execution.resumable_external_session_id.is_none())
+        {
+            // A graceful stop may only auto-dispatch through the exact live
+            // HarnessSession. WorkUnit attempts without that authority remain
+            // available for an explicit exact operator decision.
+            ResumePolicy::Manual
+        } else {
+            resume_policy.clone()
+        };
         let now = now_rfc3339();
         let event = crate::task_service::execution_status_domain_event(
             execution,
@@ -1110,7 +1140,7 @@ async fn cancel_execution_records(
                 status: Some(ExecutionStatus::Cancelled),
                 stop_reason: Some(Some(stop_reason.clone())),
                 stopped_by: Some(Some(stopped_by.display())),
-                resume_policy: Some(Some(resume_policy.clone())),
+                resume_policy: Some(Some(execution_resume_policy)),
                 stopped_at: Some(Some(now.clone())),
                 external_session_id: None,
                 agent_message_id: None,
@@ -1449,10 +1479,11 @@ mod tests {
         TaskService,
     };
     use db::{
-        create_sqlite_pool, new_uuid_v4, run_migrations, CreateAgent, CreateExecution,
+        create_sqlite_pool, new_uuid_v4, run_migrations, AgentRepo, CreateAgent, CreateExecution,
         CreateProject, CreateRepo, CreateRoleMembership, CreateTask, CreateTaskRole, DaemonRepo,
         DaemonStatus, RepoRepo, RoleMembershipRepo, RoleMembershipStatus, TaskLifecycleState,
-        TaskRoleRepo, UpdateProject, UpsertDaemon, User, UserRepo,
+        TaskRoleRepo, UpdateAgent, UpdateDaemonReport, UpdateProject, UpdateRoleMembership,
+        UpsertDaemon, User, UserRepo, WorkUnitRepo,
     };
     use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError};
     use serde_json::Value;
@@ -1891,6 +1922,108 @@ mod tests {
         execution
     }
 
+    struct ParallelRecoveryFixture {
+        db: Arc<SqliteDb>,
+        event_bus: Arc<EventBus>,
+        task: Task,
+        agents: Vec<Agent>,
+        executions: Vec<db::Execution>,
+    }
+
+    async fn seed_parallel_recovery_fixture(
+        harnesses: &[&str],
+        sessions: &[Option<&str>],
+    ) -> ParallelRecoveryFixture {
+        assert!(harnesses.len() >= 2);
+        assert_eq!(harnesses.len(), sessions.len());
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(64));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let mut agents = Vec::with_capacity(harnesses.len());
+        for harness in harnesses {
+            agents.push(
+                seed_agent_with_harness(&db, AgentStatus::Busy, Some(now_rfc3339()), harness).await,
+            );
+        }
+        for (agent, harness) in agents.iter().zip(harnesses) {
+            let daemon_id = agent.daemon_id.as_deref().expect("fixture Agent daemon");
+            DaemonRepo::update_report(
+                &*db,
+                UpdateDaemonReport {
+                    id: daemon_id.to_owned(),
+                    detected_clis_json: format!(
+                        r#"[{{"kind":"{harness}","availability":"authenticated"}}]"#
+                    ),
+                    labels_json: None,
+                    status: DaemonStatus::Online,
+                    last_report_at: now_rfc3339(),
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await
+            .expect("fixture daemon advertises its authenticated harness");
+        }
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "active".to_owned(),
+            Some(agents[0].id.clone()),
+        )
+        .await;
+        let role = TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
+            .await
+            .expect("TaskRole loads")
+            .expect("TaskRole exists");
+        TaskRoleRepo::update(
+            &*db,
+            db::UpdateTaskRole {
+                id: role.id.clone(),
+                expected_version: role.version,
+                coordination_mode: Some(Some(db::CoordinationMode::Collaborative)),
+                policy_json: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("TaskRole allows multiple independent Actors");
+        for agent in agents.iter().skip(1) {
+            RoleMembershipRepo::add(
+                &*db,
+                CreateRoleMembership {
+                    id: new_uuid_v4(),
+                    task_role_id: role.id.clone(),
+                    actor_kind: db::ActorKind::Agent,
+                    actor_id: agent.id.clone(),
+                    status: RoleMembershipStatus::Active,
+                    created_at: now_rfc3339(),
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await
+            .expect("each exact Actor has an active TaskRole membership");
+        }
+        let mut executions = Vec::with_capacity(agents.len());
+        for (agent, session) in agents.iter().zip(sessions) {
+            executions.push(
+                seed_running_execution(
+                    &db,
+                    task.id.clone(),
+                    agent.id.clone(),
+                    session.map(str::to_owned),
+                )
+                .await,
+            );
+        }
+        ParallelRecoveryFixture {
+            db,
+            event_bus,
+            task,
+            agents,
+            executions,
+        }
+    }
+
     #[tokio::test]
     async fn crash_recovery_ignores_idle_in_progress_tasks() {
         let db = Arc::new(sqlite_db().await);
@@ -2066,7 +2199,8 @@ mod tests {
         );
         assert_eq!(
             annotation["recovery_actions"],
-            json!(["reexecute", "reset_to_initial", "cancel_task"])
+            json!(["reexecute", "cancel_task"]),
+            "an exact WorkUnit target can be recovered or cancelled; reset-to-initial has no exact V2 authority"
         );
 
         let mut event_types = Vec::new();
@@ -2198,8 +2332,11 @@ mod tests {
         .await
         .expect("execution activity updates");
 
-        let task_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
         let executor = Arc::new(RecordingCancelExecutor::default());
+        let task_service = Arc::new(
+            TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+                .with_task_executor(executor.clone()),
+        );
         let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
             .with_task_service(task_service)
             .with_task_executor(executor.clone())
@@ -2347,6 +2484,1581 @@ mod tests {
         assert_eq!(updated.status, ExecutionStatus::Cancelled);
         assert!(updated.error.as_deref().unwrap().contains("Recovered"));
         assert_eq!(updated.resume_policy, Some(ResumePolicy::Manual));
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_with_two_manual_work_units_can_be_resolved_by_exact_selection() {
+        let fixture = seed_parallel_recovery_fixture(&["shell", "shell"], &[None, None]).await;
+        let db = Arc::clone(&fixture.db);
+        let event_bus = Arc::clone(&fixture.event_bus);
+        let task = fixture.task.clone();
+        let execution_a = fixture.executions[0].clone();
+        let execution_b = fixture.executions[1].clone();
+        let work_unit_a = execution_a
+            .work_unit_id
+            .clone()
+            .expect("A has an exact WorkUnit");
+        let work_unit_b = execution_b
+            .work_unit_id
+            .clone()
+            .expect("B has an exact WorkUnit");
+        assert_ne!(work_unit_a, work_unit_b);
+
+        let recovered = CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .run_recovery()
+            .await
+            .expect("CrashRecovery runs");
+        assert_eq!(recovered, 1);
+
+        let stopped_a = ExecutionRepo::get_by_id(&*db, &execution_a.id)
+            .await
+            .expect("A reloads")
+            .expect("A remains historical");
+        let stopped_b = ExecutionRepo::get_by_id(&*db, &execution_b.id)
+            .await
+            .expect("B reloads")
+            .expect("B remains historical");
+        for (execution, work_unit_id) in [
+            (&stopped_a, work_unit_a.as_str()),
+            (&stopped_b, work_unit_b.as_str()),
+        ] {
+            assert_eq!(execution.status, ExecutionStatus::Cancelled);
+            assert_eq!(execution.stop_reason, Some(StopReason::CrashRecovery));
+            assert_eq!(execution.resume_policy, Some(ResumePolicy::Manual));
+            assert_eq!(execution.work_unit_id.as_deref(), Some(work_unit_id));
+            assert_eq!(execution.task_id, task.id);
+        }
+
+        let active_leases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workspace_lease
+             WHERE execution_id IN (?, ?) AND status = 'active'",
+        )
+        .bind(&execution_a.id)
+        .bind(&execution_b.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("lease state loads");
+        assert_eq!(
+            active_leases, 0,
+            "cancelled attempts retain no active lease"
+        );
+
+        let blocked_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("Task reloads")
+            .expect("Task remains");
+        let annotation: Value = serde_json::from_str(
+            blocked_task
+                .error_annotation
+                .as_deref()
+                .expect("aggregate recovery annotation persists"),
+        )
+        .expect("annotation is valid JSON");
+        assert_eq!(annotation["blocking_reason"], "recovery_target_ambiguous");
+        assert!(annotation["blocked_execution_id"].is_null());
+        assert_eq!(annotation["recovery_actions"], serde_json::json!([]));
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("TaskLifecycle loads")
+            .expect("TaskLifecycle exists");
+        assert_eq!(lifecycle.state, TaskLifecycleState::Blocked);
+        assert_eq!(
+            lifecycle.reason_kind.as_deref(),
+            Some("recovery_target_ambiguous")
+        );
+        assert!(lifecycle
+            .reason_ref
+            .as_deref()
+            .unwrap()
+            .starts_with("task-version:"));
+
+        let transition_count_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_lifecycle_transition WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("lifecycle receipts load");
+        let execution_count_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("Execution count loads");
+        let event_count_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event WHERE scope_type = 'task' AND scope_id = ?",
+        )
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("DomainEvent count loads");
+
+        let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+        let task_level_recovery = service
+            .recover_task(
+                task.id.clone(),
+                api_types::RecoveryAction::Reexecute,
+                None,
+                None,
+            )
+            .await
+            .expect_err("Task-level recovery must not infer A or B");
+        assert!(task_level_recovery
+            .to_string()
+            .contains("no blocking recovery annotation"));
+
+        for parent in [&execution_a, &execution_b] {
+            let individual_recovery = service
+                .re_execute_execution_with_context(parent.id.clone(), None)
+                .await
+                .err()
+                .expect("exact parent alone cannot resolve an ambiguous aggregate block");
+            assert!(individual_recovery
+                .to_string()
+                .contains("exact current Execution block"));
+        }
+
+        let final_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("Task reloads after rejected requests")
+            .expect("Task remains");
+        assert_eq!(final_task.lifecycle_state, TaskLifecycleState::Blocked);
+        assert_eq!(final_task.error_annotation, blocked_task.error_annotation);
+        let transition_count_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_lifecycle_transition WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("lifecycle receipts reload");
+        let execution_count_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("Execution count reloads");
+        let event_count_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event WHERE scope_type = 'task' AND scope_id = ?",
+        )
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("DomainEvent count reloads");
+        assert_eq!(transition_count_after, transition_count_before);
+        assert_eq!(execution_count_after, execution_count_before);
+        assert_eq!(event_count_after, event_count_before);
+
+        let operator_id = "recovery-operator";
+        let request_a = api_types::RecoverWorkUnitExecutionRequest {
+            work_unit_id: work_unit_a.clone(),
+            expected_task_version: final_task.version,
+            expected_lifecycle_version: lifecycle.version,
+            expected_work_unit_version: WorkUnitRepo::get_by_id(&*db, &work_unit_a)
+                .await
+                .expect("A WorkUnit loads")
+                .expect("A WorkUnit exists")
+                .version,
+            idempotency_key: "recover-a-once".to_owned(),
+            context: Some("resume the exact A scope".to_owned()),
+        };
+        let child_a = service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                execution_a.id.clone(),
+                request_a.clone(),
+                operator_id,
+            )
+            .await
+            .expect("explicit A selection resolves and admits atomically");
+        assert!(!child_a.idempotent_replay);
+        assert_eq!(
+            child_a.execution.parent_execution_id.as_deref(),
+            Some(execution_a.id.as_str())
+        );
+        assert_eq!(
+            child_a.execution.work_unit_id.as_deref(),
+            Some(work_unit_a.as_str())
+        );
+        assert_eq!(child_a.task.lifecycle_state, TaskLifecycleState::Active);
+        assert!(child_a.task.error_annotation.is_none());
+        assert!(child_a.task.blocked_json.is_none());
+
+        let receipt_a: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'execution.recovery_admitted'
+               AND entity_id = ? AND actor_type = 'human' AND actor_id = ?",
+        )
+        .bind(&child_a.execution.id)
+        .bind(operator_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("A human decision receipt loads");
+        assert_eq!(receipt_a, 1);
+        let child_a_replay = service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                execution_a.id.clone(),
+                request_a,
+                operator_id,
+            )
+            .await
+            .expect("same-key retry reads the durable decision");
+        assert!(child_a_replay.idempotent_replay);
+        assert_eq!(child_a_replay.execution.id, child_a.execution.id);
+
+        let task_after_a = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("Task reloads after A")
+            .expect("Task remains");
+        let lifecycle_after_a = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("lifecycle reloads after A")
+            .expect("lifecycle remains");
+        let work_unit_a_current = WorkUnitRepo::get_by_id(&*db, &work_unit_a)
+            .await
+            .expect("A WorkUnit reloads")
+            .expect("A WorkUnit remains");
+        let child_agent = AgentRepo::get_by_id(
+            &*db,
+            child_a
+                .execution
+                .agent_id
+                .as_deref()
+                .expect("A child retains its exact Agent"),
+        )
+        .await
+        .expect("child Agent loads")
+        .expect("child Agent remains");
+        AgentRepo::update(
+            &*db,
+            UpdateAgent {
+                id: child_agent.id.clone(),
+                expected_version: child_agent.version,
+                name: None,
+                description: None,
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: None,
+                config_json: None,
+                daemon_id: None,
+                max_concurrent_tasks: Some(2),
+                heartbeat_interval_seconds: None,
+                max_missed_heartbeats: None,
+                status: None,
+                last_heartbeat_at: None,
+                is_default: None,
+                paused: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("test Agent capacity allows the durable duplicate guard to decide");
+        assert!(
+            service
+                .recover_work_unit_execution(
+                    task.id.clone(),
+                    execution_a.id.clone(),
+                    api_types::RecoverWorkUnitExecutionRequest {
+                        work_unit_id: work_unit_a.clone(),
+                        expected_task_version: task_after_a.version,
+                        expected_lifecycle_version: lifecycle_after_a.version,
+                        expected_work_unit_version: work_unit_a_current.version,
+                        idempotency_key: "recover-a-second-child-is-forbidden".to_owned(),
+                        context: None,
+                    },
+                    operator_id,
+                )
+                .await
+                .is_err(),
+            "a different key cannot create another child from the consumed parent"
+        );
+
+        let current_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("Task reloads before selecting B")
+            .expect("Task remains");
+        let current_lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("lifecycle reloads before selecting B")
+            .expect("lifecycle remains");
+        let current_work_unit_b = WorkUnitRepo::get_by_id(&*db, &work_unit_b)
+            .await
+            .expect("B WorkUnit reloads")
+            .expect("B WorkUnit remains");
+        let child_b = service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                execution_b.id.clone(),
+                api_types::RecoverWorkUnitExecutionRequest {
+                    work_unit_id: work_unit_b.clone(),
+                    expected_task_version: current_task.version,
+                    expected_lifecycle_version: current_lifecycle.version,
+                    expected_work_unit_version: current_work_unit_b.version,
+                    idempotency_key: "recover-b-once".to_owned(),
+                    context: None,
+                },
+                operator_id,
+            )
+            .await
+            .expect("B remains independently recoverable after A");
+        assert!(!child_b.idempotent_replay);
+        assert_eq!(
+            child_b.execution.parent_execution_id.as_deref(),
+            Some(execution_b.id.as_str())
+        );
+        assert_eq!(
+            child_b.execution.work_unit_id.as_deref(),
+            Some(work_unit_b.as_str())
+        );
+
+        let final_lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("final lifecycle loads")
+            .expect("final lifecycle remains");
+        assert_eq!(final_lifecycle.state, TaskLifecycleState::Active);
+        assert_eq!(final_lifecycle.version, lifecycle.version + 1);
+        let final_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("final Task loads")
+            .expect("final Task remains");
+        assert!(final_task.error_annotation.is_none());
+        assert!(final_task.blocked_json.is_none());
+        for (parent, child, work_unit_id) in [
+            (&stopped_a, &child_a.execution, work_unit_a.as_str()),
+            (&stopped_b, &child_b.execution, work_unit_b.as_str()),
+        ] {
+            let persisted_parent = ExecutionRepo::get_by_id(&*db, &parent.id)
+                .await
+                .expect("cancelled parent reloads")
+                .expect("cancelled parent remains");
+            assert_eq!(persisted_parent.status, ExecutionStatus::Cancelled);
+            assert_eq!(persisted_parent.work_unit_id.as_deref(), Some(work_unit_id));
+            assert_eq!(
+                child.parent_execution_id.as_deref(),
+                Some(parent.id.as_str())
+            );
+            assert_eq!(child.work_unit_id.as_deref(), Some(work_unit_id));
+            let child_started: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM domain_event
+                 WHERE event_type = 'execution.started' AND entity_id = ?
+                   AND scope_type = 'task' AND scope_id = ?",
+            )
+            .bind(&child.id)
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("child start receipt loads");
+            assert_eq!(child_started, 1);
+        }
+        let recovery_receipt_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'execution.recovery_admitted' AND scope_id = ?",
+        )
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("recovery decision receipts load");
+        assert_eq!(recovery_receipt_count, 2);
+        let execution_count_final: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("all attempts remain durable");
+        assert_eq!(execution_count_final, execution_count_before + 2);
+        let transition_count_final: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_lifecycle_transition WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("lifecycle receipt count reloads");
+        assert_eq!(transition_count_final, transition_count_before + 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_recovery_same_key_after_post_commit_crash_replays_without_duplicate() {
+        let fixture = seed_parallel_recovery_fixture(&["shell", "shell"], &[None, None]).await;
+        let db = Arc::clone(&fixture.db);
+        let event_bus = Arc::clone(&fixture.event_bus);
+        let task = fixture.task.clone();
+        let parent = fixture.executions[0].clone();
+        let work_unit_id = parent
+            .work_unit_id
+            .clone()
+            .expect("parent A has an exact WorkUnit");
+
+        CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .run_recovery()
+            .await
+            .expect("initial crash recovery records the aggregate ambiguity");
+        let blocked_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("Task reloads")
+            .expect("Task remains");
+        let blocked_lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("lifecycle loads")
+            .expect("lifecycle remains");
+        let work_unit = WorkUnitRepo::get_by_id(&*db, &work_unit_id)
+            .await
+            .expect("A WorkUnit loads")
+            .expect("A WorkUnit remains");
+        let request = api_types::RecoverWorkUnitExecutionRequest {
+            work_unit_id: work_unit_id.clone(),
+            expected_task_version: blocked_task.version,
+            expected_lifecycle_version: blocked_lifecycle.version,
+            expected_work_unit_version: work_unit.version,
+            idempotency_key: "post-commit-crash-decision".to_owned(),
+            context: Some("operator selected A".to_owned()),
+        };
+        let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+        let committed = service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                parent.id.clone(),
+                request.clone(),
+                "recovery-operator",
+            )
+            .await
+            .expect("human decision and child commit before provider dispatch");
+        assert!(!committed.idempotent_replay);
+
+        let children_before_restart: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution
+             WHERE task_id = ? AND parent_execution_id IS NOT NULL",
+        )
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("child count loads before restart");
+        assert_eq!(children_before_restart, 1);
+
+        CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .run_recovery()
+            .await
+            .expect("startup recovery reconciles the committed Running child");
+        let reconciled_child = ExecutionRepo::get_by_id(&*db, &committed.execution.id)
+            .await
+            .expect("child reloads after restart")
+            .expect("child remains in history");
+        assert_eq!(reconciled_child.status, ExecutionStatus::Cancelled);
+        assert_eq!(
+            reconciled_child.stop_reason,
+            Some(StopReason::CrashRecovery)
+        );
+        let reconciled_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("Task reloads after restart")
+            .expect("Task remains");
+        assert_eq!(reconciled_task.lifecycle_state, TaskLifecycleState::Blocked);
+        let annotation: Value = serde_json::from_str(
+            reconciled_task
+                .error_annotation
+                .as_deref()
+                .expect("the interrupted child has an exact recovery annotation"),
+        )
+        .expect("recovery annotation is valid JSON");
+        assert_eq!(annotation["blocked_execution_id"], committed.execution.id);
+
+        let replay = service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                parent.id.clone(),
+                request,
+                "recovery-operator",
+            )
+            .await
+            .expect("same-key retry reads the committed receipt after startup recovery");
+        assert!(replay.idempotent_replay);
+        assert_eq!(replay.execution.id, committed.execution.id);
+        assert_eq!(replay.execution.status, ExecutionStatus::Cancelled);
+        let children_after_replay: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution
+             WHERE task_id = ? AND parent_execution_id IS NOT NULL",
+        )
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("child count reloads after retry");
+        assert_eq!(children_after_replay, children_before_restart);
+        let decision_receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'execution.recovery_admitted'
+               AND scope_id = ? AND actor_id = 'recovery-operator'",
+        )
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("human decision receipt count loads");
+        assert_eq!(decision_receipts, 1);
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_mixes_auto_and_manual_policy_by_exact_work_unit() {
+        let fixture =
+            seed_parallel_recovery_fixture(&["codex", "shell"], &[Some("codex-session-a"), None])
+                .await;
+        let parent_a = &fixture.executions[0];
+        let parent_b = &fixture.executions[1];
+        let work_unit_a = parent_a.work_unit_id.as_deref().expect("A exact WorkUnit");
+        let work_unit_b = parent_b.work_unit_id.as_deref().expect("B exact WorkUnit");
+
+        let recovered = CrashRecovery::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus))
+            .run_recovery()
+            .await
+            .expect("mixed CrashRecovery policies complete");
+        assert_eq!(recovered, 0, "neither Task is given an aggregate block");
+
+        let stopped_a = ExecutionRepo::get_by_id(&*fixture.db, &parent_a.id)
+            .await
+            .expect("A reloads")
+            .expect("A remains historical");
+        let stopped_b = ExecutionRepo::get_by_id(&*fixture.db, &parent_b.id)
+            .await
+            .expect("B reloads")
+            .expect("B remains historical");
+        assert_eq!(stopped_a.status, ExecutionStatus::Cancelled);
+        assert_eq!(stopped_a.resume_policy, Some(ResumePolicy::Auto));
+        assert_eq!(stopped_a.work_unit_id.as_deref(), Some(work_unit_a));
+        assert_eq!(stopped_b.status, ExecutionStatus::Cancelled);
+        assert_eq!(stopped_b.resume_policy, Some(ResumePolicy::Manual));
+        assert_eq!(stopped_b.work_unit_id.as_deref(), Some(work_unit_b));
+        let automatic_candidates =
+            ExecutionRepo::list_work_unit_auto_recovery_candidates(&*fixture.db)
+                .await
+                .expect("exact automatic candidates load");
+        assert_eq!(
+            automatic_candidates
+                .iter()
+                .map(|execution| execution.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![parent_a.id.as_str()]
+        );
+
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .expect("Task reloads")
+            .expect("Task remains");
+        assert_eq!(task.lifecycle_state, TaskLifecycleState::Active);
+        assert!(task.error_annotation.is_none());
+        assert!(task.blocked_json.is_none());
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &task.id)
+            .await
+            .expect("TaskLifecycle reloads")
+            .expect("TaskLifecycle remains");
+        let service = TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus));
+        let (first, second) = tokio::join!(
+            service.re_execute_automatic_recovery_execution(parent_a.id.clone()),
+            service.re_execute_automatic_recovery_execution(parent_a.id.clone()),
+        );
+        let first = first.expect("first exact Auto admission resolves");
+        let second = second.expect("competing exact Auto admission resolves");
+        assert_ne!(first.idempotent_replay, second.idempotent_replay);
+        let (auto_child, replay) = if first.idempotent_replay {
+            (second, first)
+        } else {
+            (first, second)
+        };
+        assert_eq!(
+            auto_child.execution.parent_execution_id.as_deref(),
+            Some(parent_a.id.as_str())
+        );
+        assert_eq!(
+            auto_child.execution.harness_session_id, parent_a.harness_session_id,
+            "automatic recovery must retain the exact resumable session"
+        );
+        assert_eq!(
+            auto_child.execution.work_unit_id.as_deref(),
+            Some(work_unit_a)
+        );
+        let invocation = crate::task_service::execution::harness_invocation_for_execution(
+            &fixture.db,
+            &auto_child.execution,
+            auto_child.execution.workspace_id.as_deref(),
+        )
+        .await
+        .expect("automatic recovery resolves its exact HarnessSession invocation");
+        assert_eq!(
+            invocation,
+            api_types::HarnessInvocation::Resume {
+                external_session_id: "codex-session-a".to_owned()
+            }
+        );
+        assert!(replay.idempotent_replay);
+        assert_eq!(replay.execution.id, auto_child.execution.id);
+        assert!(
+            ExecutionRepo::list_work_unit_auto_recovery_candidates(&*fixture.db)
+                .await
+                .expect("remaining automatic candidates reload")
+                .iter()
+                .all(|candidate| candidate.id != parent_a.id),
+            "a durable child consumes the automatic recovery candidate"
+        );
+
+        let work_unit = WorkUnitRepo::get_by_id(&*fixture.db, work_unit_b)
+            .await
+            .expect("B WorkUnit reloads")
+            .expect("B WorkUnit remains");
+        let manual_child = service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                parent_b.id.clone(),
+                api_types::RecoverWorkUnitExecutionRequest {
+                    work_unit_id: work_unit_b.to_owned(),
+                    expected_task_version: task.version,
+                    expected_lifecycle_version: lifecycle.version,
+                    expected_work_unit_version: work_unit.version,
+                    idempotency_key: "mixed-manual-b".to_owned(),
+                    context: None,
+                },
+                "recovery-operator",
+            )
+            .await
+            .expect("manual B remains independently selectable");
+        assert_eq!(
+            manual_child.execution.parent_execution_id.as_deref(),
+            Some(parent_b.id.as_str())
+        );
+        assert_eq!(
+            manual_child.execution.work_unit_id.as_deref(),
+            Some(work_unit_b)
+        );
+        let final_task = TaskRepo::get_by_id(&*fixture.db, &task.id, false)
+            .await
+            .expect("final Task loads")
+            .expect("final Task remains");
+        assert_eq!(final_task.lifecycle_state, TaskLifecycleState::Active);
+        assert!(final_task.error_annotation.is_none());
+        assert!(final_task.blocked_json.is_none());
+        assert_eq!(fixture.agents.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_without_reusable_session_requires_an_exact_human_choice() {
+        let fixture = seed_parallel_recovery_fixture(&["shell", "shell"], &[None, None]).await;
+        let cancelled = cancel_running_executions(
+            &fixture.db,
+            &fixture.task.id,
+            StopReason::GracefulShutdown,
+            &api_types::Actor::system(api_types::SystemComponent::GracefulShutdown),
+            ResumePolicy::Auto,
+        )
+        .await
+        .expect("graceful shutdown cancels exact running WorkUnit attempts");
+        assert_eq!(cancelled.len(), 2);
+
+        let parents = &fixture.executions;
+        let work_unit_id = parents[0]
+            .work_unit_id
+            .as_deref()
+            .expect("A has an exact WorkUnit");
+        let stopped = ExecutionRepo::get_by_id(&*fixture.db, &parents[0].id)
+            .await
+            .expect("A reloads")
+            .expect("A remains historical");
+        assert_eq!(stopped.status, ExecutionStatus::Cancelled);
+        assert_eq!(stopped.stop_reason, Some(StopReason::GracefulShutdown));
+        assert_eq!(stopped.resume_policy, Some(ResumePolicy::Manual));
+        assert!(stopped.harness_session_id.is_none());
+        assert!(
+            ExecutionRepo::list_work_unit_auto_recovery_candidates(&*fixture.db)
+                .await
+                .expect("Auto candidates load")
+                .is_empty()
+        );
+
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .expect("Task reloads")
+            .expect("Task remains");
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &task.id)
+            .await
+            .expect("TaskLifecycle loads")
+            .expect("TaskLifecycle remains");
+        let work_unit = WorkUnitRepo::get_by_id(&*fixture.db, work_unit_id)
+            .await
+            .expect("A WorkUnit loads")
+            .expect("A WorkUnit remains");
+        let service = TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus));
+        let recovered = service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                stopped.id.clone(),
+                api_types::RecoverWorkUnitExecutionRequest {
+                    work_unit_id: work_unit_id.to_owned(),
+                    expected_task_version: task.version,
+                    expected_lifecycle_version: lifecycle.version,
+                    expected_work_unit_version: work_unit.version,
+                    idempotency_key: "graceful-exact-recovery".to_owned(),
+                    context: None,
+                },
+                "recovery-operator",
+            )
+            .await
+            .expect("Human can explicitly admit the exact non-resumable graceful stop");
+        assert_eq!(
+            recovered.execution.parent_execution_id.as_deref(),
+            Some(stopped.id.as_str())
+        );
+        assert_eq!(
+            recovered.execution.work_unit_id.as_deref(),
+            Some(work_unit_id)
+        );
+        assert!(recovered.execution.harness_session_id.is_none());
+        assert!(!recovered.idempotent_replay);
+
+        let start_receipt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'execution.started' AND entity_id = ?",
+        )
+        .bind(&recovered.execution.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("new child start receipt loads");
+        let operator_receipt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'execution.recovery_admitted' AND entity_id = ?",
+        )
+        .bind(&recovered.execution.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("Human decision receipt loads");
+        assert_eq!(start_receipt, 1);
+        assert_eq!(operator_receipt, 1);
+    }
+
+    #[tokio::test]
+    async fn human_may_explicitly_choose_a_fresh_child_for_an_auto_candidate() {
+        let fixture =
+            seed_parallel_recovery_fixture(&["codex", "shell"], &[Some("codex-session-a"), None])
+                .await;
+        CrashRecovery::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus))
+            .run_recovery()
+            .await
+            .expect("CrashRecovery keeps independently recoverable candidates");
+        let parent = &fixture.executions[0];
+        let stopped_parent = ExecutionRepo::get_by_id(&*fixture.db, &parent.id)
+            .await
+            .expect("Auto parent reloads")
+            .expect("Auto parent remains historical");
+        assert_eq!(stopped_parent.resume_policy, Some(ResumePolicy::Auto));
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .expect("Task reloads")
+            .expect("Task remains");
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &task.id)
+            .await
+            .expect("TaskLifecycle loads")
+            .expect("TaskLifecycle remains");
+        let work_unit_id = parent.work_unit_id.as_deref().expect("A exact WorkUnit");
+        let work_unit = WorkUnitRepo::get_by_id(&*fixture.db, work_unit_id)
+            .await
+            .expect("A WorkUnit loads")
+            .expect("A WorkUnit exists");
+        let service = TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus));
+        let human_choice = service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                parent.id.clone(),
+                api_types::RecoverWorkUnitExecutionRequest {
+                    work_unit_id: work_unit.id.clone(),
+                    expected_task_version: task.version,
+                    expected_lifecycle_version: lifecycle.version,
+                    expected_work_unit_version: work_unit.version,
+                    idempotency_key: "human-fresh-choice-for-auto".to_owned(),
+                    context: Some("operator chose a fresh attempt".to_owned()),
+                },
+                "recovery-operator",
+            )
+            .await
+            .expect("exact Human decision may authorize a fresh child from Auto");
+        assert!(!human_choice.idempotent_replay);
+        assert_eq!(
+            human_choice.execution.parent_execution_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(
+            human_choice.execution.work_unit_id.as_deref(),
+            Some(work_unit_id)
+        );
+        let fresh_session_id = human_choice
+            .execution
+            .harness_session_id
+            .as_deref()
+            .expect("fresh child receives its own pending HarnessSession");
+        assert_ne!(
+            Some(fresh_session_id),
+            stopped_parent.harness_session_id.as_deref()
+        );
+        let external_session_id: Option<String> =
+            sqlx::query_scalar("SELECT external_session_id FROM harness_session WHERE id = ?")
+                .bind(fresh_session_id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("fresh HarnessSession loads");
+        assert!(external_session_id.is_none());
+        let invocation = crate::task_service::execution::harness_invocation_for_execution(
+            &fixture.db,
+            &human_choice.execution,
+            human_choice.execution.workspace_id.as_deref(),
+        )
+        .await
+        .expect("explicit fresh recovery resolves its new HarnessSession");
+        assert_eq!(invocation, api_types::HarnessInvocation::Start);
+        assert!(
+            ExecutionRepo::list_work_unit_auto_recovery_candidates(&*fixture.db)
+                .await
+                .expect("Auto candidates reload after the explicit choice")
+                .iter()
+                .all(|candidate| candidate.id != parent.id)
+        );
+        let receipt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'execution.recovery_admitted'
+               AND entity_id = ? AND actor_type = 'human'
+               AND actor_id = 'recovery-operator'",
+        )
+        .bind(&human_choice.execution.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("Human override receipt loads");
+        assert_eq!(receipt, 1);
+    }
+
+    #[tokio::test]
+    async fn three_work_unit_recovery_keeps_each_automatic_and_manual_identity() {
+        let fixture = seed_parallel_recovery_fixture(
+            &["codex", "shell", "shell"],
+            &[Some("codex-session-a"), None, None],
+        )
+        .await;
+        let parents = &fixture.executions;
+        let work_units = parents
+            .iter()
+            .map(|execution| execution.work_unit_id.clone().expect("exact WorkUnit"))
+            .collect::<Vec<_>>();
+        assert_eq!(work_units.len(), 3);
+        assert_ne!(work_units[0], work_units[1]);
+        assert_ne!(work_units[0], work_units[2]);
+        assert_ne!(work_units[1], work_units[2]);
+
+        CrashRecovery::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus))
+            .run_recovery()
+            .await
+            .expect("three-target CrashRecovery completes");
+
+        let current = parents
+            .iter()
+            .map(|parent| parent.id.as_str())
+            .collect::<Vec<_>>();
+        let stopped = ExecutionRepo::list_work_unit_auto_recovery_candidates(&*fixture.db)
+            .await
+            .expect("automatic candidate list loads");
+        assert_eq!(
+            stopped
+                .iter()
+                .map(|execution| execution.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![current[0]],
+            "only the exact resumable A session is automatic"
+        );
+        for (index, parent) in parents.iter().enumerate() {
+            let persisted = ExecutionRepo::get_by_id(&*fixture.db, &parent.id)
+                .await
+                .expect("parent reloads")
+                .expect("parent remains historical");
+            assert_eq!(persisted.status, ExecutionStatus::Cancelled);
+            assert_eq!(
+                persisted.work_unit_id.as_deref(),
+                Some(work_units[index].as_str())
+            );
+            assert_eq!(
+                persisted.resume_policy,
+                Some(if index == 0 {
+                    ResumePolicy::Auto
+                } else {
+                    ResumePolicy::Manual
+                })
+            );
+        }
+
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .expect("Task reloads")
+            .expect("Task remains");
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &task.id)
+            .await
+            .expect("TaskLifecycle reloads")
+            .expect("TaskLifecycle remains");
+        assert_eq!(task.lifecycle_state, TaskLifecycleState::Active);
+        assert!(task.error_annotation.is_none());
+        assert!(task.blocked_json.is_none());
+
+        let work_unit_b = WorkUnitRepo::get_by_id(&*fixture.db, &work_units[1])
+            .await
+            .expect("B WorkUnit reloads")
+            .expect("B WorkUnit remains");
+        let service = TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus));
+        let child_b = service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                parents[1].id.clone(),
+                api_types::RecoverWorkUnitExecutionRequest {
+                    work_unit_id: work_units[1].clone(),
+                    expected_task_version: task.version,
+                    expected_lifecycle_version: lifecycle.version,
+                    expected_work_unit_version: work_unit_b.version,
+                    idempotency_key: "three-target-b-decision".to_owned(),
+                    context: Some("operator selected WorkUnit B".to_owned()),
+                },
+                "recovery-operator",
+            )
+            .await
+            .expect("B can be selected without consuming C");
+        assert_eq!(
+            child_b.execution.parent_execution_id.as_deref(),
+            Some(parents[1].id.as_str())
+        );
+        assert_eq!(
+            child_b.execution.work_unit_id.as_deref(),
+            Some(work_units[1].as_str())
+        );
+        let still_pending_c = ExecutionRepo::get_by_id(&*fixture.db, &parents[2].id)
+            .await
+            .expect("C reloads after B choice")
+            .expect("C remains historical");
+        assert_eq!(still_pending_c.status, ExecutionStatus::Cancelled);
+        assert_eq!(still_pending_c.resume_policy, Some(ResumePolicy::Manual));
+        assert_eq!(
+            still_pending_c.work_unit_id.as_deref(),
+            Some(work_units[2].as_str())
+        );
+        assert!(ExecutionRepo::get_by_id(&*fixture.db, &parents[0].id)
+            .await
+            .expect("A remains readable")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn explicit_recovery_rejects_wrong_task_work_unit_and_stale_versions() {
+        let fixture = seed_parallel_recovery_fixture(&["shell", "shell"], &[None, None]).await;
+        CrashRecovery::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus))
+            .run_recovery()
+            .await
+            .expect("CrashRecovery commits the ambiguous block");
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .expect("Task loads")
+            .expect("Task exists");
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &task.id)
+            .await
+            .expect("TaskLifecycle loads")
+            .expect("TaskLifecycle exists");
+        let work_unit_a = WorkUnitRepo::get_by_id(
+            &*fixture.db,
+            fixture.executions[0]
+                .work_unit_id
+                .as_deref()
+                .expect("A exact WorkUnit"),
+        )
+        .await
+        .expect("A WorkUnit loads")
+        .expect("A WorkUnit exists");
+        let work_unit_b = WorkUnitRepo::get_by_id(
+            &*fixture.db,
+            fixture.executions[1]
+                .work_unit_id
+                .as_deref()
+                .expect("B exact WorkUnit"),
+        )
+        .await
+        .expect("B WorkUnit loads")
+        .expect("B WorkUnit exists");
+        let foreign_task = seed_task(
+            &fixture.db,
+            task.project_id.clone(),
+            task.repo_id.clone().expect("Task Repo remains exact"),
+            "active".to_owned(),
+            None,
+        )
+        .await;
+        let service = TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus));
+        let make_request = |unit: &db::WorkUnit, key: &str, task_version, lifecycle_version| {
+            api_types::RecoverWorkUnitExecutionRequest {
+                work_unit_id: unit.id.clone(),
+                expected_task_version: task_version,
+                expected_lifecycle_version: lifecycle_version,
+                expected_work_unit_version: unit.version,
+                idempotency_key: key.to_owned(),
+                context: None,
+            }
+        };
+
+        assert!(service
+            .recover_work_unit_execution(
+                foreign_task.id,
+                fixture.executions[0].id.clone(),
+                make_request(
+                    &work_unit_a,
+                    "foreign-task",
+                    task.version,
+                    lifecycle.version
+                ),
+                "recovery-operator",
+            )
+            .await
+            .is_err());
+        assert!(service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                fixture.executions[0].id.clone(),
+                make_request(
+                    &work_unit_b,
+                    "wrong-work-unit",
+                    task.version,
+                    lifecycle.version
+                ),
+                "recovery-operator",
+            )
+            .await
+            .is_err());
+        assert!(service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                fixture.executions[0].id.clone(),
+                make_request(
+                    &work_unit_a,
+                    "stale-task-version",
+                    task.version - 1,
+                    lifecycle.version
+                ),
+                "recovery-operator",
+            )
+            .await
+            .is_err());
+        assert!(service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                fixture.executions[0].id.clone(),
+                make_request(
+                    &work_unit_a,
+                    "stale-lifecycle-version",
+                    task.version,
+                    lifecycle.version - 1
+                ),
+                "recovery-operator",
+            )
+            .await
+            .is_err());
+
+        let task_after = TaskRepo::get_by_id(&*fixture.db, &task.id, false)
+            .await
+            .expect("Task reloads after rejected choices")
+            .expect("Task remains");
+        assert_eq!(task_after.version, task.version);
+        assert_eq!(task_after.lifecycle_state, TaskLifecycleState::Blocked);
+        assert_eq!(task_after.error_annotation, task.error_annotation);
+        let transition_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_lifecycle_transition WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("transition count loads");
+        assert_eq!(transition_count, 1);
+        let child_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution WHERE task_id = ? AND parent_execution_id IS NOT NULL",
+        )
+        .bind(&task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("child count loads");
+        assert_eq!(child_count, 0);
+        let receipt_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'execution.recovery_admitted' AND scope_id = ?",
+        )
+        .bind(&task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("decision receipt count loads");
+        assert_eq!(receipt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_recovery_rejects_suspended_work_unit_actor_membership() {
+        let fixture = seed_parallel_recovery_fixture(&["shell", "shell"], &[None, None]).await;
+        CrashRecovery::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus))
+            .run_recovery()
+            .await
+            .expect("CrashRecovery commits the ambiguous block");
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .expect("Task loads")
+            .expect("Task exists");
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &task.id)
+            .await
+            .expect("TaskLifecycle loads")
+            .expect("TaskLifecycle exists");
+        let parent = &fixture.executions[0];
+        let work_unit_id = parent.work_unit_id.as_deref().expect("A exact WorkUnit");
+        let work_unit = WorkUnitRepo::get_by_id(&*fixture.db, work_unit_id)
+            .await
+            .expect("A WorkUnit loads")
+            .expect("A WorkUnit exists");
+        let role = TaskRoleRepo::get_by_task_and_role(&*fixture.db, &task.id, &work_unit.role)
+            .await
+            .expect("TaskRole loads")
+            .expect("TaskRole exists");
+        let membership = RoleMembershipRepo::list_by_role(&*fixture.db, &role.id, true)
+            .await
+            .expect("membership history loads")
+            .into_iter()
+            .find(|membership| {
+                membership.actor_kind == db::ActorKind::Agent
+                    && membership.actor_id == parent.agent_id.as_deref().unwrap_or_default()
+                    && membership.status == RoleMembershipStatus::Active
+            })
+            .expect("A parent Agent has its current active membership");
+        RoleMembershipRepo::update(
+            &*fixture.db,
+            UpdateRoleMembership {
+                id: membership.id,
+                expected_version: membership.version,
+                status: RoleMembershipStatus::Suspended,
+                updated_at: now_rfc3339(),
+                ended_at: None,
+            },
+        )
+        .await
+        .expect("A Agent membership is suspended before admission");
+
+        let task_before = TaskRepo::get_by_id(&*fixture.db, &task.id, false)
+            .await
+            .expect("Task reloads")
+            .expect("Task remains");
+        let execution_count_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("Execution count loads");
+        let service = TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus));
+        assert!(service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                parent.id.clone(),
+                api_types::RecoverWorkUnitExecutionRequest {
+                    work_unit_id: work_unit.id.clone(),
+                    expected_task_version: task_before.version,
+                    expected_lifecycle_version: lifecycle.version,
+                    expected_work_unit_version: work_unit.version,
+                    idempotency_key: "suspended-recovery-actor".to_owned(),
+                    context: None,
+                },
+                "recovery-operator",
+            )
+            .await
+            .is_err());
+        let task_after = TaskRepo::get_by_id(&*fixture.db, &task.id, false)
+            .await
+            .expect("Task reloads after rejected selection")
+            .expect("Task remains");
+        assert_eq!(task_after.version, task_before.version);
+        assert_eq!(task_after.lifecycle_state, TaskLifecycleState::Blocked);
+        assert_eq!(task_after.error_annotation, task.error_annotation);
+        let execution_count_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("Execution count reloads");
+        assert_eq!(execution_count_after, execution_count_before);
+        let decision_receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'execution.recovery_admitted' AND scope_id = ?",
+        )
+        .bind(&task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("decision receipts load");
+        assert_eq!(decision_receipts, 0);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_recovery_remains_selectable_if_annotation_write_is_interrupted() {
+        let fixture = seed_parallel_recovery_fixture(&["shell", "shell"], &[None, None]).await;
+        sqlx::query(
+            "CREATE TRIGGER fail_recovery_annotation
+             BEFORE UPDATE OF error_annotation ON task
+             WHEN NEW.error_annotation IS NOT NULL
+             BEGIN SELECT RAISE(ABORT, 'injected recovery annotation failure'); END",
+        )
+        .execute(fixture.db.pool())
+        .await
+        .expect("failure injection trigger creates");
+        let recovery_result =
+            CrashRecovery::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus))
+                .run_recovery()
+                .await;
+        assert!(
+            recovery_result.is_err(),
+            "the injected annotation write fails"
+        );
+        sqlx::query("DROP TRIGGER fail_recovery_annotation")
+            .execute(fixture.db.pool())
+            .await
+            .expect("failure injection trigger drops");
+
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .expect("Task loads after interrupted write")
+            .expect("Task remains");
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &task.id)
+            .await
+            .expect("TaskLifecycle loads after interrupted write")
+            .expect("TaskLifecycle remains");
+        assert_eq!(lifecycle.state, TaskLifecycleState::Blocked);
+        assert_eq!(
+            lifecycle.reason_kind.as_deref(),
+            Some("recovery_target_ambiguous")
+        );
+        assert!(lifecycle
+            .reason_ref
+            .as_deref()
+            .unwrap()
+            .starts_with("task-version:"));
+        assert!(task.error_annotation.is_none());
+        assert!(task.blocked_json.is_none());
+        for parent in &fixture.executions {
+            let stopped = ExecutionRepo::get_by_id(&*fixture.db, &parent.id)
+                .await
+                .expect("cancelled attempt loads")
+                .expect("cancelled attempt remains");
+            assert_eq!(stopped.status, ExecutionStatus::Cancelled);
+            assert_eq!(stopped.resume_policy, Some(ResumePolicy::Manual));
+            assert!(stopped.work_unit_id.is_some());
+        }
+        let parent = &fixture.executions[0];
+        let work_unit_id = parent.work_unit_id.as_deref().expect("A exact WorkUnit");
+        let work_unit = WorkUnitRepo::get_by_id(&*fixture.db, work_unit_id)
+            .await
+            .expect("A WorkUnit loads")
+            .expect("A WorkUnit remains");
+        let service = TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus));
+        let selected = service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                parent.id.clone(),
+                api_types::RecoverWorkUnitExecutionRequest {
+                    work_unit_id: work_unit.id,
+                    expected_task_version: task.version,
+                    expected_lifecycle_version: lifecycle.version,
+                    expected_work_unit_version: work_unit.version,
+                    idempotency_key: "select-after-annotation-interruption".to_owned(),
+                    context: None,
+                },
+                "recovery-operator",
+            )
+            .await
+            .expect("exact durable identities resolve the ambiguous lifecycle without annotation");
+        assert_eq!(
+            selected.execution.parent_execution_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(selected.task.lifecycle_state, TaskLifecycleState::Active);
+        assert!(selected.task.error_annotation.is_none());
+        let sibling = ExecutionRepo::get_by_id(&*fixture.db, &fixture.executions[1].id)
+            .await
+            .expect("unselected sibling loads")
+            .expect("unselected sibling remains");
+        assert_eq!(sibling.status, ExecutionStatus::Cancelled);
+        assert_eq!(sibling.resume_policy, Some(ResumePolicy::Manual));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_agent_timeout_recovery_uses_the_same_exact_selection_boundary() {
+        let fixture = seed_parallel_recovery_fixture(&["shell", "shell"], &[None, None]).await;
+        let outcome = recover_executions(
+            &fixture.db,
+            &fixture.event_bus,
+            fixture.task.clone(),
+            fixture.executions.clone(),
+            StopReason::AgentTimeout,
+            &api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor),
+        )
+        .await
+        .expect("timeout reconciliation persists its exact stopped attempts");
+        assert!(outcome.annotated);
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .expect("Task reloads")
+            .expect("Task remains");
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &task.id)
+            .await
+            .expect("TaskLifecycle reloads")
+            .expect("TaskLifecycle remains");
+        assert_eq!(
+            lifecycle.reason_kind.as_deref(),
+            Some("recovery_target_ambiguous")
+        );
+        for parent in &fixture.executions {
+            let stopped = ExecutionRepo::get_by_id(&*fixture.db, &parent.id)
+                .await
+                .expect("timeout-stopped attempt loads")
+                .expect("timeout-stopped attempt remains");
+            assert_eq!(stopped.stop_reason, Some(StopReason::AgentTimeout));
+            assert_eq!(stopped.resume_policy, Some(ResumePolicy::Manual));
+            assert!(stopped.work_unit_id.is_some());
+        }
+        let parent = &fixture.executions[1];
+        let work_unit = WorkUnitRepo::get_by_id(
+            &*fixture.db,
+            parent.work_unit_id.as_deref().expect("B exact WorkUnit"),
+        )
+        .await
+        .expect("B WorkUnit loads")
+        .expect("B WorkUnit exists");
+        let service = TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus));
+        let selected = service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                parent.id.clone(),
+                api_types::RecoverWorkUnitExecutionRequest {
+                    work_unit_id: work_unit.id.clone(),
+                    expected_task_version: task.version,
+                    expected_lifecycle_version: lifecycle.version,
+                    expected_work_unit_version: work_unit.version,
+                    idempotency_key: "select-timeout-target-b".to_owned(),
+                    context: None,
+                },
+                "recovery-operator",
+            )
+            .await
+            .expect("exact timed-out B may be selected without inferring A");
+        assert_eq!(
+            selected.execution.parent_execution_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(
+            selected.execution.work_unit_id.as_deref(),
+            Some(work_unit.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_recovery_rolls_back_lifecycle_child_and_receipt_together() {
+        let fixture = seed_parallel_recovery_fixture(&["shell", "shell"], &[None, None]).await;
+        CrashRecovery::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus))
+            .run_recovery()
+            .await
+            .expect("CrashRecovery commits the ambiguous block");
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .expect("Task loads")
+            .expect("Task exists");
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &task.id)
+            .await
+            .expect("TaskLifecycle loads")
+            .expect("TaskLifecycle exists");
+        let parent = &fixture.executions[0];
+        let work_unit_id = parent
+            .work_unit_id
+            .as_deref()
+            .expect("parent exact WorkUnit");
+        let work_unit = WorkUnitRepo::get_by_id(&*fixture.db, work_unit_id)
+            .await
+            .expect("WorkUnit loads")
+            .expect("WorkUnit exists");
+        let request = api_types::RecoverWorkUnitExecutionRequest {
+            work_unit_id: work_unit.id.clone(),
+            expected_task_version: task.version,
+            expected_lifecycle_version: lifecycle.version,
+            expected_work_unit_version: work_unit.version,
+            idempotency_key: "rollback-recovery".to_owned(),
+            context: None,
+        };
+        let execution_count_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("execution count loads");
+        let event_count_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event WHERE scope_type = 'task' AND scope_id = ?",
+        )
+        .bind(&task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("event count loads");
+        sqlx::query(
+            "CREATE TRIGGER fail_recovery_receipt
+             BEFORE INSERT ON domain_event
+             WHEN NEW.event_type = 'execution.recovery_admitted'
+             BEGIN SELECT RAISE(ABORT, 'injected recovery receipt failure'); END",
+        )
+        .execute(fixture.db.pool())
+        .await
+        .expect("failure injection trigger creates");
+        let service = TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus));
+        assert!(service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                parent.id.clone(),
+                request.clone(),
+                "recovery-operator",
+            )
+            .await
+            .is_err());
+        sqlx::query("DROP TRIGGER fail_recovery_receipt")
+            .execute(fixture.db.pool())
+            .await
+            .expect("failure injection trigger drops");
+
+        let task_after_failure = TaskRepo::get_by_id(&*fixture.db, &task.id, false)
+            .await
+            .expect("Task reloads after rollback")
+            .expect("Task remains");
+        let lifecycle_after_failure = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &task.id)
+            .await
+            .expect("lifecycle reloads after rollback")
+            .expect("lifecycle remains");
+        assert_eq!(task_after_failure.version, task.version);
+        assert_eq!(
+            task_after_failure.lifecycle_state,
+            TaskLifecycleState::Blocked
+        );
+        assert_eq!(task_after_failure.error_annotation, task.error_annotation);
+        assert_eq!(lifecycle_after_failure.version, lifecycle.version);
+        assert_eq!(lifecycle_after_failure.state, lifecycle.state);
+        let execution_count_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("execution count reloads");
+        assert_eq!(execution_count_after, execution_count_before);
+        let event_count_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event WHERE scope_type = 'task' AND scope_id = ?",
+        )
+        .bind(&task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("event count reloads");
+        assert_eq!(event_count_after, event_count_before);
+        let active_leases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workspace_lease WHERE status = 'active' AND task_id = ?",
+        )
+        .bind(&task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("lease count loads");
+        assert_eq!(active_leases, 0);
+
+        let retried = service
+            .recover_work_unit_execution(
+                task.id.clone(),
+                parent.id.clone(),
+                request,
+                "recovery-operator",
+            )
+            .await
+            .expect("same request can commit after complete rollback");
+        assert!(!retried.idempotent_replay);
+        assert_eq!(
+            retried.execution.parent_execution_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn competing_ambiguous_recovery_choices_commit_only_one_decision() {
+        let fixture = seed_parallel_recovery_fixture(&["shell", "shell"], &[None, None]).await;
+        CrashRecovery::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus))
+            .run_recovery()
+            .await
+            .expect("CrashRecovery commits the ambiguous block");
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .expect("Task loads")
+            .expect("Task exists");
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &task.id)
+            .await
+            .expect("TaskLifecycle loads")
+            .expect("TaskLifecycle exists");
+        let work_unit_a = WorkUnitRepo::get_by_id(
+            &*fixture.db,
+            fixture.executions[0].work_unit_id.as_deref().unwrap(),
+        )
+        .await
+        .expect("A WorkUnit loads")
+        .expect("A WorkUnit exists");
+        let work_unit_b = WorkUnitRepo::get_by_id(
+            &*fixture.db,
+            fixture.executions[1].work_unit_id.as_deref().unwrap(),
+        )
+        .await
+        .expect("B WorkUnit loads")
+        .expect("B WorkUnit exists");
+        let service = TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus));
+        let request_a = api_types::RecoverWorkUnitExecutionRequest {
+            work_unit_id: work_unit_a.id.clone(),
+            expected_task_version: task.version,
+            expected_lifecycle_version: lifecycle.version,
+            expected_work_unit_version: work_unit_a.version,
+            idempotency_key: "competing-a".to_owned(),
+            context: None,
+        };
+        let request_b = api_types::RecoverWorkUnitExecutionRequest {
+            work_unit_id: work_unit_b.id.clone(),
+            expected_task_version: task.version,
+            expected_lifecycle_version: lifecycle.version,
+            expected_work_unit_version: work_unit_b.version,
+            idempotency_key: "competing-b".to_owned(),
+            context: None,
+        };
+        let a = service.recover_work_unit_execution(
+            task.id.clone(),
+            fixture.executions[0].id.clone(),
+            request_a,
+            "recovery-operator",
+        );
+        let b = service.recover_work_unit_execution(
+            task.id.clone(),
+            fixture.executions[1].id.clone(),
+            request_b,
+            "recovery-operator",
+        );
+        let (a, b) = tokio::join!(a, b);
+        assert_ne!(
+            a.is_ok(),
+            b.is_ok(),
+            "only one stale aggregate decision wins"
+        );
+        let successful = a.or(b).expect("one exact decision commits");
+        assert_eq!(successful.task.lifecycle_state, TaskLifecycleState::Active);
+        let children: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution WHERE task_id = ? AND parent_execution_id IS NOT NULL",
+        )
+        .bind(&task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("child count loads");
+        assert_eq!(children, 1);
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'execution.recovery_admitted' AND scope_id = ?",
+        )
+        .bind(&task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("receipt count loads");
+        assert_eq!(receipts, 1);
+        let current = TaskRepo::get_by_id(&*fixture.db, &task.id, false)
+            .await
+            .expect("Task reloads")
+            .expect("Task remains");
+        assert!(current.error_annotation.is_none());
+        assert!(current.blocked_json.is_none());
     }
 
     #[tokio::test]

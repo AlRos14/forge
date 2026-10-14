@@ -87,6 +87,22 @@ pub struct FollowUpRequest {
     pub overrides: Option<ExecutionOverridesRequest>,
 }
 
+/// Explicitly select one exact crash-recovery Execution and WorkUnit.
+/// Expected versions bind the human decision to the state they reviewed.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct RecoverWorkUnitExecutionRequest {
+    pub work_unit_id: String,
+    pub expected_task_version: i64,
+    pub expected_lifecycle_version: i64,
+    pub expected_work_unit_version: i64,
+    pub idempotency_key: String,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub context: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskDependency {
     pub task_id: String,

@@ -128,6 +128,7 @@ fn export_typescript() {
 
     StartExecutionRequest::export().expect("export StartExecutionRequest");
     FollowUpRequest::export().expect("export FollowUpRequest");
+    RecoverWorkUnitExecutionRequest::export().expect("export RecoverWorkUnitExecutionRequest");
     ClaimOverrides::export().expect("export ClaimOverrides");
     ExecutionResponse::export().expect("export ExecutionResponse");
     ExecutionUsageResponse::export().expect("export ExecutionUsageResponse");

@@ -573,6 +573,10 @@ impl ExecutionRepo for SqliteDb {
                AND status = 'cancelled'
                AND resume_policy = 'auto'
                AND stop_reason IN ('crash_recovery', 'graceful_shutdown')
+               AND NOT EXISTS (
+                   SELECT 1 FROM execution child
+                   WHERE child.parent_execution_id = execution.id
+               )
              ORDER BY created_at ASC, id ASC",
         )
         .fetch_all(&self.pool)

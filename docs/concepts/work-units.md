@@ -45,15 +45,25 @@ Execution without destroying the scope. Runnable, blocked, running, and
 awaiting-integration are derived from the WorkUnit, dependencies, Executions,
 Workspaces, and integration outcomes.
 
-TaskLifecycle is an aggregate Task block, so an Execution admission can
-resolve it only when the current block's lifecycle reference, blocking
-annotation (when present), and exact parent Execution identify the same open
-WorkUnit. A follow-up or re-execute for a sibling WorkUnit is rejected while
-another WorkUnit owns the block. `error_annotation` and `blocked_json` carry
-different details; each present field must independently name that exact
-Execution before admission may clear it. Lifecycle activation, metadata
-cleanup, and child admission commit together. A manual lifecycle transition
-cannot bypass pending blocking metadata.
+TaskLifecycle is aggregate Task progress. An Execution admission normally
+resolves an Execution-owned block only when the current lifecycle reference,
+blocking annotation (when present), and exact parent Execution identify the
+same open WorkUnit. A sibling cannot clear a block owned by another WorkUnit.
+If crash recovery or timeout reconciliation had to stop multiple Executions
+and the aggregate block has no single owner, an authorized Human may select
+one exact cancelled Manual Execution with its WorkUnit and current versions.
+The selection
+atomically resolves the ambiguous Task block and admits that exact child;
+remaining WorkUnits retain their own pending Execution history and can be
+selected while the Task is Active. An Auto crash or graceful-shutdown candidate
+continues only by resuming its same active, explicitly linked HarnessSession;
+if that session is not reusable, automatic dispatch waits for an exact Human
+selection. The Human may explicitly authorize a fresh child for a cancelled
+Auto candidate. `error_annotation` and `blocked_json` carry
+different details; each present field must independently identify its owner
+before admission may clear it. Lifecycle activation, metadata cleanup, the
+child Execution, and its idempotency receipt commit together. A manual
+lifecycle transition cannot bypass pending blocking metadata.
 
 An assigned WorkUnit is runnable only while its Actor still has active
 membership in the WorkUnit's TaskRole. If membership is suspended or ended,

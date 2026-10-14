@@ -90,6 +90,29 @@ pub async fn start_task_execution(
     ))
 }
 
+pub async fn recover_work_unit_execution(
+    State(state): State<AppState>,
+    Path((task_id, execution_id)): Path<(String, String)>,
+    user: AuthenticatedUser,
+    Json(request): Json<api_types::RecoverWorkUnitExecutionRequest>,
+) -> ApiResult<Json<ExecutionResponse>> {
+    crate::routes::tasks::require_task_mutable(&state, &task_id, &user).await?;
+    let launched = state
+        .task_service
+        .recover_work_unit_execution(task_id, execution_id, request, user.user_id)
+        .await
+        .map_err(ApiError::from)?;
+    if !launched.idempotent_replay {
+        state
+            .task_service
+            .start_execution(launched.execution.id.clone())
+            .await?;
+    }
+    Ok(Json(
+        execution_response_with_usage(&state.db, launched.execution).await?,
+    ))
+}
+
 pub async fn get_execution(
     State(state): State<AppState>,
     Path(id): Path<String>,

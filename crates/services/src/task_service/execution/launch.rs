@@ -3,6 +3,363 @@ use db::{WorkUnitRepo, WorkspaceRepo};
 use sha2::Digest as _;
 
 impl TaskService {
+    /// Admit one human-selected, exact manual crash-recovery target. The
+    /// service records the decision and child Execution atomically; callers
+    /// dispatch the provider only for a newly admitted child.
+    pub async fn recover_work_unit_execution(
+        &self,
+        task_id: impl Into<String>,
+        parent_execution_id: impl Into<String>,
+        request: api_types::RecoverWorkUnitExecutionRequest,
+        requested_by: impl Into<String>,
+    ) -> Result<LaunchExecutionResult> {
+        let task_id = task_id.into();
+        let parent_execution_id = parent_execution_id.into();
+        let requested_by = requested_by.into();
+        validate_required("task_id", &task_id)?;
+        validate_required("parent_execution_id", &parent_execution_id)?;
+        validate_required("work_unit_id", &request.work_unit_id)?;
+        validate_required("requested_by", &requested_by)?;
+        if request.idempotency_key.trim().is_empty() || request.idempotency_key.len() > 200 {
+            return Err(ServiceError::invalid_operation(
+                "recovery idempotency_key must contain 1 to 200 characters",
+            ));
+        }
+        let request_digest = explicit_recovery_request_digest(
+            &task_id,
+            &parent_execution_id,
+            &request,
+            &requested_by,
+        );
+        let receipt_dedupe_key = format!(
+            "execution-recovery:{}:{}",
+            task_id,
+            hex::encode(sha2::Sha256::digest(request.idempotency_key.as_bytes()))
+        );
+        if let Some(replay) = self
+            .replay_explicit_recovery(
+                &task_id,
+                &parent_execution_id,
+                &request,
+                &requested_by,
+                &request_digest,
+                &receipt_dedupe_key,
+            )
+            .await?
+        {
+            return Ok(replay);
+        }
+
+        let parent_execution = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", parent_execution_id.clone()))?;
+        if parent_execution.task_id != task_id
+            || parent_execution.work_unit_id.as_deref() != Some(request.work_unit_id.as_str())
+            || parent_execution.status != ExecutionStatus::Cancelled
+            || !matches!(
+                parent_execution.stop_reason,
+                Some(
+                    db::StopReason::CrashRecovery
+                        | db::StopReason::AgentTimeout
+                        | db::StopReason::GracefulShutdown
+                )
+            )
+            || !matches!(
+                parent_execution.resume_policy,
+                Some(db::ResumePolicy::Manual | db::ResumePolicy::Auto)
+            )
+        {
+            return Err(ServiceError::invalid_operation(
+                "recovery requires an exact cancelled crash-recovery, timeout, or graceful-shutdown Execution without a child",
+            ));
+        }
+        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.clone()))?;
+        if task.version != request.expected_task_version {
+            return Err(db::DbError::TaskVersionConflict {
+                expected: request.expected_task_version,
+                actual: task.version,
+            }
+            .into());
+        }
+        if lifecycle.version != request.expected_lifecycle_version {
+            return Err(db::DbError::VersionConflict.into());
+        }
+        let ambiguous_reason_ref = match lifecycle.state {
+            db::TaskLifecycleState::Blocked => {
+                if lifecycle.reason_kind.as_deref() != Some("recovery_target_ambiguous")
+                    || task.blocked_json.is_some()
+                {
+                    return Err(ServiceError::invalid_operation(
+                        "only the current ambiguous crash-recovery block accepts an explicit target",
+                    ));
+                }
+                Some(lifecycle.reason_ref.clone().ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "ambiguous recovery block has no current reason reference",
+                    )
+                })?)
+            }
+            db::TaskLifecycleState::Active => {
+                if task.error_annotation.is_some()
+                    || task.blocked_json.is_some()
+                    || task.failed_json.is_some()
+                {
+                    return Err(ServiceError::invalid_operation(
+                        "active Task has pending blocking or failure metadata",
+                    ));
+                }
+                None
+            }
+            state => {
+                return Err(ServiceError::invalid_operation(format!(
+                    "manual crash recovery cannot activate TaskLifecycle {state}"
+                )))
+            }
+        };
+        let work_unit = WorkUnitRepo::get_by_id(&*self.db, &request.work_unit_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("work_unit", request.work_unit_id.clone()))?;
+        if work_unit.task_id != task_id
+            || work_unit.version != request.expected_work_unit_version
+            || work_unit.status != db::WorkUnitStatus::Open
+            || !super::has_exact_work_unit_target(&self.db, &task_id, &parent_execution).await?
+        {
+            return Err(db::DbError::VersionConflict.into());
+        }
+        let agent_id = match (
+            work_unit.assigned_actor.as_ref(),
+            parent_execution.actor_ref(),
+        ) {
+            (Some(db::ActorRef::Agent(assigned)), Some(db::ActorRef::Agent(parent)))
+                if assigned == &parent
+                    && parent_execution.agent_id.as_deref() == Some(parent.as_str()) =>
+            {
+                parent
+            }
+            _ => return Err(ServiceError::AuthorizationDenied {
+                message:
+                    "recovery requires the parent Actor to remain the exact assigned WorkUnit Agent"
+                        .to_owned(),
+            }),
+        };
+        let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
+        if agent.paused {
+            return Err(ServiceError::AgentPaused { agent_id });
+        }
+        if !crate::agent_capacity::has_running_execution_capacity(&self.db, &agent).await? {
+            return Err(db::DbError::AgentAtCapacity.into());
+        }
+        let workspace = match parent_execution.workspace_id.as_deref() {
+            Some(workspace_id) => Some(
+                WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?,
+            ),
+            None => None,
+        };
+        let executor_config_snapshot_json = build_executor_config_snapshot(
+            &self.db,
+            &task,
+            &agent,
+            None,
+            self.adapter_registry.as_deref(),
+        )
+        .await?;
+        let source_prompt = parent_execution
+            .prompt
+            .as_deref()
+            .or(parent_execution.summary.as_deref())
+            .unwrap_or_default();
+        let summary = match request.context.as_deref() {
+            Some(context) if !source_prompt.is_empty() => {
+                format!("[User context: {context}]\n\n{source_prompt}")
+            }
+            Some(context) => format!("[User context: {context}]"),
+            None => source_prompt.to_owned(),
+        };
+        let artifact_input_ids = self
+            .inherit_plan_artifact_inputs(&parent_execution.id, &task.id)
+            .await?;
+        let now = now_rfc3339();
+        let execution_input = CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent.id.clone()),
+            actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
+            purpose: Some(parent_execution.purpose.clone().unwrap_or_else(|| {
+                execution_purpose_for_task_type(&task.task_type, &work_unit.role)
+            })),
+            harness_session_id: None,
+            role: work_unit.role.clone(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: Some(parent_execution.id.clone()),
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some(summary),
+            logs_path: None,
+            before_sha: workspace
+                .as_ref()
+                .and_then(|workspace| workspace.before_sha.clone())
+                .or_else(|| parent_execution.before_sha.clone()),
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json,
+            workspace_id: parent_execution.workspace_id.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let admission = super::super::ExplicitRecoveryAdmission {
+            expected_task_version: request.expected_task_version,
+            expected_lifecycle_version: request.expected_lifecycle_version,
+            ambiguous_reason_ref,
+            idempotency_key: request.idempotency_key.clone(),
+            receipt_dedupe_key,
+            request_digest,
+            requested_by,
+        };
+        let (task, execution, idempotent_replay) = self
+            .admit_recovery_work_unit_execution_with_options(
+                &task,
+                &lifecycle,
+                &parent_execution.id,
+                &request.work_unit_id,
+                request.expected_work_unit_version,
+                execution_input,
+                artifact_input_ids,
+                Some(admission),
+            )
+            .await?;
+        if !idempotent_replay {
+            tracing::info!(
+                task_id = %task.id,
+                agent_id = %agent.id,
+                execution_id = %execution.id,
+                parent_execution_id = %parent_execution.id,
+                work_unit_id = %request.work_unit_id,
+                "explicit WorkUnit crash recovery admitted"
+            );
+            self.publish(ForgeEvent {
+                event_type: "task.execution_launched".to_owned(),
+                entity_id: task.id.clone(),
+                timestamp: event_timestamp(),
+                context: EventContext::TaskAssigned {
+                    project_id: task.project_id.clone(),
+                    agent_id: agent.id,
+                    execution_id: execution.id.clone(),
+                },
+            });
+        }
+        Ok(LaunchExecutionResult {
+            task,
+            execution,
+            workspace,
+            idempotent_replay,
+        })
+    }
+
+    async fn replay_explicit_recovery(
+        &self,
+        task_id: &str,
+        parent_execution_id: &str,
+        request: &api_types::RecoverWorkUnitExecutionRequest,
+        requested_by: &str,
+        request_digest: &str,
+        receipt_dedupe_key: &str,
+    ) -> Result<Option<LaunchExecutionResult>> {
+        let Some(receipt) =
+            db::DomainEventRepo::get_event_by_dedupe(&*self.db, receipt_dedupe_key).await?
+        else {
+            return Ok(None);
+        };
+        let payload: Value = serde_json::from_str(&receipt.payload_json).map_err(|error| {
+            ServiceError::invalid_operation(format!("stored recovery receipt is invalid: {error}"))
+        })?;
+        if receipt.event_type != "execution.recovery_admitted"
+            || receipt.entity_type != "execution"
+            || receipt.actor_type != "human"
+            || receipt.actor_id.as_deref() != Some(requested_by)
+            || receipt.scope_type != "task"
+            || receipt.scope_id != task_id
+            || payload.get("task_id").and_then(Value::as_str) != Some(task_id)
+            || payload.get("parent_execution_id").and_then(Value::as_str)
+                != Some(parent_execution_id)
+            || payload.get("work_unit_id").and_then(Value::as_str)
+                != Some(request.work_unit_id.as_str())
+            || payload.get("request_digest").and_then(Value::as_str) != Some(request_digest)
+            || payload.get("requested_by").and_then(Value::as_str) != Some(requested_by)
+            || payload.get("expected_task_version").and_then(Value::as_i64)
+                != Some(request.expected_task_version)
+            || payload
+                .get("expected_lifecycle_version")
+                .and_then(Value::as_i64)
+                != Some(request.expected_lifecycle_version)
+            || payload
+                .get("expected_work_unit_version")
+                .and_then(Value::as_i64)
+                != Some(request.expected_work_unit_version)
+        {
+            return Err(db::DbError::IdempotencyConflict.into());
+        }
+        let execution = ExecutionRepo::get_by_id(&*self.db, &receipt.entity_id)
+            .await?
+            .filter(|execution| {
+                execution.id
+                    == payload
+                        .get("execution_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                    && execution.task_id == task_id
+                    && execution.work_unit_id.as_deref() == Some(request.work_unit_id.as_str())
+                    && execution.parent_execution_id.as_deref() == Some(parent_execution_id)
+            })
+            .ok_or_else(|| {
+                db::DbError::Check(
+                    "recovery receipt does not resolve to its exact child Execution".to_owned(),
+                )
+            })?;
+        let start_event = db::DomainEventRepo::get_event_by_dedupe(
+            &*self.db,
+            &format!("execution.started:{}", execution.id),
+        )
+        .await?;
+        if !start_event.is_some_and(|event| {
+            event.event_type == "execution.started"
+                && event.entity_type == "execution"
+                && event.entity_id == execution.id
+                && event.scope_type == "task"
+                && event.scope_id == task_id
+        }) {
+            return Err(db::DbError::Check(
+                "recovery receipt child has no exact durable start event".to_owned(),
+            )
+            .into());
+        }
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let workspace = match execution.workspace_id.as_deref() {
+            Some(workspace_id) => WorkspaceRepo::get_by_id(&*self.db, workspace_id).await?,
+            None => None,
+        };
+        Ok(Some(LaunchExecutionResult {
+            task,
+            execution,
+            workspace,
+            idempotent_replay: true,
+        }))
+    }
+
     /// Prepare a target Execution from one explicitly assigned WorkUnit.
     /// Repository WorkUnits must already have their exact isolated Workspace.
     pub async fn launch_work_unit_execution(
@@ -107,6 +464,7 @@ impl TaskService {
             transitions: lifecycle_transitions,
             clear_blocking_metadata: None,
             follow_up_receipt: None,
+            automatic_recovery_parent_id: None,
         };
         let executor_config_snapshot_json = build_executor_config_snapshot(
             &self.db,
@@ -450,6 +808,7 @@ impl TaskService {
                 parent_execution_id: parent_execution_id.clone(),
                 request_digest,
             }),
+            automatic_recovery_parent_id: None,
         };
         let now = now_rfc3339();
         let (task, execution, idempotent_replay) = self
@@ -544,7 +903,7 @@ impl TaskService {
         parent_execution_id: impl Into<String>,
         context: Option<String>,
     ) -> Result<LaunchExecutionResult> {
-        self.re_execute_execution_with_context_inner(parent_execution_id, context, false)
+        self.re_execute_execution_with_context_inner(parent_execution_id, context, false, false)
             .await
     }
 
@@ -553,7 +912,17 @@ impl TaskService {
         parent_execution_id: impl Into<String>,
         context: Option<String>,
     ) -> Result<LaunchExecutionResult> {
-        self.re_execute_execution_with_context_inner(parent_execution_id, context, true)
+        self.re_execute_execution_with_context_inner(parent_execution_id, context, true, false)
+            .await
+    }
+
+    /// Admit an exact Auto recovery candidate as a child that resumes its
+    /// parent's existing HarnessSession. Ordinary re-execution starts fresh.
+    pub(crate) async fn re_execute_automatic_recovery_execution(
+        &self,
+        parent_execution_id: impl Into<String>,
+    ) -> Result<LaunchExecutionResult> {
+        self.re_execute_execution_with_context_inner(parent_execution_id, None, false, true)
             .await
     }
 
@@ -562,6 +931,7 @@ impl TaskService {
         parent_execution_id: impl Into<String>,
         context: Option<String>,
         clear_recovery_metadata: bool,
+        automatic_recovery: bool,
     ) -> Result<LaunchExecutionResult> {
         let parent_execution_id = parent_execution_id.into();
         validate_required("parent_execution_id", &parent_execution_id)?;
@@ -576,6 +946,18 @@ impl TaskService {
                 "re-execute requires a completed, failed, or cancelled execution, got {}",
                 parent_execution.status
             )));
+        }
+        if automatic_recovery
+            && (parent_execution.status != ExecutionStatus::Cancelled
+                || parent_execution.resume_policy != Some(db::ResumePolicy::Auto)
+                || !matches!(
+                    parent_execution.stop_reason,
+                    Some(db::StopReason::CrashRecovery | db::StopReason::GracefulShutdown)
+                ))
+        {
+            return Err(ServiceError::invalid_operation(
+                "automatic recovery requires an exact cancelled Auto crash-recovery Execution",
+            ));
         }
         let task = TaskRepo::get_by_id(&*self.db, &parent_execution.task_id, false)
             .await?
@@ -609,6 +991,27 @@ impl TaskService {
                 ));
             }
         };
+        if automatic_recovery {
+            if let Some(memberships) = crate::task_service::current_role_memberships_authoritative(
+                &self.db,
+                &task.id,
+                &work_unit.role,
+            )
+            .await?
+            {
+                let actor_is_active_member = memberships.iter().any(|membership| {
+                    membership.status == db::RoleMembershipStatus::Active
+                        && membership.actor_kind == db::ActorKind::Agent
+                        && membership.actor_id == agent_id
+                });
+                if !actor_is_active_member {
+                    return Err(ServiceError::AuthorizationDenied {
+                        message: "automatic recovery requires the parent Agent's current active WorkUnit role membership"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
         let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
@@ -671,18 +1074,55 @@ impl TaskService {
                 transitions: lifecycle_transitions,
                 clear_blocking_metadata,
                 follow_up_receipt: None,
+                automatic_recovery_parent_id: automatic_recovery
+                    .then(|| parent_execution.id.clone()),
             })
         } else {
             None
         };
-        let executor_config_snapshot_json = build_executor_config_snapshot(
-            &self.db,
-            &task,
-            &agent,
-            None,
-            self.adapter_registry.as_deref(),
-        )
-        .await?;
+        let (harness_session_id, executor_config_snapshot_json) = if automatic_recovery {
+            let session_id = parent_execution.harness_session_id.clone().ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "automatic recovery parent has no explicit HarnessSession",
+                )
+            })?;
+            let _external_session_id = resumable_external_session(
+                &self.db,
+                &parent_execution,
+                Some(&agent.id),
+                parent_execution.workspace_id.as_deref(),
+            )
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "automatic recovery parent HarnessSession is no longer resumable",
+                )
+            })?;
+            let snapshot = parent_execution
+                .executor_config_snapshot_json
+                .as_deref()
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "automatic recovery parent is missing its executor snapshot",
+                    )
+                })?;
+            (
+                Some(session_id),
+                Some(executor_snapshot_for_harness_resume(snapshot)?),
+            )
+        } else {
+            (
+                None,
+                build_executor_config_snapshot(
+                    &self.db,
+                    &task,
+                    &agent,
+                    None,
+                    self.adapter_registry.as_deref(),
+                )
+                .await?,
+            )
+        };
         let source_prompt = parent_execution
             .prompt
             .as_deref()
@@ -707,7 +1147,7 @@ impl TaskService {
             purpose: Some(parent_execution.purpose.clone().unwrap_or_else(|| {
                 execution_purpose_for_task_type(&task.task_type, &work_unit.role)
             })),
-            harness_session_id: None,
+            harness_session_id,
             role: work_unit.role.clone(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -923,6 +1363,28 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id))
     }
+}
+
+fn explicit_recovery_request_digest(
+    task_id: &str,
+    parent_execution_id: &str,
+    request: &api_types::RecoverWorkUnitExecutionRequest,
+    requested_by: &str,
+) -> String {
+    let request_identity = json!({
+        "task_id": task_id,
+        "parent_execution_id": parent_execution_id,
+        "work_unit_id": request.work_unit_id,
+        "expected_task_version": request.expected_task_version,
+        "expected_lifecycle_version": request.expected_lifecycle_version,
+        "expected_work_unit_version": request.expected_work_unit_version,
+        "idempotency_key": request.idempotency_key,
+        "requested_by": requested_by,
+        "context": request.context,
+    });
+    hex::encode(sha2::Sha256::digest(
+        request_identity.to_string().as_bytes(),
+    ))
 }
 
 pub(super) fn validate_task_blocking_metadata_owner(

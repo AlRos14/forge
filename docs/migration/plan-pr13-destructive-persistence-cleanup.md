@@ -452,3 +452,142 @@ BUG_STILL_LIVE = 0
 
 The completion report records final Git SHAs, remote read-back, clean-tree
 verification, and the independent-review status. Merge remains unauthorized.
+
+## PR13 closure supplement — multi-WorkUnit crash recovery — 2026-10-14
+
+### Cause and reproduction
+
+`recover_executions()` assigned the automatic-resume policy to a Task's full
+set of stopped Executions only when every member had an exact resumable
+HarnessSession. With two exact WorkUnits but no resumable sessions it wrote
+`recovery_target_ambiguous`, no `blocked_execution_id`, and no recovery action.
+The aggregate TaskLifecycle then became Blocked with a Task-version
+`reason_ref`. Existing Task recovery required one blocked Execution; ordinary
+re-execute, follow-up, initial launch, and manual lifecycle transitions could
+not select a member of this set. The pre-fix service test exercised CrashRecovery,
+Execution cancellation, WorkUnit lineage, lease revocation, TaskLifecycle and
+annotations, then confirmed that both exact parents and Task-level recovery
+were rejected without creating a child.
+
+A second reachable boundary was confirmed with a SQLite failure trigger:
+CrashRecovery commits the Blocked lifecycle before its separate annotation
+write. If that latter write is interrupted, durable Execution and WorkUnit
+identities survive with an ambiguous lifecycle but no annotation. The former
+recovery surface could not resolve this state either.
+
+### Alternatives and decision
+
+- **A — resolve the whole ambiguous block:** rejected as unnecessary. It would
+  require describing and deciding all affected Executions together.
+- **B — select one exact target:** chosen. A Human request binds Task, parent
+  Execution, WorkUnit, Task version, lifecycle version, WorkUnit version, and
+  idempotency key. In a Blocked ambiguous Task the first exact choice atomically
+  activates the aggregate Task and admits that child; remaining Manual
+  Executions remain individually selectable while Active.
+- **C — reuse an existing transition or recovery receipt:** unavailable.
+  Existing recovery receipts and routes require an exact owner and cannot
+  express a human selection from a block with no single Execution owner.
+
+The new REST request is the minimum public contract because the previous
+surface had no operator route for selecting a WorkUnit Execution. It reuses
+TaskLifecycle, WorkUnit, Execution, WorkspaceLease, and DomainEvent; no new
+table, scheduler, or state machine was added.
+
+### Correction
+
+Automatic recovery is now decided per exact Execution. A resumable candidate
+can enter Auto while a sibling remains Manual; eligible Auto candidates do not
+create an aggregate block when the Task is Active and has no pending blocking
+or failure metadata. An Auto parent stops being a candidate after a durable
+child exists, preventing repeated dispatch after a lost provider response or
+process restart.
+
+The new `POST /tasks/{task_id}/executions/{execution_id}/recovery` route admits
+one explicitly selected cancelled CrashRecovery, AgentTimeout, or
+GracefulShutdown parent. For an ambiguous Blocked Task, the candidate must be
+Manual; while Active, a Human may explicitly authorize a fresh child from an
+exact Manual or Auto parent. Its receipt records the requesting Human, exact
+lineage, request digest, and reviewed versions. `BEGIN IMMEDIATE` checks those
+versions and the current lifecycle, candidate status, exact open WorkUnit,
+Actor assignment and membership, workspace binding, and existing child
+lineage. Lifecycle activation, metadata cleanup when present, child, start
+event, WorkspaceLease, and human decision receipt commit together. Same-key
+retries return the same child and skip provider dispatch; a new key cannot
+create a second child from the consumed parent. An interrupted ambiguous
+annotation write remains resolvable from the lifecycle reason plus the exact
+durable candidate identity. The new receipt is excluded from the public event
+projection.
+
+`recovery_target_unavailable` remains deliberately fail closed: if no exact
+open WorkUnit target can be proven, Execution recovery cannot select one, and
+the existing Task cancellation path remains available. Timeout reconciliation
+uses the exact selection route for ambiguous Manual candidates. Provider
+effects remain outside SQLite; uncertain outcomes retain the admitted child
+identity for existing crash or stalled-Execution reconciliation.
+
+The focused audit also found that the dispatcher treated Auto as a fresh
+re-execution even though CrashRecovery had assigned it only after proving an
+exact reusable HarnessSession. That dropped the session link and could start a
+second provider session after an uncertain result. Auto dispatch now admits a
+child with that exact HarnessSession and resume snapshot. Its `BEGIN IMMEDIATE`
+admission checks the cancelled parent and serializes duplicate dispatcher
+attempts; an already committed exact child is returned as an idempotent replay
+and is not started again. The dispatcher skips candidates whose target or
+session no longer passes the resumability checks. Graceful shutdown now marks
+an exact WorkUnit Execution Manual when it lacks a reusable session, so the
+same explicit operator route can make the next decision. A Human may also
+explicitly choose a fresh child for an Auto parent; automatic dispatch itself
+does not fall back to a new provider session.
+
+### Focused evidence
+
+| Command or check | Result |
+| --- | --- |
+| Pre-fix `cargo test -p services --lib crash_recovery_with_two_manual_work_units_has_no_exact_recovery_route --locked --offline -- --test-threads=1` | PASS as reproduction: both exact individual routes were rejected and no durable child/event was added. |
+| `cargo test -p services --lib crash_recovery_with_two_manual_work_units_can_be_resolved_by_exact_selection --locked --offline -- --test-threads=1` | PASS: A then B exact selection, same-key replay, no second child, immutable cancelled parents, lifecycle transition, human receipts, and retained lineage. |
+| `cargo test -p services --lib explicit_recovery_same_key_after_post_commit_crash_replays_without_duplicate --locked --offline -- --test-threads=1` | PASS: startup CrashRecovery reconciles the committed Running child; same-key retry returns that now-cancelled child with one decision receipt and no new Execution. |
+| `cargo test -p services --lib explicit_recovery_rejects_suspended_work_unit_actor_membership --locked --offline -- --test-threads=1` | PASS: current membership is rechecked at durable admission; a suspended Actor leaves lifecycle, annotation, Executions, and decision receipts unchanged. |
+| `cargo test -p services --lib crash_recovery_mixes_auto_and_manual_policy_by_exact_work_unit --locked --offline -- --test-threads=1` | PASS: A Auto and B Manual coexist without an aggregate block; a durable Auto child consumes its parent candidate. |
+| `cargo test -p services --lib graceful_shutdown_without_reusable_session_requires_an_exact_human_choice --locked --offline -- --test-threads=1` | PASS: exact graceful stop without HarnessSession remains Manual and an operator admits one exact child with start and decision receipts. |
+| `cargo test -p services --lib human_may_explicitly_choose_a_fresh_child_for_an_auto_candidate --locked --offline -- --test-threads=1` | PASS: explicit Human choice creates a fresh child with a distinct pending HarnessSession and `Start`; Auto dispatch remains an exact-session `Resume`. |
+| `cargo test -p services --lib three_work_unit_recovery_keeps_each_automatic_and_manual_identity --locked --offline -- --test-threads=1` | PASS: one resumable candidate and two distinct Manual WorkUnits remain independently recorded after selecting B. |
+| `cargo test -p services --lib explicit_recovery_rejects_wrong_task_work_unit_and_stale_versions --locked --offline -- --test-threads=1` | PASS: foreign Task, wrong WorkUnit, stale Task version, and stale lifecycle version reject without mutation. |
+| `cargo test -p services --lib competing_ambiguous_recovery_choices_commit_only_one_decision --locked --offline -- --test-threads=1` | PASS: incompatible concurrent A/B decisions produce one child and one receipt. |
+| `cargo test -p services --lib explicit_recovery_rolls_back_lifecycle_child_and_receipt_together --locked --offline -- --test-threads=1` | PASS: injected receipt-write failure rolls back lifecycle, metadata, child, start event, lease, and decision receipt; retry then commits once. |
+| `cargo test -p services --lib ambiguous_recovery_remains_selectable_if_annotation_write_is_interrupted --locked --offline -- --test-threads=1` | PASS: injected annotation-write interruption leaves a selectable exact candidate; choosing A preserves pending B. |
+| `cargo test -p services --lib ambiguous_agent_timeout_recovery_uses_the_same_exact_selection_boundary --locked --offline -- --test-threads=1` | PASS: ambiguous timeout candidates preserve exact identities and an authorized exact choice resolves one. |
+| `cargo test -p services --lib explicit_multi_work_unit_recovery_keeps_repository_workspaces_and_leases_separate --locked --offline -- --test-threads=1` | PASS: two repository WorkUnits recover with their own Workspace and active lease; cancelled parents retain no lease. |
+| `cargo test -p services --lib ordinary_reexecute_ --locked --offline -- --test-threads=1` | PASS, 3 tests; ordinary exact recovery, snapshot failure, and WorkUnit-version race remain correct. |
+| `cargo test -p services --lib follow_up_retry_replays_exact_child_and_new_key_authorizes_next_child --locked --offline -- --test-threads=1` | PASS: V133 follow-up receipt replay and new-key behavior remain unchanged. |
+| `cargo test -p services --lib follow_up_on_sibling_work_unit_preserves_current_block_owner_and_evidence --locked --offline -- --test-threads=1` | PASS: an error or follow-up from a sibling cannot replace the current blocked Execution owner or clear its evidence. |
+| `cargo test -p services --lib failed_external_start_after_durable_recovery_does_not_replay_old_attempt --locked --offline -- --test-threads=1`; `cargo test -p services --lib rejected_recovery_cancel_preserves_blocking_metadata --locked --offline -- --test-threads=1` | PASS: provider failure does not replay an old attempt; explicit Task cancellation still succeeds after a rejected transition is retried. |
+| `cargo test -p api --lib legacy_review_and_agent_chat_events_are_not_public --locked --offline`; `cargo test -p api-types export_typescript --locked --offline -- --ignored` | PASS: recovery decision receipt stays private; generated `RecoverWorkUnitExecutionRequest` binding exports. |
+| Initial `cargo test -p services --lib recovery::tests --locked --offline -- --test-threads=1` sweep; isolated reruns of the three reported cases | Sweep: 33 passed; one new test used a pre-PR13 `agent` table name and two existing tests had a stale timeout action assertion and omitted executor injection. Those test-only issues were corrected; the three affected tests each passed in isolated reruns. |
+
+The `restart_failed_task()` contract was inspected with the current call-site
+census. It has no REST, CLI, or in-repository production caller. It clears
+Task-level `failed_json` but leaves lifecycle transition authority to the
+existing lifecycle API; it does not resolve Execution-owned blocking
+metadata. No change was justified in this focused closure.
+
+### Residual risk and final census
+
+- No route can recover an Execution whose exact open WorkUnit, current Actor,
+  or workspace identity is unavailable. This is intentional fail-closed
+  behavior; cancel the Task or create a new Task with valid scope.
+- Provider start remains external. A lost response uses the same-key receipt
+  and exact child; new execution from that parent is rejected once a child
+  exists.
+- Workspace-wide build/test/clippy, migrations, and global CI were not run.
+  The branch CI state will be reported only from live GitHub evidence.
+
+```text
+P0 = 0
+P1 = 0
+P2 = 0
+P3 = 0
+BUG_STILL_LIVE = 0
+```
+
+This supplement supersedes the earlier multi-WorkUnit recovery status above.
+PR13 remains subject to independent review; merge is not authorized.

@@ -18,20 +18,47 @@ impl TaskDispatcher {
             if !is_exact_auto_recovery_candidate(&execution) {
                 continue;
             }
+            if !crate::task_service::execution::has_exact_work_unit_target(
+                &self.db,
+                &execution.task_id,
+                &execution,
+            )
+            .await?
+                || crate::task_service::resumable_external_session(
+                    &self.db,
+                    &execution,
+                    execution.agent_id.as_deref(),
+                    execution.workspace_id.as_deref(),
+                )
+                .await?
+                .is_none()
+            {
+                tracing::debug!(
+                    task_id = %execution.task_id,
+                    execution_id = %execution.id,
+                    "Auto recovery awaits an exact reusable HarnessSession or Human decision"
+                );
+                continue;
+            }
 
             let result = async {
                 let launch = self
                     .task_service
-                    .re_execute_execution(execution.id.clone())
+                    .re_execute_automatic_recovery_execution(execution.id.clone())
                     .await?;
-                self.task_service
-                    .start_execution(launch.execution.id.clone())
-                    .await
+                if launch.idempotent_replay {
+                    Ok(false)
+                } else {
+                    self.task_service
+                        .start_execution(launch.execution.id.clone())
+                        .await
+                        .map(|start| start.accepted)
+                }
             }
             .await;
             match result {
-                Ok(start) if start.accepted => resumed += 1,
-                Ok(_) => {}
+                Ok(true) => resumed += 1,
+                Ok(false) => {}
                 Err(ServiceError::Db(DbError::VersionConflict))
                 | Err(ServiceError::Db(DbError::TaskVersionConflict { .. })) => {
                     tracing::debug!(

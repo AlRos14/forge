@@ -1744,10 +1744,25 @@ pub struct CreateWorkUnitExecution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoverWorkUnitExecution {
     pub admission: CreateWorkUnitExecution,
-    pub lifecycle_transition: TransitionTaskLifecycle,
+    pub expected_task_version: i64,
+    pub expected_lifecycle_state: TaskLifecycleState,
+    pub expected_lifecycle_version: i64,
+    pub lifecycle_transition: Option<TransitionTaskLifecycle>,
+    /// A human may select one exact cancelled Execution from the current
+    /// ambiguous crash-recovery block. The snapshots and selected target are
+    /// rechecked inside the same write transaction.
+    pub ambiguous_block_selection: Option<ResolveAmbiguousRecoveryBlock>,
     pub expected_error_annotation: Option<String>,
     pub expected_blocked_json: Option<String>,
     pub expected_metadata_json: Option<String>,
+    /// Durable DomainEvent receipt for an explicitly requested recovery.
+    /// The event and child Execution commit atomically.
+    pub request_receipt: Option<CreateDomainEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveAmbiguousRecoveryBlock {
+    pub expected_reason_ref: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1776,6 +1791,10 @@ pub struct AdmitWorkUnitExecutionWithLifecycle {
     pub lifecycle_transitions: Vec<TransitionTaskLifecycle>,
     pub clear_blocking_metadata: Option<ClearTaskBlockingMetadata>,
     pub follow_up_receipt: Option<CreateFollowUpExecutionReceipt>,
+    /// Exact parent selected by the automatic recovery dispatcher. The
+    /// repository serializes competing admissions and replays its committed
+    /// child without creating another Execution.
+    pub automatic_recovery_parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1804,8 +1823,10 @@ pub struct WorkUnitExecutionLifecycleWrite {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryWorkUnitExecutionWrite {
     pub execution: Execution,
-    pub lifecycle_event: DomainEvent,
-    pub execution_event: DomainEvent,
+    pub lifecycle_event: Option<DomainEvent>,
+    pub execution_event: Option<DomainEvent>,
+    pub request_receipt_event: Option<DomainEvent>,
+    pub idempotent_replay: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

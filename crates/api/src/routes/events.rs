@@ -363,6 +363,7 @@ mod tests {
     fn legacy_review_and_agent_chat_events_are_not_public() {
         assert!(project_domain_event(&domain_event("review.status_changed", "{}")).is_none());
         assert!(project_domain_event(&domain_event("agent_chat.message_created", "{}")).is_none());
+        assert!(project_domain_event(&domain_event("execution.recovery_admitted", "{}")).is_none());
     }
 
     #[test]

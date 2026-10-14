@@ -92,6 +92,17 @@ pub(crate) struct WorkUnitAdmissionLifecyclePlan {
     pub(crate) transitions: Vec<db::TransitionTaskLifecycle>,
     pub(crate) clear_blocking_metadata: Option<db::ClearTaskBlockingMetadata>,
     pub(crate) follow_up_receipt: Option<db::CreateFollowUpExecutionReceipt>,
+    pub(crate) automatic_recovery_parent_id: Option<String>,
+}
+
+pub(crate) struct ExplicitRecoveryAdmission {
+    pub(crate) expected_task_version: i64,
+    pub(crate) expected_lifecycle_version: i64,
+    pub(crate) ambiguous_reason_ref: Option<String>,
+    pub(crate) idempotency_key: String,
+    pub(crate) receipt_dedupe_key: String,
+    pub(crate) request_digest: String,
+    pub(crate) requested_by: String,
 }
 
 pub(crate) fn execution_domain_event(
@@ -399,7 +410,12 @@ impl TaskService {
             let agent = db::AgentRepo::get_by_id(&*self.db, agent_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-            if !crate::agent_capacity::has_running_execution_capacity(&self.db, &agent).await? {
+            let is_automatic_recovery = lifecycle_plan
+                .as_ref()
+                .is_some_and(|plan| plan.automatic_recovery_parent_id.is_some());
+            if !is_automatic_recovery
+                && !crate::agent_capacity::has_running_execution_capacity(&self.db, &agent).await?
+            {
                 return Err(db::DbError::AgentAtCapacity.into());
             }
         }
@@ -532,6 +548,7 @@ impl TaskService {
                     lifecycle_transitions: plan.transitions,
                     clear_blocking_metadata: plan.clear_blocking_metadata,
                     follow_up_receipt: plan.follow_up_receipt,
+                    automatic_recovery_parent_id: plan.automatic_recovery_parent_id,
                 },
                 artifact_input_ids,
                 event,
@@ -572,10 +589,10 @@ impl TaskService {
         Ok((task, execution, idempotent_replay))
     }
 
-    /// Recovery admission changes the blocked Task to Active and creates its
-    /// exact child Execution in one SQLite transaction. Preflight checks here
-    /// provide useful errors; the repository transaction and SQL guards repeat
-    /// the authority checks at the durable boundary.
+    /// Recovery admission changes a blocked Task to Active and creates its
+    /// exact child Execution in one SQLite transaction. Explicit operator
+    /// recovery can also admit a Manual crash-recovery Execution while the
+    /// aggregate Task remains Active.
     pub(crate) async fn admit_recovery_work_unit_execution_with_artifact_inputs(
         &self,
         task: &Task,
@@ -586,7 +603,39 @@ impl TaskService {
         input: CreateExecution,
         artifact_input_ids: Vec<String>,
     ) -> Result<(Task, Execution)> {
-        if lifecycle.state != db::TaskLifecycleState::Blocked
+        let (task, execution, _) = self
+            .admit_recovery_work_unit_execution_with_options(
+                task,
+                lifecycle,
+                blocked_execution_id,
+                work_unit_id,
+                expected_work_unit_version,
+                input,
+                artifact_input_ids,
+                None,
+            )
+            .await?;
+        Ok((task, execution))
+    }
+
+    pub(crate) async fn admit_recovery_work_unit_execution_with_options(
+        &self,
+        task: &Task,
+        lifecycle: &db::TaskLifecycle,
+        blocked_execution_id: &str,
+        work_unit_id: &str,
+        expected_work_unit_version: i64,
+        input: CreateExecution,
+        artifact_input_ids: Vec<String>,
+        explicit: Option<ExplicitRecoveryAdmission>,
+    ) -> Result<(Task, Execution, bool)> {
+        let parent_execution_id = input.parent_execution_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation("recovery Execution requires exact parent lineage")
+        })?;
+        let is_legacy_blocked_recovery = explicit.is_none();
+        if (is_legacy_blocked_recovery
+            && (lifecycle.state != db::TaskLifecycleState::Blocked
+                || parent_execution_id != blocked_execution_id))
             || input.task_id != task.id
             || input.parent_execution_id.as_deref() != Some(blocked_execution_id)
             || input.status != ExecutionStatus::Running
@@ -595,6 +644,62 @@ impl TaskService {
             return Err(ServiceError::invalid_operation(
                 "recovery admission requires the exact blocked Task, parent Execution, and WorkUnit target",
             ));
+        }
+        if let Some(explicit) = explicit.as_ref() {
+            if explicit.expected_task_version != task.version
+                || explicit.expected_lifecycle_version != lifecycle.version
+                || task.lifecycle_state != lifecycle.state
+                || !matches!(
+                    lifecycle.state,
+                    db::TaskLifecycleState::Active | db::TaskLifecycleState::Blocked
+                )
+            {
+                return Err(ServiceError::Db(db::DbError::VersionConflict));
+            }
+            match lifecycle.state {
+                db::TaskLifecycleState::Blocked => {
+                    let annotation = task
+                        .error_annotation
+                        .as_deref()
+                        .map(serde_json::from_str::<Value>)
+                        .transpose()
+                        .map_err(|error| {
+                            ServiceError::invalid_operation(format!(
+                                "invalid ambiguous recovery annotation: {error}"
+                            ))
+                        })?;
+                    if task.blocked_json.is_some()
+                        || lifecycle.reason_kind.as_deref() != Some("recovery_target_ambiguous")
+                        || explicit.ambiguous_reason_ref.as_deref()
+                            != lifecycle.reason_ref.as_deref()
+                        || annotation.as_ref().is_some_and(|annotation| {
+                            annotation.get("type").and_then(Value::as_str)
+                                != Some("recovery_required")
+                                || annotation.get("blocking_reason").and_then(Value::as_str)
+                                    != Some("recovery_target_ambiguous")
+                                || !annotation
+                                    .get("blocked_execution_id")
+                                    .is_some_and(Value::is_null)
+                                || annotation
+                                    .get("recovery_actions")
+                                    .and_then(Value::as_array)
+                                    .is_none_or(|actions| !actions.is_empty())
+                        })
+                    {
+                        return Err(ServiceError::Db(db::DbError::VersionConflict));
+                    }
+                }
+                db::TaskLifecycleState::Active => {
+                    if explicit.ambiguous_reason_ref.is_some()
+                        || task.error_annotation.is_some()
+                        || task.blocked_json.is_some()
+                        || task.failed_json.is_some()
+                    {
+                        return Err(ServiceError::Db(db::DbError::VersionConflict));
+                    }
+                }
+                _ => unreachable!("explicit lifecycle state was checked above"),
+            }
         }
         let work_unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
             .await?
@@ -637,16 +742,23 @@ impl TaskService {
         }
         self.ensure_task_runnable(task).await?;
 
-        // The lifecycle transition increments the Task version once in the
-        // same transaction. The lease records that post-transition version.
-        let admitted_task_version = task.version.checked_add(1).ok_or_else(|| {
-            ServiceError::invalid_operation("Task version cannot be incremented for recovery")
-        })?;
-        let admitted_lifecycle_version = lifecycle.version.checked_add(1).ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "TaskLifecycle version cannot be incremented for recovery",
-            )
-        })?;
+        let transitions_lifecycle = lifecycle.state == db::TaskLifecycleState::Blocked;
+        let admitted_task_version = if transitions_lifecycle {
+            task.version.checked_add(1).ok_or_else(|| {
+                ServiceError::invalid_operation("Task version cannot be incremented for recovery")
+            })?
+        } else {
+            task.version
+        };
+        let admitted_lifecycle_version = if transitions_lifecycle {
+            lifecycle.version.checked_add(1).ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "TaskLifecycle version cannot be incremented for recovery",
+                )
+            })?
+        } else {
+            lifecycle.version
+        };
         let mut admitted_task = task.clone();
         admitted_task.version = admitted_task_version;
         let _workspace_guard = match (
@@ -705,52 +817,97 @@ impl TaskService {
         };
 
         let updated_at = now_rfc3339();
-        let idempotency_key = format!("recovery:{}:active", blocked_execution_id);
-        let lifecycle_event = CreateDomainEvent {
+        let lifecycle_transition = if transitions_lifecycle {
+            let idempotency_key = explicit.as_ref().map_or_else(
+                || format!("recovery:{}:active", blocked_execution_id),
+                |request| {
+                    format!(
+                        "recovery:{}:{}",
+                        blocked_execution_id, request.idempotency_key
+                    )
+                },
+            );
+            let lifecycle_event = CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "task.lifecycle_changed".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: task.id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: task.id.clone(),
+                correlation_id: idempotency_key.clone(),
+                causation_id: Some(blocked_execution_id.to_owned()),
+                causation_depth: 1,
+                dedupe_key: Some(format!("task-lifecycle:{}:{}", task.id, idempotency_key)),
+                payload_json: json!({
+                    "task_id": task.id,
+                    "from_state": db::TaskLifecycleState::Blocked,
+                    "to_state": db::TaskLifecycleState::Active,
+                    "from_version": lifecycle.version,
+                    "to_version": admitted_lifecycle_version,
+                    "cause_kind": "execution",
+                    "cause_ref": blocked_execution_id,
+                    "gate_evaluation_id": null,
+                    "reason_kind": "execution_recovery",
+                    "reason_ref": blocked_execution_id,
+                })
+                .to_string(),
+                created_at: updated_at.clone(),
+            };
+            Some(db::TransitionTaskLifecycle {
+                id: new_uuid_v4(),
+                task_id: task.id.clone(),
+                expected_task_version: explicit
+                    .as_ref()
+                    .map_or(task.version, |request| request.expected_task_version),
+                expected_lifecycle_version: explicit
+                    .as_ref()
+                    .map_or(lifecycle.version, |request| {
+                        request.expected_lifecycle_version
+                    }),
+                expected_state: db::TaskLifecycleState::Blocked,
+                to_state: db::TaskLifecycleState::Active,
+                cause_kind: "execution".to_owned(),
+                cause_ref: Some(blocked_execution_id.to_owned()),
+                reason_kind: Some("execution_recovery".to_owned()),
+                reason_ref: Some(blocked_execution_id.to_owned()),
+                gate_evaluation_id: None,
+                idempotency_key,
+                updated_at: updated_at.clone(),
+                event: lifecycle_event,
+            })
+        } else {
+            None
+        };
+        let execution_event = execution_domain_event(&input, "execution.started");
+        let request_receipt = explicit.as_ref().map(|request| CreateDomainEvent {
             id: new_uuid_v4(),
-            event_type: "task.lifecycle_changed".to_owned(),
-            entity_type: "task".to_owned(),
-            entity_id: task.id.clone(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
+            event_type: "execution.recovery_admitted".to_owned(),
+            entity_type: "execution".to_owned(),
+            entity_id: input.id.clone(),
+            actor_type: "human".to_owned(),
+            actor_id: Some(request.requested_by.clone()),
             scope_type: "task".to_owned(),
             scope_id: task.id.clone(),
-            correlation_id: idempotency_key.clone(),
-            causation_id: Some(blocked_execution_id.to_owned()),
+            correlation_id: request.receipt_dedupe_key.clone(),
+            causation_id: input.parent_execution_id.clone(),
             causation_depth: 1,
-            dedupe_key: Some(format!("task-lifecycle:{}:{}", task.id, idempotency_key)),
+            dedupe_key: Some(request.receipt_dedupe_key.clone()),
             payload_json: json!({
                 "task_id": task.id,
-                "from_state": db::TaskLifecycleState::Blocked,
-                "to_state": db::TaskLifecycleState::Active,
-                "from_version": lifecycle.version,
-                "to_version": admitted_lifecycle_version,
-                "cause_kind": "execution",
-                "cause_ref": blocked_execution_id,
-                "gate_evaluation_id": null,
-                "reason_kind": "execution_recovery",
-                "reason_ref": blocked_execution_id,
+                "parent_execution_id": input.parent_execution_id,
+                "work_unit_id": work_unit.id,
+                "execution_id": input.id,
+                "request_digest": request.request_digest,
+                "requested_by": request.requested_by,
+                "expected_task_version": request.expected_task_version,
+                "expected_lifecycle_version": request.expected_lifecycle_version,
+                "expected_work_unit_version": expected_work_unit_version,
             })
             .to_string(),
             created_at: updated_at.clone(),
-        };
-        let lifecycle_transition = db::TransitionTaskLifecycle {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            expected_task_version: task.version,
-            expected_lifecycle_version: lifecycle.version,
-            expected_state: db::TaskLifecycleState::Blocked,
-            to_state: db::TaskLifecycleState::Active,
-            cause_kind: "execution".to_owned(),
-            cause_ref: Some(blocked_execution_id.to_owned()),
-            reason_kind: Some("execution_recovery".to_owned()),
-            reason_ref: Some(blocked_execution_id.to_owned()),
-            gate_evaluation_id: None,
-            idempotency_key,
-            updated_at: updated_at.clone(),
-            event: lifecycle_event,
-        };
-        let execution_event = execution_domain_event(&input, "execution.started");
+        });
         let write = db::WorkUnitExecutionRepo::admit_recovery_for_work_unit_with_artifact_inputs(
             &*self.db,
             db::RecoverWorkUnitExecution {
@@ -760,24 +917,56 @@ impl TaskService {
                     work_unit_version: expected_work_unit_version,
                     workspace_lease,
                 },
+                expected_task_version: explicit
+                    .as_ref()
+                    .map_or(task.version, |request| request.expected_task_version),
+                expected_lifecycle_state: lifecycle.state,
+                expected_lifecycle_version: explicit
+                    .as_ref()
+                    .map_or(lifecycle.version, |request| {
+                        request.expected_lifecycle_version
+                    }),
                 lifecycle_transition,
+                ambiguous_block_selection: explicit
+                    .as_ref()
+                    .and_then(|request| request.ambiguous_reason_ref.as_ref())
+                    .map(|expected_reason_ref| db::ResolveAmbiguousRecoveryBlock {
+                        expected_reason_ref: expected_reason_ref.clone(),
+                    }),
                 expected_error_annotation: task.error_annotation.clone(),
                 expected_blocked_json: task.blocked_json.clone(),
                 expected_metadata_json: task.metadata_json.clone(),
+                request_receipt,
             },
             artifact_input_ids,
             execution_event,
         )
         .await?;
-        self.publish_committed_domain_event(&write.lifecycle_event);
-        self.publish_committed_domain_event(&write.execution_event);
+        if write.idempotent_replay {
+            let current_task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+            return Ok((current_task, write.execution, true));
+        }
+        if let Some(event) = write.lifecycle_event.as_ref() {
+            self.publish_committed_domain_event(event);
+        }
+        if let Some(event) = write.execution_event.as_ref() {
+            self.publish_committed_domain_event(event);
+        }
+        if let Some(event) = write.request_receipt_event.as_ref() {
+            self.publish_committed_domain_event(event);
+        }
 
         let mut recovered_task = admitted_task;
-        recovered_task.lifecycle_state = db::TaskLifecycleState::Active;
-        recovered_task.error_annotation = None;
-        recovered_task.blocked_json = None;
-        recovered_task.updated_at = updated_at;
-        if task.error_annotation.is_some() || task.blocked_json.is_some() {
+        if transitions_lifecycle {
+            recovered_task.lifecycle_state = db::TaskLifecycleState::Active;
+            recovered_task.error_annotation = None;
+            recovered_task.blocked_json = None;
+            recovered_task.updated_at = updated_at;
+        }
+        if transitions_lifecycle && (task.error_annotation.is_some() || task.blocked_json.is_some())
+        {
             let previous_reason = task
                 .blocked_json
                 .as_deref()
@@ -809,7 +998,7 @@ impl TaskService {
                 },
             });
         }
-        Ok((recovered_task, write.execution))
+        Ok((recovered_task, write.execution, false))
     }
 
     pub(crate) async fn inherit_plan_artifact_inputs(

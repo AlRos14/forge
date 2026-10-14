@@ -541,6 +541,10 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::executions::list_executions).post(routes::executions::start_task_execution),
         )
         .route(
+            "/api/v1/tasks/{task_id}/executions/{execution_id}/recovery",
+            post(routes::executions::recover_work_unit_execution),
+        )
+        .route(
             "/api/v1/executions/{id}",
             get(routes::executions::get_execution),
         )
