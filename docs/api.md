@@ -307,6 +307,10 @@ before pagination; MCP registration binds the new Agent to the authenticated
 Human. Only admins may pin an Agent to a daemon, and non-admin Agent projections
 omit daemon IDs and redact sensitive configuration values.
 
+An uncertain provider Start returns MCP error `-32029` with data code
+`execution_start_uncertain` and the exact `execution_id`. Clients must not
+retry that Start automatically because the provider may already have acted.
+
 `forge_update_task` accepts an optional `parent_task_id`; omitting the field
 preserves the current parent, while explicit `null` detaches the Task. Both
 forms use the same TaskService structural transaction as REST.

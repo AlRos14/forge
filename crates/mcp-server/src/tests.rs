@@ -2559,3 +2559,31 @@ fn forge_create_sub_tasks_nested_rejected() {
         );
     });
 }
+
+#[test]
+fn uncertain_execution_start_maps_to_a_structured_no_retry_error() {
+    let response =
+        crate::error::McpToolError::from(services::ServiceError::ExecutionStartUncertain {
+            execution_id: "execution-uncertain".to_owned(),
+        })
+        .into_response(json!(1));
+    let error = response.error.expect("uncertain Start maps to MCP error");
+    assert_eq!(error.code, -32029);
+    assert!(error.message.contains("will not be retried automatically"));
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str),
+        Some("execution_start_uncertain")
+    );
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("execution_id"))
+            .and_then(Value::as_str),
+        Some("execution-uncertain")
+    );
+}

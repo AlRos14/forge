@@ -1003,7 +1003,9 @@ outcomes.
 | Runtime red reproductions with the previous `Ok(_)`/`Err(_)` dispatch branch restored temporarily | FAIL as expected: cancellation and deterministic rejection were advanced as accepted; loss of authority with no attempt was marked uncertain. The fixed branch was restored before green validation. |
 | Non-repository pre-fix reproduction, with the old workspace-required resolution temporarily restored | FAIL as expected (exit 101): admission succeeded, then Start failed with `execution missing workspace_id`. After restoring the shared context resolver, the same test passed and completed in the isolated directory. |
 | `cargo test -p services --lib non_repository_ --locked --offline -- --test-threads=1` | PASS, 6 tests: admission/start/completion, context preparation failure before Running, unsupported remote host rejected before Running, exact follow-up identity, sibling isolation, and restart replay without a duplicate provider Start. |
-| REST `POST /api/v1/tasks/{task_id}/executions` non-repository path | NOT RUN: offline API test build could not resolve cached package `alloc-no-stdlib v2.0.4`; no network fetch was attempted. A focused route test was added to `crates/api/tests/work_units.rs`. |
+| REST `POST /api/v1/tasks/{task_id}/executions` non-repository path | PASS, 1 test after fetching the locked dependency. The first online build exposed the non-exhaustive MCP mapping for `ServiceError::ExecutionStartUncertain`; the mapping and focused MCP test were added before this green run. |
+| `cargo test -p mcp-server --lib uncertain_execution_start_maps_to_a_structured_no_retry_error --locked --offline -- --test-threads=1` | PASS; MCP preserves the exact Execution ID and no-automatic-retry signal. |
+| `CARGO_TARGET_DIR=/tmp/forge-pr13-target cargo test -p api --test work_units non_repository_agent_work_unit_starts_through_task_executions_rest_route --locked --offline -- --test-threads=1` | PASS; the REST-launched Execution completes and writes its marker in the isolated context with no WorkspaceLease. |
 | `cargo fmt --all -- --check`; `git diff --check` | PASS. |
 
 ### Regression review and remaining evidence
@@ -1029,8 +1031,12 @@ durable claim in `TaskService::start_execution()`. Launch, re-execute,
 follow-up, explicit and automatic recovery, dispatcher recovery, and
 Orchestrator dispatch all use that method. No new migration, authority table,
 fake WorkspaceLease, or alternate provider-start path was added. The public
-REST regression is the only NOT RUN test because its locked dependency is
-absent from the offline cache.
+REST regression initially could not resolve the locked dependency offline;
+after one connected dependency fetch it compiled and passed offline. That API
+build exposed a missing MCP `ServiceError::ExecutionStartUncertain` match arm;
+the MCP adapter now maps it to `-32029` with `execution_start_uncertain`,
+including the exact Execution ID, and documents that callers must not retry
+automatically.
 
 No new tables, migration, authority system, fake WorkspaceLease, or parallel
 provider-start path was introduced. The P1 no-repository host restriction is
