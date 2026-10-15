@@ -291,6 +291,11 @@ impl TaskService {
                 });
             }
             db::ProviderStartClaim::Rejected => {
+                self.fail_execution_before_dispatch(
+                    &execution.id,
+                    "provider durably rejected the execution Start".to_owned(),
+                )
+                .await?;
                 return Ok(api_types::ExecutionStartResult {
                     execution_id: execution.id,
                     accepted: false,
@@ -332,22 +337,37 @@ impl TaskService {
             Ok(_) => "execution.provider_start_rejected",
             Err(_) => "execution.provider_start_uncertain",
         };
-        if let Err(record_error) = ExecutionRepo::record_provider_start_outcome(
+        let outcome_recorded = match ExecutionRepo::record_provider_start_outcome(
             &*self.db,
             &execution.id,
             provider_start_receipt_event(&execution, outcome_event_type),
         )
         .await
         {
-            tracing::warn!(
-                execution_id = %execution.id,
-                %record_error,
-                "failed to persist provider Start outcome; the durable attempt receipt prevents replay"
-            );
-        }
+            Ok(_) => true,
+            Err(record_error) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    %record_error,
+                    "failed to persist provider Start outcome; the durable attempt receipt prevents replay"
+                );
+                false
+            }
+        };
 
         match result {
-            Ok(result) => Ok(result),
+            Ok(result) if result.accepted => Ok(result),
+            Ok(result) if outcome_recorded => {
+                self.fail_execution_before_dispatch(
+                    &execution.id,
+                    "provider durably rejected the execution Start".to_owned(),
+                )
+                .await?;
+                Ok(result)
+            }
+            Ok(_) => Err(ServiceError::ExecutionStartUncertain {
+                execution_id: execution.id,
+            }),
             Err(error) => {
                 tracing::warn!(
                     %execution_id,
@@ -392,48 +412,9 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let orchestrator_execution = execution.role == "orchestrator"
-            && execution.purpose == Some(ExecutionPurpose::Orchestrate);
-        let workspace = if orchestrator_execution {
-            self.validate_orchestrator_execution(&execution).await?;
-            let path = self.orchestrator_context_path(&execution.id);
-            std::fs::create_dir_all(&path).map_err(|error| {
-                ServiceError::invalid_operation(format!(
-                    "failed to create isolated orchestrator context: {error}"
-                ))
-            })?;
-            Workspace {
-                id: format!("orchestrator:{}", execution.id),
-                task_id: task.id.clone(),
-                repo_id: task.repo_id.clone().unwrap_or_default(),
-                worktree_path: path.to_string_lossy().into_owned(),
-                branch: "orchestrator-read-only".to_owned(),
-                status: WorkspaceStatus::Ready,
-                before_sha: None,
-                cleanup_after: None,
-                error: None,
-                created_at: execution.created_at.clone(),
-                updated_at: execution.updated_at.clone(),
-            }
-        } else {
-            let workspace_id = execution
-                .workspace_id
-                .as_deref()
-                .ok_or_else(|| ServiceError::invalid_operation("execution missing workspace_id"))?;
-            let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-            self.verify_active_workspace_lease(
-                &task,
-                &workspace,
-                &execution.role,
-                execution.agent_id.as_deref(),
-                &execution.id,
-            )
-            .await?;
-            workspace
-        };
-        let workspace_id = workspace.id.as_str();
+        let working_context = self.resolve_execution_working_context(&execution).await?;
+        let worktree_path = working_context.path.to_string_lossy().into_owned();
+        let execution_lock_key = working_context.lock_key.as_str();
         let snapshot = execution
             .executor_config_snapshot_json
             .as_deref()
@@ -465,7 +446,7 @@ impl TaskService {
         }
         let max_turns = self.resolve_max_turns(&task).await?;
         let logs_path = self
-            .resolve_execution_logs_path(&execution, &task, &workspace, &execution_id)
+            .resolve_execution_logs_path(&execution, &task, &execution_id)
             .await?;
         if let Some(parent) = std::path::Path::new(&logs_path).parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
@@ -473,50 +454,61 @@ impl TaskService {
             })?;
         }
 
-        if let Some(terminal_activity) = self.terminal_activity.as_ref() {
+        if let (Some(terminal_activity), Some(workspace)) = (
+            self.terminal_activity.as_ref(),
+            working_context.workspace.as_ref(),
+        ) {
             if terminal_activity
-                .workspace_has_active_terminal(workspace_id)
+                .workspace_has_active_terminal(&workspace.id)
                 .await
             {
                 return Err(ServiceError::TerminalActiveExecution {
-                    workspace_id: workspace_id.to_owned(),
+                    workspace_id: workspace.id.clone(),
                 });
             }
         }
         let _exec_lock_guard = if let Some(locks) = self.workspace_exec_locks.as_ref() {
-            if let Some(guard) = locks.try_acquire(workspace_id) {
-                if let Some(terminal_activity) = self.terminal_activity.as_ref() {
+            if let Some(guard) = locks.try_acquire(execution_lock_key) {
+                if let (Some(terminal_activity), Some(workspace)) = (
+                    self.terminal_activity.as_ref(),
+                    working_context.workspace.as_ref(),
+                ) {
                     if terminal_activity
-                        .workspace_has_active_terminal(workspace_id)
+                        .workspace_has_active_terminal(&workspace.id)
                         .await
                     {
                         return Err(ServiceError::TerminalActiveExecution {
-                            workspace_id: workspace_id.to_owned(),
+                            workspace_id: workspace.id.clone(),
                         });
                     }
                 }
                 Some(guard)
             } else {
-                if let Some(terminal_activity) = self.terminal_activity.as_ref() {
+                if let (Some(terminal_activity), Some(workspace)) = (
+                    self.terminal_activity.as_ref(),
+                    working_context.workspace.as_ref(),
+                ) {
                     if terminal_activity
-                        .workspace_has_active_terminal(workspace_id)
+                        .workspace_has_active_terminal(&workspace.id)
                         .await
                     {
                         return Err(ServiceError::TerminalActiveExecution {
-                            workspace_id: workspace_id.to_owned(),
+                            workspace_id: workspace.id.clone(),
                         });
                     }
                 }
-                self.event_bus.publish(events::ForgeEvent {
-                    event_type: "workspace.execution_waiting".to_owned(),
-                    entity_id: workspace_id.to_owned(),
-                    timestamp: events::event_timestamp(),
-                    context: events::EventContext::WorkspaceExecutionWaiting {
-                        workspace_id: workspace_id.to_owned(),
-                        task_id: task.id.clone(),
-                    },
-                });
-                Some(locks.acquire(workspace_id).await)
+                if let Some(workspace) = working_context.workspace.as_ref() {
+                    self.event_bus.publish(events::ForgeEvent {
+                        event_type: "workspace.execution_waiting".to_owned(),
+                        entity_id: workspace.id.clone(),
+                        timestamp: events::event_timestamp(),
+                        context: events::EventContext::WorkspaceExecutionWaiting {
+                            workspace_id: workspace.id.clone(),
+                            task_id: task.id.clone(),
+                        },
+                    });
+                }
+                Some(locks.acquire(execution_lock_key).await)
             }
         } else {
             None
@@ -564,9 +556,11 @@ impl TaskService {
             && execution_before_launch.workspace_id.is_some()
             && executors::is_worktree_read_only(&agent_config)
         {
-            let worktree_path = std::path::Path::new(&workspace.worktree_path);
+            let worktree_path = std::path::Path::new(&worktree_path);
             let digest_before =
-                match crate::ValidationService::snapshot_digest(&workspace.worktree_path).await {
+                match crate::ValidationService::snapshot_digest(&worktree_path.to_string_lossy())
+                    .await
+                {
                     Ok(digest) => digest,
                     Err(error) => {
                         return self
@@ -591,7 +585,9 @@ impl TaskService {
                 }
             };
             let digest_after =
-                match crate::ValidationService::snapshot_digest(&workspace.worktree_path).await {
+                match crate::ValidationService::snapshot_digest(&worktree_path.to_string_lossy())
+                    .await
+                {
                     Ok(digest) => digest,
                     Err(error) => {
                         return self
@@ -632,6 +628,11 @@ impl TaskService {
             .freeze_review_subject_and_inputs(execution_before_launch)
             .await?;
         let review_subject = if let Some(snapshot) = review_worktree_snapshot.as_ref() {
+            let workspace = working_context.workspace.as_ref().ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Review Execution has no persisted Workspace for its frozen subject",
+                )
+            })?;
             let subject = ExecutionRepo::get_review_execution_subject(&*self.db, &execution.id)
                 .await?
                 .ok_or_else(|| {
@@ -639,10 +640,8 @@ impl TaskService {
                         "local Review Execution did not persist its exact workspace subject",
                     )
                 })?;
-            let live_digest =
-                crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
-            let live_head =
-                git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await?;
+            let live_digest = crate::ValidationService::snapshot_digest(&worktree_path).await?;
+            let live_head = git::get_current_sha(std::path::Path::new(&worktree_path)).await?;
             if subject.workspace_id != workspace.id
                 || subject.head_commit_sha != snapshot.head_sha()
                 || Some(subject.workspace_snapshot_digest.as_str())
@@ -841,7 +840,7 @@ impl TaskService {
             && execution.workspace_id.is_some()
             && executors::is_worktree_read_only(&agent_config)
         {
-            Some(git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await?)
+            Some(git::get_current_sha(std::path::Path::new(&worktree_path)).await?)
         } else {
             None
         };
@@ -866,10 +865,8 @@ impl TaskService {
             .await?
         };
         let prelaunch_review_error = if let Some(subject) = review_subject.as_ref() {
-            let current_head =
-                git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await;
-            let current_digest =
-                crate::ValidationService::snapshot_digest(&workspace.worktree_path).await;
+            let current_head = git::get_current_sha(std::path::Path::new(&worktree_path)).await;
+            let current_digest = crate::ValidationService::snapshot_digest(&worktree_path).await;
             match (current_head, current_digest) {
                 (Ok(head), Ok(digest))
                     if head == subject.head_commit_sha
@@ -916,7 +913,7 @@ impl TaskService {
                     task_id: task.id.clone(),
                     execution_id: execution_id.clone(),
                     role: execution.role.clone(),
-                    worktree_path: workspace.worktree_path.clone(),
+                    worktree_path: worktree_path.clone(),
                     description,
                     agent_config,
                     logs_path: logs_path.clone(),
@@ -933,15 +930,13 @@ impl TaskService {
         if let (Some(snapshot), Some(subject)) =
             (review_worktree_snapshot.as_ref(), review_subject.as_ref())
         {
-            let restore = snapshot
-                .restore(std::path::Path::new(&workspace.worktree_path))
-                .await;
+            let restore = snapshot.restore(std::path::Path::new(&worktree_path)).await;
             match restore {
                 Ok(()) => {
                     let restored_head =
-                        git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await;
+                        git::get_current_sha(std::path::Path::new(&worktree_path)).await;
                     let restored_digest =
-                        crate::ValidationService::snapshot_digest(&workspace.worktree_path).await;
+                        crate::ValidationService::snapshot_digest(&worktree_path).await;
                     match (restored_head, restored_digest) {
                         (Ok(head), Ok(digest))
                             if head == subject.head_commit_sha
@@ -971,7 +966,7 @@ impl TaskService {
         let restore_result = if review_worktree_snapshot.is_some() {
             Ok(())
         } else if let Some(head) = read_only_head.as_deref() {
-            git::restore_worktree(std::path::Path::new(&workspace.worktree_path), head)
+            git::restore_worktree(std::path::Path::new(&worktree_path), head)
                 .await
                 .map_err(ServiceError::from)
         } else {
@@ -984,7 +979,7 @@ impl TaskService {
             let backup_path = snapshot.preserve_for_diagnostics();
             tracing::error!(
                 execution_id = %execution_id,
-                workspace_path = %workspace.worktree_path,
+                workspace_path = %worktree_path,
                 snapshot_backup_path = %backup_path.display(),
                 %error,
                 "read-only Review workspace could not be restored to its exact subject"
@@ -1345,6 +1340,10 @@ impl TaskService {
         &self,
         execution: &Execution,
     ) -> Result<Arc<dyn crate::daemon_transport::ExecutionProvider>> {
+        #[cfg(test)]
+        if let Some(provider) = self.execution_provider_override.as_ref() {
+            return Ok(Arc::clone(provider));
+        }
         let daemon_id =
             crate::daemon_transport::router::resolved_daemon_id_for_execution(execution)?;
         if let Some(registry) = self.daemon_connections.as_ref() {
@@ -1394,27 +1393,12 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let workspace_path = if execution.role == "orchestrator"
-            && execution.purpose == Some(ExecutionPurpose::Orchestrate)
-        {
-            self.validate_orchestrator_execution(execution).await?;
-            let path = self.orchestrator_context_path(&execution.id);
-            std::fs::create_dir_all(&path).map_err(|error| {
-                ServiceError::invalid_operation(format!(
-                    "failed to create isolated orchestrator context: {error}"
-                ))
-            })?;
-            path.to_string_lossy().into_owned()
-        } else {
-            let workspace_id = execution
-                .workspace_id
-                .as_deref()
-                .ok_or_else(|| ServiceError::invalid_operation("execution missing workspace_id"))?;
-            WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?
-                .worktree_path
-        };
+        let workspace_path = self
+            .resolve_execution_working_context(execution)
+            .await?
+            .path
+            .to_string_lossy()
+            .into_owned();
         let snapshot = execution
             .executor_config_snapshot_json
             .as_deref()
@@ -1543,13 +1527,12 @@ impl TaskService {
         &self,
         execution: &Execution,
         task: &Task,
-        workspace: &Workspace,
         execution_id: &str,
     ) -> Result<String> {
         let durable_path = execution_logs_path(
             &self.workspace_root,
             &task.project_id,
-            &workspace.task_id,
+            &task.id,
             execution_id,
         );
         let Some(stored_path) = execution.logs_path.as_deref() else {

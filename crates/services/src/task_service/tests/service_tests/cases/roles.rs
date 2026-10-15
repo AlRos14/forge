@@ -6,16 +6,144 @@ use db::{
     TaskLifecycleRepo, TaskRoleRepo,
 };
 
+struct RecordingExecutionProvider {
+    executor: Arc<RecordingCancelExecutor>,
+}
+
+#[async_trait::async_trait]
+impl crate::daemon_transport::ExecutionProvider for RecordingExecutionProvider {
+    async fn start(
+        &self,
+        params: api_types::ExecutionStartParams,
+    ) -> std::result::Result<api_types::ExecutionStartResult, crate::ServiceError> {
+        Ok(api_types::ExecutionStartResult {
+            execution_id: params.execution_id,
+            accepted: true,
+        })
+    }
+
+    async fn cancel(
+        &self,
+        params: api_types::ExecutionCancelParams,
+    ) -> std::result::Result<api_types::ExecutionCancelResult, crate::ServiceError> {
+        let _ = self.executor.cancel(&params.execution_id).await;
+        Ok(api_types::ExecutionCancelResult {
+            execution_id: params.execution_id,
+            cancelled: true,
+        })
+    }
+}
+
+async fn running_non_repository_execution_for_cancel(
+    db: &db::SqliteDb,
+    service: &TaskService,
+    task: &db::Task,
+    agent_id: &str,
+) -> db::Execution {
+    let agent = AgentRepo::get_by_id(db, agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    let daemon_id = agent.daemon_id.expect("Agent has its exact daemon");
+    let changed = sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
+        .bind(crate::embedded_daemon::embedded_machine_id())
+        .bind(&daemon_id)
+        .execute(db.pool())
+        .await
+        .expect("fixture routes the Agent to the embedded host");
+    assert_eq!(changed.rows_affected(), 1);
+    service
+        .create_task_role(
+            &task.id,
+            "implementer",
+            CoordinationMode::Independent,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("implementer TaskRole creates");
+    service
+        .add_task_role_member(
+            &task.id,
+            "implementer",
+            ActorRef::Agent(agent_id.to_owned()),
+        )
+        .await
+        .expect("Agent joins implementer TaskRole");
+    let work_unit_id = db::new_uuid_v4();
+    let now = db::now_rfc3339();
+    let work_unit = db::WorkUnitRepo::create(
+        db,
+        db::CreateWorkUnit {
+            id: work_unit_id.clone(),
+            task_id: task.id.clone(),
+            parent_work_unit_id: None,
+            title: "Task cancellation WorkUnit".to_owned(),
+            scope: "Cancel one exact Running Execution".to_owned(),
+            role: "implementer".to_owned(),
+            assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
+            requires_integration: false,
+            provenance: None,
+            created_by: db::ActorRef::Agent(agent_id.to_owned()),
+            created_at: now.clone(),
+        },
+        db::CreateDomainEvent {
+            id: db::new_uuid_v4(),
+            event_type: "work_unit.created".to_owned(),
+            entity_type: "work_unit".to_owned(),
+            entity_id: work_unit_id.clone(),
+            actor_type: "agent".to_owned(),
+            actor_id: Some(agent_id.to_owned()),
+            scope_type: "task".to_owned(),
+            scope_id: task.id.clone(),
+            correlation_id: work_unit_id,
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".to_owned(),
+            created_at: now,
+        },
+    )
+    .await
+    .expect("exact non-repository WorkUnit creates")
+    .record;
+    let execution = service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "running execution for cancellation".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("exact no-repository WorkUnit Execution admits")
+        .execution;
+    assert!(
+        service
+            .start_execution(execution.id.clone())
+            .await
+            .expect("provider accepts the exact Start")
+            .accepted
+    );
+    execution
+}
+
 #[tokio::test]
 async fn cancel_execution_invokes_task_executor_cancel() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let executor = Arc::new(RecordingCancelExecutor::default());
-    let service = TaskService::new(Arc::clone(&db), event_bus).with_task_executor(executor.clone());
+    let provider = Arc::new(RecordingExecutionProvider {
+        executor: Arc::clone(&executor),
+    });
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_task_executor(executor.clone())
+        .with_execution_provider_override(provider);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
-    let execution = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
+    let execution =
+        running_non_repository_execution_for_cancel(&db, &service, &task, &agent_id).await;
 
     service
         .cancel_execution(execution.id.clone(), "cancelled by test".to_owned())
@@ -31,11 +159,17 @@ async fn cancel_task_cancels_running_execution() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let executor = Arc::new(RecordingCancelExecutor::default());
-    let service = TaskService::new(Arc::clone(&db), event_bus).with_task_executor(executor.clone());
+    let provider = Arc::new(RecordingExecutionProvider {
+        executor: Arc::clone(&executor),
+    });
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_task_executor(executor.clone())
+        .with_execution_provider_override(provider);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
-    let execution = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
+    let execution =
+        running_non_repository_execution_for_cancel(&db, &service, &task, &agent_id).await;
 
     let cancelled_task = service
         .cancel_task(task.id.clone())

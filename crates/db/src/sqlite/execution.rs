@@ -728,8 +728,56 @@ impl ExecutionRepo for SqliteDb {
         .fetch_one(&mut *tx)
         .await?;
         if attempt_exists {
-            tx.commit().await?;
-            return Ok(PendingProviderStartFailure::Attempted(execution));
+            let rejected_outcome_is_exact: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM domain_event AS outcome
+                    WHERE outcome.dedupe_key = 'execution.provider_start_rejected:' || ?
+                      AND outcome.event_type = 'execution.provider_start_rejected'
+                      AND outcome.entity_type = 'execution'
+                      AND outcome.entity_id = ?
+                      AND outcome.actor_type = ?
+                      AND outcome.actor_id IS ?
+                      AND outcome.scope_type = 'task'
+                      AND outcome.scope_id = ?
+                      AND outcome.correlation_id = ?
+                      AND outcome.causation_id IS ?
+                      AND outcome.causation_depth = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM domain_event AS competing
+                          WHERE competing.entity_type = 'execution'
+                            AND competing.entity_id = outcome.entity_id
+                            AND competing.event_type IN (
+                                'execution.provider_start_accepted',
+                                'execution.provider_start_uncertain'
+                            )
+                      )
+                )",
+            )
+            .bind(execution_id)
+            .bind(execution_id)
+            .bind(
+                execution
+                    .actor_ref()
+                    .as_ref()
+                    .map(|actor| actor.kind().to_string())
+                    .unwrap_or_default(),
+            )
+            .bind(
+                execution
+                    .actor_ref()
+                    .as_ref()
+                    .map(|actor| actor.id().to_owned()),
+            )
+            .bind(&execution.task_id)
+            .bind(&execution.id)
+            .bind(&execution.parent_execution_id)
+            .bind(i64::from(execution.parent_execution_id.is_some()))
+            .fetch_one(&mut *tx)
+            .await?;
+            if !rejected_outcome_is_exact {
+                tx.commit().await?;
+                return Ok(PendingProviderStartFailure::Attempted(execution));
+            }
         }
 
         let pending_exists: bool = sqlx::query_scalar(
@@ -836,6 +884,8 @@ impl ExecutionRepo for SqliteDb {
         if execution.status != ExecutionStatus::Running
             || !matches!(execution.actor_ref(), Some(ActorRef::Agent(_)))
             || execution.agent_id.as_deref() != execution.actor_ref().as_ref().map(ActorRef::id)
+            || (execution.role == "orchestrator")
+                != (execution.purpose == Some(ExecutionPurpose::Orchestrate))
             || !provider_start_event_matches_execution(
                 &attempt_event,
                 &execution,
@@ -933,6 +983,113 @@ impl ExecutionRepo for SqliteDb {
             return Ok(ProviderStartClaim::TaskCancelled);
         }
 
+        let is_orchestrator = execution.role == "orchestrator"
+            && execution.purpose == Some(ExecutionPurpose::Orchestrate);
+        if is_orchestrator {
+            if execution.work_unit_id.is_some() || execution.workspace_id.is_some() {
+                tx.commit().await?;
+                return Ok(ProviderStartClaim::AuthorityLost);
+            }
+            let actor = execution.actor_ref().ok_or_else(|| {
+                DbError::Check("Orchestrator claim has no exact Agent Actor".to_owned())
+            })?;
+            let actor_kind = actor.kind().to_string();
+            let actor_id = actor.id().to_owned();
+            // Orchestrator has no WorkUnit. Its exact durable Wake attempt is
+            // the start authority, so bind the Wake, TaskRole snapshot,
+            // membership, lease, and Execution under this same write lock.
+            let wake_authority_is_current: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM orchestrator_wake AS wake
+                    JOIN orchestrator_wake_execution AS attempt
+                      ON attempt.wake_id = wake.id
+                     AND attempt.execution_id = ?
+                     AND attempt.attempt_number = wake.current_attempt
+                    JOIN execution AS current_execution
+                      ON current_execution.id = attempt.execution_id
+                    JOIN task AS current_task
+                      ON current_task.id = wake.task_id
+                    JOIN agent_current AS current_agent
+                      ON current_agent.id = wake.actor_id
+                    JOIN task_role AS role
+                      ON role.id = wake.task_role_id
+                    JOIN role_membership AS member
+                      ON member.task_role_id = wake.task_role_id
+                     AND member.actor_kind = wake.actor_kind
+                     AND member.actor_id = wake.actor_id
+                     AND member.status = 'active'
+                    WHERE current_execution.id = ?
+                      AND current_execution.task_id = wake.task_id
+                      AND current_execution.role = 'orchestrator'
+                      AND current_execution.purpose = 'orchestrate'
+                      AND current_execution.actor_kind = ?
+                      AND current_execution.actor_id = ?
+                      AND current_execution.agent_id = wake.actor_id
+                      AND current_execution.work_unit_id IS NULL
+                      AND current_execution.workspace_id IS NULL
+                      AND current_task.deleted_at IS NULL
+                      AND current_agent.paused = 0
+                      AND wake.actor_kind = ?
+                      AND wake.actor_id = ?
+                      AND wake.state = 'leased'
+                      AND wake.lease_owner IS NOT NULL
+                      AND trim(wake.lease_owner) <> ''
+                      AND wake.lease_until > ?
+                      AND wake.current_attempt = attempt.attempt_number
+                      AND wake.attempt_count >= attempt.attempt_number
+                      AND attempt.state = 'start_requested'
+                      AND role.task_id = wake.task_id
+                      AND role.role = 'orchestrator'
+                      AND role.version = wake.task_role_version
+                      AND role.policy_json = wake.task_role_policy_json
+                      AND role.coordination_mode IS wake.coordination_mode
+                      AND json_valid(role.policy_json)
+                      AND json_type(role.policy_json) = 'object'
+                      AND COALESCE(json_extract(role.policy_json, '$.schema_version'), 1) = 1
+                      AND COALESCE(json_extract(role.policy_json, '$.automatic_orchestration'), 1) = 1
+                      AND COALESCE(json_extract(role.policy_json, '$.max_actions_per_execution'), 16)
+                            BETWEEN 0 AND 16
+                      AND COALESCE(json_extract(role.policy_json, '$.max_work_unit_creations_per_execution'), 4)
+                            BETWEEN 0 AND 4
+                      AND (
+                            json_type(role.policy_json, '$.allowed_actions') IS NULL
+                            OR (
+                                json_type(role.policy_json, '$.allowed_actions') = 'array'
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM json_each(role.policy_json, '$.allowed_actions') AS action
+                                    WHERE action.type <> 'text'
+                                       OR action.value NOT IN ('message', 'handoff', 'create_work_unit', 'proposal')
+                                )
+                                AND (SELECT COUNT(*) FROM json_each(role.policy_json, '$.allowed_actions'))
+                                    = (SELECT COUNT(DISTINCT action.value)
+                                       FROM json_each(role.policy_json, '$.allowed_actions') AS action)
+                            )
+                      )
+                      AND json_valid(current_execution.executor_config_snapshot_json)
+                      AND json_extract(current_execution.executor_config_snapshot_json,
+                                       '$.pr6_orchestrator_wake.wake_id') = wake.id
+                      AND json_extract(current_execution.executor_config_snapshot_json,
+                                       '$.pr6_orchestrator_wake.task_role_version') = wake.task_role_version
+                      AND json_extract(current_execution.executor_config_snapshot_json,
+                                       '$.pr6_orchestrator_wake.task_role_policy_json') = wake.task_role_policy_json
+                )",
+            )
+            .bind(&execution.id)
+            .bind(&execution.id)
+            .bind(&actor_kind)
+            .bind(&actor_id)
+            .bind(&actor_kind)
+            .bind(&actor_id)
+            .bind(crate::now_rfc3339())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !wake_authority_is_current {
+                tx.commit().await?;
+                return Ok(ProviderStartClaim::AuthorityLost);
+            }
+        }
+
         let agent_id = execution.agent_id.as_deref().ok_or(DbError::NotFound)?;
         let paused: Option<bool> =
             sqlx::query_scalar("SELECT paused FROM agent_current WHERE id = ?")
@@ -948,7 +1105,8 @@ impl ExecutionRepo for SqliteDb {
             });
         }
 
-        if execution.workspace_id.is_some() && execution.work_unit_id.is_none() {
+        if !is_orchestrator && execution.workspace_id.is_some() && execution.work_unit_id.is_none()
+        {
             tx.commit().await?;
             return Ok(ProviderStartClaim::AuthorityLost);
         }

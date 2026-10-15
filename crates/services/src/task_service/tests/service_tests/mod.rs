@@ -401,58 +401,6 @@ async fn seed_subtask_with_status(
     .expect("subtask creates")
 }
 
-async fn seed_running_coder_execution(
-    db: &SqliteDb,
-    task_id: &str,
-    agent_id: Option<String>,
-    workspace_id: Option<String>,
-) -> Execution {
-    seed_running_role_execution(db, task_id, agent_id, "executor", workspace_id).await
-}
-
-async fn seed_running_role_execution(
-    db: &SqliteDb,
-    task_id: &str,
-    agent_id: Option<String>,
-    role: &str,
-    workspace_id: Option<String>,
-) -> Execution {
-    let now = now_rfc3339();
-    ExecutionRepo::create(
-        db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task_id.to_owned(),
-            actor_ref: agent_id
-                .as_ref()
-                .map(|agent_id| db::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(db::ExecutionPurpose::General),
-            harness_session_id: None,
-            agent_id,
-            role: role.to_owned(),
-            status: ExecutionStatus::Running,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("running execution creates")
-}
-
 #[tokio::test]
 async fn add_user_comment_persists_in_the_task_comment_store() {
     let db = Arc::new(sqlite_db().await);

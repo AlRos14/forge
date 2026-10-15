@@ -7,6 +7,8 @@ use serde_json::Value;
 struct RecoveryDispatchExecutor {
     calls: std::sync::atomic::AtomicUsize,
     started: tokio::sync::Notify,
+    worktree_paths: std::sync::Mutex<Vec<String>>,
+    write_marker: bool,
 }
 
 fn provider_start_receipt_for_test(
@@ -45,9 +47,20 @@ fn provider_start_receipt_for_test(
 impl executors::TaskExecutor for RecoveryDispatchExecutor {
     async fn execute(
         &self,
-        _ctx: executors::ExecutionContext,
+        ctx: executors::ExecutionContext,
     ) -> std::result::Result<executors::ExecutionResult, executors::ExecutorError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.worktree_paths
+            .lock()
+            .expect("worktree path list locks")
+            .push(ctx.worktree_path.clone());
+        if self.write_marker {
+            std::fs::write(
+                std::path::Path::new(&ctx.worktree_path).join("execution-id"),
+                &ctx.execution_id,
+            )
+            .expect("isolated context accepts its own marker");
+        }
         self.started.notify_one();
         Ok(executors::ExecutionResult {
             status: executors::ExecutionOutcome::Completed,
@@ -3342,6 +3355,7 @@ async fn follow_up_uses_its_exact_work_unit_while_a_sibling_work_unit_runs() {
     )
     .await;
     let sibling_agent_id = seed_agent_with_executor_type(&db, "shell", "{}").await;
+    route_agent_to_embedded_daemon(&db, &sibling_agent_id).await;
     let sibling_work_unit =
         create_simple_execution_work_unit(&db, &service, &task, &sibling_agent_id).await;
     let sibling = service
@@ -4032,6 +4046,9 @@ async fn blocked_recovery_fixture_for_executor(
         .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, executor_type, "{}").await;
+    if !requires_workspace {
+        route_agent_to_embedded_daemon(&db, &agent_id).await;
+    }
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
 
     let (parent, workspace) = if requires_workspace {
@@ -4637,6 +4654,26 @@ async fn explicit_multi_work_unit_recovery_keeps_repository_workspaces_and_lease
     .await;
     assert_ne!(parent_a.work_unit_id, parent_b.work_unit_id);
     assert_ne!(workspace_a.id, workspace_b.id);
+
+    for parent in [&parent_a, &parent_b] {
+        assert_eq!(
+            ExecutionRepo::claim_provider_start(
+                &*db,
+                &parent.id,
+                provider_start_receipt_for_test(parent, "execution.provider_start_attempted",),
+            )
+            .await
+            .expect("fixture records the exact provider attempt"),
+            db::ProviderStartClaim::Claimed
+        );
+        ExecutionRepo::record_provider_start_outcome(
+            &*db,
+            &parent.id,
+            provider_start_receipt_for_test(parent, "execution.provider_start_accepted"),
+        )
+        .await
+        .expect("fixture records accepted provider Start");
+    }
 
     crate::CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus))
         .run_recovery()
@@ -5442,6 +5479,9 @@ async fn terminal_work_unit_execution(
     external_session_id: Option<&str>,
     snapshot_override: Option<String>,
 ) -> db::Execution {
+    // This helper creates a no-repository WorkUnit, whose isolated context is
+    // supported only on the exact embedded execution host.
+    route_agent_to_embedded_daemon(db, agent_id).await;
     let work_unit = create_simple_execution_work_unit(db, service, task, agent_id).await;
     let mut execution = service
         .launch_work_unit_execution(
@@ -5655,6 +5695,7 @@ async fn ordinary_launch_artifact_rejection_rolls_back_activation_receipt_and_ev
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
     let before = admission_side_effect_snapshot(&db, &task.id, &work_unit.id).await;
@@ -5679,6 +5720,7 @@ async fn ordinary_provider_start_failure_keeps_one_admitted_execution_and_event(
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
     let admitted = service
@@ -5727,6 +5769,544 @@ async fn ordinary_provider_start_failure_keeps_one_admitted_execution_and_event(
     .await
     .expect("activation receipt count loads");
     assert_eq!(transitions, 1);
+}
+
+async fn route_agent_to_embedded_daemon(db: &SqliteDb, agent_id: &str) {
+    let agent = AgentRepo::get_by_id(db, agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    let embedded_machine_id = crate::embedded_daemon::embedded_machine_id();
+    let embedded_daemon_id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM daemon WHERE machine_id = ?")
+            .bind(&embedded_machine_id)
+            .fetch_optional(db.pool())
+            .await
+            .expect("embedded daemon lookup succeeds");
+    let daemon_id = if let Some(daemon_id) = embedded_daemon_id {
+        daemon_id
+    } else {
+        let daemon_id = agent.daemon_id.clone().expect("Agent has a routed daemon");
+        let changed = sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
+            .bind(&embedded_machine_id)
+            .bind(&daemon_id)
+            .execute(db.pool())
+            .await
+            .expect("test daemon becomes the embedded execution host");
+        assert_eq!(changed.rows_affected(), 1);
+        daemon_id
+    };
+    if agent.daemon_id.as_deref() != Some(daemon_id.as_str()) {
+        AgentRepo::update(
+            db,
+            db::UpdateAgent {
+                id: agent.id,
+                expected_version: agent.version,
+                name: None,
+                description: None,
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: None,
+                config_json: None,
+                daemon_id: Some(Some(daemon_id)),
+                max_concurrent_tasks: None,
+                heartbeat_interval_seconds: None,
+                max_missed_heartbeats: None,
+                status: None,
+                last_heartbeat_at: None,
+                is_default: None,
+                paused: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("Agent routes to the exact embedded execution host");
+    }
+}
+
+async fn wait_for_execution_completed(
+    events: &mut tokio::sync::broadcast::Receiver<events::ForgeEvent>,
+    execution_id: &str,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await.expect("execution event is delivered");
+            if event.event_type == "execution.completed" && event.entity_id == execution_id {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("execution reaches its terminal event");
+}
+
+fn local_execution_service(
+    db: Arc<SqliteDb>,
+    event_bus: Arc<EventBus>,
+    workspace_root: &std::path::Path,
+    executor: Arc<RecoveryDispatchExecutor>,
+) -> TaskService {
+    TaskService::new(db, event_bus)
+        .with_workspace_root(workspace_root.to_path_buf())
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_workspace_exec_locks(Arc::new(crate::WorkspaceExecutionLockManager::new()))
+        .with_task_executor(executor)
+        .with_adapter_registry(Arc::new(cli_adapters::default_registry()))
+}
+
+#[tokio::test]
+async fn non_repository_work_unit_admits_starts_and_finishes_in_its_isolated_context() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let executor = Arc::new(RecoveryDispatchExecutor::default());
+    let service = local_execution_service(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        workspace_root.path(),
+        Arc::clone(&executor),
+    );
+    let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
+    let mut events = event_bus.subscribe();
+
+    let launched = service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "write only inside this WorkUnit context".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("non-repository WorkUnit admits without a Workspace");
+    assert!(launched.execution.workspace_id.is_none());
+    let result = service
+        .start_execution(launched.execution.id.clone())
+        .await
+        .expect("non-repository WorkUnit starts on its isolated path");
+    assert!(result.accepted);
+    wait_for_execution_completed(&mut events, &launched.execution.id).await;
+
+    let expected_path = workspace_root
+        .path()
+        .join(".forge-workunit-context")
+        .join(&task.id)
+        .join(&work_unit.id);
+    assert!(expected_path.is_dir());
+    assert!(!expected_path.starts_with(&repo_dir));
+    assert_eq!(
+        executor
+            .worktree_paths
+            .lock()
+            .expect("execution paths load")
+            .as_slice(),
+        &[expected_path.to_string_lossy().into_owned()]
+    );
+    let stored = ExecutionRepo::get_by_id(&*db, &launched.execution.id)
+        .await
+        .expect("Execution reloads")
+        .expect("Execution remains present");
+    assert_eq!(stored.status, ExecutionStatus::Completed);
+    assert!(stored.workspace_id.is_none());
+    let leases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workspace_lease WHERE execution_id = ? OR work_unit_id = ?",
+    )
+    .bind(&stored.id)
+    .bind(&work_unit.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("WorkUnit lease count loads");
+    assert_eq!(leases, 0);
+}
+
+#[tokio::test]
+async fn non_repository_context_preparation_failure_leaves_no_running_execution() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let root = TempDir::new().expect("fixture root creates");
+    let invalid_root = root.path().join("regular-file");
+    std::fs::write(&invalid_root, "not a directory").expect("invalid context root is a file");
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_workspace_root(invalid_root)
+        .with_adapter_registry(Arc::new(cli_adapters::default_registry()));
+    let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
+    let before_lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+        .await
+        .expect("TaskLifecycle loads")
+        .expect("TaskLifecycle exists");
+
+    let result = service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "context preparation must fail before admission".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "isolated directory preparation must be fatal"
+    );
+    let executions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND work_unit_id = ? AND status = 'running'",
+    )
+    .bind(&task.id)
+    .bind(&work_unit.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("Running Execution count loads");
+    assert_eq!(executions, 0);
+    assert_eq!(
+        TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("TaskLifecycle reloads")
+            .expect("TaskLifecycle remains present"),
+        before_lifecycle
+    );
+}
+
+#[tokio::test]
+async fn non_repository_remote_host_rejects_before_running_execution() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_workspace_root(root.path().to_path_buf())
+        .with_adapter_registry(Arc::new(cli_adapters::default_registry()));
+    let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
+    let lifecycle_before = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+        .await
+        .expect("TaskLifecycle loads")
+        .expect("TaskLifecycle exists");
+
+    let error = match service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "remote no-repository context is unsupported".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("unsupported remote host must reject before admission"),
+    };
+    assert!(error.to_string().contains("online embedded execution host"));
+    let running: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution
+         WHERE task_id = ? AND work_unit_id = ? AND status = 'running'",
+    )
+    .bind(&task.id)
+    .bind(&work_unit.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("Running Execution count loads");
+    assert_eq!(running, 0);
+    let leases: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workspace_lease WHERE work_unit_id = ?")
+            .bind(&work_unit.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("WorkspaceLease count loads");
+    assert_eq!(leases, 0);
+    assert_eq!(
+        TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("TaskLifecycle reloads")
+            .expect("TaskLifecycle remains present"),
+        lifecycle_before
+    );
+}
+
+#[tokio::test]
+async fn non_repository_follow_up_keeps_work_unit_context_identity() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let executor = Arc::new(RecoveryDispatchExecutor::default());
+    let service = local_execution_service(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        workspace_root.path(),
+        Arc::clone(&executor),
+    );
+    let parent = terminal_work_unit_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        ExecutionStatus::Completed,
+        Some("non-repository-follow-up-session"),
+        None,
+    )
+    .await;
+    let mut events = event_bus.subscribe();
+    let follow_up = service
+        .follow_up_execution(
+            parent.id.clone(),
+            "continue in the same isolated context".to_owned(),
+            None,
+            None,
+            "non-repository-follow-up-context".to_owned(),
+        )
+        .await
+        .expect("follow-up binds to its exact non-repository WorkUnit");
+    assert_eq!(
+        follow_up.execution.parent_execution_id.as_deref(),
+        Some(parent.id.as_str())
+    );
+    assert_eq!(follow_up.execution.work_unit_id, parent.work_unit_id);
+    assert!(follow_up.execution.workspace_id.is_none());
+    assert_eq!(
+        follow_up.execution.harness_session_id, parent.harness_session_id,
+        "follow-up retains its exact durable HarnessSession identity"
+    );
+    service
+        .start_execution(follow_up.execution.id.clone())
+        .await
+        .expect("follow-up starts in the exact WorkUnit context");
+    wait_for_execution_completed(&mut events, &follow_up.execution.id).await;
+
+    let work_unit_id = parent.work_unit_id.expect("parent keeps exact WorkUnit id");
+    let expected_path = workspace_root
+        .path()
+        .join(".forge-workunit-context")
+        .join(&task.id)
+        .join(&work_unit_id);
+    assert_eq!(
+        executor
+            .worktree_paths
+            .lock()
+            .expect("execution paths load")
+            .as_slice(),
+        &[expected_path.to_string_lossy().into_owned()]
+    );
+    assert!(!expected_path.starts_with(&repo_dir));
+    assert!(follow_up.execution.workspace_id.is_none());
+    let leases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workspace_lease WHERE execution_id = ? OR work_unit_id = ?",
+    )
+    .bind(&follow_up.execution.id)
+    .bind(&work_unit_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("follow-up WorkspaceLease count loads");
+    assert_eq!(leases, 0);
+}
+
+#[tokio::test]
+async fn non_repository_sibling_work_units_have_independent_contexts() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let first_agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let second_agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    route_agent_to_embedded_daemon(&db, &first_agent_id).await;
+    route_agent_to_embedded_daemon(&db, &second_agent_id).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let executor = Arc::new(RecoveryDispatchExecutor {
+        write_marker: true,
+        ..Default::default()
+    });
+    let service = local_execution_service(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        workspace_root.path(),
+        Arc::clone(&executor),
+    );
+    let first_unit = create_simple_execution_work_unit(&db, &service, &task, &first_agent_id).await;
+    let second_unit =
+        create_simple_execution_work_unit(&db, &service, &task, &second_agent_id).await;
+    let first_launch = service
+        .launch_work_unit_execution(
+            &first_unit.id,
+            first_unit.version,
+            db::ExecutionPurpose::Implement,
+            "first sibling".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("first WorkUnit admits");
+    let second_launch = service
+        .launch_work_unit_execution(
+            &second_unit.id,
+            second_unit.version,
+            db::ExecutionPurpose::Implement,
+            "second sibling".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("second WorkUnit admits independently");
+    let mut events = event_bus.subscribe();
+    let (first_start, second_start) = tokio::join!(
+        service.start_execution(first_launch.execution.id.clone()),
+        service.start_execution(second_launch.execution.id.clone()),
+    );
+    assert!(first_start.expect("first Start accepted").accepted);
+    assert!(second_start.expect("second Start accepted").accepted);
+    let mut completed = std::collections::HashSet::new();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while completed.len() < 2 {
+            let event = events.recv().await.expect("completion event arrives");
+            if event.event_type == "execution.completed"
+                && [
+                    first_launch.execution.id.as_str(),
+                    second_launch.execution.id.as_str(),
+                ]
+                .contains(&event.entity_id.as_str())
+            {
+                completed.insert(event.entity_id);
+            }
+        }
+    })
+    .await
+    .expect("both sibling Executions finish");
+
+    let first_path = workspace_root
+        .path()
+        .join(".forge-workunit-context")
+        .join(&task.id)
+        .join(&first_unit.id);
+    let second_path = workspace_root
+        .path()
+        .join(".forge-workunit-context")
+        .join(&task.id)
+        .join(&second_unit.id);
+    assert_ne!(first_path, second_path);
+    assert_eq!(
+        std::fs::read_to_string(first_path.join("execution-id")).expect("first marker exists"),
+        first_launch.execution.id
+    );
+    assert_eq!(
+        std::fs::read_to_string(second_path.join("execution-id")).expect("second marker exists"),
+        second_launch.execution.id
+    );
+    let mut actual_paths = executor
+        .worktree_paths
+        .lock()
+        .expect("execution paths load")
+        .clone();
+    actual_paths.sort();
+    let mut expected_paths = vec![
+        first_path.to_string_lossy().into_owned(),
+        second_path.to_string_lossy().into_owned(),
+    ];
+    expected_paths.sort();
+    assert_eq!(actual_paths, expected_paths);
+    let leases: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workspace_lease WHERE work_unit_id IN (?, ?)")
+            .bind(&first_unit.id)
+            .bind(&second_unit.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("sibling WorkspaceLease count loads");
+    assert_eq!(leases, 0);
+}
+
+#[tokio::test]
+async fn non_repository_start_replay_after_restart_never_duplicates_provider_start() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let first_executor = Arc::new(RecoveryDispatchExecutor::default());
+    let first_service = local_execution_service(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        workspace_root.path(),
+        Arc::clone(&first_executor),
+    );
+    let work_unit = create_simple_execution_work_unit(&db, &first_service, &task, &agent_id).await;
+    let execution = first_service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "recover the exact pending Start".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("exact non-repository WorkUnit admits");
+    let context_path = workspace_root
+        .path()
+        .join(".forge-workunit-context")
+        .join(&task.id)
+        .join(&work_unit.id);
+    assert!(
+        context_path.is_dir(),
+        "preparation precedes Running admission"
+    );
+    ExecutionRepo::claim_provider_start(
+        &*db,
+        &execution.execution.id,
+        provider_start_receipt_for_test(&execution.execution, "execution.provider_start_attempted"),
+    )
+    .await
+    .expect("durable external attempt is recorded before simulated restart");
+
+    let restarted_executor = Arc::new(RecoveryDispatchExecutor::default());
+    let restarted_service = local_execution_service(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        workspace_root.path(),
+        Arc::clone(&restarted_executor),
+    );
+    let result = restarted_service
+        .start_execution(execution.execution.id.clone())
+        .await;
+    assert!(matches!(
+        result,
+        Err(ServiceError::ExecutionStartUncertain { .. })
+    ));
+    assert!(
+        context_path.is_dir(),
+        "restart resolves the same WorkUnit path"
+    );
+    assert_eq!(
+        restarted_executor
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an existing attempted Start is never sent again"
+    );
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE entity_id = ? AND event_type = 'execution.provider_start_attempted'",
+    )
+    .bind(&execution.execution.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("attempt receipt count loads");
+    assert_eq!(attempts, 1);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7481,6 +8061,7 @@ async fn follow_up_artifact_pin_rejection_preserves_blocking_annotation_and_life
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
     let parent = service
@@ -7837,6 +8418,7 @@ async fn ordinary_reexecute_snapshot_failure_keeps_ready_lifecycle_without_child
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
     let parent = service
@@ -7942,6 +8524,7 @@ async fn ordinary_reexecute_work_unit_version_race_rolls_back_activation() {
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
     let parent = service

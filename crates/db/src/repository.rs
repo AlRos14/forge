@@ -291,6 +291,10 @@ pub trait OrchestratorWakeRepo: Send + Sync {
         &self,
         input: TransitionOrchestratorWakeExecution,
     ) -> Result<bool>;
+    /// Resolve a claimed provider Start and its exact Wake attempt in one
+    /// transaction. Only the current lease owner and current attempt may
+    /// become running or deterministically failed.
+    async fn resolve_orchestrator_start(&self, input: ResolveOrchestratorStart) -> Result<bool>;
     async fn get_orchestrator_action(
         &self,
         execution_id: &str,
@@ -472,6 +476,19 @@ pub struct TransitionOrchestratorWakeExecution {
     pub expected_state: Option<String>,
     pub state: String,
     pub last_error: Option<Option<String>>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveOrchestratorStart {
+    pub wake_id: String,
+    pub attempt_number: i64,
+    pub execution_id: String,
+    pub lease_owner: String,
+    /// `running` for a durably accepted Start or `failed` for a known
+    /// rejection/loss of authority with no external attempt.
+    pub state: String,
+    pub last_error: Option<String>,
     pub updated_at: String,
 }
 

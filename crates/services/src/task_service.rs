@@ -88,6 +88,8 @@ pub struct TaskService {
     automatic_recovery_precommit_barrier: Option<Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
     provider_start_claim_barrier: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    execution_provider_override: Option<Arc<dyn crate::daemon_transport::ExecutionProvider>>,
 }
 
 pub(crate) struct WorkUnitAdmissionLifecyclePlan {
@@ -107,6 +109,12 @@ pub(crate) struct ExplicitRecoveryAdmission {
     pub(crate) receipt_dedupe_key: String,
     pub(crate) request_digest: String,
     pub(crate) requested_by: String,
+}
+
+pub(crate) struct ExecutionWorkingContext {
+    pub(crate) path: PathBuf,
+    pub(crate) lock_key: String,
+    pub(crate) workspace: Option<Workspace>,
 }
 
 pub(crate) fn execution_domain_event(
@@ -145,6 +153,64 @@ pub(crate) fn execution_domain_event(
         .to_string(),
         created_at: input.created_at.clone(),
     }
+}
+
+fn create_isolated_context_directory(root: &std::path::Path, segments: &[&str]) -> Result<PathBuf> {
+    std::fs::create_dir_all(root).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "failed to prepare isolated execution root: {error}"
+        ))
+    })?;
+    let canonical_root = std::fs::canonicalize(root).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "failed to resolve isolated execution root: {error}"
+        ))
+    })?;
+    let mut current = canonical_root.clone();
+    for segment in segments {
+        let segment_path = std::path::Path::new(segment);
+        if segment_path.components().count() != 1
+            || !matches!(
+                segment_path.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err(ServiceError::invalid_operation(
+                "isolated execution context identity contains an invalid path component",
+            ));
+        }
+        current.push(segment_path);
+        match std::fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(ServiceError::invalid_operation(format!(
+                    "failed to prepare isolated execution context: {error}"
+                )));
+            }
+        }
+        let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "failed to inspect isolated execution context: {error}"
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ServiceError::invalid_operation(
+                "isolated execution context path must contain only real directories",
+            ));
+        }
+        current = std::fs::canonicalize(&current).map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "failed to resolve isolated execution context: {error}"
+            ))
+        })?;
+        if !current.starts_with(&canonical_root) {
+            return Err(ServiceError::invalid_operation(
+                "isolated execution context escaped its configured root",
+            ));
+        }
+    }
+    Ok(current)
 }
 
 pub(crate) fn execution_status_domain_event(
@@ -236,6 +302,155 @@ pub struct LaunchExecutionResult {
 }
 
 impl TaskService {
+    async fn prepare_non_repository_work_unit_context(
+        &self,
+        task: &Task,
+        work_unit: &db::WorkUnit,
+        actor: &db::ActorRef,
+        executor_config_snapshot_json: Option<&str>,
+    ) -> Result<PathBuf> {
+        if work_unit.task_id != task.id
+            || work_unit.requires_integration
+            || work_unit.status != db::WorkUnitStatus::Open
+            || work_unit.assigned_actor.as_ref() != Some(actor)
+        {
+            return Err(ServiceError::invalid_operation(
+                "isolated execution context requires the exact open non-repository WorkUnit",
+            ));
+        }
+        let db::ActorRef::Agent(agent_id) = actor else {
+            return Err(ServiceError::invalid_operation(
+                "non-repository WorkUnit execution requires an exact Agent Actor",
+            ));
+        };
+        let snapshot = executor_config_snapshot_json.ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "non-repository WorkUnit Execution has no immutable provider snapshot",
+            )
+        })?;
+        let snapshot = parse_json_value("executor config snapshot", snapshot)?;
+        config::validate_agent_routing_snapshot(&snapshot)?;
+        if snapshot.get("agent_id").and_then(Value::as_str) != Some(agent_id.as_str()) {
+            return Err(ServiceError::invalid_operation(
+                "non-repository WorkUnit provider snapshot does not match its exact Agent",
+            ));
+        }
+        let executor_type = snapshot
+            .get("executor_type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "non-repository WorkUnit provider snapshot has no executor type",
+                )
+            })?;
+        let kind = executor_type
+            .parse::<ExecutorKind>()
+            .map_err(ServiceError::invalid_operation)?;
+        let adapter_is_supported = if let Some(registry) = self.adapter_registry.as_deref() {
+            registry.get(&kind).is_some()
+        } else {
+            let registry = cli_adapters::default_registry();
+            registry.get(&kind).is_some()
+        };
+        if !adapter_is_supported {
+            return Err(ServiceError::invalid_operation(format!(
+                "non-repository WorkUnit provider {executor_type} has no local CLI adapter"
+            )));
+        }
+        let daemon_id = snapshot
+            .get("resolved_daemon_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "non-repository WorkUnit provider snapshot has no exact execution host",
+                )
+            })?;
+        let daemon = db::DaemonRepo::get_by_id(&*self.db, daemon_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("daemon", daemon_id.to_owned()))?;
+        if daemon.status != db::DaemonStatus::Online
+            || !crate::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id)
+        {
+            return Err(ServiceError::invalid_operation(
+                "non-repository WorkUnit context is supported only by the online embedded execution host",
+            ));
+        }
+        create_isolated_context_directory(
+            &self.workspace_root,
+            &[".forge-workunit-context", &task.id, &work_unit.id],
+        )
+    }
+
+    pub(crate) async fn resolve_execution_working_context(
+        &self,
+        execution: &Execution,
+    ) -> Result<ExecutionWorkingContext> {
+        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+        if execution.role == "orchestrator"
+            && execution.purpose == Some(ExecutionPurpose::Orchestrate)
+        {
+            self.validate_orchestrator_execution(execution).await?;
+            return Ok(ExecutionWorkingContext {
+                path: create_isolated_context_directory(
+                    &self.workspace_root,
+                    &[".forge-orchestrator-context", &execution.id],
+                )?,
+                lock_key: format!("orchestrator-context:{}", execution.id),
+                workspace: None,
+            });
+        }
+        if let Some(workspace_id) = execution.workspace_id.as_deref() {
+            let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+            self.verify_active_workspace_lease(
+                &task,
+                &workspace,
+                &execution.role,
+                execution.agent_id.as_deref(),
+                &execution.id,
+            )
+            .await?;
+            return Ok(ExecutionWorkingContext {
+                path: PathBuf::from(&workspace.worktree_path),
+                lock_key: workspace.id.clone(),
+                workspace: Some(workspace),
+            });
+        }
+        let work_unit_id = execution.work_unit_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation("Execution has no repository or WorkUnit context")
+        })?;
+        let work_unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
+            .await?
+            .filter(|unit| unit.task_id == task.id)
+            .ok_or_else(|| ServiceError::not_found("work_unit", work_unit_id.to_owned()))?;
+        if work_unit.requires_integration {
+            return Err(ServiceError::invalid_operation(
+                "repository WorkUnit Execution requires its exact Workspace",
+            ));
+        }
+        self.verify_execution_workspace_authority(execution).await?;
+        let actor = execution.actor_ref().ok_or_else(|| {
+            ServiceError::invalid_operation("WorkUnit Execution has no exact Actor")
+        })?;
+        let path = self
+            .prepare_non_repository_work_unit_context(
+                &task,
+                &work_unit,
+                &actor,
+                execution.executor_config_snapshot_json.as_deref(),
+            )
+            .await?;
+        Ok(ExecutionWorkingContext {
+            path,
+            lock_key: format!("work-unit-context:{}:{}", task.id, work_unit.id),
+            workspace: None,
+        })
+    }
+
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
         Self {
             db,
@@ -254,6 +469,8 @@ impl TaskService {
             automatic_recovery_precommit_barrier: None,
             #[cfg(test)]
             provider_start_claim_barrier: None,
+            #[cfg(test)]
+            execution_provider_override: None,
         }
     }
 
@@ -272,6 +489,15 @@ impl TaskService {
         barrier: Arc<tokio::sync::Barrier>,
     ) -> Self {
         self.provider_start_claim_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_execution_provider_override(
+        mut self,
+        provider: Arc<dyn crate::daemon_transport::ExecutionProvider>,
+    ) -> Self {
+        self.execution_provider_override = Some(provider);
         self
     }
 
@@ -528,6 +754,13 @@ impl TaskService {
                     "non-mutating WorkUnit Execution cannot bind a repository Workspace",
                 ));
             }
+            self.prepare_non_repository_work_unit_context(
+                &task,
+                &work_unit,
+                actor,
+                input.executor_config_snapshot_json.as_deref(),
+            )
+            .await?;
             None
         };
 
@@ -839,6 +1072,13 @@ impl TaskService {
                     "non-repository recovery cannot select a WorkUnit Workspace",
                 ));
             }
+            self.prepare_non_repository_work_unit_context(
+                &task,
+                &work_unit,
+                actor,
+                input.executor_config_snapshot_json.as_deref(),
+            )
+            .await?;
             None
         };
 

@@ -948,3 +948,93 @@ BUG_STILL_LIVE = 0
 This supplement is pre-publication evidence; the final report records the
 commit, push, remote SHA, merge-base, and clean-tree verification. No merge was
 made; PR14 has not started.
+
+## PR13 final correction — Orchestrator claim, isolated Agent WorkUnits, and Start evidence — 2026-10-15
+
+This correction started from local and remote branch HEAD
+`cf4601f79f055cc529d4cd86752d70698f177c80`. The live `main` merge-base was
+`3d3b6b196672568c85e4c3cd2c11f010b1f62d9a`; no merge or PR14/PR15 work was
+started.
+
+**P1 — Orchestrator claim did not revalidate its Wake authority.** An
+Orchestrator Execution has no WorkUnit, so the ordinary transactional
+WorkUnit/RoleMembership/WorkspaceLease branch skipped it after the service
+preflight. The existing `BEGIN IMMEDIATE` claim now distinguishes exact
+`orchestrator`/`orchestrate` Executions and checks the current Wake, Task,
+Agent Actor, TaskRole version and authorized policy snapshot, active
+RoleMembership, current `start_requested` attempt, and unexpired Wake lease
+before inserting `execution.provider_start_attempted`. Previously recorded
+external attempts still replay their durable disposition without calling the
+provider again. Normal WorkUnit authority checks remain unchanged.
+
+**P1 — non-repository Agent WorkUnits had no usable execution context.**
+Admission accepted a non-integration WorkUnit without Workspace, while start
+parameter preparation and execution required one. Admission now prepares the
+stable isolated path `.forge-workunit-context/<task_id>/<work_unit_id>` and
+checks the exact frozen Agent routing, supported local CLI adapter, and online
+embedded host before writing a Running Execution. One shared resolver supplies
+the same context path to provider parameters and execution. It creates no
+Workspace or WorkspaceLease and never uses the Task integration Workspace.
+Unsupported host/provider combinations reject before Running admission.
+Retries, recovery, and follow-up resolve the same exact WorkUnit context;
+follow-up retains the durable HarnessSession identity.
+
+**P2 — Orchestrator treated every `Ok` as accepted and every error as
+uncertain.** Runtime resolution now requires an accepted response, matching
+durable accepted receipt, still-Running exact Execution, and current Wake
+lease before committing both Wake and attempt as `running`. A durable provider
+rejection fails the Execution/Wake/attempt. Task cancellation or lost
+authority with no attempt fails or cancels without inventing external
+uncertainty. When an attempt may have reached the provider but outcome evidence
+is uncertain or incomplete, the existing uncertain state is preserved and the
+Start is never repeated.
+
+### Deterministic reproduction and focused evidence
+
+The claim tests pause after preflight and parameter preparation and mutate
+authority before the SQLite claim. The runtime tests use a barrier at the same
+boundary and a fixed fake provider with accepted, rejected, and uncertain
+outcomes.
+
+| Check | Result |
+|---|---|
+| Orchestrator claim red run before authority repair | FAIL as expected: the six barrier mutations reached the provider claim without being rejected. |
+| `cargo test -p services --lib pr13_ --locked --offline -- --test-threads=1` after repair | PASS, 13 tests: six authority mutations, one concurrent claim, replay of an existing uncertain attempt, cancellation before claim, authority loss without an attempt, deterministic rejection, accepted Start, and uncertain Start. |
+| Runtime red reproductions with the previous `Ok(_)`/`Err(_)` dispatch branch restored temporarily | FAIL as expected: cancellation and deterministic rejection were advanced as accepted; loss of authority with no attempt was marked uncertain. The fixed branch was restored before green validation. |
+| Non-repository pre-fix reproduction, with the old workspace-required resolution temporarily restored | FAIL as expected (exit 101): admission succeeded, then Start failed with `execution missing workspace_id`. After restoring the shared context resolver, the same test passed and completed in the isolated directory. |
+| `cargo test -p services --lib non_repository_ --locked --offline -- --test-threads=1` | PASS, 6 tests: admission/start/completion, context preparation failure before Running, unsupported remote host rejected before Running, exact follow-up identity, sibling isolation, and restart replay without a duplicate provider Start. |
+| REST `POST /api/v1/tasks/{task_id}/executions` non-repository path | NOT RUN: offline API test build could not resolve cached package `alloc-no-stdlib v2.0.4`; no network fetch was attempted. A focused route test was added to `crates/api/tests/work_units.rs`. |
+| `cargo fmt --all -- --check`; `git diff --check` | PASS. |
+
+### Regression review and remaining evidence
+
+The focused adjacent regressions passed:
+
+| Check | Result |
+|---|---|
+| `cargo test -p services --lib ordinary_reexecute_ --locked --offline -- --test-threads=1` | PASS, 3 tests. |
+| `cargo test -p services --lib follow_up_ --locked --offline -- --test-threads=1` | PASS, 21 tests, including sibling WorkUnits, exact HarnessSession identity, and non-repository context preservation. |
+| `cargo test -p services --lib ordinary_provider_start_failure_keeps_one_admitted_execution_and_event --locked --offline -- --test-threads=1` | PASS; one admitted Execution and no duplicate event on deterministic provider failure. |
+| `cargo test -p services --lib provider_start_claim_revalidates_authority_after_preflight --locked --offline -- --test-threads=1` | PASS; six existing WorkUnit authority barriers still reject before provider Start. |
+| `cargo test -p services --lib failed_external_start_after_durable_recovery_does_not_replay_old_attempt --locked --offline -- --test-threads=1` | PASS; manual recovery retains durable child identity and does not replay a prior external attempt. |
+| `cargo test -p services --lib explicit_multi_work_unit_recovery_keeps_repository_workspaces_and_leases_separate --locked --offline -- --test-threads=1` | PASS; sibling repository WorkspaceLease bindings remain separate. |
+| `cargo test -p services --lib concurrent_dispatcher_ticks_recover_post_commit_auto_start_after_unpause --locked --offline -- --test-threads=1` | PASS; concurrent Auto recovery dispatch. |
+| `cargo test -p services --lib crash_recovery_resolves_pending_start_after_its_workspace_lease_expired --locked --offline -- --test-threads=1` | PASS; CrashRecovery resolves the exact pending provider attempt. |
+| `cargo test -p services --lib cancel_execution_invokes_task_executor_cancel --locked --offline -- --test-threads=1`; `cargo test -p services --lib cancel_task_cancels_running_execution --locked --offline -- --test-threads=1` | PASS, both Execution-level and Task-level cancellation routes. |
+| `cargo fmt --all -- --check`; `git diff --check` | PASS. |
+
+The dispatch audit found one production `provider.start()` call, after the
+durable claim in `TaskService::start_execution()`. Launch, re-execute,
+follow-up, explicit and automatic recovery, dispatcher recovery, and
+Orchestrator dispatch all use that method. No new migration, authority table,
+fake WorkspaceLease, or alternate provider-start path was added. The public
+REST regression is the only NOT RUN test because its locked dependency is
+absent from the offline cache.
+
+No new tables, migration, authority system, fake WorkspaceLease, or parallel
+provider-start path was introduced. The P1 no-repository host restriction is
+documented in Architecture V2 and the Unreleased Breaking changelog.
+
+No additional demonstrable finding was identified. Final census for these
+corrections: P0 = 0, P1 = 0, P2 = 0, P3 = 0, `BUG_STILL_LIVE = 0`. The final
+commit SHA, remote ref, and clean-tree checkpoint are in the delivery report.

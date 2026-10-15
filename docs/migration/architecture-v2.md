@@ -556,6 +556,25 @@ unexpired WorkspaceLease bound to that Execution in one SQLite write
 transaction. An existing provider-attempt receipt short-circuits retries so
 an uncertain external effect is never sent again.
 
+An Orchestrator Execution has no WorkUnit or WorkspaceLease. Its claim instead
+resolves the exact current OrchestratorWake attempt and, in that same write
+transaction, checks the Execution's Task, Agent Actor, `orchestrator` Role,
+`orchestrate` Purpose, active TaskRole membership, TaskRole version and policy
+snapshot, current Wake state, attempt number, and unexpired Wake lease. A lost
+authority claim records no provider attempt. The external attempt receipt is
+still checked first so accepted, rejected, and uncertain provider outcomes
+cannot be replayed.
+
+A non-repository Agent WorkUnit (`requires_integration = false`) has no
+Workspace and receives no WorkspaceLease. Its isolated execution context is
+the stable path `.forge-workunit-context/<task_id>/<work_unit_id>` under the
+configured workspace root. Parameter preparation and execution resolve that
+same exact WorkUnit context. Admission prepares the directory and verifies the
+frozen Agent, local CLI adapter, and online embedded host before creating a
+Running Execution. A host/provider combination without this local isolated
+context is rejected before admission; the missing Workspace never grants
+access to the server working directory or the Task integration Workspace.
+
 ### INV-031 — Cognitive policy is not Rust workflow branching
 
 Whether to investigate, replan, reassign, select another reviewer, or ask a

@@ -1184,45 +1184,82 @@ impl OrchestratorRuntime {
                 .await?;
             return Ok(DispatchOutcome::Retried);
         }
-        match self.task_service.start_execution(&execution.id).await {
-            Ok(_) => {
-                OrchestratorWakeRepo::transition_orchestrator_wake_execution(
-                    &*self.db,
-                    db::TransitionOrchestratorWakeExecution {
-                        wake_id: wake.id.clone(),
-                        attempt_number: reserved.attempt_number,
-                        execution_id: reserved.execution_id.clone(),
-                        lease_owner: None,
-                        expected_state: Some("start_requested".to_owned()),
-                        state: "running".to_owned(),
-                        last_error: None,
-                        updated_at: now_rfc3339(),
-                    },
-                )
-                .await?;
-                OrchestratorWakeRepo::transition_orchestrator_wake(
-                    &*self.db,
-                    db::TransitionOrchestratorWake {
-                        id: wake.id,
-                        expected_state: Some(OrchestratorWakeState::Leased),
-                        lease_owner: Some(self.lease_owner.clone()),
-                        state: OrchestratorWakeState::Running,
-                        available_at: None,
-                        current_attempt: None,
-                        last_error: None,
-                        updated_at: now_rfc3339(),
-                    },
-                )
-                .await?;
-                Ok(DispatchOutcome::Dispatched)
+        let start_result = self.task_service.start_execution(&execution.id).await;
+        let start_result_accepted = matches!(&start_result, Ok(result) if result.accepted);
+        let start_result_rejected = matches!(&start_result, Ok(result) if !result.accepted);
+        let receipt_evidence = self.provider_start_receipt_evidence(&execution).await?;
+        match receipt_evidence {
+            ProviderStartReceiptEvidence::Accepted if start_result_accepted => {
+                let execution_is_running = ExecutionRepo::get_by_id(&*self.db, &execution.id)
+                    .await?
+                    .is_some_and(|current| current.status == ExecutionStatus::Running);
+                if execution_is_running
+                    && self
+                        .resolve_start_disposition(&wake, &reserved, "running", None)
+                        .await?
+                {
+                    Ok(DispatchOutcome::Dispatched)
+                } else {
+                    self.make_uncertain(
+                        &wake,
+                        &reserved,
+                        "provider accepted Start but its exact Running Execution or Wake lease changed before durable resolution",
+                    )
+                    .await?;
+                    Ok(DispatchOutcome::Retried)
+                }
             }
-            Err(error) => {
-                self.make_uncertain(
+            ProviderStartReceiptEvidence::Rejected if !start_result_accepted => {
+                self.fail_start_execution_if_running(
+                    &execution,
+                    "provider deterministically rejected Start",
+                )
+                .await?;
+                self.resolve_start_disposition(
                     &wake,
                     &reserved,
-                    &format!("Harness start outcome is ambiguous: {error}"),
+                    "failed",
+                    Some("provider deterministically rejected Start"),
                 )
                 .await?;
+                Ok(DispatchOutcome::Retried)
+            }
+            ProviderStartReceiptEvidence::NoAttempt
+            | ProviderStartReceiptEvidence::IncoherentWithoutAttempt => {
+                let reason = if start_result_rejected {
+                    "Start was rejected or cancelled before any external attempt"
+                } else {
+                    "Start ended before any durable external attempt"
+                };
+                self.fail_start_execution_if_running(&execution, reason)
+                    .await?;
+                self.resolve_start_disposition(&wake, &reserved, "failed", Some(reason))
+                    .await?;
+                Ok(DispatchOutcome::Retried)
+            }
+            evidence @ (ProviderStartReceiptEvidence::Accepted
+            | ProviderStartReceiptEvidence::Rejected
+            | ProviderStartReceiptEvidence::Uncertain
+            | ProviderStartReceiptEvidence::AttemptedWithoutOutcome
+            | ProviderStartReceiptEvidence::IncoherentWithAttempt) => {
+                let reason = match &start_result {
+                    Ok(result) if result.accepted => {
+                        "provider Start response conflicts with its durable receipt"
+                    }
+                    Ok(_) => {
+                        "provider rejected Start after an attempt with conflicting durable evidence"
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            %error,
+                            evidence = ?evidence,
+                            "provider Start did not resolve to a durable accepted or rejected receipt"
+                        );
+                        "provider Start may have reached the external provider without a coherent durable outcome"
+                    }
+                };
+                self.make_uncertain(&wake, &reserved, reason).await?;
                 Ok(DispatchOutcome::Retried)
             }
         }
@@ -2081,6 +2118,101 @@ impl OrchestratorRuntime {
         Ok(policy)
     }
 
+    async fn provider_start_receipt_evidence(
+        &self,
+        execution: &db::Execution,
+    ) -> Result<ProviderStartReceiptEvidence> {
+        let attempt_type = "execution.provider_start_attempted";
+        let attempt = DomainEventRepo::get_event_by_dedupe(
+            &*self.db,
+            &format!("{attempt_type}:{}", execution.id),
+        )
+        .await?;
+        let mut outcome = None;
+        for (event_type, evidence) in [
+            (
+                "execution.provider_start_accepted",
+                ProviderStartReceiptEvidence::Accepted,
+            ),
+            (
+                "execution.provider_start_rejected",
+                ProviderStartReceiptEvidence::Rejected,
+            ),
+            (
+                "execution.provider_start_uncertain",
+                ProviderStartReceiptEvidence::Uncertain,
+            ),
+        ] {
+            if let Some(event) = DomainEventRepo::get_event_by_dedupe(
+                &*self.db,
+                &format!("{event_type}:{}", execution.id),
+            )
+            .await?
+            {
+                if outcome.is_some() || !provider_start_event_matches_execution(&event, execution) {
+                    return Ok(if attempt.is_some() {
+                        ProviderStartReceiptEvidence::IncoherentWithAttempt
+                    } else {
+                        ProviderStartReceiptEvidence::IncoherentWithoutAttempt
+                    });
+                }
+                outcome = Some(evidence);
+            }
+        }
+        let Some(attempt) = attempt else {
+            return Ok(if outcome.is_some() {
+                ProviderStartReceiptEvidence::IncoherentWithoutAttempt
+            } else {
+                ProviderStartReceiptEvidence::NoAttempt
+            });
+        };
+        if !provider_start_event_matches_execution(&attempt, execution)
+            || attempt.event_type != attempt_type
+        {
+            return Ok(ProviderStartReceiptEvidence::IncoherentWithAttempt);
+        }
+        Ok(outcome.unwrap_or(ProviderStartReceiptEvidence::AttemptedWithoutOutcome))
+    }
+
+    async fn resolve_start_disposition(
+        &self,
+        wake: &OrchestratorWake,
+        attempt: &OrchestratorWakeExecution,
+        state: &str,
+        reason: Option<&str>,
+    ) -> Result<bool> {
+        OrchestratorWakeRepo::resolve_orchestrator_start(
+            &*self.db,
+            db::ResolveOrchestratorStart {
+                wake_id: wake.id.clone(),
+                attempt_number: attempt.attempt_number,
+                execution_id: attempt.execution_id.clone(),
+                lease_owner: self.lease_owner.clone(),
+                state: state.to_owned(),
+                last_error: reason.map(str::to_owned),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .map_err(ServiceError::from)
+    }
+
+    async fn fail_start_execution_if_running(
+        &self,
+        execution: &db::Execution,
+        reason: &str,
+    ) -> Result<()> {
+        if ExecutionRepo::get_by_id(&*self.db, &execution.id)
+            .await?
+            .is_some_and(|current| current.status == ExecutionStatus::Running)
+        {
+            self.task_service
+                .fail_execution_before_dispatch(&execution.id, reason.to_owned())
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn defer_wake(&self, wake: &OrchestratorWake, reason: &str) -> Result<()> {
         let now = now_rfc3339();
         OrchestratorWakeRepo::transition_orchestrator_wake(
@@ -2185,6 +2317,17 @@ enum DispatchOutcome {
     Retried,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderStartReceiptEvidence {
+    NoAttempt,
+    Accepted,
+    Rejected,
+    Uncertain,
+    AttemptedWithoutOutcome,
+    IncoherentWithAttempt,
+    IncoherentWithoutAttempt,
+}
+
 impl OrchestratorAction {
     fn policy_kind(&self) -> OrchestratorActionKind {
         match self {
@@ -2259,6 +2402,25 @@ fn terminal_event_matches_execution(event_type: &str, status: &ExecutionStatus) 
         "execution.cancelled" => status == &ExecutionStatus::Cancelled,
         _ => false,
     }
+}
+
+fn provider_start_event_matches_execution(event: &DomainEvent, execution: &db::Execution) -> bool {
+    let actor = execution.actor_ref();
+    event.entity_type == "execution"
+        && event.entity_id == execution.id
+        && event.actor_type
+            == actor
+                .as_ref()
+                .map(|actor| actor.kind().to_string())
+                .unwrap_or_default()
+        && event.actor_id.as_deref() == actor.as_ref().map(|actor| actor.id())
+        && event.scope_type == "task"
+        && event.scope_id == execution.task_id
+        && event.correlation_id == execution.id
+        && event.causation_id == execution.parent_execution_id
+        && event.causation_depth == i64::from(execution.parent_execution_id.is_some())
+        && event.dedupe_key.as_deref()
+            == Some(format!("{}:{}", event.event_type, execution.id).as_str())
 }
 
 fn terminal_reconciliation_state(
@@ -2653,6 +2815,1038 @@ mod tests {
         .execute(database.pool())
         .await
         .expect("consumer cursor advances to its high-water mark");
+    }
+
+    struct ProviderStartFixture {
+        database: Arc<db::SqliteDb>,
+        service: Arc<TaskService>,
+        runtime: OrchestratorRuntime,
+        _workspace_root: tempfile::TempDir,
+        task_id: String,
+        role_id: String,
+        membership_id: String,
+        wake_id: String,
+        execution_id: String,
+        attempt_number: i64,
+        lease_owner: String,
+        provider_calls: Arc<std::sync::atomic::AtomicUsize>,
+        provider_started: Arc<tokio::sync::Notify>,
+    }
+
+    async fn provider_start_fixture(
+        claim_barrier: Option<Arc<tokio::sync::Barrier>>,
+    ) -> ProviderStartFixture {
+        provider_start_fixture_with_options(claim_barrier, true, None).await
+    }
+
+    #[derive(Clone, Copy)]
+    enum FixedStartOutcome {
+        Accepted,
+        Rejected,
+        Uncertain,
+    }
+
+    struct FixedStartProvider {
+        outcome: FixedStartOutcome,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::daemon_transport::ExecutionProvider for FixedStartProvider {
+        async fn start(
+            &self,
+            params: api_types::ExecutionStartParams,
+        ) -> std::result::Result<api_types::ExecutionStartResult, ServiceError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.notify_one();
+            match self.outcome {
+                FixedStartOutcome::Accepted => Ok(api_types::ExecutionStartResult {
+                    execution_id: params.execution_id,
+                    accepted: true,
+                }),
+                FixedStartOutcome::Rejected => Ok(api_types::ExecutionStartResult {
+                    execution_id: params.execution_id,
+                    accepted: false,
+                }),
+                FixedStartOutcome::Uncertain => Err(ServiceError::invalid_operation(
+                    "test provider lost its response after accepting the request",
+                )),
+            }
+        }
+
+        async fn cancel(
+            &self,
+            params: api_types::ExecutionCancelParams,
+        ) -> std::result::Result<api_types::ExecutionCancelResult, ServiceError> {
+            Ok(api_types::ExecutionCancelResult {
+                execution_id: params.execution_id,
+                cancelled: true,
+            })
+        }
+    }
+
+    async fn provider_start_pending_fixture(
+        claim_barrier: Option<Arc<tokio::sync::Barrier>>,
+        outcome: FixedStartOutcome,
+    ) -> ProviderStartFixture {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider: Arc<dyn crate::daemon_transport::ExecutionProvider> =
+            Arc::new(FixedStartProvider {
+                outcome,
+                calls: Arc::clone(&calls),
+                started: Arc::clone(&started),
+            });
+        provider_start_fixture_with_options(claim_barrier, false, Some((provider, calls, started)))
+            .await
+    }
+
+    async fn provider_start_receipt_count(
+        database: &Arc<db::SqliteDb>,
+        execution_id: &str,
+        event_type: &str,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE entity_id = ? AND entity_type = 'execution' AND event_type = ?",
+        )
+        .bind(execution_id)
+        .bind(event_type)
+        .fetch_one(database.pool())
+        .await
+        .expect("provider Start receipt count loads")
+    }
+
+    async fn dispatched_provider_start(
+        fixture: &ProviderStartFixture,
+    ) -> (
+        db::Execution,
+        db::OrchestratorWakeExecution,
+        db::OrchestratorWake,
+    ) {
+        let (execution_id, attempt_number): (String, i64) = sqlx::query_as(
+            "SELECT execution_id, attempt_number FROM orchestrator_wake_execution
+             WHERE wake_id = ? ORDER BY attempt_number DESC LIMIT 1",
+        )
+        .bind(&fixture.wake_id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("exact dispatched attempt loads");
+        let execution = ExecutionRepo::get_by_id(&*fixture.database, &execution_id)
+            .await
+            .expect("dispatched Execution loads")
+            .expect("dispatched Execution exists");
+        let (wake, attempt) = OrchestratorWakeRepo::get_orchestrator_wake_by_execution(
+            &*fixture.database,
+            &execution_id,
+        )
+        .await
+        .expect("Wake and exact attempt load")
+        .expect("Wake and exact attempt exist");
+        assert_eq!(wake.id, fixture.wake_id);
+        assert_eq!(attempt.attempt_number, attempt_number);
+        (execution, attempt, wake)
+    }
+
+    async fn provider_start_fixture_with_options(
+        claim_barrier: Option<Arc<tokio::sync::Barrier>>,
+        prepare_start: bool,
+        provider_override: Option<(
+            Arc<dyn crate::daemon_transport::ExecutionProvider>,
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<tokio::sync::Notify>,
+        )>,
+    ) -> ProviderStartFixture {
+        use db::{
+            AgentStatus, CreateAgent, CreateDomainEvent, CreateRoleMembership, DaemonRepo,
+            DaemonStatus, DomainEventRepo, OrchestratorWakeRepo, RoleMembershipRepo,
+            RoleMembershipStatus, TaskRoleRepo, UpdateDaemonReport, UpsertDaemon,
+        };
+
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("SQLite pool creates");
+        db::run_migrations(&pool).await.expect("schema migrates");
+        let database = Arc::new(db::SqliteDb::new(pool));
+        let event_bus = Arc::new(EventBus::new(16));
+        let human_id = test_user(&database, "Provider start fixture owner").await;
+        let project_id = test_project(&database, &human_id).await;
+        let task_id = test_task(&database, &project_id, "Provider start authority").await;
+
+        let now = now_rfc3339();
+        let daemon_id = new_uuid_v4();
+        DaemonRepo::upsert_by_machine_id(
+            &*database,
+            UpsertDaemon {
+                id: daemon_id.clone(),
+                machine_id: crate::embedded_daemon::embedded_machine_id(),
+                hostname: "provider-start-fixture".to_owned(),
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                agent_version: None,
+                labels_json: "{}".to_owned(),
+                status: DaemonStatus::Online,
+                registration_token_hash: None,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("embedded daemon creates");
+        DaemonRepo::update_report(
+            &*database,
+            UpdateDaemonReport {
+                id: daemon_id.clone(),
+                detected_clis_json: r#"[{"kind":"codex","availability":"authenticated"}]"#
+                    .to_owned(),
+                labels_json: None,
+                status: DaemonStatus::Online,
+                last_report_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Codex capability is advertised");
+
+        let agent_id = new_uuid_v4();
+        AgentRepo::create(
+            &*database,
+            CreateAgent {
+                id: agent_id.clone(),
+                name: "PR13 orchestrator".to_owned(),
+                description: None,
+                executor_type: "codex".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: Some(daemon_id),
+                max_concurrent_tasks: 2,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("CLI Agent creates");
+
+        let role_id = test_orchestrator_role(
+            &database,
+            &task_id,
+            Some(CoordinationMode::Collaborative),
+            "{}",
+        )
+        .await;
+        let membership_id = new_uuid_v4();
+        RoleMembershipRepo::add(
+            &*database,
+            CreateRoleMembership {
+                id: membership_id.clone(),
+                task_role_id: role_id.clone(),
+                actor_kind: ActorKind::Agent,
+                actor_id: agent_id.clone(),
+                status: RoleMembershipStatus::Active,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Agent is an active orchestrator member");
+
+        let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_started = Arc::new(tokio::sync::Notify::new());
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut execution_registry = executors::HarnessAdapterRegistry::new();
+        execution_registry.register(Box::new(Pr6RecordingHarnessAdapter {
+            response: r#"{"actions":[]}"#.to_owned(),
+            observed,
+            calls: Some(Arc::clone(&provider_calls)),
+            started: Some(Arc::clone(&provider_started)),
+        }));
+        let _workspace_root = tempfile::tempdir().expect("workspace root creates");
+        let mut task_service = TaskService::new(Arc::clone(&database), Arc::clone(&event_bus))
+            .with_workspace_root(_workspace_root.path().to_path_buf())
+            .with_task_executor(Arc::new(executors::AdapterExecutor::new(Arc::new(
+                execution_registry,
+            ))))
+            .with_adapter_registry(Arc::new(cli_adapters::default_registry()));
+        if let Some(barrier) = claim_barrier {
+            task_service = task_service.with_provider_start_claim_barrier(barrier);
+        }
+        if let Some((provider, _, _)) = provider_override.as_ref() {
+            task_service = task_service.with_execution_provider_override(Arc::clone(provider));
+        }
+        let service = Arc::new(task_service);
+        let runtime = OrchestratorRuntime::new(
+            Arc::clone(&database),
+            Arc::clone(&event_bus),
+            Arc::clone(&service),
+        );
+        let source_event = DomainEventRepo::append_event(
+            &*database,
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "task.transitioned".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: task_id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: task_id.clone(),
+                correlation_id: new_uuid_v4(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: "{}".to_owned(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("durable source event appends");
+        assert_eq!(
+            runtime
+                .admit_signal(
+                    &source_event,
+                    WakeSignal {
+                        work_unit_id: None,
+                        target: WakeTarget::Actor(ActorRef::Agent(agent_id.clone())),
+                    },
+                )
+                .await
+                .expect("exact orchestrator wake admits"),
+            1
+        );
+        let wake_id: String = sqlx::query_scalar(
+            "SELECT id FROM orchestrator_wake WHERE event_id = ? AND task_id = ?",
+        )
+        .bind(&source_event.id)
+        .bind(&task_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("exact wake id loads");
+        let (lease_owner, execution_id, attempt_number) = if prepare_start {
+            let lease_owner = "pr13-provider-start-fixture".to_owned();
+            let wake = OrchestratorWakeRepo::claim_orchestrator_wake(
+                &*database,
+                db::ClaimOrchestratorWake {
+                    lease_owner: lease_owner.clone(),
+                    now: now_rfc3339(),
+                    leased_until: "2099-01-01T00:00:00Z".to_owned(),
+                },
+            )
+            .await
+            .expect("wake claim succeeds")
+            .expect("wake is pending");
+            let execution_id = new_uuid_v4();
+            let attempt = OrchestratorWakeRepo::reserve_orchestrator_wake_execution(
+                &*database,
+                db::ReserveOrchestratorWakeExecution {
+                    wake_id: wake.id.clone(),
+                    lease_owner: lease_owner.clone(),
+                    execution_id: execution_id.clone(),
+                    now: now_rfc3339(),
+                },
+            )
+            .await
+            .expect("exact wake attempt reserves");
+            let wake = OrchestratorWakeRepo::get_orchestrator_wake(&*database, &wake_id)
+                .await
+                .expect("wake reloads after attempt reservation")
+                .expect("wake remains present");
+            let execution = service
+                .dispatch_orchestrator_execution(
+                    &wake,
+                    &attempt,
+                    &lease_owner,
+                    "orchestrate".to_owned(),
+                )
+                .await
+                .expect("exact orchestrator Execution admits");
+            assert_eq!(execution.id, execution_id);
+            assert!(
+                OrchestratorWakeRepo::transition_orchestrator_wake_execution(
+                    &*database,
+                    db::TransitionOrchestratorWakeExecution {
+                        wake_id: wake.id.clone(),
+                        attempt_number: attempt.attempt_number,
+                        execution_id: execution_id.clone(),
+                        lease_owner: Some(lease_owner.clone()),
+                        expected_state: Some("reserved".to_owned()),
+                        state: "start_requested".to_owned(),
+                        last_error: None,
+                        updated_at: now_rfc3339(),
+                    },
+                )
+                .await
+                .expect("attempt transitions before provider Start")
+            );
+            (lease_owner, execution_id, attempt.attempt_number)
+        } else {
+            (String::new(), String::new(), 0)
+        };
+
+        // Keep the role lookup here so the fixture proves its exact durable role.
+        assert!(TaskRoleRepo::get_by_id(&*database, &role_id)
+            .await
+            .expect("TaskRole loads")
+            .is_some());
+        ProviderStartFixture {
+            database,
+            service,
+            runtime,
+            _workspace_root,
+            task_id,
+            role_id,
+            membership_id,
+            wake_id,
+            execution_id,
+            attempt_number,
+            lease_owner,
+            provider_calls: provider_override
+                .as_ref()
+                .map(|(_, calls, _)| Arc::clone(calls))
+                .unwrap_or(provider_calls),
+            provider_started: provider_override
+                .as_ref()
+                .map(|(_, _, started)| Arc::clone(started))
+                .unwrap_or(provider_started),
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum OrchestratorClaimMutation {
+        SuspendMembership,
+        ChangeTaskRolePolicy,
+        FailWake,
+        ExpireWakeLease,
+        FailAttempt,
+        ReplaceAttempt,
+    }
+
+    async fn assert_orchestrator_provider_claim_rejects_race(mutation: OrchestratorClaimMutation) {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let fixture = provider_start_fixture(Some(Arc::clone(&barrier))).await;
+        let start_service = Arc::clone(&fixture.service);
+        let execution_id = fixture.execution_id.clone();
+        let mut start =
+            tokio::spawn(async move { start_service.start_execution(execution_id).await });
+        tokio::time::timeout(std::time::Duration::from_secs(20), barrier.wait())
+            .await
+            .expect("Start reaches the deterministic preclaim barrier");
+
+        match mutation {
+            OrchestratorClaimMutation::SuspendMembership => {
+                let membership =
+                    RoleMembershipRepo::get(&*fixture.database, &fixture.membership_id)
+                        .await
+                        .expect("membership loads")
+                        .expect("membership exists");
+                RoleMembershipRepo::update(
+                    &*fixture.database,
+                    db::UpdateRoleMembership {
+                        id: membership.id,
+                        expected_version: membership.version,
+                        status: RoleMembershipStatus::Suspended,
+                        updated_at: now_rfc3339(),
+                        ended_at: None,
+                    },
+                )
+                .await
+                .expect("membership suspends after preflight");
+            }
+            OrchestratorClaimMutation::ChangeTaskRolePolicy => {
+                let role = TaskRoleRepo::get_by_id(&*fixture.database, &fixture.role_id)
+                    .await
+                    .expect("TaskRole loads")
+                    .expect("TaskRole exists");
+                TaskRoleRepo::update(
+                    &*fixture.database,
+                    db::UpdateTaskRole {
+                        id: role.id,
+                        expected_version: role.version,
+                        coordination_mode: None,
+                        policy_json: Some(r#"{"automatic_orchestration":false}"#.to_owned()),
+                        updated_at: now_rfc3339(),
+                    },
+                )
+                .await
+                .expect("TaskRole policy changes after preflight");
+            }
+            OrchestratorClaimMutation::FailWake => {
+                let changed = sqlx::query(
+                    "UPDATE orchestrator_wake
+                     SET state = 'failed', lease_owner = NULL, lease_until = NULL,
+                         version = version + 1, updated_at = ? WHERE id = ?",
+                )
+                .bind(now_rfc3339())
+                .bind(&fixture.wake_id)
+                .execute(fixture.database.pool())
+                .await
+                .expect("fixture revokes the wake after preflight");
+                assert_eq!(changed.rows_affected(), 1);
+            }
+            OrchestratorClaimMutation::ExpireWakeLease => {
+                let changed = sqlx::query(
+                    "UPDATE orchestrator_wake
+                     SET lease_until = '2000-01-01T00:00:00Z', version = version + 1,
+                         updated_at = ? WHERE id = ?",
+                )
+                .bind(now_rfc3339())
+                .bind(&fixture.wake_id)
+                .execute(fixture.database.pool())
+                .await
+                .expect("fixture expires the wake lease after preflight");
+                assert_eq!(changed.rows_affected(), 1);
+            }
+            OrchestratorClaimMutation::FailAttempt => {
+                assert!(
+                    OrchestratorWakeRepo::transition_orchestrator_wake_execution(
+                        &*fixture.database,
+                        db::TransitionOrchestratorWakeExecution {
+                            wake_id: fixture.wake_id.clone(),
+                            attempt_number: fixture.attempt_number,
+                            execution_id: fixture.execution_id.clone(),
+                            lease_owner: Some(fixture.lease_owner.clone()),
+                            expected_state: Some("start_requested".to_owned()),
+                            state: "failed".to_owned(),
+                            last_error: Some(Some("attempt was superseded".to_owned())),
+                            updated_at: now_rfc3339(),
+                        },
+                    )
+                    .await
+                    .expect("attempt transition resolves")
+                );
+            }
+            OrchestratorClaimMutation::ReplaceAttempt => {
+                let replacement_id = new_uuid_v4();
+                let replacement_number = fixture.attempt_number + 1;
+                let now = now_rfc3339();
+                sqlx::query(
+                    "INSERT INTO orchestrator_wake_execution (
+                        wake_id, attempt_number, execution_id, state, created_at, updated_at
+                     ) VALUES (?, ?, ?, 'reserved', ?, ?)",
+                )
+                .bind(&fixture.wake_id)
+                .bind(replacement_number)
+                .bind(replacement_id)
+                .bind(&now)
+                .bind(&now)
+                .execute(fixture.database.pool())
+                .await
+                .expect("replacement attempt is durable");
+                sqlx::query(
+                    "UPDATE orchestrator_wake SET attempt_count = ?, current_attempt = ?,
+                         version = version + 1, updated_at = ? WHERE id = ?",
+                )
+                .bind(replacement_number)
+                .bind(replacement_number)
+                .bind(now)
+                .bind(&fixture.wake_id)
+                .execute(fixture.database.pool())
+                .await
+                .expect("wake points to the replacement attempt");
+            }
+        }
+
+        barrier.wait().await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut start)
+            .await
+            .expect("provider claim resolves")
+            .expect("Start task joins");
+        assert!(
+            result.is_err(),
+            "{mutation:?} must reject before provider Start: {result:?}"
+        );
+        let execution = ExecutionRepo::get_by_id(&*fixture.database, &fixture.execution_id)
+            .await
+            .expect("Execution loads")
+            .expect("Execution remains present");
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::Failed,
+            "{mutation:?}: Start result {result:?}"
+        );
+        assert_eq!(
+            fixture
+                .provider_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{mutation:?} must not invoke the harness"
+        );
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE entity_id = ? AND event_type = 'execution.provider_start_attempted'",
+        )
+        .bind(&fixture.execution_id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("provider-attempt receipt count loads");
+        assert_eq!(attempts, 0, "{mutation:?} must leave no attempt receipt");
+        let uncertainties: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE entity_id = ? AND event_type = 'execution.provider_start_uncertain'",
+        )
+        .bind(&fixture.execution_id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("uncertain receipt count loads");
+        assert_eq!(uncertainties, 0, "{mutation:?} cannot invent uncertainty");
+    }
+
+    #[tokio::test]
+    async fn pr13_orchestrator_claim_rejects_suspended_membership_after_preflight() {
+        assert_orchestrator_provider_claim_rejects_race(
+            OrchestratorClaimMutation::SuspendMembership,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pr13_orchestrator_claim_rejects_changed_task_role_policy_after_preflight() {
+        assert_orchestrator_provider_claim_rejects_race(
+            OrchestratorClaimMutation::ChangeTaskRolePolicy,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pr13_orchestrator_claim_rejects_revoked_wake_after_preflight() {
+        assert_orchestrator_provider_claim_rejects_race(OrchestratorClaimMutation::FailWake).await;
+    }
+
+    #[tokio::test]
+    async fn pr13_orchestrator_claim_rejects_expired_wake_lease_after_preflight() {
+        assert_orchestrator_provider_claim_rejects_race(OrchestratorClaimMutation::ExpireWakeLease)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn pr13_orchestrator_claim_rejects_stale_attempt_after_preflight() {
+        assert_orchestrator_provider_claim_rejects_race(OrchestratorClaimMutation::FailAttempt)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn pr13_orchestrator_claim_rejects_replaced_attempt_after_preflight() {
+        assert_orchestrator_provider_claim_rejects_race(OrchestratorClaimMutation::ReplaceAttempt)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn pr13_concurrent_orchestrator_claims_send_one_start() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let fixture = provider_start_fixture(Some(Arc::clone(&barrier))).await;
+        let first_service = Arc::clone(&fixture.service);
+        let first_id = fixture.execution_id.clone();
+        let first = tokio::spawn(async move { first_service.start_execution(first_id).await });
+        let second_service = Arc::clone(&fixture.service);
+        let second_id = fixture.execution_id.clone();
+        let second = tokio::spawn(async move { second_service.start_execution(second_id).await });
+        tokio::time::timeout(std::time::Duration::from_secs(20), barrier.wait())
+            .await
+            .expect("both Starts reach preclaim barrier");
+        tokio::time::timeout(std::time::Duration::from_secs(20), barrier.wait())
+            .await
+            .expect("both Starts release toward the claim");
+        let (first_result, second_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                (
+                    first.await.expect("first joins"),
+                    second.await.expect("second joins"),
+                )
+            })
+            .await
+            .expect("both Starts resolve");
+        assert!(first_result.is_ok() || second_result.is_ok());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fixture.provider_started.notified(),
+        )
+        .await
+        .expect("claimed Start invokes the harness");
+        assert_eq!(
+            fixture
+                .provider_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE entity_id = ? AND event_type = 'execution.provider_start_attempted'",
+        )
+        .bind(&fixture.execution_id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("provider-attempt receipt count loads");
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn pr13_orchestrator_uncertain_start_receipt_is_never_replayed() {
+        use db::DomainEventRepo;
+
+        let fixture = provider_start_fixture(None).await;
+        let execution = ExecutionRepo::get_by_id(&*fixture.database, &fixture.execution_id)
+            .await
+            .expect("Execution loads")
+            .expect("Execution exists");
+        let actor = execution.actor_ref().expect("Agent Actor is exact");
+        DomainEventRepo::append_event(
+            &*fixture.database,
+            db::CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "execution.provider_start_attempted".to_owned(),
+                entity_type: "execution".to_owned(),
+                entity_id: execution.id.clone(),
+                actor_type: actor.kind().to_string(),
+                actor_id: Some(actor.id().to_owned()),
+                scope_type: "task".to_owned(),
+                scope_id: execution.task_id.clone(),
+                correlation_id: execution.id.clone(),
+                causation_id: execution.parent_execution_id.clone(),
+                causation_depth: i64::from(execution.parent_execution_id.is_some()),
+                dedupe_key: Some(format!(
+                    "execution.provider_start_attempted:{}",
+                    execution.id
+                )),
+                payload_json: json!({
+                    "execution_id": execution.id,
+                    "task_id": execution.task_id,
+                    "agent_id": execution.agent_id,
+                    "outcome": "attempted",
+                })
+                .to_string(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("uncertain external attempt receipt persists");
+
+        let result = fixture
+            .service
+            .start_execution(fixture.execution_id.clone())
+            .await;
+        assert!(matches!(
+            result,
+            Err(crate::ServiceError::ExecutionStartUncertain { .. })
+        ));
+        assert_eq!(
+            fixture
+                .provider_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an existing uncertain attempt cannot call the provider again"
+        );
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE entity_id = ? AND event_type = 'execution.provider_start_attempted'",
+        )
+        .bind(&fixture.execution_id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("attempt count loads");
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn pr13_cancelled_task_before_provider_claim_has_no_external_attempt() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let fixture =
+            provider_start_pending_fixture(Some(Arc::clone(&barrier)), FixedStartOutcome::Accepted)
+                .await;
+        let runtime = fixture.runtime.clone();
+        let mut dispatch = tokio::spawn(async move { runtime.dispatch_one().await });
+        tokio::time::timeout(std::time::Duration::from_secs(20), barrier.wait())
+            .await
+            .expect("Start reaches the deterministic preclaim barrier");
+
+        let task = TaskRepo::get_by_id(&*fixture.database, &fixture.task_id, false)
+            .await
+            .expect("Task loads")
+            .expect("Task exists");
+        crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&fixture.database),
+            Arc::new(EventBus::new(8)),
+        )
+        .transition(crate::task_lifecycle::TransitionLifecycleInput {
+            task_id: fixture.task_id.clone(),
+            expected_task_version: task.version,
+            to_state: db::TaskLifecycleState::Cancelled,
+            cause: crate::task_lifecycle::LifecycleCause::System(
+                api_types::SystemComponent::CancelTask,
+            ),
+            reason_kind: None,
+            reason_ref: None,
+            idempotency_key: "pr13-orchestrator-cancel-before-claim".to_owned(),
+        })
+        .await
+        .expect("Task cancellation commits before provider claim");
+
+        barrier.wait().await;
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(20), &mut dispatch)
+                .await
+                .expect("dispatch resolves")
+                .expect("dispatch task joins"),
+            Ok(DispatchOutcome::Retried)
+        ));
+        let (execution, attempt, wake) = dispatched_provider_start(&fixture).await;
+        assert_eq!(execution.status, ExecutionStatus::Cancelled);
+        assert_eq!(attempt.state, "failed");
+        assert_eq!(wake.state, OrchestratorWakeState::Failed);
+        assert_eq!(
+            fixture
+                .provider_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_attempted",
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_uncertain",
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pr13_loss_of_authority_without_claim_fails_without_uncertainty() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let fixture =
+            provider_start_pending_fixture(Some(Arc::clone(&barrier)), FixedStartOutcome::Accepted)
+                .await;
+        let runtime = fixture.runtime.clone();
+        let mut dispatch = tokio::spawn(async move { runtime.dispatch_one().await });
+        tokio::time::timeout(std::time::Duration::from_secs(20), barrier.wait())
+            .await
+            .expect("Start reaches the deterministic preclaim barrier");
+        let membership = RoleMembershipRepo::get(&*fixture.database, &fixture.membership_id)
+            .await
+            .expect("membership loads")
+            .expect("membership exists");
+        RoleMembershipRepo::update(
+            &*fixture.database,
+            db::UpdateRoleMembership {
+                id: membership.id,
+                expected_version: membership.version,
+                status: RoleMembershipStatus::Suspended,
+                updated_at: now_rfc3339(),
+                ended_at: None,
+            },
+        )
+        .await
+        .expect("membership is revoked before provider claim");
+        barrier.wait().await;
+
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(20), &mut dispatch)
+                .await
+                .expect("dispatch resolves")
+                .expect("dispatch task joins"),
+            Ok(DispatchOutcome::Retried)
+        ));
+        let (execution, attempt, wake) = dispatched_provider_start(&fixture).await;
+        assert_eq!(execution.status, ExecutionStatus::Failed);
+        assert_eq!(attempt.state, "failed");
+        assert_eq!(wake.state, OrchestratorWakeState::Failed);
+        assert_eq!(
+            fixture
+                .provider_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_attempted",
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_uncertain",
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pr13_provider_rejected_start_is_durably_failed() {
+        let fixture = provider_start_pending_fixture(None, FixedStartOutcome::Rejected).await;
+        assert!(matches!(
+            fixture
+                .runtime
+                .dispatch_one()
+                .await
+                .expect("dispatch resolves"),
+            DispatchOutcome::Retried
+        ));
+        let (execution, attempt, wake) = dispatched_provider_start(&fixture).await;
+        assert_eq!(execution.status, ExecutionStatus::Failed);
+        assert_eq!(attempt.state, "failed");
+        assert_eq!(wake.state, OrchestratorWakeState::Failed);
+        assert_eq!(
+            fixture
+                .provider_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_attempted",
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_rejected",
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_uncertain",
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pr13_provider_acceptance_requires_coherent_durable_receipts() {
+        let fixture = provider_start_pending_fixture(None, FixedStartOutcome::Accepted).await;
+        assert!(matches!(
+            fixture
+                .runtime
+                .dispatch_one()
+                .await
+                .expect("dispatch resolves"),
+            DispatchOutcome::Dispatched
+        ));
+        let (execution, attempt, wake) = dispatched_provider_start(&fixture).await;
+        assert_eq!(execution.status, ExecutionStatus::Running);
+        assert_eq!(attempt.state, "running");
+        assert_eq!(wake.state, OrchestratorWakeState::Running);
+        assert_eq!(
+            fixture
+                .provider_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_attempted",
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_accepted",
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_uncertain",
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pr13_uncertain_provider_start_preserves_running_execution_without_replay() {
+        let fixture = provider_start_pending_fixture(None, FixedStartOutcome::Uncertain).await;
+        assert!(matches!(
+            fixture
+                .runtime
+                .dispatch_one()
+                .await
+                .expect("dispatch resolves"),
+            DispatchOutcome::Retried
+        ));
+        let (execution, attempt, wake) = dispatched_provider_start(&fixture).await;
+        assert_eq!(execution.status, ExecutionStatus::Running);
+        assert_eq!(attempt.state, "uncertain");
+        assert_eq!(wake.state, OrchestratorWakeState::Uncertain);
+        assert_eq!(
+            fixture
+                .provider_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_attempted",
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_uncertain",
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_accepted",
+            )
+            .await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -4180,6 +5374,8 @@ mod tests {
         response: String,
         observed:
             Arc<std::sync::Mutex<Vec<(api_types::HarnessInvocation, Option<String>, String)>>>,
+        calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
+        started: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[async_trait::async_trait]
@@ -4217,6 +5413,12 @@ mod tests {
             &self,
             context: executors::ExecutionContext,
         ) -> std::result::Result<executors::ExecutionResult, executors::ExecutorError> {
+            if let Some(calls) = self.calls.as_ref() {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if let Some(started) = self.started.as_ref() {
+                started.notify_one();
+            }
             self.observed.lock().expect("observation mutex").push((
                 context.invocation,
                 context
@@ -4511,6 +5713,8 @@ mod tests {
                     registry.register(Box::new(Pr6RecordingHarnessAdapter {
                         response: action_response,
                         observed: Arc::clone(&observed),
+                        calls: None,
+                        started: None,
                     }));
                     Arc::new(registry)
                 })))

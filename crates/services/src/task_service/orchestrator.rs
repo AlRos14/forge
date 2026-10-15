@@ -285,12 +285,6 @@ impl TaskService {
         self.publish_committed_domain_event(&committed_event);
         Ok(execution)
     }
-
-    pub(crate) fn orchestrator_context_path(&self, execution_id: &str) -> PathBuf {
-        self.workspace_root
-            .join(".forge-orchestrator-context")
-            .join(execution_id)
-    }
 }
 
 impl TaskService {
