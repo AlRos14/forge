@@ -550,6 +550,12 @@ Workspace authority, leases, security policy, human gates, merge constraints,
 credential boundaries, and destructive-action policy are core-enforced.
 Models cannot reason around them.
 
+Before an external provider Start, the durable claim rechecks the exact open
+WorkUnit revision and Actor assignment, active TaskRole membership, and
+unexpired WorkspaceLease bound to that Execution in one SQLite write
+transaction. An existing provider-attempt receipt short-circuits retries so
+an uncertain external effect is never sent again.
+
 ### INV-031 — Cognitive policy is not Rust workflow branching
 
 Whether to investigate, replan, reassign, select another reviewer, or ask a

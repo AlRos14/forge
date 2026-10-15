@@ -271,6 +271,12 @@ impl TaskService {
             }
         };
 
+        #[cfg(test)]
+        if let Some(barrier) = self.provider_start_claim_barrier.as_ref() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+
         let claim = ExecutionRepo::claim_provider_start(
             &*self.db,
             &execution.id,
@@ -297,7 +303,7 @@ impl TaskService {
             }
             db::ProviderStartClaim::AuthorityLost => {
                 let error = ServiceError::invalid_operation(
-                    "WorkspaceLease expired before provider Start was claimed",
+                    "TaskRole membership, WorkUnit assignment, or WorkspaceLease authority changed before provider Start was claimed",
                 );
                 self.fail_execution_before_dispatch(&execution.id, error.to_string())
                     .await?;

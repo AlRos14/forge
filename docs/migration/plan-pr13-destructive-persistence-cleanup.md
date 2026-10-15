@@ -875,3 +875,76 @@ BUG_STILL_LIVE = 0
 This audit supplement is pre-publication evidence; the final report records the
 commit, push, remote SHA, merge-base, and clean-tree verification. No merge was
 made; PR14 has not started.
+
+## PR13 microfix — atomic Provider Start authority claim — 2026-10-15
+
+This audit started from branch HEAD
+`4b8499445c4b9222d32f1e0e2d978543e209d07b`, matching the remote branch. The
+merge-base remains `3d3b6b196672568c85e4c3cd2c11f010b1f62d9a`.
+
+**P1 — Provider Start claim trusted stale preflight authority.**
+`start_execution()` checked the WorkUnit assignment, active RoleMembership, and
+WorkspaceLease before preparing the provider request. `claim_provider_start()`
+then entered `BEGIN IMMEDIATE`, but previously rechecked only Task cancellation,
+Agent pause, and the WorkspaceLease's basic execution tuple. Suspending a
+membership after service preflight still allowed the durable attempt receipt
+and external Start.
+
+The correction revalidates the exact open WorkUnit, admitted version, assigned
+Actor, active membership for that WorkUnit's TaskRole, and integration mode
+inside the existing claim transaction. The exact WorkspaceLease must still be
+active and unexpired, tied to the Task, WorkUnit, Workspace, Execution and
+operation key, and match its role and Agent principal. Existing Task-cancelled
+and Agent-paused guards remain. A lost authority resolves the pending
+Execution through the existing failure path, revokes any still-active lease,
+and records no provider-attempt receipt. Existing attempt receipts still
+short-circuit before these checks, preserving accepted/rejected/uncertain
+idempotency and preventing a second external effect.
+
+### Deterministic reproduction and focused evidence
+
+The service test pauses after all ordinary authority preflight and provider
+parameter preparation, immediately before `claim_provider_start()`. It then
+changes authority and releases the service into the SQLite write transaction.
+RoleMembership suspension and lease revocation/expiry use the existing
+repositories. WorkUnit reassignment and closure are forced only in isolated
+fixtures by dropping their existing Running-Execution guards; the version
+mutation is also fixture-only.
+
+| Check | Result |
+|---|---|
+| Deterministic red reproduction with the new WorkUnit/membership check temporarily bypassed | FAIL as expected: after membership suspension at the preclaim barrier, `start_execution()` returned `accepted: true`; no other source changes were present in that run. The guard was restored before green validation. |
+| `cargo test -p services --lib provider_start_claim_revalidates_authority_after_preflight --locked --offline -- --test-threads=1` | PASS, six barrier cases: suspended membership, reassigned WorkUnit, closed WorkUnit, changed WorkUnit version, revoked lease, and expired lease. Each leaves `provider_start_attempted` at zero, invokes the executor zero times, marks the pending Execution Failed once, blocks the TaskLifecycle through the existing failure route, and preserves the exact WorkUnit/Workspace bindings. |
+| `cargo test -p services --lib concurrent_provider_start_claims_dispatch_one_external_start --locked --offline -- --test-threads=1` | PASS: two starts cross preflight together; one provider attempt and accepted receipt are recorded and the executor runs once. |
+| `cargo test -p services --lib uncertain_provider_start_retry_never_sends_a_second_external_start --locked --offline -- --test-threads=1` | PASS: a confirmed attempt with uncertain response remains uncertain on retry and sends only one external Start. |
+| `cargo fmt --all -- --check`; `git diff --check` | PASS. |
+
+### Boundary census and residual contract
+
+There is one production `provider.start()` call, after the durable claim in
+`TaskService::start_execution()`. Ordinary launch/actions, follow-up, explicit
+and automatic recovery, dispatcher recovery, and orchestration dispatch all
+route through that method. The only other direct claim call found is inside a
+`#[cfg(test)]` recovery fixture. No migration or API contract changed. The
+claim's existing attempt-receipt check remains ahead of authority checks, so
+an already claimed external effect is never resent after revocation, pause, or
+restart.
+
+SQLite cannot make the provider network request part of the same transaction.
+The successful durable claim is the attempt boundary: authority revoked before
+that commit blocks Start; revocation after that commit cannot retract an
+already claimed attempt, and retries remain fail-closed as uncertain.
+
+The focused review found no additional P0/P1/P2/P3 issue at this boundary.
+
+```text
+P0 = 0
+P1 = 0 (Provider Start authority race corrected)
+P2 = 0
+P3 = 0
+BUG_STILL_LIVE = 0
+```
+
+This supplement is pre-publication evidence; the final report records the
+commit, push, remote SHA, merge-base, and clean-tree verification. No merge was
+made; PR14 has not started.

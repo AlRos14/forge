@@ -952,21 +952,78 @@ impl ExecutionRepo for SqliteDb {
             tx.commit().await?;
             return Ok(ProviderStartClaim::AuthorityLost);
         }
+
+        if let Some(work_unit_id) = execution.work_unit_id.as_deref() {
+            let Some(work_unit_version) = execution.work_unit_version else {
+                tx.commit().await?;
+                return Ok(ProviderStartClaim::AuthorityLost);
+            };
+            let actor = execution.actor_ref().ok_or_else(|| {
+                DbError::Check("provider start claim has no exact WorkUnit Actor".to_owned())
+            })?;
+            let actor_kind = actor.kind().to_string();
+            let actor_id = actor.id().to_owned();
+            // Authority may change after service preflight and while provider
+            // parameters are prepared. Recheck the same exact WorkUnit and
+            // TaskRole bindings under the claim's write lock.
+            let work_unit_authority_is_current: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM work_unit w
+                    JOIN task_role tr ON tr.task_id = w.task_id AND tr.role = w.role
+                    JOIN role_membership rm ON rm.task_role_id = tr.id
+                    WHERE w.id = ? AND w.task_id = ?
+                      AND w.status = 'open' AND w.version = ? AND w.role = ?
+                      AND w.assigned_actor_kind = ? AND w.assigned_actor_id = ?
+                      AND rm.actor_kind = ? AND rm.actor_id = ? AND rm.status = 'active'
+                      AND ((w.requires_integration = 1 AND ? IS NOT NULL)
+                           OR (w.requires_integration = 0 AND ? IS NULL))
+                )",
+            )
+            .bind(work_unit_id)
+            .bind(&execution.task_id)
+            .bind(work_unit_version)
+            .bind(&execution.role)
+            .bind(&actor_kind)
+            .bind(&actor_id)
+            .bind(&actor_kind)
+            .bind(&actor_id)
+            .bind(execution.workspace_id.as_deref())
+            .bind(execution.workspace_id.as_deref())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !work_unit_authority_is_current {
+                tx.commit().await?;
+                return Ok(ProviderStartClaim::AuthorityLost);
+            }
+        }
+
         if let (Some(work_unit_id), Some(workspace_id)) = (
             execution.work_unit_id.as_deref(),
             execution.workspace_id.as_deref(),
         ) {
+            let actor_id = execution
+                .actor_ref()
+                .map(|actor| actor.id().to_owned())
+                .ok_or_else(|| {
+                    DbError::Check("provider start claim has no exact Workspace Actor".to_owned())
+                })?;
             let lease_is_current: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
                     SELECT 1 FROM workspace_lease
                     WHERE task_id = ? AND work_unit_id = ? AND workspace_id = ?
-                      AND execution_id = ? AND status = 'active' AND expires_at > ?
+                      AND execution_id = ? AND operation_idempotency_key = ?
+                      AND role = CASE WHEN trim(?) = 'reviewer' THEN 'reviewer' ELSE 'worker' END
+                      AND assigned_principal_type = 'agent' AND assigned_principal_id = ?
+                      AND status = 'active' AND expires_at > ?
                 )",
             )
             .bind(&execution.task_id)
             .bind(work_unit_id)
             .bind(workspace_id)
             .bind(&execution.id)
+            .bind(&execution.id)
+            .bind(&execution.role)
+            .bind(&actor_id)
             .bind(crate::now_rfc3339())
             .fetch_one(&mut *tx)
             .await?;

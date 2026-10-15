@@ -86,6 +86,8 @@ pub struct TaskService {
     credential_env: Option<Arc<crate::credential_service::CredentialService>>,
     #[cfg(test)]
     automatic_recovery_precommit_barrier: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    provider_start_claim_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 pub(crate) struct WorkUnitAdmissionLifecyclePlan {
@@ -250,6 +252,8 @@ impl TaskService {
             credential_env: None,
             #[cfg(test)]
             automatic_recovery_precommit_barrier: None,
+            #[cfg(test)]
+            provider_start_claim_barrier: None,
         }
     }
 
@@ -259,6 +263,15 @@ impl TaskService {
         barrier: Arc<tokio::sync::Barrier>,
     ) -> Self {
         self.automatic_recovery_precommit_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_provider_start_claim_barrier(
+        mut self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.provider_start_claim_barrier = Some(barrier);
         self
     }
 

@@ -5729,6 +5729,345 @@ async fn ordinary_provider_start_failure_keeps_one_admitted_execution_and_event(
     assert_eq!(transitions, 1);
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ProviderStartClaimAuthorityMutation {
+    SuspendMembership,
+    ReassignWorkUnit,
+    CloseWorkUnit,
+    ChangeWorkUnitVersion,
+    RevokeLease,
+    ExpireLease,
+}
+
+async fn assert_provider_start_claim_rejects_authority_race(
+    mutation: ProviderStartClaimAuthorityMutation,
+) {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    let snapshot =
+        crate::task_service::config::build_executor_config_snapshot(&db, &task, &agent, None, None)
+            .await
+            .expect("exact Agent routing snapshot builds")
+            .expect("Agent snapshot exists");
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let executor = Arc::new(RecoveryDispatchExecutor::default());
+    let claim_barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_task_executor(executor.clone())
+        .with_provider_start_claim_barrier(Arc::clone(&claim_barrier));
+    let (execution, workspace) = create_running_repository_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        "implementer",
+        db::ExecutionPurpose::Implement,
+        workspace_root.path(),
+        Some("provider Start authority race fixture".to_owned()),
+        Some(snapshot),
+    )
+    .await;
+    let daemon_id = agent.daemon_id.as_deref().expect("Agent has its daemon");
+    let changed = sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
+        .bind(crate::embedded_daemon::embedded_machine_id())
+        .bind(daemon_id)
+        .execute(db.pool())
+        .await
+        .expect("fixture routes provider Start to the embedded executor");
+    assert_eq!(changed.rows_affected(), 1);
+    let work_unit_id = execution.work_unit_id.as_deref().expect("WorkUnit id");
+    let lease = WorkspaceLeaseRepo::get_active_for_work_unit(&*db, work_unit_id)
+        .await
+        .expect("exact WorkUnit lease loads")
+        .expect("admission creates the exact WorkUnit lease");
+
+    let start_service = service.clone();
+    let start_execution_id = execution.id.clone();
+    let mut start =
+        tokio::spawn(async move { start_service.start_execution(start_execution_id).await });
+    // The service has completed all ordinary preflight and provider parameter
+    // preparation, and is stopped immediately before the durable claim.
+    if tokio::time::timeout(std::time::Duration::from_secs(20), claim_barrier.wait())
+        .await
+        .is_err()
+    {
+        let early_result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut start).await;
+        panic!("provider start did not reach the claim barrier; early result: {early_result:?}");
+    }
+    match mutation {
+        ProviderStartClaimAuthorityMutation::SuspendMembership => {
+            let (_, membership) = db::RoleMembershipRepo::list_by_task(&*db, &task.id, false)
+                .await
+                .expect("TaskRole memberships load")
+                .into_iter()
+                .find(|(_, membership)| membership.actor_id == agent_id)
+                .expect("Agent membership exists");
+            db::RoleMembershipRepo::update(
+                &*db,
+                db::UpdateRoleMembership {
+                    id: membership.id,
+                    expected_version: membership.version,
+                    status: db::RoleMembershipStatus::Suspended,
+                    updated_at: now_rfc3339(),
+                    ended_at: None,
+                },
+            )
+            .await
+            .expect("RoleMembership suspends after preflight");
+        }
+        ProviderStartClaimAuthorityMutation::ReassignWorkUnit => {
+            let replacement_agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+            service
+                .add_task_role_member(
+                    &task.id,
+                    "implementer",
+                    ActorRef::Agent(replacement_agent_id.clone()),
+                )
+                .await
+                .expect("replacement Agent joins the same TaskRole");
+            sqlx::query("DROP TRIGGER work_unit_allocation_running_guard")
+                .execute(db.pool())
+                .await
+                .expect("isolated fixture removes the running allocation guard");
+            let changed = sqlx::query(
+                "UPDATE work_unit SET assigned_actor_kind = 'agent', assigned_actor_id = ?,
+                     version = version + 1, updated_at = ? WHERE id = ?",
+            )
+            .bind(replacement_agent_id)
+            .bind(now_rfc3339())
+            .bind(work_unit_id)
+            .execute(db.pool())
+            .await
+            .expect("fixture reassigns the WorkUnit after preflight");
+            assert_eq!(changed.rows_affected(), 1);
+        }
+        ProviderStartClaimAuthorityMutation::CloseWorkUnit => {
+            sqlx::query("DROP TRIGGER work_unit_completion_running_guard")
+                .execute(db.pool())
+                .await
+                .expect("isolated fixture removes the running completion guard");
+            let changed = sqlx::query(
+                "UPDATE work_unit SET status = 'cancelled', version = version + 1,
+                     updated_at = ? WHERE id = ?",
+            )
+            .bind(now_rfc3339())
+            .bind(work_unit_id)
+            .execute(db.pool())
+            .await
+            .expect("fixture closes the WorkUnit after preflight");
+            assert_eq!(changed.rows_affected(), 1);
+        }
+        ProviderStartClaimAuthorityMutation::ChangeWorkUnitVersion => {
+            let changed = sqlx::query(
+                "UPDATE work_unit SET version = version + 1, updated_at = ? WHERE id = ?",
+            )
+            .bind(now_rfc3339())
+            .bind(work_unit_id)
+            .execute(db.pool())
+            .await
+            .expect("fixture advances the WorkUnit version after preflight");
+            assert_eq!(changed.rows_affected(), 1);
+        }
+        ProviderStartClaimAuthorityMutation::RevokeLease => {
+            WorkspaceLeaseRepo::revoke(&*db, &lease.id, lease.version, &now_rfc3339())
+                .await
+                .expect("exact WorkspaceLease revokes after preflight");
+        }
+        ProviderStartClaimAuthorityMutation::ExpireLease => {
+            let expired = WorkspaceLeaseRepo::expire(&*db, "9999-12-31T00:00:00Z", 500)
+                .await
+                .expect("exact WorkspaceLease expires after preflight");
+            assert!(expired.iter().any(|expired| expired.id == lease.id));
+        }
+    }
+    claim_barrier.wait().await;
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut start)
+        .await
+        .expect("claim resolves without waiting for an external provider")
+        .expect("start task joins");
+    assert!(
+        matches!(result, Err(ServiceError::InvalidOperation { ref message })
+            if message.contains("authority changed before provider Start was claimed")),
+        "{mutation:?} must be rejected by the durable claim, got {result:?}"
+    );
+    assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let stored = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("Execution reloads after claim rejection")
+        .expect("Execution remains present");
+    assert_eq!(stored.status, ExecutionStatus::Failed, "{mutation:?}");
+    assert_eq!(stored.work_unit_id.as_deref(), Some(work_unit_id));
+    assert_eq!(stored.workspace_id.as_deref(), Some(workspace.id.as_str()));
+    assert_eq!(
+        TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+            .await
+            .expect("TaskLifecycle reloads")
+            .expect("TaskLifecycle remains present")
+            .state,
+        db::TaskLifecycleState::Blocked
+    );
+    let lease_after = WorkspaceLeaseRepo::get_by_id(&*db, &lease.id)
+        .await
+        .expect("lease reloads")
+        .expect("lease remains present");
+    match mutation {
+        ProviderStartClaimAuthorityMutation::ExpireLease => {
+            assert_eq!(lease_after.status, "expired");
+        }
+        ProviderStartClaimAuthorityMutation::RevokeLease => {
+            assert_eq!(lease_after.status, "revoked");
+        }
+        _ => assert_eq!(lease_after.status, "revoked"),
+    }
+    for (event_type, expected_count) in [
+        ("execution.started", 1_i64),
+        ("execution.provider_start_pending", 1),
+        ("execution.provider_start_attempted", 0),
+        ("execution.failed", 1),
+    ] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event WHERE entity_id = ? AND event_type = ?",
+        )
+        .bind(&execution.id)
+        .bind(event_type)
+        .fetch_one(db.pool())
+        .await
+        .expect("Execution receipt count loads");
+        assert_eq!(count, expected_count, "{mutation:?}: {event_type}");
+    }
+}
+
+#[tokio::test]
+async fn provider_start_claim_revalidates_authority_after_preflight() {
+    for mutation in [
+        ProviderStartClaimAuthorityMutation::SuspendMembership,
+        ProviderStartClaimAuthorityMutation::ReassignWorkUnit,
+        ProviderStartClaimAuthorityMutation::CloseWorkUnit,
+        ProviderStartClaimAuthorityMutation::ChangeWorkUnitVersion,
+        ProviderStartClaimAuthorityMutation::RevokeLease,
+        ProviderStartClaimAuthorityMutation::ExpireLease,
+    ] {
+        assert_provider_start_claim_rejects_authority_race(mutation).await;
+    }
+}
+
+#[tokio::test]
+async fn concurrent_provider_start_claims_dispatch_one_external_start() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    let snapshot =
+        crate::task_service::config::build_executor_config_snapshot(&db, &task, &agent, None, None)
+            .await
+            .expect("exact Agent routing snapshot builds")
+            .expect("Agent snapshot exists");
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let executor = Arc::new(RecoveryDispatchExecutor::default());
+    let claim_barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_task_executor(executor.clone())
+        .with_provider_start_claim_barrier(Arc::clone(&claim_barrier));
+    let (execution, _) = create_running_repository_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        "implementer",
+        db::ExecutionPurpose::Implement,
+        workspace_root.path(),
+        Some("concurrent provider claim fixture".to_owned()),
+        Some(snapshot),
+    )
+    .await;
+    let daemon_id = agent.daemon_id.as_deref().expect("Agent has its daemon");
+    let changed = sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
+        .bind(crate::embedded_daemon::embedded_machine_id())
+        .bind(daemon_id)
+        .execute(db.pool())
+        .await
+        .expect("fixture routes provider Start to the embedded executor");
+    assert_eq!(changed.rows_affected(), 1);
+
+    let first_service = service.clone();
+    let first_id = execution.id.clone();
+    let first = tokio::spawn(async move { first_service.start_execution(first_id).await });
+    let second_service = service.clone();
+    let second_id = execution.id.clone();
+    let second = tokio::spawn(async move { second_service.start_execution(second_id).await });
+    // Release both calls from the preclaim boundary in the same barrier cycle.
+    tokio::time::timeout(std::time::Duration::from_secs(20), claim_barrier.wait())
+        .await
+        .expect("both starts finish preflight");
+    tokio::time::timeout(std::time::Duration::from_secs(20), claim_barrier.wait())
+        .await
+        .expect("both starts are released toward the claim");
+    let (first_result, second_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            (
+                first.await.expect("first start joins"),
+                second.await.expect("second start joins"),
+            )
+        })
+        .await
+        .expect("both provider claims resolve");
+    assert!(first_result.is_ok() || second_result.is_ok());
+    assert!(
+        matches!(&first_result, Ok(result) if result.accepted)
+            || matches!(
+                &first_result,
+                Err(ServiceError::ExecutionStartUncertain { .. })
+            )
+    );
+    assert!(
+        matches!(&second_result, Ok(result) if result.accepted)
+            || matches!(
+                &second_result,
+                Err(ServiceError::ExecutionStartUncertain { .. })
+            )
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        executor.started.notified(),
+    )
+    .await
+    .expect("the claimed provider Start invokes the executor");
+    assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    for (event_type, expected_count) in [
+        ("execution.provider_start_attempted", 1_i64),
+        ("execution.provider_start_accepted", 1),
+    ] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event WHERE entity_id = ? AND event_type = ?",
+        )
+        .bind(&execution.id)
+        .bind(event_type)
+        .fetch_one(db.pool())
+        .await
+        .expect("provider receipt count loads");
+        assert_eq!(count, expected_count, "{event_type}");
+    }
+}
+
 #[tokio::test]
 async fn uncertain_provider_start_retry_never_sends_a_second_external_start() {
     let db = Arc::new(sqlite_db().await);

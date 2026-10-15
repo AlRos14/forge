@@ -14,9 +14,10 @@ OS authority while preserving historical data. PR12 aligns REST, MCP,
 branch implements PR13 migrations V121–V134: retired runtime code and schema
 are removed after exact-history cutovers, and preserved records no longer have
 legacy read or write authority. Durable provider-start receipts close the
-post-admission pause window, and V134 keeps late SQLite admission rejections
-typed. This document describes the target contract and the remaining migration
-boundary pending review and merge.
+post-admission pause window, and the provider claim rechecks exact WorkUnit,
+RoleMembership, and WorkspaceLease authority in its write transaction. V134
+keeps late SQLite admission rejections typed. This document describes the
+target contract and the remaining migration boundary pending review and merge.
 
 The migration register, invariant definitions, pre-PR13 dependency audit, and
 Plan PR boundaries live in [migration/architecture-v2.md](migration/architecture-v2.md).
