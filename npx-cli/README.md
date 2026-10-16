@@ -1,4 +1,10 @@
-# Forge npm bootstrapper
+# Retained upstream npm bootstrapper
+
+> This directory is retained from [ForgeAILab/forge](https://github.com/ForgeAILab/forge). The package name `@forgeailab/forge` and its bootstrap script belong to that upstream distribution and download ForgeAILab releases. They do not install or publish the `AlRos14/forge` fork. Use this repository's source build unless a release from `AlRos14/forge` is verified.
+
+The package documentation below is retained for upstream provenance. This is not an installation channel for this repository.
+
+## Upstream package documentation
 
 Run Forge from npm without installing a platform binary first:
 

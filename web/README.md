@@ -1,80 +1,43 @@
 # Forge Web UI
 
-The React + TypeScript frontend for Forge. Built with Vite, TanStack Query +
-Router, Tailwind, and shadcn/ui. Talks to the Rust backend over `/api/v1/*`.
+The React and TypeScript frontend for Forge. It uses Vite, TanStack Query and Router, Tailwind, and shadcn/ui, and calls the Rust API under `/api/v1`.
 
-This is part of the Forge workspace — for the project overview see the root
-[README](../README.md), and for the system architecture see
-[docs/architecture.md](../docs/architecture.md).
-
-## Stack
-
-- **Vite** — dev server + build, with `/api` and `/mcp` proxy to `:8080`
-- **React 18 + TypeScript** strict mode
-- **TanStack Query** for server state, **TanStack Router** for routing
-- **Tailwind CSS** + **shadcn/ui** (Radix primitives) for styling
-- **Vitest** for unit tests, **Playwright** for end-to-end smoke tests
-- **pnpm** as the package manager (enforced by `pnpm-lock.yaml`)
+The public routes and navigation are defined in `src/router.tsx` and `src/components/app-shell.tsx`. They include Project board and Task list, Task detail and Execution history, Agent and daemon administration, Operations, Project and server settings, and historical ProjectRelease snapshots. The web UI does not currently create WorkUnits; use REST or MCP.
 
 ## Develop
 
-```bash
-pnpm install
-pnpm dev            # Vite at http://localhost:5173, proxies /api → :8080
-```
-
-The dev server expects the Rust backend on `127.0.0.1:8080`. Start it from the
-workspace root with `make dev` (data dir `./test/`) or
-`cargo run -p forge-cli`.
-
-## Build
+Install the locked web dependencies and run the backend with the fixed address expected by Vite:
 
 ```bash
-pnpm build          # Production build to web/dist/
-pnpm preview        # Serve the built bundle locally
+pnpm install --frozen-lockfile
+make dev
 ```
 
-The production `forge` binary serves `web/dist/` from
-`/usr/local/share/forge/web/dist` (or whatever `FORGE_WEB_DIST_DIR` points at).
-
-## Test and lint
+In another terminal:
 
 ```bash
-pnpm lint           # ESLint, zero warnings allowed
-pnpm typecheck      # tsc --noEmit
-pnpm test           # Vitest unit tests
-pnpm exec playwright install --with-deps chromium
-pnpm run e2e        # Playwright smoke against a running stack
+make frontend
 ```
 
-## Layout
+Vite listens on `http://localhost:5173` and proxies `/api` and `/mcp` to `127.0.0.1:8080`. The Makefile sets the backend's `FORGE_SERVER_BIND` to that address by default. Override it only when you also change the Vite proxy target.
 
+## Build and check
+
+```bash
+pnpm build
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm run e2e
 ```
-src/
-├── api/               # REST client, generated/hand-written request fns
-├── components/        # Shared components (app-shell, notification-center, ui/)
-├── pages/             # Route components
-├── hooks/             # Reusable hooks (useTask, useEvents, …)
-├── lib/               # Pure utilities, formatters
-├── types/generated/   # TS types mirroring the Rust api-types crate
-└── router.tsx         # TanStack Router config
-```
 
-The `@` path alias resolves to `src/` (see `tsconfig.json`).
+The production build is written to `web/dist/`. The `forge` binary serves assets from that checkout path, then from its installed `share/forge/web/dist` path. `FORGE_WEB_DIST_DIR` overrides asset discovery. The Rust build script invokes the locked pnpm install and build unless `FORGE_SKIP_WEB_BUILD=1` is set.
 
-## API client and types
+## Package layout
 
-`src/api/client.ts` is a thin `fetch` wrapper over `/api/v1/*`. Types in
-`src/types/generated/api.ts` must match the `api-types` Rust crate response
-shapes — when a backend response shape changes, update both in the same change.
+- `src/api/client.ts` — REST client.
+- `src/types/generated/` — generated API bindings.
+- `src/features/`, `src/components/`, and `src/pages/` — feature and page UI.
+- `src/router.tsx` — TanStack Router configuration.
 
-## Branding assets
-
-| File | Use |
-|---|---|
-| `public/logo.png` | Square mark, used as favicon and in the sidebar header |
-| `public/apple-touch-icon.png` | iOS touch icon (192px) |
-| `public/forge-wordmark.png` | OG image / social share preview |
-
-Sources are committed under [`/assets/`](../assets/) at the repo root —
-re-export with `sips` if you need different sizes.
+When a Rust API response changes, update the generated TypeScript types in the same change.

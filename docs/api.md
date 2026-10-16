@@ -1,18 +1,19 @@
 # API Reference
 
-Forge exposes the versioned REST API at `/api/v1`. The public contract follows
-the current Project, Task, Actor, TaskRole, RoleMembership, Execution,
-HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review,
-Validation, Evidence, Gate, and TaskLifecycle records.
+Forge exposes the versioned REST API at `/api/v1`. This reference describes
+the post-PR13 public contract for Project, Task,
+Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit,
+Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and
+TaskLifecycle records.
 
 > The orchestrator owns work. The harness owns cognition.
 
-Plan PR12 is a breaking public-surface change. Main/Project Agent, Product
-Genesis, Agent Chat, Attention, Charter, baseline, milestone governance,
-legacy review rows, workflow state, and native runtime controls are not
-operational REST resources. PR13 migrations V121–V132 removed their retired
-runtime schemas after exact-history cutovers; preserved records live only in
-dedicated immutable history and migration-ledger tables. Unknown `/api/v1`
+Main/Project Agent, Product Genesis, Agent Chat, Attention, Charter, baseline,
+milestone governance, legacy review rows, workflow state, and native runtime
+controls are not operational REST resources. PR13 migrations V121–V134 complete
+the persistence cutover and provider-start receipt changes. Retired runtime
+schemas were removed after exact-history cutovers; preserved legacy records
+remain in dedicated immutable history and migration ledgers. Unknown `/api/v1`
 paths return the normal API `404 not_found` response;
 removed routes are not retained as aliases or `410` dispatchers. Request DTOs
 reject unknown legacy fields.
@@ -29,6 +30,18 @@ Errors use `{ "code": string, "message": string, "details": object | null,
 unsupported lifecycle request, `401` for missing/invalid credentials, `404`
 for absent or invisible records, `409` for version or authority conflicts,
 and `422` for malformed DTOs or unknown request fields.
+
+If a provider Start may have taken effect but its response is uncertain,
+`POST /tasks/{id}/executions` returns HTTP `409` with code
+`execution_start_uncertain`; its message identifies the exact Execution. Read
+that Execution and do not submit the Start again automatically.
+
+WorkUnit creation currently has no idempotency key. A live validation run
+observed `POST /tasks/{task_id}/work-units` return `500 internal_error` with
+SQLite code 517 (`database is locked`) after the WorkUnit row had committed.
+If a create response is ambiguous, inspect `GET /tasks/{task_id}/work-units`
+before retrying; a blind retry can create a duplicate. This response/commit
+failure is pending reliability work.
 
 Paginated endpoints return `items`, `has_more`, `next_cursor`, and, where
 requested, `total_count`. Cursors are opaque. The default page size is 20 and
@@ -146,7 +159,7 @@ their source records remain only in migration history where preserved.
 | Method and path | Contract |
 | --- | --- |
 | `GET /tasks/{id}/executions` | List exact historical Task Executions. |
-| `POST /tasks/{id}/executions` | Start an Agent Execution from `work_unit_id` and `expected_work_unit_version`, with explicit `purpose`, `prompt`, and optional exact `input_artifact_ids` and overrides. Role and Actor come from the allocated WorkUnit. Repository execution prepares and binds that WorkUnit's exact isolated Workspace. |
+| `POST /tasks/{id}/executions` | Start an Agent Execution from `work_unit_id` and `expected_work_unit_version`, with explicit `purpose`, `prompt`, and optional exact `input_artifact_ids` and overrides. Role and Actor come from the allocated WorkUnit. A repository WorkUnit that requires integration prepares and binds its exact isolated Workspace; supported non-repository WorkUnits have no Workspace. |
 | `POST /tasks/{task_id}/executions/{execution_id}/recovery` | Explicitly select one cancelled exact crash-recovery, Agent-timeout, or graceful-shutdown Execution for a fresh child attempt. Supply its exact `work_unit_id`, expected Task, TaskLifecycle, and WorkUnit versions, and an `idempotency_key`; an optional `context` is included in the request identity. The selected Execution's Agent must still be the WorkUnit's current assignee and active role member. The requesting Human must be authorized to mutate the Task and is recorded in the decision receipt. A same-key retry returns the exact admitted child without dispatching it again. Selecting one candidate from an ambiguous aggregate block resolves that block and admits the child in one transaction; remaining WorkUnits keep their own pending Execution history and can be selected afterward. This human selection may explicitly override an Auto candidate when the operator chooses a fresh attempt; dispatcher Auto recovery itself resumes only the parent's exact reusable HarnessSession. |
 | `GET /executions/{id}` | Read one exact Execution, including its Actor, role, purpose, HarnessSession reference, frozen execution configuration, and workspace identity. |
 | `POST /executions/{id}/follow-up` | Create a child from the exact parent Execution. `idempotency_key`, `message`, and `agent_id` are required. Repeating the same key and request replays the exact child; reusing the key with different request content conflicts. A new authorized follow-up uses a new key. A same-Agent continuation can reuse only the exact compatible HarnessSession; it never substitutes a current role member or latest Execution. |
@@ -197,7 +210,8 @@ ValidationRun lookup.
 | `GET /tasks/{task_id}/collaboration/decisions`, `POST /tasks/{task_id}/collaboration/decisions`, `GET /decisions/{id}` | Record or read a Decision with exact Proposal provenance. |
 
 These are generic domain records. They do not recreate Agent Chat, Charter,
-AgentAction, readiness, or Main/Project Agent workflows.
+AgentAction, the historical Project readiness workflow, or Main/Project Agent
+workflows. WorkUnit readiness is a current deterministic projection.
 
 ## Agents, providers, credentials, and daemon transport
 
@@ -287,13 +301,36 @@ limited to administrators; resync hints carry no Project data.
 
 ## MCP
 
-The MCP server advertises only registered target tools. The current groups are
-Project/Task CRUD, TaskLifecycle receipts, TaskRole membership, Gate and exact
-GateEvaluation, explicit Agent Execution and exact-parent follow-up, Review
-Execution/ReviewReport, ValidationRun/Evidence, WorkUnit, Agent/profile,
-provider-independent Task diff, and generic Message/Handoff/Proposal/Decision
-operations. Retired tool names return MCP `-32601 method not found`; they are
-not forwarded to a different tool.
+The MCP server advertises only registered tools. The current tool names are:
+
+- Projects: `forge_create_project`, `forge_list_projects`, `forge_get_project`,
+  `forge_update_project`, `forge_update_project_hooks`.
+- Tasks and lifecycle: `forge_create_task`, `forge_create_sub_tasks`,
+  `forge_list_tasks`, `forge_get_task`, `forge_update_task`,
+  `forge_get_task_diff`, `forge_get_task_lifecycle`,
+  `forge_list_task_lifecycle_transitions`, `forge_transition_task_lifecycle`,
+  `forge_add_task_dependency`, `forge_remove_task_dependency`,
+  `forge_list_task_dependencies`.
+- Executions and roles: `forge_list_executions`, `forge_start_execution`,
+  `forge_follow_up_execution`, `forge_list_task_roles`,
+  `forge_create_task_role`, `forge_add_task_role_member`.
+- Gates and evidence: `forge_create_task_gate`, `forge_get_gate`,
+  `forge_revise_gate_policy`, `forge_evaluate_gate`,
+  `forge_get_gate_evaluation`, `forge_list_task_review_executions`,
+  `forge_get_review_execution`, `forge_list_validation_runs`,
+  `forge_get_validation_run`, `forge_get_evidence`,
+  `forge_list_task_artifacts`.
+- Agents and collaboration: `forge_register_agent`, `forge_list_agents`,
+  `forge_list_agent_profiles`, `forge_list_task_messages`,
+  `forge_list_task_handoffs`, `forge_list_task_proposals`,
+  `forge_list_task_decisions`.
+
+`forge_start_execution` requires the exact WorkUnit ID and version, Purpose,
+and prompt. The server resolves the matching Workspace when the WorkUnit needs
+repository integration; non-repository WorkUnits have no Workspace. The
+descriptor schemas are returned by MCP `tools/list` and are implemented in
+`crates/mcp-server/src/tools/descriptors.rs`. Retired tool names return MCP
+`-32601 method not found`; they are not forwarded to a different tool.
 
 `tools/list` is authoritative for the deployed descriptor set. Tools that
 start work require an exact Actor or explicit Agent identity and do not infer a
