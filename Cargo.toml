@@ -21,9 +21,9 @@ resolver = "2"
 edition = "2021"
 version = "0.8.0"
 license = "MIT"
-description = "AI coding agent workflow engine — orchestrate agents through structured task lifecycles"
-homepage = "https://github.com/ForgeAILab/forge"
-repository = "https://github.com/ForgeAILab/forge"
+description = "Local work coordination platform for programming agents and humans"
+homepage = "https://github.com/AlRos14/forge"
+repository = "https://github.com/AlRos14/forge"
 
 [workspace.dependencies]
 tracing = "0.1"

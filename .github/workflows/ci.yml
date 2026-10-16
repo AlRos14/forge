@@ -84,7 +84,7 @@ jobs:
         run: pnpm run e2e
 
   npm-bootstrapper:
-    name: npm Bootstrapper
+    name: Upstream npm Bootstrapper Snapshot
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

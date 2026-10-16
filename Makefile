@@ -1,5 +1,9 @@
 .PHONY: dev dev-demo dev-no-daemon frontend test build ci ci-rust ci-web clean-test
 
+# The Vite dev server proxies to :8080. Override this for a different local port.
+FORGE_SERVER_BIND ?= 127.0.0.1:8080
+export FORGE_SERVER_BIND
+
 # Start the server using ./test as the data directory (safe for manual/agent testing)
 dev:
 	cargo run -p forge-cli -- --data-dir ./test
