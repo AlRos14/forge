@@ -2180,23 +2180,78 @@ mod tests {
                 seed_agent_with_harness(&db, AgentStatus::Busy, Some(now_rfc3339()), harness).await,
             );
         }
-        for (agent, harness) in agents.iter().zip(harnesses) {
-            let daemon_id = agent.daemon_id.as_deref().expect("fixture Agent daemon");
-            DaemonRepo::update_report(
+        let embedded_machine_id = crate::embedded_daemon::embedded_machine_id();
+        let existing_embedded_daemon_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM daemon WHERE machine_id = ?")
+                .bind(&embedded_machine_id)
+                .fetch_optional(db.pool())
+                .await
+                .expect("embedded fixture daemon lookup succeeds");
+        let embedded_daemon_id = if let Some(daemon_id) = existing_embedded_daemon_id {
+            daemon_id
+        } else {
+            let daemon_id = agents[0].daemon_id.clone().expect("fixture Agent daemon");
+            sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
+                .bind(&embedded_machine_id)
+                .bind(&daemon_id)
+                .execute(db.pool())
+                .await
+                .expect("fixture daemon becomes the embedded execution host");
+            daemon_id
+        };
+        let detected_clis_json = serde_json::to_string(
+            &harnesses
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|kind| json!({"kind": kind, "availability": "authenticated"}))
+                .collect::<Vec<_>>(),
+        )
+        .expect("fixture harness discovery serializes");
+        DaemonRepo::update_report(
+            &*db,
+            UpdateDaemonReport {
+                id: embedded_daemon_id.clone(),
+                detected_clis_json,
+                labels_json: None,
+                status: DaemonStatus::Online,
+                last_report_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("embedded fixture daemon advertises every authenticated harness");
+        for agent in &mut agents {
+            if agent.daemon_id.as_deref() == Some(embedded_daemon_id.as_str()) {
+                continue;
+            }
+            *agent = AgentRepo::update(
                 &*db,
-                UpdateDaemonReport {
-                    id: daemon_id.to_owned(),
-                    detected_clis_json: format!(
-                        r#"[{{"kind":"{harness}","availability":"authenticated"}}]"#
-                    ),
-                    labels_json: None,
-                    status: DaemonStatus::Online,
-                    last_report_at: now_rfc3339(),
+                UpdateAgent {
+                    id: agent.id.clone(),
+                    expected_version: agent.version,
+                    name: None,
+                    description: None,
+                    model: None,
+                    reasoning_effort: None,
+                    permission_policy: None,
+                    prompt_template: None,
+                    capabilities_json: None,
+                    config_json: None,
+                    daemon_id: Some(Some(embedded_daemon_id.clone())),
+                    max_concurrent_tasks: None,
+                    heartbeat_interval_seconds: None,
+                    max_missed_heartbeats: None,
+                    status: None,
+                    last_heartbeat_at: None,
+                    is_default: None,
+                    paused: None,
                     updated_at: now_rfc3339(),
                 },
             )
             .await
-            .expect("fixture daemon advertises its authenticated harness");
+            .expect("recovery fixture Agent routes to the embedded execution host");
         }
         let task = seed_task(
             &db,
