@@ -15,7 +15,6 @@ clap = { version = "4", features = ["derive"] }
 config = { path = "../config" }
 db = { path = "../db" }
 events = { path = "../events" }
-review = { path = "../review" }
 services = { path = "../services" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing = { workspace = true }

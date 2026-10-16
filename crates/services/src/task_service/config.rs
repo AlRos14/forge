@@ -1,67 +1,4 @@
-use api_types::GateConfig;
-
 use super::*;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RetryBudgetKind {
-    Review,
-    MergeFix,
-    Execution,
-}
-
-impl RetryBudgetKind {
-    fn key(self) -> &'static str {
-        match self {
-            Self::Review => "review",
-            Self::MergeFix => "merge_fix",
-            Self::Execution => "execution",
-        }
-    }
-
-    fn default_value(self) -> i32 {
-        match self {
-            Self::Review => 3,
-            Self::MergeFix => 1,
-            Self::Execution => 3,
-        }
-    }
-}
-
-pub(crate) fn runtime_retry_budget(
-    task: &Task,
-    kind: RetryBudgetKind,
-    state_config: Option<&Value>,
-    gate_config: Option<&GateConfig>,
-) -> Result<i32> {
-    if let Some(value) = configured_task_retry_budget(task, kind) {
-        return Ok(value);
-    }
-    if let Some(value) = state_config.and_then(|value| retry_budget_from_value(value, kind)) {
-        return Ok(value);
-    }
-    if matches!(kind, RetryBudgetKind::Review | RetryBudgetKind::MergeFix) {
-        if let Some(value) = gate_config.and_then(|config| config.max_rejections) {
-            return Ok(value);
-        }
-    }
-    Ok(kind.default_value())
-}
-
-pub(crate) fn configured_task_retry_budget(task: &Task, kind: RetryBudgetKind) -> Option<i32> {
-    task.task_state_config
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|value| retry_budget_from_value(&value, kind))
-}
-
-fn retry_budget_from_value(value: &Value, kind: RetryBudgetKind) -> Option<i32> {
-    value
-        .get("retry_budgets")
-        .and_then(|budgets| budgets.get(kind.key()))
-        .and_then(Value::as_i64)
-        .and_then(|value| i32::try_from(value).ok())
-        .filter(|value| *value >= 0)
-}
 
 pub(super) fn executor_snapshot_for_harness_resume(snapshot_json: &str) -> Result<String> {
     let mut snapshot = parse_json_value("executor config snapshot", snapshot_json)?;
@@ -219,19 +156,6 @@ pub(super) fn executor_snapshot_with_sticky_candidate(
             "exact HarnessSession candidate is no longer in the configured route",
         )),
     }
-}
-
-pub(super) fn executor_snapshot_for_fresh_start(snapshot_json: &str) -> Result<String> {
-    let mut snapshot = parse_json_value("executor config snapshot", snapshot_json)?;
-    if let Some(obj) = snapshot.as_object_mut() {
-        obj.remove("dispatch_metadata");
-        if let Some(dispatch_obj) = obj.get_mut("dispatch").and_then(Value::as_object_mut) {
-            dispatch_obj.remove("execution_policy");
-        }
-    }
-    serde_json::to_string(&snapshot).map_err(|error| {
-        ServiceError::invalid_operation(format!("invalid executor config snapshot: {error}"))
-    })
 }
 
 pub(super) async fn build_executor_config_snapshot(
@@ -693,51 +617,6 @@ pub(crate) fn recompute_effective_policy_for_route_winner(
         &normalized,
     ))
     .ok()
-}
-
-pub(super) async fn create_failed_execution_record(
-    db: &SqliteDb,
-    event_bus: &events::EventBus,
-    task_id: &str,
-    agent: &Agent,
-    workspace: &Workspace,
-    execution_id: &str,
-    role: &str,
-    purpose: ExecutionPurpose,
-    error: String,
-) -> Result<()> {
-    let now = now_rfc3339();
-    let execution = CreateExecution {
-        id: execution_id.to_owned(),
-        task_id: task_id.to_owned(),
-        agent_id: Some(agent.id.clone()),
-        actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
-        purpose: Some(purpose),
-        harness_session_id: None,
-        role: role.to_owned(),
-        status: ExecutionStatus::Failed,
-        stop_reason: None,
-        stopped_by: None,
-        resume_policy: None,
-        stopped_at: None,
-        parent_execution_id: None,
-        agent_session_id: None,
-        agent_message_id: None,
-        last_activity_at: None,
-        summary: None,
-        logs_path: None,
-        before_sha: None,
-        after_sha: None,
-        error: Some(error),
-        executor_config_snapshot_json: None,
-        workspace_id: Some(workspace.id.clone()),
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    let event = super::execution_domain_event(&execution, "execution.failed");
-    let (_, committed_event) = ExecutionRepo::create_with_event(db, execution, event).await?;
-    crate::DomainEventService::publish_committed_hint(event_bus, &committed_event);
-    Ok(())
 }
 
 fn apply_agent_fields_to_config(agent: &Agent, config: &mut Value) -> Result<()> {
@@ -1320,29 +1199,5 @@ mod tests {
             snapshot["dispatch_metadata"]["execution_policy"],
             "explicit_harness_session"
         );
-    }
-
-    #[test]
-    fn fresh_start_removes_dispatch_marker_but_adapter_owns_legacy_resume_keys() {
-        let snapshot_json = r#"{
-            "executor_type":"cursor",
-            "dispatch":{"execution_policy":"resume_latest_target_role_thread","target_role":"reviewer"},
-            "dispatch_metadata":{"execution_policy":"resume_latest_target_role_thread"},
-            "config":{"resume_session_id":"top","fallbacks":[
-                {"config":{"resume_thread_id":"nested","resume_thread_in_place":true}},
-                {"config":{"resume_session_id":"fallback","resume_fallback_prompt":"old"}}
-            ]}
-        }"#;
-
-        let cleaned =
-            executor_snapshot_for_fresh_start(snapshot_json).expect("reviewer snapshot is valid");
-        let snapshot: Value = serde_json::from_str(&cleaned).expect("cleaned snapshot is json");
-        let rendered = snapshot.to_string();
-
-        assert!(rendered.contains("resume_session_id"));
-        assert!(rendered.contains("resume_thread_id"));
-        assert!(snapshot.get("dispatch_metadata").is_none());
-        assert!(snapshot["dispatch"].get("execution_policy").is_none());
-        assert_eq!(snapshot["dispatch"]["target_role"], "reviewer");
     }
 }

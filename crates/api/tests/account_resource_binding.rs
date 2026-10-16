@@ -169,7 +169,6 @@ async fn project_member_repo_crud_uniqueness_and_role_update() {
             id: new_uuid_v4(),
             name: "member-test-proj".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: Some("test-user-id".to_owned()),
             created_at: now.clone(),

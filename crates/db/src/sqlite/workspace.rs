@@ -52,7 +52,7 @@ impl WorkspaceRepo for SqliteDb {
             .transpose()
     }
 
-    async fn get_by_task_id(&self, task_id: &str) -> Result<Option<Workspace>> {
+    async fn get_integration_by_task_id(&self, task_id: &str) -> Result<Option<Workspace>> {
         sqlx::query(
             "SELECT w.* FROM workspace w
              JOIN workspace_scope s ON s.workspace_id = w.id AND s.task_id = w.task_id

@@ -11,9 +11,8 @@ fn map_integration(row: &SqliteRow) -> Result<ProjectIntegration> {
         token_secret_ref: row.try_get("token_secret_ref")?,
         poll_interval_secs: row.try_get("poll_interval_secs")?,
         sync_filter: row.try_get("sync_filter")?,
-        default_task_state: row.try_get("default_task_state")?,
-        default_assignee_type: row.try_get("default_assignee_type")?,
-        default_assignee_id: row.try_get("default_assignee_id")?,
+        default_implementer_kind: row.try_get("default_implementer_kind")?,
+        default_implementer_id: row.try_get("default_implementer_id")?,
         enabled: row.try_get::<i64, _>("enabled")? != 0,
         last_polled_at: row.try_get("last_polled_at")?,
         created_at: row.try_get("created_at")?,
@@ -28,7 +27,7 @@ impl IntegrationRepo for SqliteDb {
         input: CreateProjectIntegration,
     ) -> Result<ProjectIntegration> {
         sqlx::query(
-            "INSERT INTO project_integration (id, project_id, platform, base_url, owner, repo, token_secret_ref, poll_interval_secs, sync_filter, default_task_state, default_assignee_type, default_assignee_id, enabled, last_polled_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO project_integration (id, project_id, platform, base_url, owner, repo, token_secret_ref, poll_interval_secs, sync_filter, default_implementer_kind, default_implementer_id, enabled, last_polled_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.project_id)
@@ -39,9 +38,8 @@ impl IntegrationRepo for SqliteDb {
         .bind(&input.token_secret_ref)
         .bind(input.poll_interval_secs)
         .bind(&input.sync_filter)
-        .bind(input.default_task_state.as_deref())
-        .bind(input.default_assignee_type.as_deref())
-        .bind(input.default_assignee_id.as_deref())
+        .bind(input.default_implementer_kind.as_deref())
+        .bind(input.default_implementer_id.as_deref())
         .bind(if input.enabled { 1 } else { 0 })
         .bind(input.last_polled_at.as_deref())
         .bind(&input.created_at)
@@ -113,14 +111,11 @@ impl IntegrationRepo for SqliteDb {
         if let Some(sync_filter) = input.sync_filter {
             push_assignment!("sync_filter", sync_filter);
         }
-        if let Some(default_task_state) = input.default_task_state {
-            push_assignment!("default_task_state", default_task_state);
+        if let Some(default_implementer_kind) = input.default_implementer_kind {
+            push_assignment!("default_implementer_kind", default_implementer_kind);
         }
-        if let Some(default_assignee_type) = input.default_assignee_type {
-            push_assignment!("default_assignee_type", default_assignee_type);
-        }
-        if let Some(default_assignee_id) = input.default_assignee_id {
-            push_assignment!("default_assignee_id", default_assignee_id);
+        if let Some(default_implementer_id) = input.default_implementer_id {
+            push_assignment!("default_implementer_id", default_implementer_id);
         }
         if let Some(enabled) = input.enabled {
             push_assignment!("enabled", if enabled { 1 } else { 0 });

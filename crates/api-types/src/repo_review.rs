@@ -2,10 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::{
-    project_hooks::ProjectHookRule, AuthorType, ReviewStatus, TaskResponse, WorkMode,
-    WorkflowDefinition,
-};
+use crate::{project_hooks::ProjectHookRule, AuthorType, WorkMode};
 
 fn default_project_version() -> i64 {
     1
@@ -83,25 +80,6 @@ pub struct ProjectResponse {
     pub version: i64,
 }
 
-// Internal workflow storage/service DTOs remain until PR13 retires the
-// legacy engine. They are deliberately absent from the TypeScript export set.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowTemplateSummary {
-    pub name: String,
-    pub display_name: String,
-    pub description: String,
-    pub is_builtin: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowTemplateResponse {
-    pub name: String,
-    pub display_name: String,
-    pub description: String,
-    pub is_builtin: bool,
-    pub definition: WorkflowDefinition,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct RepoResponse {
@@ -161,90 +139,6 @@ pub struct BranchListResponse {
     pub origin_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StepResultResponse {
-    pub index: usize,
-    pub command: String,
-    pub exit_code: i32,
-    pub stderr_tail: String,
-    #[serde(default)]
-    pub output_tail: String,
-    #[serde(default)]
-    pub started_at: Option<String>,
-    #[serde(default)]
-    pub finished_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StepResultEntry {
-    pub index: usize,
-    pub command: String,
-    pub exit_code: i32,
-    pub stderr_tail: String,
-    #[serde(default)]
-    pub output_tail: String,
-    #[serde(default)]
-    pub started_at: Option<String>,
-    #[serde(default)]
-    pub finished_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuditorVerdictEntry {
-    pub verdict: String,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReviewEvidenceEntry {
-    pub bundle_id: String,
-    pub plan_revision_id: Option<String>,
-    pub plan_digest: Option<String>,
-    pub base_sha: String,
-    pub head_sha: String,
-    pub diff_digest: String,
-    pub fresh_session: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct ReviewDetails {
-    #[serde(default)]
-    pub ci_steps: Vec<StepResultEntry>,
-    #[serde(default)]
-    pub auditor: Option<AuditorVerdictEntry>,
-    #[serde(default)]
-    pub evidence: Option<ReviewEvidenceEntry>,
-    #[serde(default)]
-    pub structured_result: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReviewResponse {
-    pub id: String,
-    pub task_id: String,
-    pub execution_id: String,
-    pub attempt_number: i64,
-    pub status: ReviewStatus,
-    pub step_results: Vec<StepResultResponse>,
-    pub details: ReviewDetails,
-    pub started_at: String,
-    pub finished_at: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReviewDecisionResponse {
-    pub task: TaskResponse,
-    pub review: ReviewResponse,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RejectReviewRequest {
-    pub reason: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct CreateCommentRequest {
@@ -298,12 +192,6 @@ pub struct NotificationResponse {
 pub struct UnreadCountResponse {
     #[ts(type = "number")]
     pub count: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransitionTaskResponse {
-    pub task: TaskResponse,
-    pub review: Option<ReviewResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

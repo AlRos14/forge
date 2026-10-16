@@ -1,66 +1,45 @@
 use crate::{
-    new_uuid_v4, AccountMainAgentBinding, AccountMainAgentBindingRepo, ActorKind, ActorRef,
-    AddWorkUnitDependency, AdmitAgentChatTurn, AdmitAgentHandoff, AdmittedAgentChatTurn,
-    AdmittedAgentHandoff, Agent, AgentAction, AgentActionApproval, AgentActionExecution,
-    AgentActionListQuery, AgentActionRepo, AgentChat, AgentChatInstructionRevision,
-    AgentChatMessage, AgentChatMessageListQuery, AgentChatMessageRepo, AgentChatRepo,
-    AgentChatSourceRef, AgentChatTransactionRepo, AgentChatTurnJob, AgentChatTurnJobRepo,
-    AgentChatTurnState, AgentCommitment, AgentCommitmentEvidence, AgentCommitmentLifecycle,
-    AgentCommitmentListQuery, AgentCommitmentRepo, AgentCommitmentStatus, AgentCommitmentTransfer,
-    AgentHandoff, AgentHandoffRepo, AgentInboxItem, AgentInboxListQuery, AgentInboxRepo,
-    AgentListQuery, AgentProfile, AgentProfileRepo, AgentQuestion, AgentQuestionListQuery,
-    AgentRepo, AgentStatus, AgentTaskListQuery, AllocateWorkUnit, AnswerAgentQuestion, Artifact,
-    AttentionConsumerHealth, AttentionListQuery, AttentionProjection, AttentionRepo,
-    CancelAgentChatTurn, CiStepStats, ClaimDomainEvents, ClaimTask, ClaimedTask,
-    CollaborationWrite, CompleteAgentChatTurn, CompleteAgentCommitment, CompleteDomainEvent,
-    CompletedAgentChatTurn, CreateAccountMainAgentBinding, CreateAgent, CreateAgentAction,
-    CreateAgentActionApproval, CreateAgentActionExecution, CreateAgentChat, CreateAgentChatMessage,
-    CreateAgentChatTurnJob, CreateAgentCommitment, CreateAgentCommitmentEvidence,
-    CreateAgentHandoff, CreateAgentIdentity, CreateAgentInboxItem, CreateAgentProfile,
-    CreateAgentQuestion, CreateAttentionProjection, CreateDomainEvent, CreateEvidence,
-    CreateExecution, CreateHarnessSession, CreateNotification, CreatePrMetadata,
-    CreatePrProviderConfig, CreateProject, CreateProjectAgentBinding, CreateProjectHookRun,
-    CreateProjectIntegration, CreateProjectMediaAsset, CreateProjectMediaAttachment,
-    CreateProjectMediaAttachmentMutation, CreateProjectReleaseMediaPin, CreateRemotePrAdmission,
-    CreateRepo, CreateReview, CreateReviewExecutionSubject, CreateRuntime, CreateSkill, CreateTask,
-    CreateTaskComment, CreateTaskExternalLink, CreateTaskIntegrationOperation, CreateTaskMedia,
-    CreateTerminalSession, CreateValidationRun, CreateWorkUnit, CreateWorkUnitExecution,
-    CreateWorkUnitIntegration, CreateWorkUnitWorkspace, CreateWorkspace, CreateWorkspaceLease,
-    Daemon, DaemonRepo, DbError, DomainEvent, DomainEventRepo, EventConsumerCursor, Evidence,
-    Execution, ExecutionEvidenceInput, ExecutionRepo, ExecutionStatus, ExecutionUsage,
-    ExecutionUsageRepo, ExternalLinkRepo, FailAgentChatTurn, FinishTaskIntegrationOperation,
-    FinishValidationRun, HarnessSession, HarnessSessionRepo, HarnessSessionStatus, IntegrationRepo,
-    MediaAsset, ModelTokenBreakdown, Notification, NotificationListQuery, NotificationRepo, Page,
-    PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Project,
-    ProjectAgentBinding, ProjectAgentBindingRepo, ProjectAnalyticsRepo, ProjectHookRun,
-    ProjectHookRunRepo, ProjectHookRunStatus, ProjectIntegration, ProjectMediaAttachment,
-    ProjectMediaTombstone, ProjectReleaseMediaPin, ProjectRepo, ProjectReviewSummary,
-    ProjectTokenStats, RecordRemotePrOutcome, RecordWorkUnitIntegration, RemotePrAdmission,
-    RemoveWorkUnitDependency, ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, Repo,
-    RepoRepo, Result, Review, ReviewExecutionSubject, ReviewExecutionSubjectWrite, ReviewRepo,
-    ReviewStatus, Runtime, RuntimeListQuery, RuntimeRepo, SelectAgentProfile, SharedMediaRepo,
-    Skill, SkillRepo, SoftDeleteProjectMediaAttachmentMutation, SortBy, SortOrder, Task,
+    new_uuid_v4, ActorKind, ActorRef, AddWorkUnitDependency, AdmitWorkUnitExecutionWithLifecycle,
+    Agent, AgentListQuery, AgentProfile, AgentProfileRepo, AgentRepo, AgentStatus,
+    AgentTaskListQuery, AllocateWorkUnit, Artifact, ClaimDomainEvents, CollaborationWrite,
+    CompleteDomainEvent, CreateAgent, CreateAgentIdentity, CreateAgentProfile, CreateDomainEvent,
+    CreateEvidence, CreateExecution, CreateHarnessSession, CreateNotification, CreatePrMetadata,
+    CreatePrProviderConfig, CreateProject, CreateProjectHookRun, CreateProjectIntegration,
+    CreateProjectMediaAsset, CreateRemotePrAdmission, CreateRepo, CreateReviewExecutionSubject,
+    CreateRuntime, CreateSkill, CreateTask, CreateTaskComment, CreateTaskExternalLink,
+    CreateTaskIntegrationOperation, CreateTaskMedia, CreateTerminalSession, CreateValidationRun,
+    CreateWorkUnit, CreateWorkUnitExecution, CreateWorkUnitIntegration, CreateWorkUnitWorkspace,
+    CreateWorkspace, CreateWorkspaceLease, Daemon, DaemonRepo, DbError, DomainEvent,
+    DomainEventRepo, EventConsumerCursor, Evidence, Execution, ExecutionEvidenceInput,
+    ExecutionRepo, ExecutionStatus, ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo,
+    FinishTaskIntegrationOperation, FinishValidationRun, HarnessSession, HarnessSessionRepo,
+    HarnessSessionStatus, IntegrationRepo, MediaAsset, Notification, NotificationListQuery,
+    NotificationRepo, Page, PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig,
+    PrProviderConfigRepo, Project, ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus,
+    ProjectIntegration, ProjectMediaTombstone, ProjectReleaseMediaPin, ProjectRepo,
+    ProviderStartClaim, RecordRemotePrOutcome, RecordWorkUnitIntegration, RecoverWorkUnitExecution,
+    RecoveryWorkUnitExecutionWrite, RemotePrAdmission, RemoveWorkUnitDependency, Repo, RepoRepo,
+    Result, ReviewExecutionSubject, ReviewExecutionSubjectWrite, Runtime, RuntimeListQuery,
+    RuntimeRepo, SelectAgentProfile, SharedMediaRepo, Skill, SkillRepo, SortBy, SortOrder, Task,
     TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskExternalLink, TaskIntegrationOperation,
     TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskIntegrationOperationStatus,
     TaskLifecycleState, TaskLifecycleTransitionIdentity, TaskListQuery, TaskMedia, TaskMediaRepo,
     TaskRepo, TaskUsageSummary, TerminalSession, TerminalSessionRepo, TerminalSessionStatus,
-    TransferAgentCommitment, TransitionTaskLifecycle, TransitionWorkUnit, UpdateAgent,
-    UpdateAgentAction, UpdateAgentChat, UpdateAgentChatTurnJob, UpdateAgentCommitment,
-    UpdateAgentInboxItem, UpdateAttentionLifecycle, UpdateDaemonReport, UpdateExecution,
+    TransitionTaskLifecycle, TransitionWorkUnit, UpdateAgent, UpdateDaemonReport, UpdateExecution,
     UpdateHarnessSession, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
     UpdateProjectHookRun, UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask,
-    UpdateTaskStatus, UpdateTerminalSessionStatus, UpdateWorkUnit, UpsertAttentionConsumerHealth,
-    UpsertDaemon, UpsertExecutionUsage, ValidationRun, ValidationRunCompletionWrite,
-    ValidationRunRepo, ValidationRunStartWrite, ValidationRunStatus, WorkUnit, WorkUnitDependency,
-    WorkUnitExecutionRepo, WorkUnitIntegration, WorkUnitIntegrationOutcome, WorkUnitProvenance,
-    WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceLease,
-    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceScope, WorkspaceStatus,
+    UpdateTerminalSessionStatus, UpdateWorkUnit, UpsertDaemon, UpsertExecutionUsage, ValidationRun,
+    ValidationRunCompletionWrite, ValidationRunRepo, ValidationRunStartWrite, ValidationRunStatus,
+    WorkUnit, WorkUnitDependency, WorkUnitExecutionLifecycleWrite, WorkUnitExecutionRepo,
+    WorkUnitIntegration, WorkUnitIntegrationOutcome, WorkUnitProvenance, WorkUnitRepo,
+    WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceLease, WorkspaceLeaseRepo,
+    WorkspaceRepo, WorkspaceScope, WorkspaceStatus,
 };
 use crate::{
     ClaimOrchestratorWake, CoordinationMode, CreateOrchestratorWake, OrchestratorActionRecord,
     OrchestratorWake, OrchestratorWakeExecution, OrchestratorWakeRepo, OrchestratorWakeState,
-    ReserveOrchestratorAction, ReserveOrchestratorWakeExecution, TransitionOrchestratorWake,
-    TransitionOrchestratorWakeExecution,
+    ReserveOrchestratorAction, ReserveOrchestratorWakeExecution, ResolveOrchestratorStart,
+    TransitionOrchestratorWake, TransitionOrchestratorWakeExecution,
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -68,13 +47,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use std::str::FromStr;
 
-mod action;
 mod agent;
-mod agent_chat;
-mod analytics;
-mod attention;
 mod collaboration;
-mod commitment;
 mod daemon;
 mod domain_event;
 mod embedded_agent;
@@ -83,15 +57,11 @@ mod execution_usage;
 mod external_link;
 mod gate_lifecycle;
 mod harness_session;
-mod inbox;
 mod integration;
-mod lcm;
-mod memory;
 mod notification;
 mod oauth_authorization_code;
 mod oauth_client;
 mod oauth_refresh_token;
-mod orchestration;
 mod orchestrator_wake;
 mod personal_access_token;
 mod pr_metadata;
@@ -101,7 +71,6 @@ mod project_hook_run;
 mod project_member;
 mod provider_authorization;
 mod repo;
-mod review;
 mod role;
 mod runtime;
 mod shared_media;
@@ -112,12 +81,10 @@ mod task_comment;
 mod task_dependency;
 mod task_integration_operation;
 mod task_media;
-mod task_move;
 mod task_terminal_session;
 mod user_auth;
 mod validation_run;
 mod work_unit;
-mod workflow;
 mod workspace;
 mod workspace_lease;
 
@@ -182,15 +149,23 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
         (SortBy::BoardPosition, SortOrder::Desc) => "board_position DESC, created_at DESC, id DESC",
         (SortBy::Title, SortOrder::Asc) => "title ASC, id ASC",
         (SortBy::Title, SortOrder::Desc) => "title DESC, id DESC",
-        (SortBy::LifecycleState, SortOrder::Asc) => "(SELECT state FROM task_lifecycle WHERE task_id = task.id) ASC, id ASC",
-        (SortBy::LifecycleState, SortOrder::Desc) => "(SELECT state FROM task_lifecycle WHERE task_id = task.id) DESC, id DESC",
-        (SortBy::Status, SortOrder::Asc) => "status ASC, id ASC",
-        (SortBy::Status, SortOrder::Desc) => "status DESC, id DESC",
+        (SortBy::LifecycleState, SortOrder::Asc) => {
+            "(SELECT state FROM task_lifecycle WHERE task_id = task.id) ASC, id ASC"
+        }
+        (SortBy::LifecycleState, SortOrder::Desc) => {
+            "(SELECT state FROM task_lifecycle WHERE task_id = task.id) DESC, id DESC"
+        }
+        (SortBy::Status, SortOrder::Asc) => {
+            "(SELECT state FROM task_lifecycle WHERE task_id = task.id) ASC, id ASC"
+        }
+        (SortBy::Status, SortOrder::Desc) => {
+            "(SELECT state FROM task_lifecycle WHERE task_id = task.id) DESC, id DESC"
+        }
         (SortBy::Agent, SortOrder::Asc) => {
-            "CASE WHEN EXISTS (SELECT 1 FROM task_role WHERE task_id = task.id AND role = 'implementer') THEN (SELECT rm.actor_id FROM task_role tr JOIN role_membership rm ON rm.task_role_id = tr.id WHERE tr.task_id = task.id AND tr.role = 'implementer' AND rm.actor_kind = 'agent' AND rm.status = 'active' ORDER BY rm.actor_id ASC, rm.created_at ASC, rm.id ASC LIMIT 1) ELSE (SELECT assignee_id FROM task_role_assignment WHERE task_id = task.id AND role_name = 'coder' ORDER BY assignee_id ASC LIMIT 1) END ASC, id ASC"
+            "(SELECT MIN(rm.actor_id) FROM task_role tr JOIN role_membership rm ON rm.task_role_id = tr.id WHERE tr.task_id = task.id AND tr.role = 'implementer' AND rm.actor_kind = 'agent' AND rm.status = 'active') ASC, id ASC"
         }
         (SortBy::Agent, SortOrder::Desc) => {
-            "CASE WHEN EXISTS (SELECT 1 FROM task_role WHERE task_id = task.id AND role = 'implementer') THEN (SELECT rm.actor_id FROM task_role tr JOIN role_membership rm ON rm.task_role_id = tr.id WHERE tr.task_id = task.id AND tr.role = 'implementer' AND rm.actor_kind = 'agent' AND rm.status = 'active' ORDER BY rm.actor_id DESC, rm.created_at DESC, rm.id DESC LIMIT 1) ELSE (SELECT assignee_id FROM task_role_assignment WHERE task_id = task.id AND role_name = 'coder' ORDER BY assignee_id DESC LIMIT 1) END DESC, id DESC"
+            "(SELECT MIN(rm.actor_id) FROM task_role tr JOIN role_membership rm ON rm.task_role_id = tr.id WHERE tr.task_id = task.id AND tr.role = 'implementer' AND rm.actor_kind = 'agent' AND rm.status = 'active') DESC, id DESC"
         }
         (SortBy::TaskType, SortOrder::Asc) => "task_type ASC, id ASC",
         (SortBy::TaskType, SortOrder::Desc) => "task_type DESC, id DESC",
@@ -199,8 +174,8 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
     }
 }
 
-const TASK_COLUMNS: &str = "id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, error_annotation, blocked_json, failed_json, entry_barrier_json, review_passed_at, archived_at, deleted_at, version, created_at, updated_at";
-const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, paused_at, owner_id, project_hooks_json, project_work_epoch, charter_status, charter_setup_required, current_charter_id, current_charter_revision_id, current_charter_version, primary_milestone_id, version, created_at, updated_at";
+const TASK_COLUMNS: &str = "task.id, task.project_id, task.repo_id, task.parent_task_id, task.title, task.description, task.task_type, (SELECT state FROM task_lifecycle WHERE task_id = task.id) AS lifecycle_state, task.is_automation, task.priority, task.board_position, task.subtask_order, task.merge_config, task.metadata_json, task.error_annotation, task.blocked_json, task.failed_json, task.deleted_at, task.version, task.created_at, task.updated_at";
+const PROJECT_COLUMNS: &str = "id, name, settings, primary_repo_id, paused_at, owner_id, project_hooks_json, project_work_epoch, version, created_at, updated_at";
 
 fn limit(page: &PageRequest) -> i64 {
     page.limit.clamp(1, 500)
@@ -247,16 +222,34 @@ fn check_error(error: sqlx::Error) -> DbError {
 }
 
 fn execution_insert_error(error: sqlx::Error) -> DbError {
-    if let sqlx::Error::Database(database_error) = &error {
-        if database_error
-            .message()
-            .to_ascii_lowercase()
-            .contains("agent reached concurrent execution capacity")
-        {
-            return DbError::AgentAtCapacity;
-        }
+    if let Some(error) = work_unit_execution_admission_error(&error) {
+        return error;
     }
     check_error(error)
+}
+
+pub(super) fn work_unit_execution_admission_error(error: &sqlx::Error) -> Option<DbError> {
+    let sqlx::Error::Database(database_error) = error else {
+        return None;
+    };
+    match database_error.message() {
+        "FORGE_WU_ADMISSION_AGENT_AT_CAPACITY" => Some(DbError::AgentAtCapacity),
+        "FORGE_WU_ADMISSION_AGENT_MISSING" | "FORGE_WU_ADMISSION_WORK_UNIT_MISSING" => {
+            Some(DbError::NotFound)
+        }
+        "FORGE_WU_ADMISSION_WORK_UNIT_NOT_OPEN" => Some(DbError::WorkUnitNotOpen),
+        "FORGE_WU_ADMISSION_ROLE_MEMBERSHIP_INACTIVE" => {
+            Some(DbError::WorkUnitRoleMembershipInactive)
+        }
+        "FORGE_WU_ADMISSION_WORKSPACE_UNAVAILABLE" => Some(DbError::WorkUnitWorkspaceUnavailable),
+        "FORGE_WU_ADMISSION_ALREADY_RUNNING" => Some(DbError::WorkUnitExecutionAlreadyRunning),
+        "FORGE_WU_ADMISSION_DEPENDENCY_UNSATISFIED" => Some(DbError::DependencyGate),
+        "FORGE_WU_ADMISSION_VERSION_CONFLICT" => Some(DbError::VersionConflict),
+        "FORGE_WU_ADMISSION_INVALID" => Some(DbError::Check(
+            "WorkUnit Execution admission has invalid required fields".to_owned(),
+        )),
+        _ => None,
+    }
 }
 
 fn map_project(row: SqliteRow) -> Result<Project> {
@@ -264,19 +257,11 @@ fn map_project(row: SqliteRow) -> Result<Project> {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
         settings: row.try_get("settings")?,
-        workflow_definition: row.try_get("workflow_definition")?,
-        workflow_template_name: row.try_get("workflow_template_name")?,
         primary_repo_id: row.try_get("primary_repo_id")?,
         paused_at: row.try_get("paused_at")?,
         owner_id: row.try_get("owner_id")?,
         project_hooks_json: row.try_get("project_hooks_json")?,
         project_work_epoch: row.try_get("project_work_epoch")?,
-        charter_status: row.try_get("charter_status")?,
-        charter_setup_required: row.try_get::<i64, _>("charter_setup_required")? != 0,
-        current_charter_id: row.try_get("current_charter_id")?,
-        current_charter_revision_id: row.try_get("current_charter_revision_id")?,
-        current_charter_version: row.try_get("current_charter_version")?,
-        primary_milestone_id: row.try_get("primary_milestone_id")?,
         version: row.try_get("version")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -452,25 +437,19 @@ fn map_task(row: SqliteRow) -> Result<Task> {
         project_id: row.try_get("project_id")?,
         repo_id: row.try_get("repo_id")?,
         parent_task_id: row.try_get("parent_task_id")?,
-        assignee_type: row.try_get("assignee_type")?,
-        assignee_id: row.try_get("assignee_id")?,
         title: row.try_get("title")?,
         description: row.try_get("description")?,
         task_type: row.try_get("task_type")?,
-        status: row.try_get("status")?,
+        lifecycle_state: parse_enum(row.try_get::<String, _>("lifecycle_state")?)?,
         is_automation: row.try_get::<i64, _>("is_automation")? != 0,
         priority: row.try_get("priority")?,
         board_position: row.try_get("board_position")?,
         subtask_order: row.try_get("subtask_order")?,
-        task_state_config: row.try_get("task_state_config")?,
         merge_config: row.try_get("merge_config")?,
         metadata_json: row.try_get("metadata_json")?,
         error_annotation: row.try_get("error_annotation")?,
         blocked_json: row.try_get("blocked_json")?,
         failed_json: row.try_get("failed_json")?,
-        entry_barrier_json: row.try_get("entry_barrier_json")?,
-        review_passed_at: row.try_get("review_passed_at")?,
-        archived_at: row.try_get("archived_at")?,
         deleted_at: row.try_get("deleted_at")?,
         version: row.try_get("version")?,
         created_at: row.try_get("created_at")?,
@@ -505,7 +484,6 @@ fn map_execution(row: SqliteRow) -> Result<Execution> {
             .transpose()?,
         stopped_at: row.try_get("stopped_at")?,
         parent_execution_id: row.try_get("parent_execution_id")?,
-        agent_session_id: row.try_get("agent_session_id")?,
         harness_session_id: row.try_get("harness_session_id")?,
         agent_message_id: row.try_get("agent_message_id")?,
         last_activity_at: row.try_get("last_activity_at")?,
@@ -536,21 +514,6 @@ fn map_execution_usage(row: SqliteRow) -> Result<ExecutionUsage> {
         cache_write_tokens: row.try_get("cache_write_tokens")?,
         cost_usd: row.try_get("cost_usd")?,
         created_at: row.try_get("created_at")?,
-    })
-}
-
-fn map_review(row: SqliteRow) -> Result<Review> {
-    Ok(Review {
-        id: row.get("id"),
-        task_id: row.get("task_id"),
-        execution_id: row.get("execution_id"),
-        attempt_number: row.get("attempt_number"),
-        status: parse_enum(row.get::<String, _>("status"))?,
-        step_results_json: row.get("step_results_json"),
-        started_at: row.get("started_at"),
-        finished_at: row.get("finished_at"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
     })
 }
 
@@ -624,10 +587,6 @@ fn execution_transition_allowed(from: &ExecutionStatus, to: &ExecutionStatus) ->
         || (*from == ExecutionStatus::Completed && *to == ExecutionStatus::Running)
 }
 
-fn review_transition_allowed(from: &ReviewStatus, to: &ReviewStatus) -> bool {
-    matches!(from, ReviewStatus::Running | ReviewStatus::AwaitingHuman) || from == to
-}
-
 async fn total_count(pool: &SqlitePool, sql: &str) -> Result<Option<i64>> {
     Ok(Some(
         sqlx::query_scalar::<_, i64>(sql).fetch_one(pool).await?,
@@ -635,12 +594,6 @@ async fn total_count(pool: &SqlitePool, sql: &str) -> Result<Option<i64>> {
 }
 
 impl SqliteDb {
-    async fn get_task_required(&self, id: &str, include_deleted: bool) -> Result<Task> {
-        TaskRepo::get_by_id(self, id, include_deleted)
-            .await?
-            .ok_or(DbError::NotFound)
-    }
-
     async fn create_execution_in_tx(
         transaction: &mut Transaction<'_, Sqlite>,
         input: &CreateExecution,
@@ -676,10 +629,7 @@ impl SqliteDb {
                 ));
             }
             if matches!(actor_ref, ActorRef::Human(_)) {
-                if input.agent_id.is_some()
-                    || input.agent_session_id.is_some()
-                    || input.harness_session_id.is_some()
-                {
+                if input.agent_id.is_some() || input.harness_session_id.is_some() {
                     return Err(DbError::Check(
                         "Human Execution cannot carry Agent/session compatibility fields"
                             .to_owned(),
@@ -709,44 +659,12 @@ impl SqliteDb {
                 !explicitly_supplied_harness_session,
             )
             .await?;
-            if let Some(session_id) = input.harness_session_id.as_deref() {
-                let external_session_id: Option<String> = sqlx::query_scalar(
-                    "SELECT external_session_id FROM harness_session WHERE id = ?",
-                )
-                .bind(session_id)
-                .fetch_one(&mut **transaction)
-                .await?;
-                match (external_session_id, input.agent_session_id.as_deref()) {
-                    (Some(external_session_id), None) => {
-                        input.agent_session_id = Some(external_session_id);
-                    }
-                    (Some(external_session_id), Some(legacy_session_id))
-                        if external_session_id != legacy_session_id =>
-                    {
-                        return Err(DbError::Check(
-                            "Execution legacy session projection disagrees with HarnessSession"
-                                .to_owned(),
-                        ));
-                    }
-                    (None, Some(_)) => {
-                        return Err(DbError::Check(
-                            "pending HarnessSession cannot have an external session projection"
-                                .to_owned(),
-                        ));
-                    }
-                    _ => {}
-                }
-            } else if input.agent_session_id.is_some() {
-                return Err(DbError::Check(
-                    "new Execution session identity must use HarnessSession authority".to_owned(),
-                ));
-            }
         }
         let stop_reason = input.stop_reason.as_ref().map(ToString::to_string);
         let resume_policy = input.resume_policy.as_ref().map(ToString::to_string);
         let prompt = input.summary.as_deref();
         sqlx::query(
-            "INSERT INTO execution (id, task_id, agent_id, actor_kind, actor_id, role, purpose, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, agent_session_id, harness_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, work_unit_id, work_unit_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO execution (id, task_id, agent_id, actor_kind, actor_id, role, purpose, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, harness_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, work_unit_id, work_unit_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.task_id)
@@ -761,7 +679,6 @@ impl SqliteDb {
         .bind(resume_policy.as_deref())
         .bind(input.stopped_at.as_deref())
         .bind(input.parent_execution_id.as_deref())
-        .bind(input.agent_session_id.as_deref())
         .bind(input.harness_session_id.as_deref())
         .bind(input.agent_message_id.as_deref())
         .bind(input.last_activity_at.as_deref())
@@ -798,18 +715,5 @@ impl SqliteDb {
         _task_id: &str,
     ) -> Result<()> {
         Ok(())
-    }
-
-    async fn unsatisfied_dependencies_in_tx(
-        transaction: &mut Transaction<'_, Sqlite>,
-        task_id: &str,
-    ) -> Result<Vec<String>> {
-        let rows = sqlx::query_scalar::<_, String>(
-            "SELECT depends_on_id FROM task_dependency WHERE task_id = ? AND depends_on_id NOT IN (SELECT id FROM task WHERE status = 'done')",
-        )
-        .bind(task_id)
-        .fetch_all(&mut **transaction)
-        .await?;
-        Ok(rows)
     }
 }

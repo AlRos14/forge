@@ -622,7 +622,6 @@ impl CredentialStore {
             .execute(&mut *transaction)
             .await
             .map_err(|_| CredentialError::Persistence)?;
-        mark_credential_dependents_unavailable(&mut transaction, handle_id, now).await?;
         transaction
             .commit()
             .await
@@ -674,36 +673,6 @@ impl CredentialStore {
                 .or_insert_with(|| Arc::new(Mutex::new(()))),
         )
     }
-}
-
-async fn mark_credential_dependents_unavailable(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    handle_id: &str,
-    now: &str,
-) -> std::result::Result<(), CredentialError> {
-    sqlx::query(
-        "UPDATE agent_connection_health
-         SET status = 'unavailable', error_code = 'credential_revoked', updated_at = ?
-         WHERE profile_id IN (SELECT id FROM agent_profile WHERE credential_ref = ?)",
-    )
-    .bind(now)
-    .bind(handle_id)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|_| CredentialError::Persistence)?;
-    sqlx::query(
-        "UPDATE agent_session
-         SET status = 'degraded', connection_status = 'unavailable',
-             version = version + 1, updated_at = ?
-         WHERE profile_id IN (SELECT id FROM agent_profile WHERE credential_ref = ?)
-           AND status NOT IN ('replaced', 'terminated')",
-    )
-    .bind(now)
-    .bind(handle_id)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|_| CredentialError::Persistence)?;
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -843,7 +812,7 @@ impl CredentialService {
         Ok(handle)
     }
 
-    /// Resolve the credential identity frozen into an Execution or Agent Chat
+    /// Resolve the credential identity frozen into an Execution
     /// invocation snapshot and add its secret to the in-memory runtime env.
     /// The current Agent is consulted only as an ownership fence; its selected
     /// profile and credential are never used to choose the handle.

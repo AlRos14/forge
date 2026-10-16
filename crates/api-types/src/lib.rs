@@ -1,13 +1,10 @@
 #![forbid(unsafe_code)]
 
-pub mod assignee;
 mod auth;
 
 mod actor;
-mod agent_chats;
 mod analytics;
 mod collaboration;
-mod coordination;
 mod core;
 mod daemon_transport;
 mod execution;
@@ -16,30 +13,26 @@ mod git;
 mod integration;
 mod lists;
 mod mcp;
-mod memory;
-mod mission_control;
 mod oauth;
 mod operations;
-mod product_genesis;
 mod project_hooks;
-mod project_orchestration;
+mod project_media;
+mod project_release;
 mod provider_auth;
 mod public_events;
 mod repo_review;
 mod requests;
 mod review_validation;
+mod roles;
 mod runtime;
 mod settings;
 mod terminal;
 mod work_unit;
-mod workflow;
 
 pub use actor::*;
-pub use agent_chats::*;
 pub use analytics::*;
 pub use auth::*;
 pub use collaboration::*;
-pub use coordination::*;
 pub use core::*;
 pub use daemon_transport::*;
 pub use execution::*;
@@ -48,23 +41,21 @@ pub use git::*;
 pub use integration::*;
 pub use lists::*;
 pub use mcp::*;
-pub use memory::*;
-pub use mission_control::*;
 pub use oauth::*;
 pub use operations::*;
-pub use product_genesis::*;
 pub use project_hooks::*;
-pub use project_orchestration::*;
+pub use project_media::*;
+pub use project_release::*;
 pub use provider_auth::*;
 pub use public_events::*;
 pub use repo_review::*;
 pub use requests::*;
 pub use review_validation::*;
+pub use roles::*;
 pub use runtime::*;
 pub use settings::*;
 pub use terminal::*;
 pub use work_unit::*;
-pub use workflow::*;
 
 #[test]
 #[ignore = "manual type export for the web client"]
@@ -137,6 +128,7 @@ fn export_typescript() {
 
     StartExecutionRequest::export().expect("export StartExecutionRequest");
     FollowUpRequest::export().expect("export FollowUpRequest");
+    RecoverWorkUnitExecutionRequest::export().expect("export RecoverWorkUnitExecutionRequest");
     ClaimOverrides::export().expect("export ClaimOverrides");
     ExecutionResponse::export().expect("export ExecutionResponse");
     ExecutionUsageResponse::export().expect("export ExecutionUsageResponse");

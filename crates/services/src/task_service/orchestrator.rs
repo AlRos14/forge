@@ -234,7 +234,6 @@ impl TaskService {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id,
-            agent_session_id: None,
             harness_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
@@ -285,12 +284,6 @@ impl TaskService {
         .await?;
         self.publish_committed_domain_event(&committed_event);
         Ok(execution)
-    }
-
-    pub(crate) fn orchestrator_context_path(&self, execution_id: &str) -> PathBuf {
-        self.workspace_root
-            .join(".forge-orchestrator-context")
-            .join(execution_id)
     }
 }
 

@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 use services::{
     gate_engine::GateEngine,
     task_lifecycle::{LifecycleCause, TaskLifecycleService, TransitionLifecycleInput},
-    DiffService,
+    CollaborationActorSource, DiffService,
 };
 
 use crate::{
@@ -103,7 +103,6 @@ pub(super) async fn forge_create_task(
             params.task_type,
             None,
             None,
-            None,
         )
         .await
         .map_err(|error| match error {
@@ -131,7 +130,6 @@ pub(super) async fn forge_create_sub_tasks(
         .map(|s| services::NewSubtaskInput {
             title: s.title,
             description: s.description,
-            assignee_id: None,
         })
         .collect::<Vec<_>>();
     let tasks = state
@@ -274,12 +272,10 @@ pub(super) async fn forge_list_tasks(
             project_id: params.project_id,
             q: None,
             lifecycle_states: params.lifecycle_state.into_vec(),
-            statuses: Vec::new(),
             agent_ids: Vec::new(),
             assignee_types: Vec::new(),
             assignee_ids: Vec::new(),
             priority: None,
-            include_archived: false,
             include_cancelled: true,
             include_deleted: false,
             page: task_page_request(params.cursor, params.limit, params.sort_by)?,
@@ -343,19 +339,30 @@ pub(super) async fn forge_start_execution(
 ) -> Result<Value, McpToolError> {
     let params: StartExecutionParams = parse_params(params)?;
     let user_id = authenticated_user(context)?;
-    let task = TaskRepo::get_by_id(&*state.db, &params.task_id, false)
+    let work_unit = db::WorkUnitRepo::get_by_id(&*state.db, &params.work_unit_id)
         .await?
-        .ok_or_else(|| McpToolError::not_found("task", params.task_id.clone()))?;
+        .ok_or_else(|| McpToolError::not_found("work_unit", params.work_unit_id.clone()))?;
+    let task = TaskRepo::get_by_id(&*state.db, &work_unit.task_id, false)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("task", work_unit.task_id.clone()))?;
     let project = ProjectRepo::get_by_id(&*state.db, &task.project_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("project", task.project_id.clone()))?;
     require_project_access(state, &project.id, user_id).await?;
-    require_agent_visible(state, context, &params.agent_id).await?;
-    if params.role.trim().is_empty() || params.prompt.trim().is_empty() {
+    if params.prompt.trim().is_empty() {
         return Err(McpToolError::new(
             -32602,
-            "role and prompt must be non-empty for an Execution",
+            "prompt must be non-empty for an Execution",
         ));
+    }
+    if work_unit.requires_integration {
+        state
+            .work_unit_service
+            .prepare_workspace(
+                CollaborationActorSource::Human(user_id.to_owned()),
+                &work_unit.id,
+            )
+            .await?;
     }
     let purpose = match params.purpose {
         PublicExecutionPurpose::Plan => ExecutionPurpose::Plan,
@@ -366,19 +373,23 @@ pub(super) async fn forge_start_execution(
         PublicExecutionPurpose::Orchestrate => ExecutionPurpose::Orchestrate,
         PublicExecutionPurpose::General => ExecutionPurpose::General,
     };
-    let execution = state
+    let launched = state
         .task_service
-        .dispatch_initial_role_execution_with_artifacts(
-            &params.task_id,
-            &params.agent_id,
-            &params.role,
+        .launch_work_unit_execution(
+            &work_unit.id,
+            params.expected_work_unit_version,
             purpose,
             params.prompt,
             params.input_artifact_ids,
             None,
         )
         .await?;
-    Ok(execution_value(execution))
+    state
+        .task_service
+        .start_execution(launched.execution.id.clone())
+        .await
+        .map_err(McpToolError::from)?;
+    Ok(execution_value(launched.execution))
 }
 
 pub(super) async fn forge_update_task(
@@ -398,7 +409,6 @@ pub(super) async fn forge_update_task(
             error_annotation: None,
             blocked_json: None,
             failed_json: None,
-            task_state_config: None,
             parent_task_id: params.parent_task_id,
             updated_at: now_rfc3339(),
         })
@@ -521,7 +531,6 @@ pub(super) async fn forge_create_project(
             id: new_uuid_v4(),
             name: params.name,
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_string(),
             primary_repo_id: None,
             owner_id: Some(user_id.clone()),
             created_at: now.clone(),
@@ -618,6 +627,7 @@ pub(super) async fn forge_follow_up_execution(
         .as_object()
         .ok_or_else(|| McpToolError::new(-32602, "params must be an object"))?;
     let execution_id = required_string_param(params, "execution_id")?;
+    let idempotency_key = required_string_param(params, "idempotency_key")?;
     let message = required_string_param(params, "message")?;
     let agent_id = required_string_param(params, "agent_id")?;
     let overrides = optional_overrides_param(params, "overrides")?;
@@ -630,25 +640,31 @@ pub(super) async fn forge_follow_up_execution(
 
     let launched = state
         .task_service
-        .follow_up_execution(execution_id, message, Some(agent_id), overrides)
+        .follow_up_execution(
+            execution_id,
+            message,
+            Some(agent_id),
+            overrides,
+            idempotency_key,
+        )
         .await?;
     let task = task_public_value(state, launched.task).await?;
 
     Ok(json!({
         "task": task,
         "execution": execution_value(launched.execution),
-        "workspace": {
-            "id": launched.workspace.id,
-            "task_id": launched.workspace.task_id,
-            "repo_id": launched.workspace.repo_id,
-            "worktree_path": launched.workspace.worktree_path,
-            "branch": launched.workspace.branch,
-            "status": launched.workspace.status.to_string(),
-            "before_sha": launched.workspace.before_sha,
-            "error": launched.workspace.error,
-            "created_at": launched.workspace.created_at,
-            "updated_at": launched.workspace.updated_at,
-        },
+        "workspace": launched.workspace.map(|workspace| json!({
+            "id": workspace.id,
+            "task_id": workspace.task_id,
+            "repo_id": workspace.repo_id,
+            "worktree_path": workspace.worktree_path,
+            "branch": workspace.branch,
+            "status": workspace.status.to_string(),
+            "before_sha": workspace.before_sha,
+            "error": workspace.error,
+            "created_at": workspace.created_at,
+            "updated_at": workspace.updated_at,
+        })),
     }))
 }
 

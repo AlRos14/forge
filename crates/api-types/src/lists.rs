@@ -99,18 +99,3 @@ pub struct BoardRevisionConflictDetails {
     pub expected_board_revision: i64,
     pub actual_board_revision: i64,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct TaskMovedEventPayload {
-    pub project_id: String,
-    pub operation_id: String,
-    pub old_status: String,
-    pub new_status: String,
-    pub old_board_position: f64,
-    pub new_board_position: f64,
-    pub task_version: i64,
-    pub board_revision: i64,
-    pub before_id: Option<String>,
-    pub after_id: Option<String>,
-}

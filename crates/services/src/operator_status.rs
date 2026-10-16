@@ -701,7 +701,10 @@ mod tests {
     //! and assert the fields you care about. Tests are independent (in-memory SQLite per test).
 
     use super::*;
-    use db::{create_sqlite_pool, new_uuid_v4, run_migrations, CreateDomainEvent, DomainEventRepo};
+    use db::{
+        create_sqlite_pool, new_uuid_v4, run_migrations, CreateDomainEvent, DomainEventRepo,
+        ProjectRepo, RepoRepo, TaskRepo,
+    };
     use serde_json::json;
 
     async fn test_service() -> (Arc<SqliteDb>, OperatorStatusService) {
@@ -719,51 +722,63 @@ mod tests {
         let repo_id = new_uuid_v4();
         let now = Utc::now().to_rfc3339();
 
-        sqlx::query(
-            "INSERT INTO project (id, name, settings, workflow_definition, created_at, updated_at)
-             VALUES (?, ?, '{}', '{}', ?, ?)",
+        ProjectRepo::create(
+            db,
+            db::CreateProject {
+                id: project_id.clone(),
+                name: format!("Project {project_id}"),
+                settings: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
         )
-        .bind(&project_id)
-        .bind(format!("Project {project_id}"))
-        .bind(&now)
-        .bind(&now)
-        .execute(db.pool())
         .await
         .expect("project inserts");
-
-        sqlx::query(
-            "INSERT INTO repo (id, project_id, name, remote_url, local_path, work_mode, default_branch, created_at, updated_at)
-             VALUES (?, ?, ?, ?, NULL, 'direct_merge', 'main', ?, ?)",
+        RepoRepo::create(
+            db,
+            db::CreateRepo {
+                id: repo_id.clone(),
+                project_id: project_id.clone(),
+                name: format!("Repo {repo_id}"),
+                remote_url: format!("https://example.com/{repo_id}.git"),
+                local_path: None,
+                work_mode: db::WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
         )
-        .bind(&repo_id)
-        .bind(&project_id)
-        .bind(format!("Repo {repo_id}"))
-        .bind(format!("https://example.com/{repo_id}.git"))
-        .bind(&now)
-        .bind(&now)
-        .execute(db.pool())
         .await
         .expect("repo inserts");
 
         (project_id, repo_id)
     }
 
-    async fn insert_task(db: &SqliteDb, status: &str) -> String {
+    async fn insert_task(db: &SqliteDb, lifecycle_state: db::TaskLifecycleState) -> String {
         let (project_id, repo_id) = seed_project_repo(db).await;
         let task_id = new_uuid_v4();
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO task (id, project_id, repo_id, title, status, priority, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+        TaskRepo::create(
+            db,
+            db::CreateTask {
+                id: task_id.clone(),
+                project_id,
+                repo_id: Some(repo_id),
+                parent_task_id: None,
+                title: format!("Task {task_id}"),
+                description: None,
+                task_type: "implementation".to_owned(),
+                lifecycle_state,
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
         )
-        .bind(&task_id)
-        .bind(&project_id)
-        .bind(&repo_id)
-        .bind(format!("Task {task_id}"))
-        .bind(status)
-        .bind(&now)
-        .bind(&now)
-        .execute(db.pool())
         .await
         .expect("task inserts");
         task_id
@@ -793,21 +808,6 @@ mod tests {
         .await
         .expect("execution inserts");
         execution_id
-    }
-
-    async fn insert_rejected_transition(db: &SqliteDb, task_id: &str) {
-        let transition_id = new_uuid_v4();
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, rejection, created_at)
-             VALUES (?, ?, 'review', 'in_progress', NULL, 'system', 'fixture rejection', 1, ?)",
-        )
-        .bind(&transition_id)
-        .bind(task_id)
-        .bind(&now)
-        .execute(db.pool())
-        .await
-        .expect("transition log inserts");
     }
 
     async fn insert_retry_receipt(db: &SqliteDb, task_id: &str) -> (String, String, String) {
@@ -959,7 +959,7 @@ mod tests {
     #[tokio::test]
     async fn running_execution_healthy() {
         let (db, service) = test_service().await;
-        let task_id = insert_task(&db, "todo").await;
+        let task_id = insert_task(&db, db::TaskLifecycleState::Ready).await;
         insert_execution(&db, &task_id, "running", None, Utc::now()).await;
 
         let status = service.compute_status().await.expect("status computes");
@@ -972,7 +972,7 @@ mod tests {
     #[tokio::test]
     async fn blocked_task_severity() {
         let (db, service) = test_service().await;
-        let task_id = insert_task(&db, "blocked").await;
+        let task_id = insert_task(&db, db::TaskLifecycleState::Blocked).await;
 
         let status = service.compute_status().await.expect("status computes");
 
@@ -1031,7 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_backlog_attention() {
         let (db, service) = test_service().await;
-        let task_id = insert_task(&db, "done").await;
+        let task_id = insert_task(&db, db::TaskLifecycleState::Done).await;
         let cleanup_after = (Utc::now() - Duration::hours(1)).to_rfc3339();
         insert_workspace(&db, &task_id, "ready", &cleanup_after).await;
 
@@ -1045,8 +1045,8 @@ mod tests {
     #[tokio::test]
     async fn failed_plus_blocked_error() {
         let (db, service) = test_service().await;
-        let blocked_task_id = insert_task(&db, "blocked").await;
-        let failed_task_id = insert_task(&db, "todo").await;
+        let blocked_task_id = insert_task(&db, db::TaskLifecycleState::Blocked).await;
+        let failed_task_id = insert_task(&db, db::TaskLifecycleState::Ready).await;
         insert_execution(
             &db,
             &failed_task_id,
@@ -1069,7 +1069,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_tasks_do_not_report_stale_execution_errors() {
         let (db, service) = test_service().await;
-        let task_id = insert_task(&db, "done").await;
+        let task_id = insert_task(&db, db::TaskLifecycleState::Done).await;
         insert_execution(
             &db,
             &task_id,
@@ -1086,20 +1086,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_transition_logs_do_not_report_retry_pressure() {
+    async fn retired_transition_log_storage_cannot_report_retry_pressure() {
         let (db, service) = test_service().await;
-        let active_task_id = insert_task(&db, "in_progress").await;
-        insert_rejected_transition(&db, &active_task_id).await;
+        let _active_task_id = insert_task(&db, db::TaskLifecycleState::Active).await;
+
+        let transition_log_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'transition_log'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("retired transition log table presence query");
+        assert_eq!(transition_log_table, 0);
 
         let status = service.compute_status().await.expect("status computes");
-
         assert!(status.retry_pressure.is_empty());
     }
 
     #[tokio::test]
     async fn retry_pressure_reports_exact_receipt_and_lifecycle_identity() {
         let (db, service) = test_service().await;
-        let task_id = insert_task(&db, "in_progress").await;
+        let task_id = insert_task(&db, db::TaskLifecycleState::Active).await;
         let (retry_receipt_id, source_event_id, receipt_event_id) =
             insert_retry_receipt(&db, &task_id).await;
 
@@ -1122,17 +1128,17 @@ mod tests {
     #[tokio::test]
     async fn mixed_operational_indicators_use_highest_severity() {
         let (db, service) = test_service().await;
-        let running_task_id = insert_task(&db, "in_progress").await;
+        let running_task_id = insert_task(&db, db::TaskLifecycleState::Active).await;
         insert_execution(&db, &running_task_id, "running", None, Utc::now()).await;
 
-        let blocked_task_id = insert_task(&db, "blocked").await;
+        let blocked_task_id = insert_task(&db, db::TaskLifecycleState::Blocked).await;
         let daemon_id = insert_daemon(&db, "offline").await;
 
-        let cleanup_task_id = insert_task(&db, "done").await;
+        let cleanup_task_id = insert_task(&db, db::TaskLifecycleState::Done).await;
         let cleanup_after = (Utc::now() - Duration::hours(1)).to_rfc3339();
         insert_workspace(&db, &cleanup_task_id, "ready", &cleanup_after).await;
 
-        let failed_task_id = insert_task(&db, "todo").await;
+        let failed_task_id = insert_task(&db, db::TaskLifecycleState::Ready).await;
         insert_execution(
             &db,
             &failed_task_id,

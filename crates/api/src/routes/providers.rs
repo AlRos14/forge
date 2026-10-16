@@ -15,9 +15,8 @@ use axum::{
     Json,
 };
 use db::{
-    now_rfc3339, AgentConnectionHealthRepo, AgentListQuery, AgentRepo, CredentialHandle,
-    CredentialHandleRepo, CredentialUsage, Daemon, DaemonRepo, DbError, PageRequest, SortBy,
-    SortOrder, UpsertAgentConnectionHealth,
+    now_rfc3339, AgentListQuery, AgentRepo, CredentialHandle, CredentialHandleRepo,
+    CredentialUsage, Daemon, DaemonRepo, DbError, PageRequest, SortBy, SortOrder,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -191,25 +190,6 @@ pub async fn delete_provider_entry(
             ),
             _ => ApiError::not_found("provider_entry", handle_id.clone()),
         })?;
-    // Make dependents visibly unhealthy right away instead of waiting for the
-    // next probe. Bindings are never silently reassigned.
-    let now = now_rfc3339();
-    for row in &affected {
-        if let Ok(Some(agent)) = AgentRepo::get_by_id(&*state.db, &row.agent_id).await {
-            let _ = AgentConnectionHealthRepo::upsert_connection_health(
-                &*state.db,
-                UpsertAgentConnectionHealth {
-                    profile_id: agent.profile_id,
-                    status: "unavailable".to_owned(),
-                    capability_status_json: agent.capabilities_json,
-                    checked_at: Some(now.clone()),
-                    error_code: Some("credential_revoked".to_owned()),
-                    updated_at: now.clone(),
-                },
-            )
-            .await;
-        }
-    }
     Ok(Json(DisconnectCredentialResponse {
         id: handle_id,
         status: "revoked".to_owned(),

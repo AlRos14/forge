@@ -1,10 +1,12 @@
 # Independent orchestration architecture: Plan PR0 contract
 
-Status: accepted as the migration target for this repository.
+Status: accepted migration target. PR13's V121–V134 destructive cutover and
+admission reliability corrections are implemented in the current branch and
+remain subject to PR review and merge.
 
-This document freezes the architecture before production code is changed. It
-is a design contract and migration ledger, not a claim that the target model
-is already implemented.
+This document records the accepted architecture and migration ledger. The
+Plan PR0 baseline and pre-PR13 dependency audit below are historical snapshots;
+the implementation status section records the current storage cutover.
 
 ## Scope statement
 
@@ -81,11 +83,12 @@ inputs. The unique `(execution_id, kind)` output relation makes retries return
 the same Artifact, while `execution_artifact_input` pins a same-Task Artifact
 and digest before a downstream Execution starts. Plan Artifact provenance is
 derived from its real Human or Agent Plan Execution. V081 revision and approval
-rows remain preserved as history and are no longer read or written by planning,
-workflow gates, REST plan projection, or review evidence selection. V098 maps
-only rows whose source Execution has a verifiable same-Task Human/Agent Actor;
-unattributable and ambiguous rows retain an explicit audit status and no
-invented producer. Physical table and column removal remains Plan PR13.
+rows were no longer read or written by planning, workflow gates, REST plan
+projection, or review evidence selection. V098 maps only rows whose source
+Execution has a verifiable same-Task Human/Agent Actor; unattributable and
+ambiguous rows retain an explicit audit status and no invented producer.
+V125 preserves the exact V081 rows, drops their runtime tables and `task.plan`,
+and keeps the V098 ledger without its source-row foreign key.
 The workflow resolver also discards the retired checklist hook from previously
 stored workflow definitions, and failed Plan Executions no longer create a
 planner-specific retry exception; general workflow and execution recovery stay
@@ -106,8 +109,8 @@ Cognitive review is now a real Human or Agent reviewer Execution with purpose
 structured `FORGE_RESULT` remains only the harness transport parsed into that
 Artifact. New deterministic checks create ValidationRuns and Evidence and do
 not create or update a Review row. Review output and Validation output remain
-independent; the existing workflow may still order checks or block a transition
-using its configured hook, while PR9 owns general Gate policy.
+independent. TaskLifecycle and Gate policy own current transition admission;
+retired workflow hooks and review rows cannot affect it.
 
 Each workspace-bound Review Execution freezes one immutable
 `review_execution_subject` row with its exact Task, Workspace, base commit,
@@ -167,10 +170,11 @@ It migrates only structured review output with same-Task real ActorRef,
 reviewer/review producer Execution, and a complete reconstructible report with
 no unpinned legacy Evidence references. Other rows receive an explicit audit
 status. Legacy CI is audited but not backfilled when its persisted environment
-and Workspace snapshot cannot be proven. Existing tables and
-`review_passed_at` remain for PR13 cleanup. The implementation details,
-transition readers/writers, crash recovery, and remaining PR9/PR13 boundaries
-are recorded in `plan-pr8-review-validation-evidence.md`.
+and Workspace snapshot cannot be proven. V131 archives and drops the Review
+and evidence-bundle tables, preserves detached V099 migration ledgers, and
+retains no special Review runtime. The implementation details and the
+pre-cutover transition/recovery audit are recorded in
+`plan-pr8-review-validation-evidence.md`.
 
 ## Plan PR9 implementation status
 
@@ -199,6 +203,17 @@ lifecycle in SQLite. V107 binds an `interactive` Execution's WorkspaceLease to
 the TaskRole selected by Task type when that role exists, and checks active
 Agent membership on lease issue and renewal. The old singleton fallback stays
 available only when the matching canonical TaskRole does not exist.
+
+An Execution-owned TaskLifecycle block is resolved only by admission of a
+child whose exact parent is the current blocking Execution on the same open
+WorkUnit. The current lifecycle reference and transition receipt, when
+present, plus each present `error_annotation` and `blocked_json` must identify
+that Execution. A sibling WorkUnit admission is rejected while another
+WorkUnit owns the aggregate block. Block cleanup, lifecycle activation, child
+Execution, ArtifactInputs, WorkspaceLease, receipts, and durable events commit
+together. Parentless launch and generic lifecycle transitions cannot bypass
+pending block evidence; Task cancellation remains an explicit Task-wide
+resolution.
 
 V115 repairs the narrowly identifiable historical case where provider Merged
 on a different PR head was turned into automatic Task rework, but only when
@@ -238,24 +253,22 @@ the aggregate lifecycle and Execution admission. An exact failure replay does
 not consume another attempt, and a rework fact does not release a block owned
 by an unrelated cause.
 
-`task.status` remains only as a guarded one-way storage projection; PR12 removes
-it from Task responses, filters, sorting, CLI output, and web views. Legacy
-workflow state, hooks, GateConfig, and transition-log counts do not advance
-lifecycle or authorize Gate outcomes. Public workflow/status routes and UI are
-removed or replaced by exact TaskLifecycle transition receipts, Gate policy
-revisions/evaluations, and current TaskRole/RoleMembership records. Stored
-workflow configuration, diagnostic projections, historical transition data,
-the status column/projection, and unused recovery code remain PR13 physical
-cleanup. MCP exposes target lifecycle, Gates, review executions/reports,
+TaskLifecycle is the sole persisted Task state authority. V129 archived the
+exact old status/configuration fields and removed them from `task`; V130
+archived and dropped workflow definitions, transition logs, deferred dispatch,
+and task-move storage. Public routes and UI use exact TaskLifecycle transition
+receipts, Gate policy revisions/evaluations, and current TaskRole/RoleMembership
+records. MCP exposes target lifecycle, Gates, Review Executions/reports,
 ValidationRuns, Evidence, roles/memberships, and generic collaboration through
 exact identities. Formal Review remains exactly reviewer role plus review
 purpose.
 
-PR12 also stops applying historical `ProjectSettings.default_role_assignments`
-to newly created Tasks and removes the old state-driven lifecycle script
-runner from Execution admission and server startup. The stored settings remain
-untouched for PR13; durable generic Project hooks continue independently from
-their exact target records and DomainEvent inputs.
+PR12 stopped applying historical `ProjectSettings.default_role_assignments`
+to newly created Tasks and removed the old state-driven lifecycle script
+runner from Execution admission and server startup. V130 preserves the exact
+old setting in migration history and removes it from active Project settings;
+durable generic Project hooks continue independently from their exact target
+records and DomainEvent inputs.
 
 PR12 also separates the public SSE contract from internal `EventContext`.
 Typed public events project exact durable DomainEvents and a bounded set of
@@ -537,6 +550,31 @@ Workspace authority, leases, security policy, human gates, merge constraints,
 credential boundaries, and destructive-action policy are core-enforced.
 Models cannot reason around them.
 
+Before an external provider Start, the durable claim rechecks the exact open
+WorkUnit revision and Actor assignment, active TaskRole membership, and
+unexpired WorkspaceLease bound to that Execution in one SQLite write
+transaction. An existing provider-attempt receipt short-circuits retries so
+an uncertain external effect is never sent again.
+
+An Orchestrator Execution has no WorkUnit or WorkspaceLease. Its claim instead
+resolves the exact current OrchestratorWake attempt and, in that same write
+transaction, checks the Execution's Task, Agent Actor, `orchestrator` Role,
+`orchestrate` Purpose, active TaskRole membership, TaskRole version and policy
+snapshot, current Wake state, attempt number, and unexpired Wake lease. A lost
+authority claim records no provider attempt. The external attempt receipt is
+still checked first so accepted, rejected, and uncertain provider outcomes
+cannot be replayed.
+
+A non-repository Agent WorkUnit (`requires_integration = false`) has no
+Workspace and receives no WorkspaceLease. Its isolated execution context is
+the stable path `.forge-workunit-context/<task_id>/<work_unit_id>` under the
+configured workspace root. Parameter preparation and execution resolve that
+same exact WorkUnit context. Admission prepares the directory and verifies the
+frozen Agent, local CLI adapter, and online embedded host before creating a
+Running Execution. A host/provider combination without this local isolated
+context is rejected before admission; the missing Workspace never grants
+access to the server working directory or the Task integration Workspace.
+
 ### INV-031 — Cognitive policy is not Rust workflow branching
 
 Whether to investigate, replan, reassign, select another reviewer, or ask a
@@ -579,11 +617,11 @@ ForgeAILab/forge is the origin. Compatibility is not the goal. Useful
 isolated fixes may be selectively adopted, while the independent architecture
 and lifecycle are maintained here.
 
-## Current dependency audit
+## Pre-PR13 dependency audit
 
-This inventory identifies current readers and writers before any replacement
-Plan PR deletes or changes them. It is intentionally conservative; each later Plan PR
-must repeat the search at its own HEAD.
+This inventory captures readers and writers before the PR13 replacement Plan PR
+deleted or changed them. It is intentionally conservative and remains useful
+as pre-cutover evidence; it does not describe the current post-V132 readers.
 
 | Legacy or transitional concept | Current storage and readers/writers observed | Replacement and stop condition |
 | --- | --- | --- |
@@ -641,25 +679,50 @@ fallback is authorized by Plan PR0.
 | --- | --- | --- | --- |
 | Plan PR0 | Documentation, invariants, ADRs, audit | All current paths | Plan PR0A may begin after Plan PR0 is reviewed and merged; Plan PR1 waits for both Plan PR0 and Plan PR0A |
 | Plan PR0A | Operational reconciliation: execution log rotation/storage, Cursor large-prompt transport, explicit launch/env configuration, usage/quota observations, WorkspaceLease revision independence, and salvage classification for legacy Repo PR #2 and local commits | Existing singular sessions, workflow cognition, special planning/review paths | Plan PR1 waits until Plan PR0 and Plan PR0A are reviewed and merged; explicit sessions and role migration remain in Plan PRs 1/2 |
-| Plan PR1 | ActorRef, TaskRole, RoleMembership, coordination mode | Singular task_role_assignment | New membership authority; remove old role path in Plan PR13 |
-| Plan PR2 | ExecutionPurpose and HarnessSession | execution.agent_session_id projection | Explicit session authority; Plan PR10 removes projection-based Resume and Plan PR13 removes the stored projection |
+| Plan PR1 | ActorRef, TaskRole, RoleMembership, coordination mode | Singular task_role_assignment and Task assignee projection | V127–V128 remove singleton storage after preserving its exact provenance; TaskRole and RoleMembership remain authoritative |
+| Plan PR2 | ExecutionPurpose and HarnessSession | execution.agent_session_id projection | V124 archives the exact scalar projection and removes the field; only an explicit HarnessSession reference authorizes Resume |
 | Plan PR3 | HarnessAdapter and dimensional capabilities | TaskExecutor supervisor/routing facade; no CodingExecutorAdapter production authority | All harness calls route through adapter; remove the transitional TaskExecutor facade when its remaining generic supervisor consumers migrate |
 | Plan PR4 | Artifact, Message, Handoff, Proposal, Decision | Plan/review/chat-specific outputs | Generic records authoritative; remove duplicate outputs in Plan PRs 7, 8, 11 |
-| Plan PR5 | WorkUnit DAG and isolated integration | One-task workspace assumptions | WorkUnit isolation authoritative; remove shared assumptions in Plan PR13 |
+| Plan PR5 | WorkUnit DAG and isolated integration | One-task workspace assumptions | WorkUnit isolation is authoritative; Task-scoped recovery/reset cannot infer a Workspace and the shared reset route is removed |
 | Plan PR6 | Event-driven orchestrator role and policy | Workflow-triggered cognition | Orchestrator actions use collaboration and small policy; remove orchestration branches in Plan PRs 9/11 |
-| Plan PR7 | Plan Execution and plan Artifact | Canonical plan revisions, planner retry/prompt machinery | Artifact authoritative; remove old plan APIs/persistence in Plan PR13 |
-| Plan PR8 | Review Executions, concrete ValidationRuns, and deterministic validation Evidence | ReviewRunner, special review rows, FORGE_RESULT-centric flow | Generic review/validation authoritative; remove special runtime in Plan PR13 |
-| Plan PR9 | Aggregate Task lifecycle and Gates | Old workflow engine/state mapping | New lifecycle authoritative; remove workflow tables/branches in Plan PR13 |
-| Plan PR10 | External harness cognition, immutable Execution identity, and deterministic no-Workspace admission | agent-host, embedded runtime, and Forge-owned model/tool loop | The removed runtime stays retired. Task dispatch and cancellation use the Execution snapshot's exact `resolved_daemon_id`; a missing host fails closed. Task launches select credentials from the Execution snapshot; only local in-process dispatch injects them. Remote credential-backed Start fails before daemon dispatch. Agent Chat storage and provenance remain readable, but every current production adapter fails closed because none proves `permission_policy=deny` and `isolation_posture=no-filesystem`. Periodic Cursor `/usage` polling is disabled during Executions because its PTY child can leave the wrapper process group; no old snapshot is attached to the current Execution. PR11 owns vertical retirement or migration. |
-| Plan PR11 | Project/Repo/Task plus generic collaboration | Retired vertical writes/authority are database-fenced; safe history reads remain | V118; remove vertical workers/materializers and legacy authority; PR12 removes surfaces, PR13 drops storage |
-| Plan PR12 | Public REST/MCP/CLI/web/types/SSE projections over target domain | Old API/MCP/CLI/UI and EventBus vocabulary | Remove obsolete surfaces; physical storage/projection cleanup remains PR13 |
-| Plan PR13 | Destructive persistence cleanup | None if preconditions hold | Drop old schema and compatibility code |
+| Plan PR7 | Plan Execution and plan Artifact | Canonical plan revisions, planner retry/prompt machinery | V125 archives and drops V081 plan persistence; V098 migration provenance remains detached from its source row |
+| Plan PR8 | Review Executions, concrete ValidationRuns, and deterministic validation Evidence | ReviewRunner, special review rows, FORGE_RESULT-centric flow | V131 archives and drops special Review persistence; V099 migration provenance remains detached from legacy Review rows |
+| Plan PR9 | Aggregate Task lifecycle and Gates | Old workflow engine/state mapping | V129–V130 remove Task status/configuration and workflow persistence after exact state cutover |
+| Plan PR10 | External harness cognition, immutable Execution identity, and deterministic no-Workspace admission | agent-host, embedded runtime, and Forge-owned model/tool loop | V126 archives native AgentSession history; V132 archives and drops Agent Chat and retired cognition storage. Task dispatch remains bound to exact Execution snapshots and fails closed without an available host. |
+| Plan PR11 | Project/Repo/Task plus generic collaboration | Retired vertical writes/authority are database-fenced; safe history reads remain | V118 retired the authority; V132 archives exact rows and drops legacy runtime storage after PR12 surface removal |
+| Plan PR12 | Public REST/MCP/CLI/web/types/SSE projections over target domain | Old API/MCP/CLI/UI and EventBus vocabulary | Removed obsolete surfaces; V121–V132 complete the assigned storage/projection cleanup in this branch |
+| Plan PR13 | Destructive persistence cleanup | None if preconditions hold | V121–V132 remove legacy schema and compatibility code after exact-history cutovers; implemented in this branch |
 | Plan PR14 | Final product documentation/name | Old public branding where intentionally retained | Rename only with explicit supplied name and data discovery |
 | Plan PR15 | Reference scenarios and reliability | None | Final acceptance and documentation correction |
 
 Plan PRs are not combined merely because adjacent code is convenient to edit.
 A later Plan PR may be blocked or reordered only by a concrete repository dependency
 that is documented and reviewed.
+
+## Plan PR13 implementation status
+
+The current branch applies migrations V121–V134 after the PR12 V120 baseline.
+The cutover preserves historical values in dedicated history tables and
+migration receipts; those records do not authorize legacy runtime reads or
+writes.
+
+| Migration | Cutover |
+| --- | --- |
+| V121–V122 | Copy exact ProjectRelease snapshot dependencies, references, and media pins into per-release history; detach the historical GET reader from Project OS tables while retaining the public immutable snapshot and shared media authority. |
+| V123 | Store Integration `default_implementer` as an exact ActorRef; preserve invalid or ambiguous legacy values in migration provenance without inferring an Actor. |
+| V124 | Preserve ambiguous `execution.agent_session_id` values in exact provenance history and drop the scalar projection; target continuity uses an explicitly attached HarnessSession. |
+| V125 | Archive V081 Task Plan revisions, approvals, review evidence bundles, and `task.plan`; drop those runtime stores while retaining the V098 migration ledger without its source-row FK. |
+| V126–V128 | Preserve native AgentSession and singleton role/assignee projections as history, then drop their runtime stores and Task columns; TaskRole and RoleMembership remain authoritative. |
+| V129–V130 | Archive and drop legacy Task status/configuration, workflow definitions, transition logs, deferred dispatch, and task-move storage; TaskLifecycle, Gates, and exact Execution/WorkUnit/Workspace identities remain authoritative. |
+| V131 | Archive and drop special Review persistence while retaining detached V099 Review/Validation provenance; current review uses reviewer Executions, ReviewReport Artifacts, ValidationRuns, and Evidence. |
+| V132 | Preserve Main/Project Agent, Agent Chat, memory, Attention, Room, Genesis, and Project OS rows in exact legacy-record history, then drop their runtime schema and Project columns. |
+| V133 | Add immutable follow-up operation receipts so one idempotency key replays its exact child Execution and cannot authorize different request content. |
+| V134 | Replace the WorkUnit Execution admission trigger with distinct rejection markers, preserving exact typed causes for capacity, RoleMembership, WorkUnit, Workspace, dependency, and concurrent-Execution failures. |
+
+ProjectRelease GETs are read-only and reconstruct only from `project_release`,
+`project_release_history_*`, shared media assets, and tombstones. They validate
+the original `snapshot_digest`; they do not read current Charter, milestone,
+readiness, baseline, document, decision, Task, or workflow state.
 
 ### PR10 Execution identity and Agent Chat transition
 

@@ -38,7 +38,28 @@ use std::{
 // retires Main/Project Agent and Project OS authority without dropping history.
 // V119 permits only exact FK ON DELETE SET NULL maintenance on retired rows;
 // every other historical field remains immutable. V120 preserves the
-// task-type-to-TaskRole mapping for interactive WorkspaceLease Executions.
+// task-type-to-TaskRole mapping for interactive WorkspaceLease Executions;
+// V121 stores self-contained immutable ProjectRelease snapshots and V122
+// detaches their readers from Project OS tables and removes old release pins.
+// V123 moves integration defaults to exact AgentRef/HumanRef storage and
+// records invalid legacy values without inferring an Actor; V124 archives
+// ambiguous Execution session projections and removes that compatibility field;
+// V125 archives V081 planner rows and removes their obsolete schema; V126
+// preserves native AgentSession rows as history and removes runtime storage;
+// V127 archives the last singleton TaskRole projection rows and drops that
+// compatibility table while actor deletion closes exact target memberships;
+// V128 archives residual Task-level assignee projections and rebuilds Task
+// without the singular columns while TaskRole/RoleMembership stays authoritative;
+// V129 archives obsolete Task status/configuration and makes TaskLifecycle the
+// sole state authority; V130 archives and removes workflow, transition-log,
+// deferred-dispatch, and task-move projections; V131 archives legacy Review rows,
+// removes their runtime table, and keeps detached V099 provenance ledgers;
+// V132 archives Main/Project Agent, Agent Chat, memory, Attention, Genesis, and
+// Project OS history before dropping those runtime tables and Project columns.
+// V133 records exact follow-up request identities atomically with their child
+// Execution so uncertain retries replay the same admitted child. V134 replaces
+// the WorkUnit Execution admission trigger with distinct failure markers so
+// late SQLite guard rejections retain their exact typed cause.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,13 +200,33 @@ async fn apply_migration(pool: &SqlitePool, migration: &Migration) -> Result<()>
 async fn apply_migration_sql(pool: &SqlitePool, migration: &Migration, sql: &str) -> Result<()> {
     if migration_requires_direct_connection(sql) {
         let mut connection = pool.acquire().await?;
-        sqlx::raw_sql(sql).execute(&mut *connection).await?;
-        sqlx::query("INSERT INTO _migration (version, name, applied_at) VALUES (?, ?, ?)")
-            .bind(migration.version)
-            .bind(&migration.name)
-            .bind(now_rfc3339())
-            .execute(&mut *connection)
-            .await?;
+        if let Err(error) = sqlx::raw_sql(sql).execute(&mut *connection).await {
+            // Restore the connection if an explicit direct migration fails
+            // while foreign keys are disabled or a transaction is open.
+            let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+            let _ = sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&mut *connection)
+                .await;
+            let _ = sqlx::query("PRAGMA legacy_alter_table = OFF")
+                .execute(&mut *connection)
+                .await;
+            return Err(error.into());
+        }
+        let receipt_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM _migration WHERE version = ?)",
+        )
+        .bind(migration.version)
+        .fetch_one(&mut *connection)
+        .await?
+            != 0;
+        if !receipt_exists {
+            sqlx::query("INSERT INTO _migration (version, name, applied_at) VALUES (?, ?, ?)")
+                .bind(migration.version)
+                .bind(&migration.name)
+                .bind(now_rfc3339())
+                .execute(&mut *connection)
+                .await?;
+        }
     } else {
         let mut transaction = pool.begin().await?;
 
@@ -208,4 +249,62 @@ fn migration_requires_direct_connection(sql: &str) -> bool {
     // migrations that rebuild referenced tables must run directly on a single
     // connection instead of inside the default transaction wrapper.
     sql.to_ascii_lowercase().contains("pragma foreign_keys")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_direct_migration_restores_pragmas_and_rolls_back_schema_and_receipt() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool creates");
+        ensure_migration_table(&pool)
+            .await
+            .expect("migration receipt table creates");
+        let migration = Migration {
+            version: 900,
+            name: "failed_direct_fixture".to_owned(),
+            path: PathBuf::from("V900__failed_direct_fixture.sql"),
+        };
+        let result = apply_migration_sql(
+            &pool,
+            &migration,
+            "PRAGMA foreign_keys = OFF;
+             PRAGMA legacy_alter_table = ON;
+             BEGIN IMMEDIATE;
+             CREATE TABLE pr13_partial_ddl (id TEXT PRIMARY KEY);
+             SELECT * FROM pr13_missing_table;
+             INSERT INTO _migration (version, name, applied_at)
+             VALUES (900, 'failed_direct_fixture', 'fixture');
+             COMMIT;",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "fixture migration must fail mid-transaction"
+        );
+
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .expect("foreign key PRAGMA reads after migration failure");
+        let legacy_alter_table: i64 = sqlx::query_scalar("PRAGMA legacy_alter_table")
+            .fetch_one(&pool)
+            .await
+            .expect("legacy alter PRAGMA reads after migration failure");
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(legacy_alter_table, 0);
+        let partial_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pr13_partial_ddl'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("partial DDL lookup succeeds");
+        assert_eq!(partial_table, 0, "failed migration DDL rolls back");
+        assert!(!is_applied(&pool, migration.version)
+            .await
+            .expect("receipt lookup succeeds"));
+    }
 }

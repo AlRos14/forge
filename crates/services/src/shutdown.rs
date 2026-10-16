@@ -3,6 +3,7 @@ use db::{ExecutionRepo, ResumePolicy, SqliteDb, StopReason};
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
 use std::{
+    collections::HashSet,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -59,6 +60,20 @@ impl GracefulShutdown {
              FROM task
              JOIN execution ON execution.task_id = task.id AND execution.status = 'running'
              WHERE task.deleted_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM domain_event pending
+                   WHERE pending.entity_type = 'execution'
+                     AND pending.entity_id = execution.id
+                     AND pending.event_type = 'execution.provider_start_pending'
+                     AND pending.dedupe_key = 'execution.provider_start_pending:' || execution.id
+                     AND NOT EXISTS (
+                         SELECT 1 FROM domain_event attempt
+                         WHERE attempt.entity_type = 'execution'
+                           AND attempt.entity_id = execution.id
+                           AND attempt.event_type = 'execution.provider_start_attempted'
+                           AND attempt.dedupe_key = 'execution.provider_start_attempted:' || execution.id
+                     )
+               )
              ORDER BY task.id",
         )
         .fetch_all(self.db.pool())
@@ -104,6 +119,12 @@ impl GracefulShutdown {
         if self.task_executor.is_none() && self.task_service.is_none() {
             return Ok(());
         }
+        let pending_provider_starts: HashSet<String> =
+            ExecutionRepo::list_pending_provider_starts(&*self.db)
+                .await?
+                .into_iter()
+                .map(|execution| execution.id)
+                .collect();
         let rows = sqlx::query("SELECT id FROM execution WHERE task_id = ? AND status = 'running'")
             .bind(task_id)
             .fetch_all(self.db.pool())
@@ -112,6 +133,9 @@ impl GracefulShutdown {
             use sqlx::Row;
 
             let execution_id: String = row.get("id");
+            if pending_provider_starts.contains(&execution_id) {
+                continue;
+            }
             let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &execution_id).await? else {
                 continue;
             };
@@ -166,8 +190,8 @@ mod tests {
     use db::{
         create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
         CreateAgent, CreateExecution, CreateProject, CreateRepo, CreateTask, DaemonRepo,
-        DaemonStatus, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo, TaskStatus,
-        UpdateAgent, UpdateProject, UpsertDaemon,
+        DaemonStatus, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskLifecycleState,
+        TaskRepo, UpdateAgent, UpdateProject, UpsertDaemon,
     };
     use executors::{ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor};
     use std::sync::Mutex;
@@ -213,7 +237,6 @@ mod tests {
                 id: project_id.clone(),
                 name: "Forge".to_owned(),
                 settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
                 primary_repo_id: None,
                 owner_id: None,
                 created_at: now.clone(),
@@ -316,8 +339,7 @@ mod tests {
         db: &SqliteDb,
         project_id: String,
         repo_id: String,
-        status: TaskStatus,
-        agent_id: Option<String>,
+        lifecycle_state: TaskLifecycleState,
     ) -> String {
         let now = now_rfc3339();
         TaskRepo::create(
@@ -328,15 +350,12 @@ mod tests {
                 repo_id: Some(repo_id),
                 parent_task_id: None,
                 subtask_order: None,
-                assignee_type: agent_id.as_ref().map(|_| "agent".to_owned()),
-                assignee_id: agent_id,
                 title: "Shutdown test".to_owned(),
                 description: None,
                 task_type: "implementation".to_owned(),
-                status,
+                lifecycle_state,
                 is_automation: false,
                 priority: 0,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now,
@@ -359,7 +378,7 @@ mod tests {
             .expect("agent loads")
             .expect("agent exists");
         let resolved_daemon_id = agent.daemon_id.clone().expect("agent daemon binding");
-        ExecutionRepo::create(
+        let execution = ExecutionRepo::create(
             db,
             CreateExecution {
                 id: new_uuid_v4(),
@@ -375,7 +394,6 @@ mod tests {
                 resume_policy: None,
                 stopped_at: None,
                 parent_execution_id: None,
-                agent_session_id,
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,
@@ -399,7 +417,19 @@ mod tests {
             },
         )
         .await
-        .expect("execution creates")
+        .expect("execution creates");
+        if let Some(external_session_id) = agent_session_id {
+            ExecutionRepo::record_harness_session_result(
+                db,
+                &execution.id,
+                &external_session_id,
+                &now_rfc3339(),
+            )
+            .await
+            .expect("exact HarnessSession receives the external session identity")
+        } else {
+            execution
+        }
     }
 
     #[tokio::test]
@@ -409,14 +439,7 @@ mod tests {
         let mut rx = event_bus.subscribe();
         let (project_id, repo_id) = seed_project_repo(&db).await;
         let agent_id = seed_agent(&db).await;
-        let task_id = seed_task(
-            &db,
-            project_id,
-            repo_id,
-            "in_progress".to_owned(),
-            Some(agent_id.clone()),
-        )
-        .await;
+        let task_id = seed_task(&db, project_id, repo_id, TaskLifecycleState::Active).await;
         let execution = seed_running_execution(&db, task_id.clone(), agent_id, None).await;
         let shutdown = GracefulShutdown::new(Arc::clone(&db), event_bus);
 
@@ -428,7 +451,7 @@ mod tests {
             .await
             .expect("task fetches")
             .expect("task exists");
-        assert_eq!(task.status, "in_progress".to_owned());
+        assert_eq!(task.lifecycle_state, TaskLifecycleState::Active);
         assert_eq!(task.error_annotation, None);
         let execution = ExecutionRepo::get_by_id(&*db, &execution.id)
             .await
@@ -451,14 +474,7 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(16));
         let (project_id, repo_id) = seed_project_repo(&db).await;
         let agent_id = seed_agent(&db).await;
-        let task_id = seed_task(
-            &db,
-            project_id,
-            repo_id,
-            "in_progress".to_owned(),
-            Some(agent_id.clone()),
-        )
-        .await;
+        let task_id = seed_task(&db, project_id, repo_id, TaskLifecycleState::Active).await;
         let execution = seed_running_execution(&db, task_id, agent_id, None).await;
         let executor = Arc::new(RecordingCancelExecutor::default());
 
@@ -518,14 +534,7 @@ mod tests {
         )
         .await
         .expect("daemon B creates");
-        let task_id = seed_task(
-            &db,
-            project_id,
-            repo_id,
-            "in_progress".to_owned(),
-            Some(agent_id.clone()),
-        )
-        .await;
+        let task_id = seed_task(&db, project_id, repo_id, TaskLifecycleState::Active).await;
         let execution = seed_running_execution(&db, task_id, agent_id.clone(), None).await;
         let current_agent = AgentRepo::get_by_id(&*db, &agent_id)
             .await
@@ -626,14 +635,7 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(16));
         let (project_id, repo_id) = seed_project_repo(&db).await;
         let task_agent_id = seed_agent(&db).await;
-        let task_id = seed_task(
-            &db,
-            project_id,
-            repo_id,
-            "in_progress".to_owned(),
-            Some(task_agent_id.clone()),
-        )
-        .await;
+        let task_id = seed_task(&db, project_id, repo_id, TaskLifecycleState::Active).await;
         let execution = seed_running_execution(
             &db,
             task_id.clone(),
@@ -651,14 +653,25 @@ mod tests {
             .await
             .expect("task fetches")
             .expect("task exists");
-        assert_eq!(task.status, "in_progress");
+        assert_eq!(task.lifecycle_state, TaskLifecycleState::Active);
 
         let execution = ExecutionRepo::get_by_id(&*db, &execution.id)
             .await
             .expect("execution fetches")
             .expect("execution exists");
         assert_eq!(execution.status, ExecutionStatus::Cancelled);
-        assert_eq!(execution.agent_session_id.as_deref(), Some("session-789"));
+        let external_session_id: Option<String> =
+            sqlx::query_scalar("SELECT external_session_id FROM harness_session WHERE id = ?")
+                .bind(
+                    execution
+                        .harness_session_id
+                        .as_deref()
+                        .expect("HarnessSession link"),
+                )
+                .fetch_one(db.pool())
+                .await
+                .expect("HarnessSession identity loads");
+        assert_eq!(external_session_id.as_deref(), Some("session-789"));
     }
 
     #[tokio::test]
@@ -666,7 +679,7 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let (project_id, repo_id) = seed_project_repo(&db).await;
-        let task_id = seed_task(&db, project_id, repo_id, "todo".to_owned(), None).await;
+        let task_id = seed_task(&db, project_id, repo_id, TaskLifecycleState::Ready).await;
         let version = TaskRepo::get_by_id(&*db, &task_id, false)
             .await
             .expect("task fetches")
@@ -682,7 +695,7 @@ mod tests {
             .await
             .expect("task fetches")
             .expect("task exists");
-        assert_eq!(task.status, "todo".to_owned());
+        assert_eq!(task.lifecycle_state, TaskLifecycleState::Ready);
         assert_eq!(task.error_annotation, None);
         assert_eq!(task.version, version);
     }

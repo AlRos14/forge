@@ -13,6 +13,9 @@ pub enum DbError {
     #[error("repository has associated tasks")]
     RepoInUse,
 
+    #[error("Project has immutable Releases")]
+    ProjectHasReleases,
+
     #[error("version conflict")]
     VersionConflict,
 
@@ -31,15 +34,6 @@ pub enum DbError {
     #[error("board revision conflict: expected {expected}, actual {actual}")]
     BoardRevisionConflict { expected: i64, actual: i64 },
 
-    #[error("move operation conflict: {operation_id}")]
-    MoveOperationConflict { operation_id: String },
-
-    #[error("move operation is incomplete: {operation_id}")]
-    MoveOperationIncomplete { operation_id: String },
-
-    #[error("invalid task move: {0}")]
-    InvalidTaskMove(String),
-
     #[error("invalid transition")]
     InvalidTransition,
 
@@ -48,6 +42,21 @@ pub enum DbError {
 
     #[error("agent at capacity")]
     AgentAtCapacity,
+
+    #[error("agent is paused: {agent_id}")]
+    AgentPaused { agent_id: String },
+
+    #[error("WorkUnit is not open for Execution admission")]
+    WorkUnitNotOpen,
+
+    #[error("Execution Actor is not an active member of the WorkUnit role")]
+    WorkUnitRoleMembershipInactive,
+
+    #[error("WorkUnit Workspace is not available for Execution admission")]
+    WorkUnitWorkspaceUnavailable,
+
+    #[error("WorkUnit already has a Running Execution")]
+    WorkUnitExecutionAlreadyRunning,
 
     #[error("dependency gate")]
     DependencyGate,

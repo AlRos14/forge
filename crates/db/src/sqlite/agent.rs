@@ -1,10 +1,10 @@
 use super::*;
 use crate::now_rfc3339;
 
-// CLI identities still receive authority from the server-issued canonical
-// scope. This ceiling only makes the scope catalog usable; it cannot grant a
-// Chat filesystem access or let Main cross into Project/Task mutations.
-const DEFAULT_CLI_SCOPE_PERMISSIONS: &str = r#"{"permissions":["read_account","read_project","read_agent_chat","read_task","read_memory","propose_task","propose_discovery","propose_project","propose_handoff","propose_message","propose_review","propose_commitment","propose_memory","propose_decision","propose_session","task_read","task_write"]}"#;
+// CLI identities receive only permissions for the active Task collaboration
+// surface. Retired Agent Chat, memory, Main Agent, and Project Agent actions
+// are not seeded into new identities or profiles.
+const DEFAULT_CLI_SCOPE_PERMISSIONS: &str = r#"{"permissions":["read_account","read_project","read_task","propose_task","task_read","task_write"]}"#;
 
 async fn list_agents(
     db: &SqliteDb,

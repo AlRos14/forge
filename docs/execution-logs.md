@@ -84,8 +84,11 @@ Cost is shown only when `execution_usage.cost_usd` was actually reported.
 
 ## Resume Identifiers
 
-`execution.agent_session_id` stores the adapter session/thread id used for
-follow-ups.
+Forge no longer stores an adapter session/thread id on the Execution.
+Continuity uses the exact `execution.harness_session_id` reference and that
+HarnessSession's `external_session_id`. V124 preserves old scalar values in
+`pr13_execution_session_projection_history`; those values are provenance and
+never authorize Resume.
 
 | Adapter     | Resume config key   | Meaning                                                                    |
 | ----------- | ------------------- | -------------------------------------------------------------------------- |
@@ -103,7 +106,8 @@ execution's chat history. This matches the Vibe Kanban model:
    - `parent_execution_id` pointing at the previous execution.
    - `prompt` set to the follow-up message.
    - `summary` initially set to the follow-up message for list display.
-3. Forge resolves the parent execution's `agent_session_id`.
+3. Forge resolves the parent Execution's explicitly linked HarnessSession and
+   its external session id, if the exact compatible session exists.
 4. Forge injects the adapter-specific resume key into the new execution's
    executor config snapshot.
 5. The adapter resumes or forks the native session and sends the follow-up

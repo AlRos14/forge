@@ -13,6 +13,7 @@ executors = { path = "../executors" }
 db = { path = "../db" }
 services = { path = "../services" }
 events = { path = "../events" }
+workspace = { path = "../workspace" }
 axum = "0.8"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

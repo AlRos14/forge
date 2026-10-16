@@ -20,11 +20,11 @@ use crate::{
 
 fn integration_response(model: db::ProjectIntegration) -> IntegrationResponse {
     let default_implementer = match (
-        model.default_assignee_type.as_deref(),
-        model.default_assignee_id,
+        model.default_implementer_kind.as_deref(),
+        model.default_implementer_id,
     ) {
         (Some("agent"), Some(id)) => Some(ActorRef::Agent(id)),
-        (Some("user"), Some(id)) => Some(ActorRef::Human(id)),
+        (Some("human"), Some(id)) => Some(ActorRef::Human(id)),
         _ => None,
     };
     IntegrationResponse {
@@ -56,7 +56,8 @@ pub async fn create_integration(
         .platform
         .parse::<db::IntegrationPlatform>()
         .map_err(|_| ApiError::bad_request("invalid platform"))?;
-    let (default_assignee_type, default_assignee_id) = storage_actor(body.default_implementer);
+    let (default_implementer_kind, default_implementer_id) =
+        storage_actor(body.default_implementer);
 
     let now = db::now_rfc3339();
     let model = CreateProjectIntegration {
@@ -69,9 +70,8 @@ pub async fn create_integration(
         token_secret_ref: body.credential_env_var,
         poll_interval_secs: body.poll_interval_secs.unwrap_or(300),
         sync_filter: body.sync_filter.unwrap_or_else(|| json!({})).to_string(),
-        default_task_state: None,
-        default_assignee_type,
-        default_assignee_id,
+        default_implementer_kind,
+        default_implementer_id,
         enabled: body.enabled.unwrap_or(true),
         last_polled_at: None,
         created_at: now.clone(),
@@ -112,7 +112,7 @@ pub async fn update_integration(
         .map(|platform| platform.parse::<db::IntegrationPlatform>())
         .transpose()
         .map_err(|_| ApiError::bad_request("invalid platform"))?;
-    let (default_assignee_type, default_assignee_id) = match body.default_implementer {
+    let (default_implementer_kind, default_implementer_id) = match body.default_implementer {
         None => (None, None),
         Some(None) => (Some(None), Some(None)),
         Some(Some(actor)) => {
@@ -132,9 +132,8 @@ pub async fn update_integration(
         token_secret_ref: body.credential_env_var,
         poll_interval_secs: body.poll_interval_secs,
         sync_filter: body.sync_filter.as_ref().map(Value::to_string),
-        default_task_state: None,
-        default_assignee_type,
-        default_assignee_id,
+        default_implementer_kind,
+        default_implementer_id,
         enabled: body.enabled,
         last_polled_at: None,
     };
@@ -150,7 +149,7 @@ pub async fn update_integration(
 fn storage_actor(actor: Option<ActorRef>) -> (Option<String>, Option<String>) {
     match actor {
         Some(ActorRef::Agent(id)) => (Some("agent".to_owned()), Some(id)),
-        Some(ActorRef::Human(id)) => (Some("user".to_owned()), Some(id)),
+        Some(ActorRef::Human(id)) => (Some("human".to_owned()), Some(id)),
         None => (None, None),
     }
 }

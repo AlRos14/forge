@@ -73,7 +73,7 @@ impl DomainEventRepo for SqliteDb {
                 return Ok(event);
             }
             Err(error) if is_stale_orchestrator_action_error(&error) => {
-                return Err(DbError::StaleOrchestratorAction)
+                return Err(DbError::StaleOrchestratorAction);
             }
             Err(error) => return Err(error.into()),
         }

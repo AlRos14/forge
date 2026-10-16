@@ -17,7 +17,7 @@ impl DiffService {
     }
 
     pub async fn task_diff(&self, task_id: &str) -> Result<DiffResponse> {
-        let workspace = WorkspaceRepo::get_by_task_id(&*self.db, task_id)
+        let workspace = WorkspaceRepo::get_integration_by_task_id(&*self.db, task_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", task_id.to_owned()))?;
         self.workspace_diff(&workspace.id).await

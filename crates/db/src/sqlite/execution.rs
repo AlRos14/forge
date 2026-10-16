@@ -1,5 +1,8 @@
 use super::*;
-use crate::{now_rfc3339, AgentExecutionStats, ExecutionPurpose, ExecutionStatus};
+use crate::{
+    now_rfc3339, AgentExecutionStats, ExecutionPurpose, ExecutionStatus,
+    PendingProviderStartFailure, RunningExecutionFailure,
+};
 
 fn map_review_execution_subject(row: SqliteRow) -> Result<ReviewExecutionSubject> {
     Ok(ReviewExecutionSubject {
@@ -49,6 +52,48 @@ fn review_subject_identity_matches(
         && current.base_commit_sha == proposed.base_commit_sha
         && current.head_commit_sha == proposed.head_commit_sha
         && current.workspace_snapshot_digest == proposed.workspace_snapshot_digest
+}
+
+fn provider_start_event_matches_execution(
+    event: &CreateDomainEvent,
+    execution: &Execution,
+    event_type: &str,
+) -> bool {
+    let actor = execution.actor_ref();
+    let expected_dedupe_key = format!("{event_type}:{}", execution.id);
+    event.event_type == event_type
+        && event.entity_type == "execution"
+        && event.entity_id == execution.id
+        && event.actor_type
+            == actor
+                .as_ref()
+                .map(|actor| actor.kind().to_string())
+                .unwrap_or_default()
+        && event.actor_id.as_deref() == actor.as_ref().map(|actor| actor.id())
+        && event.scope_type == "task"
+        && event.scope_id == execution.task_id
+        && event.correlation_id == execution.id
+        && event.causation_id == execution.parent_execution_id
+        && event.causation_depth == i64::from(execution.parent_execution_id.is_some())
+        && event.dedupe_key.as_deref() == Some(expected_dedupe_key.as_str())
+}
+
+fn provider_start_event_semantics_match(
+    row: &SqliteRow,
+    input: &CreateDomainEvent,
+) -> Result<bool> {
+    Ok(row.try_get::<String, _>("event_type")? == input.event_type
+        && row.try_get::<String, _>("entity_type")? == input.entity_type
+        && row.try_get::<String, _>("entity_id")? == input.entity_id
+        && row.try_get::<String, _>("actor_type")? == input.actor_type
+        && row.try_get::<Option<String>, _>("actor_id")? == input.actor_id
+        && row.try_get::<String, _>("scope_type")? == input.scope_type
+        && row.try_get::<String, _>("scope_id")? == input.scope_id
+        && row.try_get::<String, _>("correlation_id")? == input.correlation_id
+        && row.try_get::<Option<String>, _>("causation_id")? == input.causation_id
+        && row.try_get::<i64, _>("causation_depth")? == input.causation_depth
+        && row.try_get::<Option<String>, _>("dedupe_key")? == input.dedupe_key
+        && row.try_get::<String, _>("payload_json")? == input.payload_json)
 }
 
 async fn create_human_review_execution(
@@ -117,9 +162,8 @@ async fn create_human_review_execution(
 }
 
 /// Recheck current Human role authority inside the same SQLite transaction as
-/// an authoritative Review write. Once the replacement TaskRole exists, the
-/// membership is the sole authority; the legacy singleton is used only when
-/// that TaskRole has not been created.
+/// an authoritative Review write. Only a current target TaskRole membership
+/// can authorize it.
 pub(super) async fn human_has_current_role_authority_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     task_id: &str,
@@ -130,34 +174,19 @@ pub(super) async fn human_has_current_role_authority_in_tx(
         return Ok(false);
     };
     let authorized: i64 = sqlx::query_scalar(
-        "SELECT CASE
-            WHEN EXISTS (
-                SELECT 1 FROM task_role
-                WHERE task_id = ? AND role = ?
-            ) THEN EXISTS (
-                SELECT 1
-                FROM task_role AS role
-                JOIN role_membership AS membership
-                  ON membership.task_role_id = role.id
-                WHERE role.task_id = ? AND role.role = ?
-                  AND membership.actor_kind = 'human'
-                  AND membership.actor_id = ?
-                  AND membership.status = 'active'
-            )
-            ELSE EXISTS (
-                SELECT 1 FROM task_role_assignment
-                WHERE task_id = ? AND role_name = ?
-                  AND assignee_type = 'user' AND assignee_id = ?
-            )
-         END",
+        "SELECT EXISTS (
+            SELECT 1
+            FROM task_role AS role
+            JOIN role_membership AS membership
+              ON membership.task_role_id = role.id
+            WHERE role.task_id = ? AND role.role = ?
+              AND membership.actor_kind = 'human'
+              AND membership.actor_id = ?
+              AND membership.status = 'active'
+         )",
     )
     .bind(task_id)
     .bind(&canonical_role)
-    .bind(task_id)
-    .bind(&canonical_role)
-    .bind(user_id)
-    .bind(task_id)
-    .bind(role)
     .bind(user_id)
     .fetch_one(&mut **tx)
     .await?;
@@ -582,6 +611,658 @@ impl ExecutionRepo for SqliteDb {
         rows.into_iter().map(map_execution).collect()
     }
 
+    async fn list_work_unit_auto_recovery_candidates(&self) -> Result<Vec<Execution>> {
+        let rows = sqlx::query(
+            "SELECT * FROM execution
+             WHERE work_unit_id IS NOT NULL
+               AND status = 'cancelled'
+               AND resume_policy = 'auto'
+               AND stop_reason IN ('crash_recovery', 'graceful_shutdown')
+               AND NOT EXISTS (
+                   SELECT 1 FROM execution child
+                   WHERE child.parent_execution_id = execution.id
+               )
+             ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(map_execution).collect()
+    }
+
+    async fn list_pending_provider_starts(&self) -> Result<Vec<Execution>> {
+        let rows = sqlx::query(
+            "SELECT e.* FROM execution e
+             JOIN domain_event pending
+               ON pending.entity_type = 'execution'
+              AND pending.entity_id = e.id
+              AND pending.event_type = 'execution.provider_start_pending'
+              AND pending.dedupe_key = 'execution.provider_start_pending:' || e.id
+             WHERE e.work_unit_id IS NOT NULL
+               AND e.actor_kind = 'agent'
+               AND e.agent_id = e.actor_id
+               AND e.status = 'running'
+               AND NOT EXISTS (
+                   SELECT 1 FROM domain_event attempt
+                   WHERE attempt.entity_type = 'execution'
+                     AND attempt.entity_id = e.id
+                     AND attempt.event_type = 'execution.provider_start_attempted'
+                     AND attempt.dedupe_key = 'execution.provider_start_attempted:' || e.id
+               )
+             ORDER BY pending.sequence ASC, e.id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(map_execution).collect()
+    }
+
+    async fn is_provider_start_pending(&self, execution_id: &str) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM execution e
+                WHERE e.id = ? AND e.work_unit_id IS NOT NULL
+                  AND e.actor_kind = 'agent' AND e.agent_id = e.actor_id
+                  AND e.status = 'running'
+                  AND EXISTS (
+                      SELECT 1 FROM domain_event pending
+                      WHERE pending.entity_type = 'execution'
+                        AND pending.entity_id = e.id
+                        AND pending.event_type = 'execution.provider_start_pending'
+                        AND pending.dedupe_key = 'execution.provider_start_pending:' || e.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM domain_event attempt
+                      WHERE attempt.entity_type = 'execution'
+                        AND attempt.entity_id = e.id
+                        AND attempt.event_type = 'execution.provider_start_attempted'
+                        AND attempt.dedupe_key = 'execution.provider_start_attempted:' || e.id
+                  )
+            )",
+        )
+        .bind(execution_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn fail_pending_provider_start(
+        &self,
+        execution_id: &str,
+        update: UpdateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<PendingProviderStartFailure> {
+        if update.id != execution_id
+            || update.status != Some(ExecutionStatus::Failed)
+            || event.event_type != "execution.failed"
+            || event.entity_type != "execution"
+            || event.entity_id != execution_id
+        {
+            return Err(DbError::Check(
+                "pending provider Start failure must target its exact Execution".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
+            .bind(execution_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_execution)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        if execution.status != ExecutionStatus::Running {
+            tx.commit().await?;
+            return Ok(PendingProviderStartFailure::NotRunning(execution));
+        }
+
+        let attempt_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM domain_event
+                WHERE entity_type = 'execution'
+                  AND entity_id = ?
+                  AND event_type = 'execution.provider_start_attempted'
+                  AND dedupe_key = 'execution.provider_start_attempted:' || ?
+            )",
+        )
+        .bind(execution_id)
+        .bind(execution_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if attempt_exists {
+            let rejected_outcome_is_exact: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM domain_event AS outcome
+                    WHERE outcome.dedupe_key = 'execution.provider_start_rejected:' || ?
+                      AND outcome.event_type = 'execution.provider_start_rejected'
+                      AND outcome.entity_type = 'execution'
+                      AND outcome.entity_id = ?
+                      AND outcome.actor_type = ?
+                      AND outcome.actor_id IS ?
+                      AND outcome.scope_type = 'task'
+                      AND outcome.scope_id = ?
+                      AND outcome.correlation_id = ?
+                      AND outcome.causation_id IS ?
+                      AND outcome.causation_depth = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM domain_event AS competing
+                          WHERE competing.entity_type = 'execution'
+                            AND competing.entity_id = outcome.entity_id
+                            AND competing.event_type IN (
+                                'execution.provider_start_accepted',
+                                'execution.provider_start_uncertain'
+                            )
+                      )
+                )",
+            )
+            .bind(execution_id)
+            .bind(execution_id)
+            .bind(
+                execution
+                    .actor_ref()
+                    .as_ref()
+                    .map(|actor| actor.kind().to_string())
+                    .unwrap_or_default(),
+            )
+            .bind(
+                execution
+                    .actor_ref()
+                    .as_ref()
+                    .map(|actor| actor.id().to_owned()),
+            )
+            .bind(&execution.task_id)
+            .bind(&execution.id)
+            .bind(&execution.parent_execution_id)
+            .bind(i64::from(execution.parent_execution_id.is_some()))
+            .fetch_one(&mut *tx)
+            .await?;
+            if !rejected_outcome_is_exact {
+                tx.commit().await?;
+                return Ok(PendingProviderStartFailure::Attempted(execution));
+            }
+        }
+
+        let pending_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM domain_event
+                WHERE entity_type = 'execution'
+                  AND entity_id = ?
+                  AND event_type = 'execution.provider_start_pending'
+                  AND dedupe_key = 'execution.provider_start_pending:' || ?
+            )",
+        )
+        .bind(execution_id)
+        .bind(execution_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !pending_exists {
+            tx.commit().await?;
+            return Ok(PendingProviderStartFailure::NotPending(execution));
+        }
+
+        let updated = update_execution_in_tx(&mut tx, update).await?;
+        let committed_event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
+        tx.commit().await?;
+        Ok(PendingProviderStartFailure::Resolved(
+            updated,
+            committed_event,
+        ))
+    }
+
+    async fn fail_running_unless_provider_start_pending(
+        &self,
+        execution_id: &str,
+        update: UpdateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<RunningExecutionFailure> {
+        if update.id != execution_id
+            || update.status != Some(ExecutionStatus::Failed)
+            || event.event_type != "execution.failed"
+            || event.entity_type != "execution"
+            || event.entity_id != execution_id
+        {
+            return Err(DbError::Check(
+                "running Execution failure must target its exact Execution".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
+            .bind(execution_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_execution)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        if execution.status != ExecutionStatus::Running {
+            tx.commit().await?;
+            return Ok(RunningExecutionFailure::NotRunning(execution));
+        }
+
+        let provider_start_pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM domain_event pending
+                WHERE pending.entity_type = 'execution'
+                  AND pending.entity_id = ?
+                  AND pending.event_type = 'execution.provider_start_pending'
+                  AND pending.dedupe_key = 'execution.provider_start_pending:' || ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM domain_event attempt
+                      WHERE attempt.entity_type = 'execution'
+                        AND attempt.entity_id = pending.entity_id
+                        AND attempt.event_type = 'execution.provider_start_attempted'
+                        AND attempt.dedupe_key = 'execution.provider_start_attempted:' || pending.entity_id
+                  )
+            )",
+        )
+        .bind(execution_id)
+        .bind(execution_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if provider_start_pending {
+            tx.commit().await?;
+            return Ok(RunningExecutionFailure::Pending(execution));
+        }
+
+        let updated = update_execution_in_tx(&mut tx, update).await?;
+        let committed_event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
+        tx.commit().await?;
+        Ok(RunningExecutionFailure::Failed(updated, committed_event))
+    }
+
+    async fn claim_provider_start(
+        &self,
+        execution_id: &str,
+        attempt_event: CreateDomainEvent,
+    ) -> Result<ProviderStartClaim> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
+            .bind(execution_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_execution)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        if execution.status != ExecutionStatus::Running
+            || !matches!(execution.actor_ref(), Some(ActorRef::Agent(_)))
+            || execution.agent_id.as_deref() != execution.actor_ref().as_ref().map(ActorRef::id)
+            || (execution.role == "orchestrator")
+                != (execution.purpose == Some(ExecutionPurpose::Orchestrate))
+            || !provider_start_event_matches_execution(
+                &attempt_event,
+                &execution,
+                "execution.provider_start_attempted",
+            )
+        {
+            return Err(DbError::Check(
+                "provider start claim requires the exact Running Agent WorkUnit Execution"
+                    .to_owned(),
+            ));
+        }
+
+        let attempt_key = format!("execution.provider_start_attempted:{execution_id}");
+        if let Some(existing_attempt) =
+            sqlx::query("SELECT * FROM domain_event WHERE dedupe_key = ?")
+                .bind(&attempt_key)
+                .fetch_optional(&mut *tx)
+                .await?
+        {
+            if !provider_start_event_semantics_match(&existing_attempt, &attempt_event)? {
+                return Err(DbError::Check(
+                    "provider start attempt receipt conflicts with its Execution".to_owned(),
+                ));
+            }
+            let mut disposition = None;
+            for (event_type, claim) in [
+                (
+                    "execution.provider_start_accepted",
+                    ProviderStartClaim::Accepted,
+                ),
+                (
+                    "execution.provider_start_rejected",
+                    ProviderStartClaim::Rejected,
+                ),
+                (
+                    "execution.provider_start_uncertain",
+                    ProviderStartClaim::Uncertain,
+                ),
+            ] {
+                let outcome_key = format!("{event_type}:{execution_id}");
+                if let Some(outcome) = sqlx::query(
+                    "SELECT event_type, entity_type, entity_id, actor_type, actor_id,
+                            scope_type, scope_id, correlation_id, causation_id,
+                            causation_depth, dedupe_key
+                     FROM domain_event WHERE dedupe_key = ?",
+                )
+                .bind(&outcome_key)
+                .fetch_optional(&mut *tx)
+                .await?
+                {
+                    let actor = execution.actor_ref();
+                    let identity_matches = outcome.try_get::<String, _>("event_type")?
+                        == event_type
+                        && outcome.try_get::<String, _>("entity_type")? == "execution"
+                        && outcome.try_get::<String, _>("entity_id")? == execution.id
+                        && outcome.try_get::<String, _>("actor_type")?
+                            == actor
+                                .as_ref()
+                                .map(|actor| actor.kind().to_string())
+                                .unwrap_or_default()
+                        && outcome.try_get::<Option<String>, _>("actor_id")?
+                            == actor.as_ref().map(|actor| actor.id().to_owned())
+                        && outcome.try_get::<String, _>("scope_type")? == "task"
+                        && outcome.try_get::<String, _>("scope_id")? == execution.task_id
+                        && outcome.try_get::<String, _>("correlation_id")? == execution.id
+                        && outcome.try_get::<Option<String>, _>("causation_id")?
+                            == execution.parent_execution_id
+                        && outcome.try_get::<i64, _>("causation_depth")?
+                            == i64::from(execution.parent_execution_id.is_some())
+                        && outcome.try_get::<Option<String>, _>("dedupe_key")? == Some(outcome_key);
+                    if !identity_matches || disposition.is_some() {
+                        return Err(DbError::Check(
+                            "provider start outcome receipt conflicts with its Execution"
+                                .to_owned(),
+                        ));
+                    }
+                    disposition = Some(claim);
+                }
+            }
+            tx.commit().await?;
+            return Ok(disposition.unwrap_or(ProviderStartClaim::Uncertain));
+        }
+
+        let task_is_cancelled: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_lifecycle
+                WHERE task_id = ? AND state = 'cancelled'
+            )",
+        )
+        .bind(&execution.task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if task_is_cancelled {
+            tx.commit().await?;
+            return Ok(ProviderStartClaim::TaskCancelled);
+        }
+
+        let is_orchestrator = execution.role == "orchestrator"
+            && execution.purpose == Some(ExecutionPurpose::Orchestrate);
+        if is_orchestrator {
+            if execution.work_unit_id.is_some() || execution.workspace_id.is_some() {
+                tx.commit().await?;
+                return Ok(ProviderStartClaim::AuthorityLost);
+            }
+            let actor = execution.actor_ref().ok_or_else(|| {
+                DbError::Check("Orchestrator claim has no exact Agent Actor".to_owned())
+            })?;
+            let actor_kind = actor.kind().to_string();
+            let actor_id = actor.id().to_owned();
+            // Orchestrator has no WorkUnit. Its exact durable Wake attempt is
+            // the start authority, so bind the Wake, TaskRole snapshot,
+            // membership, lease, and Execution under this same write lock.
+            let wake_authority_is_current: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM orchestrator_wake AS wake
+                    JOIN orchestrator_wake_execution AS attempt
+                      ON attempt.wake_id = wake.id
+                     AND attempt.execution_id = ?
+                     AND attempt.attempt_number = wake.current_attempt
+                    JOIN execution AS current_execution
+                      ON current_execution.id = attempt.execution_id
+                    JOIN task AS current_task
+                      ON current_task.id = wake.task_id
+                    JOIN agent_current AS current_agent
+                      ON current_agent.id = wake.actor_id
+                    JOIN task_role AS role
+                      ON role.id = wake.task_role_id
+                    JOIN role_membership AS member
+                      ON member.task_role_id = wake.task_role_id
+                     AND member.actor_kind = wake.actor_kind
+                     AND member.actor_id = wake.actor_id
+                     AND member.status = 'active'
+                    WHERE current_execution.id = ?
+                      AND current_execution.task_id = wake.task_id
+                      AND current_execution.role = 'orchestrator'
+                      AND current_execution.purpose = 'orchestrate'
+                      AND current_execution.actor_kind = ?
+                      AND current_execution.actor_id = ?
+                      AND current_execution.agent_id = wake.actor_id
+                      AND current_execution.work_unit_id IS NULL
+                      AND current_execution.workspace_id IS NULL
+                      AND current_task.deleted_at IS NULL
+                      AND current_agent.paused = 0
+                      AND wake.actor_kind = ?
+                      AND wake.actor_id = ?
+                      AND wake.state = 'leased'
+                      AND wake.lease_owner IS NOT NULL
+                      AND trim(wake.lease_owner) <> ''
+                      AND wake.lease_until > ?
+                      AND wake.current_attempt = attempt.attempt_number
+                      AND wake.attempt_count >= attempt.attempt_number
+                      AND attempt.state = 'start_requested'
+                      AND role.task_id = wake.task_id
+                      AND role.role = 'orchestrator'
+                      AND role.version = wake.task_role_version
+                      AND role.policy_json = wake.task_role_policy_json
+                      AND role.coordination_mode IS wake.coordination_mode
+                      AND json_valid(role.policy_json)
+                      AND json_type(role.policy_json) = 'object'
+                      AND COALESCE(json_extract(role.policy_json, '$.schema_version'), 1) = 1
+                      AND COALESCE(json_extract(role.policy_json, '$.automatic_orchestration'), 1) = 1
+                      AND COALESCE(json_extract(role.policy_json, '$.max_actions_per_execution'), 16)
+                            BETWEEN 0 AND 16
+                      AND COALESCE(json_extract(role.policy_json, '$.max_work_unit_creations_per_execution'), 4)
+                            BETWEEN 0 AND 4
+                      AND (
+                            json_type(role.policy_json, '$.allowed_actions') IS NULL
+                            OR (
+                                json_type(role.policy_json, '$.allowed_actions') = 'array'
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM json_each(role.policy_json, '$.allowed_actions') AS action
+                                    WHERE action.type <> 'text'
+                                       OR action.value NOT IN ('message', 'handoff', 'create_work_unit', 'proposal')
+                                )
+                                AND (SELECT COUNT(*) FROM json_each(role.policy_json, '$.allowed_actions'))
+                                    = (SELECT COUNT(DISTINCT action.value)
+                                       FROM json_each(role.policy_json, '$.allowed_actions') AS action)
+                            )
+                      )
+                      AND json_valid(current_execution.executor_config_snapshot_json)
+                      AND json_extract(current_execution.executor_config_snapshot_json,
+                                       '$.pr6_orchestrator_wake.wake_id') = wake.id
+                      AND json_extract(current_execution.executor_config_snapshot_json,
+                                       '$.pr6_orchestrator_wake.task_role_version') = wake.task_role_version
+                      AND json_extract(current_execution.executor_config_snapshot_json,
+                                       '$.pr6_orchestrator_wake.task_role_policy_json') = wake.task_role_policy_json
+                )",
+            )
+            .bind(&execution.id)
+            .bind(&execution.id)
+            .bind(&actor_kind)
+            .bind(&actor_id)
+            .bind(&actor_kind)
+            .bind(&actor_id)
+            .bind(crate::now_rfc3339())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !wake_authority_is_current {
+                tx.commit().await?;
+                return Ok(ProviderStartClaim::AuthorityLost);
+            }
+        }
+
+        let agent_id = execution.agent_id.as_deref().ok_or(DbError::NotFound)?;
+        let paused: Option<bool> =
+            sqlx::query_scalar("SELECT paused FROM agent_current WHERE id = ?")
+                .bind(agent_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(paused) = paused else {
+            return Err(DbError::NotFound);
+        };
+        if paused {
+            return Err(DbError::AgentPaused {
+                agent_id: agent_id.to_owned(),
+            });
+        }
+
+        if !is_orchestrator && execution.workspace_id.is_some() && execution.work_unit_id.is_none()
+        {
+            tx.commit().await?;
+            return Ok(ProviderStartClaim::AuthorityLost);
+        }
+
+        if let Some(work_unit_id) = execution.work_unit_id.as_deref() {
+            let Some(work_unit_version) = execution.work_unit_version else {
+                tx.commit().await?;
+                return Ok(ProviderStartClaim::AuthorityLost);
+            };
+            let actor = execution.actor_ref().ok_or_else(|| {
+                DbError::Check("provider start claim has no exact WorkUnit Actor".to_owned())
+            })?;
+            let actor_kind = actor.kind().to_string();
+            let actor_id = actor.id().to_owned();
+            // Authority may change after service preflight and while provider
+            // parameters are prepared. Recheck the same exact WorkUnit and
+            // TaskRole bindings under the claim's write lock.
+            let work_unit_authority_is_current: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM work_unit w
+                    JOIN task_role tr ON tr.task_id = w.task_id AND tr.role = w.role
+                    JOIN role_membership rm ON rm.task_role_id = tr.id
+                    WHERE w.id = ? AND w.task_id = ?
+                      AND w.status = 'open' AND w.version = ? AND w.role = ?
+                      AND w.assigned_actor_kind = ? AND w.assigned_actor_id = ?
+                      AND rm.actor_kind = ? AND rm.actor_id = ? AND rm.status = 'active'
+                      AND ((w.requires_integration = 1 AND ? IS NOT NULL)
+                           OR (w.requires_integration = 0 AND ? IS NULL))
+                )",
+            )
+            .bind(work_unit_id)
+            .bind(&execution.task_id)
+            .bind(work_unit_version)
+            .bind(&execution.role)
+            .bind(&actor_kind)
+            .bind(&actor_id)
+            .bind(&actor_kind)
+            .bind(&actor_id)
+            .bind(execution.workspace_id.as_deref())
+            .bind(execution.workspace_id.as_deref())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !work_unit_authority_is_current {
+                tx.commit().await?;
+                return Ok(ProviderStartClaim::AuthorityLost);
+            }
+        }
+
+        if let (Some(work_unit_id), Some(workspace_id)) = (
+            execution.work_unit_id.as_deref(),
+            execution.workspace_id.as_deref(),
+        ) {
+            let actor_id = execution
+                .actor_ref()
+                .map(|actor| actor.id().to_owned())
+                .ok_or_else(|| {
+                    DbError::Check("provider start claim has no exact Workspace Actor".to_owned())
+                })?;
+            let lease_is_current: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM workspace_lease
+                    WHERE task_id = ? AND work_unit_id = ? AND workspace_id = ?
+                      AND execution_id = ? AND operation_idempotency_key = ?
+                      AND role = CASE WHEN trim(?) = 'reviewer' THEN 'reviewer' ELSE 'worker' END
+                      AND assigned_principal_type = 'agent' AND assigned_principal_id = ?
+                      AND status = 'active' AND expires_at > ?
+                )",
+            )
+            .bind(&execution.task_id)
+            .bind(work_unit_id)
+            .bind(workspace_id)
+            .bind(&execution.id)
+            .bind(&execution.id)
+            .bind(&execution.role)
+            .bind(&actor_id)
+            .bind(crate::now_rfc3339())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !lease_is_current {
+                tx.commit().await?;
+                return Ok(ProviderStartClaim::AuthorityLost);
+            }
+        }
+
+        DomainEventRepo::append_event_in_tx(self, &mut tx, &attempt_event).await?;
+        tx.commit().await?;
+        Ok(ProviderStartClaim::Claimed)
+    }
+
+    async fn record_provider_start_outcome(
+        &self,
+        execution_id: &str,
+        outcome_event: CreateDomainEvent,
+    ) -> Result<DomainEvent> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
+            .bind(execution_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_execution)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        let allowed = matches!(
+            outcome_event.event_type.as_str(),
+            "execution.provider_start_accepted"
+                | "execution.provider_start_rejected"
+                | "execution.provider_start_uncertain"
+        );
+        if !allowed
+            || !provider_start_event_matches_execution(
+                &outcome_event,
+                &execution,
+                &outcome_event.event_type,
+            )
+        {
+            return Err(DbError::Check(
+                "provider start outcome requires its exact Execution identity".to_owned(),
+            ));
+        }
+        let attempt_key = format!("execution.provider_start_attempted:{execution_id}");
+        let has_attempt: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM domain_event WHERE dedupe_key = ?
+                 AND event_type = 'execution.provider_start_attempted'
+                 AND entity_type = 'execution' AND entity_id = ?)",
+        )
+        .bind(&attempt_key)
+        .bind(execution_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !has_attempt {
+            return Err(DbError::Check(
+                "provider start outcome has no durable attempt receipt".to_owned(),
+            ));
+        }
+        for event_type in [
+            "execution.provider_start_accepted",
+            "execution.provider_start_rejected",
+            "execution.provider_start_uncertain",
+        ] {
+            let outcome_key = format!("{event_type}:{execution_id}");
+            if event_type != outcome_event.event_type
+                && sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM domain_event WHERE dedupe_key = ?)",
+                )
+                .bind(outcome_key)
+                .fetch_one(&mut *tx)
+                .await?
+            {
+                return Err(DbError::VersionConflict);
+            }
+        }
+        let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &outcome_event).await?;
+        tx.commit().await?;
+        Ok(event)
+    }
+
     async fn list_by_task_and_role(
         &self,
         task_id: &str,
@@ -662,13 +1343,27 @@ impl ExecutionRepo for SqliteDb {
 
     async fn list_stalled_running(&self, stale_before: &str) -> Result<Vec<Execution>> {
         let rows = sqlx::query(
-            "SELECT * FROM execution
-             WHERE status = 'running'
+            "SELECT e.* FROM execution e
+             WHERE e.status = 'running'
                AND (
-                 (last_activity_at IS NULL AND created_at < ?)
-                 OR (last_activity_at IS NOT NULL AND last_activity_at < ?)
+                 (e.last_activity_at IS NULL AND e.created_at < ?)
+                 OR (e.last_activity_at IS NOT NULL AND e.last_activity_at < ?)
                )
-             ORDER BY COALESCE(last_activity_at, created_at) ASC, id ASC",
+               AND NOT EXISTS (
+                   SELECT 1 FROM domain_event pending
+                   WHERE pending.entity_type = 'execution'
+                     AND pending.entity_id = e.id
+                     AND pending.event_type = 'execution.provider_start_pending'
+                     AND pending.dedupe_key = 'execution.provider_start_pending:' || e.id
+                     AND NOT EXISTS (
+                         SELECT 1 FROM domain_event attempt
+                         WHERE attempt.entity_type = 'execution'
+                           AND attempt.entity_id = e.id
+                           AND attempt.event_type = 'execution.provider_start_attempted'
+                           AND attempt.dedupe_key = 'execution.provider_start_attempted:' || e.id
+                     )
+               )
+             ORDER BY COALESCE(e.last_activity_at, e.created_at) ASC, e.id ASC",
         )
         .bind(stale_before)
         .bind(stale_before)
@@ -700,6 +1395,20 @@ impl ExecutionRepo for SqliteDb {
             sqlx::query(
                 "SELECT e.* FROM execution e
                  WHERE e.status = 'running'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM domain_event pending
+                       WHERE pending.entity_type = 'execution'
+                         AND pending.entity_id = e.id
+                         AND pending.event_type = 'execution.provider_start_pending'
+                         AND pending.dedupe_key = 'execution.provider_start_pending:' || e.id
+                         AND NOT EXISTS (
+                             SELECT 1 FROM domain_event attempt
+                             WHERE attempt.entity_type = 'execution'
+                               AND attempt.entity_id = e.id
+                               AND attempt.event_type = 'execution.provider_start_attempted'
+                               AND attempt.dedupe_key = 'execution.provider_start_attempted:' || e.id
+                         )
+                   )
                    AND CASE
                          WHEN json_valid(e.executor_config_snapshot_json)
                          THEN json_extract(e.executor_config_snapshot_json, '$.resolved_daemon_id')
@@ -720,6 +1429,20 @@ impl ExecutionRepo for SqliteDb {
             let query = format!(
                 "SELECT e.* FROM execution e
                  WHERE e.status = 'running'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM domain_event pending
+                       WHERE pending.entity_type = 'execution'
+                         AND pending.entity_id = e.id
+                         AND pending.event_type = 'execution.provider_start_pending'
+                         AND pending.dedupe_key = 'execution.provider_start_pending:' || e.id
+                         AND NOT EXISTS (
+                             SELECT 1 FROM domain_event attempt
+                             WHERE attempt.entity_type = 'execution'
+                               AND attempt.entity_id = e.id
+                               AND attempt.event_type = 'execution.provider_start_attempted'
+                               AND attempt.dedupe_key = 'execution.provider_start_attempted:' || e.id
+                         )
+                   )
                    AND CASE
                          WHEN json_valid(e.executor_config_snapshot_json)
                          THEN json_extract(e.executor_config_snapshot_json, '$.resolved_daemon_id')
@@ -803,12 +1526,7 @@ async fn update_execution_in_tx(
     if let Some(status) = input.status {
         push_assignment!("status", status.to_string());
     }
-    let legacy_session_update = input.agent_session_id.clone();
-    if matches!(legacy_session_update.as_ref(), Some(None))
-        && execution.harness_session_id.is_none()
-    {
-        push_assignment!("agent_session_id", None::<String>);
-    }
+    let external_session_update = input.external_session_id.clone();
     if let Some(agent_message_id) = input.agent_message_id {
         push_assignment!("agent_message_id", agent_message_id);
     }
@@ -861,7 +1579,7 @@ async fn update_execution_in_tx(
     query.push("updated_at = ").push_bind(input.updated_at);
     query.push(" WHERE id = ").push_bind(&input.id);
     query.build().execute(&mut **transaction).await?;
-    if let Some(Some(external_session_id)) = legacy_session_update.as_ref() {
+    if let Some(Some(external_session_id)) = external_session_update.as_ref() {
         bind_external_session_in_tx(transaction, &input.id, external_session_id, &now_rfc3339())
             .await?;
     }
@@ -913,17 +1631,6 @@ async fn bind_external_session_in_tx(
         .map(super::map_execution)
         .transpose()?
         .ok_or(DbError::NotFound)?;
-
-    if execution
-        .agent_session_id
-        .as_deref()
-        .is_some_and(|existing| existing != external_session_id)
-    {
-        return Err(DbError::Check(
-            "Execution legacy session projection disagrees with the returned external identity"
-                .to_owned(),
-        ));
-    }
 
     if execution.actor_kind == Some(ActorKind::Human) {
         return Err(DbError::Check(
@@ -1023,188 +1730,11 @@ async fn bind_external_session_in_tx(
         .bind(harness_session_id)
         .execute(&mut **transaction)
         .await?;
-        sqlx::query(
-            "UPDATE execution
-             SET agent_session_id = ?, updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(external_session_id)
-        .bind(updated_at)
-        .bind(execution_id)
-        .execute(&mut **transaction)
-        .await?;
         return Ok(());
     }
 
-    if execution.actor_kind.is_none()
-        && execution
-            .agent_id
-            .as_deref()
-            .is_some_and(|agent_id| agent_id.eq_ignore_ascii_case("human"))
-    {
-        // The reserved sentinel is historical compatibility only. Preserve its
-        // old projection without turning it into a generic Actor or session.
-        sqlx::query("UPDATE execution SET agent_session_id = ?, updated_at = ? WHERE id = ?")
-            .bind(external_session_id)
-            .bind(updated_at)
-            .bind(execution_id)
-            .execute(&mut **transaction)
-            .await?;
-        return Ok(());
-    }
-
-    let Some(agent_id) = execution.agent_id.as_deref() else {
-        // Historical/system-shaped rows have no generic Agent authority. Keep
-        // their bounded legacy projection rather than inventing a principal.
-        sqlx::query("UPDATE execution SET agent_session_id = ?, updated_at = ? WHERE id = ?")
-            .bind(external_session_id)
-            .bind(updated_at)
-            .bind(execution_id)
-            .execute(&mut **transaction)
-            .await?;
-        return Ok(());
-    };
-    if execution.actor_kind != Some(ActorKind::Agent)
-        || execution.actor_id.as_deref() != Some(agent_id)
-    {
-        return Err(DbError::Check(
-            "cannot materialize HarnessSession without an Agent ActorRef".to_owned(),
-        ));
-    }
-
-    let historical_ambiguity: Option<i64> = sqlx::query_scalar(
-        "SELECT 1
-         FROM execution_session_migration_issue
-         WHERE execution_id = ? AND issue_kind = 'historical_session_ambiguous'
-         LIMIT 1",
-    )
-    .bind(execution_id)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    if historical_ambiguity.is_some() {
-        // Contradictory historical evidence stays on the bounded legacy
-        // projection. Do not silently choose a generic session during a
-        // result callback.
-        sqlx::query("UPDATE execution SET agent_session_id = ?, updated_at = ? WHERE id = ?")
-            .bind(external_session_id)
-            .bind(updated_at)
-            .bind(execution_id)
-            .execute(&mut **transaction)
-            .await?;
-        return Ok(());
-    }
-
-    let snapshot_json = execution
-        .executor_config_snapshot_json
-        .as_deref()
-        .unwrap_or("{}");
-    let snapshot = serde_json::from_str::<serde_json::Value>(snapshot_json).unwrap_or_default();
-    let harness_kind = snapshot
-        .get("executor_type")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("legacy")
-        .to_owned();
-    if harness_kind != "legacy" {
-        harness_session::validate_agent_harness_identity_in_tx(
-            transaction,
-            agent_id,
-            &harness_kind,
-        )
-        .await?;
-    }
-    let profile_id =
-        harness_session::profile_id_for_snapshot_in_tx(transaction, agent_id, &snapshot).await?;
-    let capabilities_snapshot_json = snapshot
-        .get("harness_capabilities")
-        .map(ToString::to_string)
-        .unwrap_or_else(|| r#"{"schema_version":1,"capabilities":{}}"#.to_owned());
-    let existing = sqlx::query(
-        "SELECT id, status, workspace_id FROM harness_session
-         WHERE agent_id = ? AND harness_kind = ? AND external_session_id = ?
-         LIMIT 1",
-    )
-    .bind(agent_id)
-    .bind(&harness_kind)
-    .bind(external_session_id)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    let harness_session_id = if let Some(existing) = existing {
-        let existing_status: HarnessSessionStatus =
-            parse_enum(existing.try_get::<String, _>("status")?)?;
-        if matches!(
-            &existing_status,
-            HarnessSessionStatus::Ended | HarnessSessionStatus::Failed
-        ) {
-            return Err(DbError::Check(
-                "external session identity belongs to an ended or failed HarnessSession".to_owned(),
-            ));
-        }
-        let existing_workspace_id: Option<String> = existing.try_get("workspace_id")?;
-        if existing_workspace_id.is_some()
-            && existing_workspace_id.as_deref() != execution.workspace_id.as_deref()
-        {
-            return Err(DbError::Check(
-                "external session identity is workspace-incompatible".to_owned(),
-            ));
-        }
-        let existing_id = existing.try_get::<String, _>("id")?;
-        if matches!(&existing_status, HarnessSessionStatus::Pending)
-            && snapshot.get("harness_capabilities").is_some()
-        {
-            sqlx::query(
-                "UPDATE harness_session SET capabilities_snapshot_json = ? WHERE id = ? AND status = 'pending'",
-            )
-            .bind(&capabilities_snapshot_json)
-            .bind(&existing_id)
-            .execute(&mut **transaction)
-            .await?;
-        }
-        existing_id
-    } else {
-        let id = crate::new_uuid_v4();
-        sqlx::query(
-            "INSERT INTO harness_session (
-                 id, agent_id, harness_kind, external_session_id, profile_id,
-                 profile_snapshot_json, capabilities_snapshot_json, workspace_id,
-                 status, predecessor_session_id, created_at, updated_at, last_activity_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(agent_id)
-        .bind(&harness_kind)
-        .bind(external_session_id)
-        .bind(profile_id.as_deref())
-        .bind(snapshot_json)
-        .bind(&capabilities_snapshot_json)
-        .bind(execution.workspace_id.as_deref())
-        .bind(&execution.created_at)
-        .bind(updated_at)
-        .bind(updated_at)
-        .execute(&mut **transaction)
-        .await?;
-        id
-    };
-    sqlx::query(
-        "UPDATE harness_session
-         SET status = 'active', last_activity_at = ?, updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(updated_at)
-    .bind(updated_at)
-    .bind(&harness_session_id)
-    .execute(&mut **transaction)
-    .await?;
-    sqlx::query(
-        "UPDATE execution
-         SET harness_session_id = ?, agent_session_id = ?, updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(&harness_session_id)
-    .bind(external_session_id)
-    .bind(updated_at)
-    .bind(execution_id)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
+    Err(DbError::Check(
+        "Execution has no exact HarnessSession authority for this external session result"
+            .to_owned(),
+    ))
 }

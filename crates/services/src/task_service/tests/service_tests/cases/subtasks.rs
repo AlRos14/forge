@@ -4,8 +4,8 @@ use super::super::*;
 async fn subtask_helpers_resolve_root_and_subtask() {
     let db = Arc::new(sqlite_db().await);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    let subtask = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
+    let root = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let subtask = seed_subtask_with_status(&db, &root, "child", TaskLifecycleState::Ready, 0).await;
     let root_id = root.id.clone();
 
     assert!(is_root_task(&db, &root.id).await.expect("root checks"));
@@ -34,7 +34,6 @@ async fn create_task_assigns_subtask_order_and_rejects_nested_subtask() {
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("root task creates");
@@ -45,7 +44,6 @@ async fn create_task_assigns_subtask_order_and_rejects_nested_subtask() {
             "Child",
             None,
             Some(root.id.clone()),
-            None,
             None,
             None,
             None,
@@ -69,7 +67,6 @@ async fn create_task_assigns_subtask_order_and_rejects_nested_subtask() {
             "Grandchild",
             None,
             Some(subtask.id),
-            None,
             None,
             None,
             None,
@@ -105,7 +102,6 @@ async fn create_task_rejects_foreign_and_missing_parents_before_writing() {
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("parent creates");
@@ -122,7 +118,6 @@ async fn create_task_rejects_foreign_and_missing_parents_before_writing() {
                 "Rejected child",
                 None,
                 Some(parent_id.to_owned()),
-                None,
                 None,
                 None,
                 None,
@@ -162,7 +157,6 @@ async fn update_task_parent_rejects_foreign_self_nested_and_cyclic_links_atomica
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("Root A creates");
@@ -170,7 +164,6 @@ async fn update_task_parent_rejects_foreign_self_nested_and_cyclic_links_atomica
         .create_task(
             project_id.clone(),
             "Root B",
-            None,
             None,
             None,
             None,
@@ -186,7 +179,6 @@ async fn update_task_parent_rejects_foreign_self_nested_and_cyclic_links_atomica
             "Child A",
             None,
             Some(root_a.id.clone()),
-            None,
             None,
             None,
             None,
@@ -210,7 +202,6 @@ async fn update_task_parent_rejects_foreign_self_nested_and_cyclic_links_atomica
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("Root C creates");
@@ -218,7 +209,6 @@ async fn update_task_parent_rejects_foreign_self_nested_and_cyclic_links_atomica
         .create_task(
             other_project_id,
             "Foreign root",
-            None,
             None,
             None,
             None,
@@ -294,7 +284,6 @@ fn task_update(task: &Task, parent_task_id: Option<Option<String>>) -> db::Updat
         error_annotation: None,
         blocked_json: None,
         failed_json: None,
-        task_state_config: None,
         parent_task_id,
         updated_at: now_rfc3339(),
     }
@@ -325,6 +314,15 @@ async fn parent_mutations_keep_parent_and_subtask_order_coherent() {
     assert_eq!(children_a[1].subtask_order, Some(1));
     assert_eq!(children_b[0].subtask_order, Some(0));
     assert_eq!(children_b[1].subtask_order, Some(1));
+    for child in children_a.iter().chain(&children_b) {
+        assert!(
+            db::TaskLifecycleRepo::get_task_lifecycle(&*db, &child.id)
+                .await
+                .expect("subtask lifecycle lookup succeeds")
+                .is_some(),
+            "canonical subtask creation commits TaskLifecycle"
+        );
+    }
 
     let root_x = create_root(&service, &project_id, "Root X").await;
     let attached = service
@@ -360,7 +358,7 @@ async fn create_subtasks_batch_rolls_back_all_rows_after_a_mid_batch_failure() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let (project_id, repo_id, _) = seed_project_repo(&db).await;
-    let parent = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let parent = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     sqlx::query(
         "CREATE TRIGGER reject_selected_subtask BEFORE INSERT ON task WHEN NEW.title = 'Reject middle child' BEGIN SELECT RAISE(ABORT, 'injected batch failure'); END",
     )
@@ -405,7 +403,6 @@ async fn ordinary_task_update_does_not_rewrite_parent_structure() {
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("child creates");
@@ -433,7 +430,6 @@ async fn stale_and_direct_repository_parent_updates_are_rejected_atomically() {
             "Child",
             None,
             Some(parent_a.id.clone()),
-            None,
             None,
             None,
             None,
@@ -542,7 +538,6 @@ async fn create_child_serializes_with_parent_reparent() {
                 None,
                 None,
                 None,
-                None,
             )
             .await
     });
@@ -646,7 +641,6 @@ async fn create_root(service: &TaskService, project_id: &str, title: &str) -> Ta
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("root creates")
@@ -656,7 +650,6 @@ fn subtask_input(title: &str) -> NewSubtaskInput {
     NewSubtaskInput {
         title: title.to_owned(),
         description: None,
-        assignee_id: None,
     }
 }
 
@@ -674,66 +667,6 @@ async fn sqlite_file_db() -> (Arc<SqliteDb>, TempDir) {
 }
 
 #[tokio::test]
-async fn create_subtasks_preserves_input_order_and_rejects_different_assignee_atomically() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_a = seed_agent(&db).await;
-    let _agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    service
-        .reassign_role(
-            role_assignment_input(&root.id, "coder", Some(agent_a.clone()), None),
-            false,
-            false,
-        )
-        .await
-        .expect("coder assignment succeeds");
-
-    let subtasks = service
-        .create_subtasks(
-            root.id.clone(),
-            vec![
-                NewSubtaskInput {
-                    title: "First".to_owned(),
-                    description: None,
-                    assignee_id: None,
-                },
-                NewSubtaskInput {
-                    title: "Second".to_owned(),
-                    description: Some("details".to_owned()),
-                    assignee_id: None,
-                },
-            ],
-        )
-        .await
-        .expect("subtasks create");
-
-    assert_eq!(subtasks.len(), 2);
-    assert_eq!(subtasks[0].subtask_order, Some(0));
-    assert_eq!(subtasks[1].subtask_order, Some(1));
-    assert_eq!(subtasks[0].project_id.as_str(), root.project_id.as_str());
-    assert_eq!(
-        subtasks[0].repo_id.as_deref().unwrap(),
-        root.repo_id.as_deref().unwrap()
-    );
-    assert_eq!(
-        subtasks[0].parent_task_id.as_deref(),
-        Some(root.id.as_str())
-    );
-    let subtask_roles = TaskRoleAssignmentRepo::list_by_task(&*db, &subtasks[0].id)
-        .await
-        .expect("subtask roles load");
-    assert!(subtask_roles.is_empty());
-
-    let after = TaskRepo::list_subtasks_ordered(&*db, &root.id)
-        .await
-        .expect("subtasks load");
-    assert_eq!(after.len(), 2);
-}
-
-#[tokio::test]
 async fn soft_delete_rejects_parent_with_live_children_without_partial_writes() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
@@ -745,7 +678,6 @@ async fn soft_delete_rejects_parent_with_live_children_without_partial_writes() 
             "Child",
             None,
             Some(parent.id.clone()),
-            None,
             None,
             None,
             None,
@@ -787,7 +719,6 @@ async fn soft_delete_leaf_keeps_its_parent_live() {
             "Child",
             None,
             Some(parent.id.clone()),
-            None,
             None,
             None,
             None,
@@ -835,7 +766,6 @@ async fn create_child_serializes_with_parent_soft_delete() {
                 "C",
                 None,
                 Some(create_parent_id),
-                None,
                 None,
                 None,
                 None,
@@ -1054,15 +984,12 @@ async fn reparent_requires_the_same_exact_repo() {
             repo_id: Some(repo_b.id.clone()),
             parent_task_id: None,
             subtask_order: None,
-            assignee_type: None,
-            assignee_id: None,
             title: "B in Repo B".to_owned(),
             description: None,
             task_type: "implementation".to_owned(),
-            status: "todo".to_owned(),
+            lifecycle_state: db::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now,
@@ -1120,7 +1047,6 @@ async fn deleting_parent_after_detach_preserves_a_clean_root() {
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("child creates");
@@ -1169,7 +1095,7 @@ async fn reorder_subtasks_updates_order() {
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let root = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
     let subtasks = service
         .create_subtasks(
             root.id.clone(),
@@ -1177,17 +1103,14 @@ async fn reorder_subtasks_updates_order() {
                 NewSubtaskInput {
                     title: "A".to_owned(),
                     description: None,
-                    assignee_id: None,
                 },
                 NewSubtaskInput {
                     title: "B".to_owned(),
                     description: None,
-                    assignee_id: None,
                 },
                 NewSubtaskInput {
                     title: "C".to_owned(),
                     description: None,
-                    assignee_id: None,
                 },
             ],
         )

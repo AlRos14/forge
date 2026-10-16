@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use db::{PageRequest, Project, ProjectRepo, SortBy, SortOrder, Task, TaskListQuery, TaskRepo};
 use events::EventBus;
 use tokio::sync::Notify;
 use tracing::Instrument;
@@ -14,7 +13,6 @@ use tracing::Instrument;
 use crate::{Result, TaskService};
 
 mod active_recovery;
-mod initial_scheduling;
 
 pub struct TaskDispatcher {
     db: Arc<db::SqliteDb>,
@@ -23,6 +21,10 @@ pub struct TaskDispatcher {
     check_interval: Duration,
     stopped: AtomicBool,
     stop_notify: Notify,
+    #[cfg(test)]
+    after_auto_admission_barrier: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    after_pending_snapshot_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl TaskDispatcher {
@@ -49,7 +51,29 @@ impl TaskDispatcher {
             check_interval,
             stopped: AtomicBool::new(false),
             stop_notify: Notify::new(),
+            #[cfg(test)]
+            after_auto_admission_barrier: None,
+            #[cfg(test)]
+            after_pending_snapshot_barrier: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_auto_admission_barrier(
+        mut self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.after_auto_admission_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_pending_snapshot_barrier(
+        mut self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.after_pending_snapshot_barrier = Some(barrier);
+        self
     }
 
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -89,17 +113,9 @@ impl TaskDispatcher {
 
     #[tracing::instrument(skip(self))]
     pub async fn check_once(&self) -> Result<u64> {
-        let mut dispatched = 0;
-        for project in self.list_projects().await? {
-            if self.is_stopped() {
-                break;
-            }
-            if project.paused_at.is_some() {
-                continue;
-            }
-            dispatched += self.dispatch_initial_tasks(&project).await?;
-            dispatched += self.recover_auto_cancelled_tasks(&project).await?;
-        }
+        let pending_starts = self.recover_pending_provider_starts().await?;
+        let auto_recovered = self.recover_auto_cancelled_work_unit_executions().await?;
+        let dispatched = pending_starts + auto_recovered;
 
         tracing::info!(
             dispatched_tasks = dispatched,
@@ -107,69 +123,4 @@ impl TaskDispatcher {
         );
         Ok(dispatched)
     }
-
-    async fn list_projects(&self) -> Result<Vec<Project>> {
-        let mut items = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = ProjectRepo::list(
-                &*self.db,
-                PageRequest {
-                    cursor,
-                    limit: 100,
-                    include_total: false,
-                    sort_by: SortBy::CreatedAt,
-                    sort_order: SortOrder::Asc,
-                },
-            )
-            .await?;
-            items.extend(page.items);
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                break;
-            }
-        }
-        Ok(items)
-    }
-
-    async fn list_tasks(&self, project_id: &str, statuses: Vec<String>) -> Result<Vec<Task>> {
-        let mut items = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = TaskRepo::list(
-                &*self.db,
-                TaskListQuery {
-                    project_id: project_id.to_owned(),
-                    q: None,
-                    lifecycle_states: Vec::new(),
-                    statuses: statuses.clone(),
-                    agent_ids: Vec::new(),
-                    assignee_types: Vec::new(),
-                    assignee_ids: Vec::new(),
-                    priority: None,
-                    include_archived: false,
-                    include_cancelled: false,
-                    include_deleted: false,
-                    page: PageRequest {
-                        cursor,
-                        limit: 200,
-                        include_total: false,
-                        sort_by: SortBy::CreatedAt,
-                        sort_order: SortOrder::Asc,
-                    },
-                },
-            )
-            .await?;
-            items.extend(page.items);
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                break;
-            }
-        }
-        Ok(items)
-    }
 }
-
-#[cfg(test)]
-#[path = "task_dispatcher/tests.rs"]
-mod tests;

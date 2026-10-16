@@ -92,9 +92,8 @@ pub(crate) struct ListExecutionsParams {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StartExecutionParams {
-    pub(crate) task_id: String,
-    pub(crate) agent_id: String,
-    pub(crate) role: String,
+    pub(crate) work_unit_id: String,
+    pub(crate) expected_work_unit_version: i64,
     pub(crate) purpose: ExecutionPurpose,
     pub(crate) prompt: String,
     #[serde(default)]

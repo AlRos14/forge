@@ -288,11 +288,9 @@ async fn admit_merge_lifecycle_in_tx(
     .await?;
     let _ = updated_lifecycle;
     let changed = sqlx::query(
-        "UPDATE task SET status = ?, entry_barrier_json = NULL,
-             version = version + 1, updated_at = ?
+        "UPDATE task SET version = version + 1, updated_at = ?
          WHERE id = ? AND version = ? AND deleted_at IS NULL",
     )
-    .bind(TaskLifecycleState::Merging.legacy_projection())
     .bind(&input.created_at)
     .bind(&input.task_id)
     .bind(task_version)
@@ -465,10 +463,9 @@ async fn finish_merge_lifecycle_in_tx(
         )
         .await?;
     let changed = sqlx::query(
-        "UPDATE task SET status = ?, version = version + 1, updated_at = ?
+        "UPDATE task SET version = version + 1, updated_at = ?
          WHERE id = ? AND version = ? AND deleted_at IS NULL",
     )
-    .bind(target.legacy_projection())
     .bind(updated_at)
     .bind(&lifecycle_operation.task_id)
     .bind(task_version)

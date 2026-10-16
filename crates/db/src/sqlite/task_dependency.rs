@@ -63,7 +63,7 @@ impl TaskDependencyRepo for SqliteDb {
 
     async fn unsatisfied_dependencies(&self, task_id: &str) -> Result<Vec<String>> {
         Ok(sqlx::query_scalar::<_, String>(
-            "SELECT depends_on_id FROM task_dependency WHERE task_id = ? AND depends_on_id NOT IN (SELECT id FROM task WHERE status = 'done')",
+            "SELECT task_dependency.depends_on_id FROM task_dependency JOIN task_lifecycle ON task_lifecycle.task_id = task_dependency.depends_on_id WHERE task_dependency.task_id = ? AND task_lifecycle.state != 'done'",
         )
         .bind(task_id)
         .fetch_all(&self.pool)

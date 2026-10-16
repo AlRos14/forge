@@ -119,20 +119,25 @@ async fn seed_blocked_task(harness: &common::Harness, title: &str) -> String {
 
     let task_id = db::new_uuid_v4();
     let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO task (
-            id, project_id, repo_id, parent_task_id, subtask_order, title, description,
-            status, priority, task_state_config, merge_config, plan, created_at, updated_at
-         )
-         VALUES (?, ?, ?, NULL, NULL, ?, NULL, 'blocked', 0, NULL, NULL, NULL, ?, ?)",
+    db::TaskRepo::create(
+        &*harness.state.db,
+        db::CreateTask {
+            id: task_id.clone(),
+            project_id: project.id,
+            repo_id: Some(repo.id),
+            parent_task_id: None,
+            title: title.to_owned(),
+            description: None,
+            task_type: "implementation".to_owned(),
+            lifecycle_state: db::TaskLifecycleState::Blocked,
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
     )
-    .bind(&task_id)
-    .bind(&project.id)
-    .bind(&repo.id)
-    .bind(title)
-    .bind(&now)
-    .bind(&now)
-    .execute(harness.state.db.pool())
     .await
     .expect("blocked task inserts");
 

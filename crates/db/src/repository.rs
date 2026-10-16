@@ -1,4 +1,4 @@
-use crate::{models::*, pagination::*, DbError, Result};
+use crate::{models::*, pagination::*, Result};
 use async_trait::async_trait;
 use sqlx::{Sqlite, Transaction};
 
@@ -44,17 +44,10 @@ pub trait TaskRepo: Send + Sync {
         input: UpdateTask,
         subtask_order: Option<i64>,
     ) -> Result<Task>;
-    async fn archive(&self, input: ArchiveTask) -> Result<Task>;
     async fn soft_delete_in_tx(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
         input: SoftDeleteTask,
-    ) -> Result<Task>;
-    async fn set_review_passed_at(
-        &self,
-        id: &str,
-        review_passed_at: Option<String>,
-        updated_at: &str,
     ) -> Result<Task>;
     async fn set_metadata_json(
         &self,
@@ -69,19 +62,6 @@ pub trait TaskRepo: Send + Sync {
         metadata_json: Option<String>,
         updated_at: &str,
     ) -> Result<()>;
-    async fn set_entry_barrier(
-        &self,
-        id: &str,
-        expected_version: i64,
-        entry_barrier_json: Option<String>,
-        updated_at: &str,
-    ) -> Result<Task>;
-    async fn claim(
-        &self,
-        transaction: &mut Transaction<'_, Sqlite>,
-        input: ClaimTask,
-    ) -> Result<ClaimedTask>;
-    async fn update_status(&self, input: UpdateTaskStatus) -> Result<Task>;
 }
 
 #[async_trait]
@@ -183,19 +163,6 @@ pub trait GateRepo: Send + Sync {
 #[async_trait]
 pub trait TaskBoardRepo: Send + Sync {
     async fn board_revision(&self, project_id: &str) -> Result<i64>;
-    async fn replay_move_task(
-        &self,
-        operation_id: &str,
-        identity: &MoveTaskIdentity,
-    ) -> Result<Option<MoveTaskResult>>;
-    async fn compare_and_move_task(&self, input: CompareAndMoveTask)
-        -> Result<MoveTaskPersistence>;
-    async fn complete_move_operation(
-        &self,
-        operation_id: &str,
-        result: &MoveTaskResult,
-        updated_at: &str,
-    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -284,229 +251,6 @@ pub trait ProviderAuthorizationRepo: Send + Sync {
 }
 
 #[async_trait]
-pub trait AgentContextScopeRepo: Send + Sync {
-    async fn create_context_scope(
-        &self,
-        input: CreateAgentContextScope,
-    ) -> Result<AgentContextScope>;
-    async fn get_context_scope(&self, id: &str) -> Result<Option<AgentContextScope>>;
-    async fn get_context_scope_for_identity(
-        &self,
-        identity_id: &str,
-        scope_type: &str,
-        scope_id: &str,
-    ) -> Result<Option<AgentContextScope>>;
-    async fn list_context_scopes(&self, identity_id: &str) -> Result<Vec<AgentContextScope>>;
-}
-
-#[async_trait]
-pub trait AgentSessionRepo: Send + Sync {
-    async fn create_agent_session(&self, input: CreateAgentSession) -> Result<AgentSession>;
-    async fn get_agent_session(&self, id: &str) -> Result<Option<AgentSession>>;
-    async fn list_agent_sessions(&self, identity_id: &str) -> Result<Vec<AgentSession>>;
-    async fn get_active_agent_session(
-        &self,
-        identity_id: &str,
-        context_scope_id: &str,
-    ) -> Result<Option<AgentSession>>;
-    async fn update_agent_session(&self, input: UpdateAgentSession) -> Result<AgentSession>;
-    async fn rotate_agent_session(&self, input: RotateAgentSession) -> Result<AgentSession>;
-}
-
-#[async_trait]
-pub trait AgentConnectionHealthRepo: Send + Sync {
-    async fn upsert_connection_health(
-        &self,
-        input: UpsertAgentConnectionHealth,
-    ) -> Result<AgentConnectionHealth>;
-    async fn get_connection_health(
-        &self,
-        profile_id: &str,
-    ) -> Result<Option<AgentConnectionHealth>>;
-}
-
-#[async_trait]
-pub trait AgentCommitmentRepo: Send + Sync {
-    async fn create_commitment(&self, input: CreateAgentCommitment) -> Result<AgentCommitment>;
-    async fn get_commitment(&self, id: &str) -> Result<Option<AgentCommitment>>;
-    async fn list_commitments(
-        &self,
-        query: AgentCommitmentListQuery,
-    ) -> Result<Vec<AgentCommitment>>;
-    async fn update_commitment(&self, input: UpdateAgentCommitment) -> Result<AgentCommitment>;
-    async fn complete_commitment(&self, input: CompleteAgentCommitment) -> Result<AgentCommitment>;
-    async fn transfer_commitment(&self, input: TransferAgentCommitment) -> Result<AgentCommitment>;
-    async fn add_commitment_evidence(
-        &self,
-        input: CreateAgentCommitmentEvidence,
-    ) -> Result<AgentCommitmentEvidence>;
-    async fn list_commitment_evidence(
-        &self,
-        commitment_id: &str,
-    ) -> Result<Vec<AgentCommitmentEvidence>>;
-    async fn list_commitment_transfers(
-        &self,
-        commitment_id: &str,
-    ) -> Result<Vec<AgentCommitmentTransfer>>;
-    async fn list_commitment_lifecycle(
-        &self,
-        commitment_id: &str,
-    ) -> Result<Vec<AgentCommitmentLifecycle>>;
-}
-
-#[async_trait]
-pub trait AgentInboxRepo: Send + Sync {
-    async fn create_inbox_item(&self, input: CreateAgentInboxItem) -> Result<AgentInboxItem>;
-    async fn get_inbox_item(&self, id: &str) -> Result<Option<AgentInboxItem>>;
-    async fn list_inbox_items(&self, query: AgentInboxListQuery) -> Result<Vec<AgentInboxItem>>;
-    async fn update_inbox_item(&self, input: UpdateAgentInboxItem) -> Result<AgentInboxItem>;
-    async fn create_question_with_inbox(
-        &self,
-        inbox: CreateAgentInboxItem,
-        question: CreateAgentQuestion,
-    ) -> Result<AgentQuestion>;
-    async fn create_question(&self, input: CreateAgentQuestion) -> Result<AgentQuestion>;
-    async fn get_question(&self, id: &str) -> Result<Option<AgentQuestion>>;
-    async fn list_questions(&self, query: AgentQuestionListQuery) -> Result<Vec<AgentQuestion>>;
-    async fn answer_question(&self, input: AnswerAgentQuestion) -> Result<AgentQuestion>;
-}
-
-#[async_trait]
-pub trait AgentActionRepo: Send + Sync {
-    async fn create_action(&self, input: CreateAgentAction) -> Result<AgentAction>;
-    async fn get_action(&self, id: &str) -> Result<Option<AgentAction>>;
-    async fn list_actions(&self, query: AgentActionListQuery) -> Result<Vec<AgentAction>>;
-    async fn update_action(&self, input: UpdateAgentAction) -> Result<AgentAction>;
-    async fn record_action_approval(
-        &self,
-        input: CreateAgentActionApproval,
-    ) -> Result<AgentActionApproval>;
-    async fn list_action_approvals(&self, action_id: &str) -> Result<Vec<AgentActionApproval>>;
-    async fn record_action_execution(
-        &self,
-        input: CreateAgentActionExecution,
-    ) -> Result<AgentActionExecution>;
-    async fn get_successful_action_execution(
-        &self,
-        action_id: &str,
-    ) -> Result<Option<AgentActionExecution>>;
-    async fn list_action_executions(&self, action_id: &str) -> Result<Vec<AgentActionExecution>>;
-}
-
-#[async_trait]
-pub trait AgentLcmRepo: Send + Sync {
-    async fn create_or_get_lcm_timeline(
-        &self,
-        input: CreateAgentLcmTimeline,
-    ) -> Result<AgentLcmTimeline>;
-    async fn get_lcm_timeline(&self, id: &str) -> Result<Option<AgentLcmTimeline>>;
-    async fn get_lcm_timeline_for_binding(
-        &self,
-        identity_id: &str,
-        scope_type: &str,
-        scope_id: &str,
-    ) -> Result<Option<AgentLcmTimeline>>;
-    async fn list_lcm_entries(
-        &self,
-        timeline_id: &str,
-        start: i64,
-        end: i64,
-        limit: i64,
-    ) -> Result<Vec<AgentLcmEntryRecord>>;
-    async fn list_lcm_nodes(
-        &self,
-        timeline_id: &str,
-        active_only: bool,
-    ) -> Result<Vec<AgentLcmNodeRecord>>;
-    async fn get_lcm_node(
-        &self,
-        timeline_id: &str,
-        node_id: &str,
-    ) -> Result<Option<AgentLcmNodeRecord>>;
-    async fn get_lcm_operation(
-        &self,
-        timeline_id: &str,
-        operation_id: &str,
-    ) -> Result<Option<AgentLcmOperation>>;
-    async fn append_lcm_entries(
-        &self,
-        input: AppendAgentLcmEntries,
-    ) -> Result<AgentLcmMutationResult>;
-    /// Removes the provisional tail of a timeline's immutable sequence,
-    /// starting at `from_sequence` (inclusive). Fails when any summary
-    /// node's source range reaches into the truncated span.
-    async fn truncate_lcm_entries_from(
-        &self,
-        timeline_id: &str,
-        from_sequence: i64,
-        updated_at: &str,
-    ) -> Result<AgentLcmTruncation>;
-    async fn commit_lcm_leaf(&self, input: CommitAgentLcmLeaf) -> Result<AgentLcmMutationResult>;
-    async fn commit_lcm_condensation(
-        &self,
-        input: CommitAgentLcmCondensation,
-    ) -> Result<AgentLcmMutationResult>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentLcmTimeline {
-    pub id: String,
-    pub identity_id: String,
-    pub scope_type: String,
-    pub scope_id: String,
-    pub authorization_revision: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendAgentLcmEntries {
-    pub timeline_id: String,
-    pub expected_revision: i64,
-    pub operation_id: String,
-    pub operation_fingerprint: String,
-    pub entries: Vec<AgentLcmEntryRecord>,
-    pub expected_sequence: i64,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitAgentLcmLeaf {
-    pub timeline_id: String,
-    pub expected_revision: i64,
-    pub operation_id: String,
-    pub operation_fingerprint: String,
-    pub node: AgentLcmNodeRecord,
-    pub entry_ids: Vec<String>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitAgentLcmCondensation {
-    pub timeline_id: String,
-    pub expected_revision: i64,
-    pub operation_id: String,
-    pub operation_fingerprint: String,
-    pub node: AgentLcmNodeRecord,
-    pub child_node_ids: Vec<String>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentLcmMutationResult {
-    pub revision: i64,
-    pub already_committed: bool,
-    pub entries: i64,
-    pub node_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AgentLcmTruncation {
-    pub revision: i64,
-    pub removed: i64,
-}
-
-#[async_trait]
 pub trait DomainEventRepo: Send + Sync {
     async fn append_event(&self, input: CreateDomainEvent) -> Result<DomainEvent>;
     async fn append_event_in_tx(
@@ -547,6 +291,10 @@ pub trait OrchestratorWakeRepo: Send + Sync {
         &self,
         input: TransitionOrchestratorWakeExecution,
     ) -> Result<bool>;
+    /// Resolve a claimed provider Start and its exact Wake attempt in one
+    /// transaction. Only the current lease owner and current attempt may
+    /// become running or deterministically failed.
+    async fn resolve_orchestrator_start(&self, input: ResolveOrchestratorStart) -> Result<bool>;
     async fn get_orchestrator_action(
         &self,
         execution_id: &str,
@@ -556,34 +304,6 @@ pub trait OrchestratorWakeRepo: Send + Sync {
         &self,
         input: ReserveOrchestratorAction,
     ) -> Result<OrchestratorActionRecord>;
-}
-
-#[async_trait]
-pub trait AttentionRepo: Send + Sync {
-    async fn list_attention(&self, query: AttentionListQuery) -> Result<Page<AttentionProjection>>;
-    async fn get_attention(&self, id: &str) -> Result<Option<AttentionProjection>>;
-    async fn insert_attention(
-        &self,
-        input: CreateAttentionProjection,
-    ) -> Result<AttentionProjection>;
-    async fn update_attention_lifecycle(
-        &self,
-        input: UpdateAttentionLifecycle,
-    ) -> Result<AttentionProjection>;
-    async fn resolve_attention_by_dedupe(
-        &self,
-        dedupe_key: &str,
-        source_event_id: &str,
-        updated_at: &str,
-    ) -> Result<Option<AttentionProjection>>;
-    async fn get_attention_consumer_health(
-        &self,
-        consumer_name: &str,
-    ) -> Result<Option<AttentionConsumerHealth>>;
-    async fn upsert_attention_consumer_health(
-        &self,
-        input: UpsertAttentionConsumerHealth,
-    ) -> Result<AttentionConsumerHealth>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -760,6 +480,19 @@ pub struct TransitionOrchestratorWakeExecution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveOrchestratorStart {
+    pub wake_id: String,
+    pub attempt_number: i64,
+    pub execution_id: String,
+    pub lease_owner: String,
+    /// `running` for a durably accepted Start or `failed` for a known
+    /// rejection/loss of authority with no external attempt.
+    pub state: String,
+    pub last_error: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReserveOrchestratorAction {
     pub execution_id: String,
     pub action_index: i64,
@@ -774,9 +507,9 @@ pub trait WorkspaceRepo: Send + Sync {
     async fn create(&self, input: CreateWorkspace) -> Result<Workspace>;
     async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Workspace>>;
-    /// Legacy Task-scoped lookup. Returns only the canonical integration
-    /// workspace; WorkUnit workspaces are always addressed explicitly.
-    async fn get_by_task_id(&self, task_id: &str) -> Result<Option<Workspace>>;
+    /// Resolve the Task's explicitly scoped integration Workspace. WorkUnit
+    /// workspaces must be addressed by exact WorkUnit or Workspace identity.
+    async fn get_integration_by_task_id(&self, task_id: &str) -> Result<Option<Workspace>>;
     async fn set_cleanup_after(
         &self,
         id: &str,
@@ -828,7 +561,37 @@ pub trait WorkUnitExecutionRepo: Send + Sync {
         &self,
         input: CreateWorkUnitExecution,
         event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<Execution>> {
+        self.create_for_work_unit_with_artifact_inputs(input, Vec::new(), event)
+            .await
+    }
+    async fn create_for_work_unit_with_artifact_inputs(
+        &self,
+        input: CreateWorkUnitExecution,
+        artifact_input_ids: Vec<String>,
+        event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<Execution>>;
+    /// Atomically apply the bounded lifecycle receipt(s), optional recovery
+    /// annotation cleanup, and ordinary WorkUnit Execution admission.
+    async fn admit_with_lifecycle_and_artifact_inputs(
+        &self,
+        input: AdmitWorkUnitExecutionWithLifecycle,
+        artifact_input_ids: Vec<String>,
+        execution_event: CreateDomainEvent,
+    ) -> Result<WorkUnitExecutionLifecycleWrite>;
+    async fn get_follow_up_execution_receipt(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<FollowUpExecutionReceipt>>;
+    /// Atomically clear a blocked Task's recovery projection, transition its
+    /// canonical lifecycle to Active, and admit the exact follow-up Execution.
+    /// A rejected admission leaves the previous recovery annotation intact.
+    async fn admit_recovery_for_work_unit_with_artifact_inputs(
+        &self,
+        input: RecoverWorkUnitExecution,
+        artifact_input_ids: Vec<String>,
+        execution_event: CreateDomainEvent,
+    ) -> Result<RecoveryWorkUnitExecutionWrite>;
 }
 
 #[async_trait]
@@ -1060,6 +823,48 @@ pub trait ExecutionRepo: Send + Sync {
     async fn stats_by_agent(&self, agent_id: &str) -> Result<AgentExecutionStats>;
     async fn list_by_task(&self, task_id: &str, page: PageRequest) -> Result<Page<Execution>>;
     async fn list_latest_executions_for_tasks(&self, task_ids: &[&str]) -> Result<Vec<Execution>>;
+    /// Exact WorkUnit-bound Executions authorized for automatic restart after
+    /// an orderly shutdown or process crash. Task-scoped legacy Executions are
+    /// intentionally excluded.
+    async fn list_work_unit_auto_recovery_candidates(&self) -> Result<Vec<Execution>>;
+    /// Newly admitted Agent WorkUnit Executions whose external provider start
+    /// has not been claimed. Older admissions without this receipt are not
+    /// inferred to be pending because their external outcome is unknowable.
+    async fn list_pending_provider_starts(&self) -> Result<Vec<Execution>>;
+    /// Check the exact durable queued-start contract for one Execution.
+    async fn is_provider_start_pending(&self, execution_id: &str) -> Result<bool>;
+    /// Resolve a queued provider Start only while its durable receipt still
+    /// proves that no external attempt has been claimed.
+    async fn fail_pending_provider_start(
+        &self,
+        execution_id: &str,
+        update: UpdateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<PendingProviderStartFailure>;
+    /// Fail an external execution only if it is still Running and has no
+    /// unattempted provider-start receipt at the serialized write boundary.
+    async fn fail_running_unless_provider_start_pending(
+        &self,
+        execution_id: &str,
+        update: UpdateExecution,
+        event: CreateDomainEvent,
+    ) -> Result<RunningExecutionFailure>;
+    /// Atomically claim the one external Start attempt for an admitted
+    /// Execution. A paused Agent leaves the admission pending; an existing
+    /// attempt is returned as accepted, rejected, or uncertain and is never
+    /// sent to the provider again.
+    async fn claim_provider_start(
+        &self,
+        execution_id: &str,
+        attempt_event: CreateDomainEvent,
+    ) -> Result<ProviderStartClaim>;
+    /// Persist the provider's observed accepted/rejected result, or record an
+    /// uncertain outcome after the request was attempted.
+    async fn record_provider_start_outcome(
+        &self,
+        execution_id: &str,
+        outcome_event: CreateDomainEvent,
+    ) -> Result<DomainEvent>;
     async fn list_by_task_and_role(
         &self,
         task_id: &str,
@@ -1083,15 +888,39 @@ pub trait ExecutionRepo: Send + Sync {
         exclude_ids: &[String],
     ) -> Result<Vec<Execution>>;
     async fn get_logs_path(&self, id: &str) -> Result<Option<String>>;
-    /// Persist an external harness session identity and its legacy projection
-    /// together. The generic HarnessSession is authoritative; the execution
-    /// column is updated only as a compatibility projection.
+    /// Persist an external harness session identity only through the exact
+    /// HarnessSession already attached to this Execution.
     async fn record_harness_session_result(
         &self,
         execution_id: &str,
         external_session_id: &str,
         updated_at: &str,
     ) -> Result<Execution>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderStartClaim {
+    Claimed,
+    Accepted,
+    Rejected,
+    Uncertain,
+    AuthorityLost,
+    TaskCancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingProviderStartFailure {
+    Resolved(Execution, DomainEvent),
+    Attempted(Execution),
+    NotPending(Execution),
+    NotRunning(Execution),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunningExecutionFailure {
+    Failed(Execution, DomainEvent),
+    Pending(Execution),
+    NotRunning(Execution),
 }
 
 /// Generic PR4 collaboration persistence. Every create/lifecycle operation
@@ -1214,221 +1043,6 @@ pub struct AgentExecutionStats {
 }
 
 #[async_trait]
-pub trait AccountMainAgentBindingRepo: Send + Sync {
-    async fn get_active_main_binding(
-        &self,
-        account_id: &str,
-    ) -> Result<Option<AccountMainAgentBinding>>;
-    async fn get_main_binding(&self, id: &str) -> Result<Option<AccountMainAgentBinding>>;
-    async fn list_main_binding_history(
-        &self,
-        account_id: &str,
-    ) -> Result<Vec<AccountMainAgentBinding>>;
-    async fn create_main_binding(
-        &self,
-        input: CreateAccountMainAgentBinding,
-    ) -> Result<AccountMainAgentBinding>;
-    async fn replace_main_binding(
-        &self,
-        input: ReplaceAccountMainAgentBinding,
-    ) -> Result<AccountMainAgentBinding>;
-}
-
-#[async_trait]
-pub trait ProjectAgentBindingRepo: Send + Sync {
-    async fn get_active_project_binding(
-        &self,
-        project_id: &str,
-    ) -> Result<Option<ProjectAgentBinding>>;
-    async fn get_project_binding(&self, id: &str) -> Result<Option<ProjectAgentBinding>>;
-    async fn list_project_binding_history(
-        &self,
-        project_id: &str,
-    ) -> Result<Vec<ProjectAgentBinding>>;
-    async fn create_project_binding(
-        &self,
-        input: CreateProjectAgentBinding,
-    ) -> Result<ProjectAgentBinding>;
-    async fn replace_project_binding(
-        &self,
-        input: ReplaceProjectAgentBinding,
-    ) -> Result<ProjectAgentBinding>;
-    async fn replace_project_binding_in_tx(
-        &self,
-        transaction: &mut Transaction<'_, Sqlite>,
-        input: ReplaceProjectAgentBinding,
-    ) -> Result<ProjectAgentBinding>;
-}
-
-#[async_trait]
-pub trait AgentChatRepo: Send + Sync {
-    async fn get_agent_chat(&self, id: &str) -> Result<Option<AgentChat>>;
-    async fn get_main_chat(&self, account_id: &str) -> Result<Option<AgentChat>>;
-    async fn get_project_chat(&self, project_id: &str) -> Result<Option<AgentChat>>;
-    async fn list_agent_chats(&self, account_id: &str) -> Result<Vec<AgentChat>>;
-    async fn create_agent_chat(&self, input: CreateAgentChat) -> Result<AgentChat>;
-    async fn update_agent_chat(&self, input: UpdateAgentChat) -> Result<AgentChat>;
-    async fn list_chat_source_refs(&self, chat_id: &str) -> Result<Vec<AgentChatSourceRef>>;
-    async fn list_chat_instructions(
-        &self,
-        chat_id: &str,
-    ) -> Result<Vec<AgentChatInstructionRevision>>;
-}
-
-#[async_trait]
-pub trait AgentChatMessageRepo: Send + Sync {
-    async fn get_agent_chat_message(&self, id: &str) -> Result<Option<AgentChatMessage>>;
-    async fn list_agent_chat_messages(
-        &self,
-        query: AgentChatMessageListQuery,
-    ) -> Result<Page<AgentChatMessage>>;
-    async fn append_agent_chat_message(
-        &self,
-        input: CreateAgentChatMessage,
-    ) -> Result<AgentChatMessage>;
-}
-
-#[async_trait]
-pub trait AgentChatTurnJobRepo: Send + Sync {
-    async fn get_agent_chat_turn_job(&self, id: &str) -> Result<Option<AgentChatTurnJob>>;
-    async fn list_agent_chat_turn_jobs(&self, chat_id: &str) -> Result<Vec<AgentChatTurnJob>>;
-    async fn create_agent_chat_turn_job(
-        &self,
-        input: CreateAgentChatTurnJob,
-    ) -> Result<AgentChatTurnJob>;
-    async fn update_agent_chat_turn_job(
-        &self,
-        input: UpdateAgentChatTurnJob,
-    ) -> Result<AgentChatTurnJob>;
-}
-
-#[async_trait]
-pub trait AgentHandoffRepo: Send + Sync {
-    async fn get_agent_handoff(&self, id: &str) -> Result<Option<AgentHandoff>>;
-    async fn list_agent_handoffs(&self, target_chat_id: &str) -> Result<Vec<AgentHandoff>>;
-    async fn create_agent_handoff(&self, input: CreateAgentHandoff) -> Result<AgentHandoff>;
-}
-
-/// Short transactional composites used by the singular chat service.  The
-/// individual repositories remain useful for inspection, while these methods
-/// make message/turn and handoff delivery idempotent at the database boundary.
-#[async_trait]
-pub trait AgentChatTransactionRepo: Send + Sync {
-    async fn admit_agent_chat_turn(
-        &self,
-        input: AdmitAgentChatTurn,
-    ) -> Result<AdmittedAgentChatTurn>;
-    async fn complete_agent_chat_turn(
-        &self,
-        input: CompleteAgentChatTurn,
-    ) -> Result<CompletedAgentChatTurn>;
-    async fn fail_agent_chat_turn(&self, input: FailAgentChatTurn) -> Result<AgentChatTurnJob>;
-    /// Cancel a queued/leased/retry-wait turn and append the cancellation
-    /// event in the same transaction.  The idempotency key is represented by
-    /// the event dedupe key so retries do not require a second turn-job store.
-    async fn cancel_agent_chat_turn(&self, input: CancelAgentChatTurn) -> Result<AgentChatTurnJob>;
-    async fn admit_agent_handoff(&self, input: AdmitAgentHandoff) -> Result<AdmittedAgentHandoff>;
-}
-
-#[async_trait]
-pub trait MemoryRepository: Send + Sync {
-    async fn insert_memory_item(&self, item: &MemoryItem) -> std::result::Result<(), DbError>;
-    async fn get_memory_item(&self, id: &str) -> std::result::Result<Option<MemoryItem>, DbError>;
-    async fn memory_source_exists(
-        &self,
-        project_id: &str,
-        source_type: &str,
-        source_ref: &str,
-    ) -> std::result::Result<bool, DbError>;
-    async fn memory_source_exists_with_confidence(
-        &self,
-        project_id: &str,
-        source_type: &str,
-        source_ref: &str,
-        confidence: &str,
-    ) -> std::result::Result<bool, DbError>;
-    async fn search_memory_items(
-        &self,
-        project_id: &str,
-        query: &str,
-        limit: usize,
-        cursor: Option<String>,
-    ) -> std::result::Result<(Vec<MemoryItem>, bool), DbError>;
-    async fn list_memory_items_by_source(
-        &self,
-        project_id: &str,
-        source_type: &str,
-        source_id: &str,
-    ) -> std::result::Result<Vec<MemoryItem>, DbError>;
-}
-
-/// ACL-first semantic-memory operations.  These methods are intentionally a
-/// separate trait so legacy project-indexing code cannot accidentally omit the
-/// authorization context when it is migrated to scoped retrieval.
-#[async_trait]
-pub trait ScopedMemoryRepository: Send + Sync {
-    async fn insert_memory_item_if_source_absent(
-        &self,
-        item: &MemoryItem,
-        source_type: &str,
-        source_ref: &str,
-    ) -> std::result::Result<(MemoryItem, bool), DbError>;
-    async fn get_memory_item_scoped(
-        &self,
-        query: MemoryGetQuery,
-    ) -> std::result::Result<Option<MemoryItem>, DbError>;
-    async fn search_memory_items_scoped(
-        &self,
-        query: MemoryAccessQuery,
-    ) -> std::result::Result<(Vec<MemoryItem>, bool), DbError>;
-    async fn insert_memory_lifecycle_assertion(
-        &self,
-        input: CreateMemoryLifecycleAssertion,
-    ) -> std::result::Result<MemoryLifecycleAssertion, DbError>;
-    async fn list_memory_lifecycle_assertions(
-        &self,
-        memory_item_id: &str,
-    ) -> std::result::Result<Vec<MemoryLifecycleAssertion>, DbError>;
-    async fn create_memory_source_binding(
-        &self,
-        input: CreateForgeMemorySourceBinding,
-    ) -> std::result::Result<ForgeMemorySourceBinding, DbError>;
-    async fn get_memory_source_binding(
-        &self,
-        identity_id: &str,
-        context_scope_id: &str,
-    ) -> std::result::Result<Option<ForgeMemorySourceBinding>, DbError>;
-    async fn create_context_manifest(
-        &self,
-        input: CreateContextManifest,
-    ) -> std::result::Result<ContextManifest, DbError>;
-    async fn append_context_manifest_source(
-        &self,
-        input: CreateContextManifestSource,
-    ) -> std::result::Result<ContextManifestSource, DbError>;
-    async fn get_context_manifest(
-        &self,
-        id: &str,
-    ) -> std::result::Result<Option<ContextManifest>, DbError>;
-    async fn get_context_manifest_scoped(
-        &self,
-        id: &str,
-        identity_id: &str,
-        context_scope_id: &str,
-    ) -> std::result::Result<Option<ContextManifest>, DbError>;
-    async fn list_context_manifests_scoped(
-        &self,
-        identity_id: &str,
-        context_scope_id: Option<&str>,
-        limit: i64,
-    ) -> std::result::Result<Vec<ContextManifest>, DbError>;
-    async fn list_context_manifest_sources(
-        &self,
-        manifest_id: &str,
-    ) -> std::result::Result<Vec<ContextManifestSource>, DbError>;
-}
-
-#[async_trait]
 pub trait ValidationRunRepo: Send + Sync {
     /// Insert the Running identity and `validation_run.started` event atomically.
     /// Same-key retries return the exact existing row and no second event.
@@ -1497,23 +1111,6 @@ pub trait ValidationRunRepo: Send + Sync {
 }
 
 #[async_trait]
-pub trait ReviewRepo: Send + Sync {
-    async fn create(&self, input: CreateReview) -> Result<Review>;
-    async fn update_status(
-        &self,
-        id: &str,
-        status: ReviewStatus,
-        step_results_json: String,
-        finished_at: Option<String>,
-        updated_at: &str,
-    ) -> Result<Review>;
-    async fn get_by_id(&self, id: &str) -> Result<Option<Review>>;
-    async fn list_by_task(&self, task_id: &str) -> Result<Vec<Review>>;
-    async fn list_latest_reviews_for_tasks(&self, task_ids: &[&str]) -> Result<Vec<Review>>;
-    async fn next_attempt_number(&self, task_id: &str) -> Result<i64>;
-}
-
-#[async_trait]
 pub trait TaskCommentRepo: Send + Sync {
     async fn create_comment(&self, input: CreateTaskComment) -> Result<TaskComment>;
     async fn list_comments(&self, task_id: &str, page: PageRequest) -> Result<Page<TaskComment>>;
@@ -1532,9 +1129,9 @@ pub trait TaskMediaRepo: Send + Sync {
 
 /// Repository boundary for the additive Project-owned media metadata layer.
 ///
-/// Implementations must keep reference changes transactional.  In
+/// Implementations must keep reference changes transactional. In
 /// particular, a cleanup worker may only claim an asset after checking active
-/// attachments and release pins in the same write transaction.  Claims carry
+/// Task media references and release pins in the same write transaction. Claims carry
 /// a persisted owner/expiry lease and asset version; reset/finalize operations
 /// must present both exact values.  Every attachment/pin insertion must reject
 /// an asset already queued for deletion or marked as deleted.
@@ -1598,27 +1195,6 @@ pub trait SharedMediaRepo: Send + Sync {
         &self,
         input: ProjectMediaTombstone,
     ) -> Result<MediaAsset>;
-    async fn create_project_media_attachment_mutation(
-        &self,
-        input: CreateProjectMediaAttachmentMutation,
-    ) -> Result<ProjectMediaAttachment>;
-    async fn soft_delete_project_media_attachment_mutation(
-        &self,
-        input: SoftDeleteProjectMediaAttachmentMutation,
-    ) -> Result<ProjectMediaAttachment>;
-    async fn create_project_media_attachment(
-        &self,
-        input: CreateProjectMediaAttachment,
-    ) -> Result<ProjectMediaAttachment>;
-    async fn soft_delete_project_media_attachment(
-        &self,
-        id: &str,
-        deleted_at: &str,
-    ) -> Result<ProjectMediaAttachment>;
-    async fn create_project_release_media_pin(
-        &self,
-        input: CreateProjectReleaseMediaPin,
-    ) -> Result<ProjectReleaseMediaPin>;
     async fn list_project_release_media_pins(
         &self,
         release_id: &str,
@@ -1858,13 +1434,10 @@ pub struct TaskListQuery {
     pub project_id: String,
     pub q: Option<String>,
     pub lifecycle_states: Vec<TaskLifecycleState>,
-    /// Internal transition-era query support. Public Task listing uses `lifecycle_states`.
-    pub statuses: Vec<String>,
     pub agent_ids: Vec<String>,
     pub assignee_types: Vec<String>,
     pub assignee_ids: Vec<String>,
     pub priority: Option<i64>,
-    pub include_archived: bool,
     pub include_cancelled: bool,
     pub include_deleted: bool,
     pub page: PageRequest,
@@ -1873,7 +1446,6 @@ pub struct TaskListQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTaskListQuery {
     pub agent_id: String,
-    pub include_archived: bool,
     pub include_cancelled: bool,
     pub include_deleted: bool,
     pub page: PageRequest,
@@ -1902,7 +1474,6 @@ pub struct CreateProject {
     pub id: String,
     pub name: String,
     pub settings: String,
-    pub workflow_definition: String,
     pub primary_repo_id: Option<String>,
     pub owner_id: Option<String>,
     pub created_at: String,
@@ -2142,66 +1713,6 @@ pub struct SelectAgentProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentContextScope {
-    pub id: String,
-    pub identity_id: String,
-    pub scope_type: String,
-    pub scope_id: String,
-    pub project_id: Option<String>,
-    pub task_id: Option<String>,
-    pub task_role: Option<String>,
-    pub workspace_access: String,
-    pub authority_json: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentSession {
-    pub id: String,
-    pub identity_id: String,
-    pub profile_id: String,
-    pub context_scope_id: String,
-    pub backend_kind: String,
-    pub runtime_session_id: Option<String>,
-    pub status: String,
-    pub capabilities_json: String,
-    pub connection_status: String,
-    pub predecessor_session_id: Option<String>,
-    pub last_activity_at: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdateAgentSession {
-    pub id: String,
-    pub expected_version: i64,
-    pub runtime_session_id: Option<Option<String>>,
-    pub status: Option<String>,
-    pub connection_status: Option<String>,
-    pub last_activity_at: Option<Option<String>>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RotateAgentSession {
-    pub previous_session_id: String,
-    pub expected_version: i64,
-    pub replacement: CreateAgentSession,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpsertAgentConnectionHealth {
-    pub profile_id: String,
-    pub status: String,
-    pub capability_status_json: String,
-    pub checked_at: Option<String>,
-    pub error_code: Option<String>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateWorkspace {
     pub id: String,
     pub task_id: String,
@@ -2308,6 +1819,94 @@ pub struct CreateWorkUnitExecution {
     pub work_unit_id: String,
     pub work_unit_version: i64,
     pub workspace_lease: Option<CreateWorkspaceLease>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverWorkUnitExecution {
+    pub admission: CreateWorkUnitExecution,
+    pub expected_task_version: i64,
+    pub expected_lifecycle_state: TaskLifecycleState,
+    pub expected_lifecycle_version: i64,
+    pub lifecycle_transition: Option<TransitionTaskLifecycle>,
+    /// A human may select one exact cancelled Execution from the current
+    /// ambiguous crash-recovery block. The snapshots and selected target are
+    /// rechecked inside the same write transaction.
+    pub ambiguous_block_selection: Option<ResolveAmbiguousRecoveryBlock>,
+    pub expected_error_annotation: Option<String>,
+    pub expected_blocked_json: Option<String>,
+    pub expected_metadata_json: Option<String>,
+    /// Durable DomainEvent receipt for an explicitly requested recovery.
+    /// The event and child Execution commit atomically.
+    pub request_receipt: Option<CreateDomainEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveAmbiguousRecoveryBlock {
+    pub expected_reason_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearTaskBlockingMetadata {
+    /// The exact failed Execution whose current TaskLifecycle block this
+    /// admission resolves. The WorkUnit and lifecycle receipt are checked in
+    /// the same SQLite transaction as the child Execution.
+    pub blocking_execution_id: String,
+    pub blocking_work_unit_id: String,
+    pub expected_lifecycle_reason_kind: String,
+    pub expected_error_annotation: Option<String>,
+    pub expected_blocked_json: Option<String>,
+    pub expected_metadata_json: Option<String>,
+    pub replacement_metadata_json: Option<String>,
+}
+
+/// A bounded ordinary WorkUnit admission that may activate its Task in the
+/// same commit as the Execution. Lifecycle transitions are supplied as
+/// receipt-bearing PR9 transitions; this is not a second transition engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmitWorkUnitExecutionWithLifecycle {
+    pub admission: CreateWorkUnitExecution,
+    pub expected_task_version: i64,
+    pub expected_lifecycle_state: TaskLifecycleState,
+    pub expected_lifecycle_version: i64,
+    pub lifecycle_transitions: Vec<TransitionTaskLifecycle>,
+    pub clear_blocking_metadata: Option<ClearTaskBlockingMetadata>,
+    pub follow_up_receipt: Option<CreateFollowUpExecutionReceipt>,
+    /// Exact parent selected by the automatic recovery dispatcher. The
+    /// repository serializes competing admissions and replays its committed
+    /// child without creating another Execution.
+    pub automatic_recovery_parent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateFollowUpExecutionReceipt {
+    pub idempotency_key: String,
+    pub parent_execution_id: String,
+    pub request_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowUpExecutionReceipt {
+    pub idempotency_key: String,
+    pub parent_execution_id: String,
+    pub request_digest: String,
+    pub execution_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkUnitExecutionLifecycleWrite {
+    pub execution: Execution,
+    pub lifecycle_events: Vec<DomainEvent>,
+    pub execution_event: Option<DomainEvent>,
+    pub idempotent_replay: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryWorkUnitExecutionWrite {
+    pub execution: Execution,
+    pub lifecycle_event: Option<DomainEvent>,
+    pub execution_event: Option<DomainEvent>,
+    pub request_receipt_event: Option<DomainEvent>,
+    pub idempotent_replay: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2433,16 +2032,13 @@ pub struct CreateTask {
     pub project_id: String,
     pub repo_id: Option<String>,
     pub parent_task_id: Option<String>,
-    pub assignee_type: Option<String>,
-    pub assignee_id: Option<String>,
     pub title: String,
     pub description: Option<String>,
     pub task_type: String,
-    pub status: String,
+    pub lifecycle_state: TaskLifecycleState,
     pub is_automation: bool,
     pub priority: i64,
     pub subtask_order: Option<i64>,
-    pub task_state_config: Option<String>,
     pub merge_config: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -2459,7 +2055,6 @@ pub struct UpdateTask {
     pub error_annotation: Option<Option<String>>,
     pub blocked_json: Option<Option<String>>,
     pub failed_json: Option<Option<String>>,
-    pub task_state_config: Option<Option<String>>,
     pub parent_task_id: Option<Option<String>>,
     pub updated_at: String,
 }
@@ -2469,45 +2064,6 @@ pub struct SoftDeleteTask {
     pub id: String,
     pub expected_version: i64,
     pub deleted_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArchiveTask {
-    pub id: String,
-    pub expected_version: i64,
-    pub archived_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaimTask {
-    pub task_id: String,
-    pub assignee_type: String,
-    pub assignee_id: Option<String>,
-    pub expected_version: i64,
-    pub source_status: String,
-    pub target_status: String,
-    pub execution: CreateExecution,
-    pub max_concurrent_tasks: i64,
-    pub claimed_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ClaimedTask {
-    pub task: Task,
-    pub execution: Execution,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdateTaskStatus {
-    pub id: String,
-    pub expected_version: i64,
-    pub status: String,
-    pub assignee_id: Option<Option<String>>,
-    pub error_annotation: Option<Option<String>>,
-    pub blocked_json: Option<Option<String>>,
-    pub failed_json: Option<Option<String>>,
     pub updated_at: String,
 }
 
@@ -2530,7 +2086,6 @@ pub struct CreateExecution {
     pub resume_policy: Option<ResumePolicy>,
     pub stopped_at: Option<String>,
     pub parent_execution_id: Option<String>,
-    pub agent_session_id: Option<String>,
     pub harness_session_id: Option<String>,
     pub agent_message_id: Option<String>,
     pub last_activity_at: Option<String>,
@@ -2553,12 +2108,10 @@ pub struct UpdateExecution {
     pub stopped_by: Option<Option<String>>,
     pub resume_policy: Option<Option<ResumePolicy>>,
     pub stopped_at: Option<Option<String>>,
-    /// Legacy-shaped input retained for callers that receive an
-    /// ExecutionResult. `Some(Some(id))` is an external harness identity and
-    /// is routed through the generic HarnessSession authority by the
-    /// repository; `Some(None)` only clears a historical row with no generic
-    /// session reference.
-    pub agent_session_id: Option<Option<String>>,
+    /// External HarnessSession identity observed in an exact Agent Execution
+    /// result. It is bound through HarnessSession and is never stored as an
+    /// Execution projection.
+    pub external_session_id: Option<Option<String>>,
     pub agent_message_id: Option<Option<String>>,
     pub last_activity_at: Option<Option<String>>,
     pub summary: Option<Option<String>>,
@@ -2567,236 +2120,6 @@ pub struct UpdateExecution {
     pub after_sha: Option<Option<String>>,
     pub error: Option<Option<String>>,
     pub executor_config_snapshot_json: Option<Option<String>>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAccountMainAgentBinding {
-    pub id: String,
-    pub account_id: String,
-    pub identity_id: String,
-    pub profile_id: String,
-    pub autonomy_policy_json: String,
-    pub tool_policy_revision: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplaceAccountMainAgentBinding {
-    pub account_id: String,
-    pub expected_version: i64,
-    pub replacement: CreateAccountMainAgentBinding,
-    pub replacement_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateProjectAgentBinding {
-    pub id: String,
-    pub project_id: String,
-    pub identity_id: Option<String>,
-    pub profile_id: Option<String>,
-    pub state: String,
-    pub autonomy_policy_json: String,
-    pub permission_ceiling_json: String,
-    pub subscriptions_json: String,
-    pub wake_budget: i64,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplaceProjectAgentBinding {
-    pub project_id: String,
-    pub expected_version: i64,
-    pub replacement: CreateProjectAgentBinding,
-    pub replacement_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentChat {
-    pub id: String,
-    pub kind: String,
-    pub account_id: Option<String>,
-    pub project_id: Option<String>,
-    pub status: String,
-    pub instruction_revision: i64,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdateAgentChat {
-    pub id: String,
-    pub expected_version: i64,
-    pub status: Option<String>,
-    pub instruction_revision: Option<i64>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentChatMessage {
-    pub id: String,
-    pub chat_id: String,
-    pub sequence: i64,
-    pub author_type: AgentChatMessageAuthorType,
-    pub author_id: Option<String>,
-    pub content: String,
-    pub content_guard_json: String,
-    pub sensitivity: String,
-    pub status: AgentChatMessageStatus,
-    pub outcome: Option<String>,
-    pub model: Option<String>,
-    pub profile_id: Option<String>,
-    pub session_id: Option<String>,
-    pub context_manifest_id: Option<String>,
-    pub token_usage_json: Option<String>,
-    pub duration_ms: Option<i64>,
-    pub error: Option<String>,
-    pub correlation_id: String,
-    pub causation_id: Option<String>,
-    pub handoff_id: Option<String>,
-    pub source_type: String,
-    pub source_id: Option<String>,
-    pub source_message_id: Option<String>,
-    pub source_room_id: Option<String>,
-    pub source_conversation_id: Option<String>,
-    pub source_sequence: Option<i64>,
-    pub source_metadata_json: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentChatMessageListQuery {
-    pub chat_id: String,
-    pub before_sequence: Option<i64>,
-    pub page: PageRequest,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentChatTurnJob {
-    pub id: String,
-    pub chat_id: String,
-    pub triggering_message_id: String,
-    pub responder_identity_id: String,
-    pub profile_id: String,
-    pub canonical_scope_type: String,
-    pub canonical_scope_id: String,
-    pub dedupe_key: String,
-    pub max_attempts: i64,
-    pub correlation_id: String,
-    pub causation_id: Option<String>,
-    pub causation_depth: i64,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdateAgentChatTurnJob {
-    pub id: String,
-    pub expected_version: i64,
-    pub status: AgentChatTurnState,
-    pub lease_owner: Option<Option<String>>,
-    pub leased_until: Option<Option<String>>,
-    pub attempt_count: Option<i64>,
-    pub next_attempt_at: Option<Option<String>>,
-    pub response_message_id: Option<Option<String>>,
-    pub error_code: Option<Option<String>>,
-    pub error_message: Option<Option<String>>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentHandoff {
-    pub id: String,
-    pub source_chat_id: String,
-    pub target_chat_id: String,
-    pub source_message_id: Option<String>,
-    pub source_turn_job_id: Option<String>,
-    pub author_identity_id: Option<String>,
-    pub content: String,
-    pub content_guard_json: String,
-    pub source_revisions_json: String,
-    pub correlation_id: String,
-    pub causation_id: Option<String>,
-    pub dedupe_key: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmitAgentChatTurn {
-    pub message: CreateAgentChatMessage,
-    pub turn: CreateAgentChatTurnJob,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmittedAgentChatTurn {
-    pub message: AgentChatMessage,
-    pub turn: AgentChatTurnJob,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteAgentChatTurn {
-    pub turn_job_id: String,
-    pub expected_version: i64,
-    pub lease_owner: String,
-    pub response: CreateAgentChatMessage,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FailAgentChatTurn {
-    pub turn_job_id: String,
-    pub expected_version: i64,
-    pub lease_owner: String,
-    pub status: AgentChatTurnState,
-    pub attempt_count: i64,
-    pub next_attempt_at: Option<String>,
-    pub error_code: String,
-    pub error_message: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CancelAgentChatTurn {
-    pub turn_job_id: String,
-    pub expected_version: i64,
-    pub actor_user_id: String,
-    pub idempotency_key: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletedAgentChatTurn {
-    pub response: AgentChatMessage,
-    pub turn: AgentChatTurnJob,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmitAgentHandoff {
-    pub handoff: CreateAgentHandoff,
-    pub target_message: CreateAgentChatMessage,
-    pub target_turn: CreateAgentChatTurnJob,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmittedAgentHandoff {
-    pub handoff: AgentHandoff,
-    pub message: AgentChatMessage,
-    pub turn: AgentChatTurnJob,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateReview {
-    pub id: String,
-    pub task_id: String,
-    pub execution_id: String,
-    pub attempt_number: i64,
-    pub status: ReviewStatus,
-    pub step_results_json: String,
-    pub started_at: String,
-    pub created_at: String,
     pub updated_at: String,
 }
 
@@ -2810,28 +2133,6 @@ pub struct CreateTaskComment {
     pub content: String,
     pub created_at: String,
     pub updated_at: String,
-}
-
-#[async_trait]
-pub trait TaskRoleAssignmentRepo: Send + Sync {
-    async fn assign(
-        &self,
-        input: CreateTaskRoleAssignment,
-    ) -> std::result::Result<TaskRoleAssignment, crate::DbError>;
-    async fn get_by_task_and_role(
-        &self,
-        task_id: &str,
-        role_name: &str,
-    ) -> std::result::Result<Option<TaskRoleAssignment>, crate::DbError>;
-    async fn list_by_task(
-        &self,
-        task_id: &str,
-    ) -> std::result::Result<Vec<TaskRoleAssignment>, crate::DbError>;
-    async fn remove(
-        &self,
-        task_id: &str,
-        role_name: &str,
-    ) -> std::result::Result<(), crate::DbError>;
 }
 
 #[async_trait]
@@ -2874,42 +2175,6 @@ pub trait RoleMembershipRepo: Send + Sync {
     ) -> std::result::Result<RoleMembership, crate::DbError>;
 }
 
-#[async_trait]
-pub trait TransitionLogRepo: Send + Sync {
-    async fn insert(
-        &self,
-        input: CreateTransitionLog,
-    ) -> std::result::Result<TransitionLog, crate::DbError>;
-    async fn insert_recovery_marker(
-        &self,
-        task_id: &str,
-        current_state: &str,
-        action_kind: &str,
-        triggered_by: &str,
-        reason: &str,
-    ) -> std::result::Result<TransitionLog, crate::DbError>;
-    async fn list_by_task(
-        &self,
-        task_id: &str,
-    ) -> std::result::Result<Vec<TransitionLog>, crate::DbError>;
-    async fn count_gate_rejections(
-        &self,
-        task_id: &str,
-        gate_state: &str,
-    ) -> std::result::Result<i64, crate::DbError>;
-    async fn count_to_state_since(
-        &self,
-        task_id: &str,
-        to_state: &str,
-        since: Option<&str>,
-    ) -> std::result::Result<i64, crate::DbError>;
-    async fn update_hook_results(
-        &self,
-        id: &str,
-        hook_results_json: &str,
-    ) -> std::result::Result<(), crate::DbError>;
-}
-
 #[derive(Debug, Clone)]
 pub struct UpsertExecutionUsage {
     pub execution_id: String,
@@ -2930,73 +2195,6 @@ pub struct TaskUsageSummary {
     pub total_cache_write_tokens: i64,
     pub total_cost_usd: Option<f64>,
     pub execution_count: i64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct CiStepStats {
-    pub command: String,
-    pub total_runs: i64,
-    pub pass_count: i64,
-    pub fail_count: i64,
-    pub avg_duration_ms: Option<i64>,
-    pub p50_duration_ms: Option<i64>,
-    pub p95_duration_ms: Option<i64>,
-    pub last_run_at: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ModelTokenBreakdown {
-    pub provider: String,
-    pub model: String,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub cost_usd: Option<f64>,
-    pub execution_count: i64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProjectTokenStats {
-    pub total_input_tokens: i64,
-    pub total_output_tokens: i64,
-    pub total_cache_read_tokens: i64,
-    pub total_cache_write_tokens: i64,
-    pub total_cost_usd: Option<f64>,
-    pub execution_count: i64,
-    pub by_model: Vec<ModelTokenBreakdown>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProjectReviewSummary {
-    pub total_reviews: i64,
-    pub passed: i64,
-    pub failed: i64,
-    pub cancelled: i64,
-    pub avg_duration_ms: Option<i64>,
-    pub pass_rate: f64,
-}
-
-#[async_trait]
-pub trait ProjectAnalyticsRepo: Send + Sync {
-    async fn get_project_ci_analytics(
-        &self,
-        project_id: &str,
-        from: Option<&str>,
-        to: Option<&str>,
-    ) -> Result<Vec<CiStepStats>>;
-    async fn get_project_token_analytics(
-        &self,
-        project_id: &str,
-        from: Option<&str>,
-        to: Option<&str>,
-    ) -> Result<ProjectTokenStats>;
-    async fn get_project_review_summary(
-        &self,
-        project_id: &str,
-        from: Option<&str>,
-        to: Option<&str>,
-    ) -> Result<ProjectReviewSummary>;
 }
 
 #[async_trait]
@@ -3118,239 +2316,6 @@ pub trait ProjectMemberRepo: Send + Sync {
         project_id: &str,
         user_id: &str,
     ) -> Result<()>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentCommitment {
-    pub id: String,
-    pub owner_identity_id: String,
-    pub scope_type: String,
-    pub scope_id: String,
-    pub title: String,
-    pub description: Option<String>,
-    pub status: AgentCommitmentStatus,
-    pub due_at: Option<String>,
-    pub correlation_id: String,
-    pub originating_action_id: Option<String>,
-    pub originating_task_id: Option<String>,
-    pub evidence_required: bool,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentCommitmentListQuery {
-    pub owner_identity_id: Option<String>,
-    pub scope_type: Option<String>,
-    pub scope_id: Option<String>,
-    pub status: Option<AgentCommitmentStatus>,
-    pub limit: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdateAgentCommitment {
-    pub id: String,
-    pub expected_version: i64,
-    pub status: Option<AgentCommitmentStatus>,
-    pub due_at: Option<Option<String>>,
-    pub description: Option<Option<String>>,
-    pub blocked_reason: Option<Option<String>>,
-    pub cancellation_reason: Option<Option<String>>,
-    pub actor_type: String,
-    pub actor_id: String,
-    pub reason: Option<String>,
-    pub evidence_id: Option<String>,
-    pub dedupe_key: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteAgentCommitment {
-    pub id: String,
-    pub expected_version: i64,
-    pub evidence: CreateAgentCommitmentEvidence,
-    pub actor_type: String,
-    pub actor_id: String,
-    pub reason: Option<String>,
-    pub dedupe_key: String,
-    pub completed_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransferAgentCommitment {
-    pub id: String,
-    pub expected_version: i64,
-    pub to_identity_id: String,
-    pub reason: String,
-    pub actor_type: String,
-    pub actor_id: String,
-    pub dedupe_key: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentCommitmentEvidence {
-    pub id: String,
-    pub commitment_id: String,
-    pub evidence_type: String,
-    pub evidence_id: String,
-    pub scope_type: String,
-    pub scope_id: String,
-    pub description: Option<String>,
-    pub metadata_json: String,
-    pub authorized_by_type: String,
-    pub authorized_by_id: String,
-    pub dedupe_key: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentInboxItem {
-    pub id: String,
-    pub recipient_identity_id: String,
-    pub scope_type: String,
-    pub scope_id: String,
-    pub kind: AgentInboxKind,
-    pub status: AgentInboxStatus,
-    pub title: String,
-    pub body: String,
-    pub payload_json: String,
-    pub source_type: Option<String>,
-    pub source_id: Option<String>,
-    pub correlation_id: String,
-    pub causation_id: Option<String>,
-    pub dedupe_key: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentInboxListQuery {
-    pub recipient_identity_id: String,
-    pub status: Option<AgentInboxStatus>,
-    pub scope_type: Option<String>,
-    pub scope_id: Option<String>,
-    pub limit: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdateAgentInboxItem {
-    pub id: String,
-    pub expected_version: i64,
-    pub status: AgentInboxStatus,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentQuestion {
-    pub id: String,
-    pub recipient_identity_id: String,
-    pub scope_type: String,
-    pub scope_id: String,
-    pub question: String,
-    pub context_json: String,
-    pub asked_by_type: String,
-    pub asked_by_id: String,
-    pub inbox_item_id: Option<String>,
-    pub due_at: Option<String>,
-    pub correlation_id: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentQuestionListQuery {
-    pub recipient_identity_id: String,
-    pub status: Option<AgentQuestionStatus>,
-    pub scope_type: Option<String>,
-    pub scope_id: Option<String>,
-    pub limit: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnswerAgentQuestion {
-    pub id: String,
-    pub expected_version: i64,
-    pub answer: String,
-    pub answered_by_type: String,
-    pub answered_by_id: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentAction {
-    pub id: String,
-    pub actor_identity_id: String,
-    pub scope_type: String,
-    pub scope_id: String,
-    pub operation: String,
-    pub payload_json: String,
-    pub payload_hash: String,
-    pub dedupe_key: String,
-    pub correlation_id: String,
-    pub causation_id: Option<String>,
-    pub causation_depth: i64,
-    pub requested_permission: String,
-    pub policy_result: AgentActionPolicyResult,
-    pub policy_reason: Option<String>,
-    pub status: AgentActionStatus,
-    pub target_type: Option<String>,
-    pub target_id: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentActionListQuery {
-    pub actor_identity_id: Option<String>,
-    pub scope_type: Option<String>,
-    pub scope_id: Option<String>,
-    pub status: Option<AgentActionStatus>,
-    pub limit: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdateAgentAction {
-    pub id: String,
-    pub expected_version: i64,
-    pub policy_result: Option<AgentActionPolicyResult>,
-    pub policy_reason: Option<Option<String>>,
-    pub status: Option<AgentActionStatus>,
-    pub outcome_json: Option<Option<String>>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentActionApproval {
-    pub id: String,
-    pub action_id: String,
-    pub expected_action_version: i64,
-    pub approver_identity_id: String,
-    pub decision: AgentActionApprovalDecision,
-    pub reason: Option<String>,
-    pub resulting_status: AgentActionStatus,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateAgentActionExecution {
-    pub id: String,
-    pub action_id: String,
-    pub expected_action_version: i64,
-    pub attempt: i64,
-    pub status: AgentActionExecutionStatus,
-    pub result_json: Option<String>,
-    pub error: Option<String>,
-    pub executed_by_type: String,
-    pub executed_by_id: String,
-    pub idempotency_key: String,
-    pub action_status: AgentActionStatus,
-    pub action_outcome_json: Option<String>,
-    pub created_at: String,
-    pub completed_at: Option<String>,
-    pub updated_at: String,
 }
 
 #[async_trait]

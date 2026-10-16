@@ -280,6 +280,82 @@ impl OrchestratorWakeRepo for SqliteDb {
         Ok(result.rows_affected() == 1)
     }
 
+    async fn resolve_orchestrator_start(&self, input: ResolveOrchestratorStart) -> Result<bool> {
+        if !matches!(input.state.as_str(), "running" | "failed")
+            || input.wake_id.trim().is_empty()
+            || input.execution_id.trim().is_empty()
+            || input.lease_owner.trim().is_empty()
+        {
+            return Err(DbError::Check(
+                "orchestrator Start resolution requires one exact lease and terminal disposition"
+                    .to_owned(),
+            ));
+        }
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if input.state == "running" {
+            let execution_is_running: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM execution
+                    WHERE id = ? AND role = 'orchestrator'
+                      AND purpose = 'orchestrate' AND status = 'running'
+                )",
+            )
+            .bind(&input.execution_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !execution_is_running {
+                transaction.commit().await?;
+                return Ok(false);
+            }
+        }
+        let changed_attempt = sqlx::query(
+            "UPDATE orchestrator_wake_execution
+             SET state = ?, last_error = ?, updated_at = ?
+             WHERE wake_id = ? AND attempt_number = ? AND execution_id = ?
+               AND state = 'start_requested'
+               AND EXISTS (
+                   SELECT 1 FROM orchestrator_wake AS wake
+                   WHERE wake.id = orchestrator_wake_execution.wake_id
+                     AND wake.state = 'leased'
+                     AND wake.lease_owner = ?
+                     AND wake.current_attempt = orchestrator_wake_execution.attempt_number
+               )",
+        )
+        .bind(&input.state)
+        .bind(&input.last_error)
+        .bind(&input.updated_at)
+        .bind(&input.wake_id)
+        .bind(input.attempt_number)
+        .bind(&input.execution_id)
+        .bind(&input.lease_owner)
+        .execute(&mut *transaction)
+        .await?;
+        if changed_attempt.rows_affected() != 1 {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let changed_wake = sqlx::query(
+            "UPDATE orchestrator_wake
+             SET state = ?, lease_owner = NULL, lease_until = NULL,
+                 last_error = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND state = 'leased' AND lease_owner = ? AND current_attempt = ?",
+        )
+        .bind(&input.state)
+        .bind(&input.last_error)
+        .bind(&input.updated_at)
+        .bind(&input.wake_id)
+        .bind(&input.lease_owner)
+        .bind(input.attempt_number)
+        .execute(&mut *transaction)
+        .await?;
+        if changed_wake.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        transaction.commit().await?;
+        Ok(true)
+    }
+
     async fn reserve_orchestrator_action(
         &self,
         input: ReserveOrchestratorAction,

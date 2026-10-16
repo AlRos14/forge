@@ -1,10 +1,7 @@
 use std::collections::HashSet;
 
 use api_types::ActorRef;
-use db::{
-    canonical_task_role_name, new_uuid_v4, now_rfc3339, AgentRepo, ProjectMemberRepo, SqliteDb,
-    UserRepo,
-};
+use db::{AgentRepo, ProjectMemberRepo, SqliteDb, UserRepo};
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use sqlx::{Row, Sqlite, Transaction};
 
@@ -181,7 +178,7 @@ pub(crate) async fn reconcile_project_actor_memberships_in_tx(
             ActorRef::Agent(id) => ("agent", id.as_str()),
         };
         let affected_roles = sqlx::query(
-            "SELECT DISTINCT tr.task_id, tr.id AS task_role_id, tr.role
+            "SELECT DISTINCT tr.task_id, tr.id AS task_role_id
              FROM task AS t
              JOIN task_role AS tr ON tr.task_id = t.id
              JOIN role_membership AS rm ON rm.task_role_id = tr.id
@@ -200,7 +197,6 @@ pub(crate) async fn reconcile_project_actor_memberships_in_tx(
         for role in affected_roles {
             let task_id: String = role.try_get("task_id")?;
             let task_role_id: String = role.try_get("task_role_id")?;
-            let canonical_role: String = role.try_get("role")?;
             if affected_task_ids.insert(task_id.clone()) {
                 effects.push(ScopeRevocationEffect {
                     project_id: project_id.to_owned(),
@@ -220,138 +216,7 @@ pub(crate) async fn reconcile_project_actor_memberships_in_tx(
             .bind(actor_id)
             .execute(&mut **transaction)
             .await?;
-            sync_legacy_role_projection_in_tx(
-                transaction,
-                &task_id,
-                &task_role_id,
-                &canonical_role,
-                None,
-                None,
-            )
-            .await?;
         }
     }
     Ok(effects)
-}
-
-/// The single compatibility projection algorithm used by membership writes
-/// and scope revocation. It never selects a representative for authority.
-pub(crate) async fn sync_legacy_role_projection_in_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
-    task_id: &str,
-    task_role_id: &str,
-    canonical_role: &str,
-    fallback_role: Option<&str>,
-    preferred_projection_role: Option<&str>,
-) -> Result<()> {
-    let member = sqlx::query(
-        "SELECT actor_kind, actor_id, created_at
-         FROM role_membership
-         WHERE task_role_id = ? AND status = 'active'
-         ORDER BY CASE actor_kind WHEN 'agent' THEN 0 ELSE 1 END,
-                  created_at, id
-         LIMIT 1",
-    )
-    .bind(task_role_id)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    let mut projection_roles = sqlx::query(
-        "SELECT role_name
-         FROM task_role_assignment
-         WHERE task_id = ?
-         ORDER BY role_name",
-    )
-    .bind(task_id)
-    .fetch_all(&mut **transaction)
-    .await?
-    .into_iter()
-    .filter_map(|row| {
-        let role_name: String = row.try_get("role_name").ok()?;
-        (canonical_task_role_name(&role_name).as_deref() == Some(canonical_role))
-            .then_some(role_name)
-    })
-    .collect::<Vec<_>>();
-    if projection_roles.is_empty() {
-        if let Some(preferred) = preferred_projection_role {
-            if canonical_task_role_name(preferred).as_deref() == Some(canonical_role) {
-                projection_roles.push(preferred.to_owned());
-            }
-        }
-    }
-    if projection_roles.is_empty() {
-        if let Some(role) = fallback_role {
-            projection_roles.push(role.to_owned());
-        }
-    }
-    if projection_roles.is_empty() && canonical_role != "implementer" {
-        return Ok(());
-    }
-
-    let now = now_rfc3339();
-    let Some(member) = member else {
-        if canonical_role == "implementer" {
-            sqlx::query(
-                "UPDATE task
-                 SET assignee_type = NULL, assignee_id = NULL, updated_at = ?
-                 WHERE id = ?",
-            )
-            .bind(now)
-            .bind(task_id)
-            .execute(&mut **transaction)
-            .await?;
-        }
-        for projection_role in projection_roles {
-            sqlx::query("DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?")
-                .bind(task_id)
-                .bind(projection_role)
-                .execute(&mut **transaction)
-                .await?;
-        }
-        return Ok(());
-    };
-    let actor_kind: String = member.try_get("actor_kind")?;
-    let actor_id: String = member.try_get("actor_id")?;
-    let member_created_at: String = member.try_get("created_at")?;
-    let assignee_type = if actor_kind == "agent" {
-        "agent"
-    } else {
-        "user"
-    };
-    if canonical_role == "implementer" {
-        sqlx::query(
-            "UPDATE task
-             SET assignee_type = ?, assignee_id = ?, updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(assignee_type)
-        .bind(&actor_id)
-        .bind(&now)
-        .bind(task_id)
-        .execute(&mut **transaction)
-        .await?;
-    }
-    if projection_roles.is_empty() {
-        return Ok(());
-    }
-    for projection_role in projection_roles {
-        sqlx::query(
-            "INSERT INTO task_role_assignment
-                (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(task_id, role_name) DO UPDATE SET
-                assignee_type = excluded.assignee_type,
-                assignee_id = excluded.assignee_id,
-                updated_at = excluded.updated_at",
-        )
-        .bind(new_uuid_v4())
-        .bind(task_id)
-        .bind(projection_role)
-        .bind(assignee_type)
-        .bind(&actor_id)
-        .bind(&member_created_at)
-        .bind(&now)
-        .execute(&mut **transaction)
-        .await?;
-    }
-    Ok(())
 }

@@ -132,7 +132,6 @@ dependencies = [
  "jsonwebtoken",
  "mcp-server",
  "rand 0.8.6",
- "review",
  "schemars",
  "serde",
  "serde_json",
@@ -980,7 +979,6 @@ dependencies = [
  "config",
  "db",
  "events",
- "review",
  "services",
  "tokio",
  "tracing",
@@ -1710,6 +1708,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "uuid",
+ "workspace",
 ]
 
 [[package]]
@@ -2215,24 +2214,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "review"
-version = "0.8.0"
-dependencies = [
- "api-types",
- "async-trait",
- "db",
- "events",
- "executors",
- "git",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2525,7 +2506,6 @@ dependencies = [
  "portable-pty",
  "rand 0.8.6",
  "reqwest",
- "review",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -473,7 +473,7 @@ async fn bootstrap_assigns_orphaned_resources_to_first_user() {
     let reg = register_daemon(&harness.app, "machine-bootstrap").await;
 
     let now = db::now_rfc3339();
-    sqlx::query("INSERT INTO project (id, name, settings, workflow_definition, created_at, updated_at) VALUES ('bp1', 'bootstrap-proj', '{}', '{}', ?, ?)")
+    sqlx::query("INSERT INTO project (id, name, settings, created_at, updated_at) VALUES ('bp1', 'bootstrap-proj', '{}', ?, ?)")
         .bind(&now).bind(&now)
         .execute(harness.state.db.pool())
         .await

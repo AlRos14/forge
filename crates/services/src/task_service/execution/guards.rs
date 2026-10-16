@@ -84,130 +84,15 @@ impl TaskService {
                         && membership.actor_kind == db::ActorKind::Agent
                         && membership.actor_id == agent.id
                 }),
-                None => {
-                    let role_assignment = match execution.role.as_str() {
-                        "executor" | crate::workflow::default_roles::CODER => {
-                            self.coder_assignment(&task.id).await?
-                        }
-                        role => {
-                            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role)
-                                .await?
-                        }
-                    };
-                    matches!(
-                        role_assignment.as_ref(),
-                        Some(assignment)
-                            if assignment.assignee_type == Some(AssigneeKind::Agent)
-                                && assignment.assignee_id.as_deref() == Some(&agent.id)
-                    )
-                }
+                // Non-TaskRole execution labels have no assignment authority.
+                // The exact Execution identity is the only remaining target
+                // for this capacity exception.
+                None => execution.agent_id.as_deref() == Some(agent.id.as_str()),
             };
         if !role_authorized {
             return Ok(false);
         }
         Ok(running_count <= agent.max_concurrent_tasks)
-    }
-
-    pub(super) async fn ensure_no_running_interactive_execution(
-        &self,
-        task_id: &str,
-    ) -> Result<()> {
-        let page = ExecutionRepo::list_by_task(
-            &*self.db,
-            task_id,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-        if let Some(running) = page.items.into_iter().find(|execution| {
-            execution.work_unit_id.is_none()
-                && execution.role == "interactive"
-                && execution.status == ExecutionStatus::Running
-        }) {
-            return Err(ServiceError::invalid_operation(format!(
-                "interactive execution already running: {}",
-                running.id
-            )));
-        }
-        Ok(())
-    }
-
-    /// Repository Tasks have one active WorkspaceLease per Task, so any
-    /// running repository execution excludes every other role—not only a
-    /// second interactive session. This preflight prevents a losing launch
-    /// from creating a failed execution and annotating the Task while the
-    /// scheduler's legitimate execution is still running.
-    pub(super) async fn ensure_no_running_repository_execution(&self, task: &Task) -> Result<()> {
-        if !db::WorkUnitRepo::list_by_task(&*self.db, &task.id)
-            .await?
-            .is_empty()
-        {
-            return Err(ServiceError::invalid_operation(
-                "Task has WorkUnits; new Executions must bind an explicit WorkUnit scope",
-            ));
-        }
-        if task.repo_id.is_none() {
-            return Ok(());
-        }
-        let page = ExecutionRepo::list_by_task(
-            &*self.db,
-            &task.id,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-        if let Some(running) = page
-            .items
-            .into_iter()
-            .find(|execution| execution.status == ExecutionStatus::Running)
-        {
-            return Err(ServiceError::invalid_operation(format!(
-                "repository execution already running: {}",
-                running.id
-            )));
-        }
-        Ok(())
-    }
-
-    pub(super) async fn check_dependency_gate(&self, task: &Task, agent_id: &str) -> Result<()> {
-        let unsatisfied_dependencies =
-            TaskDependencyRepo::unsatisfied_dependencies(&*self.db, &task.id).await?;
-        if unsatisfied_dependencies.is_empty() {
-            return Ok(());
-        }
-
-        for depends_on_id in &unsatisfied_dependencies {
-            let page = ExecutionRepo::list_by_task(
-                &*self.db,
-                depends_on_id,
-                PageRequest {
-                    cursor: None,
-                    limit: 20,
-                    include_total: false,
-                    sort_by: SortBy::CreatedAt,
-                    sort_order: SortOrder::Desc,
-                },
-            )
-            .await?;
-            let context_holder_match = page.items.into_iter().any(|execution| {
-                execution.role == "executor" && execution.agent_id.as_deref() == Some(agent_id)
-            });
-            if context_holder_match {
-                return Ok(());
-            }
-        }
-
-        Err(ServiceError::DependencyGate)
     }
 
     pub async fn fail_execution_before_dispatch(
@@ -224,32 +109,46 @@ impl TaskService {
             &ExecutionStatus::Failed,
             &failed_at,
         );
-        let (execution, committed_event) = ExecutionRepo::update_with_event(
+        let update = db::UpdateExecution {
+            id: execution_id.to_owned(),
+            status: Some(ExecutionStatus::Failed),
+            stop_reason: Some(Some(db::StopReason::ExecutorFailed)),
+            stopped_by: Some(Some(
+                api_types::Actor::system(api_types::SystemComponent::Dispatch).display(),
+            )),
+            resume_policy: Some(Some(db::ResumePolicy::Manual)),
+            stopped_at: Some(Some(failed_at.clone())),
+            external_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: Some(Some(error)),
+            executor_config_snapshot_json: None,
+            updated_at: failed_at,
+        };
+        let (execution, committed_event) = match ExecutionRepo::fail_pending_provider_start(
             &*self.db,
-            db::UpdateExecution {
-                id: execution_id.to_owned(),
-                status: Some(ExecutionStatus::Failed),
-                stop_reason: Some(Some(db::StopReason::ExecutorFailed)),
-                stopped_by: Some(Some(
-                    api_types::Actor::system(api_types::SystemComponent::Dispatch).display(),
-                )),
-                resume_policy: Some(Some(db::ResumePolicy::Manual)),
-                stopped_at: Some(Some(now_rfc3339())),
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: Some(Some(error)),
-                executor_config_snapshot_json: None,
-                updated_at: failed_at,
-            },
-            event,
+            execution_id,
+            update.clone(),
+            event.clone(),
         )
-        .await
-        .map_err(ServiceError::from)?;
+        .await?
+        {
+            db::PendingProviderStartFailure::Resolved(execution, event) => (execution, event),
+            db::PendingProviderStartFailure::Attempted(execution)
+            | db::PendingProviderStartFailure::NotRunning(execution) => return Ok(execution),
+            db::PendingProviderStartFailure::NotPending(execution) => {
+                if execution.status != ExecutionStatus::Running {
+                    return Ok(execution);
+                }
+                ExecutionRepo::update_with_event(&*self.db, update, event)
+                    .await
+                    .map_err(ServiceError::from)?
+            }
+        };
         self.publish_committed_domain_event(&committed_event);
         self.revoke_active_workspace_lease_for_execution(&execution.task_id, &execution.id)
             .await;

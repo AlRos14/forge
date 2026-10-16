@@ -46,7 +46,7 @@ pub use roles::{
     add_task_role_member, create_task_role_model, list_task_role_model, update_task_role_member,
     update_task_role_model,
 };
-pub use workspace::{get_task_diff, get_task_workspace, reset_task_workspace};
+pub use workspace::{get_task_diff, get_task_workspace};
 
 pub(super) async fn require_task_visible(
     state: &AppState,

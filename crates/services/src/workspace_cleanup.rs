@@ -162,15 +162,19 @@ impl WorkspaceCleanupScheduler {
             .await?
             .ok_or_else(|| crate::ServiceError::not_found("workspace", workspace_id.to_owned()))?;
         let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, workspace_id).await?;
-        let lock_key = match scope.as_ref().map(|scope| scope.kind) {
-            Some(WorkspaceScopeKind::Integration) => {
+        let scope = scope.ok_or_else(|| {
+            ServiceError::invalid_operation(format!(
+                "Workspace {workspace_id} has no exact durable scope; cleanup is refused"
+            ))
+        })?;
+        let lock_key = match scope.kind {
+            WorkspaceScopeKind::Integration => {
                 Some(format!("task-integration:{}", workspace.task_id))
             }
-            Some(WorkspaceScopeKind::WorkUnit) => scope
+            WorkspaceScopeKind::WorkUnit => scope
+                .work_unit_id
                 .as_ref()
-                .and_then(|scope| scope.work_unit_id.as_ref())
                 .map(|id| format!("work-unit-workspace:{id}")),
-            None => None,
         };
         let locks = self
             .workspace_exec_locks
@@ -188,10 +192,7 @@ impl WorkspaceCleanupScheduler {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
             .ok_or_else(|| crate::ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-        if let Some(scope) = scope
-            .as_ref()
-            .filter(|scope| scope.kind == WorkspaceScopeKind::WorkUnit)
-        {
+        if scope.kind == WorkspaceScopeKind::WorkUnit {
             let _workspace_guard = match locks.as_ref() {
                 Some(locks) => Some(locks.acquire(workspace_id).await),
                 None => None,
@@ -203,9 +204,7 @@ impl WorkspaceCleanupScheduler {
                 .cleanup_work_unit_workspace(workspace_id, &workspace.task_id, work_unit_id)
                 .await;
         }
-        if scope
-            .as_ref()
-            .is_some_and(|scope| scope.kind == WorkspaceScopeKind::Integration)
+        if scope.kind == WorkspaceScopeKind::Integration
             && !WorkUnitRepo::list_by_task(&*self.db, &workspace.task_id)
                 .await?
                 .is_empty()
@@ -231,9 +230,7 @@ impl WorkspaceCleanupScheduler {
                 ))
             })?
             .clone();
-        let integration_scope = scope
-            .as_ref()
-            .is_some_and(|scope| scope.kind == WorkspaceScopeKind::Integration);
+        let integration_scope = scope.kind == WorkspaceScopeKind::Integration;
         if integration_scope {
             if let Some(terminal_cleanup) = terminal_cleanup.as_ref() {
                 terminal_cleanup
@@ -563,7 +560,6 @@ mod tests {
                 id: project_id.clone(),
                 name: "Forge".to_owned(),
                 settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
                 primary_repo_id: None,
                 owner_id: None,
                 created_at: now.clone(),
@@ -609,15 +605,12 @@ mod tests {
                 repo_id: Some(repo_id.clone()),
                 parent_task_id: None,
                 subtask_order: None,
-                assignee_type: None,
-                assignee_id: None,
                 title: "Cleanup task".to_owned(),
                 description: None,
                 task_type: "implementation".to_owned(),
-                status: "done".to_owned(),
+                lifecycle_state: db::TaskLifecycleState::Done,
                 is_automation: false,
                 priority: 0,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -719,12 +712,13 @@ mod tests {
             .expect("cleanup succeeds");
 
         assert!(!plan_path.exists());
-        let legacy_revision_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM task_plan_revision")
-                .fetch_one(db.pool())
-                .await
-                .expect("legacy plan table remains queryable");
-        assert_eq!(legacy_revision_count, 0);
+        let legacy_plan_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_plan_revision'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("legacy plan table presence query");
+        assert_eq!(legacy_plan_table, 0);
     }
 
     #[tokio::test]

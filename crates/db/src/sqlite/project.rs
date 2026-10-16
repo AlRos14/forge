@@ -5,11 +5,10 @@ use crate::{new_uuid_v4, now_rfc3339};
 impl ProjectRepo for SqliteDb {
     async fn create(&self, input: CreateProject) -> Result<Project> {
         let mut transaction = self.pool.begin().await?;
-        sqlx::query("INSERT INTO project (id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, owner_id, project_hooks_json, project_work_epoch, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, ?, ?, '[]', 0, ?, ?)")
+        sqlx::query("INSERT INTO project (id, name, settings, primary_repo_id, owner_id, project_hooks_json, project_work_epoch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '[]', 0, ?, ?)")
             .bind(&input.id)
             .bind(&input.name)
             .bind(&input.settings)
-            .bind(&input.workflow_definition)
             .bind(&input.primary_repo_id)
             .bind(&input.owner_id)
             .bind(&input.created_at)
@@ -270,6 +269,16 @@ impl ProjectRepo for SqliteDb {
             return Err(DbError::NotFound);
         }
 
+        let has_immutable_releases = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM project_release WHERE project_id = ?)",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_immutable_releases != 0 {
+            return Err(DbError::ProjectHasReleases);
+        }
+
         let active_integration_operation = sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS(
                  SELECT 1 FROM task_integration_operation op
@@ -301,46 +310,9 @@ impl ProjectRepo for SqliteDb {
             .execute(&mut *tx)
             .await?;
 
-        // A Project Chat deletion cascades through immutable legacy handoff
-        // records. Delete those rows explicitly while the Project-scoped
-        // guard and their chat provenance are still present; the guarded
-        // triggers permit only this bounded teardown path.
         for statement in [
-            "DELETE FROM agent_handoff_delivery
-             WHERE handoff_id IN (
-                 SELECT h.id FROM agent_handoff h
-                 WHERE EXISTS (
-                     SELECT 1 FROM agent_chat c
-                     WHERE c.project_id = ?
-                       AND (c.id = h.source_chat_id OR c.id = h.target_chat_id)
-                 )
-             )",
-            "DELETE FROM agent_handoff
-             WHERE EXISTS (
-                 SELECT 1 FROM agent_chat c
-                 WHERE c.project_id = ?
-                   AND (c.id = agent_handoff.source_chat_id
-                        OR c.id = agent_handoff.target_chat_id)
-             )",
-        ] {
-            sqlx::query(statement).bind(id).execute(&mut *tx).await?;
-        }
-
-        // Project Chat transcripts and instruction revisions carry immutable
-        // delete guards for direct callers. Remove them under the same exact
-        // Project teardown guard before the Project FK cascade removes chats.
-        for statement in [
-            "DELETE FROM agent_chat_turn_job
-             WHERE chat_id IN (SELECT id FROM agent_chat WHERE project_id = ?)",
-            "DELETE FROM agent_chat_instruction_revision
-             WHERE chat_id IN (SELECT id FROM agent_chat WHERE project_id = ?)",
-            "DELETE FROM agent_chat_message
-             WHERE chat_id IN (SELECT id FROM agent_chat WHERE project_id = ?)",
-        ] {
-            sqlx::query(statement).bind(id).execute(&mut *tx).await?;
-        }
-
-        for statement in [
+            "DELETE FROM execution_follow_up_receipt WHERE parent_execution_id IN
+                 (SELECT e.id FROM execution e JOIN task t ON t.id = e.task_id WHERE t.project_id = ?)",
             "DELETE FROM orchestrator_action WHERE execution_id IN
                  (SELECT e.id FROM execution e JOIN task t ON t.id = e.task_id WHERE t.project_id = ?)",
             "DELETE FROM orchestrator_wake_execution WHERE wake_id IN
@@ -407,9 +379,6 @@ impl ProjectRepo for SqliteDb {
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM proposal_artifact WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
-            "DELETE FROM legacy_task_plan_artifact_migration WHERE plan_revision_id IN
-                 (SELECT r.id FROM task_plan_revision r JOIN task t ON t.id = r.task_id
-                  WHERE t.project_id = ?)",
             "DELETE FROM decision_actor WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM artifact_execution_producer WHERE task_id IN
@@ -426,38 +395,6 @@ impl ProjectRepo for SqliteDb {
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM media_asset_tombstone WHERE asset_id IN
                  (SELECT id FROM media_asset WHERE project_id = ?)",
-            "DELETE FROM project_release_media_pin WHERE project_id = ?",
-            "DELETE FROM project_release_reference WHERE release_id IN
-                 (SELECT id FROM project_release WHERE project_id = ?)",
-            "DELETE FROM project_release WHERE project_id = ?",
-            "DELETE FROM project_readiness_input WHERE readiness_snapshot_id IN
-                 (SELECT id FROM project_readiness_snapshot WHERE project_id = ?)",
-            "DELETE FROM project_readiness_snapshot WHERE project_id = ?",
-            "DELETE FROM project_milestone_check_result WHERE project_id = ?",
-            "DELETE FROM project_milestone_revision WHERE milestone_id IN
-                 (SELECT id FROM project_milestone WHERE project_id = ?)",
-            "DELETE FROM project_execution_baseline_approval WHERE baseline_id IN
-                 (SELECT id FROM project_execution_baseline WHERE project_id = ?)",
-            "DELETE FROM project_execution_baseline_revision WHERE baseline_id IN
-                 (SELECT id FROM project_execution_baseline WHERE project_id = ?)",
-            "DELETE FROM project_document_approval WHERE document_id IN
-                 (SELECT id FROM project_document WHERE project_id = ?)",
-            "DELETE FROM project_document_revision WHERE document_id IN
-                 (SELECT id FROM project_document WHERE project_id = ?)",
-            "DELETE FROM project_decision WHERE project_id = ?",
-            "DELETE FROM project_reconciliation_resolution WHERE reconciliation_id IN
-                 (SELECT id FROM project_reconciliation_record WHERE project_id = ?)",
-            "DELETE FROM project_reconciliation_record WHERE project_id = ?",
-            "DELETE FROM project_canonical_conflict WHERE project_id = ?",
-            "DELETE FROM project_charter_approval_event WHERE approval_id IN
-                 (SELECT a.id FROM project_charter_approval a
-                  JOIN project_charter c ON c.id = a.charter_id
-                  WHERE c.project_id = ?)",
-            "DELETE FROM project_charter_approval WHERE charter_id IN
-                 (SELECT id FROM project_charter WHERE project_id = ?)",
-            "DELETE FROM project_charter_revision WHERE charter_id IN
-                 (SELECT id FROM project_charter WHERE project_id = ?)",
-            "DELETE FROM project_charter WHERE project_id = ?",
         ] {
             sqlx::query(statement).bind(id).execute(&mut *tx).await?;
         }

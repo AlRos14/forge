@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn status_affecting_event_matches_expected_types() {
-        assert!(is_status_affecting_event("task.status_changed"));
+        assert!(is_status_affecting_event("task.lifecycle_changed"));
         assert!(is_status_affecting_event("task.moved"));
         assert!(is_status_affecting_event("execution.started"));
         assert!(is_status_affecting_event("daemon.registered"));
@@ -118,13 +118,11 @@ mod tests {
 
         for index in 0..10 {
             event_bus.publish(ForgeEvent {
-                event_type: "task.status_changed".to_string(),
+                event_type: "task.lifecycle_changed".to_string(),
                 entity_id: format!("task-{index}"),
                 timestamp: event_timestamp(),
-                context: EventContext::TaskStatusChanged {
+                context: EventContext::TaskUpdated {
                     project_id: "project-1".to_string(),
-                    old_status: "todo".to_string(),
-                    new_status: "in_progress".to_string(),
                 },
             });
         }

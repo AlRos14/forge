@@ -83,6 +83,7 @@ pub fn api_router(state: AppState) -> Router {
             Arc::clone(&state.event_bus),
             Arc::clone(&state.task_service),
             Arc::clone(&state.agent_service),
+            Arc::clone(&state.work_unit_service),
         )
     });
 
@@ -295,10 +296,6 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/tasks/{id}/workspace",
             get(routes::tasks::get_task_workspace),
-        )
-        .route(
-            "/api/v1/tasks/{id}/workspace/reset",
-            post(routes::tasks::reset_task_workspace),
         )
         .route("/api/v1/tasks/{id}/diff", get(routes::tasks::get_task_diff))
         .route(
@@ -542,6 +539,10 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/tasks/{id}/executions",
             get(routes::executions::list_executions).post(routes::executions::start_task_execution),
+        )
+        .route(
+            "/api/v1/tasks/{task_id}/executions/{execution_id}/recovery",
+            post(routes::executions::recover_work_unit_execution),
         )
         .route(
             "/api/v1/executions/{id}",

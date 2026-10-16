@@ -136,12 +136,6 @@ async fn main() {
         Arc::clone(&db),
         media_storage_root(&effective_config.forge.data_dir),
     ));
-    let review_runner = Arc::new(review::ReviewRunner::new(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-        Arc::clone(&adapter_registry),
-    ));
-
     match services::ensure_default_agents(&db, &adapter_registry).await {
         Ok(agents) => info!(agent_count = agents.len(), "default agents ready"),
         Err(error) => warn!(%error, "default agent upsert failed"),
@@ -200,7 +194,6 @@ async fn main() {
         adapter_registry,
         merge_service,
         Arc::clone(&cleanup_scheduler),
-        review_runner,
         api::state::ShutdownSignal::new(),
         config.workflows_dir(),
         jwt_secret,

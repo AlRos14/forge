@@ -90,6 +90,41 @@ async fn project_and_task_creation_are_ordinary_v2_operations() {
 }
 
 #[tokio::test]
+async fn task_scoped_workspace_reset_route_is_retired() {
+    let workspace = common::TestDir::new("pr13-task-workspace-reset-retired");
+    let harness = common::test_app(workspace.path(), "pr13-task-workspace-reset-retired").await;
+    let token = common::test_jwt();
+    let project: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &token,
+        json!({"name": "Workspace identity"}),
+        StatusCode::OK,
+    )
+    .await;
+    let task: TaskResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        &token,
+        json!({"title": "Exact Workspace"}),
+        StatusCode::OK,
+    )
+    .await;
+
+    let status = request_status(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/workspace/reset", task.id),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn project_repo_and_integration_routes_enforce_user_visibility() {
     let workspace = common::TestDir::new("pr12-project-route-visibility");
     let harness = common::test_app(workspace.path(), "pr12-project-route-visibility").await;
@@ -418,7 +453,6 @@ async fn task_and_execution_routes_enforce_project_visibility() {
             resume_policy: None,
             stopped_at: None,
             parent_execution_id: None,
-            agent_session_id: None,
             harness_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
@@ -470,11 +504,6 @@ async fn task_and_execution_routes_enforce_project_visibility() {
             None,
         ),
         (
-            Method::POST,
-            format!("/api/v1/tasks/{}/workspace/reset", task_a.id),
-            None,
-        ),
-        (
             Method::GET,
             format!("/api/v1/tasks/{}/diff", task_a.id),
             None,
@@ -512,7 +541,9 @@ async fn task_and_execution_routes_enforce_project_visibility() {
         (
             Method::POST,
             format!("/api/v1/executions/{execution_id}/follow-up"),
-            Some(json!({"agent_id": "agent-any", "message": "continue"})),
+            Some(
+                json!({"idempotency_key": "pr12-surface-follow-up", "agent_id": "agent-any", "message": "continue"}),
+            ),
         ),
         (
             Method::POST,
@@ -1657,7 +1688,6 @@ async fn project_visibility_is_separate_from_project_and_task_write_authority() 
             id: db::new_uuid_v4(),
             name: "Public system Project".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),
@@ -1989,7 +2019,6 @@ async fn project_deleted_hint_targets_only_pre_delete_recipients() {
             id: db::new_uuid_v4(),
             name: "Deleted Project".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: Some("test-user-id".to_owned()),
             created_at: now.clone(),

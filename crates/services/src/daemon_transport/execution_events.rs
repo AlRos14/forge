@@ -5,9 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use db::{
-    AgentRepo, Execution, ExecutionRepo, ExecutionStatus, TaskRepo, UpdateExecution, WorkspaceRepo,
-};
+use db::{AgentRepo, Execution, ExecutionRepo, TaskRepo, UpdateExecution, WorkspaceRepo};
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{LogKind, LogStream, LogWriter};
 use serde_json::json;
@@ -83,7 +81,7 @@ impl ServerExecutionEventSink {
                         stopped_by: None,
                         resume_policy: None,
                         stopped_at: None,
-                        agent_session_id: None,
+                        external_session_id: None,
                         agent_message_id: None,
                         last_activity_at: Some(Some(notification.ts.clone())),
                         summary: None,
@@ -291,14 +289,9 @@ impl DaemonExecutionEventHandler for ServerExecutionEventSink {
                 "task service is unavailable for daemon terminal notification",
             ));
         };
-        let execution = task_service
+        task_service
             .complete_remote_execution(notification.clone(), Some(daemon_id))
             .await?;
-        if execution.status != ExecutionStatus::Running {
-            task_service
-                .maybe_cascade_executor_completion(&notification.execution_id)
-                .await?;
-        }
         Ok(())
     }
 }

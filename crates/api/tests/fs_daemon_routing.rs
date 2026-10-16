@@ -705,7 +705,7 @@ async fn remote_terminal_preserves_existing_metadata_when_fields_are_absent() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            agent_session_id: Some(Some("remote-session-1".to_owned())),
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some(Some("partial remote summary".to_owned())),
@@ -745,10 +745,6 @@ async fn remote_terminal_preserves_existing_metadata_when_fields_are_absent() {
     .await;
 
     let updated = wait_for_execution_status(&state, &execution.id, ExecutionStatus::Failed).await;
-    assert_eq!(
-        updated.agent_session_id.as_deref(),
-        Some("remote-session-1")
-    );
     assert_eq!(updated.summary.as_deref(), Some("partial remote summary"));
     assert_eq!(updated.after_sha.as_deref(), Some("partial-after-sha"));
     assert_eq!(

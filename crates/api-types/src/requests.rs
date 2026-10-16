@@ -65,12 +65,13 @@ pub struct ClaimTaskRequest {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct StartExecutionRequest {
-    pub agent_id: String,
-    pub role: String,
+    pub work_unit_id: String,
+    pub expected_work_unit_version: i64,
     pub purpose: ExecutionPurpose,
     pub prompt: String,
     #[serde(default)]
     pub input_artifact_ids: Vec<String>,
+    pub overrides: Option<ExecutionOverridesRequest>,
 }
 
 pub type ExecutionOverridesRequest = ClaimOverrides;
@@ -79,10 +80,27 @@ pub type ExecutionOverridesRequest = ClaimOverrides;
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 #[ts(export)]
 pub struct FollowUpRequest {
+    pub idempotency_key: String,
     pub message: String,
     pub agent_id: String,
     #[ts(optional = nullable)]
     pub overrides: Option<ExecutionOverridesRequest>,
+}
+
+/// Explicitly select one exact crash-recovery Execution and WorkUnit.
+/// Expected versions bind the human decision to the state they reviewed.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct RecoverWorkUnitExecutionRequest {
+    pub work_unit_id: String,
+    pub expected_task_version: i64,
+    pub expected_lifecycle_version: i64,
+    pub expected_work_unit_version: i64,
+    pub idempotency_key: String,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub context: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,4 +274,27 @@ pub struct UpdatePrProviderConfigRequest {
     #[ts(type = "string | null")]
     #[ts(optional)]
     pub token: Option<Option<String>>,
+}
+
+#[cfg(test)]
+mod follow_up_request_tests {
+    use super::FollowUpRequest;
+
+    #[test]
+    fn follow_up_requires_a_stable_idempotency_key() {
+        let missing_key = serde_json::json!({
+            "message": "continue",
+            "agent_id": "agent-1"
+        });
+        assert!(serde_json::from_value::<FollowUpRequest>(missing_key).is_err());
+
+        let with_key = serde_json::json!({
+            "idempotency_key": "follow-up-request-1",
+            "message": "continue",
+            "agent_id": "agent-1"
+        });
+        let request = serde_json::from_value::<FollowUpRequest>(with_key)
+            .expect("follow-up request with its operation key deserializes");
+        assert_eq!(request.idempotency_key, "follow-up-request-1");
+    }
 }

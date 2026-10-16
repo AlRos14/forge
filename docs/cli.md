@@ -60,8 +60,9 @@ forge-ctl task get <TASK_ID>
 forge-ctl task role create <TASK_ID> --role implementer --coordination-mode independent
 forge-ctl task role add-member <TASK_ID> implementer --actor-kind agent --actor-id <AGENT_ID>
 forge-ctl task role list <TASK_ID>
-forge-ctl task execute <TASK_ID> --agent-id <AGENT_ID> \
-  --role implementer --purpose implement --prompt "Fix the login error"
+forge-ctl task execute <TASK_ID> --work-unit-id <WORK_UNIT_ID> \
+  --expected-work-unit-version 2 --purpose implement \
+  --prompt "Fix the login error"
 forge-ctl task transition <TASK_ID> blocked \
   --expected-lifecycle-version 3 --idempotency-key <KEY> \
   --reason-kind dependency --reason-ref issue:123
@@ -78,10 +79,10 @@ forge-ctl task transition <TASK_ID> ready-to-merge \
 ```
 
 Gate evaluation and merge admission are also available through the REST API.
-`task execute` requires the exact Agent, active TaskRole membership, purpose,
-and prompt. It never selects a current role member implicitly. Tasks with
-WorkUnits fail closed until an explicit WorkUnit-scoped Execution command is
-available. The CLI will not translate old Task status or workflow values.
+`task execute` requires an explicitly allocated WorkUnit and its expected
+version. Role and Actor come from that WorkUnit; repository execution prepares
+and binds its exact isolated Workspace. Task-level Agent and role selection is
+retired. The CLI will not translate old Task status or workflow values.
 
 ## Agents and provider credentials
 

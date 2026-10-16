@@ -1,19 +1,12 @@
 use super::*;
 use crate::terminal_service::TerminalActivityTracker;
-use crate::workflow::default_roles;
-use crate::workspace_execution_lock::WorkspaceExecutionLockManager;
 use ::workspace::RepoCacheLockManager;
-use api_types::{
-    CanonicalPhase, FailurePolicy, HookAudience, HookSpec, StateDefinition, StateHooks, StateKind,
-    WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
-};
 use async_trait::async_trait;
 use db::{
-    create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgent, CreateProjectMember,
-    CreateTask, DaemonRepo, DaemonStatus, ReviewRepo, ReviewStatus, UpdateProject, UpsertDaemon,
+    create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgent, CreateTask,
+    DaemonRepo, DaemonStatus, TaskLifecycleState, UpdateProject, UpsertDaemon,
 };
 use executors::{ExecutionResult, ExecutorError};
-use sqlx::Row;
 use tempfile::TempDir;
 
 struct NoDiffExecutor;
@@ -31,26 +24,6 @@ impl TaskExecutor for NoDiffExecutor {
             summary: None,
             error: None,
             usage: None,
-            ..Default::default()
-        })
-    }
-
-    async fn cancel(&self, _execution_id: &str) -> std::result::Result<(), ExecutorError> {
-        Ok(())
-    }
-}
-
-struct PlanOutputExecutor;
-
-#[async_trait]
-impl TaskExecutor for PlanOutputExecutor {
-    async fn execute(
-        &self,
-        _ctx: ExecutionContext,
-    ) -> std::result::Result<ExecutionResult, ExecutorError> {
-        Ok(ExecutionResult {
-            status: ExecutionOutcome::Completed,
-            assistant_output: Some("- [x] verify plan\n".to_owned()),
             ..Default::default()
         })
     }
@@ -190,7 +163,6 @@ async fn seed_project_repo(db: &SqliteDb) -> (String, String, TempDir) {
             id: project_id.clone(),
             name: "Forge".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),
@@ -352,7 +324,7 @@ async fn seed_task_with_status(
     db: &SqliteDb,
     project_id: &str,
     repo_id: &str,
-    status: TaskStatus,
+    lifecycle_state: TaskLifecycleState,
 ) -> Task {
     let now = now_rfc3339();
     TaskRepo::create(
@@ -363,15 +335,12 @@ async fn seed_task_with_status(
             repo_id: Some(repo_id.to_owned()),
             parent_task_id: None,
             subtask_order: None,
-            assignee_type: None,
-            assignee_id: None,
-            title: format!("task-{status}"),
+            title: format!("task-{lifecycle_state:?}"),
             description: Some("seeded task".to_owned()),
             task_type: "implementation".to_owned(),
-            status,
+            lifecycle_state,
             is_automation: false,
             priority: 0,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now,
@@ -405,7 +374,7 @@ async fn seed_subtask_with_status(
     db: &SqliteDb,
     parent: &Task,
     title: &str,
-    status: TaskStatus,
+    lifecycle_state: TaskLifecycleState,
     subtask_order: i64,
 ) -> Task {
     let now = now_rfc3339();
@@ -417,15 +386,12 @@ async fn seed_subtask_with_status(
             repo_id: parent.repo_id.clone(),
             parent_task_id: Some(parent.id.clone()),
             subtask_order: Some(subtask_order),
-            assignee_type: None,
-            assignee_id: None,
             title: title.to_owned(),
             description: Some("seeded subtask".to_owned()),
             task_type: "implementation".to_owned(),
-            status,
+            lifecycle_state,
             is_automation: false,
             priority: 0,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now,
@@ -435,242 +401,13 @@ async fn seed_subtask_with_status(
     .expect("subtask creates")
 }
 
-async fn seed_ordered_sequence_started(db: &SqliteDb, task: &Task) {
-    let mut metadata = task.metadata().expect("task metadata parses");
-    metadata.ordered_sequence_started = Some(true);
-    TaskRepo::set_metadata_json(db, &task.id, metadata.to_json(), &now_rfc3339())
-        .await
-        .expect("task metadata updates");
-}
-
-fn role_assignment_input(
-    task_id: &str,
-    role_name: &str,
-    agent_id: Option<String>,
-    user_id: Option<String>,
-) -> db::CreateTaskRoleAssignment {
-    let now = now_rfc3339();
-    let (assignee_type, assignee_id) = if let Some(agent_id) = agent_id {
-        (db::AssigneeKind::Agent, agent_id)
-    } else {
-        (
-            db::AssigneeKind::User,
-            user_id.expect("user assignment includes id"),
-        )
-    };
-    db::CreateTaskRoleAssignment {
-        id: new_uuid_v4(),
-        task_id: task_id.to_owned(),
-        role_name: role_name.to_owned(),
-        assignee_type: Some(assignee_type),
-        assignee_id: Some(assignee_id),
-        created_at: now.clone(),
-        updated_at: now,
-    }
-}
-
-fn hook(action: &str) -> HookSpec {
-    HookSpec {
-        action: action.to_owned(),
-        params: json!({}),
-        applies_to: HookAudience::All,
-        on_failure: FailurePolicy::Log,
-    }
-}
-
-fn workflow_state(
-    name: &str,
-    kind: StateKind,
-    role: Option<&str>,
-    hooks: StateHooks,
-) -> StateDefinition {
-    StateDefinition {
-        name: name.to_owned(),
-        kind,
-        column: name.to_owned(),
-        display_name: name.to_owned(),
-        role: role.map(str::to_owned),
-        hooks,
-        cleanup: None,
-        canonical_phase: Some(match kind {
-            StateKind::Backlog => CanonicalPhase::Backlog,
-            StateKind::Initial => CanonicalPhase::Ready,
-            StateKind::Active => CanonicalPhase::Working,
-            StateKind::Gate => CanonicalPhase::Working,
-            StateKind::Terminal => CanonicalPhase::Done,
-            StateKind::Custom => CanonicalPhase::Working,
-        }),
-        gate_config: None,
-        dispatch: None,
-        triggers: std::collections::BTreeMap::new(),
-        config: json!({}),
-    }
-}
-
-fn implicit_assignee_workflow() -> WorkflowDefinition {
-    let mut todo = workflow_state("todo", StateKind::Initial, None, StateHooks::default());
-    todo.triggers.insert(
-        WorkflowTrigger::Accept,
-        WorkflowTriggerDefinition {
-            to: "in_progress".to_owned(),
-            dispatch: None,
-        },
-    );
-    let mut in_progress = workflow_state(
-        "in_progress",
-        StateKind::Active,
-        None,
-        StateHooks {
-            on_enter: vec![hook("dispatch_role_agent")],
-            ..StateHooks::default()
-        },
-    );
-    in_progress.triggers.insert(
-        WorkflowTrigger::Accept,
-        WorkflowTriggerDefinition {
-            to: "done".to_owned(),
-            dispatch: None,
-        },
-    );
-    WorkflowDefinition {
-        roles: Vec::new(),
-        states: vec![
-            todo,
-            in_progress,
-            workflow_state("done", StateKind::Terminal, None, StateHooks::default()),
-        ],
-        configuration: Vec::new(),
-        cancellation_state: None,
-    }
-}
-
-async fn update_project_workflow(db: &SqliteDb, project_id: &str, workflow: &WorkflowDefinition) {
-    sqlx::query("UPDATE project SET workflow_definition = ?, updated_at = ? WHERE id = ?")
-        .bind(serde_json::to_string(workflow).expect("workflow serializes"))
-        .bind(now_rfc3339())
-        .bind(project_id)
-        .execute(db.pool())
-        .await
-        .expect("project workflow updates");
-}
-
-async fn wait_until_execution_has_logs_path(db: &SqliteDb, execution_id: &str) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-    loop {
-        let execution = ExecutionRepo::get_by_id(db, execution_id)
-            .await
-            .expect("execution loads")
-            .expect("execution exists");
-        if execution.logs_path.is_some() {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "execution did not reach pre-launch setup"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-}
-
-async fn seed_running_coder_execution(
-    db: &SqliteDb,
-    task_id: &str,
-    agent_id: Option<String>,
-    workspace_id: Option<String>,
-) -> Execution {
-    seed_running_role_execution(db, task_id, agent_id, "executor", workspace_id).await
-}
-
-async fn seed_running_role_execution(
-    db: &SqliteDb,
-    task_id: &str,
-    agent_id: Option<String>,
-    role: &str,
-    workspace_id: Option<String>,
-) -> Execution {
-    let now = now_rfc3339();
-    ExecutionRepo::create(
-        db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task_id.to_owned(),
-            actor_ref: agent_id
-                .as_ref()
-                .map(|agent_id| db::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(db::ExecutionPurpose::General),
-            harness_session_id: None,
-            agent_id,
-            role: role.to_owned(),
-            status: ExecutionStatus::Running,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("running execution creates")
-}
-
-async fn seed_workspace_for_task(
-    db: &SqliteDb,
-    task: &Task,
-    workspace_root: &std::path::Path,
-) -> String {
-    let now = now_rfc3339();
-    let workspace_id = new_uuid_v4();
-    let worktree_path = workspace_root.join(&task.id).join("forge");
-    WorkspaceRepo::create(
-        db,
-        CreateWorkspace {
-            id: workspace_id.clone(),
-            task_id: task.id.clone(),
-            repo_id: task.repo_id.clone().unwrap(),
-            worktree_path: worktree_path.to_string_lossy().into_owned(),
-            branch: ::workspace::task_branch_name(&task.id),
-            status: WorkspaceStatus::Ready,
-            before_sha: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("workspace creates");
-    std::fs::create_dir_all(&worktree_path).expect("worktree dir creates");
-    workspace_id
-}
-
-async fn next_role_reassigned_event(
-    rx: &mut tokio::sync::broadcast::Receiver<ForgeEvent>,
-) -> ForgeEvent {
-    loop {
-        let event = rx.recv().await.expect("event receives");
-        if event.event_type == "task.role_reassigned" {
-            return event;
-        }
-    }
-}
-
 #[tokio::test]
-async fn add_user_comment_indexes_comment_memory_item() {
+async fn add_user_comment_persists_in_the_task_comment_store() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
 
     let comment = service
         .add_user_comment(
@@ -683,17 +420,21 @@ async fn add_user_comment_indexes_comment_memory_item() {
 
     assert_eq!(comment.author_type, db::CommentAuthorType::User);
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM memory_item \
-         WHERE project_id = ? AND task_id = ? AND source_type = 'comment' \
-           AND kind = 'comment' AND metadata_json = ?",
+        "SELECT COUNT(*) FROM task_comment WHERE id = ? AND task_id = ?",
     )
-    .bind(&project_id)
+    .bind(&comment.id)
     .bind(&task.id)
-    .bind(json!({ "source_ref": comment.id }).to_string())
     .fetch_one(db.pool())
     .await
-    .expect("comment memory item count loads");
+    .expect("Task comment count loads");
     assert_eq!(count, 1);
+    let legacy_memory_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_item'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("legacy Memory storage lookup");
+    assert_eq!(legacy_memory_table, 0);
 }
 
 mod cases;

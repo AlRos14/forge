@@ -213,12 +213,19 @@ impl From<ServiceError> for McpToolError {
                     json!({"code": "daemon_timeout", "daemon_id": daemon_id, "method": method}),
                 )
             }
+            ServiceError::ExecutionStartUncertain { execution_id } => Self::new(
+                -32029,
+                format!(
+                    "provider Start for Execution {execution_id} may have taken effect and will not be retried automatically"
+                ),
+            )
+            .with_data(json!({
+                "code": "execution_start_uncertain",
+                "execution_id": execution_id,
+            })),
             ServiceError::Domain(message) => Self::new(-32602, message),
             ServiceError::Db(error) => error.into(),
             ServiceError::Git(error) => Self::new(-32603, "git error").with_data(json!({
-                "details": error.to_string()
-            })),
-            ServiceError::Review(error) => Self::new(-32603, "review error").with_data(json!({
                 "details": error.to_string()
             })),
             ServiceError::GuardRejection { guard, reason } => {

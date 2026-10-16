@@ -34,7 +34,6 @@ async fn retired_binding_writes_are_fenced_while_agent_identity_and_profile_rema
             id: project_id.clone(),
             name: "ordinary project".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: Some(account_id.clone()),
             created_at: now.clone(),

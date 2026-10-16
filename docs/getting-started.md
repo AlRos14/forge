@@ -170,8 +170,8 @@ forge-ctl task role create <TASK_ID> --role implementer \
   --coordination-mode independent
 forge-ctl task role add-member <TASK_ID> implementer \
   --actor-kind agent --actor-id <AGENT_ID>
-forge-ctl task execute <TASK_ID> --agent-id <AGENT_ID> \
-  --role implementer --purpose implement \
+forge-ctl task execute <TASK_ID> --work-unit-id <WORK_UNIT_ID> \
+  --expected-work-unit-version 2 --purpose implement \
   --prompt "Create greeting.txt with a short greeting"
 forge-ctl task get <TASK_ID>
 ```

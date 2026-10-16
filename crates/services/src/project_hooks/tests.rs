@@ -5,7 +5,7 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
     CreateAgent, CreateProject, CreateProjectHookRun, CreateTask, DaemonRepo, DaemonStatus,
     ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus, ProjectRepo, RoleMembershipRepo,
-    SqliteDb, Task, TaskRepo, UpdateDaemonReport, UpsertDaemon,
+    SqliteDb, Task, TaskLifecycleState, TaskRepo, UpdateDaemonReport, UpsertDaemon,
 };
 use events::{EventBus, EventContext, ForgeEvent};
 use serde_json::json;
@@ -334,7 +334,7 @@ async fn all_work_completed_ignores_running_automation_task_and_automation_does_
 {
     let (db, service) = test_service().await;
     let project = seed_project(&db).await;
-    let done_task = seed_task(&db, &project.id, "done", false).await;
+    let done_task = seed_task(&db, &project.id, TaskLifecycleState::Done, false).await;
     let before_automation = ProjectRepo::get_by_id(&*db, &project.id)
         .await
         .expect("project loads")
@@ -422,7 +422,7 @@ async fn all_work_completed_ignores_running_automation_task_and_automation_does_
 async fn all_work_completed_matches_when_all_visible_tasks_are_cancelled() {
     let (db, _service) = test_service().await;
     let project = seed_project(&db).await;
-    let cancelled_task = seed_task(&db, &project.id, "cancelled", false).await;
+    let cancelled_task = seed_task(&db, &project.id, TaskLifecycleState::Cancelled, false).await;
     let cause = EvaluationCause::TaskTransitioned {
         task_id: cancelled_task.id.clone(),
     };
@@ -446,25 +446,10 @@ async fn all_work_completed_matches_when_all_visible_tasks_are_cancelled() {
 }
 
 #[tokio::test]
-async fn all_work_completed_uses_aggregate_lifecycle_over_custom_workflow_terminality() {
+async fn all_work_completed_uses_aggregate_lifecycle_state() {
     let (db, _service) = test_service().await;
-    let mut project = seed_project(&db).await;
-    let task = seed_task(&db, &project.id, "in_progress", false).await;
-    let mut workflow = crate::workflow::default_workflow::default_workflow();
-    let active_projection = workflow
-        .states
-        .iter_mut()
-        .find(|state| state.name == "in_progress")
-        .expect("legacy active projection exists");
-    active_projection.kind = api_types::StateKind::Terminal;
-    let definition = serde_json::to_string(&workflow).expect("workflow serializes");
-    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
-        .bind(&definition)
-        .bind(&project.id)
-        .execute(db.pool())
-        .await
-        .expect("custom workflow stores");
-    project.workflow_definition = definition;
+    let project = seed_project(&db).await;
+    let task = seed_task(&db, &project.id, TaskLifecycleState::Active, false).await;
     assert_eq!(
         db::TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
             .await
@@ -497,7 +482,7 @@ async fn all_work_completed_uses_aggregate_lifecycle_over_custom_workflow_termin
 async fn project_hook_rechecks_from_exact_task_lifecycle_domain_event() {
     let (db, service) = test_service().await;
     let project = seed_project(&db).await;
-    let task = seed_task(&db, &project.id, "todo", false).await;
+    let task = seed_task(&db, &project.id, TaskLifecycleState::Ready, false).await;
     let mut receiver = service.event_bus.subscribe();
     let lifecycle = crate::task_lifecycle::TaskLifecycleService::new(
         Arc::clone(&db),
@@ -538,10 +523,8 @@ async fn project_hook_rechecks_from_exact_task_lifecycle_domain_event() {
         event_type: "task.status_changed".to_owned(),
         entity_id: task.id,
         timestamp: now_rfc3339(),
-        context: EventContext::TaskStatusChanged {
+        context: EventContext::TaskUpdated {
             project_id: project.id,
-            old_status: "todo".to_owned(),
-            new_status: "in_progress".to_owned(),
         },
     };
     assert!(
@@ -652,7 +635,6 @@ async fn seed_project(db: &SqliteDb) -> db::Project {
             id: new_uuid_v4(),
             name: "Hooks".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),
@@ -663,7 +645,12 @@ async fn seed_project(db: &SqliteDb) -> db::Project {
     .expect("project creates")
 }
 
-async fn seed_task(db: &SqliteDb, project_id: &str, status: &str, is_automation: bool) -> Task {
+async fn seed_task(
+    db: &SqliteDb,
+    project_id: &str,
+    lifecycle_state: TaskLifecycleState,
+    is_automation: bool,
+) -> Task {
     let now = now_rfc3339();
     TaskRepo::create(
         db,
@@ -673,15 +660,12 @@ async fn seed_task(db: &SqliteDb, project_id: &str, status: &str, is_automation:
             repo_id: None,
             parent_task_id: None,
             subtask_order: None,
-            assignee_type: None,
-            assignee_id: None,
-            title: format!("{status} task"),
+            title: format!("{lifecycle_state:?} task"),
             description: None,
             task_type: "implementation".to_owned(),
-            status: status.to_owned(),
+            lifecycle_state,
             is_automation,
             priority: 0,
-            task_state_config: None,
             merge_config: None,
             created_at: now.clone(),
             updated_at: now,

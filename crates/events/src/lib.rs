@@ -5,7 +5,6 @@ use tokio::sync::broadcast;
 
 pub const PROJECT_HOOK_RUN_CHANGED_EVENT: &str = "project_hook.run_changed";
 pub const OPERATIONS_STATUS_CHANGED_EVENT: &str = "operations.status_changed";
-pub const TASK_MOVED_EVENT: &str = "task.moved";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForgeEvent {
@@ -16,12 +15,6 @@ pub struct ForgeEvent {
     pub context: EventContext,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RoleAssignmentSnapshot {
-    pub assignee_type: Option<String>,
-    pub assignee_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EventContext {
@@ -29,32 +22,10 @@ pub enum EventContext {
         project_id: String,
         title: String,
     },
-    TaskStatusChanged {
-        project_id: String,
-        old_status: String,
-        new_status: String,
-    },
-    TaskMoved(api_types::TaskMovedEventPayload),
-    TaskAutoTransitioned {
-        task_id: String,
-        from: String,
-        to: String,
-        reason: String,
-    },
     TaskAssigned {
         project_id: String,
         agent_id: String,
         execution_id: String,
-    },
-    TaskRoleReassigned {
-        task_id: String,
-        role_name: String,
-        previous_assignment: Option<RoleAssignmentSnapshot>,
-        new_assignment: Option<RoleAssignmentSnapshot>,
-        triggered_cancellation: bool,
-        reset_workspace: bool,
-        reset_worktree: bool,
-        transitioned_to_todo: bool,
     },
     TaskBlocked {
         project_id: String,
@@ -78,30 +49,15 @@ pub enum EventContext {
         previous_reason: Option<String>,
         new_execution_id: Option<String>,
     },
-    TaskCancelled {
-        project_id: String,
-    },
     TaskRecovered {
         project_id: String,
         reason: String,
-    },
-    RecoveryApplied {
-        project_id: String,
-        task_id: String,
-        action: String,
-        state: Option<String>,
-        transition_log_id: Option<String>,
     },
     TaskUpdated {
         project_id: String,
     },
     TaskDeleted {
         project_id: String,
-    },
-    TaskDependencySatisfied {
-        task_id: String,
-        depends_on_id: String,
-        timestamp: String,
     },
     ExecutionStarted {
         task_id: String,
@@ -358,25 +314,6 @@ pub enum EventContext {
         scope_type: String,
         scope_id: String,
     },
-    AgentChatMessageAdmitted {
-        chat_id: String,
-        message_id: String,
-        author_type: String,
-    },
-    AgentChatTurnProgress {
-        chat_id: String,
-        turn_job_id: String,
-        delta: String,
-    },
-    AgentChatResponseCompleted {
-        chat_id: String,
-        turn_job_id: String,
-        message_id: String,
-    },
-    AgentChatUpdated {
-        chat_id: String,
-        status: String,
-    },
     ExternalSyncCompleted {
         integration_id: String,
         imported_count: u32,
@@ -463,13 +400,11 @@ mod tests {
         let mut rx2 = bus.subscribe();
 
         let event = ForgeEvent {
-            event_type: "task.status_changed".to_string(),
+            event_type: "task.lifecycle_changed".to_string(),
             entity_id: "task-456".to_string(),
             timestamp: event_timestamp(),
-            context: EventContext::TaskStatusChanged {
+            context: EventContext::TaskUpdated {
                 project_id: "proj-1".to_string(),
-                old_status: "todo".to_string(),
-                new_status: "in_progress".to_string(),
             },
         };
 

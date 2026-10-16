@@ -23,35 +23,6 @@ fn map_media_asset(row: &SqliteRow) -> Result<MediaAsset> {
     })
 }
 
-fn map_project_media_attachment(row: &SqliteRow) -> Result<ProjectMediaAttachment> {
-    Ok(ProjectMediaAttachment {
-        id: row.try_get("id")?,
-        project_id: row.try_get("project_id")?,
-        asset_id: row.try_get("asset_id")?,
-        attachment_kind: row.try_get("attachment_kind")?,
-        task_media_id: row.try_get("task_media_id")?,
-        task_id: row.try_get("task_id")?,
-        milestone_id: row.try_get("milestone_id")?,
-        milestone_check_id: row.try_get("milestone_check_id")?,
-        source_task_id: row.try_get("source_task_id")?,
-        source_execution_id: row.try_get("source_execution_id")?,
-        source_validation_id: row.try_get("source_validation_id")?,
-        acceptance_check_ids_json: row.try_get("acceptance_check_ids_json")?,
-        caption: row.try_get("caption")?,
-        evidence_kind: row.try_get("evidence_kind")?,
-        checksum: row.try_get("checksum")?,
-        availability: row.try_get("availability")?,
-        project_url: row.try_get("project_url")?,
-        author_type: row.try_get("author_type")?,
-        author_id: row.try_get("author_id")?,
-        authorization_json: row.try_get("authorization_json")?,
-        version: row.try_get("version")?,
-        created_at: row.try_get("created_at")?,
-        deleted_at: row.try_get("deleted_at")?,
-        updated_at: row.try_get("updated_at")?,
-    })
-}
-
 fn map_project_release_media_pin(row: &SqliteRow) -> Result<ProjectReleaseMediaPin> {
     Ok(ProjectReleaseMediaPin {
         id: row.try_get("id")?,
@@ -69,7 +40,6 @@ fn map_project_release_media_pin(row: &SqliteRow) -> Result<ProjectReleaseMediaP
 }
 
 const MEDIA_ASSET_COLUMNS: &str = "id, project_id, legacy_task_media_id, display_filename, content_type, byte_size, storage_key, checksum, availability, gc_state, gc_candidate_at, gc_lease_owner, gc_lease_expires_at, version, deleted_at, created_at, updated_at";
-const PROJECT_MEDIA_ATTACHMENT_COLUMNS: &str = "id, project_id, asset_id, attachment_kind, task_media_id, task_id, milestone_id, milestone_check_id, source_task_id, source_execution_id, source_validation_id, acceptance_check_ids_json, caption, evidence_kind, checksum, availability, project_url, author_type, author_id, authorization_json, version, created_at, deleted_at, updated_at";
 const PROJECT_RELEASE_MEDIA_PIN_COLUMNS: &str = "id, project_id, release_id, asset_id, attachment_id, legacy_task_media_id, asset_checksum, attachment_digest, availability, pin_digest, created_at";
 
 /// Look up a committed media tombstone receipt in an existing transaction.
@@ -836,7 +806,7 @@ impl SharedMediaRepo for SqliteDb {
 
         let pin_rows = sqlx::query(
             "SELECT id, release_id, availability
-             FROM project_release_media_pin
+             FROM project_release_history_media_pin
              WHERE project_id = ? AND asset_id = ? AND availability != 'purged'",
         )
         .bind(&input.project_id)
@@ -875,19 +845,6 @@ impl SharedMediaRepo for SqliteDb {
             .execute(&mut *transaction)
             .await?;
         }
-
-        sqlx::query(
-            "UPDATE project_media_attachment
-             SET availability = ?, version = version + 1, updated_at = ?
-             WHERE project_id = ? AND asset_id = ? AND availability != ?",
-        )
-        .bind(&input.target_availability)
-        .bind(&input.created_at)
-        .bind(&input.project_id)
-        .bind(&input.asset_id)
-        .bind(&input.target_availability)
-        .execute(&mut *transaction)
-        .await?;
 
         // A tombstone wins over an upload that was metadata-committed but
         // had not yet reached finalize.  Remove the durable pending marker so
@@ -971,641 +928,13 @@ impl SharedMediaRepo for SqliteDb {
         Ok(asset)
     }
 
-    async fn create_project_media_attachment_mutation(
-        &self,
-        input: CreateProjectMediaAttachmentMutation,
-    ) -> Result<ProjectMediaAttachment> {
-        let mut transaction = self.pool.begin().await?;
-        let attachment = &input.attachment;
-        let dedupe_key = format!(
-            "project-evidence-attach:{}:{}",
-            attachment.project_id, input.idempotency_key
-        );
-        if let Some(existing) = sqlx::query(
-            "SELECT entity_id, event_type, payload_json
-             FROM domain_event WHERE dedupe_key = ?",
-        )
-        .bind(&dedupe_key)
-        .fetch_optional(&mut *transaction)
-        .await?
-        {
-            let entity_id: String = existing.try_get("entity_id")?;
-            let event_type: String = existing.try_get("event_type")?;
-            let payload_json: String = existing.try_get("payload_json")?;
-            let payload: serde_json::Value = serde_json::from_str(&payload_json)
-                .map_err(|error| DbError::Check(format!("invalid evidence event: {error}")))?;
-            if event_type != "project.evidence.attached"
-                || payload.get("project_id").and_then(|v| v.as_str())
-                    != Some(attachment.project_id.as_str())
-                || payload.get("milestone_id").and_then(|v| v.as_str())
-                    != attachment.milestone_id.as_deref()
-                || payload.get("asset_id").and_then(|v| v.as_str())
-                    != Some(attachment.asset_id.as_str())
-                || payload.get("checksum").and_then(|v| v.as_str())
-                    != attachment.checksum.as_deref()
-                || payload.get("mutation_fingerprint").and_then(|v| v.as_str())
-                    != Some(input.mutation_fingerprint.as_str())
-                || payload
-                    .get("expected_milestone_version")
-                    .and_then(|v| v.as_i64())
-                    != Some(input.expected_milestone_version)
-            {
-                return Err(DbError::IdempotencyConflict);
-            }
-            let row = sqlx::query(&format!(
-                "SELECT {PROJECT_MEDIA_ATTACHMENT_COLUMNS}
-                 FROM project_media_attachment WHERE id = ?"
-            ))
-            .bind(&entity_id)
-            .fetch_one(&mut *transaction)
-            .await?;
-            let attachment = map_project_media_attachment(&row)?;
-            transaction.commit().await?;
-            return Ok(attachment);
-        }
-
-        let milestone_id = attachment
-            .milestone_id
-            .as_deref()
-            .ok_or_else(|| DbError::Check("evidence milestone is required".to_owned()))?;
-        let milestone = sqlx::query(
-            "SELECT project_id, version, current_definition_revision_id
-             FROM project_milestone WHERE id = ?",
-        )
-        .bind(milestone_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(DbError::NotFound)?;
-        let milestone_project: String = milestone.try_get("project_id")?;
-        if milestone_project != attachment.project_id {
-            return Err(DbError::Check(
-                "evidence milestone is outside the Project".to_owned(),
-            ));
-        }
-        let milestone_version: i64 = milestone.try_get("version")?;
-        if milestone_version != input.expected_milestone_version {
-            return Err(DbError::VersionConflict);
-        }
-        let current_definition_revision_id: Option<String> =
-            milestone.try_get("current_definition_revision_id")?;
-
-        ensure_asset_attachable(
-            &mut transaction,
-            &attachment.asset_id,
-            &attachment.project_id,
-        )
-        .await?;
-        if attachment.availability != "available" {
-            return Err(DbError::Check(
-                "new evidence references must be available".to_owned(),
-            ));
-        }
-        let attachment_checksum = attachment
-            .checksum
-            .as_deref()
-            .filter(|checksum| is_sha256_digest(checksum))
-            .ok_or_else(|| DbError::Check("evidence checksum is required".to_owned()))?;
-        let asset_checksum = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT checksum FROM media_asset WHERE id = ? AND project_id = ?",
-        )
-        .bind(&attachment.asset_id)
-        .bind(&attachment.project_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .flatten();
-        if asset_checksum.as_deref() != Some(attachment_checksum) {
-            return Err(DbError::Check(
-                "evidence checksum does not match the media asset".to_owned(),
-            ));
-        }
-        if let Some(task_id) = attachment.task_id.as_deref() {
-            let task_project =
-                sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
-                    .bind(task_id)
-                    .fetch_optional(&mut *transaction)
-                    .await?
-                    .ok_or(DbError::NotFound)?;
-            if task_project != attachment.project_id {
-                return Err(DbError::Check(
-                    "evidence Task is outside the Project".to_owned(),
-                ));
-            }
-        }
-
-        if let Some(source_task_id) = attachment.source_task_id.as_deref() {
-            let source_project =
-                sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
-                    .bind(source_task_id)
-                    .fetch_optional(&mut *transaction)
-                    .await?
-                    .ok_or(DbError::NotFound)?;
-            if source_project != attachment.project_id
-                || attachment.task_id.as_deref() != Some(source_task_id)
-            {
-                return Err(DbError::Check(
-                    "evidence source Task is outside the attached Task scope".to_owned(),
-                ));
-            }
-        }
-        if let Some(source_execution_id) = attachment.source_execution_id.as_deref() {
-            let source_execution = sqlx::query(
-                "SELECT e.task_id, t.project_id
-                 FROM execution e JOIN task t ON t.id = e.task_id
-                 WHERE e.id = ?",
-            )
-            .bind(source_execution_id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or(DbError::NotFound)?;
-            let execution_task_id: String = source_execution.try_get("task_id")?;
-            let execution_project: String = source_execution.try_get("project_id")?;
-            if execution_project != attachment.project_id
-                || attachment.task_id.as_deref() != Some(execution_task_id.as_str())
-            {
-                return Err(DbError::Check(
-                    "evidence source execution is outside the attached Task scope".to_owned(),
-                ));
-            }
-        }
-
-        let check_ids: Vec<String> = serde_json::from_str(&attachment.acceptance_check_ids_json)
-            .map_err(|error| DbError::Check(format!("invalid acceptance check list: {error}")))?;
-        for check_id in &check_ids {
-            let check = sqlx::query(
-                "SELECT project_id, milestone_id, definition_revision_id
-                 FROM project_milestone_check WHERE id = ?",
-            )
-            .bind(check_id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or(DbError::NotFound)?;
-            let check_project: String = check.try_get("project_id")?;
-            let check_milestone: String = check.try_get("milestone_id")?;
-            let check_revision: String = check.try_get("definition_revision_id")?;
-            if check_project != attachment.project_id || check_milestone != milestone_id {
-                return Err(DbError::Check(
-                    "evidence acceptance check is outside the milestone".to_owned(),
-                ));
-            }
-            if current_definition_revision_id.as_deref() != Some(check_revision.as_str()) {
-                return Err(DbError::Check(
-                    "evidence acceptance check is not from the current milestone definition"
-                        .to_owned(),
-                ));
-            }
-        }
-        if let Some(source_validation_id) = attachment.source_validation_id.as_deref() {
-            let validation = sqlx::query(
-                "SELECT project_id, milestone_id, check_id, definition_revision_id
-                 FROM project_milestone_check_result WHERE id = ?",
-            )
-            .bind(source_validation_id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or(DbError::NotFound)?;
-            let validation_project: String = validation.try_get("project_id")?;
-            let validation_milestone: String = validation.try_get("milestone_id")?;
-            let validation_check: String = validation.try_get("check_id")?;
-            let validation_revision: String = validation.try_get("definition_revision_id")?;
-            if validation_project != attachment.project_id
-                || validation_milestone != milestone_id
-                || !check_ids.iter().any(|id| id == &validation_check)
-                || current_definition_revision_id.as_deref() != Some(validation_revision.as_str())
-            {
-                return Err(DbError::Check(
-                    "evidence source validation is outside the current milestone definition"
-                        .to_owned(),
-                ));
-            }
-        }
-
-        sqlx::query(
-            "INSERT INTO project_media_attachment (
-                id, project_id, asset_id, attachment_kind, task_media_id, task_id,
-                milestone_id, milestone_check_id, source_task_id, source_execution_id,
-                source_validation_id, acceptance_check_ids_json, caption, evidence_kind,
-                checksum, availability, project_url, author_type, author_id,
-                authorization_json, version, created_at, deleted_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, ?)",
-        )
-        .bind(&attachment.id)
-        .bind(&attachment.project_id)
-        .bind(&attachment.asset_id)
-        .bind(&attachment.attachment_kind)
-        .bind(attachment.task_media_id.as_deref())
-        .bind(attachment.task_id.as_deref())
-        .bind(attachment.milestone_id.as_deref())
-        .bind(attachment.milestone_check_id.as_deref())
-        .bind(attachment.source_task_id.as_deref())
-        .bind(attachment.source_execution_id.as_deref())
-        .bind(attachment.source_validation_id.as_deref())
-        .bind(&attachment.acceptance_check_ids_json)
-        .bind(attachment.caption.as_deref())
-        .bind(attachment.evidence_kind.as_deref())
-        .bind(attachment.checksum.as_deref())
-        .bind(&attachment.availability)
-        .bind(attachment.project_url.as_deref())
-        .bind(&attachment.author_type)
-        .bind(attachment.author_id.as_deref())
-        .bind(&attachment.authorization_json)
-        .bind(&attachment.created_at)
-        .bind(&attachment.created_at)
-        .execute(&mut *transaction)
-        .await?;
-        let asset = reconcile_media_asset_in_tx(
-            &mut transaction,
-            &attachment.asset_id,
-            &attachment.created_at,
-        )
-        .await?;
-        if asset.gc_state == "deleted" {
-            return Err(DbError::Check(
-                "media asset was deleted while attaching evidence".to_owned(),
-            ));
-        }
-
-        let payload_json = serde_json::json!({
-            "project_id": attachment.project_id,
-            "milestone_id": milestone_id,
-            "asset_id": attachment.asset_id,
-            "evidence_id": attachment.id,
-            "checksum": attachment.checksum,
-            "expected_milestone_version": input.expected_milestone_version,
-            "authorization_event_id": input.authorization_event_id,
-            "mutation_fingerprint": input.mutation_fingerprint,
-        })
-        .to_string();
-        let event = CreateDomainEvent {
-            id: new_uuid_v4(),
-            event_type: "project.evidence.attached".to_owned(),
-            entity_type: "project_media_attachment".to_owned(),
-            entity_id: attachment.id.clone(),
-            actor_type: attachment.author_type.clone(),
-            actor_id: attachment.author_id.clone(),
-            scope_type: "project".to_owned(),
-            scope_id: attachment.project_id.clone(),
-            correlation_id: dedupe_key.clone(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some(dedupe_key),
-            payload_json,
-            created_at: attachment.created_at.clone(),
-        };
-        DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
-        let row = sqlx::query(&format!(
-            "SELECT {PROJECT_MEDIA_ATTACHMENT_COLUMNS}
-             FROM project_media_attachment WHERE id = ?"
-        ))
-        .bind(&attachment.id)
-        .fetch_one(&mut *transaction)
-        .await?;
-        let attachment = map_project_media_attachment(&row)?;
-        transaction.commit().await?;
-        Ok(attachment)
-    }
-
-    async fn soft_delete_project_media_attachment_mutation(
-        &self,
-        input: SoftDeleteProjectMediaAttachmentMutation,
-    ) -> Result<ProjectMediaAttachment> {
-        let mut transaction = self.pool.begin().await?;
-        let dedupe_key = format!(
-            "project-evidence-remove:{}:{}",
-            input.project_id, input.idempotency_key
-        );
-        if let Some(existing) = sqlx::query(
-            "SELECT entity_id, event_type, payload_json
-             FROM domain_event WHERE dedupe_key = ?",
-        )
-        .bind(&dedupe_key)
-        .fetch_optional(&mut *transaction)
-        .await?
-        {
-            let entity_id: String = existing.try_get("entity_id")?;
-            let event_type: String = existing.try_get("event_type")?;
-            let payload_json: String = existing.try_get("payload_json")?;
-            let payload: serde_json::Value = serde_json::from_str(&payload_json)
-                .map_err(|error| DbError::Check(format!("invalid evidence event: {error}")))?;
-            if event_type != "project.evidence.removed"
-                || entity_id != input.id
-                || payload.get("project_id").and_then(|v| v.as_str())
-                    != Some(input.project_id.as_str())
-                || payload.get("milestone_id").and_then(|v| v.as_str())
-                    != Some(input.milestone_id.as_str())
-                || payload.get("expected_version").and_then(|v| v.as_i64())
-                    != Some(input.expected_version)
-                || payload.get("mutation_fingerprint").and_then(|v| v.as_str())
-                    != Some(input.mutation_fingerprint.as_str())
-            {
-                return Err(DbError::IdempotencyConflict);
-            }
-            let row = sqlx::query(&format!(
-                "SELECT {PROJECT_MEDIA_ATTACHMENT_COLUMNS}
-                 FROM project_media_attachment WHERE id = ?"
-            ))
-            .bind(&input.id)
-            .fetch_one(&mut *transaction)
-            .await?;
-            let attachment = map_project_media_attachment(&row)?;
-            transaction.commit().await?;
-            return Ok(attachment);
-        }
-
-        let row = sqlx::query(&format!(
-            "SELECT {PROJECT_MEDIA_ATTACHMENT_COLUMNS}
-             FROM project_media_attachment
-             WHERE id = ? AND project_id = ? AND milestone_id = ?
-               AND attachment_kind = 'evidence'"
-        ))
-        .bind(&input.id)
-        .bind(&input.project_id)
-        .bind(&input.milestone_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(DbError::NotFound)?;
-        let current = map_project_media_attachment(&row)?;
-        if current.deleted_at.is_some() {
-            return Err(DbError::NotFound);
-        }
-        if current.version != input.expected_version {
-            return Err(DbError::VersionConflict);
-        }
-        let result = sqlx::query(
-            "UPDATE project_media_attachment
-             SET deleted_at = ?, availability = 'purged', version = version + 1, updated_at = ?
-             WHERE id = ? AND project_id = ? AND milestone_id = ?
-               AND attachment_kind = 'evidence' AND deleted_at IS NULL AND version = ?",
-        )
-        .bind(&input.deleted_at)
-        .bind(&input.deleted_at)
-        .bind(&input.id)
-        .bind(&input.project_id)
-        .bind(&input.milestone_id)
-        .bind(input.expected_version)
-        .execute(&mut *transaction)
-        .await?;
-        if result.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-        reconcile_media_asset_in_tx(&mut transaction, &current.asset_id, &input.deleted_at).await?;
-        let payload_json = serde_json::json!({
-            "project_id": input.project_id,
-            "milestone_id": input.milestone_id,
-            "evidence_id": input.id,
-            "expected_version": input.expected_version,
-            "authorization_event_id": input.authorization_event_id,
-            "mutation_fingerprint": input.mutation_fingerprint,
-        })
-        .to_string();
-        let event = CreateDomainEvent {
-            id: new_uuid_v4(),
-            event_type: "project.evidence.removed".to_owned(),
-            entity_type: "project_media_attachment".to_owned(),
-            entity_id: input.id.clone(),
-            actor_type: input.actor_type,
-            actor_id: input.actor_id,
-            scope_type: "project".to_owned(),
-            scope_id: input.project_id.clone(),
-            correlation_id: dedupe_key.clone(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some(dedupe_key),
-            payload_json,
-            created_at: input.deleted_at.clone(),
-        };
-        DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
-        let row = sqlx::query(&format!(
-            "SELECT {PROJECT_MEDIA_ATTACHMENT_COLUMNS}
-             FROM project_media_attachment WHERE id = ?"
-        ))
-        .bind(&input.id)
-        .fetch_one(&mut *transaction)
-        .await?;
-        let attachment = map_project_media_attachment(&row)?;
-        transaction.commit().await?;
-        Ok(attachment)
-    }
-
-    async fn create_project_media_attachment(
-        &self,
-        input: CreateProjectMediaAttachment,
-    ) -> Result<ProjectMediaAttachment> {
-        let mut transaction = self.pool.begin().await?;
-        ensure_asset_attachable(&mut transaction, &input.asset_id, &input.project_id).await?;
-        if input.availability != "available" {
-            return Err(DbError::Check(
-                "new media references must be available".to_owned(),
-            ));
-        }
-        let input_checksum = input
-            .checksum
-            .as_deref()
-            .filter(|checksum| is_sha256_digest(checksum))
-            .ok_or_else(|| DbError::Check("evidence checksum is required".to_owned()))?;
-        let asset_checksum = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT checksum FROM media_asset WHERE id = ? AND project_id = ?",
-        )
-        .bind(&input.asset_id)
-        .bind(&input.project_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .flatten();
-        if asset_checksum.as_deref() != Some(input_checksum) {
-            return Err(DbError::Check(
-                "evidence checksum does not match the media asset".to_owned(),
-            ));
-        }
-
-        sqlx::query(
-            "INSERT INTO project_media_attachment (
-                id, project_id, asset_id, attachment_kind, task_media_id, task_id,
-                milestone_id, milestone_check_id, source_task_id, source_execution_id,
-                source_validation_id, acceptance_check_ids_json, caption, evidence_kind,
-                checksum, availability, project_url, author_type, author_id,
-                authorization_json, version, created_at, deleted_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, ?)",
-        )
-        .bind(&input.id)
-        .bind(&input.project_id)
-        .bind(&input.asset_id)
-        .bind(&input.attachment_kind)
-        .bind(input.task_media_id.as_deref())
-        .bind(input.task_id.as_deref())
-        .bind(input.milestone_id.as_deref())
-        .bind(input.milestone_check_id.as_deref())
-        .bind(input.source_task_id.as_deref())
-        .bind(input.source_execution_id.as_deref())
-        .bind(input.source_validation_id.as_deref())
-        .bind(&input.acceptance_check_ids_json)
-        .bind(input.caption.as_deref())
-        .bind(input.evidence_kind.as_deref())
-        .bind(input.checksum.as_deref())
-        .bind(&input.availability)
-        .bind(input.project_url.as_deref())
-        .bind(&input.author_type)
-        .bind(input.author_id.as_deref())
-        .bind(&input.authorization_json)
-        .bind(&input.created_at)
-        .bind(&input.created_at)
-        .execute(&mut *transaction)
-        .await?;
-
-        let asset =
-            reconcile_media_asset_in_tx(&mut transaction, &input.asset_id, &input.created_at)
-                .await?;
-        if asset.gc_state == "deleted" {
-            return Err(DbError::Check(
-                "media asset was deleted while attaching evidence".to_owned(),
-            ));
-        }
-
-        let attachment = sqlx::query(&format!(
-            "SELECT {PROJECT_MEDIA_ATTACHMENT_COLUMNS} FROM project_media_attachment WHERE id = ?"
-        ))
-        .bind(&input.id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(DbError::from)
-        .and_then(|row| map_project_media_attachment(&row))?;
-
-        transaction.commit().await?;
-        Ok(attachment)
-    }
-
-    async fn soft_delete_project_media_attachment(
-        &self,
-        id: &str,
-        deleted_at: &str,
-    ) -> Result<ProjectMediaAttachment> {
-        let mut transaction = self.pool.begin().await?;
-        let asset_id = sqlx::query_scalar::<_, String>(
-            "SELECT asset_id FROM project_media_attachment WHERE id = ? AND deleted_at IS NULL",
-        )
-        .bind(id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(DbError::NotFound)?;
-
-        let result = sqlx::query(
-            "UPDATE project_media_attachment
-             SET deleted_at = ?, availability = 'purged', version = version + 1, updated_at = ?
-             WHERE id = ? AND deleted_at IS NULL",
-        )
-        .bind(deleted_at)
-        .bind(deleted_at)
-        .bind(id)
-        .execute(&mut *transaction)
-        .await?;
-        if result.rows_affected() != 1 {
-            return Err(DbError::NotFound);
-        }
-
-        reconcile_media_asset_in_tx(&mut transaction, &asset_id, deleted_at).await?;
-        let attachment = sqlx::query(&format!(
-            "SELECT {PROJECT_MEDIA_ATTACHMENT_COLUMNS} FROM project_media_attachment WHERE id = ?"
-        ))
-        .bind(id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(DbError::from)
-        .and_then(|row| map_project_media_attachment(&row))?;
-        transaction.commit().await?;
-        Ok(attachment)
-    }
-
-    async fn create_project_release_media_pin(
-        &self,
-        input: CreateProjectReleaseMediaPin,
-    ) -> Result<ProjectReleaseMediaPin> {
-        let mut transaction = self.pool.begin().await?;
-
-        if !is_sha256_digest(&input.asset_checksum) {
-            return Err(DbError::Check(
-                "release media pin requires a SHA-256 asset checksum".to_owned(),
-            ));
-        }
-        if input.availability != "available" || input.attachment_digest.trim().is_empty() {
-            return Err(DbError::Check(
-                "release media pin must reference available evidence with a digest".to_owned(),
-            ));
-        }
-        let persisted_checksum = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT checksum FROM media_asset WHERE id = ? AND project_id = ?",
-        )
-        .bind(&input.asset_id)
-        .bind(&input.project_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .flatten()
-        .ok_or(DbError::Check(
-            "release media asset checksum is unavailable".to_owned(),
-        ))?;
-        if persisted_checksum != input.asset_checksum {
-            return Err(DbError::Check(
-                "release media pin asset checksum does not match asset".to_owned(),
-            ));
-        }
-
-        if let Some(existing) = fetch_project_release_media_pin(
-            &mut transaction,
-            &input.release_id,
-            &input.asset_id,
-            input.attachment_id.as_deref(),
-        )
-        .await?
-        {
-            validate_pin_replay(&existing, &input)?;
-            transaction.commit().await?;
-            return Ok(existing);
-        }
-
-        ensure_asset_attachable(&mut transaction, &input.asset_id, &input.project_id).await?;
-
-        // Release retries are intentionally idempotent by the immutable
-        // release/asset/attachment identity.  A replay returns the original
-        // pin instead of attempting a second insert.
-        sqlx::query(
-            "INSERT OR IGNORE INTO project_release_media_pin (
-                id, project_id, release_id, asset_id, attachment_id,
-                legacy_task_media_id, asset_checksum, attachment_digest,
-                availability, pin_digest, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&input.id)
-        .bind(&input.project_id)
-        .bind(&input.release_id)
-        .bind(&input.asset_id)
-        .bind(input.attachment_id.as_deref())
-        .bind(input.legacy_task_media_id.as_deref())
-        .bind(&input.asset_checksum)
-        .bind(&input.attachment_digest)
-        .bind(&input.availability)
-        .bind(&input.pin_digest)
-        .bind(&input.created_at)
-        .execute(&mut *transaction)
-        .await?;
-
-        reconcile_media_asset_in_tx(&mut transaction, &input.asset_id, &input.created_at).await?;
-        let pin = fetch_project_release_media_pin(
-            &mut transaction,
-            &input.release_id,
-            &input.asset_id,
-            input.attachment_id.as_deref(),
-        )
-        .await?
-        .ok_or_else(|| DbError::Check("release media pin insert was not persisted".to_owned()))?;
-        validate_pin_replay(&pin, &input)?;
-        transaction.commit().await?;
-        Ok(pin)
-    }
-
     async fn list_project_release_media_pins(
         &self,
         release_id: &str,
     ) -> Result<Vec<ProjectReleaseMediaPin>> {
         sqlx::query(&format!(
             "SELECT {PROJECT_RELEASE_MEDIA_PIN_COLUMNS}
-             FROM project_release_media_pin WHERE release_id = ? ORDER BY id ASC"
+             FROM project_release_history_media_pin WHERE release_id = ? ORDER BY id ASC"
         ))
         .bind(release_id)
         .fetch_all(self.pool())
@@ -1659,17 +988,11 @@ impl SharedMediaRepo for SqliteDb {
                    AND version = ?
                    AND (gc_lease_owner IS NULL OR gc_lease_expires_at IS NULL OR gc_lease_expires_at <= ?)
                    AND NOT EXISTS (
-                       SELECT 1 FROM project_media_attachment
-                       WHERE asset_id = media_asset.id
-                         AND deleted_at IS NULL
-                         AND availability != 'purged'
-                   )
-                   AND NOT EXISTS (
                        SELECT 1 FROM task_media
                        WHERE asset_id = media_asset.id AND deleted_at IS NULL
                    )
                    AND NOT EXISTS (
-                       SELECT 1 FROM project_release_media_pin
+                       SELECT 1 FROM project_release_history_media_pin
                        WHERE asset_id = media_asset.id AND availability != 'purged'
                    )",
             )
@@ -1740,17 +1063,11 @@ impl SharedMediaRepo for SqliteDb {
                AND version = ?
                AND (gc_lease_owner IS NULL OR gc_lease_expires_at IS NULL OR gc_lease_expires_at <= ?)
                AND NOT EXISTS (
-                   SELECT 1 FROM project_media_attachment
-                   WHERE asset_id = media_asset.id
-                     AND deleted_at IS NULL
-                     AND availability != 'purged'
-               )
-               AND NOT EXISTS (
                    SELECT 1 FROM task_media
                    WHERE asset_id = media_asset.id AND deleted_at IS NULL
                )
                AND NOT EXISTS (
-                   SELECT 1 FROM project_release_media_pin
+                   SELECT 1 FROM project_release_history_media_pin
                    WHERE asset_id = media_asset.id AND availability != 'purged'
                )",
         )
@@ -1864,17 +1181,11 @@ impl SharedMediaRepo for SqliteDb {
                AND gc_lease_expires_at > ?
                AND version = ?
                AND NOT EXISTS (
-                   SELECT 1 FROM project_media_attachment
-                   WHERE asset_id = media_asset.id
-                     AND deleted_at IS NULL
-                     AND availability != 'purged'
-               )
-               AND NOT EXISTS (
                    SELECT 1 FROM task_media
                    WHERE asset_id = media_asset.id AND deleted_at IS NULL
                )
                AND NOT EXISTS (
-                   SELECT 1 FROM project_release_media_pin
+                   SELECT 1 FROM project_release_history_media_pin
                    WHERE asset_id = media_asset.id AND availability != 'purged'
                )",
         )
@@ -1900,29 +1211,6 @@ impl SharedMediaRepo for SqliteDb {
         transaction.commit().await?;
         Ok(Some(map_media_asset(&row)?))
     }
-}
-
-async fn ensure_asset_attachable(
-    transaction: &mut Transaction<'_, Sqlite>,
-    asset_id: &str,
-    project_id: &str,
-) -> Result<()> {
-    let row = sqlx::query(
-        "SELECT availability, gc_state FROM media_asset WHERE id = ? AND project_id = ?",
-    )
-    .bind(asset_id)
-    .bind(project_id)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or(DbError::NotFound)?;
-    let availability: String = row.try_get("availability")?;
-    let gc_state: String = row.try_get("gc_state")?;
-    if availability != "available" || gc_state == "deleted" || gc_state == "gc_queued" {
-        return Err(DbError::Check(
-            "media asset is unavailable for a new reference".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 fn is_sha256_digest(value: &str) -> bool {
@@ -1987,64 +1275,19 @@ fn validate_project_media_metadata(
     Ok(())
 }
 
-async fn fetch_project_release_media_pin(
-    transaction: &mut Transaction<'_, Sqlite>,
-    release_id: &str,
-    asset_id: &str,
-    attachment_id: Option<&str>,
-) -> Result<Option<ProjectReleaseMediaPin>> {
-    let row = sqlx::query(&format!(
-        "SELECT {PROJECT_RELEASE_MEDIA_PIN_COLUMNS}
-         FROM project_release_media_pin
-         WHERE release_id = ? AND asset_id = ? AND attachment_id IS ?"
-    ))
-    .bind(release_id)
-    .bind(asset_id)
-    .bind(attachment_id)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    row.map(|row| map_project_release_media_pin(&row))
-        .transpose()
-}
-
-fn validate_pin_replay(
-    existing: &ProjectReleaseMediaPin,
-    input: &CreateProjectReleaseMediaPin,
-) -> Result<()> {
-    let same_payload = existing.project_id == input.project_id
-        && existing.release_id == input.release_id
-        && existing.asset_id == input.asset_id
-        && existing.attachment_id == input.attachment_id
-        && existing.legacy_task_media_id == input.legacy_task_media_id
-        && existing.asset_checksum == input.asset_checksum
-        && existing.attachment_digest == input.attachment_digest
-        && existing.availability == input.availability
-        && existing.pin_digest == input.pin_digest;
-    if !same_payload {
-        return Err(DbError::Check(
-            "conflicting replay payload for release media pin".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 async fn media_asset_is_referenced(
     transaction: &mut Transaction<'_, Sqlite>,
     asset_id: &str,
 ) -> Result<bool> {
     Ok(sqlx::query_scalar::<_, i64>(
         "SELECT CASE WHEN EXISTS (
-             SELECT 1 FROM project_media_attachment
-             WHERE asset_id = ? AND deleted_at IS NULL AND availability != 'purged'
-         ) OR EXISTS (
              SELECT 1 FROM task_media
              WHERE asset_id = ? AND deleted_at IS NULL
          ) OR EXISTS (
-             SELECT 1 FROM project_release_media_pin
+             SELECT 1 FROM project_release_history_media_pin
              WHERE asset_id = ? AND availability != 'purged'
          ) THEN 1 ELSE 0 END",
     )
-    .bind(asset_id)
     .bind(asset_id)
     .bind(asset_id)
     .fetch_one(&mut **transaction)

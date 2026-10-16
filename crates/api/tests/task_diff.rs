@@ -50,7 +50,8 @@ async fn task_diff_endpoint_returns_workspace_diff_and_handles_missing_workspace
         .launch_execution(task.id.clone(), agent_id, None, None)
         .await
         .expect("launch succeeds");
-    let workspace_path = PathBuf::from(&launched.workspace.worktree_path);
+    let workspace = launched.workspace.expect("launch creates exact workspace");
+    let workspace_path = PathBuf::from(&workspace.worktree_path);
     std::fs::write(workspace_path.join("README.md"), "# Task diff\nupdated\n")
         .expect("workspace file writes");
 
@@ -61,8 +62,7 @@ async fn task_diff_endpoint_returns_workspace_diff_and_handles_missing_workspace
         StatusCode::OK,
     )
     .await;
-    let base_sha = launched
-        .workspace
+    let base_sha = workspace
         .before_sha
         .clone()
         .expect("workspace records base sha");
@@ -77,7 +77,7 @@ async fn task_diff_endpoint_returns_workspace_diff_and_handles_missing_workspace
     let workspace_diff: DiffEnvelope = empty_request(
         &app,
         Method::GET,
-        &format!("/api/v1/workspaces/{}/diff", launched.workspace.id),
+        &format!("/api/v1/workspaces/{}/diff", workspace.id),
         StatusCode::OK,
     )
     .await;
@@ -106,8 +106,8 @@ async fn task_diff_uses_merge_base_when_default_branch_advances() {
         .launch_execution(task.id.clone(), agent_id, None, None)
         .await
         .expect("launch succeeds");
-    let base_sha = launched
-        .workspace
+    let workspace = launched.workspace.expect("launch creates exact workspace");
+    let base_sha = workspace
         .before_sha
         .clone()
         .expect("workspace records base sha");
@@ -117,7 +117,7 @@ async fn task_diff_uses_merge_base_when_default_branch_advances() {
     run_git(&repo_dir, &["add", "-A"]);
     run_git(&repo_dir, &["commit", "-m", "advance default branch"]);
 
-    let workspace_path = PathBuf::from(&launched.workspace.worktree_path);
+    let workspace_path = PathBuf::from(&workspace.worktree_path);
     std::fs::write(
         workspace_path.join("README.md"),
         "# Task diff\nworkspace update\n",
@@ -185,7 +185,6 @@ async fn create_project_and_repo(harness: &Harness) -> (String, String, PathBuf,
             id: new_uuid_v4(),
             name: "Task Diff".to_owned(),
             settings: "{}".to_owned(),
-            workflow_definition: "{}".to_string(),
             primary_repo_id: None,
             owner_id: None,
             created_at: now.clone(),

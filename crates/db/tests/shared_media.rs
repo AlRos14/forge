@@ -1,22 +1,13 @@
 use db::{
     create_sqlite_pool, now_rfc3339, run_migrations, BeginProjectMediaUpload, CommentAuthorType,
-    CreateProjectMediaAsset, CreateProjectMediaAttachment, CreateProjectMediaAttachmentMutation,
-    CreateProjectReleaseMediaPin, CreateTaskMedia, ProjectMediaTombstone, SharedMediaRepo,
-    SqliteDb, TaskMediaRepo,
+    CreateProjectMediaAsset, CreateTaskMedia, ProjectMediaTombstone, SharedMediaRepo, SqliteDb,
+    TaskMediaRepo,
 };
 use sqlx::SqlitePool;
-
-mod support;
 
 async fn fixture() -> (SqliteDb, String, String) {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
-    fixture_rows(pool).await
-}
-
-async fn fixture_before_pr11() -> (SqliteDb, String, String) {
-    let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
-    support::migrate_through(&pool, 117).await;
     fixture_rows(pool).await
 }
 
@@ -102,148 +93,6 @@ async fn upload(db: &SqliteDb, task_id: &str, id: &str) -> db::TaskMedia {
     media
 }
 
-async fn create_release(db: &SqliteDb, project_id: &str) {
-    let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO project_milestone
-         (id, project_id, milestone_sequence, milestone_key, lifecycle, created_at, updated_at)
-         VALUES ('milestone-media', ?, 1, 'M001', 'released', ?, ?)",
-    )
-    .bind(project_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("milestone");
-    sqlx::query(
-        "INSERT INTO project_milestone_revision
-         (id, milestone_id, revision, base_revision, lifecycle, outcome,
-          included_scope_json, excluded_scope_json, document_revisions_json,
-          task_selection_json, dependencies_json, risks_json, acceptance_checks_json,
-          evidence_requirements_json, known_issues_json, change_summary, schema_version,
-          render_version, rendered_view, content_digest, rendered_digest,
-          author_type, source_refs_json, created_at)
-         VALUES ('milestone-media-r1', 'milestone-media', 1, 0, 'approved', 'media proof',
-                 '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '',
-                 'test', 'test', 'media milestone', 'digest', 'rendered', 'user', '[]', ?)",
-    )
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("milestone revision");
-    sqlx::query(
-        "INSERT INTO project_charter
-         (id, account_id, project_id, project_mode, maturity, lifecycle, created_at, updated_at)
-         VALUES ('charter-media', 'user-media', ?, 'standard', 'mvp', 'attached', ?, ?)",
-    )
-    .bind(project_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("charter");
-    sqlx::query(
-        "INSERT INTO project_charter_revision
-         (id, charter_id, revision, lifecycle, schema_version, render_version,
-          content_json, rendered_view, author_type, author_id, content_digest,
-          rendered_digest, created_at)
-         VALUES ('charter-media-r1', 'charter-media', 1, 'approved', 'test', 'test',
-                 '{}', 'media charter', 'user', 'user-media', 'charter-digest',
-                 'charter-rendered-digest', ?)",
-    )
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("charter revision");
-    sqlx::query(
-        "UPDATE project_charter
-         SET current_approved_revision_id = ?
-         WHERE id = 'charter-media'",
-    )
-    .bind("charter-media-r1")
-    .execute(db.pool())
-    .await
-    .expect("charter pointer");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline
-         (id, project_id, lifecycle, current_revision_id, created_at, updated_at)
-         VALUES ('baseline-media', ?, 'active', NULL, ?, ?)",
-    )
-    .bind(project_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("baseline");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_revision
-         (id, baseline_id, revision, lifecycle, charter_revision_id,
-          release_policy_revision, release_policy_digest, schema_version,
-          render_version, rendered_view, content_digest, rendered_digest, created_at)
-         VALUES ('baseline-media-r1', 'baseline-media', 1, 'approved',
-                 'charter-media-r1', 'policy-media-r1', 'policy-digest', 'test',
-                 'test', 'media baseline', 'baseline-digest',
-                 'baseline-rendered-digest', ?)",
-    )
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("baseline revision");
-    sqlx::query(
-        "UPDATE project_execution_baseline
-         SET current_revision_id = ?
-         WHERE id = 'baseline-media'",
-    )
-    .bind("baseline-media-r1")
-    .execute(db.pool())
-    .await
-    .expect("baseline pointer");
-    sqlx::query(
-        "INSERT INTO project_readiness_snapshot
-         (id, project_id, milestone_id, definition_revision_id,
-          baseline_id, baseline_revision_id, baseline_digest,
-          release_policy_revision, release_policy_digest, event_watermark, outcome,
-          computing_policy_revision, readiness_digest, principal_type, principal_id,
-          authorization_basis, authorization_action, authorization_occurred_at,
-          expected_milestone_version, explicit_event,
-          idempotency_key, created_at)
-         VALUES ('readiness-media', ?, 'milestone-media', 'milestone-media-r1',
-                 'baseline-media', 'baseline-media-r1', 'baseline-digest',
-                 'policy-media-r1', 'policy-digest', 'event-watermark-media', 'ready',
-                 'test', 'readiness-digest', 'user', 'user-media', 'test',
-                 'project.milestone.readiness.evaluate', '2026-08-13T00:00:00Z', 1,
-                 'event-media', 'idem-readiness-media', ?)",
-    )
-    .bind(project_id)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("readiness");
-    sqlx::query(
-        "INSERT INTO project_release
-         (id, project_id, milestone_id, release_sequence, release_revision,
-          release_identifier, milestone_revision_id, readiness_snapshot_id,
-          readiness_digest, baseline_id, baseline_revision_id, baseline_digest,
-          release_policy_revision, release_policy_digest,
-          releasing_principal_type, releasing_principal_id,
-          authorization_basis, authorization_action, authorization_occurred_at,
-          explicit_event, schema_version, snapshot_digest,
-          idempotency_key, created_at)
-         VALUES ('release-media', ?, 'milestone-media', 1, 1, 'M001-r1',
-                 'milestone-media-r1', 'readiness-media', 'readiness-digest',
-                 'baseline-media', 'baseline-media-r1', 'baseline-digest',
-                 'policy-media-r1', 'policy-digest',
-                 'user', 'user-media', 'test', 'project.release.create',
-                 '2026-08-13T00:00:00Z', 'event-release-media', 'test',
-                 'snapshot-digest', 'idem-release-media', ?)",
-    )
-    .bind(project_id)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("release");
-}
-
 #[tokio::test]
 async fn unreferenced_task_media_is_claimed_and_gc_is_idempotent() {
     let (db, _project_id, task_id) = fixture().await;
@@ -312,190 +161,104 @@ async fn unreferenced_task_media_is_claimed_and_gc_is_idempotent() {
 }
 
 #[tokio::test]
-async fn active_project_evidence_blocks_task_media_gc_until_removed() {
-    let (db, project_id, task_id) = fixture().await;
-    let media = upload(&db, &task_id, "asset-evidence").await;
-    let now = now_rfc3339();
-    SharedMediaRepo::create_project_media_attachment(
-        &db,
-        CreateProjectMediaAttachment {
-            id: "evidence-attachment".to_owned(),
-            project_id: project_id.clone(),
-            asset_id: media.id.clone(),
-            attachment_kind: "evidence".to_owned(),
-            task_media_id: None,
-            task_id: None,
-            milestone_id: None,
-            milestone_check_id: None,
-            source_task_id: Some(task_id.clone()),
-            source_execution_id: None,
-            source_validation_id: None,
-            acceptance_check_ids_json: "[\"check-1\"]".to_owned(),
-            caption: Some("proof".to_owned()),
-            evidence_kind: Some("screenshot".to_owned()),
-            checksum: Some(
-                "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_owned(),
-            ),
-            availability: "available".to_owned(),
-            project_url: Some(format!("/api/v1/projects/{project_id}/media/{}", media.id)),
-            author_type: "user".to_owned(),
-            author_id: Some("user-media".to_owned()),
-            authorization_json: "{}".to_owned(),
-            created_at: now.clone(),
-        },
-    )
-    .await
-    .expect("evidence attachment");
-
-    TaskMediaRepo::soft_delete_media(&db, &media.id, &now)
-        .await
-        .expect("soft delete task media");
-    let asset = SharedMediaRepo::reconcile_media_asset(&db, &media.id, &now)
-        .await
-        .expect("reconcile")
-        .expect("asset");
-    assert_eq!(asset.gc_state, "referenced");
-    assert!(SharedMediaRepo::claim_media_gc_candidates(
-        &db,
-        &now,
-        "worker-evidence",
-        "9999-12-31T00:00:00Z",
-        10,
-    )
-    .await
-    .expect("claim with evidence")
-    .is_empty());
-
-    SharedMediaRepo::soft_delete_project_media_attachment(&db, "evidence-attachment", &now)
-        .await
-        .expect("remove evidence");
-    assert_eq!(
-        SharedMediaRepo::get_media_asset(&db, &media.id)
-            .await
-            .expect("asset")
-            .expect("asset row")
-            .gc_state,
-        "gc_candidate"
-    );
-}
-
-#[tokio::test]
 async fn immutable_release_pin_keeps_asset_referenced_after_task_cleanup() {
-    let (db, project_id, task_id) = fixture_before_pr11().await;
-    create_release(&db, &project_id).await;
+    let (db, project_id, task_id) = fixture().await;
     let media = upload(&db, &task_id, "asset-pinned").await;
     let now = now_rfc3339();
-    let project_url = format!("/api/v1/projects/{project_id}/media/{}", media.id);
-    SharedMediaRepo::create_project_media_attachment(
-        &db,
-        CreateProjectMediaAttachment {
-            id: "pinned-evidence".to_owned(),
-            project_id: project_id.clone(),
-            asset_id: media.id.clone(),
-            attachment_kind: "evidence".to_owned(),
-            task_media_id: None,
-            task_id: None,
-            milestone_id: None,
-            milestone_check_id: None,
-            source_task_id: Some(task_id.clone()),
-            source_execution_id: None,
-            source_validation_id: None,
-            acceptance_check_ids_json: "[]".to_owned(),
-            caption: Some("release proof".to_owned()),
-            evidence_kind: Some("screenshot".to_owned()),
-            checksum: Some(
-                "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_owned(),
-            ),
-            availability: "available".to_owned(),
-            project_url: Some(project_url.clone()),
-            author_type: "user".to_owned(),
-            author_id: Some("user-media".to_owned()),
-            authorization_json: "{}".to_owned(),
-            created_at: now.clone(),
-        },
+    // ProjectRelease is immutable history with no writer. Seed a representative
+    // historic row and its copied pin below the released write fences so this
+    // test can exercise media retention against the V122 schema.
+    sqlx::query("DROP TRIGGER pr11_retired_insert_project_release")
+        .execute(db.pool())
+        .await
+        .expect("temporarily open fixture insert");
+    sqlx::query(
+        "INSERT INTO project_release (
+            id, project_id, milestone_id, release_sequence, release_revision,
+            release_identifier, milestone_revision_id, readiness_snapshot_id,
+            readiness_digest, baseline_id, baseline_revision_id, baseline_digest,
+            release_policy_revision, release_policy_digest, releasing_principal_type,
+            releasing_principal_id, authorization_basis, authorization_action,
+            explicit_event, authorization_occurred_at, schema_version,
+            snapshot_digest, idempotency_key, created_at
+         ) VALUES (
+            'release-media', ?, 'milestone-identity', 1, 1, 'M001-r1',
+            'milestone-revision-identity', 'readiness-identity', 'readiness-digest',
+            'baseline-identity', 'baseline-revision-identity', 'baseline-digest',
+            'policy-revision', 'policy-digest', 'user', 'user-media', 'test',
+            'project.release.create', 'release-event', '2026-08-13T00:00:00Z',
+            'release-v1', 'snapshot-digest', 'release-media-key', ?
+         )",
     )
+    .bind(&project_id)
+    .bind(&now)
+    .execute(db.pool())
     .await
-    .expect("pinned evidence attachment");
-    let pin = SharedMediaRepo::create_project_release_media_pin(
-        &db,
-        CreateProjectReleaseMediaPin {
-            id: "pin-media".to_owned(),
-            project_id: project_id.clone(),
-            release_id: "release-media".to_owned(),
-            asset_id: media.id.clone(),
-            attachment_id: None,
-            legacy_task_media_id: Some(media.id.clone()),
-            asset_checksum: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
-                .to_owned(),
-            attachment_digest: "attachment-digest".to_owned(),
-            availability: "available".to_owned(),
-            pin_digest: "pin-digest".to_owned(),
-            created_at: now.clone(),
-        },
+    .expect("historic Release fixture");
+    sqlx::query(
+        "CREATE TRIGGER pr11_retired_insert_project_release
+         BEFORE INSERT ON project_release BEGIN
+             SELECT RAISE(ABORT, 'PR11_OPERATION_RETIRED: Project Release');
+         END",
     )
+    .execute(db.pool())
     .await
-    .expect("pin");
-    assert_eq!(pin.asset_id, media.id);
-
-    // A release-pin retry with a NULL attachment identity must return the
-    // original row (SQLite's ordinary UNIQUE constraint treats NULLs as
-    // distinct).  A conflicting immutable payload is rejected instead of
-    // silently returning that unrelated original.
-    let replay = SharedMediaRepo::create_project_release_media_pin(
-        &db,
-        CreateProjectReleaseMediaPin {
-            id: "pin-media-retry".to_owned(),
-            project_id: project_id.clone(),
-            release_id: "release-media".to_owned(),
-            asset_id: media.id.clone(),
-            attachment_id: None,
-            legacy_task_media_id: Some(media.id.clone()),
-            asset_checksum: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
-                .to_owned(),
-            attachment_digest: "attachment-digest".to_owned(),
-            availability: "available".to_owned(),
-            pin_digest: "pin-digest".to_owned(),
-            created_at: now.clone(),
-        },
-    )
-    .await
-    .expect("idempotent NULL-attachment pin replay");
-    assert_eq!(replay.id, pin.id);
-    let duplicate_null_pin = sqlx::query(
-        "INSERT INTO project_release_media_pin
-            (id, project_id, release_id, asset_id, asset_checksum, attachment_digest,
-             availability, pin_digest, created_at)
-         VALUES ('pin-media-raw-duplicate', ?, 'release-media', ?,
-                 '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
-                 'attachment-digest', 'available', 'pin-digest', ?)",
+    .expect("restore Release write fence");
+    sqlx::query("DROP TRIGGER project_release_history_media_pin_insert_guard")
+        .execute(db.pool())
+        .await
+        .expect("temporarily open history fixture insert");
+    sqlx::query(
+        "INSERT INTO project_release_history_media_pin (
+            id, project_id, release_id, asset_id, attachment_id,
+            legacy_task_media_id, asset_checksum, attachment_digest,
+            availability, pin_digest, created_at
+         ) VALUES (
+            'pin-media', ?, 'release-media', ?, NULL, ?,
+            '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
+            'attachment-digest', 'available', 'pin-digest', ?
+         )",
     )
     .bind(&project_id)
     .bind(&media.id)
+    .bind(&media.id)
     .bind(&now)
     .execute(db.pool())
-    .await;
-    assert!(
-        duplicate_null_pin.is_err(),
-        "NULL attachment identity must be unique in SQLite"
-    );
-    let conflict = SharedMediaRepo::create_project_release_media_pin(
-        &db,
-        CreateProjectReleaseMediaPin {
-            id: "pin-media-conflict".to_owned(),
-            project_id: project_id.clone(),
-            release_id: "release-media".to_owned(),
-            asset_id: media.id.clone(),
-            attachment_id: None,
-            legacy_task_media_id: Some(media.id.clone()),
-            asset_checksum: "different-checksum".to_owned(),
-            attachment_digest: "attachment-digest".to_owned(),
-            availability: "available".to_owned(),
-            pin_digest: "pin-digest".to_owned(),
-            created_at: now.clone(),
-        },
+    .await
+    .expect("historic Release pin fixture");
+    sqlx::query(
+        "CREATE TRIGGER project_release_history_media_pin_insert_guard
+         BEFORE INSERT ON project_release_history_media_pin BEGIN
+             SELECT RAISE(ABORT, 'ProjectRelease history snapshots are immutable');
+         END",
     )
-    .await;
-    assert!(matches!(conflict, Err(db::DbError::Check(_))));
+    .execute(db.pool())
+    .await
+    .expect("restore history write fence");
+    let retained_pin: (String, String, String, String) = sqlx::query_as(
+        "SELECT id, asset_id, asset_checksum, pin_digest
+         FROM project_release_history_media_pin WHERE release_id = 'release-media'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("copied historical media pin");
+    assert_eq!(
+        retained_pin,
+        (
+            "pin-media".to_owned(),
+            media.id.clone(),
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_owned(),
+            "pin-digest".to_owned(),
+        )
+    );
+    let source_pin_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'project_release_media_pin'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("source pin table lookup");
+    assert_eq!(source_pin_table, 0);
 
     TaskMediaRepo::soft_delete_media(&db, &media.id, &now)
         .await
@@ -504,17 +267,6 @@ async fn immutable_release_pin_keeps_asset_referenced_after_task_cleanup() {
         .await
         .expect("task media lookup")
         .is_none());
-    let retained_project_url: String = sqlx::query_scalar(
-        "SELECT project_url FROM project_media_attachment
-         WHERE id = 'pinned-evidence' AND deleted_at IS NULL",
-    )
-    .fetch_one(db.pool())
-    .await
-    .expect("retained Project evidence URL");
-    assert_eq!(retained_project_url, project_url);
-    SharedMediaRepo::soft_delete_project_media_attachment(&db, "pinned-evidence", &now)
-        .await
-        .expect("remove non-pinned evidence attachment");
     let asset = SharedMediaRepo::get_media_asset(&db, &media.id)
         .await
         .expect("asset")
@@ -754,85 +506,8 @@ async fn project_media_tombstone_replay_compares_complete_user_receipt() {
 }
 
 #[tokio::test]
-async fn project_evidence_composite_rejects_cross_project_asset() {
-    let (db, project_id, task_id) = fixture_before_pr11().await;
-    let media = upload(&db, &task_id, "asset-cross-project").await;
-    let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO project (id, name, settings, created_at, updated_at)
-         VALUES ('project-media-other', 'Other', '{}', ?, ?)",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("other project");
-    sqlx::query(
-        "INSERT INTO project_milestone
-         (id, project_id, milestone_sequence, milestone_key, lifecycle, created_at, updated_at)
-         VALUES ('milestone-media-other', 'project-media-other', 1, 'M001', 'active', ?, ?)",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("other milestone");
-
-    let result = SharedMediaRepo::create_project_media_attachment_mutation(
-        &db,
-        CreateProjectMediaAttachmentMutation {
-            attachment: CreateProjectMediaAttachment {
-                id: "cross-project-evidence".to_owned(),
-                project_id: "project-media-other".to_owned(),
-                asset_id: media.id,
-                attachment_kind: "evidence".to_owned(),
-                task_media_id: None,
-                task_id: None,
-                milestone_id: Some("milestone-media-other".to_owned()),
-                milestone_check_id: None,
-                source_task_id: None,
-                source_execution_id: None,
-                source_validation_id: None,
-                acceptance_check_ids_json: "[]".to_owned(),
-                caption: Some("cross project".to_owned()),
-                evidence_kind: Some("screenshot".to_owned()),
-                checksum: Some(
-                    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_owned(),
-                ),
-                availability: "available".to_owned(),
-                project_url: None,
-                author_type: "user".to_owned(),
-                author_id: Some("user-media".to_owned()),
-                authorization_json: "{}".to_owned(),
-                created_at: now.clone(),
-            },
-            expected_milestone_version: 1,
-            idempotency_key: "cross-project-evidence".to_owned(),
-            mutation_fingerprint: "cross-project-fingerprint".to_owned(),
-            authorization_event_id: "auth-cross-project".to_owned(),
-        },
-    )
-    .await;
-    assert!(matches!(
-        result,
-        Err(db::DbError::NotFound) | Err(db::DbError::Check(_))
-    ));
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM project_media_attachment WHERE id = 'cross-project-evidence'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .expect("attachment count"),
-        0
-    );
-    let _ = project_id;
-}
-
-#[tokio::test]
-async fn queued_gc_is_restartable_and_rejects_new_typed_references() {
-    let (db, project_id, task_id) = fixture_before_pr11().await;
-    create_release(&db, &project_id).await;
+async fn queued_gc_is_restartable_and_rejects_forged_release_pins() {
+    let (db, project_id, task_id) = fixture().await;
     let media = upload(&db, &task_id, "asset-restart").await;
     let now = now_rfc3339();
     TaskMediaRepo::soft_delete_media(&db, &media.id, &now)
@@ -850,72 +525,24 @@ async fn queued_gc_is_restartable_and_rejects_new_typed_references() {
     assert_eq!(first_claim.len(), 1);
     let first_claim_version = first_claim[0].version;
 
-    let error = SharedMediaRepo::create_project_media_attachment(
-        &db,
-        CreateProjectMediaAttachment {
-            id: "late-attachment".to_owned(),
-            project_id: project_id.clone(),
-            asset_id: media.id.clone(),
-            attachment_kind: "evidence".to_owned(),
-            task_media_id: None,
-            task_id: None,
-            milestone_id: None,
-            milestone_check_id: None,
-            source_task_id: Some(task_id),
-            source_execution_id: None,
-            source_validation_id: None,
-            acceptance_check_ids_json: "[]".to_owned(),
-            caption: Some("late".to_owned()),
-            evidence_kind: Some("screenshot".to_owned()),
-            checksum: None,
-            availability: "available".to_owned(),
-            project_url: None,
-            author_type: "user".to_owned(),
-            author_id: Some("user-media".to_owned()),
-            authorization_json: "{}".to_owned(),
-            created_at: now.clone(),
-        },
-    )
-    .await
-    .expect_err("queued asset cannot be reattached");
-    assert!(matches!(error, db::DbError::Check(_)));
-
-    // The same interleaving must be rejected at the schema boundary, even if
-    // a caller bypasses the typed repository and inserts directly through
-    // SQLite while a worker owns the persisted lease.
-    let raw_attachment = sqlx::query(
-        "INSERT INTO project_media_attachment
-            (id, project_id, asset_id, attachment_kind, acceptance_check_ids_json,
-             availability, author_type, authorization_json, version, created_at, updated_at)
-         VALUES ('late-attachment-sql', ?, ?, 'evidence', '[]', 'available',
-                 'user', '{}', 1, ?, ?)",
-    )
-    .bind(&project_id)
-    .bind(&media.id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await;
-    assert!(
-        raw_attachment.is_err(),
-        "SQL attachment trigger must reject queued asset"
-    );
-
-    let raw_pin = sqlx::query(
-        "INSERT INTO project_release_media_pin
-            (id, project_id, release_id, asset_id, legacy_task_media_id,
+    // Release history has no public writer after the V121/V122 cutover. Its
+    // schema fence must still reject a forged pin while GC owns the asset.
+    let historical_pin_write = sqlx::query(
+        "INSERT INTO project_release_history_media_pin
+            (id, project_id, release_id, asset_id, attachment_id,
+             legacy_task_media_id, asset_checksum, attachment_digest,
              availability, pin_digest, created_at)
-         VALUES ('late-pin-sql', ?, 'release-media', ?, ?, 'available', 'late', ?)",
+         VALUES ('forged-history', ?, 'missing-release', ?, NULL, NULL,
+                 'checksum', 'attachment', 'available', 'digest', ?)",
     )
     .bind(&project_id)
-    .bind(&media.id)
     .bind(&media.id)
     .bind(&now)
     .execute(db.pool())
     .await;
     assert!(
-        raw_pin.is_err(),
-        "SQL release-pin trigger must reject queued asset"
+        historical_pin_write.is_err(),
+        "schema guard must reject forged release history pins"
     );
 
     // A worker restart sees the queued row again, and reconciliation remains

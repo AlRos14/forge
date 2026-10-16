@@ -228,6 +228,7 @@ export function ExecutionDetailPage({
   const [followUpMessage, setFollowUpMessage] = useState('')
   const [followUpConfig, setFollowUpConfig] = useState<ExecutionConfigValue | null>(null)
   const followUpTextareaRef = useRef<HTMLTextAreaElement>(null)
+  const followUpIdempotencyRef = useRef<{ identity: string; key: string } | null>(null)
 
   const [logsParams, setLogsParams] = useState<ExecutionLogsParams>({ tail: LOG_PAGE_LIMIT })
   const logsQuery = useExecutionLogs(
@@ -401,19 +402,29 @@ export function ExecutionDetailPage({
       toast.error('Choose an exact Agent identity before starting a child Execution')
       return
     }
+    const overrides = followUpConfig?.overrides
+      ? {
+          model_id: followUpConfig.overrides.model_id ?? null,
+          reasoning_effort: followUpConfig.overrides.reasoning_effort ?? null,
+          permission_policy: followUpConfig.overrides.permission_policy ?? null,
+        }
+      : null
+    const requestIdentity = JSON.stringify([executionId, trimmed, selectedAgentId, overrides])
+    if (followUpIdempotencyRef.current?.identity !== requestIdentity) {
+      followUpIdempotencyRef.current = {
+        identity: requestIdentity,
+        key: crypto.randomUUID(),
+      }
+    }
     const body: FollowUpRequest = {
+      idempotency_key: followUpIdempotencyRef.current.key,
       message: trimmed,
       agent_id: selectedAgentId,
-      overrides: followUpConfig?.overrides
-        ? {
-            model_id: followUpConfig.overrides.model_id ?? null,
-            reasoning_effort: followUpConfig.overrides.reasoning_effort ?? null,
-            permission_policy: followUpConfig.overrides.permission_policy ?? null,
-          }
-        : null,
+      overrides,
     }
     followUpExecution.mutate(body, {
       onSuccess: (response) => {
+        followUpIdempotencyRef.current = null
         saveRecentExecutionSelection(
           followUpConfig?.agentId,
           followUpConfig?.selection ?? {

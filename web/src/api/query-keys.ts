@@ -7,6 +7,7 @@ export const qk = {
   taskDiff: (taskId: string) => ['tasks', taskId, 'diff'] as const,
   taskDetail: (taskId: string) => ['tasks', taskId, 'detail'] as const,
   gates: (taskId: string) => ['tasks', taskId, 'gates'] as const,
+  workUnits: (taskId: string) => ['tasks', taskId, 'work-units'] as const,
   reviewExecutions: (taskId: string) => ['tasks', taskId, 'review-executions'] as const,
   validationRuns: (taskId: string) => ['tasks', taskId, 'validation-runs'] as const,
   agents: ['agents'] as const,

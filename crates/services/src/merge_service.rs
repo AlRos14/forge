@@ -2,10 +2,10 @@ use crate::gate_engine::GateEngine;
 use crate::task_integration_operation::TaskIntegrationOperationManager;
 use crate::{Result, ServiceError};
 use db::{
-    now_rfc3339, Execution, ExecutionRepo, GateEvaluation, GateEvaluationInput,
-    GateEvaluationOutcome, GateRepo, PageRequest, PrProviderConfigRepo, RepoRepo, SortBy,
-    SortOrder, SqliteDb, TaskIntegrationOperationRepo, TaskLifecycleRepo, TaskLifecycleState,
-    TaskRepo, WorkMode, WorkUnitRepo, WorkspaceRepo,
+    ExecutionRepo, GateEvaluation, GateEvaluationInput, GateEvaluationOutcome, GateRepo,
+    PageRequest, PrProviderConfigRepo, RepoRepo, SortBy, SortOrder, SqliteDb,
+    TaskIntegrationOperationRepo, TaskLifecycleRepo, TaskLifecycleState, TaskRepo, WorkMode,
+    WorkUnitRepo, WorkspaceRepo,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,6 @@ pub struct MergeService {
 
 struct TaskMergeSource {
     workspace: db::Workspace,
-    execution: Option<Execution>,
     branch: String,
 }
 
@@ -230,60 +229,10 @@ impl MergeService {
             }
 
             let before_sha = git::get_current_sha(repo_path).await?;
-            let worktree_sha = git::get_current_sha(worktree_path).await?;
-            if let Some(execution) = source.execution.as_ref() {
-                ExecutionRepo::update(
-                    &*self.db,
-                    db::UpdateExecution {
-                        id: execution.id.clone(),
-                        status: None,
-                        stop_reason: None,
-                        stopped_by: None,
-                        resume_policy: None,
-                        stopped_at: None,
-                        agent_session_id: None,
-                        agent_message_id: None,
-                        last_activity_at: None,
-                        summary: None,
-                        logs_path: None,
-                        before_sha: Some(Some(worktree_sha)),
-                        after_sha: None,
-                        error: None,
-                        executor_config_snapshot_json: None,
-                        updated_at: now_rfc3339(),
-                    },
-                )
-                .await?;
-            }
-
             git::checkout_branch(repo_path, &target_branch).await?;
             match git::merge_branch_into(repo_path, &source.branch).await {
                 Ok(()) => {
                     let after_sha = git::get_current_sha(repo_path).await?;
-                    if let Some(execution) = source.execution.as_ref() {
-                        ExecutionRepo::update(
-                            &*self.db,
-                            db::UpdateExecution {
-                                id: execution.id.clone(),
-                                status: None,
-                                stop_reason: None,
-                                stopped_by: None,
-                                resume_policy: None,
-                                stopped_at: None,
-                                agent_session_id: None,
-                                agent_message_id: None,
-                                last_activity_at: None,
-                                summary: None,
-                                logs_path: None,
-                                before_sha: None,
-                                after_sha: Some(Some(after_sha.clone())),
-                                error: None,
-                                executor_config_snapshot_json: None,
-                                updated_at: now_rfc3339(),
-                            },
-                        )
-                        .await?;
-                    }
                     Ok(MergeOutcome::Done {
                         before_sha,
                         after_sha,
@@ -319,7 +268,7 @@ impl MergeService {
                 .ok()
                 .and_then(|configured| configured.clone());
             if let Some(cleanup_scheduler) = cleanup_scheduler {
-                match WorkspaceRepo::get_by_task_id(&*self.db, &task_id).await {
+                match WorkspaceRepo::get_integration_by_task_id(&*self.db, &task_id).await {
                     Ok(Some(workspace)) => {
                         if let Err(error) = cleanup_scheduler.cleanup_now(&workspace.id).await {
                             tracing::warn!(task_id = %task_id, workspace_id = %workspace.id, %error, "post-merge workspace cleanup failed");
@@ -515,124 +464,77 @@ impl MergeService {
         }
         let inputs = GateRepo::list_gate_evaluation_inputs(&*self.db, &evaluation.id).await?;
         let work_units = WorkUnitRepo::list_by_task(&*self.db, task_id).await?;
-        let candidate = if work_units.is_empty() {
-            let mut candidate: Option<MergeCandidateSubject> = None;
-            for input in inputs.iter().filter(|input| {
-                matches!(
-                    input.input_kind.as_str(),
-                    "review_report" | "validation_run"
-                )
-            }) {
-                let subject = merge_candidate_subject(input)?;
-                if candidate
-                    .as_ref()
-                    .is_some_and(|current| current != &subject)
-                {
-                    return Err(ServiceError::Conflict(
-                        "merge Gate inputs refer to different workspace commits or snapshots"
-                            .to_owned(),
-                    ));
-                }
-                candidate = Some(subject);
-            }
-            candidate.ok_or_else(|| {
-                ServiceError::Conflict(
-                    "merge-readiness evaluation has no exact ReviewReport or ValidationRun candidate"
-                        .to_owned(),
-                )
-            })?
-        } else {
-            let mut integrations = Vec::new();
-            for input in inputs
-                .iter()
-                .filter(|input| input.input_kind == "work_unit_integration")
-            {
-                let integration = WorkUnitRepo::get_integration_by_id(&*self.db, &input.input_id)
-                    .await?
-                    .ok_or_else(|| {
-                        ServiceError::not_found("WorkUnitIntegration", input.input_id.clone())
-                    })?;
-                let subject = merge_candidate_subject(input)?;
-                if integration.task_id != task_id
-                    || integration.version != input.input_version
-                    || integration.outcome != db::WorkUnitIntegrationOutcome::Success
-                    || integration.target_workspace_id != subject.workspace_id
-                    || integration.target_after_sha.as_deref() != Some(subject.commit_sha.as_str())
-                {
-                    return Err(ServiceError::Conflict(
-                        "merge Gate WorkUnitIntegration input is no longer the exact successful integration"
-                            .to_owned(),
-                    ));
-                }
-                integrations.push((integration.created_at, integration.id, subject));
-            }
-            integrations.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
-            let (_, _, candidate) = integrations.pop().ok_or_else(|| {
-                ServiceError::Conflict(
-                    "Task with WorkUnits requires an exact successful WorkUnitIntegration input before merge"
-                        .to_owned(),
-                )
-            })?;
-            let mut verifier_subject: Option<MergeCandidateSubject> = None;
-            for input in inputs.iter().filter(|input| {
-                matches!(
-                    input.input_kind.as_str(),
-                    "review_report" | "validation_run"
-                )
-            }) {
-                let subject = merge_candidate_subject(input)?;
-                if subject.workspace_id != candidate.workspace_id
-                    || subject.commit_sha != candidate.commit_sha
-                {
-                    return Err(ServiceError::Conflict(
-                        "merge Gate ReviewReport or ValidationRun does not cover the exact integrated WorkUnit commit"
-                            .to_owned(),
-                    ));
-                }
-                if verifier_subject
-                    .as_ref()
-                    .is_some_and(|existing| existing != &subject)
-                {
-                    return Err(ServiceError::Conflict(
-                        "merge Gate ReviewReport and ValidationRun refer to different snapshots"
-                            .to_owned(),
-                    ));
-                }
-                verifier_subject = Some(subject);
-            }
-            candidate
-        };
-
-        if source.workspace.id != candidate.workspace_id {
-            return Err(ServiceError::Conflict(
-                "merge source Workspace differs from the exact GateEvaluation candidate".to_owned(),
-            ));
-        }
-        if let Some(execution) = source.execution.as_ref() {
-            if execution.status != db::ExecutionStatus::Completed
-                || execution.workspace_id.as_deref() != Some(candidate.workspace_id.as_str())
-                || execution
-                    .after_sha
-                    .as_deref()
-                    .is_some_and(|sha| sha != candidate.commit_sha)
-            {
-                return Err(ServiceError::Conflict(
-                    "merge source Execution does not match the exact GateEvaluation candidate"
-                        .to_owned(),
-                ));
-            }
-        } else if work_units.is_empty() {
-            return Err(ServiceError::Conflict(
-                "merge candidate has no exact completed source Execution".to_owned(),
+        if work_units.is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "Task merge requires an exact WorkUnit integration; a Task cannot select a source Execution by recency",
             ));
         }
         let current_sha = git::get_current_sha(Path::new(&source.workspace.worktree_path)).await?;
-        if current_sha != candidate.commit_sha {
+        let mut integrations = Vec::new();
+        for input in inputs
+            .iter()
+            .filter(|input| input.input_kind == "work_unit_integration")
+        {
+            let integration = WorkUnitRepo::get_integration_by_id(&*self.db, &input.input_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("WorkUnitIntegration", input.input_id.clone())
+                })?;
+            let subject = merge_candidate_subject(input)?;
+            if integration.task_id != task_id
+                || integration.version != input.input_version
+                || integration.outcome != db::WorkUnitIntegrationOutcome::Success
+                || integration.target_workspace_id != subject.workspace_id
+                || integration.target_after_sha.as_deref() != Some(subject.commit_sha.as_str())
+            {
+                return Err(ServiceError::Conflict(
+                    "merge Gate WorkUnitIntegration input is no longer the exact successful integration"
+                        .to_owned(),
+                ));
+            }
+            integrations.push(subject);
+        }
+        let matching_candidates: Vec<_> = integrations
+            .iter()
+            .filter(|candidate| {
+                candidate.workspace_id == source.workspace.id && candidate.commit_sha == current_sha
+            })
+            .collect();
+        if matching_candidates.len() != 1 {
             return Err(ServiceError::Conflict(
-                "merge source commit is stale relative to the exact GateEvaluation candidate"
+                "merge GateEvaluation must pin one exact successful WorkUnitIntegration for the current integration Workspace commit"
                     .to_owned(),
             ));
         }
+        let candidate = matching_candidates[0];
+        let mut verifier_subject: Option<MergeCandidateSubject> = None;
+        for input in inputs.iter().filter(|input| {
+            matches!(
+                input.input_kind.as_str(),
+                "review_report" | "validation_run"
+            )
+        }) {
+            let subject = merge_candidate_subject(input)?;
+            if subject.workspace_id != candidate.workspace_id
+                || subject.commit_sha != candidate.commit_sha
+            {
+                return Err(ServiceError::Conflict(
+                    "merge Gate ReviewReport or ValidationRun does not cover the exact integrated WorkUnit commit"
+                        .to_owned(),
+                ));
+            }
+            if verifier_subject
+                .as_ref()
+                .is_some_and(|existing| existing != &subject)
+            {
+                return Err(ServiceError::Conflict(
+                    "merge Gate ReviewReport and ValidationRun refer to different snapshots"
+                        .to_owned(),
+                ));
+            }
+            verifier_subject = Some(subject);
+        }
+
         let executions = ExecutionRepo::list_by_task(
             &*self.db,
             task_id,
@@ -654,7 +556,7 @@ impl MergeService {
                 "Task has a running Execution and cannot enter merge admission".to_owned(),
             ));
         }
-        Ok(candidate.commit_sha)
+        Ok(candidate.commit_sha.clone())
     }
 
     async fn ensure_current_gate_evaluation(
@@ -814,34 +716,6 @@ async fn read_conflict_paths(worktree_path: &Path) -> Vec<PathBuf> {
     }
 }
 
-async fn latest_executor_execution(db: &SqliteDb, task_id: &str) -> Result<Execution> {
-    let page = ExecutionRepo::list_by_task(
-        db,
-        task_id,
-        PageRequest {
-            cursor: None,
-            limit: 500,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await?;
-    page.items
-        .into_iter()
-        .find(|execution| {
-            execution.work_unit_id.is_none()
-                && execution.status == db::ExecutionStatus::Completed
-                && matches!(
-                    execution.role.as_str(),
-                    "executor" | "coder" | "worker" | "implementer"
-                )
-        })
-        .ok_or_else(|| ServiceError::InvalidOperation {
-            message: format!("task {task_id} has no executor execution"),
-        })
-}
-
 fn merge_candidate_subject(input: &GateEvaluationInput) -> Result<MergeCandidateSubject> {
     let subject: Value = serde_json::from_str(&input.subject_json).map_err(|error| {
         ServiceError::invalid_operation(format!(
@@ -920,30 +794,20 @@ fn merge_operation_status(result: &Result<MergeOutcome>) -> db::TaskIntegrationO
 }
 
 async fn task_merge_source(db: &SqliteDb, task_id: &str) -> Result<TaskMergeSource> {
-    if !WorkUnitRepo::list_by_task(db, task_id).await?.is_empty() {
-        let workspace = WorkspaceRepo::get_by_task_id(db, task_id)
-            .await?
-            .ok_or_else(|| {
-                ServiceError::invalid_operation("Task with WorkUnits has no integration workspace")
-            })?;
-        return Ok(TaskMergeSource {
-            branch: workspace.branch.clone(),
-            workspace,
-            execution: None,
-        });
+    if WorkUnitRepo::list_by_task(db, task_id).await?.is_empty() {
+        return Err(ServiceError::invalid_operation(
+            "Task merge requires an exact WorkUnit integration; no WorkUnit source can be inferred from Task Executions",
+        ));
     }
 
-    let execution = latest_executor_execution(db, task_id).await?;
-    let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
-        ServiceError::invalid_operation("executor execution missing workspace_id")
-    })?;
-    let workspace = WorkspaceRepo::get_by_id(db, workspace_id)
+    let workspace = WorkspaceRepo::get_integration_by_task_id(db, task_id)
         .await?
-        .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        .ok_or_else(|| {
+            ServiceError::invalid_operation("Task with WorkUnits has no integration workspace")
+        })?;
     Ok(TaskMergeSource {
-        branch: workspace::task_branch_name(task_id),
+        branch: workspace.branch.clone(),
         workspace,
-        execution: Some(execution),
     })
 }
 
@@ -1003,9 +867,32 @@ mod tests {
             .await
             .expect_err("legacy merge cannot bypass Gate admission");
         assert!(matches!(
-            error,
+            &error,
             ServiceError::InvalidOperation { message }
                 if message.contains("exact satisfied merge-readiness GateEvaluation")
         ));
+    }
+
+    #[tokio::test]
+    async fn task_merge_never_selects_a_task_execution_by_recency() {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        db::run_migrations(&pool).await.expect("migrations run");
+        let database = SqliteDb::new(pool);
+
+        let error = match task_merge_source(&database, "task-without-work-units").await {
+            Err(error) => error,
+            Ok(_) => panic!("Task without WorkUnits must not receive an inferred merge source"),
+        };
+        assert!(
+            matches!(
+                &error,
+                ServiceError::InvalidOperation { message }
+                    if message.contains("exact WorkUnit integration")
+                        && message.contains("no WorkUnit source can be inferred")
+            ),
+            "unexpected error: {error:?}"
+        );
     }
 }

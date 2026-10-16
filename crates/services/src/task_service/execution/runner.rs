@@ -3,14 +3,41 @@ use super::*;
 const EXECUTION_LOG_BATCH_MAX_ENTRIES: usize = 50;
 const EXECUTION_LOG_BATCH_MAX_WAIT: Duration = Duration::from_millis(500);
 
+fn provider_start_receipt_event(execution: &Execution, event_type: &str) -> db::CreateDomainEvent {
+    let actor = execution.actor_ref();
+    db::CreateDomainEvent {
+        id: new_uuid_v4(),
+        event_type: event_type.to_owned(),
+        entity_type: "execution".to_owned(),
+        entity_id: execution.id.clone(),
+        actor_type: actor
+            .as_ref()
+            .map(|actor| actor.kind().to_string())
+            .unwrap_or_else(|| "system".to_owned()),
+        actor_id: actor.as_ref().map(|actor| actor.id().to_owned()),
+        scope_type: "task".to_owned(),
+        scope_id: execution.task_id.clone(),
+        correlation_id: execution.id.clone(),
+        causation_id: execution.parent_execution_id.clone(),
+        causation_depth: i64::from(execution.parent_execution_id.is_some()),
+        dedupe_key: Some(format!("{event_type}:{}", execution.id)),
+        payload_json: serde_json::json!({
+            "execution_id": execution.id,
+            "task_id": execution.task_id,
+            "agent_id": execution.agent_id,
+            "outcome": event_type.strip_prefix("execution.provider_start_").unwrap_or_default(),
+        })
+        .to_string(),
+        created_at: now_rfc3339(),
+    }
+}
+
 impl TaskService {
     pub(crate) async fn freeze_review_subject_and_inputs(
         &self,
         execution: Execution,
     ) -> Result<Execution> {
-        if execution.role != crate::workflow::default_roles::REVIEWER
-            || execution.purpose != Some(ExecutionPurpose::Review)
-        {
+        if execution.role != "reviewer" || execution.purpose != Some(ExecutionPurpose::Review) {
             return Ok(execution);
         }
         let Some(workspace_id) = execution.workspace_id.as_deref() else {
@@ -146,7 +173,25 @@ impl TaskService {
                 "only running executions can be started",
             ));
         }
-        if execution.role == crate::workflow::default_roles::REVIEWER
+        let task_is_cancelled =
+            db::TaskLifecycleRepo::get_task_lifecycle(&*self.db, &execution.task_id)
+                .await?
+                .is_some_and(|lifecycle| lifecycle.state == db::TaskLifecycleState::Cancelled);
+        if task_is_cancelled {
+            self.cancel_active_execution(
+                &execution,
+                "cancelled by task cancellation",
+                db::StopReason::TaskCancelled,
+                &api_types::Actor::system(api_types::SystemComponent::CancelTask),
+                db::ResumePolicy::None,
+            )
+            .await?;
+            return Ok(api_types::ExecutionStartResult {
+                execution_id: execution.id,
+                accepted: false,
+            });
+        }
+        if execution.role == "reviewer"
             && execution.purpose == Some(ExecutionPurpose::Review)
             && self
                 .reconcile_existing_review_report(&execution, None, None)
@@ -178,10 +223,18 @@ impl TaskService {
             }
             return Err(error);
         }
-        let result = async {
-            if execution.role == crate::workflow::default_roles::REVIEWER
-                && execution.purpose == Some(ExecutionPurpose::Review)
-            {
+        if let Some(agent_id) = execution.agent_id.as_deref() {
+            let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
+            if agent.paused {
+                return Err(ServiceError::AgentPaused {
+                    agent_id: agent_id.to_owned(),
+                });
+            }
+        }
+        let prepared = async {
+            if execution.role == "reviewer" && execution.purpose == Some(ExecutionPurpose::Review) {
                 self.verify_execution_workspace_authority(&execution)
                     .await?;
             }
@@ -196,12 +249,12 @@ impl TaskService {
                     ));
                 }
             }
-            provider.start(params).await
+            Ok::<_, ServiceError>((execution, provider, params))
         }
         .await;
 
-        match result {
-            Ok(result) => Ok(result),
+        let (execution, provider, params) = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
                 let failure_message = error.to_string();
                 if let Err(mark_error) = self
@@ -214,7 +267,114 @@ impl TaskService {
                         "failed to mark execution failed after dispatch start error"
                     );
                 }
-                Err(error)
+                return Err(error);
+            }
+        };
+
+        #[cfg(test)]
+        if let Some(barrier) = self.provider_start_claim_barrier.as_ref() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+
+        let claim = ExecutionRepo::claim_provider_start(
+            &*self.db,
+            &execution.id,
+            provider_start_receipt_event(&execution, "execution.provider_start_attempted"),
+        )
+        .await?;
+        match claim {
+            db::ProviderStartClaim::Accepted => {
+                return Ok(api_types::ExecutionStartResult {
+                    execution_id: execution.id,
+                    accepted: true,
+                });
+            }
+            db::ProviderStartClaim::Rejected => {
+                self.fail_execution_before_dispatch(
+                    &execution.id,
+                    "provider durably rejected the execution Start".to_owned(),
+                )
+                .await?;
+                return Ok(api_types::ExecutionStartResult {
+                    execution_id: execution.id,
+                    accepted: false,
+                });
+            }
+            db::ProviderStartClaim::Uncertain => {
+                return Err(ServiceError::ExecutionStartUncertain {
+                    execution_id: execution.id,
+                });
+            }
+            db::ProviderStartClaim::AuthorityLost => {
+                let error = ServiceError::invalid_operation(
+                    "TaskRole membership, WorkUnit assignment, or WorkspaceLease authority changed before provider Start was claimed",
+                );
+                self.fail_execution_before_dispatch(&execution.id, error.to_string())
+                    .await?;
+                return Err(error);
+            }
+            db::ProviderStartClaim::TaskCancelled => {
+                self.cancel_active_execution(
+                    &execution,
+                    "cancelled by task cancellation",
+                    db::StopReason::TaskCancelled,
+                    &api_types::Actor::system(api_types::SystemComponent::CancelTask),
+                    db::ResumePolicy::None,
+                )
+                .await?;
+                return Ok(api_types::ExecutionStartResult {
+                    execution_id: execution.id,
+                    accepted: false,
+                });
+            }
+            db::ProviderStartClaim::Claimed => {}
+        }
+
+        let result = provider.start(params).await;
+        let outcome_event_type = match &result {
+            Ok(result) if result.accepted => "execution.provider_start_accepted",
+            Ok(_) => "execution.provider_start_rejected",
+            Err(_) => "execution.provider_start_uncertain",
+        };
+        let outcome_recorded = match ExecutionRepo::record_provider_start_outcome(
+            &*self.db,
+            &execution.id,
+            provider_start_receipt_event(&execution, outcome_event_type),
+        )
+        .await
+        {
+            Ok(_) => true,
+            Err(record_error) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    %record_error,
+                    "failed to persist provider Start outcome; the durable attempt receipt prevents replay"
+                );
+                false
+            }
+        };
+
+        match result {
+            Ok(result) if result.accepted => Ok(result),
+            Ok(result) if outcome_recorded => {
+                self.fail_execution_before_dispatch(
+                    &execution.id,
+                    "provider durably rejected the execution Start".to_owned(),
+                )
+                .await?;
+                Ok(result)
+            }
+            Ok(_) => Err(ServiceError::ExecutionStartUncertain {
+                execution_id: execution.id,
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    %execution_id,
+                    %error,
+                    "provider Start outcome is uncertain; retain the Running Execution and never replay the external request"
+                );
+                Err(ServiceError::ExecutionStartUncertain { execution_id })
             }
         }
     }
@@ -235,9 +395,7 @@ impl TaskService {
                 "only running executions can be executed",
             ));
         }
-        if execution.role == crate::workflow::default_roles::REVIEWER
-            && execution.purpose == Some(ExecutionPurpose::Review)
-        {
+        if execution.role == "reviewer" && execution.purpose == Some(ExecutionPurpose::Review) {
             if let Some((completed, _report)) = self
                 .reconcile_existing_review_report(&execution, None, None)
                 .await?
@@ -254,48 +412,9 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let orchestrator_execution = execution.role == "orchestrator"
-            && execution.purpose == Some(ExecutionPurpose::Orchestrate);
-        let workspace = if orchestrator_execution {
-            self.validate_orchestrator_execution(&execution).await?;
-            let path = self.orchestrator_context_path(&execution.id);
-            std::fs::create_dir_all(&path).map_err(|error| {
-                ServiceError::invalid_operation(format!(
-                    "failed to create isolated orchestrator context: {error}"
-                ))
-            })?;
-            Workspace {
-                id: format!("orchestrator:{}", execution.id),
-                task_id: task.id.clone(),
-                repo_id: task.repo_id.clone().unwrap_or_default(),
-                worktree_path: path.to_string_lossy().into_owned(),
-                branch: "orchestrator-read-only".to_owned(),
-                status: WorkspaceStatus::Ready,
-                before_sha: None,
-                cleanup_after: None,
-                error: None,
-                created_at: execution.created_at.clone(),
-                updated_at: execution.updated_at.clone(),
-            }
-        } else {
-            let workspace_id = execution
-                .workspace_id
-                .as_deref()
-                .ok_or_else(|| ServiceError::invalid_operation("execution missing workspace_id"))?;
-            let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-            self.verify_active_workspace_lease(
-                &task,
-                &workspace,
-                &execution.role,
-                execution.agent_id.as_deref(),
-                &execution.id,
-            )
-            .await?;
-            workspace
-        };
-        let workspace_id = workspace.id.as_str();
+        let working_context = self.resolve_execution_working_context(&execution).await?;
+        let worktree_path = working_context.path.to_string_lossy().into_owned();
+        let execution_lock_key = working_context.lock_key.as_str();
         let snapshot = execution
             .executor_config_snapshot_json
             .as_deref()
@@ -304,7 +423,7 @@ impl TaskService {
             })?;
         let mut agent_config = parse_json_value("executor config snapshot", snapshot)?;
         crate::task_service::config::validate_agent_routing_snapshot(&agent_config)?;
-        if execution.role == crate::workflow::default_roles::REVIEWER
+        if execution.role == "reviewer"
             || matches!(
                 task.task_type.as_str(),
                 "planning" | "discovery" | "review" | "validation"
@@ -327,7 +446,7 @@ impl TaskService {
         }
         let max_turns = self.resolve_max_turns(&task).await?;
         let logs_path = self
-            .resolve_execution_logs_path(&execution, &task, &workspace, &execution_id)
+            .resolve_execution_logs_path(&execution, &task, &execution_id)
             .await?;
         if let Some(parent) = std::path::Path::new(&logs_path).parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
@@ -335,50 +454,61 @@ impl TaskService {
             })?;
         }
 
-        if let Some(terminal_activity) = self.terminal_activity.as_ref() {
+        if let (Some(terminal_activity), Some(workspace)) = (
+            self.terminal_activity.as_ref(),
+            working_context.workspace.as_ref(),
+        ) {
             if terminal_activity
-                .workspace_has_active_terminal(workspace_id)
+                .workspace_has_active_terminal(&workspace.id)
                 .await
             {
                 return Err(ServiceError::TerminalActiveExecution {
-                    workspace_id: workspace_id.to_owned(),
+                    workspace_id: workspace.id.clone(),
                 });
             }
         }
         let _exec_lock_guard = if let Some(locks) = self.workspace_exec_locks.as_ref() {
-            if let Some(guard) = locks.try_acquire(workspace_id) {
-                if let Some(terminal_activity) = self.terminal_activity.as_ref() {
+            if let Some(guard) = locks.try_acquire(execution_lock_key) {
+                if let (Some(terminal_activity), Some(workspace)) = (
+                    self.terminal_activity.as_ref(),
+                    working_context.workspace.as_ref(),
+                ) {
                     if terminal_activity
-                        .workspace_has_active_terminal(workspace_id)
+                        .workspace_has_active_terminal(&workspace.id)
                         .await
                     {
                         return Err(ServiceError::TerminalActiveExecution {
-                            workspace_id: workspace_id.to_owned(),
+                            workspace_id: workspace.id.clone(),
                         });
                     }
                 }
                 Some(guard)
             } else {
-                if let Some(terminal_activity) = self.terminal_activity.as_ref() {
+                if let (Some(terminal_activity), Some(workspace)) = (
+                    self.terminal_activity.as_ref(),
+                    working_context.workspace.as_ref(),
+                ) {
                     if terminal_activity
-                        .workspace_has_active_terminal(workspace_id)
+                        .workspace_has_active_terminal(&workspace.id)
                         .await
                     {
                         return Err(ServiceError::TerminalActiveExecution {
-                            workspace_id: workspace_id.to_owned(),
+                            workspace_id: workspace.id.clone(),
                         });
                     }
                 }
-                self.event_bus.publish(events::ForgeEvent {
-                    event_type: "workspace.execution_waiting".to_owned(),
-                    entity_id: workspace_id.to_owned(),
-                    timestamp: events::event_timestamp(),
-                    context: events::EventContext::WorkspaceExecutionWaiting {
-                        workspace_id: workspace_id.to_owned(),
-                        task_id: task.id.clone(),
-                    },
-                });
-                Some(locks.acquire(workspace_id).await)
+                if let Some(workspace) = working_context.workspace.as_ref() {
+                    self.event_bus.publish(events::ForgeEvent {
+                        event_type: "workspace.execution_waiting".to_owned(),
+                        entity_id: workspace.id.clone(),
+                        timestamp: events::event_timestamp(),
+                        context: events::EventContext::WorkspaceExecutionWaiting {
+                            workspace_id: workspace.id.clone(),
+                            task_id: task.id.clone(),
+                        },
+                    });
+                }
+                Some(locks.acquire(execution_lock_key).await)
             }
         } else {
             None
@@ -418,8 +548,7 @@ impl TaskService {
             return Err(error);
         }
 
-        let is_review_execution = execution_before_launch.role
-            == crate::workflow::default_roles::REVIEWER
+        let is_review_execution = execution_before_launch.role == "reviewer"
             && execution_before_launch.purpose == Some(ExecutionPurpose::Review);
         let mut review_worktree_snapshot = None;
         let mut review_snapshot_digest = None;
@@ -427,9 +556,11 @@ impl TaskService {
             && execution_before_launch.workspace_id.is_some()
             && executors::is_worktree_read_only(&agent_config)
         {
-            let worktree_path = std::path::Path::new(&workspace.worktree_path);
+            let worktree_path = std::path::Path::new(&worktree_path);
             let digest_before =
-                match crate::ValidationService::snapshot_digest(&workspace.worktree_path).await {
+                match crate::ValidationService::snapshot_digest(&worktree_path.to_string_lossy())
+                    .await
+                {
                     Ok(digest) => digest,
                     Err(error) => {
                         return self
@@ -454,7 +585,9 @@ impl TaskService {
                 }
             };
             let digest_after =
-                match crate::ValidationService::snapshot_digest(&workspace.worktree_path).await {
+                match crate::ValidationService::snapshot_digest(&worktree_path.to_string_lossy())
+                    .await
+                {
                     Ok(digest) => digest,
                     Err(error) => {
                         return self
@@ -495,6 +628,11 @@ impl TaskService {
             .freeze_review_subject_and_inputs(execution_before_launch)
             .await?;
         let review_subject = if let Some(snapshot) = review_worktree_snapshot.as_ref() {
+            let workspace = working_context.workspace.as_ref().ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Review Execution has no persisted Workspace for its frozen subject",
+                )
+            })?;
             let subject = ExecutionRepo::get_review_execution_subject(&*self.db, &execution.id)
                 .await?
                 .ok_or_else(|| {
@@ -502,10 +640,8 @@ impl TaskService {
                         "local Review Execution did not persist its exact workspace subject",
                     )
                 })?;
-            let live_digest =
-                crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
-            let live_head =
-                git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await?;
+            let live_digest = crate::ValidationService::snapshot_digest(&worktree_path).await?;
+            let live_head = git::get_current_sha(std::path::Path::new(&worktree_path)).await?;
             if subject.workspace_id != workspace.id
                 || subject.head_commit_sha != snapshot.head_sha()
                 || Some(subject.workspace_snapshot_digest.as_str())
@@ -535,7 +671,7 @@ impl TaskService {
                 stopped_by: None,
                 resume_policy: None,
                 stopped_at: None,
-                agent_session_id: None,
+                external_session_id: None,
                 agent_message_id: None,
                 last_activity_at: Some(Some(launch_activity_at)),
                 summary: None,
@@ -704,7 +840,7 @@ impl TaskService {
             && execution.workspace_id.is_some()
             && executors::is_worktree_read_only(&agent_config)
         {
-            Some(git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await?)
+            Some(git::get_current_sha(std::path::Path::new(&worktree_path)).await?)
         } else {
             None
         };
@@ -729,10 +865,8 @@ impl TaskService {
             .await?
         };
         let prelaunch_review_error = if let Some(subject) = review_subject.as_ref() {
-            let current_head =
-                git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await;
-            let current_digest =
-                crate::ValidationService::snapshot_digest(&workspace.worktree_path).await;
+            let current_head = git::get_current_sha(std::path::Path::new(&worktree_path)).await;
+            let current_digest = crate::ValidationService::snapshot_digest(&worktree_path).await;
             match (current_head, current_digest) {
                 (Ok(head), Ok(digest))
                     if head == subject.head_commit_sha
@@ -779,7 +913,7 @@ impl TaskService {
                     task_id: task.id.clone(),
                     execution_id: execution_id.clone(),
                     role: execution.role.clone(),
-                    worktree_path: workspace.worktree_path.clone(),
+                    worktree_path: worktree_path.clone(),
                     description,
                     agent_config,
                     logs_path: logs_path.clone(),
@@ -796,15 +930,13 @@ impl TaskService {
         if let (Some(snapshot), Some(subject)) =
             (review_worktree_snapshot.as_ref(), review_subject.as_ref())
         {
-            let restore = snapshot
-                .restore(std::path::Path::new(&workspace.worktree_path))
-                .await;
+            let restore = snapshot.restore(std::path::Path::new(&worktree_path)).await;
             match restore {
                 Ok(()) => {
                     let restored_head =
-                        git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await;
+                        git::get_current_sha(std::path::Path::new(&worktree_path)).await;
                     let restored_digest =
-                        crate::ValidationService::snapshot_digest(&workspace.worktree_path).await;
+                        crate::ValidationService::snapshot_digest(&worktree_path).await;
                     match (restored_head, restored_digest) {
                         (Ok(head), Ok(digest))
                             if head == subject.head_commit_sha
@@ -834,7 +966,7 @@ impl TaskService {
         let restore_result = if review_worktree_snapshot.is_some() {
             Ok(())
         } else if let Some(head) = read_only_head.as_deref() {
-            git::restore_worktree(std::path::Path::new(&workspace.worktree_path), head)
+            git::restore_worktree(std::path::Path::new(&worktree_path), head)
                 .await
                 .map_err(ServiceError::from)
         } else {
@@ -847,7 +979,7 @@ impl TaskService {
             let backup_path = snapshot.preserve_for_diagnostics();
             tracing::error!(
                 execution_id = %execution_id,
-                workspace_path = %workspace.worktree_path,
+                workspace_path = %worktree_path,
                 snapshot_backup_path = %backup_path.display(),
                 %error,
                 "read-only Review workspace could not be restored to its exact subject"
@@ -928,7 +1060,7 @@ impl TaskService {
             }
         }
 
-        if current_execution.role == crate::workflow::default_roles::REVIEWER
+        if current_execution.role == "reviewer"
             && current_execution.purpose == Some(ExecutionPurpose::Review)
             && result.status == ExecutionOutcome::Completed
         {
@@ -1062,7 +1194,7 @@ impl TaskService {
                 stopped_by,
                 resume_policy,
                 stopped_at,
-                agent_session_id: Some(result.agent_session_id),
+                external_session_id: Some(result.agent_session_id),
                 agent_message_id: None,
                 last_activity_at: Some(Some(now.clone())),
                 summary: Some(result.summary),
@@ -1208,6 +1340,10 @@ impl TaskService {
         &self,
         execution: &Execution,
     ) -> Result<Arc<dyn crate::daemon_transport::ExecutionProvider>> {
+        #[cfg(test)]
+        if let Some(provider) = self.execution_provider_override.as_ref() {
+            return Ok(Arc::clone(provider));
+        }
         let daemon_id =
             crate::daemon_transport::router::resolved_daemon_id_for_execution(execution)?;
         if let Some(registry) = self.daemon_connections.as_ref() {
@@ -1257,27 +1393,12 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let workspace_path = if execution.role == "orchestrator"
-            && execution.purpose == Some(ExecutionPurpose::Orchestrate)
-        {
-            self.validate_orchestrator_execution(execution).await?;
-            let path = self.orchestrator_context_path(&execution.id);
-            std::fs::create_dir_all(&path).map_err(|error| {
-                ServiceError::invalid_operation(format!(
-                    "failed to create isolated orchestrator context: {error}"
-                ))
-            })?;
-            path.to_string_lossy().into_owned()
-        } else {
-            let workspace_id = execution
-                .workspace_id
-                .as_deref()
-                .ok_or_else(|| ServiceError::invalid_operation("execution missing workspace_id"))?;
-            WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?
-                .worktree_path
-        };
+        let workspace_path = self
+            .resolve_execution_working_context(execution)
+            .await?
+            .path
+            .to_string_lossy()
+            .into_owned();
         let snapshot = execution
             .executor_config_snapshot_json
             .as_deref()
@@ -1286,7 +1407,7 @@ impl TaskService {
             })?;
         let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
         crate::task_service::config::validate_agent_routing_snapshot(&executor_config)?;
-        if execution.role == crate::workflow::default_roles::REVIEWER
+        if execution.role == "reviewer"
             || matches!(
                 task.task_type.as_str(),
                 "planning" | "discovery" | "review" | "validation"
@@ -1380,89 +1501,20 @@ impl TaskService {
         execution: &Execution,
         max_turns: Option<u32>,
     ) -> Result<()> {
-        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
         let message = match max_turns {
             Some(limit) => format!("Execution stopped after reaching max_turns={limit}"),
             None => "Execution stopped after reaching max_turns".to_owned(),
         };
-        let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: api_types::FailureKind::MaxTurnsExceeded,
-            blocking_reason: "max_turns_exceeded".to_owned(),
-            blocked_by: Some(
-                api_types::Actor::system(api_types::SystemComponent::Executor).display(),
-            ),
-            blocked_at: Some(now_rfc3339()),
-            blocked_execution_id: Some(execution.id.clone()),
-            artifact: Some(api_types::BlockingArtifact {
-                kind: "execution".to_owned(),
-                id: Some(execution.id.clone()),
-                log_path: execution.logs_path.clone(),
-            }),
-            message: Some(message.clone()),
-            hook: None,
-            recovery_actions: vec![
-                api_types::RecoveryAction::ResetToInitial,
-                api_types::RecoveryAction::CancelTask,
-            ],
-        };
-        let blocked_meta = json!({
-            "reason": message,
-            "created_at": now_rfc3339(),
-            "kind": "max_turns_exceeded",
-            "execution_id": execution.id,
-        });
-        let updated = TaskRepo::update_status(
-            &*self.db,
-            db::UpdateTaskStatus {
-                id: task.id.clone(),
-                expected_version: task.version,
-                status: task.status,
-                assignee_id: None,
-                error_annotation: Some(Some(serde_json::to_string(&annotation).map_err(
-                    |error| {
-                        ServiceError::invalid_operation(format!(
-                            "failed to serialize max-turns annotation: {error}"
-                        ))
-                    },
-                )?)),
-                blocked_json: Some(Some(blocked_meta.to_string())),
-                failed_json: Some(None),
-                updated_at: now_rfc3339(),
-            },
+        self.annotate_execution_block(
+            execution,
+            api_types::FailureKind::MaxTurnsExceeded,
+            message,
+            None,
         )
-        .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            updated.id, updated.version
-        ))
-        .await;
-        self.publish(ForgeEvent {
-            event_type: "task.blocked".to_owned(),
-            entity_id: updated.id,
-            timestamp: event_timestamp(),
-            context: EventContext::TaskBlocked {
-                project_id: updated.project_id,
-                reason: "max_turns_exceeded".to_owned(),
-                kind: Some(api_types::FailureKind::MaxTurnsExceeded),
-                source: None,
-                execution_id: Some(execution.id.clone()),
-            },
-        });
-        Ok(())
+        .await
     }
 
     async fn resolve_max_turns(&self, task: &Task) -> Result<Option<u32>> {
-        if let Some(value) = task
-            .task_state_config
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-            .and_then(|value| max_turns_from_value(&value))
-        {
-            return Ok(Some(value));
-        }
-
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -1475,13 +1527,12 @@ impl TaskService {
         &self,
         execution: &Execution,
         task: &Task,
-        workspace: &Workspace,
         execution_id: &str,
     ) -> Result<String> {
         let durable_path = execution_logs_path(
             &self.workspace_root,
             &task.project_id,
-            &workspace.task_id,
+            &task.id,
             execution_id,
         );
         let Some(stored_path) = execution.logs_path.as_deref() else {

@@ -91,15 +91,7 @@ pub enum ResumePolicy {
 pub enum RecoveryAction {
     ResumeSession,
     Reexecute,
-    ResetToInitial,
     CancelTask,
-    MarkReviewed,
-    RetryHook,
-    ResumeProcess,
-    UpdateWorkspaceAndRetryHook,
-    SkipHookOnce,
-    ProceedOnce,
-    OpenInteractive,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -395,16 +387,6 @@ impl std::fmt::Display for TaskAnnotation {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewStatus {
-    Running,
-    AwaitingHuman,
-    Passed,
-    Failed,
-    Cancelled,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -419,16 +401,6 @@ pub enum AuthorType {
 pub enum HumanDecision {
     Approved,
     Rejected,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, Default, PartialEq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub struct ReviewConfig {
-    #[serde(default)]
-    pub ci_steps: Vec<String>,
-    #[serde(default)]
-    pub review_prompt: Option<String>,
 }
 
 #[cfg(test)]

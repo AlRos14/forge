@@ -5,8 +5,10 @@ truth.
 
 PR8 makes reviewer Executions and ReviewReport Artifacts authoritative for new
 review results, and ValidationRuns/Evidence authoritative for deterministic
-checks. Legacy Review and `review_evidence_bundle` rows remain historical until
-PR13; they do not satisfy a PR9 Gate.
+checks. V131 archives exact legacy Review and `review_evidence_bundle` rows in
+`pr13_legacy_record_history` and drops their runtime tables. V099 provenance
+ledgers remain detached migration history; none of these legacy rows satisfy a
+PR9 Gate.
 
 ## Validation
 

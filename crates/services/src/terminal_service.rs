@@ -217,7 +217,8 @@ impl TerminalService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let Some(workspace) = WorkspaceRepo::get_by_task_id(&*self.db, task_id).await? else {
+        let Some(workspace) = WorkspaceRepo::get_integration_by_task_id(&*self.db, task_id).await?
+        else {
             availability.reason = Some(api_types::TERMINAL_WORKSPACE_NOT_READY.to_owned());
             return Ok(availability);
         };
@@ -747,7 +748,7 @@ impl TerminalService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let workspace = WorkspaceRepo::get_by_task_id(&*self.db, task_id)
+        let workspace = WorkspaceRepo::get_integration_by_task_id(&*self.db, task_id)
             .await?
             .ok_or(ServiceError::TerminalWorkspaceNotReady)?;
         let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &workspace.id)
@@ -1649,7 +1650,6 @@ mod tests {
                 id: project_id.clone(),
                 name: "Terminal Project".to_owned(),
                 settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
                 primary_repo_id: None,
                 owner_id: Some(TEST_USER_ID.to_owned()),
                 created_at: now.clone(),
@@ -1681,16 +1681,13 @@ mod tests {
                 project_id,
                 repo_id: Some(repo_id.clone()),
                 parent_task_id: None,
-                assignee_type: None,
-                assignee_id: None,
                 title: "Terminal task".to_owned(),
                 description: None,
                 task_type: "implementation".to_owned(),
-                status: "todo".to_owned(),
+                lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
                 subtask_order: None,
-                task_state_config: None,
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),

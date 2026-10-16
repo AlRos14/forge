@@ -7,7 +7,7 @@ async fn pr8_validation_service_records_exact_pass_fail_stale_and_retry_identity
     let event_bus = Arc::new(EventBus::new(32));
     let validation = crate::ValidationService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let temp = TempDir::new().expect("workspace temp directory creates");
     let worktree_path = temp.path().join("worktree");
     std::fs::create_dir_all(&worktree_path).expect("worktree directory creates");
@@ -207,7 +207,7 @@ async fn pr8_validation_idempotency_identity_includes_staged_workspace_state() {
     let db = Arc::new(sqlite_db().await);
     let validation = crate::ValidationService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
     let (project_id, repo_id, _) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let temp = TempDir::new().expect("workspace temp directory creates");
     let worktree_path = temp.path().join("worktree");
     std::fs::create_dir_all(&worktree_path).expect("worktree directory creates");

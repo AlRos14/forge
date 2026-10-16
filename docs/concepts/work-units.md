@@ -45,6 +45,26 @@ Execution without destroying the scope. Runnable, blocked, running, and
 awaiting-integration are derived from the WorkUnit, dependencies, Executions,
 Workspaces, and integration outcomes.
 
+TaskLifecycle is aggregate Task progress. An Execution admission normally
+resolves an Execution-owned block only when the current lifecycle reference,
+blocking annotation (when present), and exact parent Execution identify the
+same open WorkUnit. A sibling cannot clear a block owned by another WorkUnit.
+If crash recovery or timeout reconciliation had to stop multiple Executions
+and the aggregate block has no single owner, an authorized Human may select
+one exact cancelled Manual Execution with its WorkUnit and current versions.
+The selection
+atomically resolves the ambiguous Task block and admits that exact child;
+remaining WorkUnits retain their own pending Execution history and can be
+selected while the Task is Active. An Auto crash or graceful-shutdown candidate
+continues only by resuming its same active, explicitly linked HarnessSession;
+if that session is not reusable, automatic dispatch waits for an exact Human
+selection. The Human may explicitly authorize a fresh child for a cancelled
+Auto candidate. `error_annotation` and `blocked_json` carry
+different details; each present field must independently identify its owner
+before admission may clear it. Lifecycle activation, metadata cleanup, the
+child Execution, and its idempotency receipt commit together. A manual
+lifecycle transition cannot bypass pending blocking metadata.
+
 An assigned WorkUnit is runnable only while its Actor still has active
 membership in the WorkUnit's TaskRole. If membership is suspended or ended,
 readiness asks for reallocation; it does not change the historical assignment
@@ -84,6 +104,22 @@ An Execution may target a WorkUnit and records the exact WorkUnit ID and
 admitted version. A WorkUnit can have retries or historical attempts, but
 every attempt is a separate Execution with immutable Actor, Role, Purpose,
 WorkUnit, Workspace, and session references.
+
+The Execution admission transaction also records that an Agent provider Start
+is pending. The existing dispatcher may retry only until it atomically records
+the one provider-start attempt. A pause before that claim leaves the committed
+Execution pending for a later tick; an uncertain provider response cannot
+authorize another external Start. Admission receipts and the WorkspaceLease
+remain attached to the same Execution throughout recovery.
+
+Heartbeat expiry, daemon reports, and restart recovery treat a pending receipt
+as queued work rather than an external provider effect. If a required Workspace
+or lease authority has expired, recovery terminalizes the still-pending
+Execution and blocks the Task without reviving the lease. This write is
+conditional on the absence of the provider-attempt receipt, so a concurrent
+Start attempt keeps its existing uncertain or accepted recovery behavior.
+Explicit Task cancellation still cancels pending work locally and cleans up
+Running Executions even if recovery had already transitioned the Task lifecycle.
 
 ## Isolation
 

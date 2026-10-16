@@ -27,7 +27,6 @@ impl HookActionHandler for CreateTaskAction<'_> {
                 self.task_type.map(task_type_to_string),
                 None,
                 None,
-                None,
             )
             .await?;
         Ok(ActionOutcome::completed(format!(

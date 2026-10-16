@@ -1,4 +1,4 @@
-//! Project-scoped media and milestone-evidence routes.
+//! Project-scoped shared media routes.
 //!
 //! Project media is an authorized projection over the shared `media_asset`
 //! row.  The bytes are never copied when an asset is attached as evidence;
@@ -6,10 +6,7 @@
 
 use std::path::{Component, Path as StdPath, PathBuf};
 
-use api_types::{
-    AttachEvidenceRequest, EvidenceAttachment, EvidenceAttachmentListResponse,
-    EvidenceAvailability, EvidenceKind, MediaAsset, ProjectMediaListResponse,
-};
+use api_types::{EvidenceAvailability, MediaAsset, ProjectMediaListResponse};
 use axum::{
     extract::{Multipart, Path, Query, State},
     http::{
@@ -20,9 +17,8 @@ use axum::{
     Json,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, CreateProjectMediaAsset, CreateProjectMediaAttachment,
-    CreateProjectMediaAttachmentMutation, ProjectMediaTombstone, ProjectMemberRepo, ProjectRepo,
-    SharedMediaRepo, SoftDeleteProjectMediaAttachmentMutation,
+    new_uuid_v4, now_rfc3339, CreateProjectMediaAsset, ProjectMediaTombstone, ProjectMemberRepo,
+    ProjectRepo, SharedMediaRepo,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -34,8 +30,6 @@ use crate::{
     state::AppState,
 };
 
-const EVIDENCE_ATTACH_ACTION: &str = "project.evidence.attach";
-const EVIDENCE_REMOVE_ACTION: &str = "project.evidence.remove";
 const MEDIA_UPLOAD_ACTION: &str = "project.media.upload";
 const MEDIA_REDACT_ACTION: &str = "project.media.redact";
 const MEDIA_PURGE_ACTION: &str = "project.media.purge";
@@ -55,12 +49,6 @@ const ALLOWED_CONTENT_TYPES: &[&str] = &[
 
 #[derive(Debug, Deserialize)]
 pub struct MediaListQuery {
-    pub cursor: Option<String>,
-    pub limit: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct EvidenceListQuery {
     pub cursor: Option<String>,
     pub limit: Option<i64>,
 }
@@ -109,9 +97,10 @@ pub async fn list_media(
             .ok_or_else(|| ApiError::internal("project media row disappeared during listing"))?;
         let asset = reconcile_asset_checksum(&state, asset).await?;
         let task_media_ids = sqlx::query_scalar::<_, String>(
-            "SELECT task_media_id FROM project_media_attachment
-             WHERE project_id = ? AND asset_id = ? AND task_media_id IS NOT NULL
-               AND deleted_at IS NULL ORDER BY id ASC",
+            "SELECT tm.id FROM task_media tm
+             JOIN task t ON t.id = tm.task_id
+             WHERE t.project_id = ? AND tm.asset_id = ? AND tm.deleted_at IS NULL
+             ORDER BY tm.id ASC",
         )
         .bind(&project_id)
         .bind(&asset_id)
@@ -493,205 +482,6 @@ async fn tombstone_media(
     )?))
 }
 
-pub async fn attach_evidence(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path((project_id, milestone_id)): Path<(String, String)>,
-    Json(request): Json<AttachEvidenceRequest>,
-) -> ApiResult<Json<EvidenceAttachment>> {
-    crate::routes::projects::require_project_mutable(&state, &project_id, &user.user_id).await?;
-    if request.milestone_id != milestone_id {
-        return Err(ApiError::bad_request(
-            "milestone_id in the path and request must match",
-        ));
-    }
-    validate_authorization(
-        &request.mutation.authorization,
-        &user.user_id,
-        EVIDENCE_ATTACH_ACTION,
-    )?;
-    if request.mutation.idempotency_key.trim().is_empty() {
-        return Err(ApiError::bad_request("idempotency_key is required"));
-    }
-    let asset = SharedMediaRepo::get_media_asset(&*state.db, &request.asset_id)
-        .await?
-        .filter(|asset| asset.project_id == project_id)
-        .ok_or_else(|| ApiError::not_found("media", request.asset_id.clone()))?;
-    if asset.deleted_at.is_some() || asset.availability != "available" {
-        return Err(ApiError::conflict_with_code(
-            "media.unavailable",
-            "media asset is not available",
-        ));
-    }
-    let asset = reconcile_asset_checksum(&state, asset).await?;
-    if !is_sha256_digest(&request.checksum)
-        || asset.checksum.as_deref() != Some(request.checksum.as_str())
-    {
-        return Err(ApiError::conflict_with_code(
-            "media.digest_mismatch",
-            "evidence checksum does not match the asset",
-        ));
-    }
-    let now = now_rfc3339();
-    let attachment = SharedMediaRepo::create_project_media_attachment_mutation(
-        &*state.db,
-        CreateProjectMediaAttachmentMutation {
-            attachment: CreateProjectMediaAttachment {
-                id: new_uuid_v4(),
-                project_id: project_id.clone(),
-                asset_id: asset.id.clone(),
-                attachment_kind: "evidence".to_owned(),
-                // A Project evidence attachment is a new reference to the
-                // shared bytes.  Reusing the legacy task_media_id here would
-                // violate the legacy one-row uniqueness constraint when the
-                // same Task asset is cited by more than one milestone.
-                task_media_id: None,
-                task_id: request.task_id.clone(),
-                milestone_id: Some(milestone_id.clone()),
-                milestone_check_id: None,
-                source_task_id: request.task_id.clone(),
-                source_execution_id: request.source_run_id.clone(),
-                source_validation_id: request.source_validation_id.clone(),
-                acceptance_check_ids_json: serde_json::to_string(&request.acceptance_check_ids)
-                    .map_err(|error| ApiError::bad_request(error.to_string()))?,
-                caption: Some(request.caption.clone()),
-                evidence_kind: Some(evidence_kind_name(request.kind).to_owned()),
-                checksum: Some(request.checksum.clone()),
-                availability: "available".to_owned(),
-                project_url: Some(project_media_url(&project_id, &asset.id)),
-                author_type: "user".to_owned(),
-                author_id: Some(user.user_id.clone()),
-                authorization_json: serde_json::to_string(&request.mutation.authorization)
-                    .map_err(|error| ApiError::bad_request(error.to_string()))?,
-                created_at: now.clone(),
-            },
-            expected_milestone_version: request.mutation.expected_version,
-            idempotency_key: request.mutation.idempotency_key.clone(),
-            mutation_fingerprint: mutation_digest(&request),
-            authorization_event_id: request.mutation.authorization.event_id.clone(),
-        },
-    )
-    .await?;
-    Ok(Json(evidence_attachment_response(attachment)?))
-}
-
-pub async fn list_evidence(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path((project_id, milestone_id)): Path<(String, String)>,
-    Query(query): Query<EvidenceListQuery>,
-) -> ApiResult<Json<EvidenceAttachmentListResponse>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
-    let (cursor_created_at, cursor_id) = decode_cursor(query.cursor.as_deref())?
-        .map_or((None, None), |(created_at, id)| {
-            (Some(created_at), Some(id))
-        });
-    let limit = query.limit.unwrap_or(20).clamp(1, 100);
-    let mut statement = sqlx::query(
-        "SELECT * FROM project_media_attachment
-         WHERE project_id = ? AND milestone_id = ?
-           AND attachment_kind = 'evidence' AND deleted_at IS NULL
-         ORDER BY created_at ASC, id ASC LIMIT ?",
-    );
-    if let (Some(created_at), Some(id)) = (cursor_created_at, cursor_id) {
-        statement = sqlx::query(
-            "SELECT * FROM project_media_attachment
-             WHERE project_id = ? AND milestone_id = ?
-               AND attachment_kind = 'evidence' AND deleted_at IS NULL
-               AND (created_at > ? OR (created_at = ? AND id > ?))
-             ORDER BY created_at ASC, id ASC LIMIT ?",
-        )
-        .bind(&project_id)
-        .bind(&milestone_id)
-        .bind(created_at.clone())
-        .bind(created_at)
-        .bind(id)
-        .bind(limit + 1);
-    } else {
-        statement = statement
-            .bind(&project_id)
-            .bind(&milestone_id)
-            .bind(limit + 1);
-    }
-    let mut rows = statement.fetch_all(state.db.pool()).await?;
-    let has_more = rows.len() > limit as usize;
-    rows.truncate(limit as usize);
-    let mut items = Vec::with_capacity(rows.len());
-    for row in rows {
-        items.push(evidence_attachment_response(map_attachment_row(&row)?)?);
-    }
-    let next_cursor = has_more
-        .then(|| {
-            items
-                .last()
-                .map(|item| encode_cursor(&item.created_at, &item.id))
-        })
-        .flatten();
-    Ok(Json(EvidenceAttachmentListResponse {
-        items,
-        next_cursor,
-        has_more,
-    }))
-}
-
-pub async fn get_evidence(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path((project_id, milestone_id, evidence_id)): Path<(String, String, String)>,
-) -> ApiResult<Json<EvidenceAttachment>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
-    let row = sqlx::query(
-        "SELECT * FROM project_media_attachment
-         WHERE id = ? AND project_id = ? AND milestone_id = ?
-           AND attachment_kind = 'evidence' AND deleted_at IS NULL",
-    )
-    .bind(&evidence_id)
-    .bind(&project_id)
-    .bind(&milestone_id)
-    .fetch_optional(state.db.pool())
-    .await?
-    .ok_or_else(|| ApiError::not_found("evidence", evidence_id))?;
-    Ok(Json(evidence_attachment_response(map_attachment_row(
-        &row,
-    )?)?))
-}
-
-pub async fn remove_evidence(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path((project_id, milestone_id, evidence_id)): Path<(String, String, String)>,
-    Json(request): Json<api_types::MutationEnvelope>,
-) -> ApiResult<StatusCode> {
-    crate::routes::projects::require_project_mutable(&state, &project_id, &user.user_id).await?;
-    validate_authorization(
-        &request.authorization,
-        &user.user_id,
-        EVIDENCE_REMOVE_ACTION,
-    )?;
-    if request.idempotency_key.trim().is_empty() {
-        return Err(ApiError::bad_request("idempotency_key is required"));
-    }
-    SharedMediaRepo::soft_delete_project_media_attachment_mutation(
-        &*state.db,
-        SoftDeleteProjectMediaAttachmentMutation {
-            id: evidence_id.clone(),
-            project_id,
-            milestone_id,
-            expected_version: request.expected_version,
-            idempotency_key: request.idempotency_key.clone(),
-            mutation_fingerprint: mutation_digest(&request),
-            actor_type: "user".to_owned(),
-            actor_id: Some(user.user_id),
-            authorization_json: serde_json::to_string(&request.authorization)
-                .map_err(|error| ApiError::bad_request(error.to_string()))?,
-            authorization_event_id: request.authorization.event_id,
-            deleted_at: now_rfc3339(),
-        },
-    )
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 fn media_asset_response_from_model(
     asset: db::MediaAsset,
     task_media_ids: Vec<String>,
@@ -725,92 +515,6 @@ fn media_asset_response_from_model(
         stable_project_url,
         created_at: asset.created_at,
         deleted_at: asset.deleted_at,
-    })
-}
-
-fn map_attachment_row(row: &sqlx::sqlite::SqliteRow) -> ApiResult<db::ProjectMediaAttachment> {
-    Ok(db::ProjectMediaAttachment {
-        id: row.try_get("id")?,
-        project_id: row.try_get("project_id")?,
-        asset_id: row.try_get("asset_id")?,
-        attachment_kind: row.try_get("attachment_kind")?,
-        task_media_id: row.try_get("task_media_id")?,
-        task_id: row.try_get("task_id")?,
-        milestone_id: row.try_get("milestone_id")?,
-        milestone_check_id: row.try_get("milestone_check_id")?,
-        source_task_id: row.try_get("source_task_id")?,
-        source_execution_id: row.try_get("source_execution_id")?,
-        source_validation_id: row.try_get("source_validation_id")?,
-        acceptance_check_ids_json: row.try_get("acceptance_check_ids_json")?,
-        caption: row.try_get("caption")?,
-        evidence_kind: row.try_get("evidence_kind")?,
-        checksum: row.try_get("checksum")?,
-        availability: row.try_get("availability")?,
-        project_url: row.try_get("project_url")?,
-        author_type: row.try_get("author_type")?,
-        author_id: row.try_get("author_id")?,
-        authorization_json: row.try_get("authorization_json")?,
-        version: row.try_get("version")?,
-        created_at: row.try_get("created_at")?,
-        deleted_at: row.try_get("deleted_at")?,
-        updated_at: row.try_get("updated_at")?,
-    })
-}
-
-fn evidence_attachment_response(row: db::ProjectMediaAttachment) -> ApiResult<EvidenceAttachment> {
-    if row.attachment_kind != "evidence" {
-        return Err(ApiError::internal(
-            "persisted Project media attachment kind is invalid",
-        ));
-    }
-    let acceptance_check_ids =
-        serde_json::from_str(&row.acceptance_check_ids_json).map_err(|error| {
-            ApiError::internal(format!("persisted evidence JSON is invalid: {error}"))
-        })?;
-    let caption = row
-        .caption
-        .ok_or_else(|| ApiError::internal("persisted evidence caption is missing"))?;
-    let checksum = row
-        .checksum
-        .filter(|checksum| is_sha256_digest(checksum))
-        .ok_or_else(|| ApiError::internal("persisted evidence checksum is unavailable"))?;
-    let author_type = match row.author_type.as_str() {
-        "user" => api_types::PrincipalKind::User,
-        "agent" => api_types::PrincipalKind::Agent,
-        "system" => api_types::PrincipalKind::System,
-        _ => {
-            return Err(ApiError::internal(
-                "persisted evidence author type is unknown",
-            ));
-        }
-    };
-    let author_id = row
-        .author_id
-        .filter(|id| !id.trim().is_empty())
-        .ok_or_else(|| ApiError::internal("persisted evidence author id is missing"))?;
-    Ok(EvidenceAttachment {
-        id: row.id,
-        project_id: row.project_id,
-        asset_id: row.asset_id,
-        task_id: row.task_id,
-        source_task_id: row.source_task_id,
-        source_run_id: row.source_execution_id,
-        source_validation_id: row.source_validation_id,
-        milestone_id: row.milestone_id,
-        acceptance_check_ids,
-        caption,
-        kind: evidence_kind(row.evidence_kind.as_deref())?,
-        checksum,
-        availability: evidence_availability(&row.availability)?,
-        author: api_types::PrincipalRef {
-            kind: author_type,
-            id: author_id,
-            display_name: None,
-        },
-        captured_at: row.created_at.clone(),
-        version: row.version,
-        created_at: row.created_at,
-        removed_at: row.deleted_at,
     })
 }
 
@@ -1231,27 +935,6 @@ fn decode_cursor(value: Option<&str>) -> ApiResult<Option<(String, String)>> {
     Ok(Some((timestamp.to_owned(), id.to_owned())))
 }
 
-fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
-    match kind {
-        EvidenceKind::Screenshot => "screenshot",
-        EvidenceKind::WalkthroughVideo => "walkthrough_video",
-        EvidenceKind::Log => "log",
-        EvidenceKind::Report => "report",
-        EvidenceKind::Other => "other",
-    }
-}
-
-fn evidence_kind(value: Option<&str>) -> ApiResult<EvidenceKind> {
-    match value {
-        Some("screenshot") => Ok(EvidenceKind::Screenshot),
-        Some("walkthrough_video") => Ok(EvidenceKind::WalkthroughVideo),
-        Some("log") => Ok(EvidenceKind::Log),
-        Some("report") => Ok(EvidenceKind::Report),
-        Some("other") => Ok(EvidenceKind::Other),
-        _ => Err(ApiError::internal("persisted evidence kind is unknown")),
-    }
-}
-
 fn evidence_availability(value: &str) -> ApiResult<EvidenceAvailability> {
     match value {
         "available" => Ok(EvidenceAvailability::Available),
@@ -1310,8 +993,6 @@ mod tests {
 
     #[test]
     fn persisted_media_enums_fail_closed() {
-        assert!(evidence_kind(Some("unknown")).is_err());
-        assert!(evidence_kind(None).is_err());
         assert!(evidence_availability("unknown").is_err());
         assert!(evidence_availability("available").is_ok());
     }

@@ -723,11 +723,6 @@ async fn test_app(
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
     ));
-    let review_runner = Arc::new(review::ReviewRunner::new(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-        Arc::clone(&adapter_registry),
-    ));
 
     let mut config = config::ForgeConfig::default();
     config.forge.data_dir = data_dir.to_path_buf();
@@ -742,7 +737,6 @@ async fn test_app(
             adapter_registry,
             merge_service,
             cleanup_scheduler,
-            review_runner,
             api::state::ShutdownSignal::new(),
             data_dir.join("workflows"),
             api::state::test_jwt_secret(),

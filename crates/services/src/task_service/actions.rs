@@ -2,10 +2,7 @@ use super::execution::resumable_external_session;
 use super::*;
 
 use api_types::{Actor, TaskAction, UserActionSource};
-use db::{
-    AssigneeKind, ExecutionRepo, PageRequest, SortBy, SortOrder, TaskLifecycleRepo, TaskRepo,
-    TaskRoleAssignmentRepo, WorkspaceRepo,
-};
+use db::{ExecutionRepo, PageRequest, SortBy, SortOrder, TaskLifecycleRepo, TaskRepo};
 
 #[derive(Debug)]
 pub struct TaskActionResult {
@@ -69,28 +66,40 @@ impl TaskService {
         if !available.contains(&action) {
             return Err(ServiceError::TaskActionUnavailable {
                 available_actions: available,
-                reason: unavailable_reason(action, &task, lifecycle.state),
+                reason: unavailable_reason(action, lifecycle.state),
             });
         }
 
         let actor = Actor::user(UserActionSource::Api);
         let result = match action {
             TaskAction::Start => {
-                let agent_id = self.action_agent_id(&task).await?;
-                self.claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
-                    .await?
-                    .task
+                return Err(ServiceError::invalid_operation(
+                    "Task-level start is retired; create and allocate an exact WorkUnit first",
+                ));
             }
             TaskAction::Pause => {
-                let execution =
-                    self.latest_running_execution(&task.id)
-                        .await?
-                        .ok_or_else(|| ServiceError::TaskActionUnavailable {
-                            available_actions: Vec::new(),
-                            reason: "task has no running execution to pause".to_owned(),
-                        })?;
+                let running = self
+                    .task_executions(&task.id)
+                    .await?
+                    .into_iter()
+                    .filter(|execution| execution.status == ExecutionStatus::Running)
+                    .collect::<Vec<_>>();
+                if running.len() != 1
+                    || !crate::task_service::execution::has_exact_work_unit_target(
+                        &self.db,
+                        &task.id,
+                        &running[0],
+                    )
+                    .await?
+                {
+                    return Err(ServiceError::TaskActionUnavailable {
+                        available_actions: Vec::new(),
+                        reason: "pause requires exactly one running Execution bound to an exact WorkUnit; use the Execution action when targets are ambiguous".to_owned(),
+                    });
+                }
+                let execution = &running[0];
                 self.pause_execution(
-                    execution.id,
+                    execution.id.clone(),
                     reason
                         .clone()
                         .unwrap_or_else(|| "paused by user".to_owned()),
@@ -138,36 +147,66 @@ impl TaskService {
         lifecycle_state: db::TaskLifecycleState,
     ) -> Result<Vec<TaskAction>> {
         let executions = self.task_executions(&task.id).await?;
-        let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
-            .await?
-            .map(|workspace| workspace.id);
         let is_terminal = matches!(
             lifecycle_state,
             db::TaskLifecycleState::Done | db::TaskLifecycleState::Cancelled
         );
-        let running = executions
+        let running_executions = executions
             .iter()
-            .any(|execution| execution.status == ExecutionStatus::Running);
-        let mut resumable = false;
+            .filter(|execution| execution.status == ExecutionStatus::Running)
+            .collect::<Vec<_>>();
+        let running = running_executions.len() == 1
+            && crate::task_service::execution::has_exact_work_unit_target(
+                &self.db,
+                &task.id,
+                running_executions[0],
+            )
+            .await?;
+        let mut exact_stopped = Vec::new();
         for execution in &executions {
             if execution.status != ExecutionStatus::Running
-                && resumable_external_session(
-                    &self.db,
-                    execution,
-                    execution.agent_id.as_deref(),
-                    current_workspace_id.as_deref(),
+                && crate::task_service::execution::has_exact_work_unit_target(
+                    &self.db, &task.id, execution,
                 )
                 .await?
-                .is_some()
             {
-                resumable = true;
-                break;
+                exact_stopped.push(execution);
             }
         }
-        let has_previous_execution = executions.iter().any(|execution| {
-            execution.status != ExecutionStatus::Running && execution.agent_id.is_some()
-        });
-        let has_agent = self.action_agent_id(task).await.is_ok();
+        let annotated_execution = task
+            .error_annotation
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<api_types::TaskAnnotation>(raw).ok())
+            .and_then(|annotation| match annotation {
+                api_types::TaskAnnotation::Blocking(annotation) => annotation.blocked_execution_id,
+                api_types::TaskAnnotation::Legacy(_) => None,
+            })
+            .and_then(|id| {
+                exact_stopped
+                    .iter()
+                    .copied()
+                    .find(|execution| execution.id == id)
+            });
+        let resume_candidate =
+            annotated_execution.or_else(|| (exact_stopped.len() == 1).then(|| exact_stopped[0]));
+        let resumable = if let Some(execution) = resume_candidate {
+            if resumable_external_session(
+                &self.db,
+                execution,
+                execution.agent_id.as_deref(),
+                execution.workspace_id.as_deref(),
+            )
+            .await?
+            .is_some()
+            {
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let has_previous_execution = annotated_execution.is_some() || exact_stopped.len() == 1;
         let retry_budget_exhausted =
             crate::task_failure_retry::TaskFailureRetryService::has_exhausted_retry_budget(
                 &self.db, &task.id,
@@ -175,9 +214,6 @@ impl TaskService {
             .await?;
 
         let mut actions = Vec::new();
-        if lifecycle_state == db::TaskLifecycleState::Ready && has_agent {
-            actions.push(TaskAction::Start);
-        }
         if running {
             actions.push(TaskAction::Pause);
         }
@@ -187,7 +223,6 @@ impl TaskService {
             retry_budget_exhausted,
             resumable,
             has_previous_execution,
-            has_agent,
         ) {
             actions.push(TaskAction::Resume);
         }
@@ -211,161 +246,72 @@ impl TaskService {
             if annotation
                 .recovery_actions
                 .contains(&api_types::RecoveryAction::ResumeSession)
+                && annotation.blocked_execution_id.is_some()
             {
-                match self
+                return self
                     .recover_task(
                         task.id.clone(),
                         api_types::RecoveryAction::ResumeSession,
                         Some("resumed by user".to_owned()),
-                        context.clone(),
+                        context,
                     )
-                    .await
-                {
-                    Ok(task) => return Ok(task),
-                    Err(ServiceError::InvalidOperation { message })
-                        if message.contains("no resumable session") => {}
-                    Err(error) => return Err(error),
-                }
+                    .await;
             }
         }
 
         let executions = self.task_executions(&task.id).await?;
-        let current_workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
-            .await?
-            .map(|workspace| workspace.id);
-        let mut resumable_execution = None;
+        let mut exact_stopped = Vec::new();
         for execution in &executions {
             if execution.status != ExecutionStatus::Running
-                && resumable_external_session(
-                    &self.db,
-                    execution,
-                    execution.agent_id.as_deref(),
-                    current_workspace_id.as_deref(),
+                && crate::task_service::execution::has_exact_work_unit_target(
+                    &self.db, &task.id, execution,
                 )
                 .await?
-                .is_some()
             {
-                resumable_execution = Some(execution);
-                break;
+                exact_stopped.push(execution);
             }
         }
-        if let Some(execution) = resumable_execution {
+        if exact_stopped.len() == 1 {
+            let execution = exact_stopped[0];
             let launched = self
-                .follow_up_execution(
-                    execution.id.clone(),
-                    context.clone().unwrap_or_else(|| {
-                        "Resume work from the latest worker session.".to_owned()
-                    }),
-                    // The selected Execution supplies causal lineage only.
-                    // Follow-up must select the current RoleMembership Actor
-                    // before deciding whether that Actor may reuse the
-                    // lineage HarnessSession.
-                    None,
-                    None,
-                )
+                .re_execute_execution_with_context(execution.id.clone(), context)
                 .await?;
             self.start_execution(launched.execution.id).await?;
             return Ok(launched.task);
         }
-
-        if let Some(execution) = executions.iter().find(|execution| {
-            execution.status != ExecutionStatus::Running && execution.agent_id.is_some()
-        }) {
-            let launched = self
-                .re_execute_execution_with_context(execution.id.clone(), context.clone())
-                .await?;
-            self.start_execution(launched.execution.id).await?;
-            return Ok(launched.task);
-        }
-
-        let agent_id = self.action_agent_id(task).await?;
-        let role = task_execution_role(task);
-        let _launched = self
-            .dispatch_initial_role_execution(
-                &task.id,
-                &agent_id,
-                role,
-                crate::task_service::execution::execution_purpose_for_task_type(
-                    &task.task_type,
-                    role,
-                ),
-                context.unwrap_or_else(|| "Resume task work.".to_owned()),
-            )
-            .await?;
-        TaskRepo::get_by_id(&*self.db, &task.id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
-    }
-
-    async fn action_agent_id(&self, task: &Task) -> Result<String> {
-        let role = task_execution_role(task);
-        if let Some(memberships) =
-            crate::task_service::current_role_memberships_authoritative(&self.db, &task.id, role)
-                .await?
-        {
-            let selected = if task.repo_id.is_some() {
-                crate::task_service::select_usable_repository_agent_id(
-                    &self.db,
-                    &task.project_id,
-                    &memberships,
-                )
-                .await?
-            } else {
-                crate::task_service::select_usable_agent_id(&self.db, &memberships).await?
-            };
-            return selected.ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "no active Agent membership is available for TaskRole {role}"
-                ))
-            });
-        }
-
-        let legacy_roles: &[&str] = if role == "implementer" {
-            &["implementer", "coder", "worker", "assignee", "executor"]
+        let reason = if exact_stopped.len() > 1 {
+            "Task has multiple stopped WorkUnit Executions; recovery requires an exact blocked_execution_id"
         } else {
-            &[role]
+            "Task has no stopped Execution bound to an exact open WorkUnit"
         };
-        for legacy_role in legacy_roles {
-            if let Some(assignment) =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, legacy_role)
-                    .await?
-            {
-                if assignment.assignee_type == Some(AssigneeKind::Agent) {
-                    if let Some(agent_id) = assignment.assignee_id {
-                        return Ok(agent_id);
-                    }
-                }
-            }
-        }
-        Err(ServiceError::invalid_operation(format!(
-            "TaskRole {role} has no assigned Agent"
-        )))
+        Err(ServiceError::TaskActionUnavailable {
+            available_actions: Vec::new(),
+            reason: reason.to_owned(),
+        })
     }
 
     async fn task_executions(&self, task_id: &str) -> Result<Vec<Execution>> {
-        Ok(ExecutionRepo::list_by_task(
-            &*self.db,
-            task_id,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?
-        .items)
-    }
-
-    async fn latest_running_execution(&self, task_id: &str) -> Result<Option<Execution>> {
-        Ok(self
-            .task_executions(task_id)
-            .await?
-            .into_iter()
-            .find(|execution| {
-                execution.work_unit_id.is_none() && execution.status == ExecutionStatus::Running
-            }))
+        let mut executions = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = ExecutionRepo::list_by_task(
+                &*self.db,
+                task_id,
+                PageRequest {
+                    cursor,
+                    limit: 100,
+                    include_total: false,
+                    sort_by: SortBy::CreatedAt,
+                    sort_order: SortOrder::Desc,
+                },
+            )
+            .await?;
+            executions.extend(page.items);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                return Ok(executions);
+            }
+        }
     }
 }
 
@@ -375,16 +321,13 @@ fn should_offer_resume(
     retry_budget_exhausted: bool,
     resumable: bool,
     has_previous_execution: bool,
-    has_agent: bool,
 ) -> bool {
     !matches!(
         lifecycle,
         db::TaskLifecycleState::ReadyToMerge | db::TaskLifecycleState::Merging
     ) && !is_terminal
         && !retry_budget_exhausted
-        && (resumable
-            || has_previous_execution
-            || (lifecycle == db::TaskLifecycleState::Active && has_agent))
+        && (resumable || has_previous_execution)
 }
 
 fn should_offer_cancel(lifecycle: db::TaskLifecycleState) -> bool {
@@ -421,7 +364,6 @@ mod tests {
             false,
             true,
             true,
-            true,
         ));
         assert!(should_offer_resume(
             TaskLifecycleState::Active,
@@ -429,7 +371,6 @@ mod tests {
             false,
             false,
             true,
-            false,
         ));
         assert!(!should_offer_resume(
             TaskLifecycleState::Merging,
@@ -437,26 +378,16 @@ mod tests {
             false,
             false,
             true,
-            true,
         ));
         assert!(!should_offer_cancel(TaskLifecycleState::Merging));
         assert!(should_offer_cancel(TaskLifecycleState::Active));
     }
 }
 
-fn task_execution_role(task: &Task) -> &'static str {
-    crate::task_service::execution::task_role_for_task_type(&task.task_type)
-}
-
-fn unavailable_reason(
-    action: TaskAction,
-    task: &Task,
-    lifecycle: db::TaskLifecycleState,
-) -> String {
+fn unavailable_reason(action: TaskAction, lifecycle: db::TaskLifecycleState) -> String {
     format!(
-        "action '{}' is not available while Task lifecycle is '{}' (legacy status '{}')",
+        "action '{}' is not available while Task lifecycle is '{}'",
         action_name(action),
-        lifecycle,
-        task.status
+        lifecycle
     )
 }
