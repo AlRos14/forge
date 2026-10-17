@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="ForgeAILab/forge"
+REPO="AlRos14/forge"
 PREFIX="${PREFIX:-/usr/local}"
 BINARY_DIR="${BINARY_DIR:-${PREFIX}/bin}"
 SHARE_DIR="${SHARE_DIR:-${PREFIX}/share/forge}"

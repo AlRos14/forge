@@ -1,124 +1,115 @@
-# CLAUDE.md
+# CLAUDE.md / AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides repository guidance to coding agents.
 
-The user-facing entry point is [README.md](README.md). Deeper material is split across `docs/`:
-- [docs/architecture.md](docs/architecture.md) — target Actor/harness orchestration architecture and preserved infrastructure.
-- [docs/migration/architecture-v2.md](docs/migration/architecture-v2.md) — Plan PR-by-Plan PR migration contract, invariants, and current dependency audit.
-- [docs/api.md](docs/api.md) — REST surface, pagination, MCP tools.
-- [docs/getting-started.md](docs/getting-started.md) — install, configuration, end-to-end walkthrough.
-- [docs/cli.md](docs/cli.md) — `forge-ctl` reference.
+The user-facing entry point is [README.md](README.md). Current implementation contracts:
 
-When you change behavior, update the relevant `docs/` file in the same change. Treat README as a launch landing page — keep it short and link out.
+- [docs/architecture.md](docs/architecture.md) — post-PR13 runtime, authority, and persistence.
+- [docs/migration/architecture-v2.md](docs/migration/architecture-v2.md) — ordered PR0–PR15 migration contract and invariants INV-001–INV-037.
+- [docs/concepts/](docs/concepts/) — Actor, role, execution, WorkUnit, review, validation, Gate, and collaboration contracts.
+- [docs/api.md](docs/api.md) — REST, MCP, and SSE.
+- [docs/getting-started.md](docs/getting-started.md) — source build and end-to-end REST walkthrough.
+- [docs/cli.md](docs/cli.md) — forge-ctl reference.
+- [docs/upstream.md](docs/upstream.md) — origin, independent maintenance, and MIT attribution.
 
-## Project status: Public Beta (`0.1.x`)
+When behavior or a public contract changes, update the affected documentation in the same change. Keep README short and link to details.
 
-Forge is in public beta. The local-first single-user product is shipping to real users, but we are still pre-`1.0` and pre-stable.
+## Product state
 
-What that means for changes you make:
+The workspace source version is 0.8.0. This repository has no verified published GitHub release as of the PR14 documentation audit. Build from this repository to use the current implementation; do not present ForgeAILab npm, Homebrew, installer, or release artifacts as this fork's distribution.
 
-- **Breaking changes are allowed**, but they must be **visible**: update [CHANGELOG.md](CHANGELOG.md) under the `Unreleased` section with a `### Breaking` entry, and bump the workspace version when cutting a release. Silent breakage is no longer acceptable now that users exist.
-- **No backward-compat shims, no `_v2` suffixes, no deprecated aliases.** When something changes, update all call sites and delete the old code. Express the break in the changelog, not in the source.
-- **No feature flags for rollout safety.** Ship the new behavior directly.
-- **Database migrations must preserve user data** unless the user explicitly opts in to a destructive migration (e.g. a hard schema reset for the dev `./test` data dir). Add a new numbered migration; do not edit historical ones.
-- **Public surfaces** — REST endpoints, MCP tool names, `forge-ctl` flag names, event payload shapes, JSONL log schema, on-disk file layout — are the ones to be most deliberate about. Internal Rust APIs and crate boundaries can still move freely.
-- When a spec/design changes, rewrite the affected code to match. Don't layer the new design on top of the old one.
+PR13 is merged. The current implementation uses the Actor and harness orchestration model, TaskLifecycle, TaskRole/RoleMembership, WorkUnits, explicit Executions and HarnessSessions, deterministic Gates, and generic collaboration. Main Agent, Project Agent, Agent Chat, Product Genesis, Project OS operations, legacy Attention, and the old WorkflowEngine are retired from current runtime/public authority. Their migration provenance and historical snapshots remain historical evidence.
 
-If you find yourself writing `// kept for backward compatibility`, a `_v2` suffix, a re-export shim, or a deprecated alias — stop, just change the code, and note the break in the changelog.
+The product name remains Forge until its owner provides a new name. Do not rename public or persisted identifiers, crates, commands, packages, variables, paths, or database records without that exact decision and a reviewed preservation plan.
 
-A stable `1.0` will land once the workflow engine consolidation, multi-user story, and release artifact hardening (signing, SBOMs, Homebrew, Windows builds) are finalized. Until then, assume the public surface is still moving.
+## Change rules
 
-## Build & test commands
+- Breaking public changes must be visible in CHANGELOG.md under Unreleased; do not introduce compatibility aliases or silent legacy behavior.
+- Preserve installed user data. Add forward numbered migrations and never edit historical migration files. Any destructive test reset must be limited to disposable ./test data.
+- Treat REST routes, MCP tool names/schemas, forge-ctl flags, SSE payloads, JSONL logs, configuration, and on-disk paths as deliberate public contracts.
+- When a design changes, update the implementation and its callers to match the current contract; do not layer retired authority back into the runtime.
+- Read Architecture and Architecture V2 before changing domain wiring, Execution, WorkUnit, workspace, role assignment, Gate, or TaskLifecycle.
+- TaskLifecycle is the only current Task state authority. TaskRole and RoleMembership define responsibility and eligibility; WorkUnit allocation defines executable scope. Do not infer an Actor, Workspace, or HarnessSession from a Task or the latest Execution.
+- A WorkUnit must be explicitly created and allocated before Agent Execution. forge-ctl currently has no WorkUnit creation command.
+- Project visibility is not write authority. Preserve exact Actor, RoleMembership, WorkUnit, WorkspaceLease, and provider-start checks.
+- Durable records are authoritative; EventBus and SSE are delivery/projection mechanisms.
+- Preserve MIT licensing and upstream attribution.
+
+## Build and check commands
 
 ```bash
-cargo build                          # Build entire workspace
-cargo test                           # Run all tests
-cargo test -p db                     # Run tests for a specific crate
-cargo test -p api --test happy_path  # End-to-end happy-path test
-cargo run -p forge-client -- --help  # forge-ctl CLI client
-cargo build -p forge-client          # Build forge-ctl binary
+cargo build
+cargo test
+cargo test -p db
+cargo test -p api --test happy_path
+cargo run --locked -p forge-client -- --help
+cargo build -p forge-client
 cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all
-FORGE_SKIP_WEB_BUILD=1 cargo check -p forge-cli  # Skip pnpm web build during Rust-only work
+cargo fmt --all -- --check
+FORGE_SKIP_WEB_BUILD=1 cargo check -p forge-cli
 ```
 
-The happy-path test (`crates/api/tests/happy_path.rs`) is the canonical end-to-end smoke and a forcing function for spec alignment — if you break it, you probably need to revisit the spec, not the test.
+The Rust build script installs the locked web dependencies and builds the frontend unless FORGE_SKIP_WEB_BUILD=1 is set. Do not run cargo clean; reuse the existing target cache. Choose checks proportional to the change. Documentation-only changes do not need a workspace Rust build.
 
-### Running the server
+The API happy-path test is a focused end-to-end contract test. Lifecycle changes must name touched invariants and keep the relevant lifecycle/API tests green.
 
-Use the Makefile targets for local dev and manual/agent testing — they all point data at `./test/` (gitignored) instead of `~/.forge/`, so test state never pollutes real user data:
+### Local server and web UI
+
+Use Makefile targets for local testing. They use the disposable ./test/ data directory; make dev binds to 127.0.0.1:8080 for the Vite proxy. The direct server default binds to 127.0.0.1:0, selects an available loopback port, and saves it in server.json.
 
 ```bash
-make dev               # start server → ./test data dir (default for testing)
-make dev-demo          # same + seed demo data (idempotent)
-make dev-no-daemon     # server only, no embedded AI daemon
-make frontend          # Vite dev server on :5173, proxies /api to :8080
-make clean-test        # wipe ./test directory and start fresh
+make dev
+make dev-demo
+make dev-no-daemon
+make frontend
+make clean-test
 ```
 
-Direct invocations (when you need flags not covered by `make`):
+make clean-test removes only ./test/. It must not be used against ~/.forge or another real data directory.
+
+Frontend checks:
 
 ```bash
-cargo run -p forge-cli -- --data-dir ./test           # explicit local data dir
-cargo run -p forge-cli -- --no-mcp                    # disable MCP endpoint
-FORGE_DATA_DIR=./test cargo run -p forge-cli          # env-var equivalent
-# Server always binds to 127.0.0.1:8080
+cd web
+pnpm install --frozen-lockfile
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm build
+pnpm run e2e
 ```
 
-### Frontend
+pnpm is the package manager. Do not add npm or Yarn lockfiles.
 
-```bash
-cd web && pnpm install && pnpm dev    # Vite dev server on :5173, proxies /api to :8080
-cd web && pnpm build                  # Production build to web/dist/
-cd web && pnpm lint && pnpm typecheck && pnpm test
-```
+## Architecture and implementation conventions
 
-`pnpm` is the package manager (enforced by `pnpm-lock.yaml`). Don't introduce `npm` or `yarn` lockfiles.
-
-## When working on this repo
-
-- **Read `docs/architecture.md` and `docs/migration/architecture-v2.md` before changing domain wiring, execution, workflow, role assignment, or task lifecycle.** The target Actor/harness contract is authoritative; the current workflow and singular-assignee paths are transitional until their named Plan PRs.
-- **Public-API changes touch four places**: the route handler in `crates/api/src/routes/`, the request/response type in `crates/api-types/`, the generated TS types under `web/src/types/generated/`, and `docs/api.md`. Update all four in one change.
-- **Lifecycle changes** must keep `crates/api/tests/happy_path.rs` green, name the touched invariants, and update the target lifecycle/Gate documentation. Do not encode actor cognition as an exclusive Task state.
-- **Migrations** are numbered `V{NNN}__{name}.sql`. Add a new file; don't edit historical migrations even during beta — users have running databases.
-- **Errors** flow `DbError` (db) → `ServiceError` (services) → `ApiError` (api). Map at the boundaries; don't leak lower-layer error types upward.
-- **Concurrency**: tasks and agents use a `version` column. Updates require `WHERE version = ?` and increment on success. Version mismatch → `DbError::VersionConflict` → HTTP 409.
-- **Pagination**: opaque keyset cursors, response field is `items` (not `data`). The `db` layer queries `limit + 1` to compute `has_more`.
-
-## Architecture summary (reference only)
-
-The target model lives in [docs/architecture.md](docs/architecture.md), with
-the ordered migration contract in
-[docs/migration/architecture-v2.md](docs/migration/architecture-v2.md).
-
-```
+```text
 forge-cli → api → services → db
                 → events
-          → mcp-server → same domain primitives
+          → mcp-server → same domain services
           → HarnessAdapter → cli-adapters → forge-daemon
           → workspace → git
           → config
           → api-types
+forge-client → REST API
+web/ → REST API and authenticated SSE
 ```
 
-- **Domain boundary** — Humans and harness-bound Agents are peer Actors; Roles are Task-scoped memberships; Executions record one Actor, Role, and Purpose.
-- **Cognition boundary** — harnesses own model loops and native capabilities; Forge owns work, authority, collaboration, evidence, and lifecycle.
-- **Isolation** — concurrent mutating WorkUnits use separate branches/worktrees and explicit leases; integration is deterministic and locked.
-- **Persistence** — SQLite repositories and numbered migrations remain the current infrastructure; replacement schema is additive until Plan PR13.
-- **Events** — durable domain records are authoritative; the events crate and SSE are delivery/projection mechanisms.
-- **Current transition** — the repository still contains legacy workflow, review, singular-assignee, Main/Project Agent, and agent-host paths. Do not delete or redesign them outside their named Plan PR.
-- **Infrastructure** — the existing repository traits, AppState, MCP server, workspace path guards, config precedence, and local bind defaults remain useful implementation details while the domain migrates.
+- Humans and harness-bound Agents are peer Actors. Executions record one Actor, Role, Purpose, and explicit context.
+- Harnesses own cognition and native session semantics; Forge owns work, authority, collaboration, evidence, and lifecycle.
+- Concurrent repository WorkUnits use separate workspaces and explicit leases. Integration is a separate serialized operation.
+- SQLite and numbered migrations are current persistence.
+- TaskLifecycleService owns aggregate Task state. task.status was removed in V129.
+- Formal Review is a reviewer Execution with Purpose review and a ReviewReport Artifact. ValidationRun is deterministic evidence; Agent Purpose validate is cognitive work.
+- Gate evaluates exact immutable inputs; it does not run tests, review code, integrate, or merge.
+- The current Orchestrator is event-driven and has a bounded typed output set. Do not claim unsupported autonomous steering, assignment, or merge actions.
+
+Public API response changes touch the route in crates/api/src/routes/, DTOs in crates/api-types/, generated TypeScript types in web/src/types/generated/, and docs/api.md.
+
+Errors flow DbError → ServiceError → ApiError; map them at boundaries. Concurrent updates use expected versions and return a typed conflict (HTTP 409). REST pagination uses opaque keyset cursors and response field items.
 
 ## Database
 
-SQLite with WAL mode. Schema in `crates/db/migrations/V001__initial_schema.sql`. Migrations are numbered `V{NNN}__{name}.sql` and tracked in `_migration` table. All primary keys are app-generated UUID v4; all timestamps are app-generated RFC3339.
+SQLite uses WAL mode. Migrations are named V{NNN}__{name}.sql, recorded in _migration, and must be additive and data-preserving. Primary keys and timestamps are generated by the application. Keep migrations, row mappers, and tests aligned.
 
-Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`, `busy_timeout=5000` per connection.
-
-Enum serialization uses `Display`/`FromStr` (in `db::models`) for SQLite TEXT columns. Row mapping is manual via `sqlx::Row::get()`, not compile-time checked macros — so a renamed column will fail at runtime, not at `cargo check`. Update both the migration and the row-mapper together.
-
-For tests, use `create_sqlite_pool("sqlite::memory:")` for an in-memory database.
-
-## Frontend
-
-React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses `@` path alias → `web/src/`. API client at `web/src/api/client.ts` calls `/api/v1/*` endpoints. Types in `web/src/types/generated/api.ts` must match `api-types` crate responses — when you change a response shape on the Rust side, regenerate or hand-update the TS types in the same change.
+For isolated DB tests, use create_sqlite_pool("sqlite::memory:"). Do not change historical V001–V134 migrations; add a new numbered file when schema work is authorized.

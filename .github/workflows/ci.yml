@@ -5,6 +5,16 @@ on:
   pull_request:
 
 jobs:
+  documentation-contract:
+    name: Documentation Contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check Getting Started WorkUnit order
+        run: python3 scripts/check-getting-started-order.py
+
   rust:
     name: Rust
     runs-on: ubuntu-latest
@@ -84,7 +94,7 @@ jobs:
         run: pnpm run e2e
 
   npm-bootstrapper:
-    name: npm Bootstrapper
+    name: Upstream npm Bootstrapper Snapshot
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
