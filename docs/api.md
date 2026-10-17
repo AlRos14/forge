@@ -36,12 +36,15 @@ If a provider Start may have taken effect but its response is uncertain,
 `execution_start_uncertain`; its message identifies the exact Execution. Read
 that Execution and do not submit the Start again automatically.
 
-WorkUnit creation currently has no idempotency key. A live validation run
-observed `POST /tasks/{task_id}/work-units` return `500 internal_error` with
-SQLite code 517 (`database is locked`) after the WorkUnit row had committed.
-If a create response is ambiguous, inspect `GET /tasks/{task_id}/work-units`
-before retrying; a blind retry can create a duplicate. This response/commit
-failure is pending reliability work.
+WorkUnit creation currently has no idempotency key. Validation of PR14's
+original head observed `POST /tasks/{task_id}/work-units` return
+`500 internal_error` with SQLite code 517 (`database is locked`) after the
+WorkUnit row had committed. A deterministic two-connection reproduction
+located the failure in `TaskIntegrationOperationRepo::finish`: a deferred
+read-then-write transaction could not upgrade after a concurrent commit. The
+finish transaction now starts with `BEGIN IMMEDIATE`. If a create response is
+ambiguous, inspect `GET /tasks/{task_id}/work-units` before retrying; a blind
+retry can create a duplicate.
 
 Paginated endpoints return `items`, `has_more`, `next_cursor`, and, where
 requested, `total_count`. Cursors are opaque. The default page size is 20 and

@@ -34,7 +34,7 @@ The local server provides REST, MCP, the `forge-ctl` client, and the web UI. It 
 
 ## Build this repository
 
-This repository has no published GitHub release. It has no verified npm or Homebrew distribution of this fork. Build from source to use this version. The build requires stable Rust, Git, Node.js 24, and pnpm 10; building the `forge` binary also builds the web UI.
+At the PR14 documentation audit on 2026-10-16, this repository had no published GitHub release and no npm or Homebrew distribution of this fork was verified. Build from source to use this version. The build requires stable Rust, Git, Node.js 24, and pnpm 10; building the `forge` binary also builds the web UI.
 
 ```bash
 git clone https://github.com/AlRos14/forge.git

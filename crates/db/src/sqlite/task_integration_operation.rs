@@ -1,4 +1,5 @@
 use super::*;
+use std::future::Future;
 
 fn map_operation(row: SqliteRow) -> Result<TaskIntegrationOperation> {
     Ok(TaskIntegrationOperation {
@@ -1365,40 +1366,395 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                 "a Task integration operation can only finish with a terminal status".to_owned(),
             ));
         }
-        let mut tx = self.pool.begin().await?;
-        let current = load_operation(&mut tx, &input.id).await?;
-        if current.kind == TaskIntegrationOperationKind::TaskMerge && current.remote_waiting {
-            return Err(DbError::InvalidTransition);
+        let tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        finish_operation_in_tx(self, input, tx, std::future::ready(())).await
+    }
+}
+
+// Tests pause after the operation read to force a competing commit; production passes `ready()`.
+async fn finish_operation_in_tx<F>(
+    db: &SqliteDb,
+    input: FinishTaskIntegrationOperation,
+    mut tx: Transaction<'_, Sqlite>,
+    after_load: F,
+) -> Result<TaskIntegrationOperation>
+where
+    F: Future<Output = ()> + Send,
+{
+    let current = load_operation(&mut tx, &input.id).await?;
+    after_load.await;
+    if current.kind == TaskIntegrationOperationKind::TaskMerge && current.remote_waiting {
+        return Err(DbError::InvalidTransition);
+    }
+    if current.status != TaskIntegrationOperationStatus::Running {
+        if current.status == input.status && current.result_event_id == input.result_event_id {
+            tx.commit().await?;
+            return Ok(current);
         }
-        if current.status != TaskIntegrationOperationStatus::Running {
-            if current.status == input.status && current.result_event_id == input.result_event_id {
-                tx.commit().await?;
-                return Ok(current);
-            }
-            return Err(DbError::VersionConflict);
-        }
-        let updated = sqlx::query(
-            "UPDATE task_integration_operation
-             SET status = ?, result_event_id = ?, version = version + 1,
-                 updated_at = ?, finished_at = ?
-             WHERE id = ? AND version = ? AND status = 'running'",
+        return Err(DbError::VersionConflict);
+    }
+    let updated = sqlx::query(
+        "UPDATE task_integration_operation
+         SET status = ?, result_event_id = ?, version = version + 1,
+             updated_at = ?, finished_at = ?
+         WHERE id = ? AND version = ? AND status = 'running'",
+    )
+    .bind(input.status.to_string())
+    .bind(input.result_event_id.as_deref())
+    .bind(&input.updated_at)
+    .bind(&input.finished_at)
+    .bind(&input.id)
+    .bind(input.expected_version)
+    .execute(&mut *tx)
+    .await
+    .map_err(operation_write_error)?;
+    if updated.rows_affected() != 1 {
+        return Err(DbError::VersionConflict);
+    }
+    let operation = load_operation(&mut tx, &input.id).await?;
+    finish_merge_lifecycle_in_tx(db, &mut tx, &operation, input.status, &input.updated_at).await?;
+    tx.commit().await?;
+    Ok(operation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ActorKind, ActorRef,
+        CreateDomainEvent, CreateProject, CreateRoleMembership, CreateTask,
+        CreateTaskIntegrationOperation, CreateTaskRole, CreateWorkUnit, ProjectRepo,
+        RoleMembershipRepo, RoleMembershipStatus, TaskIntegrationOperationRepo, TaskLifecycleState,
+        TaskRepo, TaskRoleRepo, User, UserRepo, WorkUnitRepo,
+    };
+    use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+    use std::str::FromStr;
+    use tokio::sync::oneshot;
+
+    async fn zero_wait_contention_pool(database_url: &str) -> SqlitePool {
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str(database_url)
+            .expect("SQLite connection options")
+            .create_if_missing(true);
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .after_connect(|connection, _metadata| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA foreign_keys = ON")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("PRAGMA journal_mode = WAL")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("PRAGMA busy_timeout = 0")
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await
+            .expect("zero-wait competing connection")
+    }
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        SqliteDb,
+        SqlitePool,
+        String,
+        String,
+        String,
+        TaskIntegrationOperation,
+    ) {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_url = format!("sqlite://{}", directory.path().join("forge.db").display());
+        let pool = create_sqlite_pool(&database_url)
+            .await
+            .expect("primary pool");
+        run_migrations(&pool).await.expect("migrations");
+        let db = SqliteDb::new(pool);
+        let concurrent_pool = zero_wait_contention_pool(&database_url).await;
+
+        let user_id = new_uuid_v4();
+        let now = now_rfc3339();
+        UserRepo::create_user(
+            &db,
+            &User {
+                id: user_id.clone(),
+                email: "finish-race@example.invalid".to_owned(),
+                password_hash: "test-only".to_owned(),
+                display_name: None,
+                is_admin: true,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
         )
-        .bind(input.status.to_string())
-        .bind(input.result_event_id.as_deref())
-        .bind(&input.updated_at)
-        .bind(&input.finished_at)
-        .bind(&input.id)
-        .bind(input.expected_version)
-        .execute(&mut *tx)
         .await
-        .map_err(operation_write_error)?;
-        if updated.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
+        .expect("user");
+        let project_id = new_uuid_v4();
+        ProjectRepo::create(
+            &db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "WorkUnit finish race".to_owned(),
+                settings: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: Some(user_id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project");
+        let task_id = new_uuid_v4();
+        TaskRepo::create(
+            &db,
+            CreateTask {
+                id: task_id.clone(),
+                project_id: project_id.clone(),
+                repo_id: None,
+                parent_task_id: None,
+                subtask_order: None,
+                title: "Reproduce WorkUnit create finish".to_owned(),
+                description: None,
+                task_type: "implementation".to_owned(),
+                lifecycle_state: TaskLifecycleState::Ready,
+                is_automation: false,
+                priority: 0,
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("task");
+        let task_role = TaskRoleRepo::create(
+            &db,
+            CreateTaskRole {
+                id: new_uuid_v4(),
+                task_id: task_id.clone(),
+                role: "implementer".to_owned(),
+                coordination_mode: None,
+                policy_json: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("TaskRole");
+        RoleMembershipRepo::add(
+            &db,
+            CreateRoleMembership {
+                id: new_uuid_v4(),
+                task_role_id: task_role.id,
+                actor_kind: ActorKind::Human,
+                actor_id: user_id.clone(),
+                status: RoleMembershipStatus::Active,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("active creator membership");
+
+        let operation = TaskIntegrationOperationRepo::begin(
+            &db,
+            CreateTaskIntegrationOperation {
+                id: new_uuid_v4(),
+                task_id: task_id.clone(),
+                kind: TaskIntegrationOperationKind::WorkUnitCreate,
+                owner_id: new_uuid_v4(),
+                gate_evaluation_id: None,
+                remote_waiting: false,
+                parent_operation_id: None,
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .expect("durable WorkUnitCreate claim");
+        let work_unit_id = new_uuid_v4();
+        WorkUnitRepo::create(
+            &db,
+            CreateWorkUnit {
+                id: work_unit_id.clone(),
+                task_id: task_id.clone(),
+                parent_work_unit_id: None,
+                title: "Committed before operation finish".to_owned(),
+                scope: "Test the create/finish boundary".to_owned(),
+                role: "implementer".to_owned(),
+                assigned_actor: None,
+                requires_integration: false,
+                provenance: None,
+                created_by: ActorRef::Human(user_id.clone()),
+                created_at: now.clone(),
+            },
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "work_unit.created".to_owned(),
+                entity_type: "work_unit".to_owned(),
+                entity_id: work_unit_id.clone(),
+                actor_type: "human".to_owned(),
+                actor_id: Some(user_id),
+                scope_type: "task".to_owned(),
+                scope_id: task_id.clone(),
+                correlation_id: new_uuid_v4(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: "{}".to_owned(),
+                created_at: now,
+            },
+        )
+        .await
+        .expect("WorkUnit commits before finish")
+        .record;
+
+        (
+            directory,
+            db,
+            concurrent_pool,
+            task_id,
+            work_unit_id,
+            project_id,
+            operation,
+        )
+    }
+
+    fn finish_input(operation: &TaskIntegrationOperation) -> FinishTaskIntegrationOperation {
+        let now = now_rfc3339();
+        FinishTaskIntegrationOperation {
+            id: operation.id.clone(),
+            expected_version: operation.version,
+            status: TaskIntegrationOperationStatus::Succeeded,
+            result_event_id: None,
+            updated_at: now.clone(),
+            finished_at: now,
         }
-        let operation = load_operation(&mut tx, &input.id).await?;
-        finish_merge_lifecycle_in_tx(self, &mut tx, &operation, input.status, &input.updated_at)
-            .await?;
-        tx.commit().await?;
-        Ok(operation)
+    }
+
+    #[tokio::test]
+    async fn deferred_finish_reproduces_busy_snapshot_after_work_unit_commit() {
+        let (_directory, db, concurrent_pool, _task_id, work_unit_id, project_id, operation) =
+            fixture().await;
+        assert!(WorkUnitRepo::get_by_id(&db, &work_unit_id)
+            .await
+            .expect("read committed WorkUnit")
+            .is_some());
+
+        let tx = db.pool.begin().await.expect("deferred finish transaction");
+        let (loaded_tx, loaded_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let finish_db = db.clone();
+        let finish = tokio::spawn(async move {
+            finish_operation_in_tx(&finish_db, finish_input(&operation), tx, async move {
+                loaded_tx
+                    .send(())
+                    .expect("finish read its operation snapshot");
+                resume_rx.await.expect("resume after competing commit");
+            })
+            .await
+        });
+        loaded_rx.await.expect("finish has loaded its snapshot");
+
+        let mut concurrent = concurrent_pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("competing writer begins");
+        sqlx::query("UPDATE project SET updated_at = ? WHERE id = ?")
+            .bind(now_rfc3339())
+            .bind(project_id)
+            .execute(&mut *concurrent)
+            .await
+            .expect("competing write");
+        concurrent.commit().await.expect("competing write commits");
+        resume_tx.send(()).expect("resume finish");
+
+        let error = finish
+            .await
+            .expect("finish task joins")
+            .expect_err("deferred snapshot cannot upgrade after a competing commit");
+        let database_error = match error {
+            DbError::Sqlx(sqlx::Error::Database(error)) => error,
+            other => panic!("expected SQLite busy snapshot, got {other:?}"),
+        };
+        assert_eq!(database_error.code().as_deref(), Some("517"));
+        assert!(database_error.message().contains("database is locked"));
+        assert!(WorkUnitRepo::get_by_id(&db, &work_unit_id)
+            .await
+            .expect("read WorkUnit after finish error")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn immediate_finish_serializes_a_competing_writer() {
+        let (_directory, db, concurrent_pool, _task_id, _work_unit_id, project_id, operation) =
+            fixture().await;
+        let tx = db
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("immediate finish transaction");
+        let (loaded_tx, loaded_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let finish_db = db.clone();
+        let finish = tokio::spawn(async move {
+            finish_operation_in_tx(&finish_db, finish_input(&operation), tx, async move {
+                loaded_tx.send(()).expect("finish read its operation");
+                resume_rx.await.expect("resume finish");
+            })
+            .await
+        });
+        loaded_rx.await.expect("finish has read its operation");
+
+        let (writer_attempt_tx, writer_attempt_rx) = oneshot::channel();
+        let (retry_tx, retry_rx) = oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let result = concurrent_pool.begin_with("BEGIN IMMEDIATE").await;
+            let outcome = match result {
+                Err(sqlx::Error::Database(error)) => {
+                    format!("{} {}", error.code().unwrap_or_default(), error.message())
+                }
+                Err(error) => format!("unexpected error: {error}"),
+                Ok(tx) => {
+                    tx.rollback()
+                        .await
+                        .expect("unexpectedly acquired writer rolls back");
+                    "writer acquired while finish held its reservation".to_owned()
+                }
+            };
+            writer_attempt_tx
+                .send(outcome)
+                .expect("report competing writer attempt");
+            retry_rx.await.expect("retry after finish commits");
+
+            let mut tx = concurrent_pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .expect("competing writer begins after finish commits");
+            sqlx::query("UPDATE project SET updated_at = ? WHERE id = ?")
+                .bind(now_rfc3339())
+                .bind(project_id)
+                .execute(&mut *tx)
+                .await
+                .expect("competing write");
+            tx.commit().await.expect("competing writer commits");
+        });
+        let blocked_writer = writer_attempt_rx
+            .await
+            .expect("competing writer attempted while finish holds its reservation");
+        assert!(
+            blocked_writer.starts_with("5 database is locked"),
+            "expected SQLITE_BUSY while finish held its reservation, got {blocked_writer}"
+        );
+        resume_tx
+            .send(())
+            .expect("resume finish before writer retry");
+
+        let finished = finish
+            .await
+            .expect("finish task joins")
+            .expect("immediate finish succeeds");
+        assert_eq!(finished.status, TaskIntegrationOperationStatus::Succeeded);
+        retry_tx.send(()).expect("retry writer after finish commit");
+        writer.await.expect("competing writer completes");
     }
 }

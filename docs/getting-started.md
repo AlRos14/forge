@@ -175,13 +175,14 @@ WORK_UNIT_ID="$(jq -er '.id' <<<"$WORK_UNIT")"
 WORK_UNIT_VERSION="$(jq -er '.version' <<<"$WORK_UNIT")"
 ```
 
-WorkUnit creation has no idempotency key. If this request returns an error or
-the connection ends before its response arrives, do not repeat the `POST`
-blindly: the current server has returned `500 internal_error` with SQLite
-`database is locked` after the WorkUnit was already committed. First inspect
-`GET "/tasks/$TASK_ID/work-units"` and match the intended title, role, and
-Actor. If the exact WorkUnit exists, use its returned `id` and `version` to
-continue. This response/commit defect is recorded for PR15 reliability work.
+WorkUnit creation has no idempotency key. During validation of the original
+PR14 head, this request returned `500 internal_error` with SQLite
+`database is locked` after the WorkUnit had committed. A focused repair makes
+the durable operation finish transaction acquire its SQLite write reservation
+before reading. If any create response is still ambiguous, do not repeat the
+`POST` blindly: inspect `GET "/tasks/$TASK_ID/work-units"`, match the intended
+title, role, and Actor, and continue with the exact returned `id` and `version`
+if that WorkUnit exists.
 
 For a Task without a Repo, create a WorkUnit with
 `"requires_integration":false`. It uses the stable per-Task/per-WorkUnit
@@ -215,6 +216,11 @@ while :; do
     *) sleep 1 ;;
   esac
 done
+if [[ "$STATUS" != "completed" ]]; then
+  printf 'Execution %s ended with status %s; stop before completing or integrating the WorkUnit.\n' \
+    "$EXECUTION_ID" "$STATUS" >&2
+  exit 1
+fi
 jq '{id,status,actor_ref,role,purpose,work_unit_id,harness_session_id,workspace_id,summary}' \
   <<<"$EXECUTION"
 request GET "/executions/$EXECUTION_ID/logs" | jq .
@@ -232,50 +238,91 @@ Inspect the exact Execution and follow the explicit recovery path in
 Execution completion does not complete its WorkUnit, advance TaskLifecycle, or
 satisfy a Gate.
 
-- A Human Review starts from the Task's Review surface or
-  `POST /tasks/{id}/review-executions`. The reviewer must have active
-  membership in the Task's `reviewer` Role. Supply the exact Ready Workspace
-  to review, or `null` for a Workspace-free review; Forge does not infer one.
-- `ValidationRun` and `Evidence` are distinct from ReviewReports. The current
-  REST, MCP, CLI, and web surfaces expose ValidationRuns for reading; there is
-  no public command in this snapshot to start a deterministic ValidationRun.
-  Do not treat an Agent `validate` Execution as deterministic test evidence.
-- A Gate evaluates its exact current policy and input records. Read the
-  immutable GateEvaluation; do not infer success from a review verdict or a
-  shell exit alone. Lifecycle transitions that require a Gate must carry that
-  exact evaluation and the current lifecycle version.
-- For this repository WorkUnit, call
-  `POST /work-units/{id}/integrations` only after its exact Execution completed.
-  This sample uses a key tied to that Execution, so a retry of the same request
-  replays the same operation:
+### 1. Confirm the exact Execution completed
 
-  ```bash
-  INTEGRATION_KEY="getting-started-$EXECUTION_ID"
-  INTEGRATION="$(request POST "/work-units/$WORK_UNIT_ID/integrations" "$(jq -cn \
-    --arg execution_id "$EXECUTION_ID" --arg key "$INTEGRATION_KEY" \
-    '{execution_id:$execution_id,idempotency_key:$key}')")"
-  jq '{id,outcome,source_sha,target_before_sha,target_after_sha}' <<<"$INTEGRATION"
-  ```
+Section 7 stops unless the response for `$EXECUTION_ID` is `completed`. A
+failed, cancelled, stalled, or uncertain Execution cannot proceed to WorkUnit
+completion or integration.
 
-  The operation is serialized and may return success, conflict, failure, or
-  rejection. Inspect its exact outcome; a conflict or failure needs an explicit
-  recovery decision. Integration does not complete other WorkUnits or close the
-  Task.
-- After successful integration, reread the WorkUnit and complete it against
-  its returned version when its dependencies and result allow it:
+### 2. Read the current WorkUnit and version
 
-  ```bash
-  WORK_UNIT="$(request GET "/work-units/$WORK_UNIT_ID")"
-  WORK_UNIT_VERSION="$(jq -er '.version' <<<"$WORK_UNIT")"
-  request POST "/work-units/$WORK_UNIT_ID/status" "$(jq -cn \
-    --argjson version "$WORK_UNIT_VERSION" \
-    '{expected_version:$version,status:"completed"}')"
-  ```
+The exact Execution in this example ran against the WorkUnit revision returned
+in section 6:
 
-  Reread TaskLifecycle before requesting any further transition. Use only an
-  allowed transition with its current version. A merge requires the exact
-  satisfied GateEvaluation through `POST /tasks/{id}/merge`; completing this
-  sample WorkUnit alone does not authorize a Task merge or closure.
+```bash
+WORK_UNIT="$(request GET "/work-units/$WORK_UNIT_ID")"
+WORK_UNIT_VERSION="$(jq -er '.version' <<<"$WORK_UNIT")"
+jq '{id,status,version,requires_integration}' <<<"$WORK_UNIT"
+```
+
+### 3. Mark that WorkUnit completed
+
+This transition requires its completed Execution result SHA and any
+dependencies to be satisfied:
+
+```bash
+COMPLETED_WORK_UNIT="$(request POST "/work-units/$WORK_UNIT_ID/status" "$(jq -cn \
+  --argjson version "$WORK_UNIT_VERSION" \
+  '{expected_version:$version,status:"completed"}')")"
+jq '{id,status,version}' <<<"$COMPLETED_WORK_UNIT"
+```
+
+### 4. Integrate the exact Execution result
+
+Use its exact ID and a stable key; retry this same request only with the same
+key:
+
+```bash
+INTEGRATION_KEY="getting-started-$EXECUTION_ID"
+INTEGRATION="$(request POST "/work-units/$WORK_UNIT_ID/integrations" "$(jq -cn \
+  --arg execution_id "$EXECUTION_ID" --arg key "$INTEGRATION_KEY" \
+  '{execution_id:$execution_id,idempotency_key:$key}')")"
+jq '{id,outcome,source_sha,target_before_sha,target_after_sha}' <<<"$INTEGRATION"
+```
+
+### 5. Inspect the integration outcome
+
+Only `success` proceeds through this example. `conflict`, `failed`, and
+`rejected` require inspecting the exact record and an explicit recovery
+decision; `running` is not terminal and must be reconciled before proceeding.
+Integration does not complete other WorkUnits or close the Task.
+
+```bash
+INTEGRATION_OUTCOME="$(jq -er '.outcome' <<<"$INTEGRATION")"
+case "$INTEGRATION_OUTCOME" in
+  success) ;;
+  conflict|failed|rejected|running)
+    printf 'Integration outcome is %s; inspect the exact operation and resolve it before proceeding.\n' \
+      "$INTEGRATION_OUTCOME" >&2
+    exit 1
+    ;;
+  *) printf 'Unknown integration outcome: %s\n' "$INTEGRATION_OUTCOME" >&2; exit 1 ;;
+esac
+```
+
+### 6. Read TaskLifecycle and Gates before any merge
+
+```bash
+request GET "/tasks/$TASK_ID/lifecycle" | jq .
+request GET "/tasks/$TASK_ID/gates" | jq .
+```
+
+These reads are a preflight. A Gate evaluates its exact current policy and
+input records; inspect the immutable GateEvaluation instead of inferring
+success from a Review verdict or shell exit alone. A merge requires the exact
+satisfied GateEvaluation through `POST /tasks/{id}/merge`; completing or
+integrating this sample WorkUnit alone does not authorize a Task merge or
+closure. A lifecycle transition that requires a Gate must carry that exact
+evaluation and the current lifecycle version.
+
+Review and deterministic validation are separate evidence paths. A Human
+Review starts from the Task's Review surface or `POST /tasks/{id}/review-executions`;
+the reviewer needs active membership in the Task's `reviewer` Role and must
+supply the exact Ready Workspace, or `null` for a Workspace-free review.
+`ValidationRun` and `Evidence` are distinct from ReviewReports. Current REST,
+MCP, CLI, and web surfaces expose ValidationRuns for reading; this snapshot has
+no public command to start one. Do not treat an Agent `validate` Execution as
+deterministic test evidence.
 
 For the endpoint fields, permissions, errors, and exact recovery contracts, see
 [REST API](api.md), [CLI](cli.md), and the
