@@ -1605,8 +1605,7 @@ mod tests {
             },
         )
         .await
-        .expect("WorkUnit commits before finish")
-        .record;
+        .expect("WorkUnit commits before finish");
 
         (
             directory,
