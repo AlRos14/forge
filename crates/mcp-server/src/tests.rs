@@ -2177,11 +2177,7 @@ fn forge_transition_task_lifecycle_requires_exact_identity_and_returns_authority
 
         let incomplete_reason = dispatch_with_context(
             &state,
-            &McpContext {
-                project_id: None,
-                user_id: Some("human-actor".to_owned()),
-                is_admin: false,
-            },
+            &user_mcp_context("test-user"),
             "tools/call",
             json!({
                 "name": "forge_transition_task_lifecycle",
@@ -2200,11 +2196,7 @@ fn forge_transition_task_lifecycle_requires_exact_identity_and_returns_authority
 
         let result = dispatch_with_context(
             &state,
-            &McpContext {
-                project_id: None,
-                user_id: Some("human-actor".to_owned()),
-                is_admin: false,
-            },
+            &user_mcp_context("test-user"),
             "tools/call",
             json!({
                 "name": "forge_transition_task_lifecycle",

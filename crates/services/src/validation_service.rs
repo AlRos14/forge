@@ -213,7 +213,7 @@ impl ValidationService {
         }
 
         let execution = run_bounded_command(
-            &*self.db,
+            &self.db,
             &start.validation_run.id,
             &owner,
             &workspace.worktree_path,
@@ -621,7 +621,7 @@ pub(crate) async fn workspace_snapshot_digest(worktree_path: &str) -> Result<Str
     digest.update(staged_bytes.to_be_bytes());
     digest.update(staged_digest);
     digest.update(b"section:head-to-worktree\0");
-    digest.update((tracked_bytes as u64).to_be_bytes());
+    digest.update(tracked_bytes.to_be_bytes());
     digest.update(tracked_digest);
     digest.update(b"section:untracked\0");
     digest.update((paths.len() as u64).to_be_bytes());
@@ -797,6 +797,7 @@ fn digest_json(value: &impl serde::Serialize) -> Result<String> {
     Ok(hex::encode(Sha256::digest(encoded)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn event(
     event_type: &str,
     entity_type: &str,

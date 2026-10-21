@@ -2,6 +2,20 @@ use db::{create_sqlite_pool, run_migrations_from};
 use sqlx::SqlitePool;
 use std::{fs, path::Path};
 
+type MediaPinSnapshot = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
 fn copy_migrations_through(limit: i64, destination: &Path) {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for entry in fs::read_dir(source).expect("migration directory") {
@@ -377,19 +391,7 @@ async fn v121_copies_exact_release_snapshot_and_v122_detaches_project_os_foreign
             "{}".to_owned()
         )
     );
-    let media_pin_after: (
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        String,
-        String,
-        String,
-        String,
-    ) = sqlx::query_as(
+    let media_pin_after: MediaPinSnapshot = sqlx::query_as(
         "SELECT id, project_id, release_id, asset_id, attachment_id,
                 legacy_task_media_id, asset_checksum, attachment_digest,
                 availability, pin_digest, created_at

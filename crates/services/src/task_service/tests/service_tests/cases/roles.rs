@@ -388,6 +388,12 @@ async fn unusable_first_agent_does_not_hide_later_usable_membership() {
         .await
         .expect("usable Agent selection succeeds");
     assert_eq!(selected.as_deref(), Some(agent_b.as_str()));
+    let repository_selected =
+        crate::task_service::select_usable_repository_agent_id(&db, &project_id, &memberships)
+            .await
+            .expect("repository Agent selection succeeds");
+    assert_eq!(repository_selected.as_deref(), Some(agent_b.as_str()));
+
     sqlx::query("UPDATE agent_identity SET paused = 0 WHERE id = ?")
         .bind(&agent_a)
         .execute(db.pool())
@@ -397,11 +403,6 @@ async fn unusable_first_agent_does_not_hide_later_usable_membership() {
         .await
         .expect("generic Agent selection succeeds");
     assert_eq!(generic_selected.as_deref(), Some(agent_a.as_str()));
-    let repository_selected =
-        crate::task_service::select_usable_repository_agent_id(&db, &project_id, &memberships)
-            .await
-            .expect("repository Agent selection succeeds");
-    assert_eq!(repository_selected.as_deref(), Some(agent_b.as_str()));
 }
 
 #[tokio::test]

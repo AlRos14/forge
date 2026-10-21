@@ -2023,7 +2023,7 @@ fn parse_review_result(output: &str) -> Result<ParsedReviewResult> {
         match value.get(key) {
             Some(serde_json::Value::Array(values)) => Ok(values.clone()),
             None if optional => Ok(Vec::new()),
-            _ => Err(invalid(&format!("FORGE_RESULT {key} must be an array"))),
+            _ => Err(invalid(format!("FORGE_RESULT {key} must be an array"))),
         }
     };
     Ok(ParsedReviewResult {
@@ -2051,37 +2051,6 @@ fn validate_artifact_storage(
         _ => Err(invalid(
             "Artifact storage requires exactly one of inline content or external content_ref",
         )),
-    }
-}
-
-#[cfg(test)]
-mod review_report_tests {
-    use super::parse_review_result;
-
-    #[test]
-    fn pr8_review_report_parser_requires_one_complete_final_structured_result() {
-        let parsed = parse_review_result(
-            "Inspection complete.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"All required behavior is present.\",\"criteria\":[\"correctness\"],\"findings\":[],\"questions\":[],\"evidence_considered\":[]}",
-        )
-        .expect("complete structured result parses");
-        assert_eq!(parsed.verdict, "pass");
-        assert_eq!(parsed.summary, "All required behavior is present.");
-        assert_eq!(parsed.criteria.len(), 1);
-        assert!(parsed.findings.is_empty());
-        assert!(parsed.questions.is_empty());
-        assert!(parsed.evidence_considered.is_empty());
-    }
-
-    #[test]
-    fn pr8_review_report_parser_rejects_summary_fallback_duplicate_and_trailing_text() {
-        let without_summary = "Looks good.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"findings\":[],\"questions\":[]}";
-        assert!(parse_review_result(without_summary).is_err());
-
-        let duplicate = "FORGE_RESULT: {}\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"done\",\"findings\":[],\"questions\":[]}";
-        assert!(parse_review_result(duplicate).is_err());
-
-        let trailing = "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"done\",\"findings\":[],\"questions\":[]}\nmore output";
-        assert!(parse_review_result(trailing).is_err());
     }
 }
 
@@ -2147,5 +2116,36 @@ fn not_found(entity: &'static str, id: String) -> ServiceError {
 fn invalid(message: impl Into<String>) -> ServiceError {
     ServiceError::InvalidOperation {
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod review_report_tests {
+    use super::parse_review_result;
+
+    #[test]
+    fn pr8_review_report_parser_requires_one_complete_final_structured_result() {
+        let parsed = parse_review_result(
+            "Inspection complete.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"All required behavior is present.\",\"criteria\":[\"correctness\"],\"findings\":[],\"questions\":[],\"evidence_considered\":[]}",
+        )
+        .expect("complete structured result parses");
+        assert_eq!(parsed.verdict, "pass");
+        assert_eq!(parsed.summary, "All required behavior is present.");
+        assert_eq!(parsed.criteria.len(), 1);
+        assert!(parsed.findings.is_empty());
+        assert!(parsed.questions.is_empty());
+        assert!(parsed.evidence_considered.is_empty());
+    }
+
+    #[test]
+    fn pr8_review_report_parser_rejects_summary_fallback_duplicate_and_trailing_text() {
+        let without_summary = "Looks good.\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"findings\":[],\"questions\":[]}";
+        assert!(parse_review_result(without_summary).is_err());
+
+        let duplicate = "FORGE_RESULT: {}\nFORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"done\",\"findings\":[],\"questions\":[]}";
+        assert!(parse_review_result(duplicate).is_err());
+
+        let trailing = "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"done\",\"findings\":[],\"questions\":[]}\nmore output";
+        assert!(parse_review_result(trailing).is_err());
     }
 }

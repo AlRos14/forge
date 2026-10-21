@@ -27,6 +27,7 @@ pub const INVALID_FRAME: &str = "invalid_frame";
 pub const INVALID_INPUT: &str = "invalid_input";
 pub const PATH_GUARDRAIL: &str = "path_guardrail";
 pub const EXECUTION_NOT_FOUND: &str = "execution_not_found";
+pub const START_OUTCOME_UNKNOWN: &str = "start_outcome_unknown";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export)]

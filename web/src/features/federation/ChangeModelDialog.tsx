@@ -140,7 +140,7 @@ export function ChangeModelDialog({
             <SectionKicker>Edit external harness Agent</SectionKicker>
             <DialogTitle className="mt-1">{agent?.name ?? 'Agent'}</DialogTitle>
             <DialogDescription>
-              Update the Agent's harness defaults or select an exact published profile. Forge does
+              Update the Agent&apos;s harness defaults or select an exact published profile. Forge does
               not run a model loop for this Agent.
             </DialogDescription>
           </DialogHeader>

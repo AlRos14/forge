@@ -543,8 +543,8 @@ async fn execution_admission_wins_over_cleanup_claim_across_sqlite_pools() {
         },
     )
     .await
-    .expect("execution stops while lease authority remains active");
-    assert!(WorkspaceRepo::claim_work_unit_cleanup(
+    .expect("execution stops and revokes its active lease");
+    let cleanup = WorkspaceRepo::claim_work_unit_cleanup(
         &competing_db,
         &fixture.workspace_id,
         &fixture.task_id,
@@ -552,8 +552,9 @@ async fn execution_admission_wins_over_cleanup_claim_across_sqlite_pools() {
         &now_rfc3339(),
     )
     .await
-    .expect("active lease still blocks cleanup")
-    .is_none());
+    .expect("terminal execution releases workspace cleanup authority")
+    .expect("terminal execution revoked its active lease");
+    assert_eq!(cleanup.status, WorkspaceStatus::Cleaning);
 }
 
 #[tokio::test]

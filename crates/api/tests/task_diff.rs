@@ -13,9 +13,9 @@ use axum::{
     Router,
 };
 use db::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, CreateAgent,
-    CreateProject, CreateRepo, DaemonRepo, DaemonStatus, ProjectRepo, RepoRepo, SqliteDb,
-    UpdateDaemonReport, UpdateProject, UpsertDaemon,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateProject, CreateRepo,
+    CreateWorkspace, ProjectRepo, RepoRepo, SqliteDb, UpdateProject, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -24,8 +24,7 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn task_diff_endpoint_returns_workspace_diff_and_handles_missing_workspace() {
     let app = test_app().await;
-    let (project_id, _repo_id, repo_dir, default_branch) = create_project_and_repo(&app).await;
-    let agent_id = create_agent(&app).await;
+    let (project_id, repo_id, repo_dir, default_branch) = create_project_and_repo(&app).await;
 
     let task: TaskResponse = json_request(
         &app,
@@ -44,13 +43,7 @@ async fn task_diff_endpoint_returns_workspace_diff_and_handles_missing_workspace
     .await;
     assert_eq!(missing_workspace_error.code, "workspace.not_found");
 
-    let launched = app
-        .state
-        .task_service
-        .launch_execution(task.id.clone(), agent_id, None, None)
-        .await
-        .expect("launch succeeds");
-    let workspace = launched.workspace.expect("launch creates exact workspace");
+    let workspace = create_integration_workspace(&app, &task.id, &repo_id, &repo_dir).await;
     let workspace_path = PathBuf::from(&workspace.worktree_path);
     std::fs::write(workspace_path.join("README.md"), "# Task diff\nupdated\n")
         .expect("workspace file writes");
@@ -89,8 +82,7 @@ async fn task_diff_endpoint_returns_workspace_diff_and_handles_missing_workspace
 #[tokio::test]
 async fn task_diff_uses_merge_base_when_default_branch_advances() {
     let app = test_app().await;
-    let (project_id, _repo_id, repo_dir, default_branch) = create_project_and_repo(&app).await;
-    let agent_id = create_agent(&app).await;
+    let (project_id, repo_id, repo_dir, default_branch) = create_project_and_repo(&app).await;
 
     let task: TaskResponse = json_request(
         &app,
@@ -100,13 +92,7 @@ async fn task_diff_uses_merge_base_when_default_branch_advances() {
         StatusCode::OK,
     )
     .await;
-    let launched = app
-        .state
-        .task_service
-        .launch_execution(task.id.clone(), agent_id, None, None)
-        .await
-        .expect("launch succeeds");
-    let workspace = launched.workspace.expect("launch creates exact workspace");
+    let workspace = create_integration_workspace(&app, &task.id, &repo_id, &repo_dir).await;
     let base_sha = workspace
         .before_sha
         .clone()
@@ -186,7 +172,7 @@ async fn create_project_and_repo(harness: &Harness) -> (String, String, PathBuf,
             name: "Task Diff".to_owned(),
             settings: "{}".to_owned(),
             primary_repo_id: None,
-            owner_id: None,
+            owner_id: Some("test-user-id".to_owned()),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -231,74 +217,46 @@ async fn create_project_and_repo(harness: &Harness) -> (String, String, PathBuf,
     (project.id, repo.id, repo_dir, default_branch)
 }
 
-async fn create_agent(harness: &Harness) -> String {
+async fn create_integration_workspace(
+    harness: &Harness,
+    task_id: &str,
+    repo_id: &str,
+    repo_dir: &Path,
+) -> db::Workspace {
+    let branch = workspace::task_branch_name(task_id);
+    let worktree_path = repo_dir
+        .parent()
+        .expect("repo has parent")
+        .join(format!("forge-task-diff-worktree-{}", new_uuid_v4()));
+    run_git(
+        repo_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            worktree_path.to_str().expect("worktree path is UTF-8"),
+            "HEAD",
+        ],
+    );
+    let before_sha = run_git(&worktree_path, &["rev-parse", "HEAD"]);
     let now = now_rfc3339();
-    let daemon = DaemonRepo::upsert_by_machine_id(
+    WorkspaceRepo::create(
         &*harness.state.db,
-        UpsertDaemon {
+        CreateWorkspace {
             id: new_uuid_v4(),
-            machine_id: services::embedded_daemon::embedded_machine_id(),
-            hostname: "localhost".to_owned(),
-            os: "linux".to_owned(),
-            arch: "x86_64".to_owned(),
-            agent_version: None,
-            labels_json: "{}".to_owned(),
-            status: DaemonStatus::Online,
-            registration_token_hash: None,
-            owner_id: None,
-            visibility: "global".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("daemon creates");
-    DaemonRepo::update_report(
-        &*harness.state.db,
-        UpdateDaemonReport {
-            id: daemon.id.clone(),
-            last_report_at: now.clone(),
-            status: DaemonStatus::Online,
-            detected_clis_json: r#"[{"kind":"shell","availability":"authenticated","version":null,"path":"/bin/sh"}]"#.to_owned(),
-            labels_json: None,
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("daemon report updates");
-
-    let agent_id = new_uuid_v4();
-    AgentRepo::create(
-        &*harness.state.db,
-        CreateAgent {
-            id: agent_id.clone(),
-            name: "shell-agent".to_owned(),
-            description: None,
-            executor_type: "shell".to_owned(),
-            model: None,
-            reasoning_effort: None,
-            permission_policy: None,
-            prompt_template: None,
-            capabilities_json: "[]".to_owned(),
-            config_json: "{}".to_owned(),
-            credential_ref: None,
-            daemon_id: Some(daemon.id),
-            max_concurrent_tasks: 2,
-            heartbeat_interval_seconds: 30,
-            max_missed_heartbeats: 3,
-            status: db::AgentStatus::Idle,
-            last_heartbeat_at: None,
-            is_default: false,
-            paused: false,
-            owner_id: None,
-            visibility: "global".to_owned(),
+            task_id: task_id.to_owned(),
+            repo_id: repo_id.to_owned(),
+            worktree_path: worktree_path.to_string_lossy().into_owned(),
+            branch,
+            status: WorkspaceStatus::Ready,
+            before_sha: Some(before_sha),
             created_at: now.clone(),
             updated_at: now,
         },
     )
     .await
-    .expect("agent creates");
-    agent_id
+    .expect("integration Workspace creates")
 }
 
 fn setup_git_repo(path: &Path) {
@@ -360,10 +318,16 @@ async fn json_request<T: DeserializeOwned>(
         )
         .await
         .expect("request succeeds");
-    assert_eq!(response.status(), expected_status);
+    let response_status = response.status();
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body reads");
+    assert_eq!(
+        response_status,
+        expected_status,
+        "unexpected response body: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     serde_json::from_slice(&bytes).expect("json parses")
 }
 
@@ -386,10 +350,16 @@ async fn empty_request<T: DeserializeOwned>(
         )
         .await
         .expect("request succeeds");
-    assert_eq!(response.status(), expected_status);
+    let response_status = response.status();
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body reads");
+    assert_eq!(
+        response_status,
+        expected_status,
+        "unexpected response body: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     serde_json::from_slice(&bytes).expect("json parses")
 }
 

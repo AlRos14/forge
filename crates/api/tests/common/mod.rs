@@ -12,7 +12,7 @@ use std::{
 use api::{build_router, AppState};
 use api_types::{
     AgentProfileResponse, AgentResponse, DaemonRegisterResponse, DaemonResponse, ProjectResponse,
-    RepoResponse, TaskResponse,
+    RepoResponse, TaskResponse, WorkUnitResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -112,6 +112,46 @@ pub async fn test_app_with_pool(
         state,
         _web_dist_dir: web_dist_dir,
     }
+}
+
+pub async fn create_allocated_work_unit(
+    app: &Router,
+    task_id: &str,
+    role: &str,
+    agent_id: &str,
+    title: &str,
+    scope: &str,
+    requires_integration: bool,
+) -> WorkUnitResponse {
+    let work_unit: WorkUnitResponse = json_request(
+        app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/work-units"),
+        json!({
+            "title": title,
+            "scope": scope,
+            "role": role,
+            "parent_work_unit_id": null,
+            "assigned_actor": null,
+            "requires_integration": requires_integration,
+            "provenance": null
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    json_request(
+        app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/allocation", work_unit.id),
+        json!({
+            "expected_version": work_unit.version,
+            "role": role,
+            "assigned_actor": { "kind": "agent", "id": agent_id }
+        }),
+        StatusCode::OK,
+    )
+    .await
 }
 
 pub fn setup_git_repo(root: &Path) -> PathBuf {

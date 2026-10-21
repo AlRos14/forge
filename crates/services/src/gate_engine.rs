@@ -2898,13 +2898,11 @@ mod tests {
         wrong_decider.permitted_deciders = vec![ActorRef::Human("different-human".to_owned())];
         mismatches.push(wrong_decider);
 
-        let mut active_revision = 1;
-        for mismatch in mismatches {
+        for (active_revision, mismatch) in (1..).zip(mismatches) {
             engine
                 .revise_policy(&gate.id, Some(active_revision), policy(mismatch))
                 .await
                 .expect("append immutable test policy revision");
-            active_revision += 1;
             let evaluation = engine
                 .evaluate_active(&gate.id)
                 .await

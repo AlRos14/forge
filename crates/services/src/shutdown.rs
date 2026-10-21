@@ -189,9 +189,10 @@ mod tests {
     use super::*;
     use db::{
         create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
-        CreateAgent, CreateExecution, CreateProject, CreateRepo, CreateTask, DaemonRepo,
-        DaemonStatus, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskLifecycleState,
-        TaskRepo, UpdateAgent, UpdateProject, UpsertDaemon,
+        CreateAgent, CreateExecution, CreateHarnessSession, CreateProject, CreateRepo, CreateTask,
+        DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus, HarnessSessionRepo,
+        HarnessSessionStatus, ProjectRepo, RepoRepo, TaskLifecycleState, TaskRepo, UpdateAgent,
+        UpdateProject, UpsertDaemon,
     };
     use executors::{ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor};
     use std::sync::Mutex;
@@ -378,15 +379,43 @@ mod tests {
             .expect("agent loads")
             .expect("agent exists");
         let resolved_daemon_id = agent.daemon_id.clone().expect("agent daemon binding");
+        let harness_session_id = if agent_session_id.is_some() {
+            let id = new_uuid_v4();
+            HarnessSessionRepo::create(
+                db,
+                CreateHarnessSession {
+                    id: id.clone(),
+                    agent_id: agent_id.clone(),
+                    harness_kind: "shell".to_owned(),
+                    external_session_id: agent_session_id.clone(),
+                    profile_id: None,
+                    profile_snapshot_json: "{}".to_owned(),
+                    capabilities_snapshot_json: "{}".to_owned(),
+                    workspace_id: None,
+                    status: HarnessSessionStatus::Active,
+                    predecessor_session_id: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                    last_activity_at: agent_session_id.as_ref().map(|_| now.clone()),
+                },
+            )
+            .await
+            .expect("exact pending HarnessSession creates");
+            Some(id)
+        } else {
+            None
+        };
         let execution = ExecutionRepo::create(
             db,
             CreateExecution {
                 id: new_uuid_v4(),
                 task_id,
-                agent_id: Some(agent_id),
-                actor_ref: None,
-                purpose: None,
-                harness_session_id: None,
+                agent_id: Some(agent_id.clone()),
+                actor_ref: harness_session_id
+                    .as_ref()
+                    .map(|_| db::ActorRef::Agent(agent_id)),
+                purpose: Some(db::ExecutionPurpose::Implement),
+                harness_session_id,
                 role: "coder".to_owned(),
                 status: ExecutionStatus::Running,
                 stop_reason: None,

@@ -517,24 +517,24 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         } else {
             S::Native
         };
-        crate::harness_capabilities(
+        crate::C {
             resume,
-            S::Emulated,
-            S::Native,
-            S::Native,
-            S::Unsupported,
-            S::Native,
-            S::Native,
-            S::Native,
-            S::Unsupported,
-            S::Native,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-        )
+            cancel: S::Emulated,
+            structured_events: S::Native,
+            usage_reporting: S::Native,
+            account_usage_observation: S::Unsupported,
+            model_selection: S::Native,
+            reasoning_controls: S::Native,
+            approval_policy: S::Native,
+            sandbox_controls: S::Unsupported,
+            planning: S::Native,
+            review_mode: S::Unsupported,
+            fork: S::Unsupported,
+            steer: S::Unsupported,
+            pause_resume: S::Unsupported,
+            compaction: S::Unsupported,
+            subagents: S::Unsupported,
+        }
     }
 
     fn interpret_execution_policy(

@@ -17,13 +17,13 @@ function renderMessage(text: string) {
 }
 
 describe('ChatAssistantMessage', () => {
-  it('opens captured plan files through the task plan UI', () => {
+  it('opens captured plan files through the task page', () => {
     renderMessage(
       'Implementation plan written to [plan.md](/tmp/forge/worktrees/6ca7d024-77a5-4e00-be97-f0b889ed6a67/plan.md).',
     )
 
     expect(screen.getByRole('link', { name: 'plan.md' }).getAttribute('href')).toBe(
-      '/tasks/6ca7d024-77a5-4e00-be97-f0b889ed6a67/overview#task-plan',
+      '/tasks/6ca7d024-77a5-4e00-be97-f0b889ed6a67',
     )
   })
 

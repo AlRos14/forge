@@ -624,7 +624,6 @@ pub fn api_router(state: AppState) -> Router {
 }
 
 #[cfg(test)]
-
 pub async fn serve(
     addr: SocketAddr,
     state: AppState,

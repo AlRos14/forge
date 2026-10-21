@@ -564,6 +564,7 @@ impl TaskService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn dispatch_initial_role_execution_with_artifacts(
         &self,
         _task_id: &str,

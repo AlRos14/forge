@@ -240,6 +240,7 @@ impl From<ServiceError> for ApiError {
             },
             ServiceError::NotFound { entity, id } => Self::not_found(entity, id),
             ServiceError::InvalidOperation { message } => Self::invalid_operation(message),
+            ServiceError::DaemonStartRejected { message } => Self::invalid_operation(message),
             ServiceError::AuthorizationDenied { message } => {
                 Self::forbidden_with_code("authorization.invalid", message)
             }

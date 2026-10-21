@@ -5,9 +5,6 @@ use std::{
 };
 
 use api::{build_router, AppState};
-use api_types::{
-    AuthorType, CommentResponse, PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse,
-};
 use axum::{
     body::{to_bytes, Body},
     http::{Method, Request, StatusCode},
@@ -23,118 +20,35 @@ use serde_json::json;
 use std::process::Stdio;
 use tower::ServiceExt;
 
-// ── Test 13.6: comment CRUD ──
+// Task comments were retired in PR13 in favor of generic collaboration Messages.
 
 #[tokio::test]
-async fn comment_create_list_delete() {
-    let workspace_root = TestDir::new("forge-comments-crud");
+async fn retired_task_comment_collection_routes_return_not_found() {
+    let workspace_root = TestDir::new("forge-retired-comments");
     let harness = test_app(workspace_root.path()).await;
-    let (repo_path, _) = setup_git_repo(workspace_root.path(), "comments");
+    let task_comments = "/api/v1/tasks/00000000-0000-4000-8000-000000000000/comments";
 
-    let project: ProjectResponse = json_request(
-        &harness.app,
-        Method::POST,
-        "/api/v1/projects",
-        json!({ "name": "Comment Test" }),
-        StatusCode::OK,
-    )
-    .await;
-
-    let _repo: RepoResponse = json_request(
-        &harness.app,
-        Method::POST,
-        &format!("/api/v1/projects/{}/repos", project.id),
-        json!({
-            "name": "repo",
-            "local_path": repo_path.to_string_lossy(),
-            "remote_url": repo_path.to_string_lossy(),
-            "default_branch": "main"
-        }),
-        StatusCode::OK,
-    )
-    .await;
-
-    let task: TaskResponse = json_request(
-        &harness.app,
-        Method::POST,
-        &format!("/api/v1/projects/{}/tasks", project.id),
-        json!({ "title": "Comment test task",
-            "description": "test"
-        }),
-        StatusCode::OK,
-    )
-    .await;
-
-    // Create a user comment
-    let comment: CommentResponse = json_request(
-        &harness.app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/comments", task.id),
-        json!({ "content": "Hello world", "author_name": "Tester" }),
-        StatusCode::CREATED,
-    )
-    .await;
-    assert_eq!(comment.content, "Hello world");
-    assert_eq!(comment.author_name, "Tester");
-    assert_eq!(comment.author_type, AuthorType::User);
-
-    // List comments
-    let listed: PaginatedResponse<CommentResponse> = empty_request(
-        &harness.app,
-        Method::GET,
-        &format!("/api/v1/tasks/{}/comments", task.id),
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(listed.items.len(), 1);
-    assert_eq!(listed.items[0].content, "Hello world");
-
-    // Delete user comment
-    let delete_response = raw_request(
-        &harness.app,
-        Method::DELETE,
-        &format!("/api/v1/comments/{}", comment.id),
-        json!(null),
-    )
-    .await;
-    assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
-
-    // Verify it's gone
-    let listed: PaginatedResponse<CommentResponse> = empty_request(
-        &harness.app,
-        Method::GET,
-        &format!("/api/v1/tasks/{}/comments", task.id),
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(listed.items.len(), 0);
+    for (method, body) in [
+        (Method::GET, json!(null)),
+        (Method::POST, json!({"content": "legacy comment"})),
+    ] {
+        let response = raw_request(&harness.app, method, task_comments, body).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[tokio::test]
-async fn system_comments_cannot_be_deleted() {
-    let workspace_root = TestDir::new("forge-comments-system-delete");
+async fn retired_comment_delete_route_returns_not_found() {
+    let workspace_root = TestDir::new("forge-retired-comment-delete");
     let harness = test_app(workspace_root.path()).await;
-
-    let task_id = seed_task_with_system_comment(&harness.state.db).await;
-
-    let listed: PaginatedResponse<CommentResponse> = empty_request(
-        &harness.app,
-        Method::GET,
-        &format!("/api/v1/tasks/{task_id}/comments"),
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(listed.items.len(), 1);
-    let system_comment_id = &listed.items[0].id;
-
     let delete_response = raw_request(
         &harness.app,
         Method::DELETE,
-        &format!("/api/v1/comments/{system_comment_id}"),
+        "/api/v1/comments/00000000-0000-4000-8000-000000000000",
         json!(null),
     )
     .await;
-    assert_eq!(delete_response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(delete_response.status(), StatusCode::NOT_FOUND);
 }
 
 // ── Harness ──

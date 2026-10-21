@@ -10,7 +10,7 @@ use api::{build_router, AppState};
 use api_types::{
     AgentResponse, CliProjectionItem, CliProjectionResponse, DaemonRegisterResponse,
     DaemonResponse, ExecutionPurpose, ExecutionResponse, ExecutionStatus, PaginatedResponse,
-    ProjectResponse, RepoResponse, TaskLifecycleState, TaskResponse,
+    ProjectResponse, RepoResponse, TaskLifecycleState, TaskResponse, WorkUnitResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -23,7 +23,8 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn daemon_onboarding_shell_task_flow_end_to_end() {
-    let (app, state) = test_app_with_state().await;
+    let workspace_root = TestDir::new("forge-daemon-onboarding-workspaces");
+    let (app, state) = test_app_with_state(workspace_root.path()).await;
 
     let registration: DaemonRegisterResponse = json_request(
         &app,
@@ -78,7 +79,10 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
     .await;
     let shell_cli = shell_cli_for_daemon(&clis, &daemon_id);
     assert_eq!(shell_cli.availability, "authenticated");
-    assert!(shell_cli.agents.is_empty());
+    assert!(shell_cli
+        .agents
+        .iter()
+        .any(|agent| { agent.name == "Shell on e2e-test-host" && agent.executor_type == "shell" }));
 
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
 
@@ -152,16 +156,57 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
         .await
         .expect("Agent joins implementer TaskRole");
 
+    let work_unit: WorkUnitResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/work-units", task.id),
+        json!({
+            "title": "Daemon onboarding shell WorkUnit",
+            "scope": "Run the isolated shell execution and capture its result",
+            "role": "implementer",
+            "parent_work_unit_id": null,
+            "assigned_actor": null,
+            "requires_integration": true,
+            "provenance": null
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    let work_units: Vec<WorkUnitResponse> = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/work-units", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(work_units.len(), 1, "REST creates exactly one WorkUnit");
+    assert_eq!(work_units[0].id, work_unit.id);
+
+    let allocated_work_unit: WorkUnitResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/allocation", work_unit.id),
+        json!({
+            "expected_version": work_unit.version,
+            "role": "implementer",
+            "assigned_actor": { "kind": "agent", "id": agent_id }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+
     let running_execution: ExecutionResponse = json_request(
         &app,
         Method::POST,
         &format!("/api/v1/tasks/{}/executions", task.id),
         json!({
-            "agent_id": agent_id,
-            "role": "implementer",
+            "work_unit_id": allocated_work_unit.id,
+            "expected_work_unit_version": allocated_work_unit.version,
             "purpose": "implement",
             "prompt": "echo forge-e2e-ok",
-            "input_artifact_ids": []
+            "input_artifact_ids": [],
+            "overrides": null
         }),
         StatusCode::OK,
     )
@@ -174,11 +219,11 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
     assert_eq!(running_execution.role, "implementer");
     assert_eq!(running_execution.purpose, Some(ExecutionPurpose::Implement));
 
-    let workspace = db::WorkspaceRepo::get_integration_by_task_id(&*state.db, &task.id)
+    let workspace = db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*state.db, &work_unit.id)
         .await
         .expect("workspace query succeeds")
-        .expect("claim created a workspace");
-    std::fs::create_dir_all(&workspace.worktree_path).expect("create shell worktree");
+        .expect("execution preparation created a WorkUnit workspace");
+    assert!(std::path::Path::new(&workspace.worktree_path).exists());
 
     let completed_execution = poll_execution_status(
         &app,
@@ -212,27 +257,58 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
     assert_eq!(agent_detail.active_execution_count, Some(0));
 }
 
-async fn test_app_with_state() -> (Router, Arc<AppState>) {
+async fn test_app_with_state(workspace_root: &Path) -> (Router, Arc<AppState>) {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*db,
+        &db::User {
+            id: "test-user-id".to_owned(),
+            email: "test@example.com".to_owned(),
+            password_hash: "$2b$04$placeholder".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("seed authenticated test user");
+
     let adapter_registry = Arc::new(cli_adapters::default_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(events::EventBus::new(16));
-    let state = Arc::new(AppState::with_adapter_registry(
+    let merge_service = Arc::new(services::MergeService::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        workspace_root.to_path_buf(),
+    ));
+    let cleanup_scheduler = Arc::new(services::WorkspaceCleanupScheduler::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        workspace_root.to_path_buf(),
+    ));
+    let state = Arc::new(AppState::with_adapter_registry_services_and_shutdown(
         db,
         event_bus,
         true,
         adapter_registry,
+        merge_service,
+        cleanup_scheduler,
+        api::state::ShutdownSignal::new(),
+        api::state::test_workflows_dir(),
+        api::state::test_jwt_secret(),
+        api::state::test_bcrypt_cost(),
     ));
 
-    let web_dist_dir =
-        std::env::temp_dir().join(format!("forge-api-daemon-e2e-{}", uuid::Uuid::new_v4()));
+    let web_dist_dir = workspace_root.join("web-dist");
     std::fs::create_dir_all(&web_dist_dir).expect("create web dist dir");
     std::fs::write(web_dist_dir.join("index.html"), "<html></html>").expect("write index");
 

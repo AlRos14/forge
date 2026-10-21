@@ -1603,7 +1603,7 @@ impl OrchestratorRuntime {
                 &*self.db,
                 db::TransitionOrchestratorWake {
                     id: wake.id.clone(),
-                    expected_state: Some(wake.state.clone()),
+                    expected_state: Some(wake.state),
                     lease_owner: None,
                     state: OrchestratorWakeState::Failed,
                     available_at: None,
@@ -2671,6 +2671,13 @@ mod tests {
     };
     use sqlx::Row;
 
+    type ProviderOverride = (
+        Arc<dyn crate::daemon_transport::ExecutionProvider>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<tokio::sync::Notify>,
+    );
+    type HarnessObservation = (api_types::HarnessInvocation, Option<String>, String);
+
     async fn test_user(database: &Arc<db::SqliteDb>, name: &str) -> String {
         let now = now_rfc3339();
         let id = new_uuid_v4();
@@ -2714,27 +2721,50 @@ mod tests {
     async fn test_task(database: &Arc<db::SqliteDb>, project_id: &str, title: &str) -> String {
         let now = now_rfc3339();
         let id = new_uuid_v4();
-        TaskRepo::create(
-            &**database,
-            CreateTask {
-                id: id.clone(),
-                project_id: project_id.to_owned(),
-                repo_id: None,
-                parent_task_id: None,
-                title: title.to_owned(),
-                description: None,
-                task_type: "implementation".to_owned(),
-                lifecycle_state: db::TaskLifecycleState::Ready,
-                is_automation: false,
-                priority: 0,
-                subtask_order: None,
-                merge_config: None,
-                created_at: now.clone(),
-                updated_at: now,
-            },
+        let lifecycle_table_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_lifecycle'
+            )",
         )
+        .fetch_one(database.pool())
         .await
-        .expect("task creates");
+        .expect("TaskLifecycle schema lookup");
+        if lifecycle_table_exists {
+            TaskRepo::create(
+                &**database,
+                CreateTask {
+                    id: id.clone(),
+                    project_id: project_id.to_owned(),
+                    repo_id: None,
+                    parent_task_id: None,
+                    title: title.to_owned(),
+                    description: None,
+                    task_type: "implementation".to_owned(),
+                    lifecycle_state: db::TaskLifecycleState::Ready,
+                    is_automation: false,
+                    priority: 0,
+                    subtask_order: None,
+                    merge_config: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("task creates");
+        } else {
+            sqlx::query(
+                "INSERT INTO task (id, project_id, title, status, created_at, updated_at)
+                 VALUES (?, ?, ?, 'todo', ?, ?)",
+            )
+            .bind(&id)
+            .bind(project_id)
+            .bind(title)
+            .bind(&now)
+            .bind(&now)
+            .execute(database.pool())
+            .await
+            .expect("legacy task seeds before TaskLifecycle exists");
+        }
         id
     }
 
@@ -2952,11 +2982,7 @@ mod tests {
     async fn provider_start_fixture_with_options(
         claim_barrier: Option<Arc<tokio::sync::Barrier>>,
         prepare_start: bool,
-        provider_override: Option<(
-            Arc<dyn crate::daemon_transport::ExecutionProvider>,
-            Arc<std::sync::atomic::AtomicUsize>,
-            Arc<tokio::sync::Notify>,
-        )>,
+        provider_override: Option<ProviderOverride>,
     ) -> ProviderStartFixture {
         use db::{
             AgentStatus, CreateAgent, CreateDomainEvent, CreateRoleMembership, DaemonRepo,
@@ -5124,15 +5150,21 @@ mod tests {
         let pre_v095 = tempfile::tempdir().expect("pre-V095 migration directory creates");
         for entry in std::fs::read_dir(&source_migrations).expect("migration directory reads") {
             let entry = entry.expect("migration entry reads");
-            let filename = entry.file_name();
-            let filename = filename.to_string_lossy();
-            if filename.starts_with("V095__")
-                || filename.starts_with("V096__")
-                || filename.starts_with("V097__")
-            {
+            let path = entry.path();
+            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(version) = filename
+                .strip_prefix('V')
+                .and_then(|name| name.split_once("__"))
+                .and_then(|(version, _)| version.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if version > 94 {
                 continue;
             }
-            std::fs::copy(entry.path(), pre_v095.path().join(filename.as_ref()))
+            std::fs::copy(&path, pre_v095.path().join(filename))
                 .expect("pre-V095 migration copies");
         }
 
@@ -5279,7 +5311,7 @@ mod tests {
         .await
         .expect("consumer cursor is at the pre-upgrade head");
 
-        db::run_migrations_from(&database.pool(), &source_migrations)
+        db::run_migrations_from(database.pool(), &source_migrations)
             .await
             .expect("V095 applies after the consumer cursor is already at head");
         let seeded_events: i64 = sqlx::query_scalar(
@@ -5354,7 +5386,7 @@ mod tests {
                 .expect("Human bootstrap does not create Executions");
         assert_eq!(executions, 0);
 
-        db::run_migrations_from(&database.pool(), &source_migrations)
+        db::run_migrations_from(database.pool(), &source_migrations)
             .await
             .expect("migration discovery remains idempotent");
         let repeated = runtime
@@ -5372,8 +5404,7 @@ mod tests {
     #[derive(Clone)]
     struct Pr6RecordingHarnessAdapter {
         response: String,
-        observed:
-            Arc<std::sync::Mutex<Vec<(api_types::HarnessInvocation, Option<String>, String)>>>,
+        observed: Arc<std::sync::Mutex<Vec<HarnessObservation>>>,
         calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
         started: Option<Arc<tokio::sync::Notify>>,
     }
@@ -5847,15 +5878,16 @@ mod tests {
         assert_eq!(session.agent_id, agent_id);
         assert_eq!(session.harness_kind, "codex");
         assert_eq!(session.workspace_id, None);
-        let observations = observed.lock().expect("executor observations");
-        assert_eq!(observations.len(), 1);
-        assert!(matches!(
-            &observations[0].0,
-            api_types::HarnessInvocation::Start
-        ));
-        assert_eq!(observations[0].1.as_deref(), Some("read-only"));
-        assert_eq!(observations[0].2, "orchestrator");
-        drop(observations);
+        {
+            let observations = observed.lock().expect("executor observations");
+            assert_eq!(observations.len(), 1);
+            assert!(matches!(
+                &observations[0].0,
+                api_types::HarnessInvocation::Start
+            ));
+            assert_eq!(observations[0].1.as_deref(), Some("read-only"));
+            assert_eq!(observations[0].2, "orchestrator");
+        }
 
         let reconciled = runtime
             .run_once(10)
@@ -6395,7 +6427,7 @@ mod tests {
         .expect("supported restrictive policy parses");
         assert!(restrictive.permits(&message));
         assert!(!restrictive.permits(&create_work_unit));
-        assert!(validate_action_policy(&restrictive, &[message.clone()]).is_ok());
+        assert!(validate_action_policy(&restrictive, std::slice::from_ref(&message)).is_ok());
         assert!(validate_action_policy(&restrictive, &[create_work_unit]).is_err());
         assert!(validate_action_policy(&restrictive, &[message.clone(), message]).is_err());
         let agent_dispatch_disabled =

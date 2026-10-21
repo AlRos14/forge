@@ -482,6 +482,7 @@ struct CauseFields {
     actor_id: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_lifecycle_transition_record(
     task_id: &str,
     expected_task_version: i64,
@@ -1626,8 +1627,7 @@ mod tests {
         wrong_outcome.required_outcome = ValidationRunStatus::Failed;
         mismatches.push(wrong_outcome);
 
-        let mut policy_revision = 1;
-        for requirement in mismatches {
+        for (policy_revision, requirement) in (1..).zip(mismatches) {
             gate_engine
                 .revise_policy(
                     &validation_gate.id,
@@ -1636,7 +1636,6 @@ mod tests {
                 )
                 .await
                 .expect("append immutable mismatch policy");
-            policy_revision += 1;
             let evaluation = gate_engine
                 .evaluate_active(&validation_gate.id)
                 .await

@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -13,7 +15,7 @@ use api_types::{
     ReviewExecutionResponse, ReviewReportVerdict, StartReviewExecutionRequest,
     SubmitReviewReportRequest, SubmitReviewReportResponse, TaskLifecycleResponse,
     TaskLifecycleState, TaskResponse, TerminalAttachTokenResponse, TerminalServerFrame,
-    TerminalSessionResponse, TerminalSessionStatus,
+    TerminalSessionResponse, TerminalSessionStatus, WorkUnitIntegrationResponse, WorkUnitResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -27,6 +29,7 @@ use db::{
 use events::{EventBus, ForgeEvent, PROJECT_HOOK_RUN_CHANGED_EVENT};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
+use sha2::Digest;
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -110,14 +113,24 @@ async fn forge_happy_path_end_to_end() {
     assert_eq!(created_task.version, 1);
     assign_test_user_as_reviewer(&harness.state, &task_id).await;
     assign_agent_as_implementer(&harness.state, &task_id, &agent_id).await;
+    let work_unit = common::create_allocated_work_unit(
+        &harness.app,
+        &task_id,
+        "implementer",
+        &agent_id,
+        "Happy path implementation",
+        "Write and commit greeting.txt for the requested Task change",
+        true,
+    )
+    .await;
 
     let execution: ExecutionResponse = json_request(
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/executions"),
         json!({
-            "agent_id": agent_id.clone(),
-            "role": "implementer",
+            "work_unit_id": work_unit.id,
+            "expected_work_unit_version": work_unit.version,
             "purpose": "implement",
             "prompt": "echo hello > greeting.txt && git add . && git commit -m 'hi'",
             "input_artifact_ids": []
@@ -132,15 +145,66 @@ async fn forge_happy_path_end_to_end() {
     );
     let execution_id = execution.id.clone();
 
-    let worktree_path = workspaces_root.path().join(&task_id).join("repo");
-    let greeting_path = worktree_path.join("greeting.txt");
-    poll_until_workspace_written(&harness.app, &task_id, &greeting_path).await;
+    let source_workspace =
+        db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*harness.state.db, &work_unit.id)
+            .await
+            .expect("WorkUnit Workspace lookup succeeds")
+            .expect("Execution created its exact WorkUnit Workspace");
+    let source_worktree_path = PathBuf::from(&source_workspace.worktree_path);
+    poll_until_workspace_written(
+        &harness.app,
+        &task_id,
+        &source_worktree_path.join("greeting.txt"),
+    )
+    .await;
     poll_until_execution_completed(&harness.state.db, &execution_id).await;
+
+    let current_work_unit: WorkUnitResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/work-units/{}", work_unit.id),
+        StatusCode::OK,
+    )
+    .await;
+    let completed_work_unit: WorkUnitResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/status", work_unit.id),
+        json!({
+            "expected_version": current_work_unit.version,
+            "status": "completed"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        completed_work_unit.status,
+        api_types::WorkUnitStatus::Completed
+    );
+
+    let integration: WorkUnitIntegrationResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/integrations", work_unit.id),
+        json!({
+            "execution_id": execution_id,
+            "idempotency_key": "happy-path-work-unit-integration"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        integration.outcome,
+        api_types::WorkUnitIntegrationOutcome::Success
+    );
+    assert!(integration.target_after_sha.is_some());
 
     let workspace = WorkspaceRepo::get_integration_by_task_id(&*harness.state.db, &task_id)
         .await
         .expect("Task Workspace lookup succeeds")
-        .expect("worker Execution created a Workspace");
+        .expect("WorkUnit integration created the Task integration Workspace");
+    let worktree_path = PathBuf::from(&workspace.worktree_path);
+    assert!(worktree_path.join("greeting.txt").exists());
     let validation = services::ValidationService::new(
         Arc::clone(&harness.state.db),
         Arc::clone(&harness.event_bus),
@@ -160,6 +224,7 @@ async fn forge_happy_path_end_to_end() {
     let review = submit_human_review(
         &harness.app,
         &task_id,
+        &source_workspace.id,
         ReviewReportVerdict::Pass,
         "The committed file satisfies the requested change.",
     )
@@ -180,40 +245,9 @@ async fn forge_happy_path_end_to_end() {
     let evidence = validation.evidence;
     assert_eq!(evidence.len(), 1);
 
-    let report_content: Value = serde_json::from_str(
-        review
-            .report
-            .content
-            .as_deref()
-            .expect("ReviewReport content is available"),
-    )
-    .expect("ReviewReport content is valid JSON");
-    let subject = report_content
-        .get("subject")
-        .expect("ReviewReport has an exact subject");
+    let dependency_digest = hex::encode(sha2::Sha256::digest(b"[]"));
     let gate_policy = json!({
         "schema_version": 1,
-        "review": {
-            "mode": "one_acceptable",
-            "required_count": 1,
-            "human_required": true,
-            "allow_humans": true,
-            "allow_agents": false,
-            "allowed_actor_refs": [{"kind": "human", "id": "test-user-id"}],
-            "task_role_snapshot": null,
-            "candidates": [{
-                "artifact_id": review.report.id,
-                "digest": review.report.digest.as_deref().expect("ReviewReport digest exists"),
-                "expected_actor": {"kind": "human", "id": "test-user-id"},
-                "required": true,
-                "subject": {
-                    "workspace_id": subject["workspace_id"],
-                    "base_commit_sha": subject["base_commit_sha"],
-                    "head_commit_sha": subject["head_commit_sha"],
-                    "workspace_snapshot_digest": subject["workspace_snapshot_digest"]
-                }
-            }]
-        },
         "validations": [{
             "validation_run_id": validations[0].id,
             "evidence_id": evidence[0].id,
@@ -226,7 +260,16 @@ async fn forge_happy_path_end_to_end() {
             "required_outcome": "passed"
         }],
         "decisions": [],
-        "work_units": []
+        "work_units": [{
+            "work_unit_id": work_unit.id,
+            "version": completed_work_unit.version,
+            "dependency_digest": dependency_digest,
+            "execution_id": execution_id,
+            "execution_result_sha": integration.source_sha,
+            "require_integration": true,
+            "integration_id": integration.id,
+            "integration_version": integration.version
+        }]
     });
     let gate: GateResponse = json_request(
         &harness.app,
@@ -306,8 +349,8 @@ async fn forge_happy_path_end_to_end() {
         "latest git subject references the task change: {latest_subject}"
     );
     assert!(
-        !workspaces_root.path().join(&task_id).exists(),
-        "workspace task directory is cleaned"
+        worktree_path.join("greeting.txt").exists(),
+        "integrated Task workspace remains available with its WorkUnit history"
     );
 
     assert_eq!(
@@ -367,7 +410,12 @@ async fn forge_happy_path_end_to_end() {
         "TaskRole membership changes do not publish the retired singular assignment event"
     );
     assert_event_type(&events, "domain_event.committed");
-    assert_event_type(&events, "workspace.cleaned");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != "workspace.cleaned"),
+        "WorkUnit Task integration Workspace remains retained for exact history"
+    );
     assert!(
         events
             .iter()
@@ -433,14 +481,24 @@ async fn request_changes_report_leaves_lifecycle_to_gate_and_orchestration() {
     assert_eq!(task.lifecycle.state, TaskLifecycleState::Ready);
     assign_test_user_as_reviewer(&harness.state, &task.id).await;
     assign_agent_as_implementer(&harness.state, &task.id, &agent.id).await;
+    let work_unit = common::create_allocated_work_unit(
+        &harness.app,
+        &task.id,
+        "implementer",
+        &agent.id,
+        "Requested changes implementation",
+        "Write the requested changes to a committed repository scope",
+        true,
+    )
+    .await;
 
     let execution: ExecutionResponse = json_request(
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{}/executions", task.id),
         json!({
-            "agent_id": agent.id,
-            "role": "implementer",
+            "work_unit_id": work_unit.id,
+            "expected_work_unit_version": work_unit.version,
             "purpose": "implement",
             "prompt": "printf 'requested changes\\n' > requested-changes.txt && git add requested-changes.txt && git commit -m requested-changes",
             "input_artifact_ids": []
@@ -452,9 +510,49 @@ async fn request_changes_report_leaves_lifecycle_to_gate_and_orchestration() {
     assert_eq!(first_execution.role.to_string(), "implementer");
     poll_until_execution_completed(&harness.state.db, &first_execution.id).await;
 
+    let current_work_unit: WorkUnitResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/work-units/{}", work_unit.id),
+        StatusCode::OK,
+    )
+    .await;
+    let _: WorkUnitResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/status", work_unit.id),
+        json!({
+            "expected_version": current_work_unit.version,
+            "status": "completed"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let integration: WorkUnitIntegrationResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/integrations", work_unit.id),
+        json!({
+            "execution_id": first_execution.id,
+            "idempotency_key": "request-changes-work-unit-integration"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        integration.outcome,
+        api_types::WorkUnitIntegrationOutcome::Success
+    );
+
+    let source_workspace =
+        db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*harness.state.db, &work_unit.id)
+            .await
+            .expect("WorkUnit Workspace lookup succeeds")
+            .expect("Execution prepared its exact WorkUnit Workspace");
     let request_changes = submit_human_review(
         &harness.app,
         &task.id,
+        &source_workspace.id,
         ReviewReportVerdict::RequestChanges,
         "Please add evidence for the requested behavior.",
     )
@@ -583,6 +681,7 @@ async fn assign_agent_as_implementer(state: &AppState, task_id: &str, agent_id: 
 async fn submit_human_review(
     app: &Router,
     task_id: &str,
+    workspace_id: &str,
     verdict: ReviewReportVerdict,
     summary: &str,
 ) -> SubmitReviewReportResponse {
@@ -590,8 +689,10 @@ async fn submit_human_review(
         app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/review-executions"),
-        serde_json::to_value(StartReviewExecutionRequest { workspace_id: None })
-            .expect("review start request serializes"),
+        serde_json::to_value(StartReviewExecutionRequest {
+            workspace_id: Some(workspace_id.to_owned()),
+        })
+        .expect("review start request serializes"),
         StatusCode::OK,
     )
     .await;
