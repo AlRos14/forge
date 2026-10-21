@@ -137,7 +137,7 @@ impl TaskService {
         )
         .await?
         {
-            db::PendingProviderStartFailure::Resolved(execution, event) => (execution, event),
+            db::PendingProviderStartFailure::Resolved(execution, event) => (*execution, event),
             db::PendingProviderStartFailure::Attempted(execution)
             | db::PendingProviderStartFailure::NotRunning(execution) => return Ok(execution),
             db::PendingProviderStartFailure::NotPending(execution) => {

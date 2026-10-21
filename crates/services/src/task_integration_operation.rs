@@ -133,6 +133,9 @@ impl TaskIntegrationOperationManager {
         })
     }
 
+    // Keep the exact admitted publication inputs explicit without changing the
+    // existing service contract during the CI toolchain update.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn admit_pull_request_publication_with_lock(
         &self,
         task_id: &str,
@@ -444,6 +447,30 @@ fn busy(task_id: &str) -> ServiceError {
 
 #[cfg(test)]
 mod tests {
+    type LegacyPrHistoryRow = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+    type RemotePrHistoryRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+
     use super::*;
     use db::{
         create_sqlite_pool, run_migrations, CreatePrProviderConfig, CreateProject, CreateRepo,
@@ -704,27 +731,56 @@ mod tests {
         )
         .await
         .expect("repository");
-        TaskRepo::create(
-            &*db,
-            CreateTask {
-                id: task_id.clone(),
-                project_id,
-                repo_id: Some(repo_id.clone()),
-                parent_task_id: None,
-                subtask_order: None,
-                title: "Operation recovery".to_owned(),
-                description: None,
-                task_type: "implementation".to_owned(),
-                lifecycle_state: db::TaskLifecycleState::Ready,
-                is_automation: false,
-                priority: 0,
-                merge_config: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
+        let legacy_task_lifecycle_trigger: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'trigger' AND name = 'task_lifecycle_insert_for_new_task'
+            )",
         )
+        .fetch_one(db.pool())
         .await
-        .expect("task");
+        .expect("legacy TaskLifecycle trigger lookup");
+        if legacy_task_lifecycle_trigger {
+            // Before V129 the database trigger creates the lifecycle projection
+            // from Task.status. Seed through that historical write path instead
+            // of combining it with the current repository's explicit insert.
+            sqlx::query(
+                "INSERT INTO task (
+                    id, project_id, repo_id, title, status, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, 'todo', ?, ?)",
+            )
+            .bind(&task_id)
+            .bind(&project_id)
+            .bind(&repo_id)
+            .bind("Operation recovery")
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .expect("legacy task inserts through its status projection");
+        } else {
+            TaskRepo::create(
+                &*db,
+                CreateTask {
+                    id: task_id.clone(),
+                    project_id,
+                    repo_id: Some(repo_id.clone()),
+                    parent_task_id: None,
+                    subtask_order: None,
+                    title: "Operation recovery".to_owned(),
+                    description: None,
+                    task_type: "implementation".to_owned(),
+                    lifecycle_state: db::TaskLifecycleState::Ready,
+                    is_automation: false,
+                    priority: 0,
+                    merge_config: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("task");
+        }
         WorkspaceRepo::create(
             &*db,
             CreateWorkspace {
@@ -1213,6 +1269,7 @@ mod tests {
         Ok((manager, merge, publish))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_test_remote_outcome(
         fixture: &Fixture,
         merge_id: &str,
@@ -1952,6 +2009,30 @@ mod tests {
             .await
             .expect("later legitimate Human lifecycle action");
         }
+
+        // This fixture runs current service code against a pre-V129 schema.
+        // Older schema versions kept Task.status aligned with TaskLifecycle;
+        // the current service no longer writes that retired projection.
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("legacy Task.status projection source loads")
+            .expect("legacy TaskLifecycle exists");
+        let legacy_status = match lifecycle.state {
+            db::TaskLifecycleState::Backlog => "backlog",
+            db::TaskLifecycleState::Ready => "todo",
+            db::TaskLifecycleState::Active
+            | db::TaskLifecycleState::ReadyToMerge
+            | db::TaskLifecycleState::Merging => "in_progress",
+            db::TaskLifecycleState::Blocked => "blocked",
+            db::TaskLifecycleState::Done => "done",
+            db::TaskLifecycleState::Cancelled => "cancelled",
+        };
+        sqlx::query("UPDATE task SET status = ? WHERE id = ?")
+            .bind(legacy_status)
+            .bind(&fixture.task_id)
+            .execute(fixture.db.pool())
+            .await
+            .expect("historical Task.status projection matches lifecycle");
 
         V113WrongHeadRework {
             _temp: None,
@@ -2994,19 +3075,7 @@ mod tests {
                 .expect("PR publication admission");
         let publish_id = publish.id().to_owned();
 
-        let history: (
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-        ) = sqlx::query_as(
+        let history: LegacyPrHistoryRow = sqlx::query_as(
             "SELECT legacy_metadata_id, provider_type, provider_pr_id, pr_url,
                         source_branch, target_branch, pr_state, merge_status,
                         task_merge_operation_id, publish_operation_id,
@@ -5086,16 +5155,7 @@ mod tests {
         )
         .await
         .expect("new admission snapshots the terminal mismatch");
-        let history: (
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            String,
-        ) = sqlx::query_as(
+        let history: RemotePrHistoryRow = sqlx::query_as(
             "SELECT admission_state, provider_status, result_classification,
                     observed_head_sha, merged_commit_sha, provider_event_id,
                     result_event_id, admitted_source_sha

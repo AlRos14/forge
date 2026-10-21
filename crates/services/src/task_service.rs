@@ -852,6 +852,7 @@ impl TaskService {
     /// exact child Execution in one SQLite transaction. Explicit operator
     /// recovery can also admit a Manual crash-recovery Execution while the
     /// aggregate Task remains Active.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn admit_recovery_work_unit_execution_with_artifact_inputs(
         &self,
         task: &Task,
@@ -877,6 +878,7 @@ impl TaskService {
         Ok((task, execution))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn admit_recovery_work_unit_execution_with_options(
         &self,
         task: &Task,
@@ -1024,7 +1026,7 @@ impl TaskService {
             self.workspace_exec_locks.as_ref(),
             work_unit
                 .requires_integration
-                .then(|| input.workspace_id.as_deref())
+                .then_some(input.workspace_id.as_deref())
                 .flatten(),
         ) {
             (Some(locks), Some(workspace_id)) => Some(locks.acquire(workspace_id).await),
@@ -1073,7 +1075,7 @@ impl TaskService {
                 ));
             }
             self.prepare_non_repository_work_unit_context(
-                &task,
+                task,
                 &work_unit,
                 actor,
                 input.executor_config_snapshot_json.as_deref(),

@@ -190,7 +190,7 @@ impl TaskService {
         let resume_candidate =
             annotated_execution.or_else(|| (exact_stopped.len() == 1).then(|| exact_stopped[0]));
         let resumable = if let Some(execution) = resume_candidate {
-            if resumable_external_session(
+            resumable_external_session(
                 &self.db,
                 execution,
                 execution.agent_id.as_deref(),
@@ -198,11 +198,6 @@ impl TaskService {
             )
             .await?
             .is_some()
-            {
-                true
-            } else {
-                false
-            }
         } else {
             false
         };
@@ -351,6 +346,14 @@ fn action_name(action: TaskAction) -> &'static str {
     }
 }
 
+fn unavailable_reason(action: TaskAction, lifecycle: db::TaskLifecycleState) -> String {
+    format!(
+        "action '{}' is not available while Task lifecycle is '{}'",
+        action_name(action),
+        lifecycle
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{should_offer_cancel, should_offer_resume};
@@ -382,12 +385,4 @@ mod tests {
         assert!(!should_offer_cancel(TaskLifecycleState::Merging));
         assert!(should_offer_cancel(TaskLifecycleState::Active));
     }
-}
-
-fn unavailable_reason(action: TaskAction, lifecycle: db::TaskLifecycleState) -> String {
-    format!(
-        "action '{}' is not available while Task lifecycle is '{}'",
-        action_name(action),
-        lifecycle
-    )
 }

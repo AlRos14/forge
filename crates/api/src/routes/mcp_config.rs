@@ -926,7 +926,7 @@ command = "other"
                 name: "Project".to_owned(),
                 settings: "{}".to_owned(),
                 primary_repo_id: None,
-                owner_id: None,
+                owner_id: Some("test-user-id".to_owned()),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },

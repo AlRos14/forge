@@ -136,6 +136,6 @@ describe('ProjectReleasePage', () => {
 
     expect(screen.getByRole('heading', { name: 'Release snapshot access denied' })).toBeTruthy()
     expect(screen.queryByText('snapshot-digest')).toBeNull()
-    expect(screen.getByRole('link', { name: /Project Overview/ })).toBeTruthy()
+    expect(screen.getByRole('link', { name: /Project board/ })).toBeTruthy()
   })
 })

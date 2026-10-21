@@ -6,8 +6,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve a remote Execution as running when its daemon reports an uncertain Start outcome, so the provider request is not treated as a definitive rejection or replayed.
+
 ### Breaking
 
+- `db::PendingProviderStartFailure::Resolved` and
+  `db::RunningExecutionFailure::Failed` now hold `Box<Execution>` to reduce
+  the size of these public enums. Consumers matching these variants must
+  dereference the execution value.
 - Follow-up Execution requests now require `idempotency_key`. Repeating the same key and request replays the exact admitted child; using that key for different request content conflicts. A new authorized follow-up supplies a new key.
 - Task Execution start now requires an explicitly allocated WorkUnit and expected WorkUnit version. Task-level Agent/role selection and Task-level Start are retired; repository Executions use the exact WorkUnit Workspace.
 - Human Review start now uses only the explicitly supplied Workspace ID; `workspace_id: null` starts a Workspace-free Review and does not infer the Task integration Workspace.
@@ -264,6 +272,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A successful repository Execution whose Harness omits `after_sha` now records
+  the exact clean Workspace HEAD. If the Workspace remains dirty, Forge marks
+  the Execution failed rather than allowing a WorkUnit to complete without an
+  integrable result.
 - Agent WorkUnit Execution admission now records an undispatched provider Start
   in the same transaction as the Execution, lease, and start event. The existing
   dispatcher resumes that exact Execution after an Agent is unpaused; a durable

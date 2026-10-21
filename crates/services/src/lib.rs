@@ -161,6 +161,9 @@ pub enum ServiceError {
     #[error("provider start outcome is uncertain for Execution {execution_id}")]
     ExecutionStartUncertain { execution_id: String },
 
+    #[error("remote daemon rejected Execution start: {message}")]
+    DaemonStartRejected { message: String },
+
     #[error("project {project_id} is paused")]
     ProjectPaused { project_id: String },
 

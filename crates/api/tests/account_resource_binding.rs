@@ -2,8 +2,8 @@
 mod common;
 
 use api_types::{
-    AgentResponse, PaginatedResponse, ProjectMemberResponse, ProjectResponse,
-    TaskPlanHistoryResponse, TaskResponse, TokenResponse, UserResponse,
+    AgentResponse, PaginatedResponse, ProjectMemberResponse, ProjectResponse, TaskResponse,
+    TokenResponse, UserResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -496,25 +496,13 @@ async fn project_auto_membership_and_non_member_scoping() {
     )
     .await;
     assert_eq!(owner_task.id, task.id);
-    let _: TaskPlanHistoryResponse = bearer_get(
-        app,
-        &format!("/api/v1/tasks/{}/plan", task.id),
-        &jwt_a,
-        StatusCode::OK,
-    )
-    .await;
-
-    for path in [
-        format!("/api/v1/tasks/{}", task.id),
-        format!("/api/v1/tasks/{}/plan", task.id),
-    ] {
-        let status = bearer_get_status(app, &path, &token_b).await;
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "non-member must not discover a task through {path}"
-        );
-    }
+    let task_path = format!("/api/v1/tasks/{}", task.id);
+    let status = bearer_get_status(app, &task_path, &token_b).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "non-member must not discover a Task"
+    );
 
     let user_b: UserResponse = bearer_get(app, "/api/v1/auth/me", &token_b, StatusCode::OK).await;
     let _: ProjectMemberResponse = bearer_json(
@@ -530,13 +518,6 @@ async fn project_auto_membership_and_non_member_scoping() {
     let _: TaskResponse = bearer_get(
         app,
         &format!("/api/v1/tasks/{}", task.id),
-        &token_b,
-        StatusCode::OK,
-    )
-    .await;
-    let _: TaskPlanHistoryResponse = bearer_get(
-        app,
-        &format!("/api/v1/tasks/{}/plan", task.id),
         &token_b,
         StatusCode::OK,
     )

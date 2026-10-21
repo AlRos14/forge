@@ -6,6 +6,27 @@ use sqlx::SqlitePool;
 use std::{collections::BTreeSet, fs, path::Path};
 use tempfile::TempDir;
 
+type DeletedGenesisSummary = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+type DeletedGenesisHistory = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+);
+
 fn copy_migrations_through(limit: i64, destination: &Path) {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for entry in fs::read_dir(source).expect("migration directory") {
@@ -26,6 +47,69 @@ fn copy_migrations_through(limit: i64, destination: &Path) {
                 .expect("migration copied");
         }
     }
+}
+
+async fn delete_project_from_pr11_schema(
+    pool: &SqlitePool,
+    project_id: &str,
+    created_at: &str,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("PRAGMA defer_foreign_keys = ON")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO project_deletion_guard (project_id, created_at) VALUES (?, ?)")
+        .bind(project_id)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await?;
+    for statement in [
+        "DELETE FROM task_lifecycle_transition WHERE task_id IN
+             (SELECT id FROM task WHERE project_id = ?)",
+        "DELETE FROM task_lifecycle_migration_audit WHERE task_id IN
+             (SELECT id FROM task WHERE project_id = ?)",
+        "DELETE FROM task_lifecycle WHERE task_id IN
+             (SELECT id FROM task WHERE project_id = ?)",
+        "DELETE FROM agent_handoff_delivery WHERE handoff_id IN
+             (SELECT h.id FROM agent_handoff h
+              JOIN agent_chat c ON c.id = h.source_chat_id OR c.id = h.target_chat_id
+              WHERE c.kind = 'project' AND c.project_id = ?)",
+        "DELETE FROM agent_handoff WHERE source_chat_id IN
+             (SELECT id FROM agent_chat WHERE kind = 'project' AND project_id = ?)
+             OR target_chat_id IN
+             (SELECT id FROM agent_chat WHERE kind = 'project' AND project_id = ?)",
+        "DELETE FROM agent_chat_instruction_revision WHERE chat_id IN
+             (SELECT id FROM agent_chat WHERE kind = 'project' AND project_id = ?)",
+        "DELETE FROM agent_chat_message WHERE chat_id IN
+             (SELECT id FROM agent_chat WHERE kind = 'project' AND project_id = ?)",
+    ] {
+        let query = sqlx::query(statement).bind(project_id);
+        let query = if statement.contains("OR target_chat_id") {
+            query.bind(project_id)
+        } else {
+            query
+        };
+        query.execute(&mut *tx).await?;
+    }
+    let deleted = sqlx::query("DELETE FROM project WHERE id = ?")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let foreign_key_violations: Vec<(String, i64, String, i64)> =
+        sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&mut *tx)
+            .await?;
+    assert!(
+        foreign_key_violations.is_empty(),
+        "historical Project teardown leaves foreign-key violations: {foreign_key_violations:?}"
+    );
+    sqlx::query("DELETE FROM project_deletion_guard WHERE project_id = ?")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(deleted)
 }
 
 async fn genesis_rows(pool: &SqlitePool) -> Vec<String> {
@@ -584,8 +668,8 @@ async fn v118_preserves_history_and_revokes_only_binding_only_memberships() {
         .expect("legacy pending turn job");
     }
 
-    let migration_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    run_migrations_from(&pool, migration_dir)
+    copy_migrations_through(119, &migrations);
+    run_migrations_from(&pool, &migrations)
         .await
         .expect("apply PR11 migrations through V119 to populated V117 database");
     let issues_before_restart: i64 =
@@ -593,8 +677,7 @@ async fn v118_preserves_history_and_revokes_only_binding_only_memberships() {
             .fetch_one(&pool)
             .await
             .expect("migration reconciliation receipts");
-    let migration_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    run_migrations_from(&pool, migration_dir)
+    run_migrations_from(&pool, &migrations)
         .await
         .expect("restart skips the already committed V118 migration");
     let issues_after_restart: i64 =
@@ -877,28 +960,32 @@ async fn v118_preserves_history_and_revokes_only_binding_only_memberships() {
     );
 
     let db = db::SqliteDb::new(pool.clone());
-    db::ProjectRepo::delete(&db, "pr11-fixture-project")
+    let release_project_delete = db::ProjectRepo::delete(&db, "pr11-fixture-project")
         .await
-        .expect("Project deletion with historical PR11 rows succeeds");
-    let genesis_after_delete: (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = sqlx::query_as(
+        .expect_err("a Project with an immutable Release cannot be deleted");
+    assert!(
+        format!("{release_project_delete:?}").contains("ProjectHasReleases"),
+        "immutable Release preserves its Project: {release_project_delete:?}"
+    );
+    let genesis_after_delete: DeletedGenesisSummary = sqlx::query_as(
         "SELECT lifecycle, project_id, handoff_id, charter_id,
                 charter_revision_id, charter_approval_id
          FROM product_genesis_session WHERE id = 'pr11-handed-off-genesis'",
     )
     .fetch_one(&pool)
     .await
-    .expect("handed-off Genesis remains historical");
+    .expect("handed-off Genesis remains attached to its preserved Project");
     assert_eq!(
         genesis_after_delete,
-        ("handed_off".to_owned(), None, None, None, None, None),
-        "FK cleanup preserves Genesis lifecycle and clears only deleted references"
+        (
+            "handed_off".to_owned(),
+            Some("pr11-fixture-project".to_owned()),
+            Some("pr11-genesis-handoff".to_owned()),
+            Some("pr11-charter".to_owned()),
+            Some("pr11-charter-r1".to_owned()),
+            Some("pr11-charter-approval".to_owned()),
+        ),
+        "a rejected deletion leaves historical Genesis references unchanged"
     );
     let commitment_after_delete: (String, String, Option<String>) = sqlx::query_as(
         "SELECT title, status, originating_task_id
@@ -906,10 +993,14 @@ async fn v118_preserves_history_and_revokes_only_binding_only_memberships() {
     )
     .fetch_one(&pool)
     .await
-    .expect("historical Task commitment remains after Project teardown");
+    .expect("historical Task commitment remains after rejected Project deletion");
     assert_eq!(
         commitment_after_delete,
-        ("historical obligation".to_owned(), "open".to_owned(), None)
+        (
+            "historical obligation".to_owned(),
+            "open".to_owned(),
+            Some("pr11-real-task".to_owned())
+        )
     );
     let remaining_project_os: i64 = sqlx::query_scalar(
         "SELECT (SELECT COUNT(*) FROM project_charter WHERE project_id = 'pr11-fixture-project')
@@ -922,14 +1013,14 @@ async fn v118_preserves_history_and_revokes_only_binding_only_memberships() {
     .await
     .expect("Project OS teardown count");
     assert_eq!(
-        remaining_project_os, 0,
-        "deletion follows existing cascade contract"
+        remaining_project_os, 5,
+        "rejected deletion preserves the immutable Project OS snapshot"
     );
     let guard_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_deletion_guard")
         .fetch_one(&pool)
         .await
         .expect("Project deletion guard cleanup");
-    assert_eq!(guard_rows, 0, "guard is removed before commit");
+    assert_eq!(guard_rows, 0, "rejected deletion leaves no teardown guard");
     let domain_event_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM domain_event WHERE id = 'pr11-project-history-event'",
     )
@@ -1106,7 +1197,7 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
         "INSERT INTO project_charter
          (id, account_id, genesis_session_id, project_id, project_mode,
           maturity, lifecycle, created_at, updated_at)
-         VALUES ('fk-charter', 'fk-owner', 'fk-genesis', 'fk-project',
+         VALUES ('fk-charter', 'fk-owner', 'fk-genesis', NULL,
                  'standard', 'mvp', 'attached', ?, ?)",
     )
     .bind(&now)
@@ -1317,13 +1408,21 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
     run_migrations_from(&pool, &migrations)
         .await
         .expect("apply V118 to populated V117 schema");
-    let db = db::SqliteDb::new(pool.clone());
-    let blocked_by_v118 = db::ProjectRepo::delete(&db, "fk-project")
+    let blocked_handoff_delete =
+        sqlx::query("DELETE FROM agent_handoff WHERE id = 'fk-genesis-handoff'")
+            .execute(&pool)
+            .await
+            .expect_err("V118 must keep historical handoffs immutable");
+    assert!(
+        format!("{blocked_handoff_delete:?}").contains("Agent handoffs are immutable"),
+        "V118 direct handoff deletion fence: {blocked_handoff_delete:?}"
+    );
+    let blocked_by_v118 = delete_project_from_pr11_schema(&pool, "fk-project", &now)
         .await
-        .expect_err("V118 must block deleting the historical handoff");
+        .expect_err("V118 must block Project teardown before exact FK cleanup is enabled");
     assert!(
         format!("{blocked_by_v118:?}").contains("Agent handoffs are immutable"),
-        "V118 handoff delete fence blocks Project teardown: {blocked_by_v118:?}"
+        "V118 blocks immutable handoff removal during Project teardown: {blocked_by_v118:?}"
     );
 
     let genesis_before_v119 = genesis_rows(&pool).await;
@@ -1497,17 +1596,10 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
         .await
         .expect("remove test guard");
 
-    db::ProjectRepo::delete(&db, "fk-project")
+    delete_project_from_pr11_schema(&pool, "fk-project", &now)
         .await
-        .expect("productive Project teardown permits only exact FK cleanup");
-    let genesis_after_delete: (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = sqlx::query_as(
+        .expect("V119 permits only exact FK cleanup during Project deletion");
+    let genesis_after_delete: DeletedGenesisSummary = sqlx::query_as(
         "SELECT lifecycle, project_id, handoff_id, charter_id,
                 charter_revision_id, charter_approval_id
          FROM product_genesis_session WHERE id = 'fk-genesis'",
@@ -1517,21 +1609,17 @@ async fn v119_allows_only_exact_task_and_binding_fk_cleanup() {
     .expect("handed-off Genesis remains historical");
     assert_eq!(
         genesis_after_delete,
-        ("handed_off".to_owned(), None, None, None, None, None),
-        "legitimate parent deletion clears only the exact historical references"
+        (
+            "handed_off".to_owned(),
+            None,
+            None,
+            Some("fk-charter".to_owned()),
+            Some("fk-charter-r1".to_owned()),
+            Some("fk-genesis-approval".to_owned()),
+        ),
+        "parent deletion clears only the exact historical foreign keys"
     );
-    let genesis_history: (
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        i64,
-    ) = sqlx::query_as(
+    let genesis_history: DeletedGenesisHistory = sqlx::query_as(
         "SELECT account_id, main_chat_id, prompt_revision, prompt_body, maturity,
                 initial_idea, source_message_ids_json,
                 preferred_project_agent_identity_id, failure_reason, version

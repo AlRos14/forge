@@ -58,8 +58,11 @@ Human, Agent, HarnessSession, or fake System Actor.
 
 ## Immutability and lineage
 
-Actor, Role, Purpose, Agent, HarnessProfileRevision, capabilities, Workspace,
-and HarnessSession references become immutable after the Execution starts.
+Actor, Role, Purpose, Agent, HarnessProfileRevision, capabilities, and Workspace
+references become immutable after the Execution starts. An attached
+HarnessSession reference cannot be replaced. An unresolved ordered fallback
+starts without a speculative session; its exact winner snapshot and external
+session identity may attach one new HarnessSession atomically with the result.
 Parent Execution records causality and rework lineage. It does not imply that
 a child shares a session or authority.
 

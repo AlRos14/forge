@@ -533,7 +533,7 @@ async fn user_session_limit_enforced() {
 }
 
 #[tokio::test]
-async fn lifecycle_event_emitted() {
+async fn terminal_session_runtime_hint_is_not_public_sse() {
     let harness = setup(enabled_terminal()).await;
     let task = seed_task(&harness).await;
     seed_ready_workspace(&harness, &task).await;
@@ -549,19 +549,6 @@ async fn lifecycle_event_emitted() {
         Some(json!({})),
     )
     .await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    harness.state.shutdown_signal.request();
-    let bytes = sse_body.await.unwrap();
-    let stream = String::from_utf8_lossy(&bytes);
-
-    assert!(
-        stream.contains("event: task.terminal.session_changed"),
-        "missing terminal SSE event in {stream}"
-    );
-    assert!(
-        stream.contains("\"kind\":\"created\""),
-        "missing created kind in {stream}"
-    );
     harness
         .state
         .terminal_service
@@ -572,6 +559,14 @@ async fn lifecycle_event_emitted() {
         )
         .await
         .unwrap();
+    harness.state.shutdown_signal.request();
+    let bytes = sse_body.await.unwrap();
+    let stream = String::from_utf8_lossy(&bytes);
+
+    assert!(
+        !stream.contains("event: task.terminal.session_changed"),
+        "internal terminal runtime hint leaked into public SSE: {stream}"
+    );
 }
 
 #[tokio::test]

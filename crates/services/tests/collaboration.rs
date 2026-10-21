@@ -4,10 +4,10 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ActorKind, AgentRepo,
     AgentStatus, ArtifactKind, ArtifactStorageKind, CollaborationRepo, CollaborationTarget,
     CoordinationMode, CreateAgentIdentity, CreateAgentProfile, CreateArtifact, CreateDomainEvent,
-    CreateRoleMembership, CreateTaskRole, CreateWorkspace, DecisionOutcome, DomainEventRepo,
-    HandoffIntent, HandoffStatus, ProjectRepo, ProposalTarget, ProposalTargetKind,
-    RoleMembershipRepo, RoleMembershipStatus, SqliteDb, TaskRoleRepo, UserRepo, WorkspaceRepo,
-    WorkspaceStatus,
+    CreateProjectMember, CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkspace,
+    DecisionOutcome, DomainEventRepo, HandoffIntent, HandoffStatus, ProjectMemberRepo, ProjectRepo,
+    ProposalTarget, ProposalTargetKind, RoleMembershipRepo, RoleMembershipStatus, SqliteDb,
+    TaskLifecycleState, TaskRepo, TaskRoleRepo, UserRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::EventBus;
 use services::{
@@ -58,6 +58,19 @@ async fn fixture() -> Fixture {
     .execute(db.pool())
     .await
     .expect("project");
+    ProjectMemberRepo::add_member(
+        &*db,
+        CreateProjectMember {
+            id: new_uuid_v4(),
+            project_id: project_id.clone(),
+            user_id: user_id.clone(),
+            role: "owner".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("human Project owner membership");
     sqlx::query(
         "INSERT INTO repo (id, project_id, name, remote_url, local_path, work_mode, default_branch, created_at, updated_at)
          VALUES (?, ?, 'test', 'https://example.invalid/pr4.git', NULL, 'direct_merge', 'main', ?, ?)",
@@ -70,16 +83,25 @@ async fn fixture() -> Fixture {
     .await
     .expect("repo");
     for task_id in [&task_id, &second_task_id] {
-        sqlx::query(
-            "INSERT INTO task (id, project_id, repo_id, title, task_type, status, created_at, updated_at)
-             VALUES (?, ?, ?, 'PR4 Task', 'implementation', 'in_progress', ?, ?)",
+        TaskRepo::create(
+            &*db,
+            CreateTask {
+                id: task_id.to_string(),
+                project_id: project_id.clone(),
+                repo_id: Some(repo_id.clone()),
+                parent_task_id: None,
+                subtask_order: None,
+                title: "PR4 Task".to_owned(),
+                description: None,
+                task_type: "implementation".to_owned(),
+                lifecycle_state: TaskLifecycleState::Active,
+                is_automation: false,
+                priority: 0,
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
         )
-        .bind(task_id)
-        .bind(&project_id)
-        .bind(&repo_id)
-        .bind(&now)
-        .bind(&now)
-        .execute(db.pool())
         .await
         .expect("task");
     }
@@ -161,17 +183,25 @@ async fn create_foreign_project(f: &Fixture) -> ForeignProjectFixture {
     .execute(f.db.pool())
     .await
     .expect("Project B repo");
-    sqlx::query(
-        "INSERT INTO task (
-             id, project_id, repo_id, title, task_type, status, created_at, updated_at
-         ) VALUES (?, ?, ?, 'Project B Task', 'implementation', 'in_progress', ?, ?)",
+    TaskRepo::create(
+        &*f.db,
+        CreateTask {
+            id: task_id.clone(),
+            project_id: project_id.clone(),
+            repo_id: Some(repo_id.clone()),
+            parent_task_id: None,
+            subtask_order: None,
+            title: "Project B Task".to_owned(),
+            description: None,
+            task_type: "implementation".to_owned(),
+            lifecycle_state: TaskLifecycleState::Active,
+            is_automation: false,
+            priority: 0,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
     )
-    .bind(&task_id)
-    .bind(&project_id)
-    .bind(&repo_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(f.db.pool())
     .await
     .expect("Project B Task");
     sqlx::query(
@@ -1357,11 +1387,15 @@ async fn foreign_execution_role_workspace_and_actor_references_are_scoped_first(
         .execute(f.db.pool())
         .await
         .expect("corrupt foreign Execution status");
-    sqlx::query("UPDATE task_role SET coordination_mode = 'corrupt-mode' WHERE id = ?")
-        .bind(&role_b.id)
-        .execute(f.db.pool())
-        .await
-        .expect("corrupt foreign TaskRole mode");
+    sqlx::query(
+        "UPDATE task_role
+         SET coordination_mode = 'corrupt-mode', version = version + 1
+         WHERE id = ?",
+    )
+    .bind(&role_b.id)
+    .execute(f.db.pool())
+    .await
+    .expect("corrupt foreign TaskRole mode with its version fence");
     sqlx::query("UPDATE workspace SET status = 'corrupt-status' WHERE id = 'pr4-workspace-b'")
         .execute(f.db.pool())
         .await
@@ -1550,11 +1584,15 @@ async fn foreign_execution_role_workspace_and_actor_references_are_scoped_first(
         .execute(f.db.pool())
         .await
         .expect("permit malformed in-Task TaskRole fixture");
-    sqlx::query("UPDATE task_role SET coordination_mode = 'corrupt-mode' WHERE id = ?")
-        .bind(&role_a.id)
-        .execute(f.db.pool())
-        .await
-        .expect("corrupt in-Task TaskRole mode");
+    sqlx::query(
+        "UPDATE task_role
+         SET coordination_mode = 'corrupt-mode', version = version + 1
+         WHERE id = ?",
+    )
+    .bind(&role_a.id)
+    .execute(f.db.pool())
+    .await
+    .expect("corrupt in-Task TaskRole mode with its version fence");
     sqlx::query("PRAGMA ignore_check_constraints = OFF")
         .execute(f.db.pool())
         .await
@@ -2143,6 +2181,19 @@ async fn historical_collaboration_reads_survive_actor_and_workspace_deletion() {
     .execute(f.db.pool())
     .await
     .expect("authorized reader user");
+    ProjectMemberRepo::add_member(
+        &*f.db,
+        CreateProjectMember {
+            id: new_uuid_v4(),
+            project_id: f.project_id.clone(),
+            user_id: reader_id.to_owned(),
+            role: "member".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("historical reader Project membership");
 
     let artifact = f
         .service

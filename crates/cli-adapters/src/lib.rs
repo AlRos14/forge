@@ -21,45 +21,7 @@ pub use shell::ShellAdapter;
 pub use smith::SmithAdapter;
 
 use executors::HarnessAdapterRegistry;
-use executors::{CapabilitySupport as S, HarnessCapabilities as C};
-
-pub(crate) fn harness_capabilities(
-    resume: S,
-    cancel: S,
-    structured_events: S,
-    usage_reporting: S,
-    account_usage_observation: S,
-    model_selection: S,
-    reasoning_controls: S,
-    approval_policy: S,
-    sandbox_controls: S,
-    planning: S,
-    review_mode: S,
-    fork: S,
-    steer: S,
-    pause_resume: S,
-    compaction: S,
-    subagents: S,
-) -> C {
-    C {
-        resume,
-        cancel,
-        structured_events,
-        usage_reporting,
-        account_usage_observation,
-        model_selection,
-        reasoning_controls,
-        approval_policy,
-        sandbox_controls,
-        planning,
-        review_mode,
-        fork,
-        steer,
-        pause_resume,
-        compaction,
-        subagents,
-    }
-}
+use executors::HarnessCapabilities as C;
 
 /// Refuse to report a successful Resume unless the integration's normalized
 /// result confirms the exact external session requested by Forge.
@@ -144,24 +106,24 @@ mod capability_tests {
         let codex = caps(executors::ExecutorKind::Codex);
         assert_eq!(
             codex,
-            harness_capabilities(
-                S::Native,
-                S::Emulated,
-                S::Native,
-                S::Native,
-                S::Native,
-                S::Native,
-                S::Native,
-                S::Native,
-                S::Native,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-            )
+            C {
+                resume: S::Native,
+                cancel: S::Emulated,
+                structured_events: S::Native,
+                usage_reporting: S::Native,
+                account_usage_observation: S::Native,
+                model_selection: S::Native,
+                reasoning_controls: S::Native,
+                approval_policy: S::Native,
+                sandbox_controls: S::Native,
+                planning: S::Unsupported,
+                review_mode: S::Unsupported,
+                fork: S::Unsupported,
+                steer: S::Unsupported,
+                pause_resume: S::Unsupported,
+                compaction: S::Unsupported,
+                subagents: S::Unsupported,
+            }
         );
         assert_eq!(codex.resume, S::Native);
         assert_eq!(codex.cancel, S::Emulated);
@@ -173,24 +135,24 @@ mod capability_tests {
         let claude = caps(executors::ExecutorKind::ClaudeCode);
         assert_eq!(
             claude,
-            harness_capabilities(
-                S::Native,
-                S::Emulated,
-                S::Native,
-                S::Native,
-                S::Unsupported,
-                S::Native,
-                S::Native,
-                S::Native,
-                S::Unsupported,
-                S::Native,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-            )
+            C {
+                resume: S::Native,
+                cancel: S::Emulated,
+                structured_events: S::Native,
+                usage_reporting: S::Native,
+                account_usage_observation: S::Unsupported,
+                model_selection: S::Native,
+                reasoning_controls: S::Native,
+                approval_policy: S::Native,
+                sandbox_controls: S::Unsupported,
+                planning: S::Native,
+                review_mode: S::Unsupported,
+                fork: S::Unsupported,
+                steer: S::Unsupported,
+                pause_resume: S::Unsupported,
+                compaction: S::Unsupported,
+                subagents: S::Unsupported,
+            }
         );
         assert_eq!(claude.resume, S::Native);
         assert_eq!(claude.cancel, S::Emulated);
@@ -200,24 +162,24 @@ mod capability_tests {
         let cursor = caps(executors::ExecutorKind::Cursor);
         assert_eq!(
             cursor,
-            harness_capabilities(
-                S::Native,
-                S::Emulated,
-                S::Native,
-                S::Native,
-                S::Emulated,
-                S::Native,
-                S::Unsupported,
-                S::Native,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unknown,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-            )
+            C {
+                resume: S::Native,
+                cancel: S::Emulated,
+                structured_events: S::Native,
+                usage_reporting: S::Native,
+                account_usage_observation: S::Emulated,
+                model_selection: S::Native,
+                reasoning_controls: S::Unsupported,
+                approval_policy: S::Native,
+                sandbox_controls: S::Unsupported,
+                planning: S::Unsupported,
+                review_mode: S::Unsupported,
+                fork: S::Unsupported,
+                steer: S::Unknown,
+                pause_resume: S::Unsupported,
+                compaction: S::Unsupported,
+                subagents: S::Unsupported,
+            }
         );
         assert_eq!(cursor.resume, S::Native);
         assert_eq!(cursor.cancel, S::Emulated);
@@ -227,24 +189,24 @@ mod capability_tests {
         let opencode = caps(executors::ExecutorKind::Opencode);
         assert_eq!(
             opencode,
-            harness_capabilities(
-                S::Native,
-                S::Emulated,
-                S::Native,
-                S::Unsupported,
-                S::Unsupported,
-                S::Native,
-                S::Unsupported,
-                S::Native,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-            )
+            C {
+                resume: S::Native,
+                cancel: S::Emulated,
+                structured_events: S::Native,
+                usage_reporting: S::Unsupported,
+                account_usage_observation: S::Unsupported,
+                model_selection: S::Native,
+                reasoning_controls: S::Unsupported,
+                approval_policy: S::Native,
+                sandbox_controls: S::Unsupported,
+                planning: S::Unsupported,
+                review_mode: S::Unsupported,
+                fork: S::Unsupported,
+                steer: S::Unsupported,
+                pause_resume: S::Unsupported,
+                compaction: S::Unsupported,
+                subagents: S::Unsupported,
+            }
         );
         assert_eq!(opencode.resume, S::Native);
         assert_eq!(opencode.usage_reporting, S::Unsupported);
@@ -253,24 +215,24 @@ mod capability_tests {
         let gemini = caps(executors::ExecutorKind::Gemini);
         assert_eq!(
             gemini,
-            harness_capabilities(
-                S::Unsupported,
-                S::Emulated,
-                S::Unknown,
-                S::Unsupported,
-                S::Unsupported,
-                S::Native,
-                S::Unsupported,
-                S::Native,
-                S::Native,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-            )
+            C {
+                resume: S::Unsupported,
+                cancel: S::Emulated,
+                structured_events: S::Unknown,
+                usage_reporting: S::Unsupported,
+                account_usage_observation: S::Unsupported,
+                model_selection: S::Native,
+                reasoning_controls: S::Unsupported,
+                approval_policy: S::Native,
+                sandbox_controls: S::Native,
+                planning: S::Unsupported,
+                review_mode: S::Unsupported,
+                fork: S::Unsupported,
+                steer: S::Unsupported,
+                pause_resume: S::Unsupported,
+                compaction: S::Unsupported,
+                subagents: S::Unsupported,
+            }
         );
         assert_eq!(gemini.resume, S::Unsupported);
         assert_eq!(gemini.cancel, S::Emulated);
@@ -280,24 +242,24 @@ mod capability_tests {
         let smith = caps(executors::ExecutorKind::Smith);
         assert_eq!(
             smith,
-            harness_capabilities(
-                S::Native,
-                S::Emulated,
-                S::Native,
-                S::Native,
-                S::Unsupported,
-                S::Native,
-                S::Native,
-                S::Native,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-            )
+            C {
+                resume: S::Native,
+                cancel: S::Emulated,
+                structured_events: S::Native,
+                usage_reporting: S::Native,
+                account_usage_observation: S::Unsupported,
+                model_selection: S::Native,
+                reasoning_controls: S::Native,
+                approval_policy: S::Native,
+                sandbox_controls: S::Unsupported,
+                planning: S::Unsupported,
+                review_mode: S::Unsupported,
+                fork: S::Unsupported,
+                steer: S::Unsupported,
+                pause_resume: S::Unsupported,
+                compaction: S::Unsupported,
+                subagents: S::Unsupported,
+            }
         );
         assert_eq!(smith.resume, S::Native);
         assert_eq!(smith.cancel, S::Emulated);
@@ -306,24 +268,24 @@ mod capability_tests {
         let shell = caps(executors::ExecutorKind::Shell);
         assert_eq!(
             shell,
-            harness_capabilities(
-                S::Unsupported,
-                S::Emulated,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-                S::Unsupported,
-            )
+            C {
+                resume: S::Unsupported,
+                cancel: S::Emulated,
+                structured_events: S::Unsupported,
+                usage_reporting: S::Unsupported,
+                account_usage_observation: S::Unsupported,
+                model_selection: S::Unsupported,
+                reasoning_controls: S::Unsupported,
+                approval_policy: S::Unsupported,
+                sandbox_controls: S::Unsupported,
+                planning: S::Unsupported,
+                review_mode: S::Unsupported,
+                fork: S::Unsupported,
+                steer: S::Unsupported,
+                pause_resume: S::Unsupported,
+                compaction: S::Unsupported,
+                subagents: S::Unsupported,
+            }
         );
         assert_eq!(shell.cancel, S::Emulated);
         let null = caps(executors::ExecutorKind::Null);

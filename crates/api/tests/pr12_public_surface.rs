@@ -3,6 +3,7 @@ mod common;
 use api_types::{
     ActorRef, AuthResponse, ErrorResponse, ExecutionResponse, IntegrationResponse, ProjectResponse,
     RepoResponse, TaskLifecycleState, TaskLifecycleTransitionResponse, TaskResponse,
+    WorkUnitResponse,
 };
 use axum::{
     body::Body,
@@ -72,21 +73,6 @@ async fn project_and_task_creation_are_ordinary_v2_operations() {
         .await
         .expect("Task count");
     assert_eq!(task_count, 1, "unknown legacy input creates no Task");
-
-    for table in [
-        "agent_chat",
-        "account_main_agent_binding",
-        "project_agent_binding",
-        "product_genesis_session",
-        "project_charter",
-        "project_task_governance",
-    ] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(harness.state.db.pool())
-            .await
-            .expect("count retired setup rows");
-        assert_eq!(count, 0, "normal creation leaves {table} empty");
-    }
 }
 
 #[tokio::test]
@@ -2138,7 +2124,7 @@ async fn execution_start_requires_an_exact_active_agent_membership_and_purpose()
         .task_service
         .create_task_role(
             &task.id,
-            "executor",
+            "implementer",
             db::CoordinationMode::Independent,
             "{}".to_owned(),
         )
@@ -2149,11 +2135,42 @@ async fn execution_start_requires_an_exact_active_agent_membership_and_purpose()
         .task_service
         .add_task_role_member(
             &task.id,
-            "executor",
+            "implementer",
             api_types::ActorRef::Agent(agent_id.clone()),
         )
         .await
         .expect("Agent membership is created");
+
+    let work_unit: WorkUnitResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/work-units", task.id),
+        &token,
+        json!({
+            "title": "Exact executor WorkUnit",
+            "scope": "Implement the requested change within this repository scope",
+            "role": "implementer",
+            "parent_work_unit_id": null,
+            "assigned_actor": null,
+            "requires_integration": true,
+            "provenance": null
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let allocated_work_unit: WorkUnitResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/allocation", work_unit.id),
+        &token,
+        json!({
+            "expected_version": work_unit.version,
+            "role": "implementer",
+            "assigned_actor": { "kind": "agent", "id": agent_id }
+        }),
+        StatusCode::OK,
+    )
+    .await;
 
     let execution: ExecutionResponse = common::json_request_with_bearer(
         &harness.app,
@@ -2161,8 +2178,8 @@ async fn execution_start_requires_an_exact_active_agent_membership_and_purpose()
         &format!("/api/v1/tasks/{}/executions", task.id),
         &token,
         json!({
-            "agent_id": agent_id.clone(),
-            "role": "executor",
+            "work_unit_id": allocated_work_unit.id,
+            "expected_work_unit_version": allocated_work_unit.version,
             "purpose": "implement",
             "prompt": "Implement the exact requested change.",
             "input_artifact_ids": []
@@ -2171,7 +2188,7 @@ async fn execution_start_requires_an_exact_active_agent_membership_and_purpose()
     )
     .await;
     assert_eq!(execution.task_id, task.id);
-    assert_eq!(execution.role, "executor");
+    assert_eq!(execution.role, "implementer");
     assert_eq!(
         execution.purpose,
         Some(api_types::ExecutionPurpose::Implement)

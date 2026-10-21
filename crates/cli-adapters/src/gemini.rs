@@ -128,24 +128,24 @@ impl HarnessAdapter for GeminiAdapter {
 
     fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
         use executors::CapabilitySupport as S;
-        crate::harness_capabilities(
-            S::Unsupported,
-            S::Emulated,
-            S::Unknown,
-            S::Unsupported,
-            S::Unsupported,
-            S::Native,
-            S::Unsupported,
-            S::Native,
-            S::Native,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-        )
+        crate::C {
+            resume: S::Unsupported,
+            cancel: S::Emulated,
+            structured_events: S::Unknown,
+            usage_reporting: S::Unsupported,
+            account_usage_observation: S::Unsupported,
+            model_selection: S::Native,
+            reasoning_controls: S::Unsupported,
+            approval_policy: S::Native,
+            sandbox_controls: S::Native,
+            planning: S::Unsupported,
+            review_mode: S::Unsupported,
+            fork: S::Unsupported,
+            steer: S::Unsupported,
+            pause_resume: S::Unsupported,
+            compaction: S::Unsupported,
+            subagents: S::Unsupported,
+        }
     }
 
     fn interpret_execution_policy(

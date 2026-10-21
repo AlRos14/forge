@@ -408,24 +408,24 @@ impl HarnessAdapter for CursorAdapter {
 
     fn capabilities(&self, _config: &Value) -> executors::HarnessCapabilities {
         use executors::CapabilitySupport as S;
-        crate::harness_capabilities(
-            S::Native,
-            S::Emulated,
-            S::Native,
-            S::Native,
-            S::Emulated,
-            S::Native,
-            S::Unsupported,
-            S::Native,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unknown,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-        )
+        crate::C {
+            resume: S::Native,
+            cancel: S::Emulated,
+            structured_events: S::Native,
+            usage_reporting: S::Native,
+            account_usage_observation: S::Emulated,
+            model_selection: S::Native,
+            reasoning_controls: S::Unsupported,
+            approval_policy: S::Native,
+            sandbox_controls: S::Unsupported,
+            planning: S::Unsupported,
+            review_mode: S::Unsupported,
+            fork: S::Unsupported,
+            steer: S::Unknown,
+            pause_resume: S::Unsupported,
+            compaction: S::Unsupported,
+            subagents: S::Unsupported,
+        }
     }
 
     fn interpret_execution_policy(&self, config: &Value) -> executors::HarnessPolicyInterpretation {

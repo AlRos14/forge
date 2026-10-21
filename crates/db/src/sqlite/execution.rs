@@ -802,7 +802,7 @@ impl ExecutionRepo for SqliteDb {
         let committed_event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
         tx.commit().await?;
         Ok(PendingProviderStartFailure::Resolved(
-            updated,
+            Box::new(updated),
             committed_event,
         ))
     }
@@ -865,7 +865,10 @@ impl ExecutionRepo for SqliteDb {
         let updated = update_execution_in_tx(&mut tx, update).await?;
         let committed_event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
         tx.commit().await?;
-        Ok(RunningExecutionFailure::Failed(updated, committed_event))
+        Ok(RunningExecutionFailure::Failed(
+            Box::new(updated),
+            committed_event,
+        ))
     }
 
     async fn claim_provider_start(
@@ -1527,6 +1530,27 @@ async fn update_execution_in_tx(
         push_assignment!("status", status.to_string());
     }
     let external_session_update = input.external_session_id.clone();
+    let resolved_harness_session_id = if external_session_update
+        .as_ref()
+        .is_some_and(Option::is_some)
+    {
+        if let Some(Some(snapshot_json)) = input.executor_config_snapshot_json.as_ref() {
+            super::harness_session::create_resolved_harness_session_in_tx(
+                transaction,
+                &execution,
+                snapshot_json,
+                &updated_at,
+            )
+            .await?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(harness_session_id) = resolved_harness_session_id {
+        push_assignment!("harness_session_id", harness_session_id);
+    }
     if let Some(agent_message_id) = input.agent_message_id {
         push_assignment!("agent_message_id", agent_message_id);
     }

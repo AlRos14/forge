@@ -13,7 +13,7 @@ describe('execution log API helpers', () => {
   it('loads execution logs through the authenticated API client', async () => {
     useAuthStore.setState({ accessToken: 'access-token', refreshToken: 'refresh-token' })
     const fetchMock = vi.spyOn(window, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ items: [], has_more: false }), {
+      new Response(JSON.stringify({ items: [], has_more: false, next_sequence: null }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       }),
@@ -22,6 +22,7 @@ describe('execution log API helpers', () => {
     await expect(getExecutionLogs('exec-1', { tail: 500 })).resolves.toEqual({
       items: [],
       has_more: false,
+      next_sequence: null,
     })
 
     expect(fetchMock).toHaveBeenCalledTimes(1)

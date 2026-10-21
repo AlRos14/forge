@@ -7,19 +7,16 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
+    time::Duration,
 };
 
 use api::{build_router, AppState};
 use api_types::{
     BranchListResponse, CreateTerminalSessionResponse, DaemonFrame, DaemonProtocolCapabilities,
     ErrorResponse, ExecutionTerminalNotification, FsListResponse, TerminalAvailability,
-    TerminalClientFrame, TerminalInputParams, TerminalInputResult, TerminalOutputNotification,
-    TerminalResizeParams, TerminalResizeResult, TerminalServerFrame, TerminalSessionResponse,
-    TerminalSessionStatus as ApiTerminalSessionStatus, TerminalStartParams, TerminalStartResult,
-    TerminalTerminateParams, TerminalTerminateResult, METHOD_EXECUTION_START,
-    METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST, METHOD_PROTOCOL_CAPABILITIES, METHOD_TERMINAL_INPUT,
-    METHOD_TERMINAL_OUTPUT, METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START,
-    METHOD_TERMINAL_TERMINATE, PATH_GUARDRAIL,
+    TerminalSessionResponse, TerminalSessionStatus as ApiTerminalSessionStatus,
+    METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST,
+    METHOD_PROTOCOL_CAPABILITIES, PATH_GUARDRAIL,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -35,12 +32,11 @@ use tower::ServiceExt;
 
 use common::{
     fake_daemon::{
-        assert_execution_status_remains, assert_heartbeat_echo, connect_daemon, connect_terminal,
-        next_daemon_request, next_terminal_server_frame, register_daemon, respond_to_fs_list,
-        seed_embedded_daemon, seed_running_execution_for_daemon,
-        seed_startable_execution_for_daemon, seed_terminal_task_for_daemon, seed_test_user,
-        send_daemon_notification, send_daemon_response, send_terminal_client_frame,
-        wait_for_execution_status, wait_until_connected, TestServer, FAKE_DAEMON_USER_ID,
+        assert_execution_status_remains, assert_heartbeat_echo, connect_daemon, register_daemon,
+        respond_to_fs_list, seed_embedded_daemon, seed_local_terminal_task,
+        seed_running_execution_for_daemon, seed_startable_execution_for_daemon, seed_test_user,
+        send_daemon_notification, wait_for_execution_status, wait_until_connected, TestServer,
+        FAKE_DAEMON_USER_ID,
     },
     TestDir,
 };
@@ -507,11 +503,13 @@ async fn connected_remote_daemon_receives_execution_start_request() {
         seed_startable_execution_for_daemon(&state, &registration.daemon_id, "echo remote").await;
     let service = state.task_service.clone();
     let execution_id = fixture.execution.id.clone();
-    let starter: tokio::task::JoinHandle<services::Result<api_types::ExecutionStartResult>> =
+    let mut starter: tokio::task::JoinHandle<services::Result<api_types::ExecutionStartResult>> =
         tokio::spawn(async move { service.start_execution(execution_id).await });
 
-    let (id, params) =
-        next_execution_start_request(&state, &registration.daemon_id, &mut outbound).await;
+    let (id, params) = tokio::select! {
+        request = next_execution_start_request(&state, &registration.daemon_id, &mut outbound) => request,
+        result = &mut starter => panic!("execution start returned before daemon dispatch: {result:?}"),
+    };
     assert_eq!(params["execution_id"], fixture.execution.id);
     assert_eq!(params["task_id"], fixture.task_id);
     assert_eq!(params["workspace_path"], fixture.workspace_path);
@@ -554,11 +552,13 @@ async fn remote_execution_start_error_marks_execution_failed() {
         seed_startable_execution_for_daemon(&state, &registration.daemon_id, "echo remote").await;
     let service = state.task_service.clone();
     let execution_id = fixture.execution.id.clone();
-    let starter: tokio::task::JoinHandle<services::Result<api_types::ExecutionStartResult>> =
+    let mut starter: tokio::task::JoinHandle<services::Result<api_types::ExecutionStartResult>> =
         tokio::spawn(async move { service.start_execution(execution_id).await });
 
-    let (id, _params) =
-        next_execution_start_request(&state, &registration.daemon_id, &mut outbound).await;
+    let (id, _params) = tokio::select! {
+        request = next_execution_start_request(&state, &registration.daemon_id, &mut outbound) => request,
+        result = &mut starter => panic!("execution start returned before daemon dispatch: {result:?}"),
+    };
 
     state.daemon_connections.dispatch_incoming(
         &registration.daemon_id,
@@ -754,24 +754,13 @@ async fn remote_terminal_preserves_existing_metadata_when_fields_are_absent() {
 }
 
 #[tokio::test]
-async fn task_terminal_routes_through_connected_external_daemon_api() {
+async fn task_terminal_without_an_execution_lease_uses_the_local_workspace() {
     let base_state = test_state().await;
     let mut config = (*base_state.effective_config).clone();
     config.terminal.enabled = true;
     let state = Arc::new((*base_state).clone().with_effective_config(config));
     let app = test_app(&state);
-    let registration = register_daemon(&app, "terminal-owner-daemon", "fs_daemon_routing").await;
-    let server = TestServer::start(Arc::clone(&state)).await;
-    let mut daemon_socket = connect_daemon(
-        &server,
-        &registration.daemon_id,
-        Some(&registration.registration_token),
-    )
-    .await
-    .expect("daemon websocket upgrade succeeds");
-    wait_until_connected(&state, &registration.daemon_id).await;
-
-    let fixture = seed_terminal_task_for_daemon(&state, &registration.daemon_id).await;
+    let fixture = seed_local_terminal_task(&state).await;
     let availability: TerminalAvailability = empty_request(
         &app,
         &format!("/api/v1/tasks/{}/terminals/availability", fixture.task_id),
@@ -781,173 +770,41 @@ async fn task_terminal_routes_through_connected_external_daemon_api() {
     assert!(availability.can_create);
     assert!(availability.daemon_reachable);
 
-    let create_app = app.clone();
-    let create_uri = format!("/api/v1/tasks/{}/terminals", fixture.task_id);
-    let create_token = test_jwt();
-    let create_task = tokio::spawn(async move {
-        json_request_with_bearer::<CreateTerminalSessionResponse>(
-            &create_app,
-            Method::POST,
-            &create_uri,
-            &create_token,
-            json!({ "rows": 31, "cols": 101 }),
-            StatusCode::CREATED,
-        )
-        .await
-    });
-
-    let (start_id, start_params) =
-        next_daemon_request(&mut daemon_socket, METHOD_TERMINAL_START).await;
-    let start_params: TerminalStartParams =
-        serde_json::from_value(start_params).expect("terminal.start params parse");
-    assert_eq!(start_params.workspace_path, fixture.workspace_path);
-    assert_eq!(start_params.rows, 31);
-    assert_eq!(start_params.cols, 101);
-    send_daemon_response(
-        &mut daemon_socket,
-        start_id,
-        TerminalStartResult {
-            session_id: start_params.session_id.clone(),
-            pid: Some(4242),
-            started_at: db::now_rfc3339(),
-        },
+    let token = test_jwt();
+    let created: CreateTerminalSessionResponse = json_request_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/terminals", fixture.task_id),
+        &token,
+        json!({ "rows": 31, "cols": 101 }),
+        StatusCode::CREATED,
     )
     .await;
-
-    let created = create_task.await.expect("create task joins");
     assert!(matches!(
         created.session.status,
         ApiTerminalSessionStatus::Running
     ));
-    assert_eq!(
-        created.session.daemon_id.as_deref(),
-        Some(registration.daemon_id.as_str())
-    );
-    assert_eq!(created.session.id, start_params.session_id);
+    assert_eq!(created.session.daemon_id, None);
+    assert_eq!(created.session.workspace_id, fixture.workspace_id);
 
     let persisted = db::TerminalSessionRepo::get_terminal_session(&*state.db, &created.session.id)
         .await
         .expect("terminal session loads")
         .expect("terminal session exists");
-    assert_eq!(
-        persisted.daemon_id.as_deref(),
-        Some(registration.daemon_id.as_str())
-    );
+    assert_eq!(persisted.daemon_id, None);
 
-    let mut terminal_socket =
-        connect_terminal(&server, &created.session.id, &created.attach.attach_token)
-            .await
-            .expect("terminal websocket upgrade succeeds");
-    send_terminal_client_frame(&mut terminal_socket, TerminalClientFrame::Ping {}).await;
-    assert!(matches!(
-        next_terminal_server_frame(&mut terminal_socket).await,
-        TerminalServerFrame::Pong {}
-    ));
-
-    send_daemon_notification(
-        &mut daemon_socket,
-        METHOD_TERMINAL_OUTPUT,
-        TerminalOutputNotification {
-            session_id: created.session.id.clone(),
-            data: "ZGFlbW9uLW91dHB1dC1vawo=".to_owned(),
-            ts: db::now_rfc3339(),
-        },
+    let terminated: TerminalSessionResponse = json_request_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/api/v1/terminals/{}/terminate", created.session.id),
+        &token,
+        json!({ "reason": "api-test" }),
+        StatusCode::OK,
     )
     .await;
-    let output = next_terminal_server_frame(&mut terminal_socket).await;
-    assert!(matches!(
-        output,
-        TerminalServerFrame::Output { data } if data == "ZGFlbW9uLW91dHB1dC1vawo="
-    ));
-
-    send_terminal_client_frame(
-        &mut terminal_socket,
-        TerminalClientFrame::Input {
-            data: "ZWNobyB2aWEtZGFlbW9uCg==".to_owned(),
-        },
-    )
-    .await;
-    let (input_id, input_params) =
-        next_daemon_request(&mut daemon_socket, METHOD_TERMINAL_INPUT).await;
-    let input_params: TerminalInputParams =
-        serde_json::from_value(input_params).expect("terminal.input params parse");
-    assert_eq!(input_params.session_id, created.session.id);
-    assert_eq!(input_params.data, "ZWNobyB2aWEtZGFlbW9uCg==");
-    send_daemon_response(
-        &mut daemon_socket,
-        input_id,
-        TerminalInputResult {
-            session_id: input_params.session_id,
-            accepted: true,
-        },
-    )
-    .await;
-
-    send_terminal_client_frame(
-        &mut terminal_socket,
-        TerminalClientFrame::Resize {
-            rows: 42,
-            cols: 120,
-        },
-    )
-    .await;
-    let (resize_id, resize_params) =
-        next_daemon_request(&mut daemon_socket, METHOD_TERMINAL_RESIZE).await;
-    let resize_params: TerminalResizeParams =
-        serde_json::from_value(resize_params).expect("terminal.resize params parse");
-    assert_eq!(resize_params.session_id, created.session.id);
-    assert_eq!(resize_params.rows, 42);
-    assert_eq!(resize_params.cols, 120);
-    send_daemon_response(
-        &mut daemon_socket,
-        resize_id,
-        TerminalResizeResult {
-            session_id: resize_params.session_id,
-            applied: true,
-        },
-    )
-    .await;
-
-    let terminate_app = app.clone();
-    let terminate_uri = format!("/api/v1/terminals/{}/terminate", created.session.id);
-    let terminate_token = test_jwt();
-    let terminate_task = tokio::spawn(async move {
-        json_request_with_bearer::<TerminalSessionResponse>(
-            &terminate_app,
-            Method::POST,
-            &terminate_uri,
-            &terminate_token,
-            json!({ "reason": "api-test" }),
-            StatusCode::OK,
-        )
-        .await
-    });
-
-    let (terminate_id, terminate_params) =
-        next_daemon_request(&mut daemon_socket, METHOD_TERMINAL_TERMINATE).await;
-    let terminate_params: TerminalTerminateParams =
-        serde_json::from_value(terminate_params).expect("terminal.terminate params parse");
-    assert_eq!(terminate_params.session_id, created.session.id);
-    assert_eq!(terminate_params.reason.as_deref(), Some("api-test"));
-    send_daemon_response(
-        &mut daemon_socket,
-        terminate_id,
-        TerminalTerminateResult {
-            session_id: terminate_params.session_id,
-            terminated: true,
-        },
-    )
-    .await;
-
-    let terminated = terminate_task.await.expect("terminate task joins");
     assert!(matches!(
         terminated.status,
         ApiTerminalSessionStatus::Terminated
-    ));
-    let exit = next_terminal_server_frame(&mut terminal_socket).await;
-    assert!(matches!(
-        exit,
-        TerminalServerFrame::Exit { reason, .. } if reason.as_deref() == Some("api-test")
     ));
 }
 
@@ -973,7 +830,10 @@ async fn next_execution_start_request(
     outbound: &mut tokio::sync::mpsc::Receiver<DaemonFrame>,
 ) -> (String, Value) {
     loop {
-        let frame = outbound.recv().await.expect("server sends daemon request");
+        let frame = tokio::time::timeout(Duration::from_secs(10), outbound.recv())
+            .await
+            .expect("daemon request arrives within 10 seconds")
+            .expect("server sends daemon request");
         let DaemonFrame::Request { id, method, params } = frame else {
             panic!("expected daemon request frame");
         };

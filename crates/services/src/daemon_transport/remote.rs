@@ -144,6 +144,14 @@ pub(crate) fn daemon_error_to_service_error(
     method: &str,
     error: api_types::DaemonErrorPayload,
 ) -> ServiceError {
+    if method == api_types::METHOD_EXECUTION_START {
+        if error.code == api_types::START_OUTCOME_UNKNOWN {
+            return ServiceError::Domain(format!("{}: {}", error.code, error.message));
+        }
+        return ServiceError::DaemonStartRejected {
+            message: format!("{}: {}", error.code, error.message),
+        };
+    }
     match error.code.as_str() {
         api_types::DAEMON_UNAVAILABLE => ServiceError::DaemonUnavailable {
             daemon_id: daemon_id.to_owned(),

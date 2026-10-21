@@ -335,6 +335,7 @@ impl TaskService {
         let outcome_event_type = match &result {
             Ok(result) if result.accepted => "execution.provider_start_accepted",
             Ok(_) => "execution.provider_start_rejected",
+            Err(ServiceError::DaemonStartRejected { .. }) => "execution.provider_start_rejected",
             Err(_) => "execution.provider_start_uncertain",
         };
         let outcome_recorded = match ExecutionRepo::record_provider_start_outcome(
@@ -368,6 +369,11 @@ impl TaskService {
             Ok(_) => Err(ServiceError::ExecutionStartUncertain {
                 execution_id: execution.id,
             }),
+            Err(ServiceError::DaemonStartRejected { message }) if outcome_recorded => {
+                self.fail_execution_before_dispatch(&execution.id, message.clone())
+                    .await?;
+                Err(ServiceError::invalid_operation(message))
+            }
             Err(error) => {
                 tracing::warn!(
                     %execution_id,
@@ -1005,6 +1011,36 @@ impl TaskService {
             }
             result
         };
+        if result.status == ExecutionOutcome::Completed
+            && result.after_sha.is_none()
+            && execution.workspace_id.is_some()
+        {
+            let workspace_path = std::path::Path::new(&worktree_path);
+            match git::is_worktree_clean(workspace_path).await {
+                Ok(true) => match git::get_current_sha(workspace_path).await {
+                    Ok(head) => result.after_sha = Some(head),
+                    Err(error) => {
+                        result.status = ExecutionOutcome::Failed;
+                        result.error = Some(format!(
+                            "completed repository Execution has no exact result SHA: {error}"
+                        ));
+                    }
+                },
+                Ok(false) => {
+                    result.status = ExecutionOutcome::Failed;
+                    result.error = Some(
+                        "repository Execution completed with uncommitted changes and no exact result SHA"
+                            .to_owned(),
+                    );
+                }
+                Err(error) => {
+                    result.status = ExecutionOutcome::Failed;
+                    result.error = Some(format!(
+                        "completed repository Execution has no exact result SHA: {error}"
+                    ));
+                }
+            }
+        }
         let max_turns_exceeded = max_turns_exceeded.load(std::sync::atomic::Ordering::SeqCst);
         let assistant_turn_count = assistant_turn_count.load(std::sync::atomic::Ordering::SeqCst);
         if max_turns_exceeded {

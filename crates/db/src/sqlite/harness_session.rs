@@ -50,46 +50,6 @@ fn may_establish_external_session(snapshot: &serde_json::Value) -> bool {
         || executor_type.eq_ignore_ascii_case("null"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::may_establish_external_session;
-
-    #[test]
-    fn unresolved_ordered_fallback_does_not_admit_pending_session() {
-        let snapshot = serde_json::json!({
-            "executor_type": "codex",
-            "config": {"profile": "account-a"},
-            "routing": {
-                "policy": "ordered_fallback_v1",
-                "candidates": [
-                    {"executor_type": "codex", "config": {"profile": "account-a"}},
-                    {"executor_type": "cursor", "config": {"profile": "account-b"}}
-                ]
-            }
-        });
-
-        assert!(!may_establish_external_session(&snapshot));
-    }
-
-    #[test]
-    fn resolved_same_agent_ordered_fallback_admits_the_resolved_snapshot() {
-        let snapshot = serde_json::json!({
-            "executor_type": "codex",
-            "config": {"profile": "account-a", "model": "model-b"},
-            "routing": {
-                "policy": "ordered_fallback_v1",
-                "selected_candidate_key": "codex:account-a#candidate-b",
-                "candidates": [
-                    {"executor_type": "codex", "config": {"profile": "account-a", "model": "model-a"}},
-                    {"executor_type": "codex", "config": {"profile": "account-a", "model": "model-b"}}
-                ]
-            }
-        });
-
-        assert!(may_establish_external_session(&snapshot));
-    }
-}
-
 pub(crate) async fn profile_id_for_snapshot_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     agent_id: &str,
@@ -180,6 +140,124 @@ pub(crate) async fn create_pending_harness_session_in_tx(
         .get("harness_capabilities")
         .map(ToString::to_string)
         .unwrap_or_else(|| r#"{"schema_version":1,"capabilities":{}}"#.to_owned());
+    let id = insert_pending_harness_session_in_tx(
+        transaction,
+        actor_agent_id,
+        &harness_kind,
+        profile_id.as_deref(),
+        snapshot_json,
+        &capabilities_snapshot_json,
+        input.workspace_id.as_deref(),
+        &input.created_at,
+        &input.updated_at,
+    )
+    .await?;
+    Ok(Some(id))
+}
+
+/// A routed Execution starts without a speculative HarnessSession. When its
+/// result carries the validated winner snapshot and an external identity,
+/// materialize that exact session in the same transaction as the result.
+pub(crate) async fn create_resolved_harness_session_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    execution: &Execution,
+    snapshot_json: &str,
+    updated_at: &str,
+) -> Result<Option<String>> {
+    if execution.harness_session_id.is_some() || execution.status != ExecutionStatus::Running {
+        return Ok(None);
+    }
+    let Some(ActorRef::Agent(agent_id)) = execution.actor_ref() else {
+        return Ok(None);
+    };
+    if execution.agent_id.as_deref() != Some(agent_id.as_str()) {
+        return Err(DbError::Check(
+            "Execution ActorRef and agent compatibility projection disagree".to_owned(),
+        ));
+    }
+
+    let prior_snapshot = execution
+        .executor_config_snapshot_json
+        .as_deref()
+        .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
+        .unwrap_or_default();
+    let prior_route_is_unresolved = prior_snapshot
+        .get("routing")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|routing| {
+            routing
+                .get("selected_candidate_key")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|key| key.trim().is_empty())
+        });
+    if !prior_route_is_unresolved {
+        return Ok(None);
+    }
+
+    let snapshot = serde_json::from_str::<serde_json::Value>(snapshot_json).map_err(|error| {
+        DbError::Check(format!("resolved executor snapshot is invalid: {error}"))
+    })?;
+    let selected_candidate_key = snapshot
+        .get("routing")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|routing| routing.get("selected_candidate_key"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    if selected_candidate_key.is_none() || !may_establish_external_session(&snapshot) {
+        return Ok(None);
+    }
+    if snapshot
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|snapshot_agent| snapshot_agent != agent_id)
+    {
+        return Err(DbError::Check(
+            "resolved executor snapshot belongs to a different Agent".to_owned(),
+        ));
+    }
+
+    let Some(harness_kind) = snapshot
+        .get("executor_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+    else {
+        return Ok(None);
+    };
+    validate_agent_harness_identity_in_tx(transaction, &agent_id, harness_kind).await?;
+    let profile_id = profile_id_for_snapshot_in_tx(transaction, &agent_id, &snapshot).await?;
+    let capabilities_snapshot_json = snapshot
+        .get("harness_capabilities")
+        .map(ToString::to_string)
+        .unwrap_or_else(|| r#"{"schema_version":1,"capabilities":{}}"#.to_owned());
+    let id = insert_pending_harness_session_in_tx(
+        transaction,
+        &agent_id,
+        harness_kind,
+        profile_id.as_deref(),
+        snapshot_json,
+        &capabilities_snapshot_json,
+        execution.workspace_id.as_deref(),
+        &execution.created_at,
+        updated_at,
+    )
+    .await?;
+    Ok(Some(id))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_pending_harness_session_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    agent_id: &str,
+    harness_kind: &str,
+    profile_id: Option<&str>,
+    snapshot_json: &str,
+    capabilities_snapshot_json: &str,
+    workspace_id: Option<&str>,
+    created_at: &str,
+    updated_at: &str,
+) -> Result<String> {
     let id = new_uuid_v4();
     sqlx::query(
         "INSERT INTO harness_session (
@@ -189,17 +267,17 @@ pub(crate) async fn create_pending_harness_session_in_tx(
          ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 'pending', NULL, ?, ?, NULL)",
     )
     .bind(&id)
-    .bind(actor_agent_id)
-    .bind(&harness_kind)
-    .bind(profile_id.as_deref())
+    .bind(agent_id)
+    .bind(harness_kind)
+    .bind(profile_id)
     .bind(snapshot_json)
-    .bind(&capabilities_snapshot_json)
-    .bind(input.workspace_id.as_deref())
-    .bind(&input.created_at)
-    .bind(&input.updated_at)
+    .bind(capabilities_snapshot_json)
+    .bind(workspace_id)
+    .bind(created_at)
+    .bind(updated_at)
     .execute(&mut **transaction)
     .await?;
-    Ok(Some(id))
+    Ok(id)
 }
 
 pub(crate) async fn validate_execution_harness_session_in_tx(
@@ -378,5 +456,45 @@ impl HarnessSessionRepo for SqliteDb {
         HarnessSessionRepo::get_by_id(self, &input.id)
             .await?
             .ok_or(DbError::NotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::may_establish_external_session;
+
+    #[test]
+    fn unresolved_ordered_fallback_does_not_admit_pending_session() {
+        let snapshot = serde_json::json!({
+            "executor_type": "codex",
+            "config": {"profile": "account-a"},
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "candidates": [
+                    {"executor_type": "codex", "config": {"profile": "account-a"}},
+                    {"executor_type": "cursor", "config": {"profile": "account-b"}}
+                ]
+            }
+        });
+
+        assert!(!may_establish_external_session(&snapshot));
+    }
+
+    #[test]
+    fn resolved_same_agent_ordered_fallback_admits_the_resolved_snapshot() {
+        let snapshot = serde_json::json!({
+            "executor_type": "codex",
+            "config": {"profile": "account-a", "model": "model-b"},
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "selected_candidate_key": "codex:account-a#candidate-b",
+                "candidates": [
+                    {"executor_type": "codex", "config": {"profile": "account-a", "model": "model-a"}},
+                    {"executor_type": "codex", "config": {"profile": "account-a", "model": "model-b"}}
+                ]
+            }
+        });
+
+        assert!(may_establish_external_session(&snapshot));
     }
 }

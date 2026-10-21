@@ -256,7 +256,7 @@ impl TaskArgs {
                     OutputFormat::Json => print_json(&execution),
                     OutputFormat::Table => {
                         let actor = serde_json::to_value(&execution.actor_ref)?.to_string();
-                        let purpose = serde_json::to_value(&execution.purpose)?;
+                        let purpose = serde_json::to_value(execution.purpose)?;
                         println!(
                             "Execution {} status={} actor={} role={} purpose={}",
                             execution.id,

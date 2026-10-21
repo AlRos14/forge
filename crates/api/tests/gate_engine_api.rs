@@ -123,7 +123,7 @@ async fn legacy_workflow_gate_actions_cannot_write_task_lifecycle() {
         Method::POST,
         &format!("/api/v1/tasks/{}/gates/review/approve", task.id),
         json!({"version": task.version, "reason": "reviewed"}),
-        StatusCode::CONFLICT,
+        StatusCode::NOT_FOUND,
     )
     .await;
     let _: serde_json::Value = json_request(
@@ -131,7 +131,7 @@ async fn legacy_workflow_gate_actions_cannot_write_task_lifecycle() {
         Method::POST,
         &format!("/api/v1/tasks/{}/gates/review/reject", task.id),
         json!({"version": task.version, "reason": "changes required"}),
-        StatusCode::CONFLICT,
+        StatusCode::NOT_FOUND,
     )
     .await;
 

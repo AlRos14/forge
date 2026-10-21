@@ -29,12 +29,7 @@ impl ProcessGroupChild {
             let pgid = child
                 .id()
                 .and_then(|id| i32::try_from(id).ok())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        "process group has no usable leader ID",
-                    )
-                })?;
+                .ok_or_else(|| io::Error::other("process group has no usable leader ID"))?;
 
             Ok(Self {
                 child,

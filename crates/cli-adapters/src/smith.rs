@@ -175,24 +175,24 @@ impl HarnessAdapter for SmithAdapter {
 
     fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
         use executors::CapabilitySupport as S;
-        crate::harness_capabilities(
-            S::Native,
-            S::Emulated,
-            S::Native,
-            S::Native,
-            S::Unsupported,
-            S::Native,
-            S::Native,
-            S::Native,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-        )
+        crate::C {
+            resume: S::Native,
+            cancel: S::Emulated,
+            structured_events: S::Native,
+            usage_reporting: S::Native,
+            account_usage_observation: S::Unsupported,
+            model_selection: S::Native,
+            reasoning_controls: S::Native,
+            approval_policy: S::Native,
+            sandbox_controls: S::Unsupported,
+            planning: S::Unsupported,
+            review_mode: S::Unsupported,
+            fork: S::Unsupported,
+            steer: S::Unsupported,
+            pause_resume: S::Unsupported,
+            compaction: S::Unsupported,
+            subagents: S::Unsupported,
+        }
     }
 
     fn executable_name(&self) -> Option<String> {
