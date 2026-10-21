@@ -1,9 +1,10 @@
 # PR15 acceptance report
 
-**Code SHA:** `232ea2b412df6ac497d9f431cbcfc4db499cc421`
+**Implementation/evidence SHA:** `232ea2b412df6ac497d9f431cbcfc4db499cc421`
+**CI-tested implementation SHA:** `2ef611f3b4b109ca259edb802e3c738ff0856677`
 **Base:** `origin/main` at `ca9cbdd38c75a72dcf3a8348bf97ef30739c8d29`
 **PR14 provenance:** merge `ca9cbdd38c75a72dcf3a8348bf97ef30739c8d29`; approved PR14 HEAD `3e9e23de73cf12c60014237eb4f356ea3d3a1aa8` is its second parent.
-**Status:** focused local evidence recorded; final GitHub Actions on the published PR15 candidate is pending.
+**Status:** focused scenario evidence recorded; final GitHub Actions and CodeQL passed on the published implementation at the SHA above. PR #19 remains draft and unmerged.
 
 The tests below exercise current Architecture V2 behavior. A fake daemon/provider is Level B protocol evidence only; no row claims a native external harness. The detailed command log and test boundaries are in [the PR15 ledger](plan-pr15-reference-scenarios-reliability.md).
 
@@ -27,7 +28,7 @@ The tests below exercise current Architecture V2 behavior. A fake daemon/provide
 
 - `git diff --check` and `cargo fmt --all -- --check` passed on the candidate source.
 - Every new or directly changed Rust test was run by its focused target. The actual-backend Playwright smoke was run once against temporary Forge data and a cached browser; it used a dedicated Vite port and did not invoke fallback authentication. No workspace-wide Rust build/test or full web suite was repeated locally.
-- Final full GitHub Actions, including required CI and CodeQL checks, is **NOT RUN yet** for the published PR15 candidate. Its result must be verified on the exact candidate SHA after opening the PR.
+- Final full GitHub Actions passed on exact implementation SHA `2ef611f3b4b109ca259edb802e3c738ff0856677`: [CI run 39626508654](https://github.com/AlRos14/forge/actions/runs/39626508654). Rust, Web, Documentation Contract, Security Audit, Upstream npm Bootstrapper Snapshot, JavaScript/TypeScript CodeQL analysis, and CodeQL all passed; the Rust job took 1 h 9 min 29 s. Subsequent changes to this report and ledger contain acceptance status only and do not alter the tested implementation.
 - S02 simultaneous provider writes and the remaining S09 provider/session recovery combinations are recorded as coverage limits, not as passing evidence or discovered product defects.
 - External/native harness validation is **NOT RUN** and is optional for local core acceptance. No paid credentials or external provider were used.
 - Focused review found no in-scope P0/P1/P2 product defect. No PR15-specific data migration, public capability, product rename, or PR15 implementation outside the stated scenarios was introduced.
