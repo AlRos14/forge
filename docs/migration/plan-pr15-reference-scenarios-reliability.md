@@ -1,6 +1,6 @@
 # Plan PR15 — Reference scenarios and reliability
 
-**Status:** inventory complete; focused implementation and acceptance evidence in progress.
+**Status:** focused implementation and local evidence recorded; final GitHub Actions is pending publication.
 **Branch:** `feat/plan-pr15-reference-scenarios-reliability`
 **Base:** `origin/main` at `ca9cbdd38c75a72dcf3a8348bf97ef30739c8d29`
 **PR14 provenance:** normal merge `ca9cbdd38c75a72dcf3a8348bf97ef30739c8d29`, parents `87c22862917a6059308cfb2a5dcb820cfcfb66ab` and approved PR14 HEAD `3e9e23de73cf12c60014237eb4f356ea3d3a1aa8`; PR #17 is merged.
@@ -149,5 +149,5 @@ The focused retired-schema check `cargo test -p db --test file_backed_migration 
 - New PR15 tests: S01 real HTTP acceptance and S04 ended-membership admission check added and passed; S11 strict real-backend Playwright smoke and real CLI/backend acceptance added and passed.
 - Acceptance scenarios: S01 PASS; S02 PARTIAL (three active Execution/lease identities and three isolated Git worktrees are evidenced; simultaneous provider writes remain unverified); S03 PASS for the tested DAG, readiness, pinned-base, and independent-scope boundaries; S04 PASS for the exercised Human/Agent, Purpose, snapshot, and ended-membership admission boundaries; S05 PASS for local HarnessAdapter/session boundaries (native harness not run); S06 PASS for tested local Orchestrator contract; S07 PASS for tested Proposal/Decision boundaries; S08 PASS for the exercised real local Git/API path and existing focused evidence; S09 PARTIAL (uncertain-start no-replay, authority revalidation, lease-expiry and interrupted Git recovery pass; other provider/session recovery outcomes remain unverified); S10 PASS via S01 plus PR14 regression evidence; S11 PASS for the exercised REST/MCP/CLI/SSE/web boundaries, with other individual commands and event types not all exercised; S12 PASS for the listed local permission, isolation, path, and authority-race boundaries; S13 PASS for the named current-schema integrity, representative history-preservation, repeat-migration and retirement checks; no all-version upgrade sweep was run.
 - External harness/provider validation: NOT RUN; optional and not required for core acceptance.
-- Acceptance report: not created yet; it will be authored after scenario evidence exists.
-- PR15 status: in progress; not ready for review.
+- Acceptance report: [plan-pr15-acceptance-report.md](plan-pr15-acceptance-report.md), recorded against code SHA `232ea2b412df6ac497d9f431cbcfc4db499cc421`; final GitHub Actions remains NOT RUN until the published candidate is available.
+- PR15 status: focused implementation is ready for publication; S02 and S09 retain the explicit PARTIAL limits in the acceptance report. The branch is not merged.
