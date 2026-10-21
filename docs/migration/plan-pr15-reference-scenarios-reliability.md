@@ -1,6 +1,6 @@
 # Plan PR15 — Reference scenarios and reliability
 
-**Status:** focused implementation and local evidence recorded; final GitHub Actions is pending publication.
+**Status:** implementation/evidence SHA `2ef611f3b4b109ca259edb802e3c738ff0856677` has final GitHub Actions and CodeQL PASS. Later status-only documentation edits do not alter that implementation. PR #19 remains draft and unmerged.
 **Branch:** `feat/plan-pr15-reference-scenarios-reliability`
 **Base:** `origin/main` at `ca9cbdd38c75a72dcf3a8348bf97ef30739c8d29`
 **PR14 provenance:** normal merge `ca9cbdd38c75a72dcf3a8348bf97ef30739c8d29`, parents `87c22862917a6059308cfb2a5dcb820cfcfb66ab` and approved PR14 HEAD `3e9e23de73cf12c60014237eb4f356ea3d3a1aa8`; PR #17 is merged.
