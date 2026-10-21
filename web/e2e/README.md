@@ -12,6 +12,7 @@ This seeds demo data and starts the API server. The suite mints admin JWTs clien
 
     cd web
     pnpm run e2e          # run the CI smoke test (headless)
+    pnpm run e2e:backend  # real REST-to-web acceptance; requires Forge on port 8080
     pnpm run e2e:terminal # run the workspace terminal UI test
     pnpm run e2e:ui       # open Playwright UI mode
     pnpm run e2e:debug    # run in debug mode
@@ -19,6 +20,8 @@ This seeds demo data and starts the API server. The suite mints admin JWTs clien
 The Vite dev server starts automatically via webServer config. If it is already running, Playwright will reuse it.
 
 Most specs use `./fixtures`, which logs in a deterministic default user before navigation and attaches an auth header to Playwright API requests. Override with `FORGE_E2E_EMAIL` and `FORGE_E2E_PASSWORD` if the default account already exists with different credentials; override backend seeding with `FORGE_E2E_BACKEND_BASE_URL`. `auth.spec.ts` intentionally imports raw Playwright fixtures so it can verify logged-out flows.
+
+`e2e:backend` is a separate acceptance smoke. It requires a live backend, authenticates against that backend without fallback credentials, creates a Project and Task through REST, then verifies the same Task appears in the web board. It deletes only the Project created by that test. If `FORGE_E2E_BACKEND_BASE_URL` is overridden, the Vite API/MCP proxy follows that URL unless `VITE_API_PROXY_TARGET` is set explicitly.
 
 ## Browser install (first time)
 

@@ -211,7 +211,7 @@ async fn forge_happy_path_end_to_end() {
     )
     .run_command(
         &task_id,
-        &workspace.id,
+        &source_workspace.id,
         "test -f greeting.txt",
         0,
         Some(&execution_id),
@@ -226,7 +226,7 @@ async fn forge_happy_path_end_to_end() {
         &task_id,
         &source_workspace.id,
         ReviewReportVerdict::Pass,
-        "The committed file satisfies the requested change.",
+        "The exact WorkUnit workspace satisfies the requested change.",
     )
     .await;
     assert_eq!(
@@ -245,9 +245,39 @@ async fn forge_happy_path_end_to_end() {
     let evidence = validation.evidence;
     assert_eq!(evidence.len(), 1);
 
+    let review_content: Value = serde_json::from_str(
+        review
+            .report
+            .content
+            .as_deref()
+            .expect("ReviewReport content is available"),
+    )
+    .expect("ReviewReport content is valid JSON");
+    let review_subject = &review_content["subject"];
+
     let dependency_digest = hex::encode(sha2::Sha256::digest(b"[]"));
-    let gate_policy = json!({
+    let quality_gate_policy = json!({
         "schema_version": 1,
+        "review": {
+            "mode": "one_acceptable",
+            "required_count": 1,
+            "human_required": true,
+            "allow_humans": true,
+            "allow_agents": false,
+            "allowed_actor_refs": [{"kind": "human", "id": "test-user-id"}],
+            "candidates": [{
+                "artifact_id": review.report.id,
+                "digest": review.report.digest,
+                "expected_actor": {"kind": "human", "id": "test-user-id"},
+                "required": true,
+                "subject": {
+                    "workspace_id": review_subject["workspace_id"],
+                    "base_commit_sha": review_subject["base_commit_sha"],
+                    "head_commit_sha": review_subject["head_commit_sha"],
+                    "workspace_snapshot_digest": review_subject["workspace_snapshot_digest"]
+                }
+            }]
+        },
         "validations": [{
             "validation_run_id": validations[0].id,
             "evidence_id": evidence[0].id,
@@ -260,6 +290,81 @@ async fn forge_happy_path_end_to_end() {
             "required_outcome": "passed"
         }],
         "decisions": [],
+        "work_units": []
+    });
+
+    let mut missing_validation_policy = quality_gate_policy.clone();
+    missing_validation_policy["validations"][0]["validation_run_id"] =
+        json!("missing-validation-run-for-pr15");
+    let quality_gate: GateResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/gates"),
+        json!({"gate_kind": "quality", "policy": missing_validation_policy}),
+        StatusCode::OK,
+    )
+    .await;
+    let review_without_validation: GateEvaluationResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/gates/{}/evaluate", quality_gate.gate.id),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(review_without_validation.outcome, "unsatisfied");
+
+    let mut missing_review_policy = quality_gate_policy.clone();
+    missing_review_policy["review"]["candidates"][0]["artifact_id"] =
+        json!("missing-review-report-for-pr15");
+    let missing_review_revision: api_types::GatePolicyRevisionResponse = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/gates/{}/policy", quality_gate.gate.id),
+        json!({
+            "expected_active_revision": quality_gate.gate.active_policy_revision,
+            "policy": missing_review_policy
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(missing_review_revision.revision, 2);
+    let validation_without_review: GateEvaluationResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/gates/{}/evaluate", quality_gate.gate.id),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(validation_without_review.outcome, "unsatisfied");
+
+    let positive_quality_revision: api_types::GatePolicyRevisionResponse = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/gates/{}/policy", quality_gate.gate.id),
+        json!({
+            "expected_active_revision": missing_review_revision.revision,
+            "policy": quality_gate_policy
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(positive_quality_revision.revision, 3);
+    let quality_evaluation: GateEvaluationResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/gates/{}/evaluate", quality_gate.gate.id),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(quality_evaluation.outcome, "satisfied");
+
+    let merge_gate_policy = json!({
+        "schema_version": 1,
+        "validations": [],
+        "decisions": [],
         "work_units": [{
             "work_unit_id": work_unit.id,
             "version": completed_work_unit.version,
@@ -271,11 +376,12 @@ async fn forge_happy_path_end_to_end() {
             "integration_version": integration.version
         }]
     });
+
     let gate: GateResponse = json_request(
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/gates"),
-        json!({"gate_kind": "merge_readiness", "policy": gate_policy}),
+        json!({"gate_kind": "merge_readiness", "policy": merge_gate_policy}),
         StatusCode::OK,
     )
     .await;
@@ -306,7 +412,10 @@ async fn forge_happy_path_end_to_end() {
         poll_until_task_lifecycle(&harness.app, &task_id, TaskLifecycleState::ReadyToMerge).await;
     assert_eq!(ready_to_merge.state, TaskLifecycleState::ReadyToMerge);
 
-    let candidate_sha = validations[0].commit_sha.clone();
+    let candidate_sha = integration
+        .target_after_sha
+        .clone()
+        .expect("integration records the exact Task workspace commit");
     std::fs::write(
         worktree_path.join("stale.txt"),
         "changed after Gate evaluation\n",
