@@ -50,11 +50,13 @@ and a failure to persist a log does not make a still-running execution appear
 inactive. Fallback executor attempts reuse the same logical log sequence rather
 than starting a second sequence.
 
-Usage observations follow the same execution-log transport for local and daemon
-execution. Codex `account/rateLimits/updated` is a native `provider_event`;
-Cursor `/usage` is a bounded, cancellable `cursor_poll` performed where the
-Cursor account exists. Every persisted observation is tied to its execution,
-account context, source, and host/daemon provenance.
+Usage observations follow the execution and daemon event paths with account
+context and host provenance. Codex `account/rateLimits/updated` events are
+native `provider_event` observations. The current local Cursor Execution path
+does not launch a `/usage` polling helper or persist a `cursor_poll` snapshot.
+An authenticated daemon may report a usage observation; the server ties any
+persisted observation to its exact Execution, account context, source, and
+host/daemon provenance.
 
 ## Adapter Sources
 

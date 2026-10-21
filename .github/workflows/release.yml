@@ -192,9 +192,10 @@ jobs:
           sbom: true
 
   publish-npm:
-    name: Publish npm Bootstrapper
+    name: Upstream npm Bootstrapper (upstream only)
     needs: release
     runs-on: ubuntu-latest
+    if: ${{ github.repository == 'ForgeAILab/forge' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -226,10 +227,10 @@ jobs:
           npm publish --access public --provenance --tag "$npm_tag"
 
   update-homebrew-tap:
-    name: Update Homebrew Tap
+    name: Update upstream Homebrew Tap (upstream only)
     needs: release
     runs-on: ubuntu-latest
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ github.repository == 'ForgeAILab/forge' && !contains(github.ref_name, '-') }}
     steps:
       - name: Dispatch tap update
         env:

@@ -17,7 +17,7 @@ const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[command(
     name = "forge",
     version,
-    about = "Forge — local-first workflow engine for coding agents"
+    about = "Forge — local work coordination for programming agents and humans"
 )]
 struct Cli {
     #[arg(long)]

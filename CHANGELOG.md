@@ -1,14 +1,38 @@
 # Changelog
 
-All notable changes to Forge are documented in this file.
-
-Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and workflows may change between minor versions.
+This changelog preserves the source repository's recorded history. The
+`Unreleased` section describes changes in `AlRos14/forge`; historical entries
+do not assert that this fork published matching artifacts. The workspace source
+version is `0.8.0`. This repository had no published GitHub Releases at the
+PR14 audit on 2026-10-16.
 
 ## [Unreleased]
 
+### Documentation
+
+- Rewrote the product entry points and current architecture, REST/MCP/SSE, CLI,
+  execution-log, contributor, agent-guidance, and release documentation to
+  describe the post-PR13 implementation. The Getting Started guide now builds
+  this repository and explicitly creates a WorkUnit before an Execution. It
+  also documents the observed ambiguous WorkUnit-create error and warns callers
+  to inspect existing WorkUnits before retrying.
+- Marked ForgeAILab package/release references as upstream-owned. Updated the
+  installer and Cargo repository metadata to point to AlRos14/forge; source
+  builds remain the supported installation path until this fork publishes a
+  verified release. No product rename was selected or applied.
+
 ### Fixed
 
-- Preserve a remote Execution as running when its daemon reports an uncertain Start outcome, so the provider request is not treated as a definitive rejection or replayed.
+- Restricted the inherited npm and Homebrew publication jobs to their upstream
+  repository, so a tag in AlRos14/forge cannot publish to third-party registries.
+- Set a fixed loopback port for Makefile development to match the Vite proxy,
+  and made the container bind to its published port 8080.
+- Updated the Docker build manifest list and Rust 1.89 base so the post-PR13
+  workspace and stable file-lock APIs compile in the published image.
+
+- Preserve a remote Execution as running when its daemon reports an uncertain
+  Start outcome, so the provider request is not treated as a definitive
+  rejection or replayed.
 
 ### Breaking
 
