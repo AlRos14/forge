@@ -106,7 +106,7 @@ pub async fn create_repo(
         },
     )
     .await?;
-    Ok(Json(repo_with_provider(&*state.db, repo).await?))
+    Ok(Json(repo_with_provider(&state.db, repo).await?))
 }
 
 pub async fn list_repos(
@@ -119,7 +119,7 @@ pub async fn list_repos(
     let page = RepoRepo::list_by_project(&*state.db, &project_id, page_request(&params)?).await?;
     let mut items = Vec::with_capacity(page.items.len());
     for repo in page.items {
-        items.push(repo_with_provider(&*state.db, repo).await?);
+        items.push(repo_with_provider(&state.db, repo).await?);
     }
     Ok(Json(PaginatedResponse {
         has_more: page.next_cursor.is_some(),
@@ -135,7 +135,7 @@ pub async fn get_repo(
     user: AuthenticatedUser,
 ) -> ApiResult<Json<RepoResponse>> {
     let repo = require_repo_visible(&state, &id, &user).await?;
-    Ok(Json(repo_with_provider(&*state.db, repo).await?))
+    Ok(Json(repo_with_provider(&state.db, repo).await?))
 }
 
 pub async fn update_repo(

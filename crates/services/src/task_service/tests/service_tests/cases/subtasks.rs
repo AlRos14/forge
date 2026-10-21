@@ -785,38 +785,37 @@ async fn create_child_serializes_with_parent_soft_delete() {
 
     let create_result = create_child.await.expect("child create joins");
     let delete_result = delete_parent.await.expect("parent delete joins");
-    if create_result.is_ok() {
-        eprintln!("observed race outcome: child create committed; parent delete was rejected");
-        let child = create_result.expect("child create wins");
-        assert!(
-            delete_result.is_err(),
-            "parent delete loses to child create"
-        );
-        let live_parent = TaskRepo::get_by_id(&*db, &parent.id, false)
-            .await
-            .expect("parent query succeeds")
-            .expect("parent remains live");
-        assert_eq!(child.parent_task_id.as_deref(), Some(parent.id.as_str()));
-        assert!(live_parent.deleted_at.is_none());
-        assert_eq!(live_parent.version, parent.version);
-    } else {
-        eprintln!("observed race outcome: parent delete committed; child create was rejected");
-        assert!(
-            matches!(
-                create_result,
-                Err(ServiceError::NotFound { entity: "task", .. })
-            ),
-            "create loses only because parent is no longer live: {create_result:?}"
-        );
-        let deleted_parent = delete_result.expect("parent delete wins");
-        assert!(deleted_parent.deleted_at.is_some());
-        let child_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE parent_task_id = ?")
-                .bind(&parent.id)
-                .fetch_one(db.pool())
+    match create_result {
+        Ok(child) => {
+            eprintln!("observed race outcome: child create committed; parent delete was rejected");
+            assert!(
+                delete_result.is_err(),
+                "parent delete loses to child create"
+            );
+            let live_parent = TaskRepo::get_by_id(&*db, &parent.id, false)
                 .await
-                .expect("child count loads");
-        assert_eq!(child_count, 0, "losing create leaves no child row");
+                .expect("parent query succeeds")
+                .expect("parent remains live");
+            assert_eq!(child.parent_task_id.as_deref(), Some(parent.id.as_str()));
+            assert!(live_parent.deleted_at.is_none());
+            assert_eq!(live_parent.version, parent.version);
+        }
+        Err(create_error) => {
+            eprintln!("observed race outcome: parent delete committed; child create was rejected");
+            assert!(
+                matches!(&create_error, ServiceError::NotFound { entity: "task", .. }),
+                "create loses only because parent is no longer live: {create_error:?}"
+            );
+            let deleted_parent = delete_result.expect("parent delete wins");
+            assert!(deleted_parent.deleted_at.is_some());
+            let child_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE parent_task_id = ?")
+                    .bind(&parent.id)
+                    .fetch_one(db.pool())
+                    .await
+                    .expect("child count loads");
+            assert_eq!(child_count, 0, "losing create leaves no child row");
+        }
     }
     assert_parent_structure_is_clean(&db).await;
 }
@@ -853,37 +852,36 @@ async fn create_subtasks_batch_serializes_with_parent_soft_delete() {
 
     let batch_result = create_batch.await.expect("batch create joins");
     let delete_result = delete_parent.await.expect("parent delete joins");
-    if batch_result.is_ok() {
-        eprintln!("observed race outcome: batch committed; parent delete was rejected");
-        let children = batch_result.expect("batch create wins");
-        assert_eq!(children.len(), 2, "the batch is complete");
-        assert!(delete_result.is_err(), "parent delete loses to the batch");
-        assert_eq!(children[0].subtask_order, Some(0));
-        assert_eq!(children[1].subtask_order, Some(1));
-        let live_parent = TaskRepo::get_by_id(&*db, &parent.id, false)
-            .await
-            .expect("parent query succeeds")
-            .expect("parent remains live");
-        assert!(live_parent.deleted_at.is_none());
-        assert_eq!(live_parent.version, parent.version);
-    } else {
-        eprintln!("observed race outcome: parent delete committed; batch was rejected");
-        assert!(
-            matches!(
-                batch_result,
-                Err(ServiceError::NotFound { entity: "task", .. })
-            ),
-            "batch loses only because parent is no longer live: {batch_result:?}"
-        );
-        let deleted_parent = delete_result.expect("parent delete wins");
-        assert!(deleted_parent.deleted_at.is_some());
-        let child_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE parent_task_id = ?")
-                .bind(&parent.id)
-                .fetch_one(db.pool())
+    match batch_result {
+        Ok(children) => {
+            eprintln!("observed race outcome: batch committed; parent delete was rejected");
+            assert_eq!(children.len(), 2, "the batch is complete");
+            assert!(delete_result.is_err(), "parent delete loses to the batch");
+            assert_eq!(children[0].subtask_order, Some(0));
+            assert_eq!(children[1].subtask_order, Some(1));
+            let live_parent = TaskRepo::get_by_id(&*db, &parent.id, false)
                 .await
-                .expect("child count loads");
-        assert_eq!(child_count, 0, "losing batch leaves no partial children");
+                .expect("parent query succeeds")
+                .expect("parent remains live");
+            assert!(live_parent.deleted_at.is_none());
+            assert_eq!(live_parent.version, parent.version);
+        }
+        Err(batch_error) => {
+            eprintln!("observed race outcome: parent delete committed; batch was rejected");
+            assert!(
+                matches!(&batch_error, ServiceError::NotFound { entity: "task", .. }),
+                "batch loses only because parent is no longer live: {batch_error:?}"
+            );
+            let deleted_parent = delete_result.expect("parent delete wins");
+            assert!(deleted_parent.deleted_at.is_some());
+            let child_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE parent_task_id = ?")
+                    .bind(&parent.id)
+                    .fetch_one(db.pool())
+                    .await
+                    .expect("child count loads");
+            assert_eq!(child_count, 0, "losing batch leaves no partial children");
+        }
     }
     assert_parent_structure_is_clean(&db).await;
 }
@@ -927,27 +925,29 @@ async fn reparent_serializes_with_destination_parent_soft_delete() {
         .await
         .expect("parent query succeeds")
         .expect("parent row remains");
-    if reparent_result.is_ok() {
-        eprintln!("observed race outcome: reparent committed; destination delete was rejected");
-        let moved = reparent_result.expect("reparent wins");
-        assert!(delete_result.is_err(), "delete loses to reparent");
-        assert_eq!(moved.parent_task_id.as_deref(), Some(parent.id.as_str()));
-        assert!(final_parent.deleted_at.is_none());
-        assert_eq!(final_parent.version, parent.version);
-    } else {
-        eprintln!("observed race outcome: destination delete committed; reparent was rejected");
-        assert!(delete_result.is_ok(), "parent delete wins the race");
-        assert!(
-            matches!(
-                reparent_result,
-                Err(ServiceError::NotFound { entity: "task", .. })
-            ),
-            "reparent loses because the destination is no longer live: {reparent_result:?}"
-        );
-        assert!(final_parent.deleted_at.is_some());
-        assert!(final_child.parent_task_id.is_none());
-        assert!(final_child.subtask_order.is_none());
-        assert_eq!(final_child.version, child.version);
+    match reparent_result {
+        Ok(moved) => {
+            eprintln!("observed race outcome: reparent committed; destination delete was rejected");
+            assert!(delete_result.is_err(), "delete loses to reparent");
+            assert_eq!(moved.parent_task_id.as_deref(), Some(parent.id.as_str()));
+            assert!(final_parent.deleted_at.is_none());
+            assert_eq!(final_parent.version, parent.version);
+        }
+        Err(reparent_error) => {
+            eprintln!("observed race outcome: destination delete committed; reparent was rejected");
+            assert!(delete_result.is_ok(), "parent delete wins the race");
+            assert!(
+                matches!(
+                    &reparent_error,
+                    ServiceError::NotFound { entity: "task", .. }
+                ),
+                "reparent loses because the destination is no longer live: {reparent_error:?}"
+            );
+            assert!(final_parent.deleted_at.is_some());
+            assert!(final_child.parent_task_id.is_none());
+            assert!(final_child.subtask_order.is_none());
+            assert_eq!(final_child.version, child.version);
+        }
     }
     assert_parent_structure_is_clean(&db).await;
 }

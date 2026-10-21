@@ -151,7 +151,7 @@ async fn launch_execution_for_task(
         .state
         .task_service
         .create_task_role(
-            &task_id,
+            task_id,
             "implementer",
             db::CoordinationMode::Independent,
             "{}".to_owned(),
@@ -162,16 +162,28 @@ async fn launch_execution_for_task(
         .state
         .task_service
         .add_task_role_member(
-            &task_id,
+            task_id,
             "implementer",
             api_types::ActorRef::Agent(agent_id.to_owned()),
         )
         .await
         .expect("Agent joins implementer TaskRole");
 
+    let work_unit = common::create_allocated_work_unit(
+        &harness.app,
+        task_id,
+        "implementer",
+        agent_id,
+        "Remote execution WorkUnit",
+        "Execute the remote Agent within this exact repository scope",
+        true,
+    )
+    .await;
+
     let start_app = harness.app.clone();
     let start_task_id = task_id.to_owned();
-    let start_agent_id = agent_id.to_owned();
+    let start_work_unit_id = work_unit.id;
+    let expected_work_unit_version = work_unit.version;
     let prompt = prompt.to_owned();
     let start_handle = tokio::spawn(async move {
         json_request::<ExecutionResponse>(
@@ -179,8 +191,8 @@ async fn launch_execution_for_task(
             Method::POST,
             &format!("/api/v1/tasks/{start_task_id}/executions"),
             json!({
-                "agent_id": start_agent_id,
-                "role": "implementer",
+                "work_unit_id": start_work_unit_id,
+                "expected_work_unit_version": expected_work_unit_version,
                 "purpose": "implement",
                 "prompt": prompt,
                 "input_artifact_ids": []
@@ -299,7 +311,7 @@ async fn remote_execution_completes_and_transitions_task() {
 }
 
 #[tokio::test]
-async fn remote_execution_failure_does_not_mutate_aggregate_task_lifecycle() {
+async fn remote_execution_failure_blocks_lifecycle_for_exact_work_unit() {
     let mut fixture = setup_remote_roundtrip("remote-roundtrip-failure").await;
 
     let (task_id, execution_id) = start_execution_with_accepted_daemon(
@@ -335,16 +347,17 @@ async fn remote_execution_failure_does_not_mutate_aggregate_task_lifecycle() {
         failed.error
     );
 
-    // Execution outcome is historical work evidence. A failed Execution does
-    // not itself rewrite aggregate TaskLifecycle; exact retry receipts and
-    // Gate facts own any later lifecycle effects.
+    // A failed WorkUnit Execution blocks TaskLifecycle through its exact
+    // Execution identity after the terminal result has been persisted.
     let lifecycle = poll_task_lifecycle(
         &fixture.harness.state.db,
         &task_id,
-        TaskLifecycleState::Active,
+        TaskLifecycleState::Blocked,
     )
     .await;
-    assert_eq!(lifecycle.state, TaskLifecycleState::Active);
+    assert_eq!(lifecycle.state, TaskLifecycleState::Blocked);
+    assert_eq!(lifecycle.reason_kind.as_deref(), Some("executor_failed"));
+    assert_eq!(lifecycle.reason_ref.as_deref(), Some(execution_id.as_str()));
 }
 
 #[tokio::test]
@@ -493,9 +506,9 @@ async fn remote_executor_unavailability_preserves_route_without_legacy_task_proj
     .await;
     assert_eq!(failed.status, DbExecutionStatus::Failed);
 
-    // TaskLifecycle and old retry metadata do not derive from an unavailable
-    // harness route. The exact route disposition is retained on this
-    // Execution for an explicit later decision.
+    // An unavailable route blocks runnable TaskLifecycle through this exact
+    // Execution. Retired Task retry counters and deferred dispatch remain
+    // absent; the route disposition is preserved on the Execution snapshot.
     let task = TaskRepo::get_by_id(&*fixture.harness.state.db, &task_id, false)
         .await
         .expect("task lookup")
@@ -507,11 +520,18 @@ async fn remote_executor_unavailability_preserves_route_without_legacy_task_proj
         .unwrap_or_else(|| json!({}));
     assert!(metadata.get("execution_retry_count").is_none());
     assert!(metadata.get("deferred_dispatch").is_none());
-    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*fixture.harness.state.db, &task_id)
-        .await
-        .expect("TaskLifecycle loads")
-        .expect("TaskLifecycle exists");
-    assert_eq!(lifecycle.state, TaskLifecycleState::Active);
+    let lifecycle = poll_task_lifecycle(
+        &fixture.harness.state.db,
+        &task_id,
+        TaskLifecycleState::Blocked,
+    )
+    .await;
+    assert_eq!(lifecycle.state, TaskLifecycleState::Blocked);
+    assert_eq!(
+        lifecycle.reason_kind.as_deref(),
+        Some("executor_unavailable")
+    );
+    assert_eq!(lifecycle.reason_ref.as_deref(), Some(execution_id.as_str()));
 
     // Attempts and disposition are persisted on the execution snapshot.
     let stored = ExecutionRepo::get_by_id(&*fixture.harness.state.db, &execution_id)

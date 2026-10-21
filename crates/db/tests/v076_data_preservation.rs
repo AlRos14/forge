@@ -1,4 +1,4 @@
-use db::{create_sqlite_pool, run_migrations_from, SharedMediaRepo, SqliteDb};
+use db::{create_sqlite_pool, run_migrations_from};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::{
@@ -598,38 +598,11 @@ async fn v076_preserves_projects_genesis_tasks_media_rows_and_file_bytes() {
     assert_eq!(count_rows(&pool, "project_charter").await, 0);
     assert_eq!(count_rows(&pool, "project_charter_approval").await, 0);
 
-    // A post-migration cleanup pass may now remove the orphan bytes using the
-    // same guarded lease/CAS protocol as ordinary Task deletion.  It must not
-    // touch the active or archived Task assets, which remain referenced.
-    let db = SqliteDb::new(pool.clone());
-    let cleanup_now = "2026-08-13T00:00:00Z";
-    let candidates = SharedMediaRepo::claim_media_gc_candidates(
-        &db,
-        cleanup_now,
-        "v076-preservation-test",
-        "9999-12-31T00:00:00Z",
-        10,
-    )
-    .await
-    .expect("post-migration candidate claim");
-    let deleted_candidate = candidates
-        .iter()
-        .find(|candidate| candidate.id == "media-deleted")
-        .expect("deleted legacy media is claimable");
-    let deleted_candidate_version = deleted_candidate.version;
-    fs::remove_file(storage_root.join("legacy/media-deleted"))
-        .expect("post-migration orphan bytes remove");
-    SharedMediaRepo::complete_media_gc(
-        &db,
-        "media-deleted",
-        "v076-preservation-test",
-        deleted_candidate_version,
-        cleanup_now,
-    )
-    .await
-    .expect("post-migration candidate finalize")
-    .expect("post-migration asset tombstone");
-    assert!(!storage_root.join("legacy/media-deleted").exists());
+    // This fixture intentionally stops at V076 to verify that migration in
+    // isolation. It checks that the legacy bytes remain intact; runtime GC
+    // claims depend on later schema added by PR13 and are covered by the
+    // current-schema shared_media tests.
+    assert!(storage_root.join("legacy/media-deleted").exists());
     assert!(storage_root.join("legacy/media-image").exists());
     assert!(storage_root.join("legacy/media-video").exists());
 

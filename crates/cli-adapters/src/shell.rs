@@ -53,24 +53,24 @@ impl HarnessAdapter for ShellAdapter {
 
     fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
         use executors::CapabilitySupport as S;
-        crate::harness_capabilities(
-            S::Unsupported,
-            S::Emulated,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-            S::Unsupported,
-        )
+        crate::C {
+            resume: S::Unsupported,
+            cancel: S::Emulated,
+            structured_events: S::Unsupported,
+            usage_reporting: S::Unsupported,
+            account_usage_observation: S::Unsupported,
+            model_selection: S::Unsupported,
+            reasoning_controls: S::Unsupported,
+            approval_policy: S::Unsupported,
+            sandbox_controls: S::Unsupported,
+            planning: S::Unsupported,
+            review_mode: S::Unsupported,
+            fork: S::Unsupported,
+            steer: S::Unsupported,
+            pause_resume: S::Unsupported,
+            compaction: S::Unsupported,
+            subagents: S::Unsupported,
+        }
     }
 
     fn executable_name(&self) -> Option<String> {

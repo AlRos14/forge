@@ -910,7 +910,7 @@ pub enum ProviderStartClaim {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingProviderStartFailure {
-    Resolved(Execution, DomainEvent),
+    Resolved(Box<Execution>, DomainEvent),
     Attempted(Execution),
     NotPending(Execution),
     NotRunning(Execution),
@@ -918,7 +918,7 @@ pub enum PendingProviderStartFailure {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunningExecutionFailure {
-    Failed(Execution, DomainEvent),
+    Failed(Box<Execution>, DomainEvent),
     Pending(Execution),
     NotRunning(Execution),
 }

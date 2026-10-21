@@ -443,9 +443,10 @@ impl OperatorStatusService {
                 COALESCE(e.stopped_at, e.updated_at) AS occurred_at
              FROM execution e
              JOIN task t ON t.id = e.task_id
+             JOIN task_lifecycle lifecycle ON lifecycle.task_id = t.id
              WHERE e.status = 'failed'
                AND t.deleted_at IS NULL
-               AND t.status NOT IN ('done', 'cancelled')
+               AND lifecycle.state NOT IN ('done', 'cancelled')
                AND COALESCE(e.stopped_at, e.updated_at) >= ?
              ORDER BY occurred_at DESC, e.id ASC",
         )

@@ -1392,7 +1392,7 @@ mod tests {
              WHERE task_id = ? AND failure_kind = ? AND failure_ref = ?",
         )
         .bind(&task_id)
-        .bind(&exhaustion_failure.kind)
+        .bind(exhaustion_failure.kind)
         .bind(&exhaustion_failure.id)
         .fetch_one(db.pool())
         .await
@@ -1418,7 +1418,7 @@ mod tests {
              WHERE task_id = ? AND failure_kind = ? AND failure_ref = ?",
         )
         .bind(&task_id)
-        .bind(&second_failure.kind)
+        .bind(second_failure.kind)
         .bind(&second_failure.id)
         .fetch_one(db.pool())
         .await
@@ -1953,7 +1953,7 @@ mod tests {
                          WHERE task_id = ? AND failure_kind = ? AND failure_ref = ?",
                     )
                     .bind(&stale_task_id)
-                    .bind(&failure.kind)
+                    .bind(failure.kind)
                     .bind(&failure.id)
                     .fetch_one(db.pool())
                     .await
@@ -2127,27 +2127,18 @@ mod tests {
         )
         .await
         .expect("legacy Project");
-        TaskRepo::create(
-            &*db,
-            CreateTask {
-                id: task_id.clone(),
-                project_id: project_id.clone(),
-                repo_id: None,
-                parent_task_id: None,
-                title: "Legacy merge failure".to_owned(),
-                description: None,
-                task_type: "implementation".to_owned(),
-                lifecycle_state: db::TaskLifecycleState::Active,
-                is_automation: false,
-                priority: 0,
-                subtask_order: None,
-                merge_config: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
+        sqlx::query(
+            "INSERT INTO task (id, project_id, title, status, created_at, updated_at)
+             VALUES (?, ?, ?, 'in_progress', ?, ?)",
         )
+        .bind(&task_id)
+        .bind(&project_id)
+        .bind("Legacy merge failure")
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
         .await
-        .expect("legacy Task");
+        .expect("legacy Task inserts through the pre-PR13 schema trigger");
         let source_event = DomainEventRepo::append_event(
             &*db,
             CreateDomainEvent {
@@ -2240,27 +2231,18 @@ mod tests {
             .await
             .expect("upgrade legacy database through V110");
         let v110_task_id = new_uuid_v4();
-        TaskRepo::create(
-            &*db,
-            CreateTask {
-                id: v110_task_id.clone(),
-                project_id: project_id.clone(),
-                repo_id: None,
-                parent_task_id: None,
-                title: "V110 override history".to_owned(),
-                description: None,
-                task_type: "implementation".to_owned(),
-                lifecycle_state: db::TaskLifecycleState::Active,
-                is_automation: false,
-                priority: 0,
-                subtask_order: None,
-                merge_config: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
+        sqlx::query(
+            "INSERT INTO task (id, project_id, title, status, created_at, updated_at)
+             VALUES (?, ?, ?, 'in_progress', ?, ?)",
         )
+        .bind(&v110_task_id)
+        .bind(&project_id)
+        .bind("V110 override history")
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
         .await
-        .expect("V110 Task");
+        .expect("V110 Task seeds through the historical lifecycle trigger");
         let v110_bus = Arc::new(EventBus::new(8));
         let v110_service = TaskFailureRetryService::new(Arc::clone(&db), Arc::clone(&v110_bus));
         for attempt in 0..2 {
@@ -3513,10 +3495,10 @@ mod tests {
         );
 
         assert!(
-            TaskFailureRetryService::has_exhausted_retry_budget(&db, &merge_retry_task_id)
+            !TaskFailureRetryService::has_exhausted_retry_budget(&db, &merge_retry_task_id)
                 .await
                 .expect("merge retry budget lookup"),
-            "the exact merge failure receipt remains an execution-dispatch fence"
+            "an exact merge-failure rework receipt does not exhaust the retry budget"
         );
     }
 

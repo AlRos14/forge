@@ -27,7 +27,7 @@ impl IntegrationRepo for SqliteDb {
         input: CreateProjectIntegration,
     ) -> Result<ProjectIntegration> {
         sqlx::query(
-            "INSERT INTO project_integration (id, project_id, platform, base_url, owner, repo, token_secret_ref, poll_interval_secs, sync_filter, default_implementer_kind, default_implementer_id, enabled, last_polled_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO project_integration (id, project_id, platform, base_url, owner, repo, token_secret_ref, poll_interval_secs, sync_filter, default_implementer_kind, default_implementer_id, enabled, last_polled_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.project_id)

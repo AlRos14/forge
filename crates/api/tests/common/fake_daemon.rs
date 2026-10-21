@@ -17,11 +17,13 @@ use axum::{
     Router,
 };
 use db::{
-    AgentRepo, AgentStatus, CreateAgent, CreateExecution, CreateProject, CreateRepo,
-    CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkspace, CreateWorkspaceLease,
+    AgentRepo, AgentStatus, CreateAgent, CreateDomainEvent, CreateExecution, CreateProject,
+    CreateRepo, CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkUnit,
+    CreateWorkUnitExecution, CreateWorkUnitWorkspace, CreateWorkspace, CreateWorkspaceLease,
     DaemonRepo, DaemonStatus, Execution, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo,
     RoleMembershipRepo, RoleMembershipStatus, TaskRepo, TaskRoleRepo, UpsertDaemon, UserRepo,
-    WorkMode, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    WorkMode, WorkUnit, WorkUnitExecutionRepo, WorkUnitRepo, WorkUnitWorkspaceRepo, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -40,6 +42,132 @@ use tower::ServiceExt;
 use super::{json_request, json_request_with_bearer, TestDir};
 
 pub const FAKE_DAEMON_USER_ID: &str = "test-user-id";
+
+fn test_domain_event(
+    event_type: &str,
+    entity_type: &str,
+    entity_id: &str,
+    task_id: &str,
+    actor_type: &str,
+    actor_id: &str,
+    payload: Value,
+) -> CreateDomainEvent {
+    CreateDomainEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        event_type: event_type.to_owned(),
+        entity_type: entity_type.to_owned(),
+        entity_id: entity_id.to_owned(),
+        actor_type: actor_type.to_owned(),
+        actor_id: Some(actor_id.to_owned()),
+        scope_type: "task".to_owned(),
+        scope_id: task_id.to_owned(),
+        correlation_id: uuid::Uuid::new_v4().to_string(),
+        causation_id: None,
+        causation_depth: 0,
+        dedupe_key: None,
+        payload_json: payload.to_string(),
+        created_at: db::now_rfc3339(),
+    }
+}
+
+fn provider_start_attempt_event(execution: &Execution) -> CreateDomainEvent {
+    let agent_id = execution
+        .agent_id
+        .as_deref()
+        .expect("running fixture Execution has an Agent");
+    CreateDomainEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        event_type: "execution.provider_start_attempted".to_owned(),
+        entity_type: "execution".to_owned(),
+        entity_id: execution.id.clone(),
+        actor_type: "agent".to_owned(),
+        actor_id: Some(agent_id.to_owned()),
+        scope_type: "task".to_owned(),
+        scope_id: execution.task_id.clone(),
+        correlation_id: execution.id.clone(),
+        causation_id: execution.parent_execution_id.clone(),
+        causation_depth: i64::from(execution.parent_execution_id.is_some()),
+        dedupe_key: Some(format!(
+            "execution.provider_start_attempted:{}",
+            execution.id
+        )),
+        payload_json: json!({
+            "execution_id": execution.id,
+            "task_id": execution.task_id,
+            "agent_id": agent_id,
+            "outcome": "attempted"
+        })
+        .to_string(),
+        created_at: db::now_rfc3339(),
+    }
+}
+
+async fn create_implementation_work_unit(
+    state: &AppState,
+    task: &db::Task,
+    agent_id: &str,
+    requires_integration: bool,
+) -> WorkUnit {
+    let now = db::now_rfc3339();
+    let role = TaskRoleRepo::create(
+        &*state.db,
+        CreateTaskRole {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            role: "implementer".to_owned(),
+            coordination_mode: None,
+            policy_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("implementer TaskRole creates");
+    RoleMembershipRepo::add(
+        &*state.db,
+        CreateRoleMembership {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_role_id: role.id,
+            actor_kind: db::ActorKind::Agent,
+            actor_id: agent_id.to_owned(),
+            status: RoleMembershipStatus::Active,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Agent joins implementer TaskRole");
+
+    let id = uuid::Uuid::new_v4().to_string();
+    WorkUnitRepo::create(
+        &*state.db,
+        CreateWorkUnit {
+            id: id.clone(),
+            task_id: task.id.clone(),
+            parent_work_unit_id: None,
+            title: "Daemon routing WorkUnit".to_owned(),
+            scope: "Exercise the daemon execution protocol".to_owned(),
+            role: "implementer".to_owned(),
+            assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
+            requires_integration,
+            provenance: None,
+            created_by: db::ActorRef::Human(FAKE_DAEMON_USER_ID.to_owned()),
+            created_at: now,
+        },
+        test_domain_event(
+            "work_unit.created",
+            "work_unit",
+            &id,
+            &task.id,
+            "human",
+            FAKE_DAEMON_USER_ID,
+            json!({"task_id": task.id, "work_unit_id": id, "version": 1, "status": "open"}),
+        ),
+    )
+    .await
+    .expect("WorkUnit creates")
+    .record
+}
 
 pub type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -471,7 +599,7 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
     )
     .await
     .expect("project creates");
-    TaskRepo::create(
+    let task = TaskRepo::create(
         &*state.db,
         CreateTask {
             id: task_id.clone(),
@@ -522,44 +650,78 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
     )
     .await
     .expect("agent creates");
-    ExecutionRepo::create(
+
+    let work_unit = create_implementation_work_unit(state, &task, &agent_id, false).await;
+    let execution = CreateExecution {
+        id: uuid::Uuid::new_v4().to_string(),
+        task_id: task_id.clone(),
+        agent_id: Some(agent_id.clone()),
+        actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+        purpose: Some(db::ExecutionPurpose::Implement),
+        harness_session_id: None,
+        role: "implementer".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_message_id: None,
+        last_activity_at: Some(now.clone()),
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: Some(
+            json!({
+                "executor_type": "codex",
+                "config": {},
+                "resolved_daemon_id": daemon_id,
+                "harness_capabilities": api_types::HarnessCapabilities::unknown().snapshot()
+            })
+            .to_string(),
+        ),
+        workspace_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    let execution_id = execution.id.clone();
+    let execution = WorkUnitExecutionRepo::create_for_work_unit(
         &*state.db,
-        CreateExecution {
-            id: uuid::Uuid::new_v4().to_string(),
-            task_id,
-            agent_id: Some(agent_id.clone()),
-            actor_ref: Some(db::ActorRef::Agent(agent_id)),
-            purpose: Some(db::ExecutionPurpose::Implement),
-            harness_session_id: None,
-            role: "coder".to_owned(),
-            status: ExecutionStatus::Running,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: Some(now.clone()),
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                json!({
-                    "executor_type": "codex",
-                    "config": {},
-                    "harness_capabilities": api_types::HarnessCapabilities::unknown().snapshot()
-                })
-                .to_string(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
+        CreateWorkUnitExecution {
+            execution,
+            work_unit_id: work_unit.id.clone(),
+            work_unit_version: work_unit.version,
+            workspace_lease: None,
         },
+        test_domain_event(
+            "execution.started",
+            "execution",
+            &execution_id,
+            &task_id,
+            "agent",
+            &agent_id,
+            json!({
+                "task_id": task_id,
+                "work_unit_id": work_unit.id,
+                "execution_id": execution_id,
+                "work_unit_version": work_unit.version
+            }),
+        ),
     )
     .await
-    .expect("execution creates")
+    .expect("WorkUnit Execution creates")
+    .record;
+    let attempt = ExecutionRepo::claim_provider_start(
+        &*state.db,
+        &execution.id,
+        provider_start_attempt_event(&execution),
+    )
+    .await
+    .expect("provider Start attempt receipt creates");
+    assert_eq!(attempt, db::ProviderStartClaim::Claimed);
+    execution
 }
 
 pub struct StartableExecutionFixture {
@@ -667,94 +829,119 @@ pub async fn seed_startable_execution_for_daemon(
     )
     .await
     .expect("agent creates");
-    WorkspaceRepo::create(
+    let work_unit = create_implementation_work_unit(state, &task, &agent_id, true).await;
+    let workspace = WorkUnitWorkspaceRepo::create_for_work_unit(
         &*state.db,
-        CreateWorkspace {
-            id: workspace_id.clone(),
-            task_id: task_id.clone(),
-            repo_id: repo_id.clone(),
-            worktree_path: workspace_path.to_string_lossy().into_owned(),
-            branch: "forge/task/start".to_owned(),
-            status: WorkspaceStatus::Ready,
-            before_sha: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
+        CreateWorkUnitWorkspace {
+            workspace: CreateWorkspace {
+                id: workspace_id.clone(),
+                task_id: task_id.clone(),
+                repo_id: repo_id.clone(),
+                worktree_path: workspace_path.to_string_lossy().into_owned(),
+                branch: "forge/work-unit/start".to_owned(),
+                status: WorkspaceStatus::Ready,
+                before_sha: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            work_unit_id: work_unit.id.clone(),
         },
     )
     .await
-    .expect("workspace creates");
-    let execution = ExecutionRepo::create(
-        &*state.db,
-        CreateExecution {
-            id: uuid::Uuid::new_v4().to_string(),
-            task_id: task_id.clone(),
-            agent_id: Some(agent_id.clone()),
-            actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(db::ExecutionPurpose::Implement),
-            harness_session_id: None,
-            role: "coder".to_owned(),
-            status: ExecutionStatus::Running,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: Some(now.clone()),
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                serde_json::json!({ "executor_type": "shell", "config": {} }).to_string(),
-            ),
-            workspace_id: Some(workspace_id),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("execution creates");
+    .expect("WorkUnit workspace creates");
+    let execution_input = CreateExecution {
+        id: uuid::Uuid::new_v4().to_string(),
+        task_id: task_id.clone(),
+        agent_id: Some(agent_id.clone()),
+        actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
+        purpose: Some(db::ExecutionPurpose::Implement),
+        harness_session_id: None,
+        role: "implementer".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_message_id: None,
+        last_activity_at: Some(now.clone()),
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: Some(
+            serde_json::json!({
+                "executor_type": "shell",
+                "config": {},
+                "resolved_daemon_id": daemon_id
+            })
+            .to_string(),
+        ),
+        workspace_id: Some(workspace.id.clone()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let execution_id = execution_input.id.clone();
     let capability_profile_revision = "forge.capability-profile/v1";
     let capability_class = "repository_write";
     let mut capability_digest = Sha256::new();
     capability_digest.update(capability_profile_revision.as_bytes());
     capability_digest.update([0]);
     capability_digest.update(capability_class.as_bytes());
-    WorkspaceLeaseRepo::issue(
+    let execution = WorkUnitExecutionRepo::create_for_work_unit(
         &*state.db,
-        CreateWorkspaceLease {
-            id: uuid::Uuid::new_v4().to_string(),
-            project_id,
-            task_id: task_id.clone(),
-            work_unit_id: None,
-            workspace_id: None,
-            task_version: task.version,
-            execution_id: execution.id.clone(),
-            operation_idempotency_key: execution.id.clone(),
-            repository_binding_id: repo_id,
-            base_ref: "main".to_owned(),
-            role: "worker".to_owned(),
-            capabilities_json: serde_json::to_string(&[capability_class])
-                .expect("lease capabilities serialize"),
-            assigned_principal_type: "agent".to_owned(),
-            assigned_principal_id: agent_id,
-            capability_profile_revision: capability_profile_revision.to_owned(),
-            capability_profile_digest: format!(
-                "sha256:{}",
-                hex::encode(capability_digest.finalize())
-            ),
-            issuing_principal_type: "system".to_owned(),
-            issuing_principal_id: "task-service-scheduler".to_owned(),
-            issued_at: now.clone(),
-            expires_at: "2099-01-01T00:00:00+00:00".to_owned(),
-            created_at: now.clone(),
-            updated_at: now,
+        CreateWorkUnitExecution {
+            execution: execution_input,
+            work_unit_id: work_unit.id.clone(),
+            work_unit_version: work_unit.version,
+            workspace_lease: Some(CreateWorkspaceLease {
+                id: uuid::Uuid::new_v4().to_string(),
+                project_id,
+                task_id: task_id.clone(),
+                work_unit_id: Some(work_unit.id.clone()),
+                workspace_id: Some(workspace.id.clone()),
+                task_version: task.version,
+                execution_id: execution_id.clone(),
+                operation_idempotency_key: execution_id.clone(),
+                repository_binding_id: repo_id,
+                base_ref: "main".to_owned(),
+                role: "worker".to_owned(),
+                capabilities_json: serde_json::to_string(&[capability_class])
+                    .expect("lease capabilities serialize"),
+                assigned_principal_type: "agent".to_owned(),
+                assigned_principal_id: agent_id.clone(),
+                capability_profile_revision: capability_profile_revision.to_owned(),
+                capability_profile_digest: format!(
+                    "sha256:{}",
+                    hex::encode(capability_digest.finalize())
+                ),
+                issuing_principal_type: "system".to_owned(),
+                issuing_principal_id: "task-service-scheduler".to_owned(),
+                issued_at: now.clone(),
+                expires_at: "2099-01-01T00:00:00+00:00".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            }),
         },
+        test_domain_event(
+            "execution.started",
+            "execution",
+            &execution_id,
+            &task_id,
+            "agent",
+            &agent_id,
+            json!({
+                "task_id": task_id,
+                "work_unit_id": work_unit.id,
+                "execution_id": execution_id,
+                "work_unit_version": work_unit.version
+            }),
+        ),
     )
     .await
-    .expect("workspace lease creates");
+    .expect("WorkUnit Execution and WorkspaceLease create")
+    .record;
 
     StartableExecutionFixture {
         task_id,
@@ -765,28 +952,24 @@ pub async fn seed_startable_execution_for_daemon(
 
 pub struct TerminalTaskFixture {
     pub task_id: String,
-    pub workspace_path: String,
+    pub workspace_id: String,
 }
 
-pub async fn seed_terminal_task_for_daemon(
-    state: &AppState,
-    daemon_id: &str,
-) -> TerminalTaskFixture {
+pub async fn seed_local_terminal_task(state: &AppState) -> TerminalTaskFixture {
     let now = db::now_rfc3339();
     let project_id = uuid::Uuid::new_v4().to_string();
     let repo_id = uuid::Uuid::new_v4().to_string();
     let task_id = uuid::Uuid::new_v4().to_string();
-    let agent_id = uuid::Uuid::new_v4().to_string();
     let workspace_id = uuid::Uuid::new_v4().to_string();
 
     ProjectRepo::create(
         &*state.db,
         CreateProject {
             id: project_id.clone(),
-            name: "Terminal Ownership".to_owned(),
+            name: "Local Terminal".to_owned(),
             settings: "{}".to_owned(),
             primary_repo_id: None,
-            owner_id: None,
+            owner_id: Some(FAKE_DAEMON_USER_ID.to_owned()),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -816,7 +999,7 @@ pub async fn seed_terminal_task_for_daemon(
             project_id,
             repo_id: Some(repo_id.clone()),
             parent_task_id: None,
-            title: "Daemon terminal".to_owned(),
+            title: "Local terminal".to_owned(),
             description: None,
             task_type: "implementation".to_owned(),
             lifecycle_state: db::TaskLifecycleState::Active,
@@ -830,76 +1013,17 @@ pub async fn seed_terminal_task_for_daemon(
     )
     .await
     .expect("task creates");
-    AgentRepo::create(
-        &*state.db,
-        CreateAgent {
-            id: agent_id.clone(),
-            name: "Terminal Owner Agent".to_owned(),
-            description: None,
-            executor_type: "codex".to_owned(),
-            model: None,
-            reasoning_effort: None,
-            permission_policy: None,
-            prompt_template: None,
-            capabilities_json: "[]".to_owned(),
-            config_json: "{}".to_owned(),
-            credential_ref: None,
-            daemon_id: Some(daemon_id.to_owned()),
-            max_concurrent_tasks: 1,
-            heartbeat_interval_seconds: 30,
-            max_missed_heartbeats: 3,
-            status: AgentStatus::Idle,
-            last_heartbeat_at: Some(now.clone()),
-            is_default: false,
-            paused: false,
-            owner_id: None,
-            visibility: "account".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("agent creates");
-    let role = TaskRoleRepo::create(
-        &*state.db,
-        CreateTaskRole {
-            id: uuid::Uuid::new_v4().to_string(),
-            task_id: task_id.to_owned(),
-            role: "implementer".to_owned(),
-            coordination_mode: None,
-            policy_json: "{}".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("implementer TaskRole creates");
-    RoleMembershipRepo::add(
-        &*state.db,
-        CreateRoleMembership {
-            id: uuid::Uuid::new_v4().to_string(),
-            task_role_id: role.id,
-            actor_kind: db::ActorKind::Agent,
-            actor_id: agent_id,
-            status: RoleMembershipStatus::Active,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("Agent joins implementer TaskRole");
-
     let workspace_root = state.cleanup_scheduler.workspace_root().to_path_buf();
     std::fs::create_dir_all(&workspace_root).expect("workspace root exists");
     let worktree_path = workspace_root
-        .join("terminal-daemon-routing")
+        .join("local-terminal-routing")
         .join(&task_id)
         .join("repo");
     std::fs::create_dir_all(&worktree_path).expect("worktree path exists");
     WorkspaceRepo::create(
         &*state.db,
         CreateWorkspace {
-            id: workspace_id,
+            id: workspace_id.clone(),
             task_id: task_id.clone(),
             repo_id,
             worktree_path: worktree_path.to_string_lossy().into_owned(),
@@ -915,7 +1039,7 @@ pub async fn seed_terminal_task_for_daemon(
 
     TerminalTaskFixture {
         task_id,
-        workspace_path: worktree_path.to_string_lossy().into_owned(),
+        workspace_id,
     }
 }
 

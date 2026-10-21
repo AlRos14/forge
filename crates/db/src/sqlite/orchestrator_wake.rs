@@ -121,7 +121,6 @@ impl OrchestratorWakeRepo for SqliteDb {
             Ok::<_, DbError>((wake, execution))
         })
         .transpose()
-        .map_err(Into::into)
     }
 
     async fn reserve_orchestrator_wake_execution(

@@ -69,6 +69,10 @@ Execution resume uses the explicit `Execution.harness_session_id` reference,
 then the session's `external_session_id`. A session is not inferred from a
 Role, Task, model, or latest Execution, and a session scoped to one workspace
 is not silently reused in another. Human Executions have no HarnessSession.
+An unresolved ordered fallback does not create a speculative session. When
+the exact winner snapshot and its external session identity arrive together,
+the result may attach one new HarnessSession atomically; a legacy external ID
+never selects an existing session.
 
 The native-runtime `AgentSession` remains distinct from generic `HarnessSession`.
 V126 renames its store to `agent_session_history`; credential-usage accounting

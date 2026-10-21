@@ -9,7 +9,7 @@ use api::{build_router, AppState};
 use api_types::{
     AgentAvailabilityResponse, AgentResponse, ErrorResponse, ExecutionResponse, PaginatedResponse,
     ProjectResponse, RepoResponse, TaskDependency, TaskLifecycleState,
-    TaskLifecycleTransitionResponse, TaskResponse, TasksResponse,
+    TaskLifecycleTransitionResponse, TaskResponse, TasksResponse, WorkUnitResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -326,7 +326,7 @@ async fn list_dependencies_returns_task_dependencies() {
 }
 
 #[tokio::test]
-async fn execution_start_blocked_by_dependency_gate_returns_conflict() {
+async fn execution_start_blocked_by_work_unit_dependency_returns_conflict() {
     let app = test_app().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let daemon_id = existing_daemon_id(&app).await;
@@ -338,31 +338,19 @@ async fn execution_start_blocked_by_dependency_gate_returns_conflict() {
         StatusCode::OK,
     )
     .await;
-    let (task_id, depends_on_id) = create_task_pair(&app, &project_id).await;
-
-    let dependency = raw_json_request(
+    let task: TaskResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/dependencies"),
-        json!({ "depends_on_id": depends_on_id }),
-    )
-    .await;
-    assert_eq!(dependency.status(), StatusCode::CREATED);
-    let dependencies: Vec<TaskDependency> = empty_request(
-        &app,
-        Method::GET,
-        &format!("/api/v1/tasks/{task_id}/dependencies"),
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Blocked WorkUnit execution" }),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(dependencies.len(), 1);
-    assert_eq!(dependencies[0].task_id, task_id);
-    assert_eq!(dependencies[0].depends_on_id, depends_on_id);
 
     let _: Value = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/task-roles"),
+        &format!("/api/v1/tasks/{}/task-roles", task.id),
         json!({ "role": "implementer", "coordination_mode": "independent", "policy": {} }),
         StatusCode::OK,
     )
@@ -370,8 +358,71 @@ async fn execution_start_blocked_by_dependency_gate_returns_conflict() {
     let _: Value = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/task-roles/implementer/members"),
+        &format!("/api/v1/tasks/{}/task-roles/implementer/members", task.id),
         json!({ "actor_ref": { "kind": "agent", "id": agent.id } }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let prerequisite: WorkUnitResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/work-units", task.id),
+        json!({
+            "title": "Prerequisite WorkUnit",
+            "scope": "Remain open so the target dependency is unsatisfied",
+            "role": "implementer",
+            "parent_work_unit_id": null,
+            "assigned_actor": null,
+            "requires_integration": false,
+            "provenance": null
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let work_unit: WorkUnitResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/work-units", task.id),
+        json!({
+            "title": "Dependent WorkUnit",
+            "scope": "Cannot launch until its prerequisite completes",
+            "role": "implementer",
+            "parent_work_unit_id": null,
+            "assigned_actor": null,
+            "requires_integration": false,
+            "provenance": null
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let _: Value = json_request(
+        &app,
+        Method::POST,
+        &format!(
+            "/api/v1/work-units/{}/dependencies/{}",
+            work_unit.id, prerequisite.id
+        ),
+        json!({ "expected_version": work_unit.version }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let work_unit: WorkUnitResponse = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/work-units/{}", work_unit.id),
+        StatusCode::OK,
+    )
+    .await;
+    let work_unit: WorkUnitResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/allocation", work_unit.id),
+        json!({
+            "expected_version": work_unit.version,
+            "role": "implementer",
+            "assigned_actor": { "kind": "agent", "id": agent.id }
+        }),
         StatusCode::OK,
     )
     .await;
@@ -379,10 +430,10 @@ async fn execution_start_blocked_by_dependency_gate_returns_conflict() {
     let response: ErrorResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/executions"),
+        &format!("/api/v1/tasks/{}/executions", task.id),
         json!({
-            "agent_id": agent.id,
-            "role": "implementer",
+            "work_unit_id": work_unit.id,
+            "expected_work_unit_version": work_unit.version,
             "purpose": "implement",
             "prompt": "echo blocked by dependency",
             "input_artifact_ids": []
@@ -432,13 +483,15 @@ async fn agent_execution_records_exact_actor_role_and_purpose() {
     )
     .await;
 
+    let work_unit = create_and_allocate_work_unit(&app, &task.id, &agent.id).await;
+
     let execution: ExecutionResponse = json_request(
         &app,
         Method::POST,
         &format!("/api/v1/tasks/{}/executions", task.id),
         json!({
-            "agent_id": agent.id,
-            "role": "implementer",
+            "work_unit_id": work_unit.id,
+            "expected_work_unit_version": work_unit.version,
             "purpose": "implement",
             "prompt": "echo agent execution",
             "input_artifact_ids": []
@@ -678,6 +731,42 @@ async fn create_task_pair(app: &Router, project_id: &str) -> (String, String) {
     )
     .await;
     (first.id, second.id)
+}
+
+async fn create_and_allocate_work_unit(
+    app: &Router,
+    task_id: &str,
+    agent_id: &str,
+) -> WorkUnitResponse {
+    let work_unit: WorkUnitResponse = json_request(
+        app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/work-units"),
+        json!({
+            "title": "E2E implementation WorkUnit",
+            "scope": "Run the assigned Agent within an explicit repository scope",
+            "role": "implementer",
+            "parent_work_unit_id": null,
+            "assigned_actor": null,
+            "requires_integration": true,
+            "provenance": null
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    json_request(
+        app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/allocation", work_unit.id),
+        json!({
+            "expected_version": work_unit.version,
+            "role": "implementer",
+            "assigned_actor": { "kind": "agent", "id": agent_id }
+        }),
+        StatusCode::OK,
+    )
+    .await
 }
 
 fn setup_git_repo(path: &Path) -> PathBuf {

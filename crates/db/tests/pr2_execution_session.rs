@@ -1,10 +1,10 @@
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, run_migrations_from, ActorRef,
     AgentProfileRepo, AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile,
-    CreateExecution, CreateHarnessSession, CreateRepo, CreateWorkspace, DbError, ExecutionPurpose,
-    ExecutionRepo, ExecutionStatus, HarnessSessionRepo, HarnessSessionStatus, RepoRepo,
-    SelectAgentProfile, SqliteDb, UpdateExecution, UpdateHarnessSession, WorkMode, WorkspaceRepo,
-    WorkspaceStatus,
+    CreateExecution, CreateHarnessSession, CreateProject, CreateRepo, CreateTask, CreateWorkspace,
+    DbError, ExecutionPurpose, ExecutionRepo, ExecutionStatus, HarnessSessionRepo,
+    HarnessSessionStatus, ProjectRepo, RepoRepo, SelectAgentProfile, SqliteDb, TaskLifecycleState,
+    TaskRepo, UpdateExecution, UpdateHarnessSession, WorkMode, WorkspaceRepo, WorkspaceStatus,
 };
 use std::{
     fs,
@@ -77,6 +77,48 @@ async fn seed_task(db: &SqliteDb, suffix: &str) -> String {
     let now = now_rfc3339();
     let project_id = format!("pr2-project-{suffix}");
     let task_id = format!("pr2-task-{suffix}");
+    ProjectRepo::create(
+        db,
+        CreateProject {
+            id: project_id.clone(),
+            name: format!("PR2 {suffix}"),
+            settings: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("project creates");
+    TaskRepo::create(
+        db,
+        CreateTask {
+            id: task_id.clone(),
+            project_id,
+            repo_id: None,
+            parent_task_id: None,
+            title: "PR2 task".to_owned(),
+            description: None,
+            task_type: "implementation".to_owned(),
+            lifecycle_state: TaskLifecycleState::Active,
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("task creates");
+    task_id
+}
+
+async fn seed_legacy_task(db: &SqliteDb, suffix: &str) -> String {
+    let now = now_rfc3339();
+    let project_id = format!("pr2-project-{suffix}");
+    let task_id = format!("pr2-task-{suffix}");
     sqlx::query(
         "INSERT INTO project (id, name, settings, workflow_definition, created_at, updated_at)
          VALUES (?, ?, '{}', '{}', ?, ?)",
@@ -87,7 +129,7 @@ async fn seed_task(db: &SqliteDb, suffix: &str) -> String {
     .bind(&now)
     .execute(db.pool())
     .await
-    .expect("project creates");
+    .expect("historical project creates");
     sqlx::query(
         "INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at)
          VALUES (?, ?, 'PR2 task', 'implementation', 'in_progress', ?, ?)",
@@ -98,8 +140,59 @@ async fn seed_task(db: &SqliteDb, suffix: &str) -> String {
     .bind(&now)
     .execute(db.pool())
     .await
-    .expect("task creates");
+    .expect("historical task creates");
     task_id
+}
+
+async fn seed_legacy_session_references(
+    db: &SqliteDb,
+    task_id: &str,
+    identity_id: &str,
+    profile_id: &str,
+    session_ids: &[&str],
+    now: &str,
+) {
+    let project_id: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id = ?")
+        .bind(task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("legacy Task project loads");
+    let scope_id = format!("pr2-scope-{identity_id}");
+    sqlx::query(
+        "INSERT INTO agent_context_scope (
+            id, identity_id, scope_type, scope_id, project_id, task_id,
+            task_role, workspace_access, authority_json, created_at, updated_at
+         ) VALUES (?, ?, 'task', ?, ?, ?, 'executor', 'task_write', '{}', ?, ?)",
+    )
+    .bind(&scope_id)
+    .bind(identity_id)
+    .bind(task_id)
+    .bind(project_id)
+    .bind(task_id)
+    .bind(now)
+    .bind(now)
+    .execute(db.pool())
+    .await
+    .expect("legacy Agent task scope creates");
+
+    for session_id in session_ids {
+        sqlx::query(
+            "INSERT INTO agent_session (
+                id, identity_id, profile_id, context_scope_id, backend_kind,
+                runtime_session_id, status, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'cli', ?, 'replaced', ?, ?)",
+        )
+        .bind(session_id)
+        .bind(identity_id)
+        .bind(profile_id)
+        .bind(&scope_id)
+        .bind(session_id)
+        .bind(now)
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .expect("legacy Agent session reference creates");
+    }
 }
 
 fn harness_capabilities_for(executor_type: &str) -> serde_json::Value {
@@ -208,6 +301,7 @@ async fn seed_workspaces(db: &SqliteDb, task_id: &str) -> (String, String, Strin
     (first, second_task_id, second)
 }
 
+#[allow(clippy::too_many_arguments)] // The ignored legacy hint is explicit fixture evidence.
 fn execution_input(
     id: &str,
     task_id: &str,
@@ -1045,7 +1139,7 @@ async fn purpose_is_independent_of_role_and_actor_change_cannot_reuse_session() 
         Some(first_session.as_str())
     );
 
-    let inferred = ExecutionRepo::create(
+    let fresh_execution = ExecutionRepo::create(
         &db,
         execution_input(
             "pr2-execution-inferred-session",
@@ -1060,8 +1154,22 @@ async fn purpose_is_independent_of_role_and_actor_change_cannot_reuse_session() 
         ),
     )
     .await
-    .expect_err("legacy external identity cannot select a new session");
-    assert!(matches!(inferred, DbError::Check(_)));
+    .expect("a legacy external identity hint does not prevent a fresh Execution");
+    let fresh_session_id = fresh_execution
+        .harness_session_id
+        .as_deref()
+        .expect("fresh Execution gets its own pending session");
+    assert_ne!(Some(fresh_session_id), Some(first_session.as_str()));
+    assert_ne!(
+        fresh_execution.harness_session_id,
+        second.harness_session_id
+    );
+    let fresh_session = HarnessSessionRepo::get_by_id(&db, fresh_session_id)
+        .await
+        .expect("fresh HarnessSession loads")
+        .expect("fresh HarnessSession exists");
+    assert_eq!(fresh_session.status, HarnessSessionStatus::Pending);
+    assert_eq!(fresh_session.external_session_id, None);
 
     let other_actor = ExecutionRepo::create(
         &db,
@@ -1459,6 +1567,7 @@ fn copy_migrations_up_to(max_version: i64, destination: &Path) {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors the historical execution row written by this fixture.
 async fn seed_legacy_execution(
     db: &SqliteDb,
     id: &str,
@@ -1499,7 +1608,36 @@ async fn historical_session_migration_groups_only_coherent_identity() {
     let db = SqliteDb::new(pool.clone());
     let profile_a = seed_agent(&db, "pr2-history-a", "codex").await;
     let profile_b = seed_agent(&db, "pr2-history-b", "codex").await;
-    let task_id = seed_task(&db, "history").await;
+    let task_id = seed_legacy_task(&db, "history").await;
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO agent_identity (
+            id, name, max_concurrent_tasks, heartbeat_interval_seconds,
+            max_missed_heartbeats, status, version, created_at, updated_at
+         ) VALUES ('human', 'Legacy human sentinel', 1, 30, 3, 'idle', 1, ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("legacy human sentinel identity creates");
+    seed_legacy_session_references(
+        &db,
+        &task_id,
+        "pr2-history-a",
+        &profile_a,
+        &[
+            "same-thread",
+            "planner-thread",
+            "auditor-thread",
+            "unknown-role-thread",
+            "ambiguous-thread",
+            "unknown-thread",
+            "human-thread",
+        ],
+        &now,
+    )
+    .await;
     let snapshot_a = serde_json::json!({
         "executor_type": "codex",
         "profile_id": profile_a,

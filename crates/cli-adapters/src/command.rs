@@ -163,11 +163,11 @@ pub(crate) fn clear_session_arguments(
     let mut index = 0;
     while index < arguments.len() {
         let argument = &arguments[index];
-        if boolean_flags.iter().any(|flag| argument.as_str() == *flag) {
+        if boolean_flags.contains(&argument.as_str()) {
             index += 1;
             continue;
         }
-        let exact_value_flag = value_flags.iter().any(|flag| argument.as_str() == *flag);
+        let exact_value_flag = value_flags.contains(&argument.as_str());
         let inline_value_flag = value_flags.iter().any(|flag| {
             argument
                 .strip_prefix(*flag)
@@ -288,10 +288,10 @@ mod tests {
 
         let descendant_pid = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Ok(value) = tokio::fs::read_to_string(&pid_file).await {
-                    if let Ok(pid) = value.trim().parse::<u32>() {
-                        break pid;
-                    }
+                if let Ok(value) = tokio::fs::read_to_string(&pid_file).await
+                    && let Ok(pid) = value.trim().parse::<u32>()
+                {
+                    break pid;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

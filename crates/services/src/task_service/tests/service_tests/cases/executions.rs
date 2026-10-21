@@ -80,9 +80,7 @@ async fn execution_external_session_id(
     db: &db::SqliteDb,
     execution: &db::Execution,
 ) -> Option<String> {
-    let Some(session_id) = execution.harness_session_id.as_deref() else {
-        return None;
-    };
+    let session_id = execution.harness_session_id.as_deref()?;
     sqlx::query_scalar("SELECT external_session_id FROM harness_session WHERE id = ?")
         .bind(session_id)
         .fetch_optional(db.pool())
@@ -729,6 +727,7 @@ async fn create_claimed_review_execution(
     (service, task, execution, workspace)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_running_repository_execution(
     db: &db::SqliteDb,
     service: &TaskService,
@@ -3104,7 +3103,7 @@ async fn remote_plan_completion_requires_full_output_and_non_plan_completion_is_
 }
 
 #[tokio::test]
-async fn role_dispatch_ignores_legacy_state_hook_settings() {
+async fn work_unit_execution_ignores_legacy_state_hook_settings() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
@@ -3114,7 +3113,7 @@ async fn role_dispatch_ignores_legacy_state_hook_settings() {
         .await
         .expect("Agent loads")
         .expect("Agent exists");
-    let daemon_id = agent.daemon_id.expect("Agent daemon binding");
+    let daemon_id = agent.daemon_id.clone().expect("Agent daemon binding");
     let registry = routing_test_registry();
     let outbound = register_routing_test_daemon(&registry, &daemon_id);
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
@@ -3139,7 +3138,7 @@ async fn role_dispatch_ignores_legacy_state_hook_settings() {
         .execute(db.pool())
         .await
         .expect("historical Project settings update");
-    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     service
         .create_task_role(
             &task.id,
@@ -3153,23 +3152,35 @@ async fn role_dispatch_ignores_legacy_state_hook_settings() {
         .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_id.clone()))
         .await
         .expect("Agent Actor joins the exact TaskRole");
+    let executor_config_snapshot =
+        crate::task_service::config::build_executor_config_snapshot(&db, &task, &agent, None, None)
+            .await
+            .expect("exact Agent routing snapshot builds")
+            .expect("Agent routing snapshot exists");
 
+    let (execution, _workspace) = create_running_repository_execution(
+        &db,
+        &service,
+        &task,
+        &agent_id,
+        "implementer",
+        db::ExecutionPurpose::Implement,
+        workspace_root.path(),
+        Some("start scoped work".to_owned()),
+        Some(executor_config_snapshot),
+    )
+    .await;
     let responder = tokio::spawn(answer_routing_test_daemon(
         Arc::clone(&registry),
         daemon_id,
         outbound,
         std::time::Duration::from_secs(2),
     ));
-    let execution = service
-        .dispatch_initial_role_execution(
-            &task.id,
-            &agent_id,
-            "implementer",
-            db::ExecutionPurpose::Implement,
-            "start scoped work".to_owned(),
-        )
+    let started = service
+        .start_execution(execution.id.clone())
         .await
-        .expect("legacy state hook does not block Execution admission");
+        .expect("WorkUnit Execution starts without legacy state hooks");
+    assert!(started.accepted);
 
     assert_eq!(
         responder.await.expect("daemon responder joins"),
@@ -3870,85 +3881,78 @@ async fn re_execute_rejects_running_parent() {
 async fn re_execute_rejects_concurrent_running_execution() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let workspace_root = TempDir::new().expect("non-repository context root creates");
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
-    let now = now_rfc3339();
-    let parent_execution = ExecutionRepo::create(
+    let work_unit = create_simple_execution_work_unit(&db, &service, &task, &agent_id).await;
+    let parent_execution = service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "cancelled parent".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("parent Execution admits through its exact WorkUnit")
+        .execution;
+    ExecutionRepo::update(
         &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id.clone()),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: "coder".to_owned(),
-            status: ExecutionStatus::Cancelled,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
+        db::UpdateExecution {
+            id: parent_execution.id.clone(),
+            status: Some(ExecutionStatus::Cancelled),
+            stop_reason: Some(Some(db::StopReason::UserCancelled)),
+            stopped_by: Some(Some("test".to_owned())),
+            resume_policy: Some(Some(db::ResumePolicy::Manual)),
+            stopped_at: Some(Some(now_rfc3339())),
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
-            summary: Some("cancelled parent".to_owned()),
+            summary: None,
             logs_path: None,
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
+            executor_config_snapshot_json: None,
+            updated_at: now_rfc3339(),
         },
     )
     .await
-    .expect("parent execution creates");
-    ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: Some(agent_id),
-            actor_ref: None,
-            purpose: None,
-            harness_session_id: None,
-            role: "coder".to_owned(),
-            status: ExecutionStatus::Running,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("running sibling".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("running execution creates");
+    .expect("parent Execution becomes terminal");
+    service
+        .launch_work_unit_execution(
+            &work_unit.id,
+            work_unit.version,
+            db::ExecutionPurpose::Implement,
+            "running sibling".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("running sibling admits through the same exact WorkUnit");
 
     let result = service.re_execute_execution(parent_execution.id).await;
 
-    assert!(matches!(
-        result,
-        Err(ServiceError::InvalidOperation { message })
-            if message.contains("already running")
-    ));
+    assert!(
+        result.is_err(),
+        "concurrent WorkUnit re-execution is rejected"
+    );
+    let running_executions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE work_unit_id = ? AND status = 'running'",
+    )
+    .bind(&work_unit.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("running WorkUnit Execution count loads");
+    assert_eq!(
+        running_executions, 1,
+        "no second running Execution is admitted"
+    );
 }
 
 #[tokio::test]
@@ -5336,6 +5340,23 @@ async fn launch_work_unit_for_override_snapshot(
     agent_id: &str,
     overrides: Option<ExecutionOverrides>,
 ) -> db::Execution {
+    service
+        .create_task_role(
+            &task.id,
+            "implementer",
+            CoordinationMode::Independent,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("implementer TaskRole creates");
+    service
+        .add_task_role_member(
+            &task.id,
+            "implementer",
+            ActorRef::Agent(agent_id.to_owned()),
+        )
+        .await
+        .expect("Agent joins exact implementer TaskRole");
     let now = now_rfc3339();
     let work_unit_id = db::new_uuid_v4();
     let work_unit = db::WorkUnitRepo::create(
@@ -8609,10 +8630,13 @@ async fn ordinary_reexecute_work_unit_version_race_rolls_back_activation() {
 #[tokio::test]
 async fn work_unit_launch_records_execution_permission_policy_override_in_snapshot() {
     let db = Arc::new(sqlite_db().await);
-    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let workspace_root = TempDir::new().expect("non-repository context root creates");
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
+        .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id =
         seed_shell_agent_with_config(&db, r#"{"command":"echo","args":["profile-default"]}"#).await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
     let task = service
         .create_task(
             project_id,
@@ -8658,7 +8682,9 @@ async fn work_unit_launch_records_execution_permission_policy_override_in_snapsh
 #[tokio::test]
 async fn work_unit_launch_records_codex_overrides_in_normalized_snapshot() {
     let db = Arc::new(sqlite_db().await);
-    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let workspace_root = TempDir::new().expect("non-repository context root creates");
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
+        .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(
         &db,
@@ -8666,6 +8692,7 @@ async fn work_unit_launch_records_codex_overrides_in_normalized_snapshot() {
         r#"{"model":"agent-model","model_reasoning_effort":"medium","sandbox":"danger-full-access","permission_policy":"supervised"}"#,
     )
     .await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
     let task = service
         .create_task(
             project_id,

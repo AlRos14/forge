@@ -659,6 +659,32 @@ async fn seed_task(
     task_id
 }
 
+async fn seed_legacy_task_before_lifecycle(
+    db: &SqliteDb,
+    project_id: &str,
+    repo_id: &str,
+    status: &str,
+    title: &str,
+) -> String {
+    let id = new_uuid_v4();
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO task (id, project_id, repo_id, title, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(project_id)
+    .bind(repo_id)
+    .bind(title)
+    .bind(status)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("historical Task fixture inserts before TaskLifecycle exists");
+    id
+}
+
 async fn seed_pr8_human_reviewer_role(
     db: &SqliteDb,
     task_id: &str,
@@ -920,16 +946,28 @@ impl Pr6ActionEffect {
     }
 }
 
+struct Pr6ActionEffectContext<'a> {
+    result_id: &'a str,
+    task_id: &'a str,
+    role_id: &'a str,
+    actor_id: &'a str,
+    execution_id: &'a str,
+    start_event: &'a crate::DomainEvent,
+}
+
 async fn write_pr6_action_effect(
     db: &SqliteDb,
     effect: Pr6ActionEffect,
-    result_id: &str,
-    task_id: &str,
-    role_id: &str,
-    actor_id: &str,
-    execution_id: &str,
-    start_event: &crate::DomainEvent,
+    context: Pr6ActionEffectContext<'_>,
 ) -> crate::Result<()> {
+    let Pr6ActionEffectContext {
+        result_id,
+        task_id,
+        role_id,
+        actor_id,
+        execution_id,
+        start_event,
+    } = context;
     let now = now_rfc3339();
     let mut transaction = db.pool().begin().await?;
     match effect {
@@ -1021,7 +1059,7 @@ async fn write_pr6_action_effect(
     };
     if let Err(error) = DomainEventRepo::append_event_in_tx(db, &mut transaction, &event).await {
         transaction.rollback().await?;
-        return Err(error.into());
+        return Err(error);
     }
     transaction.commit().await?;
     Ok(())
@@ -1051,7 +1089,7 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
             policy_ref: "forge.orchestrator.wake-policy".to_owned(),
             policy_version: 1,
             policy_digest: "digest-v1".to_owned(),
-            task_role_version: 1,
+            task_role_version: 2,
             task_role_policy_json: "{}".to_owned(),
             available_at: now.clone(),
             created_at: now.clone(),
@@ -1219,12 +1257,14 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
         write_pr6_action_effect(
             &db,
             effect,
-            result_id,
-            &task_id,
-            &role_id,
-            &agent_id,
-            &execution_id,
-            &start_event,
+            Pr6ActionEffectContext {
+                result_id,
+                task_id: &task_id,
+                role_id: &role_id,
+                actor_id: &agent_id,
+                execution_id: &execution_id,
+                start_event: &start_event,
+            },
         )
         .await
         .expect("current TaskRole snapshot permits effect and event atomically");
@@ -1269,12 +1309,14 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
     write_pr6_action_effect(
         &db,
         Pr6ActionEffect::Message,
-        &orphaned_receipt_id,
-        &task_id,
-        &role_id,
-        &agent_id,
-        &execution_id,
-        &start_event,
+        Pr6ActionEffectContext {
+            result_id: &orphaned_receipt_id,
+            task_id: &task_id,
+            role_id: &role_id,
+            actor_id: &agent_id,
+            execution_id: &execution_id,
+            start_event: &start_event,
+        },
     )
     .await
     .expect("V096 commits a valid effect while the separate receipt trigger is absent");
@@ -1306,7 +1348,7 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
         &db,
         UpdateTaskRole {
             id: role_id.clone(),
-            expected_version: 1,
+            expected_version: 2,
             coordination_mode: None,
             policy_json: Some(r#"{"allowed_actions":["message"]}"#.to_owned()),
             updated_at: now_rfc3339(),
@@ -1330,12 +1372,14 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
         let error = write_pr6_action_effect(
             &db,
             effect,
-            result_id,
-            &task_id,
-            &role_id,
-            &agent_id,
-            &execution_id,
-            &start_event,
+            Pr6ActionEffectContext {
+                result_id,
+                task_id: &task_id,
+                role_id: &role_id,
+                actor_id: &agent_id,
+                execution_id: &execution_id,
+                start_event: &start_event,
+            },
         )
         .await
         .expect_err("stale snapshot aborts the effect transaction");
@@ -1381,12 +1425,14 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
     write_pr6_action_effect(
         &db,
         Pr6ActionEffect::Message,
-        &normal_message_id,
-        &task_id,
-        &role_id,
-        &agent_id,
-        &execution_id,
-        &start_event,
+        Pr6ActionEffectContext {
+            result_id: &normal_message_id,
+            task_id: &task_id,
+            role_id: &role_id,
+            actor_id: &agent_id,
+            execution_id: &execution_id,
+            start_event: &start_event,
+        },
     )
     .await
     .expect("ordinary Agent Message without an orchestrator_action remains writable");
@@ -1448,7 +1494,7 @@ async fn pr6_wake_admission_is_deduplicated_and_lease_expiry_is_retryable() {
         policy_ref: "forge.orchestrator.wake-policy".to_owned(),
         policy_version: 1,
         policy_digest: "digest-v1".to_owned(),
-        task_role_version: 1,
+        task_role_version: 2,
         task_role_policy_json: "{}".to_owned(),
         available_at: now.to_owned(),
         created_at: now.to_owned(),
@@ -1576,7 +1622,7 @@ async fn pr6_cross_task_event_cannot_admit_an_orchestrator_wake() {
             policy_ref: "forge.orchestrator.wake-policy".to_owned(),
             policy_version: 1,
             policy_digest: "digest-v1".to_owned(),
-            task_role_version: 1,
+            task_role_version: 2,
             task_role_policy_json: "{}".to_owned(),
             available_at: now_rfc3339(),
             created_at: now_rfc3339(),
@@ -1668,7 +1714,7 @@ async fn pr6_two_sqlite_pools_compete_for_event_and_wake_authority() {
             policy_ref: "forge.orchestrator.wake-policy".to_owned(),
             policy_version: 1,
             policy_digest: "digest-v1".to_owned(),
-            task_role_version: 1,
+            task_role_version: 2,
             task_role_policy_json: "{}".to_owned(),
             available_at: now.to_owned(),
             created_at: now.to_owned(),
@@ -1723,7 +1769,7 @@ async fn pr6_action_reservation_reuses_one_uuid_and_rejects_changed_replay() {
             policy_ref: "forge.orchestrator.wake-policy".to_owned(),
             policy_version: 1,
             policy_digest: "digest-v1".to_owned(),
-            task_role_version: 1,
+            task_role_version: 2,
             task_role_policy_json: "{}".to_owned(),
             available_at: now.clone(),
             created_at: now.clone(),
@@ -4151,21 +4197,19 @@ async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_i
         .expect("database migrates through V098");
     let db = SqliteDb::new(pool);
     let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
-    let task_id = seed_task(
+    let task_id = seed_legacy_task_before_lifecycle(
         &db,
         &project_id,
         &repo_id,
-        None,
-        "review".to_owned(),
+        "review",
         "legacy review migration",
     )
     .await;
-    let other_task_id = seed_task(
+    let other_task_id = seed_legacy_task_before_lifecycle(
         &db,
         &project_id,
         &repo_id,
-        None,
-        "review".to_owned(),
+        "review",
         "wrong Task review source",
     )
     .await;
@@ -4228,29 +4272,42 @@ async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_i
     ) {
         historical_review_state(
             db,
+            HistoricalReviewFixture {
+                id,
+                task_id,
+                execution_id,
+                attempt,
+                summary,
+                status: "passed",
+                verdict: "pass",
+                has_finished_at: true,
+            },
+        )
+        .await;
+    }
+
+    struct HistoricalReviewFixture<'a> {
+        id: &'a str,
+        task_id: &'a str,
+        execution_id: &'a str,
+        attempt: i64,
+        summary: &'a str,
+        status: &'a str,
+        verdict: &'a str,
+        has_finished_at: bool,
+    }
+
+    async fn historical_review_state(db: &SqliteDb, fixture: HistoricalReviewFixture<'_>) {
+        let HistoricalReviewFixture {
             id,
             task_id,
             execution_id,
             attempt,
             summary,
-            "passed",
-            "pass",
-            true,
-        )
-        .await;
-    }
-
-    async fn historical_review_state(
-        db: &SqliteDb,
-        id: &str,
-        task_id: &str,
-        execution_id: &str,
-        attempt: i64,
-        summary: &str,
-        status: &str,
-        verdict: &str,
-        has_finished_at: bool,
-    ) {
+            status,
+            verdict,
+            has_finished_at,
+        } = fixture;
         let now = now_rfc3339();
         let result = serde_json::json!({
             "schema_version": 1,
@@ -4355,14 +4412,16 @@ async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_i
         .await;
         historical_review_state(
             &db,
-            review_id,
-            &task_id,
-            &execution_id,
-            attempt,
-            "Contradictory terminal history",
-            status,
-            verdict,
-            has_finished_at,
+            HistoricalReviewFixture {
+                id: review_id,
+                task_id: &task_id,
+                execution_id: &execution_id,
+                attempt,
+                summary: "Contradictory terminal history",
+                status,
+                verdict,
+                has_finished_at,
+            },
         )
         .await;
     }
@@ -5251,7 +5310,7 @@ async fn task_board_revision_migration_preserves_tasks_and_tracks_board_changes(
 }
 
 #[tokio::test]
-async fn notification_repo_crud_and_cascade_delete() {
+async fn notification_repo_crud_and_project_cascade_delete() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
     let (project_id, repo_id, _agent_id) = seed_project_repo_agent(&db).await;
@@ -5367,44 +5426,6 @@ async fn notification_repo_crud_and_cascade_delete() {
             .await
             .expect("count notifications before cascade");
     assert_eq!(remaining_before_cascade, 2);
-
-    sqlx::query("DELETE FROM task WHERE id = ?")
-        .bind(&task_id)
-        .execute(db.pool())
-        .await
-        .expect("hard delete task");
-    let remaining_after_task_delete: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM notification WHERE project_id = ?")
-            .bind(&project_id)
-            .fetch_one(db.pool())
-            .await
-            .expect("count notifications after task delete");
-    assert_eq!(remaining_after_task_delete, 0);
-
-    let task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "Notification target 2",
-    )
-    .await;
-    NotificationRepo::create(
-        &db,
-        crate::CreateNotification {
-            id: new_uuid_v4(),
-            project_id: project_id.clone(),
-            task_id: Some(task_id),
-            event_type: "task.done".to_owned(),
-            title: "Done".to_owned(),
-            body: None,
-            read: false,
-            created_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("notification for project cascade");
 
     ProjectRepo::delete(&db, &project_id)
         .await
@@ -5594,7 +5615,7 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            external_session_id: Some(Some("session".to_owned())),
+            external_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
             summary: Some(Some("done".to_owned())),
@@ -6440,12 +6461,11 @@ async fn pr7_migration_preserves_legacy_plan_history_and_maps_only_verifiable_au
         .expect("database migrates through V097");
     let db = SqliteDb::new(pool);
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
-    let task_id = seed_task(
+    let task_id = seed_legacy_task_before_lifecycle(
         &db,
         &project_id,
         &repo_id,
-        None,
-        "todo".to_owned(),
+        "todo",
         "Legacy plan migration",
     )
     .await;

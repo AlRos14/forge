@@ -47,8 +47,8 @@ async fn fixture_rows(pool: SqlitePool) -> (SqliteDb, String, String) {
     .await
     .expect("repo");
     sqlx::query(
-        "INSERT INTO task (id, project_id, repo_id, title, task_type, status, created_at, updated_at)
-         VALUES (?, ?, 'repo-media', 'Media Task', 'implementation', 'todo', ?, ?)",
+        "INSERT INTO task (id, project_id, repo_id, title, task_type, created_at, updated_at)
+         VALUES (?, ?, 'repo-media', 'Media Task', 'implementation', ?, ?)",
     )
     .bind(&task_id)
     .bind(&project_id)

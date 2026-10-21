@@ -1,6 +1,7 @@
 use super::*;
 
 impl TaskService {
+    #[allow(clippy::too_many_arguments)]
     pub async fn dispatch_role_follow_up(
         &self,
         task_id: &str,
@@ -24,6 +25,7 @@ impl TaskService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn dispatch_role_follow_up_with_agent(
         &self,
         task_id: &str,
@@ -48,6 +50,7 @@ impl TaskService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_role_follow_up_exact(
         &self,
         task_id: &str,

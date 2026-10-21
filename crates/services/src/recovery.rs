@@ -1434,7 +1434,7 @@ pub(crate) async fn fail_execution_daemon_disconnected(
         )
         .await?
         {
-            db::RunningExecutionFailure::Failed(updated, event) => (updated, event),
+            db::RunningExecutionFailure::Failed(updated, event) => (*updated, event),
             db::RunningExecutionFailure::Pending(current)
             | db::RunningExecutionFailure::NotRunning(current) => return Ok(current),
         };

@@ -1774,6 +1774,7 @@ mod tests {
         assert!(human_repo_readiness.ready_for_allocation);
         let mut committed_notifications = event_bus.subscribe();
 
+        #[allow(clippy::too_many_arguments)]
         async fn add_result(
             db: &SqliteDb,
             manager: &WorkspaceManager,
@@ -1916,6 +1917,7 @@ mod tests {
             (unit, workspace, execution_id, source_sha)
         }
 
+        #[allow(clippy::too_many_arguments)]
         async fn begin_running_integration(
             db: &SqliteDb,
             task_id: &str,

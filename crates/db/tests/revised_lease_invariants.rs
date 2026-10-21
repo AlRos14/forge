@@ -2,7 +2,6 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
     CreateAgentIdentity, CreateAgentProfile, CreateProject, ProjectRepo, SqliteDb,
 };
-use sqlx::Row;
 
 async fn database() -> SqliteDb {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
@@ -11,7 +10,7 @@ async fn database() -> SqliteDb {
 }
 
 #[tokio::test]
-async fn retired_binding_writes_are_fenced_while_agent_identity_and_profile_remain() {
+async fn pr13_retired_binding_storage_is_absent_while_agent_identity_and_profile_remain() {
     let db = database().await;
     let now = now_rfc3339();
     let account_id = "retired-binding-account".to_owned();
@@ -86,41 +85,19 @@ async fn retired_binding_writes_are_fenced_while_agent_identity_and_profile_rema
     .await
     .expect("Agent identity/profile remain writable");
 
-    let main_write = sqlx::query(
-        "INSERT INTO account_main_agent_binding (
-            id, account_id, identity_id, profile_id, state, version, created_at, updated_at
-         ) VALUES ('new-main-binding', ?, ?, ?, 'active', 1, ?, ?)",
+    let retired_binding_tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table'
+           AND name IN ('account_main_agent_binding', 'project_agent_binding')
+         ORDER BY name",
     )
-    .bind(&account_id)
-    .bind(&identity_id)
-    .bind(&profile_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await;
-    assert!(main_write
-        .expect_err("Main Agent binding write is retired")
-        .to_string()
-        .contains("PR11_OPERATION_RETIRED"));
-
-    let project_write = sqlx::query(
-        "INSERT INTO project_agent_binding (
-            id, project_id, identity_id, profile_id, state, version,
-            autonomy_policy_json, permission_ceiling_json, subscriptions_json,
-            wake_budget, created_at, updated_at
-         ) VALUES ('new-project-binding', ?, ?, ?, 'active', 1, '{}', '{}', '[]', 1, ?, ?)",
-    )
-    .bind(&project_id)
-    .bind(&identity_id)
-    .bind(&profile_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await;
-    assert!(project_write
-        .expect_err("Project Agent binding write is retired")
-        .to_string()
-        .contains("PR11_OPERATION_RETIRED"));
+    .fetch_all(db.pool())
+    .await
+    .expect("PR13 retired binding table census");
+    assert!(
+        retired_binding_tables.is_empty(),
+        "PR13 removes legacy binding storage after archiving history"
+    );
 
     let identity = AgentRepo::get_by_id(&db, &identity_id)
         .await
@@ -135,24 +112,4 @@ async fn retired_binding_writes_are_fenced_while_agent_identity_and_profile_rema
             .await
             .expect("profile count");
     assert_eq!(profile_count, 1);
-
-    let binding_rows: i64 = sqlx::query_scalar(
-        "SELECT (SELECT COUNT(*) FROM account_main_agent_binding WHERE id = 'new-main-binding') +
-                (SELECT COUNT(*) FROM project_agent_binding WHERE id = 'new-project-binding')",
-    )
-    .fetch_one(db.pool())
-    .await
-    .expect("binding rows count");
-    assert_eq!(binding_rows, 0);
-
-    let columns = sqlx::query("PRAGMA table_info(project_agent_binding)")
-        .fetch_all(db.pool())
-        .await
-        .expect("binding schema");
-    let names = columns
-        .iter()
-        .filter_map(|row| row.try_get::<String, _>("name").ok())
-        .collect::<Vec<_>>();
-    assert!(!names.iter().any(|name| name == "role"));
-    assert!(!names.iter().any(|name| name == "is_primary"));
 }

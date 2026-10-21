@@ -18,6 +18,31 @@ fn unique_temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("forge-{name}-{}-{nanos}", std::process::id()))
 }
 
+async fn insert_legacy_task(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    project_id: &str,
+    repo_id: Option<&str>,
+    title: &str,
+    status: &str,
+    now: &str,
+) {
+    sqlx::query(
+        "INSERT INTO task (id, project_id, repo_id, title, task_type, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'implementation', ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(project_id)
+    .bind(repo_id)
+    .bind(title)
+    .bind(status)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("historical Task row inserts under the migration-era schema");
+}
+
 #[tokio::test]
 async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_pools() {
     let db_path = unique_temp_path("migtest").with_extension("db");
@@ -185,27 +210,16 @@ async fn pr9_migration_maps_legacy_task_states_conservatively_and_audits_ambigui
         .await
         .expect("legacy entry barrier setup");
     let blocked_active_id = db::new_uuid_v4();
-    TaskRepo::create(
-        &db,
-        CreateTask {
-            id: blocked_active_id.clone(),
-            project_id: project_id.clone(),
-            repo_id: None,
-            parent_task_id: None,
-            title: "active Task with legacy block metadata".to_owned(),
-            description: None,
-            task_type: "implementation".to_owned(),
-            lifecycle_state: db::TaskLifecycleState::Active,
-            is_automation: false,
-            priority: 0,
-            subtask_order: None,
-            merge_config: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
+    insert_legacy_task(
+        &pool,
+        &blocked_active_id,
+        &project_id,
+        None,
+        "active Task with legacy block metadata",
+        "in_progress",
+        &now,
     )
-    .await
-    .expect("active blocked Task");
+    .await;
     sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
         .bind("{\"type\":\"manual_stop\"}")
         .bind(&blocked_active_id)
@@ -311,27 +325,16 @@ async fn pr5_rebuild_preserves_legacy_workspace_as_task_integration_scope() {
     )
     .await
     .expect("Repo");
-    db::TaskRepo::create(
-        &db,
-        db::CreateTask {
-            id: task_id.clone(),
-            project_id,
-            repo_id: Some(repo_id.clone()),
-            parent_task_id: None,
-            title: "legacy task".into(),
-            description: None,
-            task_type: "implementation".into(),
-            lifecycle_state: db::TaskLifecycleState::Ready,
-            is_automation: false,
-            priority: 0,
-            subtask_order: None,
-            merge_config: None,
-            created_at: now.into(),
-            updated_at: now.into(),
-        },
+    insert_legacy_task(
+        &pool,
+        &task_id,
+        &project_id,
+        Some(&repo_id),
+        "legacy task",
+        "todo",
+        now,
     )
-    .await
-    .expect("Task");
+    .await;
     sqlx::query(
         "INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, before_sha, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?)",
@@ -476,33 +479,45 @@ async fn pr5_rebuild_preserves_legacy_workspace_as_task_integration_scope() {
         .expect("integration workspace");
     assert_eq!(canonical.id, workspace_id);
 
-    let known = db::WorkUnitRepo::get_by_id(&db, &known_actor_work_unit_id)
-        .await
-        .expect("known provenance loads")
-        .expect("known WorkUnit exists");
+    let known_provenance: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT provenance_kind, provenance_id, provenance_actor_kind
+         FROM work_unit WHERE id = ?",
+    )
+    .bind(&known_actor_work_unit_id)
+    .fetch_one(&pool)
+    .await
+    .expect("known provenance loads from the V092 schema");
     assert_eq!(
-        known.provenance,
-        Some(db::WorkUnitProvenance::Actor(db::ActorRef::Human(
-            human_id.clone()
-        )))
+        known_provenance,
+        (
+            "actor".to_owned(),
+            human_id.clone(),
+            Some("human".to_owned())
+        )
     );
-    let unresolved = db::WorkUnitRepo::get_by_id(&db, &unresolved_actor_work_unit_id)
-        .await
-        .expect("unresolved provenance loads")
-        .expect("unresolved WorkUnit exists");
+    let unresolved_provenance: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT provenance_kind, provenance_id, provenance_actor_kind
+         FROM work_unit WHERE id = ?",
+    )
+    .bind(&unresolved_actor_work_unit_id)
+    .fetch_one(&pool)
+    .await
+    .expect("unresolved provenance loads from the V092 schema");
     assert_eq!(
-        unresolved.provenance,
-        Some(db::WorkUnitProvenance::LegacyActor(
-            "missing-legacy-actor".to_owned()
-        ))
+        unresolved_provenance,
+        ("actor".to_owned(), "missing-legacy-actor".to_owned(), None)
     );
-    let ambiguous = db::WorkUnitRepo::get_by_id(&db, &ambiguous_actor_work_unit_id)
-        .await
-        .expect("ambiguous provenance loads")
-        .expect("ambiguous WorkUnit exists");
+    let ambiguous_provenance: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT provenance_kind, provenance_id, provenance_actor_kind
+         FROM work_unit WHERE id = ?",
+    )
+    .bind(&ambiguous_actor_work_unit_id)
+    .fetch_one(&pool)
+    .await
+    .expect("ambiguous provenance loads from the V092 schema");
     assert_eq!(
-        ambiguous.provenance,
-        Some(db::WorkUnitProvenance::LegacyActor(ambiguous_actor_id))
+        ambiguous_provenance,
+        ("actor".to_owned(), ambiguous_actor_id, None)
     );
 
     let _ = fs::remove_file(db_path);
@@ -695,6 +710,10 @@ async fn agent_identity_profile_membership_migration_preserves_operational_histo
         "agent_turn_job",
         "project_agent_membership",
         "task_role_assignment",
+        "legacy_project_agent_membership",
+        "legacy_room",
+        "legacy_room_message",
+        "protected_legacy_session_ref",
     ] {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -729,11 +748,17 @@ async fn agent_identity_profile_membership_migration_preserves_operational_histo
     assert_eq!(profile.3, "[\"rust\"]");
 
     let membership: (String, String, String, i64) = sqlx::query_as(
-        "SELECT id, identity_id, state, version FROM legacy_project_agent_membership WHERE project_id = 'project-1'",
+        "SELECT json_extract(row_json, '$.id'),
+                json_extract(row_json, '$.identity_id'),
+                json_extract(row_json, '$.state'),
+                json_extract(row_json, '$.version')
+         FROM pr13_legacy_record_history
+         WHERE source_table = 'legacy_project_agent_membership'
+           AND source_identity = 'link-1'",
     )
     .fetch_one(&pool)
     .await
-    .expect("membership loads");
+    .expect("legacy membership archive loads");
     assert_eq!(
         membership,
         (
@@ -773,39 +798,66 @@ async fn agent_identity_profile_membership_migration_preserves_operational_histo
             .await
             .expect("execution session provenance loads");
     let room_responder: Option<String> = sqlx::query_scalar(
-        "SELECT default_responder_identity_id FROM legacy_room WHERE id = 'conversation-1'",
+        "SELECT json_extract(row_json, '$.default_responder_identity_id')
+         FROM pr13_legacy_record_history
+         WHERE source_table = 'legacy_room' AND source_identity = 'conversation-1'",
     )
     .fetch_one(&pool)
     .await
-    .expect("Room responder loads");
-    let message_body: String =
-        sqlx::query_scalar("SELECT content FROM legacy_room_message WHERE id = 'message-1'")
-            .fetch_one(&pool)
-            .await
-            .expect("message loads");
-    let interrupted_message: (String, String, Option<String>, Option<String>, Option<i64>, Option<String>) =
-        sqlx::query_as(
-            "SELECT status, outcome, model, token_usage_json, duration_ms, error FROM legacy_room_message WHERE id = 'message-2'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("interrupted message loads");
+    .expect("Room responder archive loads");
+    let message_body: String = sqlx::query_scalar(
+        "SELECT json_extract(row_json, '$.content')
+         FROM pr13_legacy_record_history
+         WHERE source_table = 'legacy_room_message' AND source_identity = 'message-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("message archive loads");
+    let interrupted_message: (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT json_extract(row_json, '$.status'),
+                    json_extract(row_json, '$.outcome'),
+                    json_extract(row_json, '$.model'),
+                    json_extract(row_json, '$.token_usage_json'),
+                    json_extract(row_json, '$.duration_ms'),
+                    json_extract(row_json, '$.error')
+             FROM pr13_legacy_record_history
+             WHERE source_table = 'legacy_room_message' AND source_identity = 'message-2'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("interrupted message archive loads");
     let protected_room_session: String = sqlx::query_scalar(
-        "SELECT opaque_session_ref FROM protected_legacy_session_ref WHERE room_id = 'conversation-1'",
+        "SELECT json_extract(row_json, '$.opaque_session_ref')
+         FROM pr13_legacy_record_history
+         WHERE source_table = 'protected_legacy_session_ref'
+           AND source_identity = 'conversation-1'",
     )
     .fetch_one(&pool)
     .await
-    .expect("protected legacy Room session loads");
-    let memory: (String, Option<String>) =
-        sqlx::query_as("SELECT body, room_id FROM memory_item WHERE id = 'memory-1'")
-            .fetch_one(&pool)
-            .await
-            .expect("memory loads");
-    let secret_memory: (String, String) =
-        sqlx::query_as("SELECT body, sensitivity FROM memory_item WHERE id = 'memory-secret'")
-            .fetch_one(&pool)
-            .await
-            .expect("secret memory loads");
+    .expect("protected legacy Room session archive loads");
+    let memory: (String, Option<String>) = sqlx::query_as(
+        "SELECT json_extract(row_json, '$.body'), json_extract(row_json, '$.room_id')
+         FROM pr13_legacy_record_history
+         WHERE source_table = 'memory_item' AND json_extract(row_json, '$.id') = 'memory-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("memory archive loads");
+    let secret_memory: (String, String) = sqlx::query_as(
+        "SELECT json_extract(row_json, '$.body'), json_extract(row_json, '$.sensitivity')
+         FROM pr13_legacy_record_history
+         WHERE source_table = 'memory_item' AND json_extract(row_json, '$.id') = 'memory-secret'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("secret memory archive loads");
     let secret_audit_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM content_guard_audit WHERE entity_type = 'memory_item' AND entity_id = 'memory-secret'",
     )
@@ -1006,11 +1058,9 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
         );
     }
     for object in [
-        "idx_task_status_project",
         "idx_task_parent",
         "idx_task_repo",
         "idx_task_parent_subtask_order",
-        "idx_task_project_archived",
         "idx_task_project_automation",
         "task_board_revision_after_insert",
         "task_board_revision_after_delete",
@@ -1023,6 +1073,25 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
             .expect("schema object lookup");
         assert_eq!(count, 1, "schema object {object} should survive rebuild");
     }
+    let retired_status_index: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_task_status_project'")
+            .fetch_one(&pool)
+            .await
+            .expect("retired status projection index lookup");
+    assert_eq!(
+        retired_status_index, 0,
+        "TaskLifecycle cutover retires the task.status index"
+    );
+    let retired_archived_index: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_task_project_archived'")
+            .fetch_one(&pool)
+            .await
+            .expect("retired archived projection index lookup");
+    assert_eq!(
+        retired_archived_index, 0,
+        "TaskLifecycle cutover retires the task.archived_at index"
+    );
+
     let foreign_key_violations: Vec<(String, i64, String, i64)> =
         sqlx::query_as("PRAGMA foreign_key_check")
             .fetch_all(&pool)
@@ -1310,27 +1379,16 @@ async fn v114_preserves_legacy_pr_outcomes_without_granting_admission_authority(
     let mut metadata_ids = Vec::new();
     for (index, (pr_state, merge_status)) in cases.into_iter().enumerate() {
         let task_id = &task_ids[index];
-        TaskRepo::create(
-            &db,
-            CreateTask {
-                id: task_id.clone(),
-                project_id: repo_project_id.clone(),
-                repo_id: Some(repo_id.clone()),
-                parent_task_id: None,
-                title: format!("Task with historical {pr_state} PR"),
-                description: None,
-                task_type: "implementation".to_owned(),
-                lifecycle_state: db::TaskLifecycleState::Ready,
-                is_automation: false,
-                priority: 0,
-                subtask_order: None,
-                merge_config: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
+        insert_legacy_task(
+            &pool,
+            task_id,
+            &repo_project_id,
+            Some(&repo_id),
+            &format!("Task with historical {pr_state} PR"),
+            "todo",
+            &now,
         )
-        .await
-        .expect("Task");
+        .await;
         let metadata_id = db::new_uuid_v4();
         let provider_pr_id = format!("old-provider-pr-{index}");
         let pr_url = format!("https://example.invalid/pr/{index}");
@@ -1462,27 +1520,16 @@ async fn v114_recovers_v110_terminal_pr_outcome_from_its_exact_result_event() {
     )
     .await
     .expect("PullRequest Repo");
-    TaskRepo::create(
-        &db,
-        CreateTask {
-            id: task_id.clone(),
-            project_id,
-            repo_id: Some(repo_id),
-            parent_task_id: None,
-            title: "V110 PR merge".to_owned(),
-            description: None,
-            task_type: "implementation".to_owned(),
-            lifecycle_state: db::TaskLifecycleState::Ready,
-            is_automation: false,
-            priority: 0,
-            subtask_order: None,
-            merge_config: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
+    insert_legacy_task(
+        &pool,
+        &task_id,
+        &project_id,
+        Some(&repo_id),
+        "V110 PR merge",
+        "todo",
+        &now,
     )
-    .await
-    .expect("Task");
+    .await;
     sqlx::query(
         "INSERT INTO pr_metadata (
             id, task_id, provider_type, provider_pr_id, pr_url, source_branch,

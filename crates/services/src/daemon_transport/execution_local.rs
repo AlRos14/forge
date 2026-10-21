@@ -51,7 +51,6 @@ impl ExecutionProvider for EmbeddedExecutionProvider {
                     let _ = task_service
                         .fail_execution_before_dispatch(&execution_id, error.to_string())
                         .await;
-                    return;
                 }
             }
             .instrument(dispatch_span),
