@@ -2169,9 +2169,17 @@ mod tests {
         harnesses: &[&str],
         sessions: &[Option<&str>],
     ) -> ParallelRecoveryFixture {
+        let db = Arc::new(sqlite_db().await);
+        seed_parallel_recovery_fixture_with_db(harnesses, sessions, db).await
+    }
+
+    async fn seed_parallel_recovery_fixture_with_db(
+        harnesses: &[&str],
+        sessions: &[Option<&str>],
+        db: Arc<SqliteDb>,
+    ) -> ParallelRecoveryFixture {
         assert!(harnesses.len() >= 2);
         assert_eq!(harnesses.len(), sessions.len());
-        let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(64));
         let (project_id, repo_id) = seed_project_repo(&db).await;
         let mut agents = Vec::with_capacity(harnesses.len());
@@ -3167,7 +3175,20 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_recovery_same_key_after_post_commit_crash_replays_without_duplicate() {
-        let fixture = seed_parallel_recovery_fixture(&["shell", "shell"], &[None, None]).await;
+        let database_dir = tempfile::TempDir::new().expect("file-backed recovery database dir");
+        let database_url = format!(
+            "sqlite://{}",
+            database_dir.path().join("recovery.db").display()
+        );
+        let pool = db::create_sqlite_pool(&database_url)
+            .await
+            .expect("file-backed recovery database opens");
+        db::run_migrations(&pool)
+            .await
+            .expect("current migrations apply");
+        let db = Arc::new(SqliteDb::new(pool));
+        let fixture =
+            seed_parallel_recovery_fixture_with_db(&["shell", "shell"], &[None, None], db).await;
         let db = Arc::clone(&fixture.db);
         let event_bus = Arc::clone(&fixture.event_bus);
         let task = fixture.task.clone();
@@ -3223,6 +3244,16 @@ mod tests {
         .expect("child count loads before restart");
         assert_eq!(children_before_restart, 1);
 
+        drop(service);
+        db.pool().close().await;
+        let reopened_pool = db::create_sqlite_pool(&database_url)
+            .await
+            .expect("recovery database reopens after simulated process exit");
+        db::run_migrations(&reopened_pool)
+            .await
+            .expect("current migrations remain safe on restart");
+        let db = Arc::new(SqliteDb::new(reopened_pool));
+
         assert_eq!(
             CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus))
                 .run_recovery()
@@ -3244,6 +3275,7 @@ mod tests {
         assert_eq!(reconciled_task.lifecycle_state, TaskLifecycleState::Active);
         assert!(reconciled_task.error_annotation.is_none());
 
+        let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
         let replay = service
             .recover_work_unit_execution(
                 task.id.clone(),

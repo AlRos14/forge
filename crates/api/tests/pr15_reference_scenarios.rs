@@ -2,7 +2,11 @@
 
 mod common;
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use api::AppState;
 use api_types::{
@@ -713,6 +717,441 @@ async fn s04_ended_membership_rejects_new_execution_for_preallocated_work_unit()
     assert_eq!(execution_count, 0);
 }
 
+#[tokio::test]
+async fn s02_three_shell_processes_write_concurrently_in_isolated_work_unit_worktrees() {
+    let temp = common::TestDir::new("pr15-s02-three-shell-workers");
+    let workspace_root = temp.path().join("workspace-root");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root creates");
+    let barrier_dir = common::TestDir::new_in(temp.path(), "barrier");
+    let release_path = barrier_dir.path().join("release");
+    let release = ShellWorkerReleaseGuard::new(release_path.clone());
+    let harness = common::test_app(&workspace_root, "pr15-s02-three-shell-workers").await;
+    let repo_path = common::setup_git_repo(temp.path());
+    let base_sha = run_git(&repo_path, &["rev-parse", "HEAD"]);
+    let (project_id, _repo_id) =
+        common::create_project_and_repo(&harness.app, "PR15 S02 concurrent writers", &repo_path)
+            .await;
+    let task: TaskResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({"title": "Three isolated shell writers"}),
+        StatusCode::OK,
+    )
+    .await;
+
+    let (agent_a, agent_b) =
+        common::create_shell_agents(&harness.app, &workspace_root, "pr15-s02").await;
+    let registered_a = db::AgentRepo::get_by_id(&*harness.state.db, &agent_a)
+        .await
+        .expect("Agent A loads")
+        .expect("Agent A exists");
+    let daemon_id = registered_a
+        .daemon_id
+        .expect("shell Agent has embedded daemon");
+    let agent_c: AgentResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/agents",
+        &common::admin_jwt(),
+        json!({
+            "name": "pr15-s02-agent-c",
+            "executor_type": "shell",
+            "daemon_id": daemon_id
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let agent_ids = [agent_a, agent_b, agent_c.id];
+    for agent_id in &agent_ids {
+        let agent = db::AgentRepo::get_by_id(&*harness.state.db, agent_id)
+            .await
+            .expect("eligible Agent loads")
+            .expect("eligible Agent exists");
+        assert!(
+            agent.max_concurrent_tasks >= 1,
+            "one assigned writer fits its Agent capacity"
+        );
+    }
+
+    harness
+        .state
+        .task_service
+        .create_task_role(
+            &task.id,
+            "implementer",
+            db::CoordinationMode::Independent,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("independent implementer TaskRole creates");
+    for agent_id in &agent_ids {
+        harness
+            .state
+            .task_service
+            .add_task_role_member(
+                &task.id,
+                "implementer",
+                api_types::ActorRef::Agent(agent_id.clone()),
+            )
+            .await
+            .expect("each shell Agent receives explicit implementer membership");
+    }
+
+    let labels = ["a", "b", "c"];
+    let mut work_units = Vec::with_capacity(labels.len());
+    for label in labels {
+        work_units.push(
+            common::create_allocated_work_unit(
+                &harness.app,
+                &task.id,
+                "implementer",
+                &agent_ids[work_units.len()],
+                &format!("Write worker {label}"),
+                "Write one uniquely named file in the exact WorkUnit worktree",
+                true,
+            )
+            .await,
+        );
+    }
+
+    let mut executions = Vec::with_capacity(labels.len());
+    for (index, label) in labels.iter().enumerate() {
+        let work_unit = &work_units[index];
+        let execution: ExecutionResponse = common::json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/tasks/{}/executions", task.id),
+            json!({
+                "work_unit_id": work_unit.id,
+                "expected_work_unit_version": work_unit.version,
+                "purpose": "implement",
+                "prompt": s02_shell_command(
+                    label,
+                    &release_path,
+                    &barrier_dir.path().join(format!("ready-{label}")),
+                ),
+                "input_artifact_ids": [],
+                "overrides": null
+            }),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(execution.status, ExecutionStatus::Running);
+        executions.push(execution);
+    }
+
+    let mut workspaces = Vec::with_capacity(executions.len());
+    let mut leases = Vec::with_capacity(executions.len());
+    let mut execution_rows = Vec::with_capacity(executions.len());
+    for index in 0..executions.len() {
+        let execution = &executions[index];
+        let work_unit = &work_units[index];
+        let agent_id = &agent_ids[index];
+        let row = db::ExecutionRepo::get_by_id(&*harness.state.db, &execution.id)
+            .await
+            .expect("Execution row loads")
+            .expect("Execution row exists");
+        assert_eq!(row.task_id, task.id);
+        assert_eq!(row.agent_id.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(row.actor_ref(), Some(db::ActorRef::Agent(agent_id.clone())));
+        assert_eq!(row.role, "implementer");
+        assert_eq!(row.purpose, Some(db::ExecutionPurpose::Implement));
+        assert_eq!(row.work_unit_id.as_deref(), Some(work_unit.id.as_str()));
+        assert_eq!(row.work_unit_version, Some(work_unit.version));
+        let workspace_id = row
+            .workspace_id
+            .as_deref()
+            .expect("Execution pins Workspace");
+        assert_eq!(execution.workspace_id.as_deref(), Some(workspace_id));
+        let workspace = db::WorkspaceRepo::get_by_id(&*harness.state.db, workspace_id)
+            .await
+            .expect("Workspace row loads")
+            .expect("Workspace row exists");
+        assert_eq!(workspace.task_id, task.id);
+        assert_eq!(workspace.status, db::WorkspaceStatus::Ready);
+        let lease =
+            db::WorkspaceLeaseRepo::get_active_for_work_unit(&*harness.state.db, &work_unit.id)
+                .await
+                .expect("exact active WorkUnit lease loads")
+                .expect("each admitted Execution has an active lease");
+        assert_eq!(lease.task_id, task.id);
+        assert_eq!(lease.work_unit_id.as_deref(), Some(work_unit.id.as_str()));
+        assert_eq!(lease.workspace_id.as_deref(), Some(workspace.id.as_str()));
+        assert_eq!(lease.execution_id, execution.id);
+        assert_eq!(lease.role, "worker");
+        assert_eq!(lease.assigned_principal_type, "agent");
+        assert_eq!(lease.assigned_principal_id, *agent_id);
+        workspaces.push(workspace);
+        leases.push(lease);
+        execution_rows.push(row);
+    }
+
+    let workspace_paths: Vec<_> = workspaces
+        .iter()
+        .map(|workspace| workspace.worktree_path.clone())
+        .collect();
+    let workspace_branches: Vec<_> = workspaces
+        .iter()
+        .map(|workspace| workspace.branch.clone())
+        .collect();
+    let mut unique_paths = workspace_paths.clone();
+    unique_paths.sort();
+    unique_paths.dedup();
+    let mut unique_branches = workspace_branches.clone();
+    unique_branches.sort();
+    unique_branches.dedup();
+    assert_eq!(unique_paths.len(), 3, "each Execution has its own worktree");
+    assert_eq!(
+        unique_branches.len(),
+        3,
+        "each Execution has its own branch"
+    );
+    for (index, workspace) in workspaces.iter().enumerate() {
+        assert!(Path::new(&workspace.worktree_path).is_dir());
+        assert_eq!(
+            run_git(
+                Path::new(&workspace.worktree_path),
+                &["branch", "--show-current"]
+            ),
+            workspace.branch
+        );
+        for label in labels {
+            assert!(
+                !Path::new(&workspace.worktree_path)
+                    .join(format!("s02-worker-{label}.txt"))
+                    .exists(),
+                "no worker writes before the shared release"
+            );
+        }
+        assert_eq!(
+            execution_rows[index].workspace_id.as_deref(),
+            Some(workspace.id.as_str())
+        );
+        assert_eq!(
+            leases[index].workspace_id.as_deref(),
+            Some(workspace.id.as_str())
+        );
+    }
+
+    let readiness_deadline = Instant::now() + Duration::from_secs(20);
+    let mut ready_records = vec![None; labels.len()];
+    loop {
+        for (index, label) in labels.iter().enumerate() {
+            if ready_records[index].is_none() {
+                ready_records[index] =
+                    read_s02_ready_record(&barrier_dir.path().join(format!("ready-{label}")));
+            }
+        }
+        if ready_records.iter().all(Option::is_some) || Instant::now() >= readiness_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let all_ready = ready_records.iter().all(Option::is_some);
+    let mut ready_pids: Vec<u32> = ready_records
+        .iter()
+        .filter_map(|record| record.as_ref().map(|record| record.pid))
+        .collect();
+    ready_pids.sort_unstable();
+    ready_pids.dedup();
+    let simultaneous_before_release = all_ready
+        && ready_pids.len() == labels.len()
+        && ready_records.iter().enumerate().all(|(index, record)| {
+            record.as_ref().is_some_and(|record| {
+                std::fs::canonicalize(&workspace_paths[index])
+                    .is_ok_and(|path| record.worktree_path == path.to_string_lossy())
+                    && shell_process_is_alive(record.pid)
+                    && !Path::new(&workspace_paths[index])
+                        .join(format!("s02-worker-{}.txt", labels[index]))
+                        .exists()
+            })
+        });
+    release
+        .release_once()
+        .expect("shared shell release publishes once");
+
+    let terminal = wait_for_s02_terminal_executions(
+        &harness.app,
+        &executions
+            .iter()
+            .map(|execution| execution.id.clone())
+            .collect::<Vec<_>>(),
+        Duration::from_secs(45),
+    )
+    .await;
+    let terminal = if terminal.is_none() {
+        for execution in &executions {
+            let current: ExecutionResponse = common::empty_request(
+                &harness.app,
+                Method::GET,
+                &format!("/api/v1/executions/{}", execution.id),
+                StatusCode::OK,
+            )
+            .await;
+            if current.status == ExecutionStatus::Running {
+                let _: ExecutionResponse = common::empty_request(
+                    &harness.app,
+                    Method::POST,
+                    &format!("/api/v1/executions/{}/cancel", execution.id),
+                    StatusCode::OK,
+                )
+                .await;
+            }
+        }
+        wait_for_s02_terminal_executions(
+            &harness.app,
+            &executions
+                .iter()
+                .map(|execution| execution.id.clone())
+                .collect::<Vec<_>>(),
+            Duration::from_secs(10),
+        )
+        .await
+    } else {
+        terminal
+    };
+    assert!(
+        all_ready,
+        "all shell processes reached the barrier; records: {ready_records:?}"
+    );
+    assert!(
+        simultaneous_before_release,
+        "three distinct shell PIDs were alive in their exact worktrees before release: {ready_records:?}"
+    );
+    let terminal = terminal.expect("all shell processes terminate before timeout");
+    assert_eq!(terminal.len(), 3);
+    assert!(terminal
+        .iter()
+        .all(|execution| execution.status == ExecutionStatus::Completed));
+
+    let mut source_shas = Vec::with_capacity(workspaces.len());
+    for (index, workspace) in workspaces.iter().enumerate() {
+        let worktree = Path::new(&workspace.worktree_path);
+        let own_file = worktree.join(format!("s02-worker-{}.txt", labels[index]));
+        assert_eq!(
+            std::fs::read_to_string(&own_file)
+                .expect("worker's file exists only in its worktree")
+                .trim(),
+            format!("worker-{}", labels[index])
+        );
+        for (other_index, other_label) in labels.iter().enumerate() {
+            if other_index != index {
+                assert!(
+                    !worktree
+                        .join(format!("s02-worker-{other_label}.txt"))
+                        .exists(),
+                    "{} is not contaminated by worker {other_label}",
+                    workspace.worktree_path
+                );
+            }
+        }
+        assert!(run_git(worktree, &["status", "--porcelain"]).is_empty());
+        let sha = run_git(worktree, &["rev-parse", "HEAD"]);
+        assert_ne!(sha, base_sha);
+        let completed_row = db::ExecutionRepo::get_by_id(&*harness.state.db, &executions[index].id)
+            .await
+            .expect("completed Execution reloads")
+            .expect("completed Execution remains persisted");
+        assert_eq!(completed_row.after_sha.as_deref(), Some(sha.as_str()));
+        source_shas.push(sha);
+    }
+    let mut unique_source_shas = source_shas.clone();
+    unique_source_shas.sort();
+    unique_source_shas.dedup();
+    assert_eq!(
+        unique_source_shas.len(),
+        3,
+        "each worker produced a distinct Git commit"
+    );
+    assert_eq!(run_git(&repo_path, &["rev-parse", "HEAD"]), base_sha);
+
+    let mut previous_target_sha: Option<String> = None;
+    let mut target_workspace_id: Option<String> = None;
+    for index in 0..work_units.len() {
+        let current: WorkUnitResponse = common::empty_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/work-units/{}", work_units[index].id),
+            StatusCode::OK,
+        )
+        .await;
+        let completed: WorkUnitResponse = common::json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/work-units/{}/status", current.id),
+            json!({"expected_version": current.version, "status": "completed"}),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(completed.status, api_types::WorkUnitStatus::Completed);
+        let integration: WorkUnitIntegrationResponse = common::json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/work-units/{}/integrations", completed.id),
+            json!({
+                "execution_id": executions[index].id,
+                "idempotency_key": format!("pr15-s02-integration-{}", labels[index])
+            }),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(integration.outcome, WorkUnitIntegrationOutcome::Success);
+        assert_eq!(integration.source_sha, source_shas[index]);
+        if let Some(previous_target_sha) = previous_target_sha.as_deref() {
+            assert_eq!(&integration.target_before_sha, previous_target_sha);
+        }
+        let target_after_sha = integration
+            .target_after_sha
+            .clone()
+            .expect("serial integration records its resulting SHA");
+        if let Some(expected_workspace_id) = target_workspace_id.as_deref() {
+            assert_eq!(&integration.target_workspace_id, expected_workspace_id);
+        }
+        target_workspace_id = Some(integration.target_workspace_id.clone());
+        previous_target_sha = Some(target_after_sha.clone());
+        let target: WorkspaceResponse = common::empty_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/tasks/{}/workspace", task.id),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(integration.target_workspace_id, target.id);
+        assert_eq!(
+            run_git(Path::new(&target.worktree_path), &["rev-parse", "HEAD"]),
+            target_after_sha
+        );
+    }
+
+    let target: WorkspaceResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/workspace", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    for label in labels {
+        assert_eq!(
+            std::fs::read_to_string(
+                Path::new(&target.worktree_path).join(format!("s02-worker-{label}.txt"))
+            )
+            .expect("serialized integration preserves every worker result")
+            .trim(),
+            format!("worker-{label}")
+        );
+    }
+    let lifecycle: TaskLifecycleResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/lifecycle", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_ne!(lifecycle.state, TaskLifecycleState::Merging);
+    assert_ne!(lifecycle.state, TaskLifecycleState::Done);
+}
+
 async fn new_unseeded_state(database_url: &str, workspace_root: &Path) -> AppState {
     let pool = db::create_sqlite_pool(database_url)
         .await
@@ -748,6 +1187,107 @@ async fn new_unseeded_state(database_url: &str, workspace_root: &Path) -> AppSta
         api::state::test_jwt_secret(),
         api::state::test_bcrypt_cost(),
     )
+}
+
+#[derive(Debug, Clone)]
+struct S02ReadyRecord {
+    pid: u32,
+    worktree_path: String,
+}
+
+struct ShellWorkerReleaseGuard {
+    release_path: PathBuf,
+}
+
+impl ShellWorkerReleaseGuard {
+    fn new(release_path: PathBuf) -> Self {
+        Self { release_path }
+    }
+
+    fn release_once(&self) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let mut release = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.release_path)?;
+        release.write_all(b"released\n")
+    }
+}
+
+impl Drop for ShellWorkerReleaseGuard {
+    fn drop(&mut self) {
+        // A panic before the explicit release must still let any already
+        // started shell process leave its barrier before temporary data drops.
+        let _ = std::fs::write(&self.release_path, b"released during cleanup\n");
+    }
+}
+
+fn s02_shell_command(label: &str, release_path: &Path, ready_path: &Path) -> String {
+    let release_path = shell_quote(&release_path.to_string_lossy());
+    let ready_path = shell_quote(&ready_path.to_string_lossy());
+    let output_file = shell_quote(&format!("s02-worker-{label}.txt"));
+    let output = shell_quote(&format!("worker-{label}"));
+    format!(
+        "set -eu\nready={ready_path}\nrelease={release_path}\nready_tmp=\"$ready.tmp\"\ntrap 'rm -f \"$ready\" \"$ready_tmp\"' EXIT HUP INT TERM\nprocess_worktree=$(pwd -P)\nprintf '%s\\n%s\\n' \"$$\" \"$process_worktree\" > \"$ready_tmp\"\nmv \"$ready_tmp\" \"$ready\"\npolls=0\nwhile [ ! -f \"$release\" ]; do\n  polls=$((polls + 1))\n  if [ \"$polls\" -ge 6000 ]; then echo 'S02 barrier timed out' >&2; exit 124; fi\n  sleep 0.01\ndone\nprintf '%s\\n' {output} > {output_file}\ngit add -- {output_file}\ngit -c user.name='Forge PR15 S02' -c user.email='pr15-s02@example.invalid' commit -m 'PR15 S02 worker {label}'\n"
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn read_s02_ready_record(path: &Path) -> Option<S02ReadyRecord> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut lines = contents.lines();
+    Some(S02ReadyRecord {
+        pid: lines.next()?.parse().ok()?,
+        worktree_path: lines.next()?.to_owned(),
+    })
+}
+
+fn shell_process_is_alive(pid: u32) -> bool {
+    std::process::Command::new("sh")
+        .args([
+            "-c",
+            "kill -0 \"$1\" 2>/dev/null",
+            "s02-pid-check",
+            &pid.to_string(),
+        ])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+async fn wait_for_s02_terminal_executions(
+    app: &axum::Router,
+    execution_ids: &[String],
+    timeout: Duration,
+) -> Option<Vec<ExecutionResponse>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut executions = Vec::with_capacity(execution_ids.len());
+        for execution_id in execution_ids {
+            executions.push(
+                common::empty_request::<ExecutionResponse>(
+                    app,
+                    Method::GET,
+                    &format!("/api/v1/executions/{execution_id}"),
+                    StatusCode::OK,
+                )
+                .await,
+            );
+        }
+        if executions
+            .iter()
+            .all(|execution| execution.status != ExecutionStatus::Running)
+        {
+            return Some(executions);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn request_json<T: DeserializeOwned>(
