@@ -1,6 +1,6 @@
 # PR15 acceptance report
 
-**Implementation/evidence SHA:** recorded in the PR #19 head/checks; code and test additions are the S02/S09 changes in this branch.
+**Implementation/evidence SHA:** `d3bbb1352df4e341e6ee1751937335687341e422` (S02/S09 test and documentation change set).
 **Prior CI-tested implementation SHA:** `60120adc4341dac33d6ce3694643a0dad13c81ac`
 **Base:** `origin/main` at `ca9cbdd38c75a72dcf3a8348bf97ef30739c8d29`
 **PR14 provenance:** merge `ca9cbdd38c75a72dcf3a8348bf97ef30739c8d29`; approved PR14 HEAD `3e9e23de73cf12c60014237eb4f356ea3d3a1aa8` is its second parent.
