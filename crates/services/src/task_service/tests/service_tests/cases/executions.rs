@@ -6671,7 +6671,18 @@ async fn concurrent_provider_start_claims_dispatch_one_external_start() {
 
 #[tokio::test]
 async fn uncertain_provider_start_retry_never_sends_a_second_external_start() {
-    let db = Arc::new(sqlite_db().await);
+    let database_dir = TempDir::new().expect("file-backed recovery database directory creates");
+    let database_url = format!(
+        "sqlite://{}",
+        database_dir.path().join("uncertain-start.db").display()
+    );
+    let pool = db::create_sqlite_pool(&database_url)
+        .await
+        .expect("file-backed database opens");
+    db::run_migrations(&pool)
+        .await
+        .expect("current database migrations apply");
+    let db = Arc::new(db::SqliteDb::new(pool));
     let event_bus = Arc::new(EventBus::new(16));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
@@ -6821,9 +6832,18 @@ async fn uncertain_provider_start_retry_never_sends_a_second_external_start() {
     .expect("uncertain outcome remains singular");
     assert_eq!(final_uncertain_receipts, 1);
 
+    drop(service);
+    db.pool().close().await;
+    let reopened_pool = db::create_sqlite_pool(&database_url)
+        .await
+        .expect("file-backed database reopens after the simulated process exit");
+    db::run_migrations(&reopened_pool)
+        .await
+        .expect("current migrations remain safe on restart");
+    let db = Arc::new(db::SqliteDb::new(reopened_pool));
     AgentRepo::set_paused(&*db, &agent_id, true)
         .await
-        .expect("Agent pauses before simulated server restart");
+        .expect("Agent pauses before recovery reconciliation");
     crate::CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus))
         .run_recovery()
         .await
@@ -7235,6 +7255,65 @@ async fn follow_up_rejects_ended_harness_session_without_clearing_recovery_annot
     )
     .await;
     assert_eq!(before.task.error_annotation, fixture.task.error_annotation);
+}
+
+#[tokio::test]
+async fn resume_session_without_reusable_session_fails_before_admission() {
+    let mut fixture = blocked_recovery_fixture_for_executor(false, "codex").await;
+    let mut annotation: api_types::TaskBlockingAnnotation = serde_json::from_str(
+        fixture
+            .task
+            .error_annotation
+            .as_deref()
+            .expect("blocked Task has an error annotation"),
+    )
+    .expect("blocking annotation parses");
+    annotation
+        .recovery_actions
+        .insert(0, api_types::RecoveryAction::ResumeSession);
+    fixture.task = TaskRepo::update(
+        &*fixture.db,
+        db::UpdateTask {
+            id: fixture.task.id.clone(),
+            expected_version: fixture.task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            error_annotation: Some(Some(
+                serde_json::to_string(&annotation).expect("blocking annotation serializes"),
+            )),
+            blocked_json: None,
+            failed_json: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("exact ResumeSession recovery action persists");
+
+    let before =
+        admission_side_effect_snapshot(&fixture.db, &fixture.task.id, &fixture.work_unit.id).await;
+    let result = fixture
+        .service
+        .recover_task(
+            fixture.task.id.clone(),
+            api_types::RecoveryAction::ResumeSession,
+            Some("explicitly request session continuity".to_owned()),
+            None,
+        )
+        .await;
+    let error = result.expect_err("ResumeSession without a session fails closed");
+    assert!(error
+        .to_string()
+        .contains("blocked execution has no reusable explicit HarnessSession"));
+    assert_admission_side_effects_unchanged(
+        &fixture.db,
+        &fixture.task.id,
+        &fixture.work_unit.id,
+        &before,
+    )
+    .await;
 }
 
 #[tokio::test]

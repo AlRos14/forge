@@ -2150,6 +2150,123 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
             .satisfied
     );
 
+    let a_before = WorkUnitRepo::get_by_id(&db, &a)
+        .await
+        .expect("A loads before independent WorkUnit transition")
+        .expect("A exists");
+    let b_before = WorkUnitRepo::get_by_id(&db, &b)
+        .await
+        .expect("B loads before independent WorkUnit transition")
+        .expect("B exists");
+    let c_before = WorkUnitRepo::get_by_id(&db, &c)
+        .await
+        .expect("C loads before independent WorkUnit transition")
+        .expect("C exists");
+    let dependency_snapshot = |dependencies: Vec<db::WorkUnitDependency>| {
+        dependencies
+            .into_iter()
+            .map(|dependency| (dependency.depends_on_work_unit_id, dependency.satisfied))
+            .collect::<Vec<_>>()
+    };
+    let a_dependencies_before = dependency_snapshot(
+        WorkUnitRepo::list_dependencies(&db, &a)
+            .await
+            .expect("A dependencies load before independent transition"),
+    );
+    let b_dependencies_before = dependency_snapshot(
+        WorkUnitRepo::list_dependencies(&db, &b)
+            .await
+            .expect("B dependencies load before independent transition"),
+    );
+    let c_dependencies_before = dependency_snapshot(
+        WorkUnitRepo::list_dependencies(&db, &c)
+            .await
+            .expect("C dependencies load before independent transition"),
+    );
+    ExecutionRepo::update(
+        &db,
+        UpdateExecution {
+            id: execution_ids[1].clone(),
+            status: Some(ExecutionStatus::Completed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            external_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: Some(Some("independent-e-result".into())),
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("independent E Execution completes");
+    WorkUnitRepo::transition(
+        &db,
+        db::TransitionWorkUnit {
+            id: e.clone(),
+            expected_version: 1,
+            status: WorkUnitStatus::Completed,
+            updated_at: now_rfc3339(),
+        },
+        event("work_unit.completed", "work_unit", &e, &task_id, &human_id),
+    )
+    .await
+    .expect("independent E WorkUnit completes");
+    assert_eq!(
+        WorkUnitRepo::get_by_id(&db, &a)
+            .await
+            .expect("A reloads")
+            .expect("A remains")
+            .status,
+        a_before.status
+    );
+    assert_eq!(
+        WorkUnitRepo::get_by_id(&db, &b)
+            .await
+            .expect("B reloads")
+            .expect("B remains")
+            .status,
+        b_before.status
+    );
+    assert_eq!(
+        WorkUnitRepo::get_by_id(&db, &c)
+            .await
+            .expect("C reloads")
+            .expect("C remains")
+            .status,
+        c_before.status
+    );
+    assert_eq!(
+        dependency_snapshot(
+            WorkUnitRepo::list_dependencies(&db, &a)
+                .await
+                .expect("A dependencies reload"),
+        ),
+        a_dependencies_before
+    );
+    assert_eq!(
+        dependency_snapshot(
+            WorkUnitRepo::list_dependencies(&db, &b)
+                .await
+                .expect("B dependencies reload"),
+        ),
+        b_dependencies_before
+    );
+    assert_eq!(
+        dependency_snapshot(
+            WorkUnitRepo::list_dependencies(&db, &c)
+                .await
+                .expect("C dependencies reload"),
+        ),
+        c_dependencies_before
+    );
+
     let active_operation = TaskIntegrationOperationRepo::begin(
         &db,
         db::CreateTaskIntegrationOperation {

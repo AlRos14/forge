@@ -3773,6 +3773,21 @@ mod tests {
             .await,
             0
         );
+        assert_eq!(
+            fixture
+                .runtime
+                .dispatch_one()
+                .await
+                .expect("failed wake is not selected for another automatic attempt"),
+            DispatchOutcome::Idle
+        );
+        assert_eq!(
+            fixture
+                .provider_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "durable rejection is never automatically replayed"
+        );
     }
 
     #[tokio::test]

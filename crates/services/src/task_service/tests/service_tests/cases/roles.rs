@@ -413,6 +413,7 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent(&db).await;
+    let agent_c = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     service
         .create_task_role(
@@ -431,6 +432,10 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
         .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_b.clone()))
         .await
         .expect("Agent B joins implementer");
+    service
+        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_c.clone()))
+        .await
+        .expect("Agent C joins implementer");
 
     let task = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
@@ -587,13 +592,18 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
         create_running_work_unit(&db, &service, &task, &repo_id, &agent_a, &now).await;
     let (unit_b, workspace_b, execution_b) =
         create_running_work_unit(&db, &service, &task, &repo_id, &agent_b, &now).await;
+    let (unit_c, workspace_c, execution_c) =
+        create_running_work_unit(&db, &service, &task, &repo_id, &agent_c, &now).await;
     assert_ne!(workspace_a.id, workspace_b.id);
+    assert_ne!(workspace_a.id, workspace_c.id);
+    assert_ne!(workspace_b.id, workspace_c.id);
     let execution_count_before: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
             .bind(&task.id)
             .fetch_one(db.pool())
             .await
             .expect("Task Execution count loads");
+    assert_eq!(execution_count_before, 3);
     let recovery = service
         .recover_task(
             task.id.clone(),
@@ -622,7 +632,13 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
         .await
         .expect("B lease loads")
         .expect("B lease is active");
+    let lease_c = db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &unit_c.id)
+        .await
+        .expect("C lease loads")
+        .expect("C lease is active");
     assert_ne!(lease_a.id, lease_b.id);
+    assert_ne!(lease_a.id, lease_c.id);
+    assert_ne!(lease_b.id, lease_c.id);
     assert_eq!(
         lease_a.workspace_id.as_deref(),
         Some(workspace_a.id.as_str())
@@ -631,6 +647,13 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
         lease_b.workspace_id.as_deref(),
         Some(workspace_b.id.as_str())
     );
+    assert_eq!(
+        lease_c.workspace_id.as_deref(),
+        Some(workspace_c.id.as_str())
+    );
+    assert_eq!(lease_a.execution_id, execution_a);
+    assert_eq!(lease_b.execution_id, execution_b);
+    assert_eq!(lease_c.execution_id, execution_c);
 
     assert!(service
         .verify_active_workspace_lease(
@@ -762,6 +785,14 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
             .expect("B lease remains active")
             .execution_id,
         execution_b
+    );
+    assert_eq!(
+        db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &unit_c.id)
+            .await
+            .expect("C lease reloads")
+            .expect("C lease remains active")
+            .execution_id,
+        execution_c
     );
 }
 

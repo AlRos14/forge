@@ -3,6 +3,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use api::{build_router, AppState};
@@ -18,6 +19,7 @@ use axum::{
 use config::{ForgeConfig, TerminalConfig};
 use db::{new_uuid_v4, now_rfc3339};
 use events::EventBus;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -567,6 +569,71 @@ async fn terminal_session_runtime_hint_is_not_public_sse() {
         !stream.contains("event: task.terminal.session_changed"),
         "internal terminal runtime hint leaked into public SSE: {stream}"
     );
+}
+
+#[tokio::test]
+async fn committed_domain_event_is_projected_to_authorized_public_sse() {
+    let harness = setup(TerminalConfig::default()).await;
+    let task = seed_task(&harness).await;
+    let sse = sse_request(&harness.app).await;
+    assert_eq!(sse.status(), StatusCode::OK);
+    let mut body = sse.into_body().into_data_stream();
+
+    let event_id = new_uuid_v4();
+    let event = db::DomainEventRepo::append_event(
+        &*harness.state.db,
+        db::CreateDomainEvent {
+            id: event_id.clone(),
+            event_type: "task.lifecycle_changed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: task.task_id.clone(),
+            actor_type: "human".to_owned(),
+            actor_id: Some(TEST_USER_ID.to_owned()),
+            scope_type: "task".to_owned(),
+            scope_id: task.task_id.clone(),
+            correlation_id: event_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: json!({
+                "task_id": task.task_id,
+                "from_state": "ready",
+                "to_state": "active",
+                "from_version": 1,
+                "to_version": 2,
+                "cause_kind": "test",
+                "cause_ref": "accepted",
+                "secret": "must not be projected"
+            })
+            .to_string(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    services::DomainEventService::publish_committed_hint(&harness.state.event_bus, &event);
+
+    let frame = tokio::time::timeout(Duration::from_secs(2), body.next())
+        .await
+        .expect("committed public event should reach the stream")
+        .expect("SSE body should remain open until the event arrives")
+        .expect("SSE body frame should be valid");
+    let frame = String::from_utf8(frame.to_vec()).unwrap();
+    assert!(frame.contains("event: task.lifecycle_changed"), "{frame}");
+    assert!(frame.contains(&format!("id: {event_id}")), "{frame}");
+    let data = frame
+        .lines()
+        .find_map(|line| line.strip_prefix("data:"))
+        .expect("SSE event should contain a data field")
+        .trim();
+    let envelope: Value = serde_json::from_str(data).unwrap();
+    assert_eq!(envelope["event_type"], "task.lifecycle_changed");
+    assert_eq!(envelope["event_id"], event_id);
+    assert!(envelope["sequence"].as_u64().is_some());
+    assert_eq!(envelope["entity_id"], task.task_id);
+    assert_eq!(envelope["payload"]["to_state"], "active");
+    assert!(envelope["payload"].get("secret").is_none());
+    harness.state.shutdown_signal.request();
 }
 
 #[tokio::test]
