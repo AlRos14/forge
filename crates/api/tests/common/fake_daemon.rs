@@ -21,9 +21,9 @@ use db::{
     CreateRepo, CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkUnit,
     CreateWorkUnitExecution, CreateWorkUnitWorkspace, CreateWorkspace, CreateWorkspaceLease,
     DaemonRepo, DaemonStatus, Execution, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo,
-    RoleMembershipRepo, RoleMembershipStatus, TaskRepo, TaskRoleRepo, UpsertDaemon, UserRepo,
-    WorkMode, WorkUnit, WorkUnitExecutionRepo, WorkUnitRepo, WorkUnitWorkspaceRepo, WorkspaceRepo,
-    WorkspaceStatus,
+    RoleMembershipRepo, RoleMembershipStatus, TaskRepo, TaskRoleRepo, UpdateDaemonReport,
+    UpsertDaemon, UserRepo, WorkMode, WorkUnit, WorkUnitExecutionRepo, WorkUnitRepo,
+    WorkUnitWorkspaceRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -167,6 +167,52 @@ async fn create_implementation_work_unit(
     .await
     .expect("WorkUnit creates")
     .record
+}
+
+async fn authorized_daemon_execution_snapshot(
+    state: &AppState,
+    agent_id: &str,
+    executor_type: &str,
+) -> Value {
+    let agent = AgentRepo::get_by_id(&*state.db, agent_id)
+        .await
+        .expect("execution fixture Agent loads")
+        .expect("execution fixture Agent exists");
+    let daemon_id = agent
+        .daemon_id
+        .as_deref()
+        .expect("execution fixture Agent is assigned to a daemon");
+    let now = db::now_rfc3339();
+    DaemonRepo::update_report(
+        &*state.db,
+        UpdateDaemonReport {
+            id: daemon_id.to_owned(),
+            last_report_at: now.clone(),
+            status: DaemonStatus::Online,
+            detected_clis_json: json!([{
+                "kind": executor_type,
+                "availability": "authenticated"
+            }])
+            .to_string(),
+            labels_json: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("execution fixture daemon reports authenticated executor");
+    let daemon = DaemonRepo::get_by_id(&*state.db, daemon_id)
+        .await
+        .expect("execution fixture daemon loads")
+        .expect("execution fixture daemon exists");
+
+    json!({
+        "agent_id": agent.id,
+        "agent_daemon_id": agent.daemon_id,
+        "daemon_authority": db::daemon_authority_snapshot(&agent, &daemon),
+        "executor_type": executor_type,
+        "config": {},
+        "resolved_daemon_id": daemon.id,
+    })
 }
 
 pub type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -651,6 +697,8 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
     .await
     .expect("agent creates");
 
+    let executor_snapshot = authorized_daemon_execution_snapshot(state, &agent_id, "codex").await;
+
     let work_unit = create_implementation_work_unit(state, &task, &agent_id, false).await;
     let execution = CreateExecution {
         id: uuid::Uuid::new_v4().to_string(),
@@ -675,9 +723,12 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
         error: None,
         executor_config_snapshot_json: Some(
             json!({
-                "executor_type": "codex",
-                "config": {},
-                "resolved_daemon_id": daemon_id,
+                "agent_id": executor_snapshot["agent_id"],
+                "agent_daemon_id": executor_snapshot["agent_daemon_id"],
+                "daemon_authority": executor_snapshot["daemon_authority"],
+                "executor_type": executor_snapshot["executor_type"],
+                "config": executor_snapshot["config"],
+                "resolved_daemon_id": executor_snapshot["resolved_daemon_id"],
                 "harness_capabilities": api_types::HarnessCapabilities::unknown().snapshot()
             })
             .to_string(),
@@ -829,6 +880,7 @@ pub async fn seed_startable_execution_for_daemon(
     )
     .await
     .expect("agent creates");
+    let executor_snapshot = authorized_daemon_execution_snapshot(state, &agent_id, "shell").await;
     let work_unit = create_implementation_work_unit(state, &task, &agent_id, true).await;
     let workspace = WorkUnitWorkspaceRepo::create_for_work_unit(
         &*state.db,
@@ -870,14 +922,7 @@ pub async fn seed_startable_execution_for_daemon(
         before_sha: None,
         after_sha: None,
         error: None,
-        executor_config_snapshot_json: Some(
-            serde_json::json!({
-                "executor_type": "shell",
-                "config": {},
-                "resolved_daemon_id": daemon_id
-            })
-            .to_string(),
-        ),
+        executor_config_snapshot_json: Some(executor_snapshot.to_string()),
         workspace_id: Some(workspace.id.clone()),
         created_at: now.clone(),
         updated_at: now.clone(),

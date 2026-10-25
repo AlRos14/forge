@@ -6,8 +6,8 @@ use db::{
     CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkspace, DaemonRepo, DaemonStatus,
     ExecutionPurpose, ExecutionRepo, ExecutionStatus, ProjectMemberRepo, ProjectRepo, RepoRepo,
     RoleMembershipRepo, RoleMembershipStatus, SqliteDb, Task, TaskRepo, TaskRoleRepo,
-    UpdateProject, UpdateTask, UpsertDaemon, User, UserRepo, ValidationRunRepo, WorkspaceRepo,
-    WorkspaceStatus,
+    UpdateDaemonReport, UpdateProject, UpdateTask, UpsertDaemon, User, UserRepo, ValidationRunRepo,
+    WorkspaceRepo, WorkspaceStatus,
 };
 use events::EventBus;
 use serde_json::{json, Value};
@@ -481,8 +481,13 @@ async fn seed_agent_registration_deps(state: &AppState) -> (String, String) {
 
 #[allow(dead_code)]
 async fn seed_agent(state: &AppState, name: &str) -> Agent {
+    seed_agent_with_owner(state, name, None).await
+}
+
+async fn seed_agent_with_owner(state: &AppState, name: &str, owner_id: Option<&str>) -> Agent {
     let now = now_rfc3339();
     let daemon_id = new_uuid_v4();
+    let owner_id = owner_id.map(str::to_owned);
     let daemon = DaemonRepo::upsert_by_machine_id(
         &*state.db,
         UpsertDaemon {
@@ -495,7 +500,7 @@ async fn seed_agent(state: &AppState, name: &str) -> Agent {
             labels_json: "{}".to_owned(),
             status: DaemonStatus::Online,
             registration_token_hash: None,
-            owner_id: None,
+            owner_id: owner_id.clone(),
             visibility: "global".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -503,6 +508,23 @@ async fn seed_agent(state: &AppState, name: &str) -> Agent {
     )
     .await
     .expect("daemon creates");
+
+    if owner_id.is_some() {
+        DaemonRepo::update_report(
+            &*state.db,
+            UpdateDaemonReport {
+                id: daemon.id.clone(),
+                last_report_at: now.clone(),
+                status: DaemonStatus::Online,
+                detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#
+                    .to_owned(),
+                labels_json: None,
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("owned execution fixture daemon reports authenticated shell");
+    }
 
     AgentRepo::create(
         &*state.db,
@@ -525,7 +547,7 @@ async fn seed_agent(state: &AppState, name: &str) -> Agent {
             last_heartbeat_at: None,
             is_default: false,
             paused: false,
-            owner_id: None,
+            owner_id,
             visibility: "global".to_owned(),
             prompt_template: None,
             created_at: now.clone(),
@@ -854,7 +876,17 @@ fn mcp_execution_output_exposes_pr2_authority_fields() {
     run_async(async {
         let state = sqlite_state().await;
         let task = seed_task(&state).await;
-        let agent = seed_agent(&state, "PR2 output agent").await;
+        let agent = seed_agent_with_owner(&state, "PR2 output agent", Some("test-user")).await;
+        let daemon = DaemonRepo::get_by_id(
+            &*state.db,
+            agent
+                .daemon_id
+                .as_deref()
+                .expect("output Agent has a daemon binding"),
+        )
+        .await
+        .expect("output Agent daemon loads")
+        .expect("output Agent daemon exists");
         let now = now_rfc3339();
         ExecutionRepo::create(
             &*state.db,
@@ -879,7 +911,17 @@ fn mcp_execution_output_exposes_pr2_authority_fields() {
                 before_sha: None,
                 after_sha: None,
                 error: None,
-                executor_config_snapshot_json: None,
+                executor_config_snapshot_json: Some(
+                    json!({
+                        "agent_id": agent.id,
+                        "agent_daemon_id": agent.daemon_id,
+                        "daemon_authority": db::daemon_authority_snapshot(&agent, &daemon),
+                        "executor_type": agent.executor_type,
+                        "config": {},
+                        "resolved_daemon_id": daemon.id,
+                    })
+                    .to_string(),
+                ),
                 workspace_id: None,
                 created_at: now.clone(),
                 updated_at: now,

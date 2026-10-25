@@ -89,6 +89,21 @@ async fn execution_external_session_id(
         .flatten()
 }
 
+async fn authorized_execution_snapshot(
+    db: &db::SqliteDb,
+    task: &db::Task,
+    agent_id: &str,
+) -> String {
+    let agent = db::AgentRepo::get_by_id(db, agent_id)
+        .await
+        .expect("Execution fixture Agent loads")
+        .expect("Execution fixture Agent exists");
+    crate::task_service::config::build_executor_config_snapshot(db, task, &agent, None, None)
+        .await
+        .expect("Execution fixture authority snapshot builds")
+        .expect("Execution fixture Agent snapshot exists")
+}
+
 async fn add_human_reviewer(
     db: &db::SqliteDb,
     service: &TaskService,
@@ -1274,6 +1289,19 @@ async fn create_remote_execution_fixture(
     purpose: db::ExecutionPurpose,
 ) -> Execution {
     let now = now_rfc3339();
+    let task = db::TaskRepo::get_by_id(db, task_id, false)
+        .await
+        .expect("remote Execution fixture Task loads")
+        .expect("remote Execution fixture Task exists");
+    let agent = db::AgentRepo::get_by_id(db, agent_id)
+        .await
+        .expect("remote Execution fixture Agent loads")
+        .expect("remote Execution fixture Agent exists");
+    let executor_config_snapshot_json =
+        crate::task_service::config::build_executor_config_snapshot(db, &task, &agent, None, None)
+            .await
+            .expect("remote Execution fixture authority snapshot builds")
+            .expect("remote Execution fixture Agent snapshot exists");
     db::ExecutionRepo::create(
         db,
         db::CreateExecution {
@@ -1301,7 +1329,7 @@ async fn create_remote_execution_fixture(
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(executor_config_snapshot_json),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now,
@@ -1318,6 +1346,7 @@ async fn pr8_agent_review_execution_materializes_one_exact_review_report() {
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
+    let executor_config_snapshot_json = authorized_execution_snapshot(&db, &task, &agent_id).await;
     let now = now_rfc3339();
     let execution = db::ExecutionRepo::create(
         &*db,
@@ -1342,7 +1371,7 @@ async fn pr8_agent_review_execution_materializes_one_exact_review_report() {
             before_sha: Some("aaaaaaa000000000000000000000000000000000".to_owned()),
             after_sha: Some("bbbbbbb000000000000000000000000000000000".to_owned()),
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(executor_config_snapshot_json),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1799,6 +1828,7 @@ async fn pr8_review_subject_uses_exact_workunit_workspace_and_matching_evidence(
     let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
+    let executor_config_snapshot_json = authorized_execution_snapshot(&db, &task, &agent_id).await;
     service
         .create_task_role(
             &task.id,
@@ -1944,7 +1974,7 @@ async fn pr8_review_subject_uses_exact_workunit_workspace_and_matching_evidence(
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(executor_config_snapshot_json),
             workspace_id: Some(work_unit_workspace.id.clone()),
             created_at: now.clone(),
             updated_at: now,
@@ -2811,6 +2841,8 @@ async fn execution_start_event_and_initial_artifact_inputs_commit_atomically() {
     let agent_id = seed_agent(&first_db).await;
     let task =
         seed_task_with_status(&first_db, &project_id, &repo_id, TaskLifecycleState::Active).await;
+    let executor_config_snapshot_json =
+        authorized_execution_snapshot(&first_db, &task, &agent_id).await;
     let producer_id = db::new_uuid_v4();
     db::ExecutionRepo::create(
         &*first_db,
@@ -2871,7 +2903,7 @@ async fn execution_start_event_and_initial_artifact_inputs_commit_atomically() {
         before_sha: None,
         after_sha: None,
         error: None,
-        executor_config_snapshot_json: None,
+        executor_config_snapshot_json: Some(executor_config_snapshot_json.clone()),
         workspace_id: None,
         created_at: now_rfc3339(),
         updated_at: now_rfc3339(),
@@ -2954,7 +2986,7 @@ async fn execution_start_event_and_initial_artifact_inputs_commit_atomically() {
         before_sha: None,
         after_sha: None,
         error: None,
-        executor_config_snapshot_json: None,
+        executor_config_snapshot_json: Some(executor_config_snapshot_json),
         workspace_id: None,
         created_at: now_rfc3339(),
         updated_at: now_rfc3339(),
