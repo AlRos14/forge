@@ -165,6 +165,13 @@ inside the serialized Provider Start claim. A changed authority fails without
 sending Start. Uncertain Start receipts remain single-attempt and are not
 retried automatically.
 
+Automatic Orchestrator execution also requires the current Task Project owner
+to match the Agent owner. `global` Agent visibility permits discovery and
+TaskRole membership, but is not an execution grant. Cross-account Agent
+execution grants are not implemented; a missing or mismatched Project or Agent
+owner fails closed both when the Orchestrator Execution is admitted and when
+Provider Start is claimed.
+
 ## Frozen Execution host (Plan PR10)
 
 Admission may resolve an Agent's pinned daemon or select an available daemon

@@ -2698,6 +2698,26 @@ mod tests {
         id
     }
 
+    async fn test_admin_user(database: &Arc<db::SqliteDb>, name: &str) -> String {
+        let now = now_rfc3339();
+        let id = new_uuid_v4();
+        UserRepo::create_user(
+            &**database,
+            &User {
+                id: id.clone(),
+                email: format!("{id}@example.test"),
+                password_hash: "test-only".to_owned(),
+                display_name: Some(name.to_owned()),
+                is_admin: true,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("administrator Actor creates");
+        id
+    }
+
     async fn test_project(database: &Arc<db::SqliteDb>, owner_id: &str) -> String {
         let now = now_rfc3339();
         let id = new_uuid_v4();
@@ -2852,7 +2872,12 @@ mod tests {
         service: Arc<TaskService>,
         runtime: OrchestratorRuntime,
         _workspace_root: tempfile::TempDir,
+        project_id: String,
         task_id: String,
+        agent_id: String,
+        agent_owner_id: String,
+        daemon_id: String,
+        foreign_owner_id: String,
         role_id: String,
         membership_id: String,
         wake_id: String,
@@ -2866,7 +2891,21 @@ mod tests {
     async fn provider_start_fixture(
         claim_barrier: Option<Arc<tokio::sync::Barrier>>,
     ) -> ProviderStartFixture {
-        provider_start_fixture_with_options(claim_barrier, true, None).await
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider: Arc<dyn crate::daemon_transport::ExecutionProvider> =
+            Arc::new(FixedStartProvider {
+                outcome: FixedStartOutcome::Accepted,
+                calls: Arc::clone(&calls),
+                started: Arc::clone(&started),
+            });
+        provider_start_fixture_with_options(
+            claim_barrier,
+            true,
+            Some((provider, calls, started)),
+            false,
+        )
+        .await
     }
 
     #[derive(Clone, Copy)]
@@ -2928,7 +2967,25 @@ mod tests {
                 calls: Arc::clone(&calls),
                 started: Arc::clone(&started),
             });
-        provider_start_fixture_with_options(claim_barrier, false, Some((provider, calls, started)))
+        provider_start_fixture_with_options(
+            claim_barrier,
+            false,
+            Some((provider, calls, started)),
+            false,
+        )
+        .await
+    }
+
+    async fn cross_account_provider_start_fixture() -> ProviderStartFixture {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider: Arc<dyn crate::daemon_transport::ExecutionProvider> =
+            Arc::new(FixedStartProvider {
+                outcome: FixedStartOutcome::Accepted,
+                calls: Arc::clone(&calls),
+                started: Arc::clone(&started),
+            });
+        provider_start_fixture_with_options(None, false, Some((provider, calls, started)), true)
             .await
     }
 
@@ -2983,11 +3040,11 @@ mod tests {
         claim_barrier: Option<Arc<tokio::sync::Barrier>>,
         prepare_start: bool,
         provider_override: Option<ProviderOverride>,
+        cross_account_project: bool,
     ) -> ProviderStartFixture {
         use db::{
-            AgentStatus, CreateAgent, CreateDomainEvent, CreateRoleMembership, DaemonRepo,
-            DaemonStatus, DomainEventRepo, OrchestratorWakeRepo, RoleMembershipRepo,
-            RoleMembershipStatus, TaskRoleRepo, UpdateDaemonReport, UpsertDaemon,
+            AgentStatus, CreateAgent, CreateDomainEvent, DaemonRepo, DaemonStatus, DomainEventRepo,
+            OrchestratorWakeRepo, TaskRoleRepo, UpdateDaemonReport, UpsertDaemon,
         };
 
         let pool = db::create_sqlite_pool("sqlite::memory:")
@@ -2996,8 +3053,14 @@ mod tests {
         db::run_migrations(&pool).await.expect("schema migrates");
         let database = Arc::new(db::SqliteDb::new(pool));
         let event_bus = Arc::new(EventBus::new(16));
-        let human_id = test_user(&database, "Provider start fixture owner").await;
-        let project_id = test_project(&database, &human_id).await;
+        let agent_owner_id = test_user(&database, "Provider start fixture Agent owner").await;
+        let foreign_owner_id = test_user(&database, "Provider start fixture other account").await;
+        let project_owner_id = if cross_account_project {
+            foreign_owner_id.as_str()
+        } else {
+            agent_owner_id.as_str()
+        };
+        let project_id = test_project(&database, project_owner_id).await;
         let task_id = test_task(&database, &project_id, "Provider start authority").await;
 
         let now = now_rfc3339();
@@ -3006,22 +3069,22 @@ mod tests {
             &*database,
             UpsertDaemon {
                 id: daemon_id.clone(),
-                machine_id: crate::embedded_daemon::embedded_machine_id(),
+                machine_id: format!("provider-start-{daemon_id}"),
                 hostname: "provider-start-fixture".to_owned(),
                 os: "linux".to_owned(),
                 arch: "x86_64".to_owned(),
                 agent_version: None,
                 labels_json: "{}".to_owned(),
                 status: DaemonStatus::Online,
-                registration_token_hash: None,
-                owner_id: None,
+                registration_token_hash: Some("fixture-daemon-registration-token-hash".to_owned()),
+                owner_id: Some(agent_owner_id.clone()),
                 visibility: "global".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
         )
         .await
-        .expect("embedded daemon creates");
+        .expect("externally registered daemon creates");
         DaemonRepo::update_report(
             &*database,
             UpdateDaemonReport {
@@ -3052,7 +3115,7 @@ mod tests {
                 capabilities_json: "[]".to_owned(),
                 config_json: "{}".to_owned(),
                 credential_ref: None,
-                daemon_id: Some(daemon_id),
+                daemon_id: Some(daemon_id.clone()),
                 max_concurrent_tasks: 2,
                 heartbeat_interval_seconds: 30,
                 max_missed_heartbeats: 3,
@@ -3060,7 +3123,7 @@ mod tests {
                 last_heartbeat_at: None,
                 is_default: false,
                 paused: false,
-                owner_id: None,
+                owner_id: Some(agent_owner_id.clone()),
                 visibility: "global".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -3076,21 +3139,6 @@ mod tests {
             "{}",
         )
         .await;
-        let membership_id = new_uuid_v4();
-        RoleMembershipRepo::add(
-            &*database,
-            CreateRoleMembership {
-                id: membership_id.clone(),
-                task_role_id: role_id.clone(),
-                actor_kind: ActorKind::Agent,
-                actor_id: agent_id.clone(),
-                status: RoleMembershipStatus::Active,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("Agent is an active orchestrator member");
 
         let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_started = Arc::new(tokio::sync::Notify::new());
@@ -3116,6 +3164,15 @@ mod tests {
             task_service = task_service.with_execution_provider_override(Arc::clone(provider));
         }
         let service = Arc::new(task_service);
+        let membership = service
+            .add_task_role_member(
+                &task_id,
+                "orchestrator",
+                api_types::ActorRef::Agent(agent_id.clone()),
+            )
+            .await
+            .expect("global Agent remains eligible for orchestrator TaskRole membership");
+        let membership_id = membership.id;
         let runtime = OrchestratorRuntime::new(
             Arc::clone(&database),
             Arc::clone(&event_bus),
@@ -3234,7 +3291,12 @@ mod tests {
             service,
             runtime,
             _workspace_root,
+            project_id,
             task_id,
+            agent_id,
+            agent_owner_id,
+            daemon_id,
+            foreign_owner_id,
             role_id,
             membership_id,
             wake_id,
@@ -3255,6 +3317,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum OrchestratorClaimMutation {
         SuspendMembership,
+        ChangeProjectOwner,
         ChangeTaskRolePolicy,
         FailWake,
         ExpireWakeLease,
@@ -3292,6 +3355,47 @@ mod tests {
                 )
                 .await
                 .expect("membership suspends after preflight");
+            }
+            OrchestratorClaimMutation::ChangeProjectOwner => {
+                let task = TaskRepo::get_by_id(&*fixture.database, &fixture.task_id, false)
+                    .await
+                    .expect("Task loads")
+                    .expect("Task exists");
+                let changed = sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+                    .bind(&fixture.foreign_owner_id)
+                    .bind(&task.project_id)
+                    .execute(fixture.database.pool())
+                    .await
+                    .expect("Project owner changes after Start preflight");
+                assert_eq!(changed.rows_affected(), 1);
+                let (project_owner, agent_owner): (Option<String>, Option<String>) =
+                    sqlx::query_as(
+                        "SELECT project.owner_id, agent.owner_id
+                         FROM project
+                         JOIN agent_current AS agent ON agent.id = ?
+                         WHERE project.id = ?",
+                    )
+                    .bind(&fixture.agent_id)
+                    .bind(&task.project_id)
+                    .fetch_one(fixture.database.pool())
+                    .await
+                    .expect("changed Project and Agent owners load");
+                assert_eq!(
+                    project_owner.as_deref(),
+                    Some(fixture.foreign_owner_id.as_str())
+                );
+                assert_eq!(
+                    agent_owner.as_deref(),
+                    Some(fixture.agent_owner_id.as_str())
+                );
+                assert_ne!(project_owner, agent_owner);
+                assert_eq!(task.project_id, fixture.project_id);
+                let execution = ExecutionRepo::get_by_id(&*fixture.database, &fixture.execution_id)
+                    .await
+                    .expect("admitted Execution loads")
+                    .expect("admitted Execution exists");
+                assert_eq!(execution.role, "orchestrator");
+                assert_eq!(execution.purpose, Some(db::ExecutionPurpose::Orchestrate));
             }
             OrchestratorClaimMutation::ChangeTaskRolePolicy => {
                 let role = TaskRoleRepo::get_by_id(&*fixture.database, &fixture.role_id)
@@ -3438,6 +3542,173 @@ mod tests {
             OrchestratorClaimMutation::SuspendMembership,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn pr20_orchestrator_claim_rejects_project_owner_change_after_preflight() {
+        assert_orchestrator_provider_claim_rejects_race(
+            OrchestratorClaimMutation::ChangeProjectOwner,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pr20_cross_account_global_orchestrator_cannot_start_owner_daemon() {
+        let fixture = cross_account_provider_start_fixture().await;
+
+        let (
+            project_owner,
+            agent_owner,
+            daemon_owner,
+            visibility,
+            daemon_status,
+            detected_clis,
+            daemon_machine_id,
+            registration_token_hash,
+            bound_daemon,
+        ): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT project.owner_id, agent.owner_id, daemon.owner_id,
+                        agent.visibility, daemon.status, daemon.detected_clis_json,
+                        daemon.machine_id, daemon.registration_token_hash,
+                        agent.daemon_id
+                 FROM project
+                 JOIN task ON task.project_id = project.id
+                 JOIN agent_current AS agent ON agent.id = ?
+                 JOIN daemon ON daemon.id = agent.daemon_id
+                 WHERE project.id = ? AND task.id = ?",
+        )
+        .bind(&fixture.agent_id)
+        .bind(&fixture.project_id)
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("cross-account Agent, Project, and daemon authority loads");
+        assert_eq!(
+            project_owner.as_deref(),
+            Some(fixture.foreign_owner_id.as_str())
+        );
+        assert_eq!(
+            agent_owner.as_deref(),
+            Some(fixture.agent_owner_id.as_str())
+        );
+        assert_eq!(
+            daemon_owner.as_deref(),
+            Some(fixture.agent_owner_id.as_str())
+        );
+        assert_eq!(visibility, "global");
+        assert_eq!(daemon_status, "online");
+        assert!(daemon_machine_id.starts_with("provider-start-"));
+        assert_ne!(
+            daemon_machine_id,
+            crate::embedded_daemon::embedded_machine_id()
+        );
+        assert!(registration_token_hash.is_some());
+        assert_eq!(bound_daemon.as_deref(), Some(fixture.daemon_id.as_str()));
+        assert!(detected_clis.contains("authenticated"));
+
+        let outcome = fixture
+            .runtime
+            .dispatch_one()
+            .await
+            .expect("dispatch resolves");
+        let provider_calls = fixture
+            .provider_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (execution_id, attempt_state): (String, String) = sqlx::query_as(
+            "SELECT execution_id, state FROM orchestrator_wake_execution
+             WHERE wake_id = ? ORDER BY attempt_number DESC LIMIT 1",
+        )
+        .bind(&fixture.wake_id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("cross-account attempt is durably resolved");
+        let execution = ExecutionRepo::get_by_id(&*fixture.database, &execution_id)
+            .await
+            .expect("Execution lookup succeeds");
+        let resolved_daemon_id = execution
+            .as_ref()
+            .and_then(|execution| execution.executor_config_snapshot_json.as_deref())
+            .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
+            .and_then(|snapshot| {
+                snapshot
+                    .get("resolved_daemon_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        assert!(
+            matches!(&outcome, DispatchOutcome::Retried)
+                && provider_calls == 0
+                && execution.is_none(),
+            "cross-account global Agent must be denied before provider Start; got {outcome:?}, {provider_calls} provider calls, resolved daemon {resolved_daemon_id:?} (Agent-owned daemon {})",
+            fixture.daemon_id
+        );
+        assert_eq!(attempt_state, "reserved");
+        let wake_state: String =
+            sqlx::query_scalar("SELECT state FROM orchestrator_wake WHERE id = ?")
+                .bind(&fixture.wake_id)
+                .fetch_one(fixture.database.pool())
+                .await
+                .expect("rejected wake state loads");
+        assert_eq!(wake_state, "failed");
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution_id,
+                "execution.provider_start_attempted",
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pr20_same_account_global_orchestrator_can_start_owner_daemon() {
+        let fixture = provider_start_pending_fixture(None, FixedStartOutcome::Accepted).await;
+
+        assert!(matches!(
+            fixture
+                .runtime
+                .dispatch_one()
+                .await
+                .expect("dispatch resolves"),
+            DispatchOutcome::Dispatched
+        ));
+
+        let (execution, _, _) = dispatched_provider_start(&fixture).await;
+        assert_eq!(
+            fixture
+                .provider_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_attempted",
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            provider_start_receipt_count(
+                &fixture.database,
+                &execution.id,
+                "execution.provider_start_accepted",
+            )
+            .await,
+            1
+        );
     }
 
     #[tokio::test]
@@ -4601,8 +4872,9 @@ mod tests {
     ) -> Pr6CompletedExecutionFixture {
         use db::{
             AgentStatus, CreateAgent, CreateDomainEvent, CreateExecution, CreateRoleMembership,
-            DomainEventRepo, ExecutionRepo, ExecutionStatus, OrchestratorWakeRepo,
-            RoleMembershipRepo, UpdateExecution,
+            DaemonRepo, DaemonStatus, DomainEventRepo, ExecutionRepo, ExecutionStatus,
+            OrchestratorWakeRepo, RoleMembershipRepo, UpdateDaemonReport, UpdateExecution,
+            UpsertDaemon,
         };
 
         let pool = db::create_sqlite_pool("sqlite::memory:")
@@ -4611,11 +4883,46 @@ mod tests {
         db::run_migrations(&pool).await.expect("schema migrates");
         let database = Arc::new(db::SqliteDb::new(pool));
         let event_bus = Arc::new(EventBus::new(8));
-        let human_id = test_user(&database, "Action receipt fixture owner").await;
+        let human_id = test_admin_user(&database, "Action receipt fixture owner").await;
         let project_id = test_project(&database, &human_id).await;
         let task_id = test_task(&database, &project_id, "Action receipt fixture").await;
         let actor_id = new_uuid_v4();
         let now = now_rfc3339();
+        let daemon_id = new_uuid_v4();
+        DaemonRepo::upsert_by_machine_id(
+            &*database,
+            UpsertDaemon {
+                id: daemon_id.clone(),
+                machine_id: crate::embedded_daemon::embedded_machine_id(),
+                hostname: "pr6-action-receipt-fixture".to_owned(),
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                agent_version: None,
+                labels_json: "{}".to_owned(),
+                status: DaemonStatus::Online,
+                registration_token_hash: None,
+                owner_id: Some(human_id.clone()),
+                visibility: "global".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("administrator-owned embedded daemon creates");
+        DaemonRepo::update_report(
+            &*database,
+            UpdateDaemonReport {
+                id: daemon_id.clone(),
+                detected_clis_json: r#"[{"kind":"codex","availability":"authenticated"}]"#
+                    .to_owned(),
+                labels_json: None,
+                status: DaemonStatus::Online,
+                last_report_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("fixture daemon reports authenticated Codex");
         db::AgentRepo::create(
             &*database,
             CreateAgent {
@@ -4630,7 +4937,7 @@ mod tests {
                 capabilities_json: "[]".to_owned(),
                 config_json: "{}".to_owned(),
                 credential_ref: None,
-                daemon_id: None,
+                daemon_id: Some(daemon_id.clone()),
                 max_concurrent_tasks: 1,
                 heartbeat_interval_seconds: 30,
                 max_missed_heartbeats: 3,
@@ -4638,7 +4945,7 @@ mod tests {
                 last_heartbeat_at: None,
                 is_default: false,
                 paused: false,
-                owner_id: None,
+                owner_id: Some(human_id.clone()),
                 visibility: "global".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -4741,6 +5048,23 @@ mod tests {
         )
         .await
         .expect("exact wake attempt reserves");
+        let action_agent = db::AgentRepo::get_by_id(&*database, &actor_id)
+            .await
+            .expect("Agent loads")
+            .expect("Agent exists");
+        let action_daemon = DaemonRepo::get_by_id(&*database, &daemon_id)
+            .await
+            .expect("daemon loads")
+            .expect("daemon exists");
+        let executor_config_snapshot = serde_json::json!({
+            "agent_id": &actor_id,
+            "agent_daemon_id": action_agent.daemon_id,
+            "daemon_authority": db::daemon_authority_snapshot(&action_agent, &action_daemon),
+            "executor_type": "codex",
+            "resolved_daemon_id": &daemon_id,
+            "config": {},
+        })
+        .to_string();
         let start_event = CreateDomainEvent {
             id: new_uuid_v4(),
             event_type: "execution.started".to_owned(),
@@ -4780,7 +5104,7 @@ mod tests {
                 before_sha: None,
                 after_sha: None,
                 error: None,
-                executor_config_snapshot_json: Some("{}".to_owned()),
+                executor_config_snapshot_json: Some(executor_config_snapshot),
                 workspace_id: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -5506,6 +5830,7 @@ mod tests {
         let database = Arc::new(db::SqliteDb::new(pool));
         let event_bus = Arc::new(EventBus::new(16));
         let now = now_rfc3339();
+        let agent_owner_id = test_admin_user(&database, "PR6 orchestrator Agent owner").await;
 
         let daemon_id = new_uuid_v4();
         DaemonRepo::upsert_by_machine_id(
@@ -5520,7 +5845,7 @@ mod tests {
                 labels_json: "{}".to_owned(),
                 status: DaemonStatus::Online,
                 registration_token_hash: None,
-                owner_id: None,
+                owner_id: Some(agent_owner_id.clone()),
                 visibility: "global".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -5558,7 +5883,7 @@ mod tests {
                 capabilities_json: "[]".to_owned(),
                 config_json: "{}".to_owned(),
                 credential_ref: None,
-                daemon_id: Some(daemon_id),
+                daemon_id: Some(daemon_id.clone()),
                 max_concurrent_tasks: 1,
                 heartbeat_interval_seconds: 30,
                 max_missed_heartbeats: 3,
@@ -5566,7 +5891,7 @@ mod tests {
                 last_heartbeat_at: None,
                 is_default: false,
                 paused: false,
-                owner_id: None,
+                owner_id: Some(agent_owner_id.clone()),
                 visibility: "global".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -5583,7 +5908,7 @@ mod tests {
                 name: "PR6 Agent wake".to_owned(),
                 settings: "{}".to_owned(),
                 primary_repo_id: None,
-                owner_id: None,
+                owner_id: Some(agent_owner_id),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
@@ -5675,6 +6000,23 @@ mod tests {
         .expect("test starts its consumer at the durable backlog boundary");
 
         let worker_execution_id = new_uuid_v4();
+        let worker_agent = AgentRepo::get_by_id(&*database, &agent_id)
+            .await
+            .expect("worker Agent loads")
+            .expect("worker Agent exists");
+        let worker_daemon = DaemonRepo::get_by_id(&*database, &daemon_id)
+            .await
+            .expect("worker daemon loads")
+            .expect("worker daemon exists");
+        let worker_config_snapshot = serde_json::json!({
+            "agent_id": worker_agent.id,
+            "agent_daemon_id": worker_agent.daemon_id,
+            "daemon_authority": db::daemon_authority_snapshot(&worker_agent, &worker_daemon),
+            "executor_type": worker_agent.executor_type,
+            "resolved_daemon_id": worker_daemon.id,
+            "config": {},
+        })
+        .to_string();
         ExecutionRepo::create(
             &*database,
             CreateExecution {
@@ -5698,7 +6040,7 @@ mod tests {
                 before_sha: None,
                 after_sha: None,
                 error: None,
-                executor_config_snapshot_json: None,
+                executor_config_snapshot_json: Some(worker_config_snapshot),
                 workspace_id: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),

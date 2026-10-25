@@ -1690,6 +1690,35 @@ mod tests {
         SqliteDb::new(pool)
     }
 
+    async fn seed_recovery_admin(db: &SqliteDb) -> String {
+        if let Some(owner_id) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM user WHERE is_admin = 1 ORDER BY created_at, id LIMIT 1",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .expect("recovery fixture administrator lookup succeeds")
+        {
+            return owner_id;
+        }
+        let now = now_rfc3339();
+        let owner_id = new_uuid_v4();
+        UserRepo::create_user(
+            db,
+            &User {
+                id: owner_id.clone(),
+                email: format!("{owner_id}@recovery.test"),
+                password_hash: "test-only".to_owned(),
+                display_name: Some("Recovery fixture administrator".to_owned()),
+                is_admin: true,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("recovery fixture administrator creates");
+        owner_id
+    }
+
     async fn seed_project_repo(db: &SqliteDb) -> (String, String) {
         let now = now_rfc3339();
         let project_id = new_uuid_v4();
@@ -1755,6 +1784,7 @@ mod tests {
         harness_kind: &str,
     ) -> Agent {
         let now = now_rfc3339();
+        let owner_id = seed_recovery_admin(db).await;
         let daemon_id = new_uuid_v4();
         DaemonRepo::upsert_by_machine_id(
             db,
@@ -1768,7 +1798,7 @@ mod tests {
                 labels_json: "{}".to_owned(),
                 status: DaemonStatus::Online,
                 registration_token_hash: None,
-                owner_id: None,
+                owner_id: Some(owner_id.clone()),
                 visibility: "global".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -1776,6 +1806,23 @@ mod tests {
         )
         .await
         .expect("daemon creates");
+        DaemonRepo::update_report(
+            db,
+            UpdateDaemonReport {
+                id: daemon_id.clone(),
+                detected_clis_json: serde_json::json!([{
+                    "kind": harness_kind,
+                    "availability": "authenticated"
+                }])
+                .to_string(),
+                labels_json: None,
+                status: DaemonStatus::Online,
+                last_report_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("daemon advertises its authenticated test harness");
 
         AgentRepo::create(
             db,
@@ -1798,7 +1845,7 @@ mod tests {
                 last_heartbeat_at,
                 is_default: false,
                 paused: false,
-                owner_id: None,
+                owner_id: Some(owner_id),
                 visibility: "global".to_owned(),
                 prompt_template: None,
                 created_at: now.clone(),
@@ -1980,6 +2027,10 @@ mod tests {
                 }
             }
         };
+        let daemon = DaemonRepo::get_by_id(db, &resolved_daemon_id)
+            .await
+            .expect("Agent daemon loads")
+            .expect("Agent daemon exists");
         let resume_support = if agent.executor_type == "codex" {
             "native"
         } else {
@@ -2053,6 +2104,7 @@ mod tests {
                             "executor_type": agent.executor_type,
                             "config": {},
                             "agent_id": agent.id,
+                            "daemon_authority": db::daemon_authority_snapshot(&agent, &daemon),
                             "agent_daemon_id": agent.daemon_id,
                             "resolved_daemon_id": resolved_daemon_id,
                             "harness_capabilities": {
@@ -4981,6 +5033,7 @@ mod tests {
         status: AgentStatus,
     ) -> (String, Agent) {
         let now = now_rfc3339();
+        let owner_id = seed_recovery_admin(db).await;
         let daemon_id = new_uuid_v4();
         DaemonRepo::upsert_by_machine_id(
             db,
@@ -4994,7 +5047,7 @@ mod tests {
                 labels_json: "{}".to_owned(),
                 status: DaemonStatus::Online,
                 registration_token_hash: None,
-                owner_id: None,
+                owner_id: Some(owner_id.clone()),
                 visibility: "global".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -5002,6 +5055,20 @@ mod tests {
         )
         .await
         .expect("daemon creates");
+        DaemonRepo::update_report(
+            db,
+            UpdateDaemonReport {
+                id: daemon_id.clone(),
+                detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#
+                    .to_owned(),
+                labels_json: None,
+                status: DaemonStatus::Online,
+                last_report_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("daemon advertises its authenticated shell harness");
 
         let agent = AgentRepo::create(
             db,
@@ -5024,7 +5091,7 @@ mod tests {
                 last_heartbeat_at: None,
                 is_default: false,
                 paused: false,
-                owner_id: None,
+                owner_id: Some(owner_id),
                 visibility: "global".to_owned(),
                 prompt_template: None,
                 created_at: now.clone(),

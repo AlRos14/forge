@@ -448,16 +448,21 @@ impl ExecutionRepo for SqliteDb {
                     .to_owned(),
             ));
         }
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let admitted: i64 = sqlx::query_scalar(
             "SELECT EXISTS(
                 SELECT 1 FROM orchestrator_wake w
                 JOIN orchestrator_wake_execution x ON x.wake_id = w.id
+                JOIN task current_task ON current_task.id = w.task_id
+                JOIN project current_project ON current_project.id = current_task.project_id
+                JOIN agent_current current_agent ON current_agent.id = w.actor_id
                 WHERE w.id = ? AND w.task_id = ? AND w.actor_kind = 'agent'
                   AND w.actor_id = ? AND w.task_role_id = (
                       SELECT id FROM task_role WHERE task_id = w.task_id
                         AND role = 'orchestrator'
                   )
+                  AND current_project.owner_id IS NOT NULL
+                  AND current_project.owner_id = current_agent.owner_id
                   AND w.state = 'leased' AND w.lease_owner = ?
                   AND EXISTS (
                       SELECT 1 FROM role_membership rm
@@ -1000,7 +1005,8 @@ impl ExecutionRepo for SqliteDb {
             let actor_id = actor.id().to_owned();
             // Orchestrator has no WorkUnit. Its exact durable Wake attempt is
             // the start authority, so bind the Wake, TaskRole snapshot,
-            // membership, lease, and Execution under this same write lock.
+            // Project account, Agent owner, membership, lease, and Execution
+            // under this same write lock.
             let wake_authority_is_current: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
                     SELECT 1
@@ -1013,6 +1019,8 @@ impl ExecutionRepo for SqliteDb {
                       ON current_execution.id = attempt.execution_id
                     JOIN task AS current_task
                       ON current_task.id = wake.task_id
+                    JOIN project AS current_project
+                      ON current_project.id = current_task.project_id
                     JOIN agent_current AS current_agent
                       ON current_agent.id = wake.actor_id
                     JOIN task_role AS role
@@ -1032,6 +1040,8 @@ impl ExecutionRepo for SqliteDb {
                       AND current_execution.work_unit_id IS NULL
                       AND current_execution.workspace_id IS NULL
                       AND current_task.deleted_at IS NULL
+                      AND current_project.owner_id IS NOT NULL
+                      AND current_project.owner_id = current_agent.owner_id
                       AND current_agent.paused = 0
                       AND wake.actor_kind = ?
                       AND wake.actor_id = ?

@@ -39,6 +39,8 @@ TaskRole and RoleMembership govern eligibility. WorkUnit allocation names the ex
 
 Forge's Orchestrator reacts to durable domain events. Its implemented output set is bounded to Messages, Handoffs, limited WorkUnit creation, and Proposals. It does not directly steer or stop a harness, reassign work, merge repositories, or execute a Proposal or Decision. Human and Agent actions remain subject to the same domain authority.
 
+Automatic Orchestrator execution requires the Agent owner and Task Project owner to be the same account. Global Agent visibility supports discovery and TaskRole membership; it does not grant cross-account execution. Forge has no cross-account Agent execution grants, so a missing or mismatched owner fails closed at Execution admission and the transactional Provider Start claim.
+
 ## Harnesses and Executions
 
 `HarnessAdapter` is the boundary for supported harness detection, profile/configuration translation, capability evidence, Start/Resume, cancellation, normalized results, and usage observations. Forge fails closed when a required capability is unknown or unsupported. It does not read a harness's private credential store.

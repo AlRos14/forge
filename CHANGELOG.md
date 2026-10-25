@@ -11,6 +11,7 @@ PR14 audit on 2026-10-16.
 ### Security
 
 - Require authenticated account ownership for daemon registration and Agent routing. `global` daemon visibility no longer grants cross-account execution; ownerless historical daemons remain preserved and ineligible for ordinary accounts. The embedded host shell is restricted to an administrator's Agent and, when the daemon has a verified owner, to that same administrator account. This intentionally breaks implicit multi-account daemon sharing.
+- Require an automatic Orchestrator Agent and its Task Project to share the same owner account. `global` Agent visibility continues to support discovery and TaskRole membership without granting use of another account's Agent daemon; the check runs at Execution admission and again in the transactional Provider Start claim. Cross-account Agent execution grants are not implemented.
 
 ### Documentation
 

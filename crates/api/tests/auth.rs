@@ -232,10 +232,10 @@ async fn sse_rejects_missing_token() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-// ── 4.9: daemon routes exempt from user JWT ────────────────────────────────
+// ── 4.9: daemon registration requires an authenticated user ────────────────
 
 #[tokio::test]
-async fn daemon_register_requires_no_user_jwt() {
+async fn daemon_register_requires_user_authentication() {
     let workspace_root = common::TestDir::new("auth-daemon-ws");
     let harness = common::test_app(workspace_root.path(), "auth-daemon").await;
 
@@ -263,11 +263,7 @@ async fn daemon_register_requires_no_user_jwt() {
         .await
         .unwrap();
 
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "daemon register must work without a user JWT"
-    );
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ── 4.10: concurrent refresh — single winner ──────────────────────────────
