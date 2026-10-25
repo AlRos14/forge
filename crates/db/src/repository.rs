@@ -744,7 +744,11 @@ pub trait DaemonRepo: Send + Sync {
     async fn update_report(&self, input: UpdateDaemonReport) -> Result<Daemon>;
     async fn mark_online(&self, id: &str, last_report_at: &str) -> Result<Daemon>;
     async fn mark_offline(&self, id: &str, updated_at: &str) -> Result<Daemon>;
-    async fn list_available_for_executor(&self, executor_type: &str) -> Result<Vec<Daemon>>;
+    async fn list_available_for_executor(
+        &self,
+        executor_type: &str,
+        owner_id: &str,
+    ) -> Result<Vec<Daemon>>;
 }
 
 #[async_trait]

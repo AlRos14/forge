@@ -4,7 +4,7 @@ use ::workspace::RepoCacheLockManager;
 use async_trait::async_trait;
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgent, CreateTask,
-    DaemonRepo, DaemonStatus, TaskLifecycleState, UpdateProject, UpsertDaemon,
+    DaemonRepo, DaemonStatus, TaskLifecycleState, UpdateProject, UpsertDaemon, User, UserRepo,
 };
 use executors::{ExecutionResult, ExecutorError};
 use tempfile::TempDir;
@@ -131,7 +131,35 @@ async fn sqlite_db() -> SqliteDb {
         .await
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
-    SqliteDb::new(pool)
+    let db = SqliteDb::new(pool);
+    seed_test_account(&db).await;
+    db
+}
+
+async fn seed_test_account(db: &SqliteDb) {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user WHERE id = 'test-account')")
+            .fetch_one(db.pool())
+            .await
+            .expect("test account lookup succeeds");
+    if exists {
+        return;
+    }
+    let now = now_rfc3339();
+    UserRepo::create_user(
+        db,
+        &User {
+            id: "test-account".to_owned(),
+            email: "test-account@test.invalid".to_owned(),
+            password_hash: "x".to_owned(),
+            display_name: None,
+            is_admin: true,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("test account creates");
 }
 
 fn run_workspace_git(path: &std::path::Path, args: &[&str]) -> String {
@@ -164,7 +192,7 @@ async fn seed_project_repo(db: &SqliteDb) -> (String, String, TempDir) {
             name: "Forge".to_owned(),
             settings: "{}".to_owned(),
             primary_repo_id: None,
-            owner_id: None,
+            owner_id: Some("test-account".to_owned()),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -262,8 +290,8 @@ async fn seed_agent_with_executor_type(
             labels_json: "{}".to_owned(),
             status: DaemonStatus::Online,
             registration_token_hash: None,
-            owner_id: None,
-            visibility: "global".to_owned(),
+            owner_id: Some("test-account".to_owned()),
+            visibility: "account".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -309,8 +337,8 @@ async fn seed_agent_with_executor_type(
             last_heartbeat_at: None,
             is_default: false,
             paused: false,
-            owner_id: None,
-            visibility: "global".to_owned(),
+            owner_id: Some("test-account".to_owned()),
+            visibility: "account".to_owned(),
             created_at: now.clone(),
             updated_at: now,
         },

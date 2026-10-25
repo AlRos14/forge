@@ -1094,6 +1094,17 @@ impl ExecutionRepo for SqliteDb {
         }
 
         let agent_id = execution.agent_id.as_deref().ok_or(DbError::NotFound)?;
+        if !super::daemon::execution_daemon_authorized_in_tx(
+            &mut tx,
+            agent_id,
+            execution.executor_config_snapshot_json.as_deref(),
+        )
+        .await?
+        {
+            tx.commit().await?;
+            return Ok(ProviderStartClaim::AuthorityLost);
+        }
+
         let paused: Option<bool> =
             sqlx::query_scalar("SELECT paused FROM agent_current WHERE id = ?")
                 .bind(agent_id)

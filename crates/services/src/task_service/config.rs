@@ -166,11 +166,8 @@ pub(super) async fn build_executor_config_snapshot(
     adapter_registry: Option<&executors::HarnessAdapterRegistry>,
 ) -> Result<Option<String>> {
     ensure_harness_adapter_profile(&agent.backend_kind, &agent.executor_type)?;
-    let resolved_daemon_id = Some(
-        crate::agent_service::resolve_daemon_for_agent(db, agent)
-            .await?
-            .id,
-    );
+    let daemon = crate::agent_service::resolve_daemon_for_agent(db, agent).await?;
+    let resolved_daemon_id = Some(daemon.id.clone());
     let mut base_config = parse_json_value("agent config_json", &agent.config_json)?;
     // Extract before normalization: the typed config round-trip drops
     // unknown fields, which would silently delete the chain.
@@ -195,6 +192,7 @@ pub(super) async fn build_executor_config_snapshot(
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
     let mut snapshot = json!({
         "agent_id": agent.id,
+        "daemon_authority": db::daemon_authority_snapshot(agent, &daemon),
         // Provider credentials remain behind the credential boundary and are
         // never copied into public execution snapshot JSON.
         "profile_id": agent.profile_id,

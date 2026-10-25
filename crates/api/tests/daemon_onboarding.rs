@@ -272,7 +272,7 @@ async fn test_app_with_state(workspace_root: &Path) -> (Router, Arc<AppState>) {
             email: "test@example.com".to_owned(),
             password_hash: "$2b$04$placeholder".to_owned(),
             display_name: None,
-            is_admin: false,
+            is_admin: true,
             created_at: now.clone(),
             updated_at: now,
         },

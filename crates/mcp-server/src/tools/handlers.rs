@@ -355,6 +355,9 @@ pub(super) async fn forge_start_execution(
             "prompt must be non-empty for an Execution",
         ));
     }
+    if let Some(db::ActorRef::Agent(agent_id)) = work_unit.assigned_actor.as_ref() {
+        services::agent_service::require_agent_account(&state.db, agent_id, user_id).await?;
+    }
     if work_unit.requires_integration {
         state
             .work_unit_service
@@ -476,7 +479,10 @@ pub(super) async fn forge_list_agents(
     let visible = page
         .items
         .into_iter()
-        .map(|agent| agent_value(agent, context.is_admin))
+        .map(|agent| {
+            let is_owner = agent.owner_id.as_deref() == Some(user_id);
+            agent_value(agent, context.is_admin && is_owner)
+        })
         .collect::<Vec<_>>();
     let has_more = page.next_cursor.is_some();
     Ok(json!({
@@ -632,7 +638,7 @@ pub(super) async fn forge_follow_up_execution(
     let agent_id = required_string_param(params, "agent_id")?;
     let overrides = optional_overrides_param(params, "overrides")?;
 
-    require_agent_visible(state, context, &agent_id).await?;
+    services::agent_service::require_agent_account(&state.db, &agent_id, user_id).await?;
     let execution = ExecutionRepo::get_by_id(&*state.db, &execution_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("execution", execution_id.to_owned()))?;
@@ -1142,24 +1148,6 @@ pub(crate) async fn require_task_access(
         .ok_or_else(|| McpToolError::not_found("task", task_id.to_owned()))?;
     require_project_access(state, &task.project_id, user_id).await?;
     Ok(task)
-}
-
-async fn require_agent_visible(
-    state: &AppState,
-    context: &McpContext,
-    agent_id: &str,
-) -> Result<db::Agent, McpToolError> {
-    let user_id = authenticated_user(context)?;
-    let agent = AgentRepo::get_by_id(&*state.db, agent_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("agent", agent_id.to_owned()))?;
-    if agent.backend_kind == "native"
-        || agent.executor_type == "embedded"
-        || (agent.visibility != "global" && agent.owner_id.as_deref() != Some(user_id))
-    {
-        return Err(McpToolError::not_found("agent", agent_id.to_owned()));
-    }
-    Ok(agent)
 }
 
 fn gate_value(

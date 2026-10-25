@@ -142,6 +142,29 @@ older account snapshot. Cursor's side-effect-free execution detection checks
 the configured executable, while the detailed availability check remains a
 separate operation.
 
+## Daemon account authority
+
+`visibility` controls which daemon records may be listed; `global` is not an
+execution grant. A daemon registered by an account is eligible only for Agents
+owned by that same account, with an online status and an authenticated executor
+capability. A daemon without a verifiable owner remains stored and visible under
+its historical visibility, but is never selected for ordinary Agent execution.
+No daemon grants or cross-account sharing mechanism is currently implemented.
+
+The server's embedded host can run commands on the server machine. An
+administrator account may route its own Agent to the host; if the embedded
+daemon has a verified owner, that must be the same account. Historical
+ownerless embedded records remain administrator-only. The local daemon is
+created by server startup; its public registration identity is reserved for an
+explicit administrator operation. An ordinary user cannot obtain the embedded
+shell by registering or leaving its Agent unpinned.
+
+The same current account, Agent profile/binding, daemon owner/visibility/host,
+online state, and authenticated capability are checked at admission and again
+inside the serialized Provider Start claim. A changed authority fails without
+sending Start. Uncertain Start receipts remain single-attempt and are not
+retried automatically.
+
 ## Frozen Execution host (Plan PR10)
 
 Admission may resolve an Agent's pinned daemon or select an available daemon

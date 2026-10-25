@@ -133,7 +133,10 @@ impl EmbeddedDaemon {
             }
         }
 
-        let registration = self.service.register(self.registration_input()).await?;
+        let registration = self
+            .service
+            .register_embedded(self.registration_input())
+            .await?;
         let credentials = DaemonCredentials {
             daemon_id: registration.daemon_id,
             token: registration.plaintext_token,

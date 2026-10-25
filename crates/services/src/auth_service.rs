@@ -367,13 +367,6 @@ impl AuthService {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
-            "UPDATE daemon SET owner_id = ?, visibility = 'account' WHERE owner_id IS NULL",
-        )
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
-
         let orphaned_projects: Vec<(String,)> =
             sqlx::query_as("SELECT id FROM project WHERE owner_id IS NULL")
                 .fetch_all(&mut *tx)
@@ -776,7 +769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_first_user_claims_orphaned_resources() {
+    async fn bootstrap_claims_agents_and_projects_but_preserves_orphan_daemons() {
         let svc = test_service().await;
         let db = &svc.db;
         let now = now_rfc3339();
@@ -809,8 +802,14 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(daemon_owner, Some(user.id.clone()));
-        assert_eq!(daemon_visibility, "account");
+        assert_eq!(
+            daemon_owner, None,
+            "historical daemon owner is not inferred"
+        );
+        assert_eq!(
+            daemon_visibility, "global",
+            "historical daemon visibility is preserved"
+        );
 
         let project_owner: Option<String> =
             sqlx::query_scalar("SELECT owner_id FROM project WHERE id = 'p1'")

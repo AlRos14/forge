@@ -32,28 +32,35 @@ pub async fn register_daemon(
     headers: HeaderMap,
     Json(request): Json<DaemonRegisterRequest>,
 ) -> ApiResult<Json<DaemonRegisterResponse>> {
-    let owner_id = registration_owner_id(&state, &headers).await?;
-    let visibility = owner_id.as_ref().map(|_| "account".to_owned());
-
-    let registration = state
-        .daemon_service
-        .register(services::DaemonRegisterInput {
-            machine_id: request.machine_id,
-            hostname: request.hostname,
-            os: request.os,
-            arch: request.arch,
-            agent_version: request.agent_version,
-            labels: request.labels.unwrap_or_else(|| serde_json::json!({})),
-            runtimes: request
-                .runtimes
-                .unwrap_or_default()
-                .into_iter()
-                .map(runtime_report_input)
-                .collect(),
-            owner_id,
-            visibility,
-        })
-        .await?;
+    let (owner_id, is_admin) = registration_principal(&state, &headers).await?;
+    let visibility = Some("account".to_owned());
+    let input = services::DaemonRegisterInput {
+        machine_id: request.machine_id,
+        hostname: request.hostname,
+        os: request.os,
+        arch: request.arch,
+        agent_version: request.agent_version,
+        labels: request.labels.unwrap_or_else(|| serde_json::json!({})),
+        runtimes: request
+            .runtimes
+            .unwrap_or_default()
+            .into_iter()
+            .map(runtime_report_input)
+            .collect(),
+        owner_id: Some(owner_id),
+        visibility,
+    };
+    let registration = if input.machine_id.starts_with("embedded:") {
+        if !is_admin {
+            return Err(ApiError::forbidden_with_code(
+                "admin_required",
+                "Embedded shell registration requires administrator authority",
+            ));
+        }
+        state.daemon_service.register_embedded(input).await?
+    } else {
+        state.daemon_service.register(input).await?
+    };
 
     Ok(Json(DaemonRegisterResponse {
         daemon_id: registration.daemon_id,
@@ -402,9 +409,14 @@ fn runtime_report_input(runtime: api_types::RuntimeReport) -> RuntimeReportInput
     }
 }
 
-async fn registration_owner_id(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<String>> {
+async fn registration_principal(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> ApiResult<(String, bool)> {
     let Some(token) = optional_bearer_token(headers)? else {
-        return Ok(None);
+        return Err(ApiError::unauthorized(
+            "daemon registration requires an authenticated account",
+        ));
     };
 
     let result = if token.starts_with("fg_") {
@@ -413,7 +425,7 @@ async fn registration_owner_id(state: &AppState, headers: &HeaderMap) -> ApiResu
         state.auth_service.verify_token(token)
     };
 
-    let (user_id, _email, _is_admin) = result.map_err(|code| {
+    let (user_id, _email, is_admin) = result.map_err(|code| {
         ApiError::unauthorized_with_code(auth_error_code(&code), "Authentication failed")
     })?;
 
@@ -421,11 +433,12 @@ async fn registration_owner_id(state: &AppState, headers: &HeaderMap) -> ApiResu
         .await?
         .is_none()
     {
-        // Registration is auth-exempt; stale or synthetic JWTs must not create dangling owner FKs.
-        return Ok(None);
+        return Err(ApiError::unauthorized(
+            "daemon registration requires an existing account",
+        ));
     }
 
-    Ok(Some(user_id))
+    Ok((user_id, is_admin))
 }
 
 fn optional_bearer_token(headers: &HeaderMap) -> ApiResult<Option<&str>> {

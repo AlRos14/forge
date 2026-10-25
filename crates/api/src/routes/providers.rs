@@ -16,7 +16,7 @@ use axum::{
 };
 use db::{
     now_rfc3339, AgentListQuery, AgentRepo, CredentialHandle, CredentialHandleRepo,
-    CredentialUsage, Daemon, DaemonRepo, DbError, PageRequest, SortBy, SortOrder,
+    CredentialUsage, Daemon, DaemonRepo, DbError, PageRequest, SortBy, SortOrder, UserRepo,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -272,6 +272,9 @@ async fn cli_runtime_entries(
     user_id: &str,
 ) -> ApiResult<Vec<CliRuntimeEntryResponse>> {
     let daemons = all_daemons(state, user_id).await?;
+    let Some(user) = UserRepo::get_user_by_id(&*state.db, user_id).await? else {
+        return Ok(Vec::new());
+    };
     let mut used_by: HashMap<String, Vec<ProviderEntryAgentRef>> = HashMap::new();
     for agent in all_agents(state, user_id).await? {
         if agent.backend_kind != "cli" || agent.credential_ref.is_some() {
@@ -291,6 +294,9 @@ async fn cli_runtime_entries(
         let detected: Vec<DetectedCli> =
             serde_json::from_str(&daemon.detected_clis_json).unwrap_or_default();
         for cli in detected {
+            if !db::daemon_execution_authorized(&daemon, Some(user_id), user.is_admin, &cli.kind) {
+                continue;
+            }
             items.push(CliRuntimeEntryResponse {
                 daemon_id: daemon.id.clone(),
                 daemon_hostname: Some(daemon.hostname.clone()),

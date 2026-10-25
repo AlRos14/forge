@@ -207,7 +207,7 @@ async fn add_remote_executor_daemon(db: &db::SqliteDb, machine_id: &str) -> Stri
             labels_json: "{}".to_owned(),
             status: db::DaemonStatus::Online,
             registration_token_hash: None,
-            owner_id: None,
+            owner_id: Some("test-account".to_owned()),
             visibility: "global".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -2712,6 +2712,7 @@ async fn plan_artifact_output_is_idempotent_across_sqlite_connections() {
         .await
         .expect("migrations run");
     let first_db = Arc::new(db::SqliteDb::new(first_pool));
+    seed_test_account(&first_db).await;
     let second_db = Arc::new(db::SqliteDb::new(
         db::create_sqlite_pool(&database_url)
             .await
@@ -2800,6 +2801,7 @@ async fn execution_start_event_and_initial_artifact_inputs_commit_atomically() {
         .await
         .expect("migrations run");
     let first_db = Arc::new(db::SqliteDb::new(first_pool));
+    seed_test_account(&first_db).await;
     let second_db = Arc::new(db::SqliteDb::new(
         db::create_sqlite_pool(&database_url)
             .await
@@ -4831,6 +4833,7 @@ async fn concurrent_dispatcher_ticks_recover_post_commit_auto_start_after_unpaus
         .with_workspace_exec_locks(Arc::new(crate::WorkspaceExecutionLockManager::new()));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let agent = db::AgentRepo::get_by_id(&*db, &agent_id)
         .await
@@ -4885,15 +4888,6 @@ async fn concurrent_dispatcher_ticks_recover_post_commit_auto_start_after_unpaus
     )
     .await
     .expect("fixture records the parent's accepted provider Start");
-
-    let daemon_id = agent.daemon_id.as_deref().expect("Agent has its daemon");
-    let changed = sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
-        .bind(crate::embedded_daemon::embedded_machine_id())
-        .bind(daemon_id)
-        .execute(db.pool())
-        .await
-        .expect("fixture daemon selects the embedded provider");
-    assert_eq!(changed.rows_affected(), 1);
 
     crate::CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus))
         .run_recovery()
@@ -5807,14 +5801,45 @@ async fn route_agent_to_embedded_daemon(db: &SqliteDb, agent_id: &str) {
     let daemon_id = if let Some(daemon_id) = embedded_daemon_id {
         daemon_id
     } else {
-        let daemon_id = agent.daemon_id.clone().expect("Agent has a routed daemon");
-        let changed = sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
-            .bind(&embedded_machine_id)
-            .bind(&daemon_id)
-            .execute(db.pool())
-            .await
-            .expect("test daemon becomes the embedded execution host");
-        assert_eq!(changed.rows_affected(), 1);
+        let daemon_id = db::new_uuid_v4();
+        let now = now_rfc3339();
+        DaemonRepo::upsert_by_machine_id(
+            db,
+            db::UpsertDaemon {
+                id: daemon_id.clone(),
+                machine_id: embedded_machine_id,
+                hostname: "test-embedded-host".to_owned(),
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                agent_version: Some("test".to_owned()),
+                labels_json: "{}".to_owned(),
+                status: db::DaemonStatus::Online,
+                registration_token_hash: None,
+                owner_id: Some("test-account".to_owned()),
+                visibility: "account".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("test embedded daemon creates");
+        DaemonRepo::update_report(
+            db,
+            db::UpdateDaemonReport {
+                id: daemon_id.clone(),
+                detected_clis_json: r#"[
+                    {"kind":"shell","availability":"authenticated"},
+                    {"kind":"codex","availability":"authenticated"}
+                ]"#
+                .to_owned(),
+                labels_json: None,
+                status: db::DaemonStatus::Online,
+                last_report_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("test embedded daemon reports authenticated providers");
         daemon_id
     };
     if agent.daemon_id.as_deref() != Some(daemon_id.as_str()) {
@@ -6338,6 +6363,9 @@ enum ProviderStartClaimAuthorityMutation {
     ChangeWorkUnitVersion,
     RevokeLease,
     ExpireLease,
+    ChangeDaemonOwner,
+    ChangeAgentOwner,
+    RevokeDaemonAuthorityConcurrent,
 }
 
 async fn assert_provider_start_claim_rejects_authority_race(
@@ -6347,6 +6375,7 @@ async fn assert_provider_start_claim_rejects_authority_race(
     let event_bus = Arc::new(EventBus::new(16));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let agent = AgentRepo::get_by_id(&*db, &agent_id)
         .await
@@ -6359,7 +6388,12 @@ async fn assert_provider_start_claim_rejects_authority_race(
             .expect("Agent snapshot exists");
     let workspace_root = TempDir::new().expect("workspace root creates");
     let executor = Arc::new(RecoveryDispatchExecutor::default());
-    let claim_barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let concurrent_dispatchers = matches!(
+        mutation,
+        ProviderStartClaimAuthorityMutation::RevokeDaemonAuthorityConcurrent
+    );
+    let start_count = if concurrent_dispatchers { 2 } else { 1 };
+    let claim_barrier = Arc::new(tokio::sync::Barrier::new(start_count + 1));
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
         .with_workspace_root(workspace_root.path().to_path_buf())
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
@@ -6377,34 +6411,51 @@ async fn assert_provider_start_claim_rejects_authority_race(
         Some(snapshot),
     )
     .await;
-    let daemon_id = agent.daemon_id.as_deref().expect("Agent has its daemon");
-    let changed = sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
-        .bind(crate::embedded_daemon::embedded_machine_id())
-        .bind(daemon_id)
-        .execute(db.pool())
-        .await
-        .expect("fixture routes provider Start to the embedded executor");
-    assert_eq!(changed.rows_affected(), 1);
     let work_unit_id = execution.work_unit_id.as_deref().expect("WorkUnit id");
     let lease = WorkspaceLeaseRepo::get_active_for_work_unit(&*db, work_unit_id)
         .await
         .expect("exact WorkUnit lease loads")
         .expect("admission creates the exact WorkUnit lease");
 
-    let start_service = service.clone();
-    let start_execution_id = execution.id.clone();
-    let mut start =
-        tokio::spawn(async move { start_service.start_execution(start_execution_id).await });
-    // The service has completed all ordinary preflight and provider parameter
-    // preparation, and is stopped immediately before the durable claim.
+    let mut starts = Vec::new();
+    for _ in 0..start_count {
+        let start_service = service.clone();
+        let start_execution_id = execution.id.clone();
+        starts.push(tokio::spawn(async move {
+            start_service.start_execution(start_execution_id).await
+        }));
+    }
+    // Each dispatcher has completed preflight and provider preparation. The
+    // test mutates current authority while all are stopped directly before claim.
     if tokio::time::timeout(std::time::Duration::from_secs(20), claim_barrier.wait())
         .await
         .is_err()
     {
-        let early_result =
-            tokio::time::timeout(std::time::Duration::from_secs(1), &mut start).await;
-        panic!("provider start did not reach the claim barrier; early result: {early_result:?}");
+        panic!("provider start did not reach the claim barrier");
     }
+    if matches!(
+        mutation,
+        ProviderStartClaimAuthorityMutation::ChangeDaemonOwner
+            | ProviderStartClaimAuthorityMutation::ChangeAgentOwner
+            | ProviderStartClaimAuthorityMutation::RevokeDaemonAuthorityConcurrent
+    ) {
+        let now = now_rfc3339();
+        db::UserRepo::create_user(
+            &*db,
+            &db::User {
+                id: "foreign-account".to_owned(),
+                email: "foreign-account@test.invalid".to_owned(),
+                password_hash: "x".to_owned(),
+                display_name: None,
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("foreign account creates for authority race");
+    }
+    let daemon_id = agent.daemon_id.clone().expect("Agent has its daemon");
     match mutation {
         ProviderStartClaimAuthorityMutation::SuspendMembership => {
             let (_, membership) = db::RoleMembershipRepo::list_by_task(&*db, &task.id, false)
@@ -6490,18 +6541,41 @@ async fn assert_provider_start_claim_rejects_authority_race(
                 .expect("exact WorkspaceLease expires after preflight");
             assert!(expired.iter().any(|expired| expired.id == lease.id));
         }
+        ProviderStartClaimAuthorityMutation::ChangeDaemonOwner
+        | ProviderStartClaimAuthorityMutation::RevokeDaemonAuthorityConcurrent => {
+            let changed = sqlx::query("UPDATE daemon SET owner_id = 'foreign-account', detected_clis_json = '[]' WHERE id = ?")
+                .bind(&daemon_id).execute(db.pool()).await.expect("daemon authority revokes after preflight");
+            assert_eq!(changed.rows_affected(), 1);
+        }
+        ProviderStartClaimAuthorityMutation::ChangeAgentOwner => {
+            let changed =
+                sqlx::query("UPDATE agent_identity SET owner_id = 'foreign-account' WHERE id = ?")
+                    .bind(&agent_id)
+                    .execute(db.pool())
+                    .await
+                    .expect("Agent ownership changes after preflight");
+            assert_eq!(changed.rows_affected(), 1);
+        }
     }
     claim_barrier.wait().await;
-
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut start)
-        .await
-        .expect("claim resolves without waiting for an external provider")
-        .expect("start task joins");
-    assert!(
-        matches!(result, Err(ServiceError::InvalidOperation { ref message })
-            if message.contains("authority changed before provider Start was claimed")),
-        "{mutation:?} must be rejected by the durable claim, got {result:?}"
-    );
+    for mut start in starts {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut start)
+            .await
+            .expect("claim resolves without external provider")
+            .expect("start task joins");
+        if concurrent_dispatchers {
+            assert!(
+                result.is_err(),
+                "both competing dispatchers fail closed after authority revocation: {result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(ServiceError::InvalidOperation { ref message })
+                if message.contains("authority changed before provider Start was claimed")),
+                "{mutation:?} must be rejected by the durable claim, got {result:?}"
+            );
+        }
+    }
     assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     let stored = ExecutionRepo::get_by_id(&*db, &execution.id)
@@ -6559,6 +6633,9 @@ async fn provider_start_claim_revalidates_authority_after_preflight() {
         ProviderStartClaimAuthorityMutation::ChangeWorkUnitVersion,
         ProviderStartClaimAuthorityMutation::RevokeLease,
         ProviderStartClaimAuthorityMutation::ExpireLease,
+        ProviderStartClaimAuthorityMutation::ChangeDaemonOwner,
+        ProviderStartClaimAuthorityMutation::ChangeAgentOwner,
+        ProviderStartClaimAuthorityMutation::RevokeDaemonAuthorityConcurrent,
     ] {
         assert_provider_start_claim_rejects_authority_race(mutation).await;
     }
@@ -6570,6 +6647,7 @@ async fn concurrent_provider_start_claims_dispatch_one_external_start() {
     let event_bus = Arc::new(EventBus::new(16));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    route_agent_to_embedded_daemon(&db, &agent_id).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let agent = AgentRepo::get_by_id(&*db, &agent_id)
         .await
@@ -6600,15 +6678,6 @@ async fn concurrent_provider_start_claims_dispatch_one_external_start() {
         Some(snapshot),
     )
     .await;
-    let daemon_id = agent.daemon_id.as_deref().expect("Agent has its daemon");
-    let changed = sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
-        .bind(crate::embedded_daemon::embedded_machine_id())
-        .bind(daemon_id)
-        .execute(db.pool())
-        .await
-        .expect("fixture routes provider Start to the embedded executor");
-    assert_eq!(changed.rows_affected(), 1);
-
     let first_service = service.clone();
     let first_id = execution.id.clone();
     let first = tokio::spawn(async move { first_service.start_execution(first_id).await });
@@ -6683,6 +6752,7 @@ async fn uncertain_provider_start_retry_never_sends_a_second_external_start() {
         .await
         .expect("current database migrations apply");
     let db = Arc::new(db::SqliteDb::new(pool));
+    seed_test_account(&db).await;
     let event_bus = Arc::new(EventBus::new(16));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;

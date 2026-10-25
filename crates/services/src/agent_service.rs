@@ -1,10 +1,9 @@
 use crate::{agent_capacity::has_running_execution_capacity, Result, ServiceError, TaskService};
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentStatus, CreateAgent, Daemon,
-    DaemonRepo, DaemonStatus, PageRequest, SortBy, SortOrder, SqliteDb, UpdateAgent,
+    DaemonRepo, PageRequest, SortBy, SortOrder, SqliteDb, UpdateAgent,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
-use serde_json::Value;
 use std::{fmt, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,20 +57,19 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
         return Ok(EffectiveStatus::Deactivated);
     }
 
-    if let Some(daemon_id) = &agent.daemon_id {
-        let Some(daemon) = DaemonRepo::get_by_id(db, daemon_id).await? else {
-            return Ok(EffectiveStatus::DaemonOffline);
-        };
-        if daemon.status == DaemonStatus::Offline {
-            return Ok(EffectiveStatus::DaemonOffline);
+    if let Some(id) = agent.daemon_id.as_deref() {
+        match DaemonRepo::get_by_id(db, id).await? {
+            None => return Ok(EffectiveStatus::DaemonOffline),
+            Some(daemon) if daemon.status == db::DaemonStatus::Offline => {
+                return Ok(EffectiveStatus::DaemonOffline)
+            }
+            Some(daemon) if !executor_capability_present(&daemon, &agent.executor_type) => {
+                return Ok(EffectiveStatus::Deactivated)
+            }
+            _ => {}
         }
-        if !daemon_supports_executor(&daemon, &agent.executor_type)? {
-            return Ok(EffectiveStatus::Deactivated);
-        }
-    } else if DaemonRepo::list_available_for_executor(db, &agent.executor_type)
-        .await?
-        .is_empty()
-    {
+    }
+    if resolve_daemon_for_agent(db, agent).await.is_err() {
         return Ok(EffectiveStatus::DaemonUnavailable);
     }
 
@@ -82,70 +80,72 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
     Ok(EffectiveStatus::Active)
 }
 
-pub async fn resolve_daemon_for_agent(db: &SqliteDb, agent: &Agent) -> Result<Daemon> {
-    if let Some(daemon_id) = &agent.daemon_id {
+fn executor_capability_present(daemon: &Daemon, executor_type: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(&daemon.detected_clis_json)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("kind").and_then(|v| v.as_str()) == Some(executor_type)
+                    && item.get("availability").and_then(|v| v.as_str()) == Some("authenticated")
+            })
+        })
+}
+
+pub async fn require_agent_account(db: &SqliteDb, agent_id: &str, account_id: &str) -> Result<()> {
+    let agent = AgentRepo::get_by_id(db, agent_id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
+    if agent.owner_id.as_deref() != Some(account_id) {
+        return Err(ServiceError::invalid_operation(
+            "Agent daemon authority belongs to another account",
+        ));
+    }
+    Ok(())
+}
+
+pub async fn resolve_daemon_for_account(
+    db: &SqliteDb,
+    owner_id: &str,
+    executor_type: &str,
+    pinned_daemon_id: Option<&str>,
+) -> Result<Daemon> {
+    let user = db::UserRepo::get_user_by_id(db, owner_id)
+        .await?
+        .ok_or_else(|| ServiceError::invalid_operation("Agent owner no longer exists"))?;
+    if let Some(daemon_id) = pinned_daemon_id {
         let daemon = DaemonRepo::get_by_id(db, daemon_id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("daemon", daemon_id.clone()))?;
-        if daemon.status == DaemonStatus::Offline {
-            return Err(ServiceError::invalid_operation(format!(
-                "pinned daemon {daemon_id} is offline"
-            )));
-        }
-        if !daemon_supports_executor(&daemon, &agent.executor_type)? {
-            return Err(ServiceError::invalid_operation(format!(
-                "pinned daemon {daemon_id} does not have authenticated {} executor",
-                agent.executor_type
-            )));
+            .ok_or_else(|| ServiceError::not_found("daemon", daemon_id.to_owned()))?;
+        if !db::daemon_execution_authorized(&daemon, Some(owner_id), user.is_admin, executor_type) {
+            return Err(ServiceError::invalid_operation(
+                "pinned daemon is not authorized or available for this account",
+            ));
         }
         return Ok(daemon);
     }
-
-    DaemonRepo::list_available_for_executor(db, &agent.executor_type)
+    DaemonRepo::list_available_for_executor(db, executor_type, owner_id)
         .await?
         .into_iter()
         .next()
         .ok_or_else(|| {
-            ServiceError::invalid_operation(format!(
-                "No daemon with authenticated {} executor found",
-                agent.executor_type
-            ))
+            ServiceError::invalid_operation(
+                "No authorized daemon with authenticated executor found",
+            )
         })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DetectedCli {
-    kind: String,
-    availability: Option<String>,
-}
-
-fn parse_detected_clis(value: &str) -> Result<Vec<DetectedCli>> {
-    let value = serde_json::from_str::<Value>(value).map_err(|error| {
-        ServiceError::invalid_operation(format!("invalid daemon detected_clis_json: {error}"))
+pub async fn resolve_daemon_for_agent(db: &SqliteDb, agent: &Agent) -> Result<Daemon> {
+    let owner_id = agent.owner_id.as_deref().ok_or_else(|| {
+        ServiceError::invalid_operation("Agent has no verified daemon account authority")
     })?;
-    let Value::Array(items) = value else {
-        return Ok(Vec::new());
-    };
-    Ok(items
-        .into_iter()
-        .filter_map(|item| {
-            let object = item.as_object()?;
-            Some(DetectedCli {
-                kind: object.get("kind")?.as_str()?.to_owned(),
-                availability: object
-                    .get("availability")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned),
-            })
-        })
-        .collect())
-}
-
-fn daemon_supports_executor(daemon: &Daemon, executor_type: &str) -> Result<bool> {
-    let detected_clis = parse_detected_clis(&daemon.detected_clis_json)?;
-    Ok(detected_clis.iter().any(|cli| {
-        cli.kind == executor_type && cli.availability.as_deref() == Some("authenticated")
-    }))
+    resolve_daemon_for_account(
+        db,
+        owner_id,
+        &agent.executor_type,
+        agent.daemon_id.as_deref(),
+    )
+    .await
 }
 
 #[derive(Clone)]
@@ -191,6 +191,21 @@ impl AgentService {
                 "embedded/native Agent profiles are retired; create a new Agent bound to an available HarnessAdapter",
             ));
         }
+        let owner_id = owner_id.filter(|id| !id.trim().is_empty()).ok_or_else(|| {
+            ServiceError::invalid_operation("Agent registration requires an authenticated owner")
+        })?;
+        if db::UserRepo::get_user_by_id(&*self.db, &owner_id)
+            .await?
+            .is_none()
+        {
+            return Err(ServiceError::invalid_operation(
+                "Agent owner does not exist",
+            ));
+        }
+        if let Some(daemon_id) = daemon_id.as_deref() {
+            resolve_daemon_for_account(&self.db, &owner_id, &executor_type, Some(daemon_id))
+                .await?;
+        }
         validate_positive("max_concurrent", max_concurrent.unwrap_or(1))?;
         validate_positive("heartbeat_interval", heartbeat_interval.unwrap_or(30))?;
         validate_positive("max_missed", max_missed.unwrap_or(3))?;
@@ -218,7 +233,7 @@ impl AgentService {
                 last_heartbeat_at: Some(now.clone()),
                 is_default,
                 paused: false,
-                owner_id,
+                owner_id: Some(owner_id),
                 visibility: visibility.unwrap_or_else(|| "global".to_owned()),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -358,7 +373,9 @@ impl AgentService {
 
         let mut available = Vec::new();
         for agent in page.items {
-            if has_running_execution_capacity(&self.db, &agent).await? {
+            if compute_effective_status(&self.db, &agent).await? == EffectiveStatus::Active
+                && has_running_execution_capacity(&self.db, &agent).await?
+            {
                 available.push(agent);
             }
         }
@@ -429,9 +446,9 @@ mod tests {
     use super::*;
     use db::{
         create_sqlite_pool, run_migrations, CreateExecution, CreateProject, CreateRepo,
-        CreateRoleMembership, CreateTask, CreateTaskRole, ExecutionRepo, ExecutionStatus,
-        ProjectRepo, RepoRepo, RoleMembershipRepo, TaskRepo, TaskRoleRepo, UpdateProject,
-        UpsertDaemon,
+        CreateRoleMembership, CreateTask, CreateTaskRole, DaemonStatus, ExecutionRepo,
+        ExecutionStatus, ProjectRepo, RepoRepo, RoleMembershipRepo, TaskRepo, TaskRoleRepo,
+        UpdateProject, UpsertDaemon, User, UserRepo,
     };
 
     async fn sqlite_db() -> SqliteDb {
@@ -439,7 +456,23 @@ mod tests {
             .await
             .expect("pool creates");
         run_migrations(&pool).await.expect("migrations run");
-        SqliteDb::new(pool)
+        let db = SqliteDb::new(pool);
+        let now = now_rfc3339();
+        UserRepo::create_user(
+            &db,
+            &User {
+                id: "owner".to_owned(),
+                email: "owner@test.invalid".to_owned(),
+                password_hash: "x".to_owned(),
+                display_name: None,
+                is_admin: true,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("test owner creates");
+        db
     }
 
     async fn seed_daemon(db: &SqliteDb) -> String {
@@ -457,8 +490,8 @@ mod tests {
                 labels_json: "{}".to_owned(),
                 status: DaemonStatus::Online,
                 registration_token_hash: None,
-                owner_id: None,
-                visibility: "global".to_owned(),
+                owner_id: Some("owner".to_owned()),
+                visibility: "account".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
@@ -466,6 +499,20 @@ mod tests {
         .await
         .expect("daemon creates");
 
+        DaemonRepo::update_report(
+            db,
+            db::UpdateDaemonReport {
+                id: daemon_id.clone(),
+                detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#
+                    .to_owned(),
+                labels_json: None,
+                status: DaemonStatus::Online,
+                last_report_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("test daemon shell capability reports");
         daemon_id
     }
 
@@ -513,8 +560,8 @@ mod tests {
                 last_heartbeat_at: Some(now.clone()),
                 is_default: false,
                 paused: false,
-                owner_id: None,
-                visibility: "global".to_owned(),
+                owner_id: Some("owner".to_owned()),
+                visibility: "account".to_owned(),
                 prompt_template: None,
                 created_at: now.clone(),
                 updated_at: now,
@@ -548,8 +595,8 @@ mod tests {
             last_heartbeat_at: None,
             is_default: false,
             paused: false,
-            owner_id: None,
-            visibility: "global".to_owned(),
+            owner_id: Some("owner".to_owned()),
+            visibility: "account".to_owned(),
             prompt_template: None,
             version: 1,
             created_at: now_rfc3339(),
@@ -568,7 +615,7 @@ mod tests {
                 name: "Forge".to_owned(),
                 settings: "{}".to_owned(),
                 primary_repo_id: None,
-                owner_id: None,
+                owner_id: Some("owner".to_owned()),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
@@ -712,8 +759,8 @@ mod tests {
                 None,
                 None,
                 false,
-                None,
-                None,
+                Some("owner".to_owned()),
+                Some("account".to_owned()),
             )
             .await
             .expect("agent registers");
@@ -910,5 +957,161 @@ mod tests {
             .expect("status computes");
 
         assert_eq!(status, EffectiveStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn daemon_authority_is_account_scoped_and_unowned_history_fails_closed() {
+        let db = sqlite_db().await;
+        UserRepo::create_user(
+            &db,
+            &User {
+                id: "account-b".to_owned(),
+                email: "b@test.invalid".to_owned(),
+                password_hash: "x".to_owned(),
+                display_name: None,
+                is_admin: false,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("second account creates");
+        let agent_a = seed_effective_agent(
+            &db,
+            AgentStatus::Idle,
+            DaemonStatus::Online,
+            r#"[{"kind":"shell","availability":"authenticated"}]"#,
+            1,
+        )
+        .await;
+        let daemon_id = agent_a.daemon_id.clone().expect("pinned daemon");
+        assert!(
+            resolve_daemon_for_agent(&db, &agent_a).await.is_ok(),
+            "owner uses own daemon"
+        );
+
+        sqlx::query("UPDATE agent_identity SET owner_id = 'account-b' WHERE id = ?")
+            .bind(&agent_a.id)
+            .execute(db.pool())
+            .await
+            .expect("transfer test Agent");
+        let agent_b = AgentRepo::get_by_id(&db, &agent_a.id)
+            .await
+            .expect("Agent read")
+            .unwrap();
+        assert!(
+            resolve_daemon_for_agent(&db, &agent_b).await.is_err(),
+            "pinned foreign daemon is denied"
+        );
+        assert_eq!(
+            compute_effective_status(&db, &agent_b).await.unwrap(),
+            EffectiveStatus::DaemonUnavailable
+        );
+
+        let now = now_rfc3339();
+        let agent_b_auto = AgentRepo::create(
+            &db,
+            CreateAgent {
+                id: new_uuid_v4(),
+                name: "account-b-auto".to_owned(),
+                description: None,
+                executor_type: "shell".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: Some(now.clone()),
+                is_default: false,
+                paused: false,
+                owner_id: Some("account-b".to_owned()),
+                visibility: "account".to_owned(),
+                prompt_template: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("unpinned Agent for account B creates");
+        assert!(
+            resolve_daemon_for_agent(&db, &agent_b_auto).await.is_err(),
+            "automatic route cannot select account A"
+        );
+        assert!(
+            DaemonRepo::list_available_for_executor(&db, "shell", "account-b")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        sqlx::query("UPDATE daemon SET owner_id = NULL, visibility = 'global' WHERE id = ?")
+            .bind(&daemon_id)
+            .execute(db.pool())
+            .await
+            .expect("make historical daemon unowned");
+        assert!(
+            resolve_daemon_for_agent(&db, &agent_a).await.is_err(),
+            "global metadata does not authorize an orphan"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_shell_requires_durable_admin_account() {
+        let db = sqlite_db().await;
+        UserRepo::create_user(
+            &db,
+            &User {
+                id: "other-admin".to_owned(),
+                email: "other-admin@test.invalid".to_owned(),
+                password_hash: "x".to_owned(),
+                display_name: None,
+                is_admin: true,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("second admin creates");
+        let agent = seed_effective_agent(
+            &db,
+            AgentStatus::Idle,
+            DaemonStatus::Online,
+            r#"[{"kind":"shell","availability":"authenticated"}]"#,
+            1,
+        )
+        .await;
+        let daemon_id = agent.daemon_id.as_deref().unwrap();
+        sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
+            .bind(crate::embedded_daemon::embedded_machine_id())
+            .bind(daemon_id)
+            .execute(db.pool())
+            .await
+            .expect("mark server embedded host");
+        assert!(
+            resolve_daemon_for_agent(&db, &agent).await.is_ok(),
+            "local admin owner can use embedded host"
+        );
+        let daemon = DaemonRepo::get_by_id(&db, daemon_id)
+            .await
+            .expect("embedded daemon loads")
+            .expect("embedded daemon exists");
+        assert!(
+            !db::daemon_execution_authorized(&daemon, Some("other-admin"), true, "shell"),
+            "another admin cannot use the locally owned embedded shell implicitly"
+        );
+        sqlx::query("UPDATE user SET is_admin = 0 WHERE id = 'owner'")
+            .execute(db.pool())
+            .await
+            .expect("revoke explicit host trust");
+        assert!(
+            resolve_daemon_for_agent(&db, &agent).await.is_err(),
+            "non-admin cannot use embedded shell"
+        );
     }
 }
