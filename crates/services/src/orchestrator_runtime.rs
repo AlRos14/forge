@@ -3556,31 +3556,16 @@ mod tests {
     async fn pr20_cross_account_global_orchestrator_cannot_start_owner_daemon() {
         let fixture = cross_account_provider_start_fixture().await;
 
-        let (
-            project_owner,
-            agent_owner,
-            daemon_owner,
-            visibility,
-            daemon_status,
-            detected_clis,
-            daemon_machine_id,
-            registration_token_hash,
-            bound_daemon,
-        ): (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-        ) = sqlx::query_as(
-            "SELECT project.owner_id, agent.owner_id, daemon.owner_id,
-                        agent.visibility, daemon.status, daemon.detected_clis_json,
-                        daemon.machine_id, daemon.registration_token_hash,
-                        agent.daemon_id
+        let authority = sqlx::query(
+            "SELECT project.owner_id AS project_owner_id,
+                        agent.owner_id AS agent_owner_id,
+                        daemon.owner_id AS daemon_owner_id,
+                        agent.visibility AS agent_visibility,
+                        daemon.status AS daemon_status,
+                        daemon.detected_clis_json AS detected_clis_json,
+                        daemon.machine_id AS daemon_machine_id,
+                        daemon.registration_token_hash AS registration_token_hash,
+                        agent.daemon_id AS bound_daemon_id
                  FROM project
                  JOIN task ON task.project_id = project.id
                  JOIN agent_current AS agent ON agent.id = ?
@@ -3593,19 +3578,46 @@ mod tests {
         .fetch_one(fixture.database.pool())
         .await
         .expect("cross-account Agent, Project, and daemon authority loads");
+        let project_owner_id: Option<String> = authority
+            .try_get("project_owner_id")
+            .expect("Project owner loads");
+        let agent_owner_id: Option<String> = authority
+            .try_get("agent_owner_id")
+            .expect("Agent owner loads");
+        let daemon_owner_id: Option<String> = authority
+            .try_get("daemon_owner_id")
+            .expect("daemon owner loads");
+        let agent_visibility: String = authority
+            .try_get("agent_visibility")
+            .expect("Agent visibility loads");
+        let daemon_status: String = authority
+            .try_get("daemon_status")
+            .expect("daemon status loads");
+        let detected_clis_json: String = authority
+            .try_get("detected_clis_json")
+            .expect("daemon CLI report loads");
+        let daemon_machine_id: String = authority
+            .try_get("daemon_machine_id")
+            .expect("daemon machine identity loads");
+        let registration_token_hash: Option<String> = authority
+            .try_get("registration_token_hash")
+            .expect("daemon registration token loads");
+        let bound_daemon_id: Option<String> = authority
+            .try_get("bound_daemon_id")
+            .expect("Agent daemon binding loads");
         assert_eq!(
-            project_owner.as_deref(),
+            project_owner_id.as_deref(),
             Some(fixture.foreign_owner_id.as_str())
         );
         assert_eq!(
-            agent_owner.as_deref(),
+            agent_owner_id.as_deref(),
             Some(fixture.agent_owner_id.as_str())
         );
         assert_eq!(
-            daemon_owner.as_deref(),
+            daemon_owner_id.as_deref(),
             Some(fixture.agent_owner_id.as_str())
         );
-        assert_eq!(visibility, "global");
+        assert_eq!(agent_visibility, "global");
         assert_eq!(daemon_status, "online");
         assert!(daemon_machine_id.starts_with("provider-start-"));
         assert_ne!(
@@ -3613,8 +3625,8 @@ mod tests {
             crate::embedded_daemon::embedded_machine_id()
         );
         assert!(registration_token_hash.is_some());
-        assert_eq!(bound_daemon.as_deref(), Some(fixture.daemon_id.as_str()));
-        assert!(detected_clis.contains("authenticated"));
+        assert_eq!(bound_daemon_id.as_deref(), Some(fixture.daemon_id.as_str()));
+        assert!(detected_clis_json.contains("authenticated"));
 
         let outcome = fixture
             .runtime
