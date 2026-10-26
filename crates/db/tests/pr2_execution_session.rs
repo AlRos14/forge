@@ -2,9 +2,10 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, run_migrations_from, ActorRef,
     AgentProfileRepo, AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile,
     CreateExecution, CreateHarnessSession, CreateProject, CreateRepo, CreateTask, CreateWorkspace,
-    DbError, ExecutionPurpose, ExecutionRepo, ExecutionStatus, HarnessSessionRepo,
-    HarnessSessionStatus, ProjectRepo, RepoRepo, SelectAgentProfile, SqliteDb, TaskLifecycleState,
-    TaskRepo, UpdateExecution, UpdateHarnessSession, WorkMode, WorkspaceRepo, WorkspaceStatus,
+    DaemonRepo, DaemonStatus, DbError, ExecutionPurpose, ExecutionRepo, ExecutionStatus,
+    HarnessSessionRepo, HarnessSessionStatus, ProjectRepo, RepoRepo, SelectAgentProfile, SqliteDb,
+    TaskLifecycleState, TaskRepo, UpdateDaemonReport, UpdateExecution, UpdateHarnessSession,
+    UpsertDaemon, User, UserRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
 };
 use std::{
     fs,
@@ -15,7 +16,73 @@ use std::{
 async fn database() -> SqliteDb {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
-    SqliteDb::new(pool)
+    let db = SqliteDb::new(pool);
+    let now = now_rfc3339();
+    UserRepo::create_user(
+        &db,
+        &User {
+            id: pr2_owner_id().to_owned(),
+            email: "pr2-execution-owner@example.com".to_owned(),
+            password_hash: "fixture-hash".to_owned(),
+            display_name: Some("PR2 execution fixture owner".to_owned()),
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("PR2 fixture owner creates");
+    db
+}
+
+fn pr2_owner_id() -> &'static str {
+    "00000000-0000-4000-8000-000000000001"
+}
+
+fn pr2_daemon_id(agent_id: &str) -> String {
+    format!("pr2-external-daemon-{agent_id}")
+}
+
+fn pr2_machine_id(agent_id: &str) -> String {
+    format!("pr2-external-machine-{agent_id}")
+}
+
+fn with_current_daemon_authority(
+    mut snapshot: serde_json::Value,
+    agent_id: &str,
+    profile_id: &str,
+    executor_type: &str,
+) -> serde_json::Value {
+    let daemon_id = pr2_daemon_id(agent_id);
+    snapshot["agent_id"] = serde_json::json!(agent_id);
+    snapshot["resolved_daemon_id"] = serde_json::json!(daemon_id);
+    snapshot["daemon_authority"] = serde_json::json!({
+        "agent_owner_id": pr2_owner_id(),
+        "profile_id": profile_id,
+        "agent_daemon_id": pr2_daemon_id(agent_id),
+        "executor_type": executor_type,
+        "daemon_id": pr2_daemon_id(agent_id),
+        "daemon_owner_id": pr2_owner_id(),
+        "daemon_visibility": "account",
+        "machine_id": pr2_machine_id(agent_id)
+    });
+    snapshot
+}
+
+fn attach_current_daemon_authority_to_execution(
+    input: &mut CreateExecution,
+    agent_id: &str,
+    profile_id: &str,
+    executor_type: &str,
+) {
+    let snapshot = input
+        .executor_config_snapshot_json
+        .take()
+        .expect("Agent execution snapshot exists");
+    let snapshot = serde_json::from_str(&snapshot).expect("Agent execution snapshot parses");
+    input.executor_config_snapshot_json = Some(
+        with_current_daemon_authority(snapshot, agent_id, profile_id, executor_type).to_string(),
+    );
 }
 
 async fn seed_agent(db: &SqliteDb, agent_id: &str, executor_type: &str) -> String {
@@ -28,8 +95,78 @@ async fn seed_agent_with_policy(
     executor_type: &str,
     permission_policy: &str,
 ) -> String {
+    seed_agent_fixture(
+        db,
+        agent_id,
+        executor_type,
+        permission_policy,
+        Some(pr2_owner_id()),
+    )
+    .await
+}
+
+async fn seed_legacy_agent_with_policy(
+    db: &SqliteDb,
+    agent_id: &str,
+    executor_type: &str,
+    permission_policy: &str,
+) -> String {
+    seed_agent_fixture(db, agent_id, executor_type, permission_policy, None).await
+}
+
+async fn seed_agent_fixture(
+    db: &SqliteDb,
+    agent_id: &str,
+    executor_type: &str,
+    permission_policy: &str,
+    owner_id: Option<&str>,
+) -> String {
     let now = now_rfc3339();
     let profile_id = new_uuid_v4();
+    let daemon_id = if let Some(owner_id) = owner_id {
+        let daemon_id = pr2_daemon_id(agent_id);
+        let machine_id = pr2_machine_id(agent_id);
+        DaemonRepo::upsert_by_machine_id(
+            db,
+            UpsertDaemon {
+                id: daemon_id.clone(),
+                machine_id,
+                hostname: format!("pr2-fixture-{agent_id}"),
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                agent_version: Some("fixture".to_owned()),
+                labels_json: "{}".to_owned(),
+                status: DaemonStatus::Online,
+                registration_token_hash: Some(format!("pr2-registration-token-{agent_id}")),
+                owner_id: Some(owner_id.to_owned()),
+                visibility: "account".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("authorized external daemon creates");
+        DaemonRepo::update_report(
+            db,
+            UpdateDaemonReport {
+                id: daemon_id.clone(),
+                last_report_at: now.clone(),
+                status: DaemonStatus::Online,
+                detected_clis_json: serde_json::json!([{
+                    "kind": executor_type,
+                    "availability": "authenticated"
+                }])
+                .to_string(),
+                labels_json: None,
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("external daemon reports authenticated CLI");
+        Some(daemon_id)
+    } else {
+        None
+    };
     AgentRepo::create_identity_with_profile(
         db,
         CreateAgentIdentity {
@@ -43,7 +180,7 @@ async fn seed_agent_with_policy(
             last_heartbeat_at: None,
             is_default: false,
             paused: false,
-            owner_id: None,
+            owner_id: owner_id.map(str::to_owned),
             visibility: "global".to_owned(),
             account_permission_ceiling: "{}".to_owned(),
             created_at: now.clone(),
@@ -63,7 +200,7 @@ async fn seed_agent_with_policy(
             tool_policy_json: "{}".to_owned(),
             config_json: r#"{"model":"test-model"}"#.to_owned(),
             credential_ref: None,
-            daemon_id: None,
+            daemon_id,
             created_at: now.clone(),
             updated_at: now,
         },
@@ -84,7 +221,7 @@ async fn seed_task(db: &SqliteDb, suffix: &str) -> String {
             name: format!("PR2 {suffix}"),
             settings: "{}".to_owned(),
             primary_repo_id: None,
-            owner_id: None,
+            owner_id: Some(pr2_owner_id().to_owned()),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -335,14 +472,19 @@ fn execution_input(
         after_sha: None,
         error: None,
         executor_config_snapshot_json: Some(
-            serde_json::json!({
+            with_current_daemon_authority(
+                serde_json::json!({
                 "agent_id": agent_id,
                 "profile_id": profile_id,
                 "executor_type": executor_type,
                 "capabilities": ["read"],
                 "harness_capabilities": harness_capabilities_for(executor_type),
                 "config": {"model": "test-model"}
-            })
+                }),
+                agent_id,
+                profile_id,
+                executor_type,
+            )
             .to_string(),
         ),
         workspace_id: workspace_id.map(str::to_owned),
@@ -678,6 +820,12 @@ async fn unresolved_ordered_fallback_does_not_create_speculative_session() {
         })
         .to_string(),
     );
+    attach_current_daemon_authority_to_execution(
+        &mut input,
+        "pr2-agent-routed",
+        &profile_id,
+        "codex",
+    );
 
     let execution = ExecutionRepo::create(&db, input)
         .await
@@ -723,6 +871,12 @@ async fn unresolved_route_result_cannot_bind_to_the_primary_candidate() {
             }
         })
         .to_string(),
+    );
+    attach_current_daemon_authority_to_execution(
+        &mut input,
+        "pr2-agent-unresolved-result",
+        &profile_id,
+        "codex",
     );
     let execution = ExecutionRepo::create(&db, input)
         .await
@@ -775,12 +929,18 @@ async fn cross_harness_winner_cannot_materialize_under_a_different_agent_identit
         })
         .to_string(),
     );
+    attach_current_daemon_authority_to_execution(
+        &mut input,
+        "pr2-agent-cross-route",
+        &profile_id,
+        "codex",
+    );
     let execution = ExecutionRepo::create(&db, input)
         .await
         .expect("routed execution creates without a speculative session");
     assert_eq!(execution.harness_session_id, None);
 
-    let resolved_snapshot = serde_json::json!({
+    let resolved_snapshot = with_current_daemon_authority(serde_json::json!({
         "agent_id": "pr2-agent-cross-route",
         "profile_id": profile_id,
         "executor_type": "cursor",
@@ -795,7 +955,7 @@ async fn cross_harness_winner_cannot_materialize_under_a_different_agent_identit
                 {"executor_type": "cursor", "config": {"account": "cursor-fallback"}}
             ]
         }
-    })
+    }), "pr2-agent-cross-route", &profile_id, "codex")
     .to_string();
     let mut result = result_update(&execution.id, Some("cursor-thread"));
     result.executor_config_snapshot_json = Some(Some(resolved_snapshot.clone()));
@@ -848,12 +1008,18 @@ async fn same_harness_fallback_snapshots_the_candidate_that_actually_ran() {
         })
         .to_string(),
     );
+    attach_current_daemon_authority_to_execution(
+        &mut input,
+        "pr2-agent-same-route",
+        &profile_id,
+        "codex",
+    );
     let execution = ExecutionRepo::create(&db, input)
         .await
         .expect("routed execution creates without a speculative session");
     assert_eq!(execution.harness_session_id, None);
 
-    let resolved_snapshot = serde_json::json!({
+    let resolved_snapshot = with_current_daemon_authority(serde_json::json!({
         "agent_id": "pr2-agent-same-route",
         "profile_id": profile_id,
         "executor_type": "codex",
@@ -868,7 +1034,7 @@ async fn same_harness_fallback_snapshots_the_candidate_that_actually_ran() {
                 {"executor_type": "codex", "config": {"profile": "same-account", "model": "model-b"}}
             ]
         }
-    })
+    }), "pr2-agent-same-route", &profile_id, "codex")
     .to_string();
     let mut result = result_update(&execution.id, Some("codex-thread-b"));
     result.executor_config_snapshot_json = Some(Some(resolved_snapshot));
@@ -928,24 +1094,35 @@ async fn routed_sessionless_candidate_does_not_fabricate_continuity() {
         })
         .to_string(),
     );
+    attach_current_daemon_authority_to_execution(
+        &mut input,
+        "pr2-agent-routed-shell",
+        &profile_id,
+        "shell",
+    );
     let execution = ExecutionRepo::create(&db, input)
         .await
         .expect("unresolved route creates without a session");
-    let resolved_snapshot = serde_json::json!({
-        "agent_id": "pr2-agent-routed-shell",
-        "profile_id": profile_id,
-        "executor_type": "shell",
-        "config": {"command":"echo fallback"},
-        "capabilities": ["read"],
-        "routing": {
-            "policy": "ordered_fallback_v1",
-            "selected_candidate_key": "shell:fallback",
-            "candidates": [
-                {"executor_type": "shell", "config": {"command":"echo primary"}},
-                {"executor_type": "shell", "config": {"command":"echo fallback"}}
-            ]
-        }
-    })
+    let resolved_snapshot = with_current_daemon_authority(
+        serde_json::json!({
+            "agent_id": "pr2-agent-routed-shell",
+            "profile_id": profile_id,
+            "executor_type": "shell",
+            "config": {"command":"echo fallback"},
+            "capabilities": ["read"],
+            "routing": {
+                "policy": "ordered_fallback_v1",
+                "selected_candidate_key": "shell:fallback",
+                "candidates": [
+                    {"executor_type": "shell", "config": {"command":"echo primary"}},
+                    {"executor_type": "shell", "config": {"command":"echo fallback"}}
+                ]
+            }
+        }),
+        "pr2-agent-routed-shell",
+        &profile_id,
+        "shell",
+    )
     .to_string();
     let mut result = result_update(&execution.id, None);
     result.status = Some(ExecutionStatus::Completed);
@@ -1606,8 +1783,8 @@ async fn historical_session_migration_groups_only_coherent_identity() {
         .await
         .expect("legacy migrations apply");
     let db = SqliteDb::new(pool.clone());
-    let profile_a = seed_agent(&db, "pr2-history-a", "codex").await;
-    let profile_b = seed_agent(&db, "pr2-history-b", "codex").await;
+    let profile_a = seed_legacy_agent_with_policy(&db, "pr2-history-a", "codex", "plan").await;
+    let profile_b = seed_legacy_agent_with_policy(&db, "pr2-history-b", "codex", "plan").await;
     let task_id = seed_legacy_task(&db, "history").await;
     let now = now_rfc3339();
     sqlx::query(
