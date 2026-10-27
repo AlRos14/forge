@@ -193,6 +193,40 @@ async fn seed_private_project_repo(
 
 async fn seed_private_agent(state: &AppState, owner_id: &str) -> String {
     let now = now_rfc3339();
+    let daemon_id = new_uuid_v4();
+    DaemonRepo::upsert_by_machine_id(
+        &*state.db,
+        UpsertDaemon {
+            id: daemon_id.clone(),
+            machine_id: format!("private-agent-machine-{daemon_id}"),
+            hostname: "private-agent-daemon".to_owned(),
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            agent_version: Some("fixture".to_owned()),
+            labels_json: "{}".to_owned(),
+            status: DaemonStatus::Online,
+            registration_token_hash: Some(format!("private-agent-registration-{daemon_id}")),
+            owner_id: Some(owner_id.to_owned()),
+            visibility: "account".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("private Agent owner daemon creates");
+    DaemonRepo::update_report(
+        &*state.db,
+        UpdateDaemonReport {
+            id: daemon_id.clone(),
+            last_report_at: now.clone(),
+            status: DaemonStatus::Online,
+            detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
+            labels_json: None,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("private Agent owner daemon reports authenticated shell");
     let agent = AgentRepo::create(
         &*state.db,
         CreateAgent {
@@ -207,7 +241,7 @@ async fn seed_private_agent(state: &AppState, owner_id: &str) -> String {
             capabilities_json: "[]".to_owned(),
             config_json: r#"{"api_key":"private-value","nested":{"password":"nested-value"},"safe":"visible"}"#.to_owned(),
             credential_ref: None,
-            daemon_id: None,
+            daemon_id: Some(daemon_id),
             max_concurrent_tasks: 1,
             heartbeat_interval_seconds: 30,
             max_missed_heartbeats: 3,
@@ -452,7 +486,7 @@ async fn seed_task_with_legacy_resume_hint(state: &AppState, ambiguous_history: 
     task
 }
 
-async fn seed_agent_registration_deps(state: &AppState) -> (String, String) {
+async fn seed_agent_registration_deps(state: &AppState, owner_id: &str) -> (String, String) {
     let now = now_rfc3339();
     let daemon_id = new_uuid_v4();
     let host = DaemonRepo::upsert_by_machine_id(
@@ -466,15 +500,28 @@ async fn seed_agent_registration_deps(state: &AppState) -> (String, String) {
             agent_version: None,
             labels_json: "{}".to_owned(),
             status: DaemonStatus::Online,
-            registration_token_hash: None,
-            owner_id: None,
-            visibility: "global".to_owned(),
+            registration_token_hash: Some(format!("registration-token-{daemon_id}")),
+            owner_id: Some(owner_id.to_owned()),
+            visibility: "account".to_owned(),
             created_at: now.clone(),
             updated_at: now,
         },
     )
     .await
     .expect("daemon creates");
+    DaemonRepo::update_report(
+        &*state.db,
+        UpdateDaemonReport {
+            id: host.id.clone(),
+            last_report_at: now_rfc3339(),
+            status: DaemonStatus::Online,
+            detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
+            labels_json: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("registration daemon reports authenticated shell");
 
     ("shell".to_owned(), host.id)
 }
@@ -1729,7 +1776,11 @@ fn user_scoped_mcp_isolates_projects_and_derived_resources() {
             }),
         )
         .await;
-        assert_eq!(error.code, -32004);
+        assert_eq!(error.code, -32602);
+        assert_eq!(
+            error.message,
+            "Agent daemon authority belongs to another account"
+        );
 
         let task_a_read = call_tool_as(
             &state,
@@ -2270,7 +2321,7 @@ fn forge_transition_task_lifecycle_requires_exact_identity_and_returns_authority
 fn forge_register_agent_registers_agent() {
     run_async(async {
         let state = sqlite_state().await;
-        let (executor_type, daemon_id) = seed_agent_registration_deps(&state).await;
+        let (executor_type, daemon_id) = seed_agent_registration_deps(&state, "test-admin").await;
         let result = call_tool_as(
             &state,
             &admin_mcp_context(),
@@ -2294,7 +2345,7 @@ fn forge_register_agent_registers_agent() {
 fn forge_list_agents_returns_paginated_agents() {
     run_async(async {
         let state = sqlite_state().await;
-        let (executor_type, daemon_id) = seed_agent_registration_deps(&state).await;
+        let (executor_type, daemon_id) = seed_agent_registration_deps(&state, "test-admin").await;
         call_tool_as(
             &state,
             &admin_mcp_context(),
