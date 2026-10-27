@@ -5759,46 +5759,50 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let (project_id, repo_id) = seed_project_repo(&db).await;
-        let now = now_rfc3339();
-        let agent = AgentRepo::create(
+        let (agent_id, agent) =
+            seed_agent_with_daemon(&db, "daemonless-embedded-host", AgentStatus::Idle).await;
+        let daemon_id = agent.daemon_id.clone().expect("fixture daemon binding");
+        sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
+            .bind(crate::embedded_daemon::embedded_machine_id())
+            .bind(&daemon_id)
+            .execute(db.pool())
+            .await
+            .expect("owned daemon becomes the embedded test host");
+        AgentRepo::update(
             &*db,
-            CreateAgent {
-                id: new_uuid_v4(),
-                name: "embedded-shell".to_owned(),
+            UpdateAgent {
+                id: agent_id.clone(),
+                expected_version: agent.version,
+                name: None,
                 description: None,
-                executor_type: "shell".to_owned(),
                 model: None,
                 reasoning_effort: None,
                 permission_policy: None,
-                capabilities_json: "[]".to_owned(),
-                config_json: "{}".to_owned(),
-                credential_ref: None,
-                daemon_id: None,
-                max_concurrent_tasks: 1,
-                heartbeat_interval_seconds: 1,
-                max_missed_heartbeats: 1,
-                status: AgentStatus::Idle,
-                last_heartbeat_at: Some(now.clone()),
-                is_default: false,
-                paused: false,
-                owner_id: None,
-                visibility: "global".to_owned(),
                 prompt_template: None,
-                created_at: now.clone(),
-                updated_at: now,
+                capabilities_json: None,
+                config_json: None,
+                daemon_id: Some(None),
+                max_concurrent_tasks: None,
+                heartbeat_interval_seconds: None,
+                max_missed_heartbeats: None,
+                status: None,
+                last_heartbeat_at: None,
+                is_default: None,
+                paused: None,
+                updated_at: now_rfc3339(),
             },
         )
         .await
-        .expect("daemonless agent creates");
+        .expect("daemonless Agent fixture keeps its durable owner");
         let task = seed_task(
             &db,
             project_id,
             repo_id,
             "active".to_owned(),
-            Some(agent.id.clone()),
+            Some(agent_id.clone()),
         )
         .await;
-        let execution = seed_running_execution(&db, task.id.clone(), agent.id.clone(), None).await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent_id.clone(), None).await;
         ExecutionRepo::update(
             &*db,
             UpdateExecution {

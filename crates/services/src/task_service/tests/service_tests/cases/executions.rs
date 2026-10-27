@@ -384,7 +384,7 @@ async fn answer_uncertain_start_daemon(
 }
 
 #[tokio::test]
-async fn start_execution_uses_frozen_daemon_after_agent_is_rebound() {
+async fn start_execution_rejects_agent_daemon_rebind_after_admission() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(32));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
@@ -401,7 +401,7 @@ async fn start_execution_uses_frozen_daemon_after_agent_is_rebound() {
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let registry = routing_test_registry();
     let _outbound_a = register_routing_test_daemon(&registry, &daemon_a);
-    let outbound_b = register_routing_test_daemon(&registry, &daemon_b);
+    let mut outbound_b = register_routing_test_daemon(&registry, &daemon_b);
     let workspace_root = TempDir::new().expect("workspace root creates");
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
         .with_workspace_root(workspace_root.path().to_path_buf())
@@ -433,39 +433,34 @@ async fn start_execution_uses_frozen_daemon_after_agent_is_rebound() {
     .await;
     change_agent_daemon(&db, &agent_id, Some(&daemon_b)).await;
     registry.unregister(&daemon_a);
-    let outbound_a = register_routing_test_daemon(&registry, &daemon_a);
+    let mut outbound_a = register_routing_test_daemon(&registry, &daemon_a);
 
-    let responder_a = tokio::spawn(answer_routing_test_daemon(
-        Arc::clone(&registry),
-        daemon_a.clone(),
-        outbound_a,
-        std::time::Duration::from_secs(2),
-    ));
-    let responder_b = tokio::spawn(answer_routing_test_daemon(
-        Arc::clone(&registry),
-        daemon_b,
-        outbound_b,
-        std::time::Duration::from_millis(150),
-    ));
-    let result = service
-        .start_execution(execution.id)
+    let error = service
+        .start_execution(execution.id.clone())
         .await
-        .expect("Start dispatches through the admitted daemon");
-    assert!(result.accepted);
-    assert_eq!(
-        responder_a.await.expect("daemon A responder joins"),
-        vec![
-            api_types::METHOD_PROTOCOL_CAPABILITIES,
-            api_types::METHOD_EXECUTION_START
-        ]
-    );
-    assert!(
-        responder_b
-            .await
-            .expect("daemon B observer joins")
-            .is_empty(),
-        "mutable Agent daemon B received no Execution request"
-    );
+        .expect_err("daemon authority rebind after admission rejects Provider Start");
+    assert!(matches!(
+        error,
+        ServiceError::InvalidOperation { message }
+            if message.contains("authority changed before provider Start was claimed")
+    ));
+    assert!(matches!(
+        outbound_a.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        outbound_b.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE entity_id = ? AND event_type = 'execution.provider_start_attempted'",
+    )
+    .bind(&execution.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("provider Start attempt count loads");
+    assert_eq!(attempts, 0, "stale authority creates no provider attempt");
 }
 
 #[tokio::test]
@@ -786,6 +781,10 @@ async fn create_running_repository_execution(
             .await
             .expect("Agent joins the Execution TaskRole");
     }
+    let executor_config_snapshot_json = Some(match executor_config_snapshot_json {
+        Some(snapshot) => snapshot,
+        None => authorized_execution_snapshot(db, task, agent_id).await,
+    });
     let repo = db::RepoRepo::get_by_id(db, task.repo_id.as_deref().expect("Task Repo binds"))
         .await
         .expect("Execution Repo loads")
@@ -2537,7 +2536,7 @@ async fn run_execution_emits_terminal_execution_event() {
         db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("Emit terminal event".to_owned()),
-        Some(r#"{"executor_type":"shell","config":{}}"#.to_owned()),
+        None,
     )
     .await;
     let mut rx = event_bus.subscribe();
@@ -2586,7 +2585,7 @@ async fn run_execution_rejects_when_terminal_active_in_workspace() {
         db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("Terminal blocks execution".to_owned()),
-        Some(r#"{"executor_type":"shell","config":{}}"#.to_owned()),
+        None,
     )
     .await;
     assert!(terminal_activity.try_mark_active(&workspace.id).await);
@@ -2626,7 +2625,7 @@ async fn run_execution_batches_execution_log_events() {
         db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("Batch execution logs".to_owned()),
-        Some(r#"{"executor_type":"shell","config":{}}"#.to_owned()),
+        None,
     )
     .await;
     let mut rx = event_bus.subscribe();
@@ -5861,7 +5860,8 @@ async fn route_agent_to_embedded_daemon(db: &SqliteDb, agent_id: &str) {
                 id: daemon_id.clone(),
                 detected_clis_json: r#"[
                     {"kind":"shell","availability":"authenticated"},
-                    {"kind":"codex","availability":"authenticated"}
+                    {"kind":"codex","availability":"authenticated"},
+                    {"kind":"claude_code","availability":"authenticated"}
                 ]"#
                 .to_owned(),
                 labels_json: None,

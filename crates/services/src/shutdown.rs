@@ -192,7 +192,7 @@ mod tests {
         CreateAgent, CreateExecution, CreateHarnessSession, CreateProject, CreateRepo, CreateTask,
         DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus, HarnessSessionRepo,
         HarnessSessionStatus, ProjectRepo, RepoRepo, TaskLifecycleState, TaskRepo, UpdateAgent,
-        UpdateProject, UpsertDaemon,
+        UpdateDaemonReport, UpdateProject, UpsertDaemon, User, UserRepo,
     };
     use executors::{ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor};
     use std::sync::Mutex;
@@ -228,8 +228,38 @@ mod tests {
         SqliteDb::new(pool)
     }
 
+    async fn seed_shutdown_owner(db: &SqliteDb) -> String {
+        if let Some(owner_id) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM user WHERE is_admin = 1 ORDER BY created_at, id LIMIT 1",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .expect("shutdown fixture owner lookup succeeds")
+        {
+            return owner_id;
+        }
+        let now = now_rfc3339();
+        let owner_id = new_uuid_v4();
+        UserRepo::create_user(
+            db,
+            &User {
+                id: owner_id.clone(),
+                email: format!("{owner_id}@shutdown.test"),
+                password_hash: "test-only".to_owned(),
+                display_name: Some("Shutdown fixture owner".to_owned()),
+                is_admin: true,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("durable shutdown fixture owner creates");
+        owner_id
+    }
+
     async fn seed_project_repo(db: &SqliteDb) -> (String, String) {
         let now = now_rfc3339();
+        let owner_id = seed_shutdown_owner(db).await;
         let project_id = new_uuid_v4();
         let repo_id = new_uuid_v4();
         ProjectRepo::create(
@@ -239,7 +269,7 @@ mod tests {
                 name: "Forge".to_owned(),
                 settings: "{}".to_owned(),
                 primary_repo_id: None,
-                owner_id: None,
+                owner_id: Some(owner_id),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
@@ -280,27 +310,47 @@ mod tests {
 
     async fn seed_agent(db: &SqliteDb) -> String {
         let now = now_rfc3339();
+        let owner_id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM user WHERE is_admin = 1 ORDER BY created_at, id LIMIT 1",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("shutdown fixture owner exists");
         let daemon_id = new_uuid_v4();
         DaemonRepo::upsert_by_machine_id(
             db,
             UpsertDaemon {
                 id: daemon_id.clone(),
-                machine_id: crate::embedded_daemon::embedded_machine_id(),
+                machine_id: format!("shutdown-machine-{daemon_id}"),
                 hostname: "test-host".to_owned(),
                 os: "linux".to_owned(),
                 arch: "x86_64".to_owned(),
                 agent_version: None,
                 labels_json: "{}".to_owned(),
                 status: DaemonStatus::Online,
-                registration_token_hash: None,
-                owner_id: None,
-                visibility: "global".to_owned(),
+                registration_token_hash: Some(format!("shutdown-registration-{daemon_id}")),
+                owner_id: Some(owner_id.clone()),
+                visibility: "account".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
         )
         .await
         .expect("daemon creates");
+        DaemonRepo::update_report(
+            db,
+            UpdateDaemonReport {
+                id: daemon_id.clone(),
+                last_report_at: now.clone(),
+                status: DaemonStatus::Online,
+                detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#
+                    .to_owned(),
+                labels_json: None,
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("daemon advertises its authenticated shell harness");
 
         let agent_id = new_uuid_v4();
         AgentRepo::create(
@@ -324,8 +374,8 @@ mod tests {
                 last_heartbeat_at: None,
                 is_default: false,
                 paused: false,
-                owner_id: None,
-                visibility: "global".to_owned(),
+                owner_id: Some(owner_id),
+                visibility: "account".to_owned(),
                 prompt_template: None,
                 created_at: now.clone(),
                 updated_at: now,
@@ -379,6 +429,10 @@ mod tests {
             .expect("agent loads")
             .expect("agent exists");
         let resolved_daemon_id = agent.daemon_id.clone().expect("agent daemon binding");
+        let daemon = DaemonRepo::get_by_id(db, &resolved_daemon_id)
+            .await
+            .expect("agent daemon loads")
+            .expect("agent daemon exists");
         let harness_session_id = if agent_session_id.is_some() {
             let id = new_uuid_v4();
             HarnessSessionRepo::create(
@@ -435,7 +489,8 @@ mod tests {
                         "agent_id": agent.id,
                         "agent_daemon_id": agent.daemon_id,
                         "resolved_daemon_id": resolved_daemon_id,
-                        "executor_type": "shell",
+                        "daemon_authority": db::daemon_authority_snapshot(&agent, &daemon),
+                        "executor_type": agent.executor_type,
                         "config": {}
                     })
                     .to_string(),
