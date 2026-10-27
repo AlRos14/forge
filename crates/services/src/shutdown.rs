@@ -558,6 +558,17 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(16));
         let (project_id, repo_id) = seed_project_repo(&db).await;
         let agent_id = seed_agent(&db).await;
+        let agent = AgentRepo::get_by_id(&*db, &agent_id)
+            .await
+            .expect("Agent loads")
+            .expect("Agent exists");
+        let daemon_id = agent.daemon_id.expect("Agent has its local daemon");
+        sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
+            .bind(crate::embedded_daemon::embedded_machine_id())
+            .bind(daemon_id)
+            .execute(db.pool())
+            .await
+            .expect("fixture routes the Agent to the local embedded host");
         let task_id = seed_task(&db, project_id, repo_id, TaskLifecycleState::Active).await;
         let execution = seed_running_execution(&db, task_id, agent_id, None).await;
         let executor = Arc::new(RecordingCancelExecutor::default());
