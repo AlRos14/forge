@@ -35,14 +35,16 @@ by Forge, or `http://127.0.0.1:8080`. The named volume `forge-data` persists
 Verify the runtime identity and persistence:
 
 ```bash
-docker compose exec forge id
+docker compose top forge
+docker compose exec --user 10001:10001 forge id
 docker compose restart forge
 docker compose logs forge
 ```
 
-`id` must report `uid=10001(forge)`. After restart, Projects, accounts, and
-server state must remain. The database is `/data/forge.db`; migrations run on
-startup and are forward-only.
+With `init: true`, PID 1 is `docker-init` and runs as root; the actual `forge`
+server process must report UID/GID `10001`. After restart, Projects, accounts,
+and server state must remain. The database is `/data/forge.db`; migrations run
+on startup and are forward-only.
 
 ## Existing root-owned `/data` volumes
 

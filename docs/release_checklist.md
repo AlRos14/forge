@@ -34,7 +34,7 @@ docker run -d --name forge-rc --init -p 127.0.0.1:18080:8080 \
 Verify in a second terminal:
 
 ```bash
-docker exec forge-rc sh -c 'cat /proc/1/status | grep ^Uid:'
+docker top forge-rc -o pid,user,args
 curl -fsS http://127.0.0.1:18080/healthz
 docker restart forge-rc
 curl -fsS http://127.0.0.1:18080/healthz
@@ -42,7 +42,8 @@ docker rm -f forge-rc
 docker volume rm forge-rc-data
 ```
 
-PID 1 should report `Uid: 10001 10001 10001 10001`. Confirm data persists
+The `forge --data-dir /data` process must report UID `10001`; PID 1 may be
+`docker-init` when `--init` is used. Confirm data persists
 across restart and that the host port is loopback-only. Test an existing
 root-owned volume separately with the explicit migration in
 [deployment](deployment.md). Do not tag, push, or publish the candidate without
