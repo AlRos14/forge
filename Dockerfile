@@ -62,18 +62,31 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     git \
-    && rm -rf /var/lib/apt/lists/*
+    gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 forge \
+    && useradd --uid 10001 --gid forge --create-home --shell /usr/sbin/nologin forge
 
 COPY --from=builder /app/target/release/forge /usr/local/bin/forge
 COPY --from=builder /app/target/release/forge-ctl /usr/local/bin/forge-ctl
 COPY --from=web-builder /app/web/dist /usr/local/share/forge/web/dist
+COPY docker/entrypoint.sh /usr/local/bin/forge-entrypoint
 
-RUN mkdir -p /data
+RUN chmod 0755 /usr/local/bin/forge-entrypoint \
+    && mkdir -p /data \
+    && chown forge:forge /data
+
+ENV HOME=/home/forge
 ENV FORGE_DATA_DIR=/data
 ENV FORGE_WEB_DIST_DIR=/usr/local/share/forge/web/dist
+# The process listens on all container interfaces; host exposure is controlled
+# explicitly by the port mapping (Compose binds loopback by default).
 ENV FORGE_SERVER_BIND=0.0.0.0:8080
 
 EXPOSE 8080
+STOPSIGNAL SIGTERM
 
-ENTRYPOINT ["forge"]
+# The entrypoint starts as root only to make an explicitly authorized /data
+# ownership migration, then drops to the unprivileged forge user before exec.
+ENTRYPOINT ["/usr/local/bin/forge-entrypoint"]
 CMD ["--data-dir", "/data"]
