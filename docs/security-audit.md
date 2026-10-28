@@ -46,6 +46,10 @@ At the hardening HEAD:
   attach-token consumption.
 - Agent/orchestrator/Execution admission requires the Agent owner's current
   Project membership, not owner equality alone.
+- A historical Project whose canonical `owner_id` points to a deleted user and
+  has no other owner membership remains fail-closed after V135. It is not made
+  public or assigned to an arbitrary account; an operator must repair it
+  explicitly. V135 transfers to an existing owner when one is available.
 
 ## Code scanning
 
