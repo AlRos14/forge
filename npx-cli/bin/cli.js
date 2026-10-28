@@ -347,14 +347,19 @@ async function ensureRelease(release) {
     throw new Error("Release archive did not include web/dist assets");
   }
 
-  fs.rmSync(installDir, { recursive: true, force: true });
-  fs.renameSync(tempDir, installDir);
-  const readyFd = fs.openSync(readyFile, "wx", 0o444);
+  // Write the readiness marker inside the private temp directory, then publish
+  // the whole directory with one rename. The marker is never created after a
+  // separate existsSync check on the published path.
+  const tempReadyFile = path.join(tempDir, ".ready");
+  const readyFd = fs.openSync(tempReadyFile, "wx", 0o444);
   try {
     fs.writeFileSync(readyFd, `${new Date().toISOString()}\n`);
   } finally {
     fs.closeSync(readyFd);
   }
+
+  fs.rmSync(installDir, { recursive: true, force: true });
+  fs.renameSync(tempDir, installDir);
 
   return { binaryPath, ctlPath, installDir, tag };
 }

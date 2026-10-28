@@ -110,19 +110,20 @@ impl ProjectMemberService {
         }
 
         let now = now_rfc3339();
-        if target.role == "owner" && role != "owner" {
-            if project.owner_id.as_deref() == Some(target.user_id.as_str()) {
-                let replacement = next_owner(&owners, target_user_id)
-                    .ok_or_else(|| ServiceError::Conflict("last_owner".to_owned()))?;
-                ProjectRepo::set_owner_in_tx(
-                    &*self.db,
-                    &mut transaction,
-                    project_id,
-                    &replacement.user_id,
-                    &now,
-                )
-                .await?;
-            }
+        if target.role == "owner"
+            && role != "owner"
+            && project.owner_id.as_deref() == Some(target.user_id.as_str())
+        {
+            let replacement = next_owner(&owners, target_user_id)
+                .ok_or_else(|| ServiceError::Conflict("last_owner".to_owned()))?;
+            ProjectRepo::set_owner_in_tx(
+                &*self.db,
+                &mut transaction,
+                project_id,
+                &replacement.user_id,
+                &now,
+            )
+            .await?;
         }
 
         let member = ProjectMemberRepo::update_member_role_in_tx(
