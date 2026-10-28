@@ -334,7 +334,10 @@ impl OAuthService {
         }
     }
 
-    pub fn verify_mcp_access_token(&self, bearer: &str) -> Result<(String, String), OAuthError> {
+    pub async fn verify_mcp_access_token(
+        &self,
+        bearer: &str,
+    ) -> Result<(String, String, bool), OAuthError> {
         let claims = self
             .auth_service
             .verify_mcp_token(bearer)
@@ -349,7 +352,11 @@ impl OAuthService {
             return Err(OAuthError::InvalidGrant("invalid_token".into()));
         }
 
-        Ok((claims.sub, claims.email))
+        let user = UserRepo::get_user_by_id(&*self.db, &claims.sub)
+            .await?
+            .ok_or_else(|| OAuthError::InvalidGrant("invalid_token".into()))?;
+
+        Ok((user.id, user.email, user.is_admin))
     }
 
     async fn exchange_authorization_code(

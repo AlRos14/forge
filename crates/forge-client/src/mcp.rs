@@ -21,7 +21,7 @@ pub enum McpCmd {
         agent: AgentTarget,
         #[arg(long, value_enum, default_value = "project")]
         scope: ConfigScope,
-        /// User access token to embed in the MCP URL. Overrides FORGE_TOKEN and stored login.
+        /// User access token to write as a Bearer Authorization header. Overrides FORGE_TOKEN and stored login.
         #[arg(long)]
         token: Option<String>,
         /// Scope this MCP endpoint to a single Forge project.
@@ -148,13 +148,14 @@ pub fn install(
     project_id: Option<&str>,
 ) -> Result<()> {
     let path = config_path(agent, scope)?;
-    let install_url = install_url(server, token, project_id)?;
+    let access_token = resolve_install_token(server, token)?;
+    let install_url = install_url(server, project_id)?;
     if agent == AgentTarget::Codex {
         let contents = read_codex_config(&path)?;
         write_codex_config_if_changed(
             &path,
             &contents,
-            set_codex_forge_url(&contents, &install_url),
+            set_codex_forge_config(&contents, &install_url, &access_token),
         )?;
         println!("Installed Forge MCP at {}", path.display());
         return Ok(());
@@ -186,6 +187,10 @@ pub fn install(
     let mut forge = Map::new();
     forge.insert("type".to_owned(), Value::String("http".to_string()));
     forge.insert("url".to_owned(), Value::String(install_url));
+    forge.insert(
+        "headers".to_owned(),
+        serde_json::json!({ "Authorization": format!("Bearer {access_token}") }),
+    );
     mcp_servers.insert("forge".to_owned(), Value::Object(forge));
 
     write_config(&path, &config)?;
@@ -292,19 +297,18 @@ fn mcp_url(server: &str) -> String {
     format!("{}/mcp", server.trim_end_matches('/'))
 }
 
-fn install_url(server: &str, token: Option<&str>, project_id: Option<&str>) -> Result<String> {
-    let token = resolve_access_token_for_server(server, token)?.ok_or_else(|| {
+fn resolve_install_token(server: &str, token: Option<&str>) -> Result<String> {
+    resolve_access_token_for_server(server, token)?.ok_or_else(|| {
         anyhow!(
             "MCP install requires an access token; run `forge-ctl login`, pass --token, or set FORGE_TOKEN"
         )
-    })?;
+    })
+}
+
+fn install_url(server: &str, project_id: Option<&str>) -> Result<String> {
     let mut url = url::Url::parse(&mcp_url(server)).context("parse Forge MCP URL")?;
-    {
-        let mut query = url.query_pairs_mut();
-        if let Some(project_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) {
-            query.append_pair("project_id", project_id);
-        }
-        query.append_pair("token", &token);
+    if let Some(project_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) {
+        url.query_pairs_mut().append_pair("project_id", project_id);
     }
     Ok(url.to_string())
 }
@@ -341,7 +345,7 @@ fn codex_forge_url(contents: &str) -> Option<String> {
     })
 }
 
-fn set_codex_forge_url(contents: &str, url: &str) -> String {
+fn set_codex_forge_config(contents: &str, url: &str, token: &str) -> String {
     let mut next = remove_codex_forge(contents);
     if !next.ends_with('\n') && !next.is_empty() {
         next.push('\n');
@@ -353,6 +357,9 @@ fn set_codex_forge_url(contents: &str, url: &str) -> String {
     next.push_str("url = ");
     next.push_str(&toml_string(url));
     next.push('\n');
+    next.push_str("http_headers = { Authorization = ");
+    next.push_str(&toml_string(&format!("Bearer {token}")));
+    next.push_str(" }\n");
     next
 }
 
@@ -479,18 +486,19 @@ mod tests {
     }
 
     #[test]
-    fn codex_forge_url_round_trips_config_toml() {
+    fn codex_forge_config_round_trips_url_and_header() {
         let initial = r#"model = "gpt-5.2"
 
 [mcp_servers.other]
 command = "other"
 "#;
 
-        let installed = set_codex_forge_url(initial, "http://127.0.0.1:8080/mcp");
+        let installed = set_codex_forge_config(initial, "http://127.0.0.1:8080/mcp", "fg_test");
         assert_eq!(
             codex_forge_url(&installed).as_deref(),
             Some("http://127.0.0.1:8080/mcp")
         );
+        assert!(installed.contains("http_headers = { Authorization = \"Bearer fg_test\" }"));
         assert!(installed.contains("[mcp_servers.other]"));
 
         let removed = remove_codex_forge(&installed);
@@ -499,54 +507,42 @@ command = "other"
     }
 
     #[test]
-    fn install_url_requires_token() {
+    fn install_requires_token() {
         let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
         let temp = unique_temp_dir("forge-client-mcp-no-token");
         let _token = EnvVarGuard::unset("FORGE_TOKEN");
         let _data = EnvVarGuard::set("FORGE_DATA_DIR", temp.to_string_lossy().as_ref());
 
-        let error = install_url("http://127.0.0.1:8080/", None, None).expect_err("token required");
+        let error =
+            resolve_install_token("http://127.0.0.1:8080/", None).expect_err("token required");
 
         assert!(error.to_string().contains("requires an access token"));
         let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
-    fn install_url_includes_explicit_token_and_project() {
-        let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
-        let temp = unique_temp_dir("forge-client-mcp-explicit-token");
-        let _env = EnvVarGuard::set("FORGE_TOKEN", "fg_from_env");
-        let _data = EnvVarGuard::set("FORGE_DATA_DIR", temp.to_string_lossy().as_ref());
+    fn install_url_includes_project_but_never_the_token() {
+        let url = install_url("http://127.0.0.1:8080/", Some("project 1")).expect("url builds");
 
-        let url = install_url(
-            "http://127.0.0.1:8080/",
-            Some("fg_explicit"),
-            Some("project 1"),
-        )
-        .expect("url builds");
-
-        assert_eq!(
-            url,
-            "http://127.0.0.1:8080/mcp?project_id=project+1&token=fg_explicit"
-        );
-        let _ = fs::remove_dir_all(temp);
+        assert_eq!(url, "http://127.0.0.1:8080/mcp?project_id=project+1");
+        assert!(!url.contains("token="));
     }
 
     #[test]
-    fn install_url_falls_back_to_forge_token_env() {
+    fn install_token_falls_back_to_forge_token_env() {
         let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
         let temp = unique_temp_dir("forge-client-mcp-env-token");
         let _env = EnvVarGuard::set("FORGE_TOKEN", "fg_from_env");
         let _data = EnvVarGuard::set("FORGE_DATA_DIR", temp.to_string_lossy().as_ref());
 
-        let url = install_url("http://127.0.0.1:8080/", None, None).expect("url builds");
+        let token = resolve_install_token("http://127.0.0.1:8080/", None).expect("token resolves");
 
-        assert_eq!(url, "http://127.0.0.1:8080/mcp?token=fg_from_env");
+        assert_eq!(token, "fg_from_env");
         let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
-    fn install_url_falls_back_to_stored_login_token() {
+    fn install_token_falls_back_to_stored_login_token() {
         let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
         let temp = unique_temp_dir("forge-client-mcp-stored-token");
         fs::create_dir_all(&temp).expect("forge data dir creates");
@@ -565,14 +561,14 @@ command = "other"
         )
         .expect("credentials write");
 
-        let url = install_url("http://127.0.0.1:8080/", None, None).expect("url builds");
+        let token = resolve_install_token("http://127.0.0.1:8080/", None).expect("token resolves");
 
-        assert_eq!(url, "http://127.0.0.1:8080/mcp?token=fg_stored");
+        assert_eq!(token, "fg_stored");
         let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
-    fn install_writes_token_url_on_temp_dir() {
+    fn install_writes_bearer_header_without_putting_token_in_url() {
         let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
         let data_dir = unique_temp_dir("forge-client-mcp-install-data");
         let _token = EnvVarGuard::unset("FORGE_TOKEN");
@@ -597,9 +593,11 @@ command = "other"
             .expect("forge url reads")
             .expect("forge url installed");
 
+        assert_eq!(url, "http://127.0.0.1:8080/mcp?project_id=project-1");
+        assert!(!url.contains("token="));
         assert_eq!(
-            url,
-            "http://127.0.0.1:8080/mcp?project_id=project-1&token=fg_test"
+            config["mcpServers"]["forge"]["headers"]["Authorization"],
+            "Bearer fg_test"
         );
         let _ = fs::remove_dir_all(repo_dir);
         let _ = fs::remove_dir_all(data_dir);

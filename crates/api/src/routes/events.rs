@@ -1,15 +1,24 @@
 use std::{convert::Infallible, sync::Arc};
 
-use api_types::{PublicEventEnvelope, PublicEventType};
+use api_types::{EventTicketResponse, PublicEventEnvelope, PublicEventType};
 use axum::{
     extract::State,
     response::sse::{Event, KeepAlive, Sse},
+    Json,
 };
 use db::{DomainEvent, DomainEventRepo, ProjectMemberRepo, ProjectRepo, SqliteDb, TaskRepo};
 use serde_json::{json, Map, Value};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::{routes::auth::AuthenticatedUser, state::AppState};
+
+pub async fn issue_event_ticket(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+) -> Json<EventTicketResponse> {
+    let (ticket, expires_at) = state.sse_tickets.issue(&user);
+    Json(EventTicketResponse { ticket, expires_at })
+}
 
 pub async fn stream_events(
     State(state): State<AppState>,

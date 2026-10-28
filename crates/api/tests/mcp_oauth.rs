@@ -148,7 +148,7 @@ async fn mcp_oauth_token_subject_is_used_for_membership() {
 }
 
 #[tokio::test]
-async fn mcp_query_token_takes_precedence_over_header() {
+async fn mcp_rejects_reusable_query_tokens() {
     let workspace = common::TestDir::new("mcp-oauth-query-token");
     let harness = common::test_app(workspace.path(), "mcp-oauth-query-token").await;
 
@@ -158,7 +158,30 @@ async fn mcp_query_token_takes_precedence_over_header() {
     let response = mcp_post(
         &harness.app,
         &format!("/mcp?token={pat}"),
-        Some("not-a-real-token"),
+        None,
+        tools_list_request(),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "a PAT in the query string must not authenticate MCP"
+    );
+}
+
+#[tokio::test]
+async fn mcp_bearer_header_wins_over_invalid_query_value() {
+    let workspace = common::TestDir::new("mcp-oauth-header-token");
+    let harness = common::test_app(workspace.path(), "mcp-oauth-header-token").await;
+
+    let auth = register_user(&harness.app, "mcp-header-token@example.com").await;
+    let pat = create_pat(&harness.app, &auth.access_token, "mcp-header-pat").await;
+
+    let response = mcp_post(
+        &harness.app,
+        "/mcp?token=not-a-valid-token",
+        Some(&pat),
         tools_list_request(),
     )
     .await;

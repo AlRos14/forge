@@ -30,8 +30,6 @@ pub struct TokenPair {
 struct Claims {
     sub: String,
     email: String,
-    #[serde(default)]
-    is_admin: bool,
     iat: u64,
     exp: u64,
 }
@@ -243,7 +241,15 @@ impl AuthService {
         Ok(RefreshTokenRepo::delete_expired_refresh_tokens(&*self.db).await?)
     }
 
-    pub fn verify_token(&self, token: &str) -> std::result::Result<(String, String, bool), String> {
+    /// Verifies the JWT signature and lifetime, then resolves the durable user.
+    ///
+    /// Privileges are never taken from the token: a deleted user is rejected and
+    /// `is_admin` is read from the current user row, so a degraded account loses
+    /// administrative authority immediately.
+    pub async fn verify_token(
+        &self,
+        token: &str,
+    ) -> std::result::Result<(String, String, bool), String> {
         use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 
         let mut validation = Validation::new(Algorithm::HS256);
@@ -260,11 +266,12 @@ impl AuthService {
             _ => "invalid_token".to_string(),
         })?;
 
-        Ok((
-            token_data.claims.sub,
-            token_data.claims.email,
-            token_data.claims.is_admin,
-        ))
+        let user = UserRepo::get_user_by_id(&*self.db, &token_data.claims.sub)
+            .await
+            .map_err(|_| "invalid_token".to_string())?
+            .ok_or_else(|| "invalid_token".to_string())?;
+
+        Ok((user.id, user.email, user.is_admin))
     }
 
     pub fn issue_mcp_token(&self, claims: McpAccessTokenClaims) -> Result<String> {
@@ -437,7 +444,6 @@ impl AuthService {
         let claims = Claims {
             sub: user.id.clone(),
             email: user.email.clone(),
-            is_admin: user.is_admin,
             iat: now,
             exp: now + ACCESS_TOKEN_EXPIRY_SECS,
         };
@@ -699,9 +705,66 @@ mod tests {
             .expect("login");
         let (user_id, email, _is_admin) = svc
             .verify_token(&pair.access_token)
+            .await
             .expect("verify succeeds");
         assert!(!user_id.is_empty());
         assert_eq!(email, "vt@test.com");
+    }
+
+    #[tokio::test]
+    async fn verify_token_uses_current_admin_authority() {
+        let svc = test_service().await;
+        let user = svc
+            .register("admin@test.com", "password123", None)
+            .await
+            .expect("register");
+        svc.bootstrap_first_user(&user.id)
+            .await
+            .expect("bootstrap admin");
+        let pair = svc
+            .login("admin@test.com", "password123")
+            .await
+            .expect("login");
+
+        let (_, _, is_admin) = svc
+            .verify_token(&pair.access_token)
+            .await
+            .expect("verify admin token");
+        assert!(is_admin, "bootstrap admin is current authority");
+
+        sqlx::query("UPDATE user SET is_admin = 0 WHERE id = ?")
+            .bind(&user.id)
+            .execute(svc.db.pool())
+            .await
+            .expect("demote user");
+
+        let (_, _, is_admin) = svc
+            .verify_token(&pair.access_token)
+            .await
+            .expect("token remains authentic");
+        assert!(!is_admin, "token cannot retain stale admin authority");
+    }
+
+    #[tokio::test]
+    async fn verify_token_rejects_deleted_user() {
+        let svc = test_service().await;
+        let user = svc
+            .register("deleted@test.com", "password123", None)
+            .await
+            .expect("register");
+        let pair = svc
+            .login("deleted@test.com", "password123")
+            .await
+            .expect("login");
+
+        UserRepo::delete_user(&*svc.db, &user.id)
+            .await
+            .expect("delete user");
+
+        assert_eq!(
+            svc.verify_token(&pair.access_token).await.unwrap_err(),
+            "invalid_token"
+        );
     }
 
     #[tokio::test]
@@ -721,7 +784,7 @@ mod tests {
             &EncodingKey::from_secret(b"test-secret"),
         )
         .unwrap();
-        let err = svc.verify_token(&expired).unwrap_err();
+        let err = svc.verify_token(&expired).await.unwrap_err();
         assert_eq!(err, "token_expired");
     }
 
@@ -742,7 +805,7 @@ mod tests {
             &EncodingKey::from_secret(b"wrong-secret"),
         )
         .unwrap();
-        assert!(svc.verify_token(&bad).is_err());
+        assert!(svc.verify_token(&bad).await.is_err());
     }
 
     #[tokio::test]
@@ -763,7 +826,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            svc.verify_token(&hs512_token).is_err(),
+            svc.verify_token(&hs512_token).await.is_err(),
             "HS512 token must be rejected when only HS256 is accepted"
         );
     }

@@ -286,6 +286,7 @@ fn export_typescript() {
     RefreshRequest::export().expect("export RefreshRequest");
     LogoutRequest::export().expect("export LogoutRequest");
     AuthResponse::export().expect("export AuthResponse");
+    EventTicketResponse::export().expect("export EventTicketResponse");
     UserResponse::export().expect("export UserResponse");
     UpdateProfileRequest::export().expect("export UpdateProfileRequest");
     CreateTokenRequest::export().expect("export CreateTokenRequest");

@@ -20,6 +20,7 @@ pub mod errors;
 pub mod middleware;
 mod path_input;
 pub mod routes;
+pub mod sse_ticket;
 pub mod state;
 
 pub use state::AppState;
@@ -578,6 +579,10 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route("/api/v1/events", get(routes::events::stream_events))
         .route(
+            "/api/v1/events/ticket",
+            post(routes::events::issue_event_ticket),
+        )
+        .route(
             "/api/v1/config/mcp",
             get(routes::mcp_config::get_mcp_config).post(routes::mcp_config::update_mcp_config),
         )
@@ -837,10 +842,30 @@ async fn event_stream_finishes_when_shutdown_is_requested() {
     let _event_bus = Arc::clone(&state.event_bus);
     let app = build_router(state, temp_web_dist());
 
+    let ticket_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events/ticket")
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .expect("build ticket request"),
+        )
+        .await
+        .expect("ticket response");
+    assert_eq!(ticket_response.status(), StatusCode::OK);
+    let ticket: api_types::EventTicketResponse = serde_json::from_slice(
+        &to_bytes(ticket_response.into_body(), usize::MAX)
+            .await
+            .expect("ticket body"),
+    )
+    .expect("ticket parses");
+
     let response = app
         .oneshot(
             Request::builder()
-                .uri(format!("/api/v1/events?token={token}"))
+                .uri(format!("/api/v1/events?ticket={}", ticket.ticket))
                 .body(axum::body::Body::empty())
                 .expect("build request"),
         )
@@ -876,6 +901,21 @@ async fn test_state() -> AppState {
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(db::SqliteDb::new(pool));
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*db,
+        &db::User {
+            id: "test-user-id".to_owned(),
+            email: "test@example.com".to_owned(),
+            password_hash: "$2b$04$placeholder".to_owned(),
+            display_name: None,
+            is_admin: true,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("seed test user");
     let event_bus = Arc::new(events::EventBus::new(16));
     AppState::new(db, event_bus, true)
 }

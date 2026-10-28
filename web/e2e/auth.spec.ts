@@ -68,7 +68,7 @@ test('register via UI → app shell shown → SSE connected → logout → redir
   await page.getByLabel('Confirm password').fill(PASSWORD)
 
   // Set up SSE request watcher BEFORE clicking submit so we don't miss it
-  const sseRequestPromise = page.waitForRequest(/\/api\/v1\/events\?token=/, { timeout: 15_000 })
+  const sseRequestPromise = page.waitForRequest(/\/api\/v1\/events\?ticket=/, { timeout: 15_000 })
 
   await page.getByRole('button', { name: 'Create account' }).click()
 
@@ -78,10 +78,10 @@ test('register via UI → app shell shown → SSE connected → logout → redir
   // ── 3. App shell is visible (user menu button in header) ─────────────
   await expect(page.getByRole('button', { name: 'User menu' })).toBeVisible({ timeout: 10_000 })
 
-  // ── 4. SSE connection established with token query param ─────────────
+  // ── 4. SSE connection established with a short-lived ticket ──────────
   const sseReq = await sseRequestPromise
   expect(sseReq.url()).toContain('/api/v1/events')
-  expect(sseReq.url()).toContain('token=')
+  expect(sseReq.url()).toContain('ticket=')
 
   // ── 5. Logout via user menu ──────────────────────────────────────────
   await page.getByRole('button', { name: 'User menu' }).click()

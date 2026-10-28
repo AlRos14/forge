@@ -1,7 +1,8 @@
 import { useEffect } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
 import { qk } from '@/api/query-keys'
-import type { ForgeEvent, PublicEventType } from '@/types/generated'
+import { apiFetch } from '@/api/client'
+import type { EventTicketResponse, ForgeEvent, PublicEventType } from '@/types/generated'
 
 type SsePayload = ForgeEvent
 
@@ -132,65 +133,77 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
       })
     }
 
+    const scheduleReconnect = () => {
+      if (cancelled) return
+      backoffTimer = setTimeout(() => {
+        if (!cancelled) {
+          backoffMs = Math.min(backoffMs * 2, 30_000)
+          connect()
+        }
+      }, backoffMs)
+    }
+
     const connect = () => {
       if (backoffTimer) {
         clearTimeout(backoffTimer)
         backoffTimer = null
       }
-      source = new EventSource(`/api/v1/events?token=${encodeURIComponent(accessToken)}`)
 
-      // Listen on generic message (unnamed events)
-      source.onmessage = handleEvent
+      void apiFetch<EventTicketResponse>('/events/ticket', { method: 'POST' })
+        .then(({ ticket }) => {
+          if (cancelled) return
+          source = new EventSource(`/api/v1/events?ticket=${encodeURIComponent(ticket)}`)
 
-      // Also listen on known named event types so we catch both
-      const namedEvents: PublicEventType[] = [
-        'task.lifecycle_changed',
-        'gate.created',
-        'gate.policy_revised',
-        'gate.evaluated',
-        'execution.started',
-        'execution.completed',
-        'execution.failed',
-        'execution.cancelled',
-        'execution.stalled',
-        'validation_run.started',
-        'validation_run.completed',
-        'evidence.created',
-        'artifact.created',
-        'message.created',
-        'handoff.created',
-        'handoff.status_changed',
-        'proposal.created',
-        'proposal.withdrawn',
-        'decision.recorded',
-        'project.created',
-        'project.updated',
-        'project.deleted',
-        'project.paused',
-        'project.resumed',
-        'project_hook.run_changed',
-        'notification.created',
-        'events.resync_required',
-        'operations.status_changed',
-      ]
-      for (const name of namedEvents) {
-        source.addEventListener(name, handleEvent as EventListener)
-      }
+          // Listen on generic message (unnamed events)
+          source.onmessage = handleEvent
 
-      source.onerror = () => {
-        source?.close()
-        if (cancelled) return
-        backoffTimer = setTimeout(() => {
-          if (!cancelled) {
-            backoffMs = Math.min(backoffMs * 2, 30_000)
-            connect()
+          // Also listen on known named event types so we catch both
+          const namedEvents: PublicEventType[] = [
+            'task.lifecycle_changed',
+            'gate.created',
+            'gate.policy_revised',
+            'gate.evaluated',
+            'execution.started',
+            'execution.completed',
+            'execution.failed',
+            'execution.cancelled',
+            'execution.stalled',
+            'validation_run.started',
+            'validation_run.completed',
+            'evidence.created',
+            'artifact.created',
+            'message.created',
+            'handoff.created',
+            'handoff.status_changed',
+            'proposal.created',
+            'proposal.withdrawn',
+            'decision.recorded',
+            'project.created',
+            'project.updated',
+            'project.deleted',
+            'project.paused',
+            'project.resumed',
+            'project_hook.run_changed',
+            'notification.created',
+            'events.resync_required',
+            'operations.status_changed',
+          ]
+          for (const name of namedEvents) {
+            source.addEventListener(name, handleEvent as EventListener)
           }
-        }, backoffMs)
-      }
 
-      source.onopen = () => {
-        backoffMs = 1000
-      }
+          source.onerror = () => {
+            source?.close()
+            scheduleReconnect()
+          }
+
+          source.onopen = () => {
+            backoffMs = 1000
+          }
+        })
+        .catch(() => {
+          scheduleReconnect()
+        })
     }
 
     connect()

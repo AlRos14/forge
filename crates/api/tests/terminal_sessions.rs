@@ -124,11 +124,32 @@ async fn request_with_bearer(
 }
 
 async fn sse_request(app: &Router) -> axum::response::Response {
+    let ticket_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/events/ticket")
+                .header(header::AUTHORIZATION, format!("Bearer {}", test_jwt()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ticket_response.status(), StatusCode::OK);
+    let bytes = to_bytes(ticket_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let ticket: Value = serde_json::from_slice(&bytes).unwrap();
+
     app.clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(format!("/api/v1/events?token={}", test_jwt()))
+                .uri(format!(
+                    "/api/v1/events?ticket={}",
+                    ticket["ticket"].as_str().unwrap()
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )

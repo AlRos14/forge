@@ -11,7 +11,6 @@ use axum::{
     Json,
 };
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use tokio::fs;
 
 use crate::{
@@ -19,7 +18,7 @@ use crate::{
     routes::auth::AuthenticatedUser,
     state::AppState,
 };
-use db::{now_rfc3339, PersonalAccessTokenRepo, ProjectRepo, RepoRepo};
+use db::{ProjectRepo, RepoRepo};
 
 pub async fn get_mcp_config(
     Query(params): Query<McpConfigQuery>,
@@ -48,7 +47,7 @@ pub async fn get_mcp_config(
     };
 
     Ok(Json(McpConfigResponse {
-        installed: mcp_url_is_usable(&state, &user, url.as_deref(), &expected_url).await,
+        installed: mcp_url_is_usable(url.as_deref(), &expected_url),
         url,
         expected_url,
         config_path: config_path.to_string_lossy().into_owned(),
@@ -114,7 +113,7 @@ pub async fn update_mcp_config(
     };
 
     Ok(Json(McpConfigResponse {
-        installed: mcp_url_is_usable(&state, &user, url.as_deref(), &expected_url).await,
+        installed: mcp_url_is_usable(url.as_deref(), &expected_url),
         url,
         expected_url,
         config_path: config_path.to_string_lossy().into_owned(),
@@ -202,25 +201,16 @@ fn percent_encode_query(value: &str) -> String {
     encoded
 }
 
-async fn mcp_url_is_usable(
-    state: &AppState,
-    user: &AuthenticatedUser,
-    url: Option<&str>,
-    expected_url: &str,
-) -> bool {
+fn mcp_url_is_usable(url: Option<&str>, expected_url: &str) -> bool {
     let Some(url) = url else {
         return false;
     };
     if url == expected_url {
         return true;
     }
-    if !mcp_url_matches_expected_scope(url, expected_url) {
-        return false;
-    }
-    let Some(token) = mcp_url_token(url) else {
-        return false;
-    };
-    mcp_token_belongs_to_user(state, user, &token).await
+    // A legacy `?token=` URL is installed but no longer authenticates. Report it
+    // as not usable so the UI prompts a reinstall with OAuth or a Bearer header.
+    mcp_url_token(url).is_none() && mcp_url_matches_expected_scope(url, expected_url)
 }
 
 fn mcp_url_matches_expected_scope(url: &str, expected_url: &str) -> bool {
@@ -236,36 +226,6 @@ fn query_param(url: &url::Url, name: &str) -> Option<String> {
     url.query_pairs()
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.into_owned())
-}
-
-async fn mcp_token_belongs_to_user(
-    state: &AppState,
-    user: &AuthenticatedUser,
-    token: &str,
-) -> bool {
-    if !token.starts_with("fg_") {
-        return state
-            .auth_service
-            .verify_token(token)
-            .is_ok_and(|(user_id, _, _)| user_id == user.user_id);
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    let token_hash = hex::encode(hasher.finalize());
-    let Ok(Some(pat)) =
-        PersonalAccessTokenRepo::get_pat_by_token_hash(&*state.db, &token_hash).await
-    else {
-        return false;
-    };
-    if pat.user_id != user.user_id {
-        return false;
-    }
-    if let Some(expires_at) = pat.expires_at {
-        expires_at >= now_rfc3339()
-    } else {
-        true
-    }
 }
 
 fn mcp_url_token(url: &str) -> Option<String> {
@@ -851,7 +811,7 @@ command = "other"
     }
 
     #[tokio::test]
-    async fn get_mcp_config_reports_installed_for_legacy_valid_pat_url() {
+    async fn get_mcp_config_marks_legacy_token_url_as_not_usable() {
         let repo_dir = unique_temp_dir("forge-mcp-pat");
         let (state, project_id) =
             test_state_with_project_repo(Some(repo_dir.to_string_lossy().into_owned())).await;
@@ -869,7 +829,10 @@ command = "other"
 
         let response = get_config(&state, "claude", Some("project"), Some(&project_id)).await;
 
-        assert!(response.installed);
+        assert!(
+            !response.installed,
+            "a query-token URL no longer authenticates and must be reinstalled"
+        );
         assert_eq!(response.url.as_deref(), Some(installed_url.as_str()));
         let _ = std::fs::remove_dir_all(repo_dir);
     }

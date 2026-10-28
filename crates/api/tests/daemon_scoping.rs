@@ -461,7 +461,7 @@ async fn mcp_request_without_token_returns_401() {
 }
 
 #[tokio::test]
-async fn mcp_query_token_takes_precedence_over_oauth_bearer() {
+async fn mcp_rejects_query_token_even_when_it_is_valid() {
     let workspace = common::TestDir::new("mcp-query-token");
     let harness = common::test_app(workspace.path(), "mcp-query-token").await;
 
@@ -492,10 +492,6 @@ async fn mcp_query_token_takes_precedence_over_oauth_bearer() {
             Request::builder()
                 .method(Method::POST)
                 .uri(format!("/mcp?token={raw}"))
-                .header(
-                    header::AUTHORIZATION,
-                    "Bearer oauth-token-that-forge-cannot-verify",
-                )
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::to_string(&json!({
@@ -510,7 +506,7 @@ async fn mcp_query_token_takes_precedence_over_oauth_bearer() {
         .await
         .expect("response");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
