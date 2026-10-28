@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 mod connection;
+mod daemon_authority;
+pub use daemon_authority::{daemon_authority_snapshot, daemon_execution_authorized};
 mod error;
 mod ids;
 mod migration;

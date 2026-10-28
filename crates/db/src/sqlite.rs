@@ -609,6 +609,22 @@ impl SqliteDb {
         if input.status == ExecutionStatus::Running && input.workspace_id.is_some() {
             Self::ensure_execution_admission_in_tx(transaction, &input.task_id).await?;
         }
+        if input.status == ExecutionStatus::Running {
+            if let Some(ActorRef::Agent(agent_id)) = input.actor_ref.as_ref() {
+                if !daemon::execution_daemon_authorized_in_tx(
+                    transaction,
+                    agent_id,
+                    input.executor_config_snapshot_json.as_deref(),
+                )
+                .await?
+                {
+                    return Err(DbError::Check(
+                        "current daemon authority is required for Agent Execution admission"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
         let mut input = input.clone();
         let actor_kind = input.actor_ref.as_ref().map(ActorRef::kind);
         let actor_id = input.actor_ref.as_ref().map(|value| value.id().to_owned());

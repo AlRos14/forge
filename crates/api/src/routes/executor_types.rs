@@ -60,7 +60,7 @@ pub async fn executor_type_discovered_options(
         ))
     })?;
     let daemons = if user.is_admin {
-        DaemonRepo::list_available_for_executor(&*state.db, &type_name).await?
+        DaemonRepo::list_available_for_executor(&*state.db, &type_name, &user.user_id).await?
     } else {
         Vec::new()
     };

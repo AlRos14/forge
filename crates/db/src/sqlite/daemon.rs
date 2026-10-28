@@ -3,7 +3,7 @@ use super::*;
 #[async_trait]
 impl DaemonRepo for SqliteDb {
     async fn upsert_by_machine_id(&self, input: UpsertDaemon) -> Result<Daemon> {
-        sqlx::query("INSERT INTO daemon (id, machine_id, hostname, os, arch, agent_version, labels_json, status, registration_token_hash, owner_id, visibility, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET hostname = excluded.hostname, os = excluded.os, arch = excluded.arch, agent_version = excluded.agent_version, labels_json = excluded.labels_json, status = excluded.status, registration_token_hash = excluded.registration_token_hash, owner_id = excluded.owner_id, visibility = excluded.visibility, updated_at = excluded.updated_at")
+        let changed = sqlx::query("INSERT INTO daemon (id, machine_id, hostname, os, arch, agent_version, labels_json, status, registration_token_hash, owner_id, visibility, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET hostname = excluded.hostname, os = excluded.os, arch = excluded.arch, agent_version = excluded.agent_version, labels_json = excluded.labels_json, status = excluded.status, registration_token_hash = excluded.registration_token_hash, owner_id = excluded.owner_id, visibility = excluded.visibility, updated_at = excluded.updated_at WHERE daemon.owner_id IS excluded.owner_id")
             .bind(&input.id)
             .bind(&input.machine_id)
             .bind(&input.hostname)
@@ -19,6 +19,11 @@ impl DaemonRepo for SqliteDb {
             .bind(&input.updated_at)
             .execute(&self.pool)
             .await?;
+        if changed.rows_affected() != 1 {
+            return Err(DbError::Check(
+                "daemon registration belongs to another account".to_owned(),
+            ));
+        }
         sqlx::query("SELECT * FROM daemon WHERE machine_id = ?")
             .bind(&input.machine_id)
             .fetch_optional(&self.pool)
@@ -199,7 +204,19 @@ impl DaemonRepo for SqliteDb {
             .ok_or(DbError::NotFound)
     }
 
-    async fn list_available_for_executor(&self, executor_type: &str) -> Result<Vec<Daemon>> {
+    async fn list_available_for_executor(
+        &self,
+        executor_type: &str,
+        owner_id: &str,
+    ) -> Result<Vec<Daemon>> {
+        let Some(owner_is_admin) =
+            sqlx::query_scalar::<_, bool>("SELECT is_admin FROM user WHERE id = ?")
+                .bind(owner_id)
+                .fetch_optional(&self.pool)
+                .await?
+        else {
+            return Ok(Vec::new());
+        };
         let rows = sqlx::query(
             "SELECT * FROM daemon WHERE status = 'online' ORDER BY created_at ASC, id ASC",
         )
@@ -208,7 +225,12 @@ impl DaemonRepo for SqliteDb {
         let mut daemons = Vec::new();
         for row in rows {
             let daemon = map_daemon(row)?;
-            if daemon_supports_executor(&daemon, executor_type) {
+            if crate::daemon_execution_authorized(
+                &daemon,
+                Some(owner_id),
+                owner_is_admin,
+                executor_type,
+            ) {
                 daemons.push(daemon);
             }
         }
@@ -216,15 +238,55 @@ impl DaemonRepo for SqliteDb {
     }
 }
 
-fn daemon_supports_executor(daemon: &Daemon, executor_type: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&daemon.detected_clis_json) else {
-        return false;
+/// Validate the immutable route against current account/profile/host authority.
+/// Used at admission and at the serialized one-attempt Provider Start claim.
+pub(super) async fn execution_daemon_authorized_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    agent_id: &str,
+    snapshot_json: Option<&str>,
+) -> Result<bool> {
+    let Some(snapshot) =
+        snapshot_json.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+    else {
+        return Ok(false);
     };
-    let Some(items) = value.as_array() else {
-        return false;
+    let Some(daemon_id) = snapshot.get("resolved_daemon_id").and_then(|v| v.as_str()) else {
+        return Ok(false);
     };
-    items.iter().any(|item| {
-        item.get("kind").and_then(serde_json::Value::as_str) == Some(executor_type)
-            && item.get("availability").and_then(serde_json::Value::as_str) == Some("authenticated")
-    })
+    let agent = sqlx::query("SELECT * FROM agent_current WHERE id = ?")
+        .bind(agent_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(map_agent)
+        .transpose()?;
+    let daemon = sqlx::query("SELECT * FROM daemon WHERE id = ?")
+        .bind(daemon_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(map_daemon)
+        .transpose()?;
+    let (Some(agent), Some(daemon)) = (agent, daemon) else {
+        return Ok(false);
+    };
+    let Some(owner_id) = agent.owner_id.as_deref() else {
+        return Ok(false);
+    };
+    let Some(is_admin) = sqlx::query_scalar::<_, bool>("SELECT is_admin FROM user WHERE id = ?")
+        .bind(owner_id)
+        .fetch_optional(&mut **tx)
+        .await?
+    else {
+        return Ok(false);
+    };
+    Ok(!agent.paused
+        && agent.backend_kind != "native"
+        && snapshot.get("agent_id").and_then(|v| v.as_str()) == Some(agent_id)
+        && snapshot.get("daemon_authority")
+            == Some(&crate::daemon_authority_snapshot(&agent, &daemon))
+        && crate::daemon_execution_authorized(
+            &daemon,
+            Some(owner_id),
+            is_admin,
+            &agent.executor_type,
+        ))
 }

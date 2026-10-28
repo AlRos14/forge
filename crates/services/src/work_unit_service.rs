@@ -1442,10 +1442,11 @@ mod tests {
     use db::{
         create_sqlite_pool, run_migrations, ActorKind, CoordinationMode, CreateAgentIdentity,
         CreateAgentProfile, CreateDomainEvent, CreateProject, CreateRepo, CreateRoleMembership,
-        CreateTask, CreateTaskRole, CreateWorkUnit, CreateWorkspace, ExecutionRepo,
-        ExecutionStatus, ProjectRepo, RepoRepo, RoleMembershipRepo, RoleMembershipStatus, TaskRepo,
-        TaskRoleRepo, UpdateExecution, UpdateRoleMembership, WorkMode, WorkUnitRepo,
-        WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo, WorkspaceStatus,
+        CreateTask, CreateTaskRole, CreateWorkUnit, CreateWorkspace, DaemonRepo, DaemonStatus,
+        ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, RoleMembershipRepo,
+        RoleMembershipStatus, TaskRepo, TaskRoleRepo, UpdateDaemonReport, UpdateExecution,
+        UpdateRoleMembership, UpsertDaemon, WorkMode, WorkUnitRepo, WorkUnitStatus,
+        WorkUnitWorkspaceRepo, WorkspaceRepo, WorkspaceStatus,
     };
     use std::{path::Path, process::Stdio, time::Duration};
     use tempfile::TempDir;
@@ -1481,13 +1482,35 @@ mod tests {
         }
     }
 
-    fn running_repository_execution(
+    async fn running_repository_execution(
+        db: &SqliteDb,
         task_id: &str,
         workspace_id: &str,
         agent_id: &str,
         before_sha: &str,
     ) -> db::CreateExecution {
         let now = now_rfc3339();
+        let agent = db::AgentRepo::get_by_id(db, agent_id)
+            .await
+            .expect("WorkUnit Execution Agent loads")
+            .expect("WorkUnit Execution Agent exists");
+        let daemon_id = agent
+            .daemon_id
+            .as_deref()
+            .expect("WorkUnit Execution Agent has an authorized daemon");
+        let daemon = db::DaemonRepo::get_by_id(db, daemon_id)
+            .await
+            .expect("WorkUnit Execution daemon loads")
+            .expect("WorkUnit Execution daemon exists");
+        let executor_config_snapshot_json = serde_json::json!({
+            "agent_id": agent.id,
+            "profile_id": agent.profile_id,
+            "executor_type": agent.executor_type,
+            "resolved_daemon_id": daemon.id,
+            "daemon_authority": db::daemon_authority_snapshot(&agent, &daemon),
+            "config": {}
+        })
+        .to_string();
         db::CreateExecution {
             id: new_uuid_v4(),
             task_id: task_id.to_owned(),
@@ -1509,7 +1532,7 @@ mod tests {
             before_sha: Some(before_sha.to_owned()),
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(executor_config_snapshot_json),
             workspace_id: Some(workspace_id.to_owned()),
             created_at: now.clone(),
             updated_at: now,
@@ -1590,6 +1613,41 @@ mod tests {
         )
         .await
         .expect("Human");
+        let daemon_id = new_uuid_v4();
+        DaemonRepo::upsert_by_machine_id(
+            &*db,
+            UpsertDaemon {
+                id: daemon_id.clone(),
+                machine_id: format!("pr5-integration-machine-{daemon_id}"),
+                hostname: "pr5-integration-daemon".to_owned(),
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                agent_version: Some("fixture".to_owned()),
+                labels_json: "{}".to_owned(),
+                status: DaemonStatus::Online,
+                registration_token_hash: Some(format!("pr5-integration-token-{daemon_id}")),
+                owner_id: Some(human_id.clone()),
+                visibility: "account".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("authorized external daemon creates");
+        DaemonRepo::update_report(
+            &*db,
+            UpdateDaemonReport {
+                id: daemon_id.clone(),
+                last_report_at: now.clone(),
+                status: DaemonStatus::Online,
+                detected_clis_json: r#"[{"kind":"codex","availability":"authenticated"}]"#
+                    .to_owned(),
+                labels_json: None,
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("external daemon reports authenticated codex CLI");
         db::AgentRepo::create_identity_with_profile(
             &*db,
             CreateAgentIdentity {
@@ -1623,7 +1681,7 @@ mod tests {
                 tool_policy_json: "{}".to_owned(),
                 config_json: "{}".to_owned(),
                 credential_ref: None,
-                daemon_id: None,
+                daemon_id: Some(daemon_id),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
@@ -2632,11 +2690,13 @@ mod tests {
             .await
             .expect("WorkUnit Workspace prepares");
         let first_attempt = running_repository_execution(
+            &db,
             &task_id,
             &original_workspace.id,
             &agent_id,
             original_workspace.before_sha.as_deref().unwrap(),
-        );
+        )
+        .await;
         let first_attempt_id = first_attempt.id.clone();
         service
             .bind_execution(
@@ -2769,11 +2829,13 @@ mod tests {
         );
         assert_eq!(recovered_workspace.status, WorkspaceStatus::Ready);
         let retry_attempt = running_repository_execution(
+            &db,
             &task_id,
             &recovered_workspace.id,
             &agent_id,
             &preserved_commit,
-        );
+        )
+        .await;
         let retry_attempt_id = retry_attempt.id.clone();
         service
             .bind_execution(

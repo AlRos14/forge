@@ -13,10 +13,10 @@ use crate::{
     ReserveOrchestratorAction, RoleMembershipRepo, RoleMembershipStatus, SelectAgentProfile,
     SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskDependencyRepo, TaskLifecycleRepo,
     TaskListQuery, TaskRepo, TaskRoleRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
-    UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo,
-    UpdateRoleMembership, UpdateSkill, UpdateTask, UpdateTaskRole, UpdateTerminalSessionStatus,
-    UpsertDaemon, ValidationRunRepo, ValidationRunStatus, WorkMode, WorkspaceLeaseRepo,
-    WorkspaceRepo, WorkspaceStatus,
+    UpdateDaemonReport, UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation,
+    UpdateRepo, UpdateRoleMembership, UpdateSkill, UpdateTask, UpdateTaskRole,
+    UpdateTerminalSessionStatus, UpsertDaemon, ValidationRunRepo, ValidationRunStatus, WorkMode,
+    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use sha2::Digest as _;
@@ -385,11 +385,27 @@ async fn seed_daemon(db: &SqliteDb) -> String {
 }
 
 async fn seed_project_repo_agent(db: &SqliteDb) -> (String, String, String) {
+    seed_project_repo_agent_with_owner(db, None).await
+}
+
+async fn seed_authorized_project_repo_agent(db: &SqliteDb) -> (String, String, String) {
+    let owner_id = seed_user(db).await;
+    seed_project_repo_agent_with_owner(db, Some(owner_id)).await
+}
+
+async fn seed_project_repo_agent_with_owner(
+    db: &SqliteDb,
+    owner_id: Option<String>,
+) -> (String, String, String) {
     let now = now_rfc3339();
     let project_id = new_uuid_v4();
     let repo_id = new_uuid_v4();
     let agent_id = new_uuid_v4();
-    let daemon_id = seed_daemon(db).await;
+    let daemon_id = if let Some(owner_id) = owner_id.as_deref() {
+        seed_owned_daemon(db, owner_id).await
+    } else {
+        seed_daemon(db).await
+    };
 
     ProjectRepo::create(
         db,
@@ -398,7 +414,7 @@ async fn seed_project_repo_agent(db: &SqliteDb) -> (String, String, String) {
             name: "Forge".to_owned(),
             settings: "{}".to_owned(),
             primary_repo_id: None,
-            owner_id: None,
+            owner_id: owner_id.clone(),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -455,8 +471,12 @@ async fn seed_project_repo_agent(db: &SqliteDb) -> (String, String, String) {
             last_heartbeat_at: None,
             is_default: false,
             paused: false,
-            owner_id: None,
-            visibility: "global".to_owned(),
+            owner_id: owner_id.clone(),
+            visibility: if owner_id.is_some() {
+                "account".to_owned()
+            } else {
+                "global".to_owned()
+            },
             prompt_template: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -466,6 +486,45 @@ async fn seed_project_repo_agent(db: &SqliteDb) -> (String, String, String) {
     .expect("agent creates");
 
     (project_id, repo_id, agent_id)
+}
+
+async fn seed_owned_daemon(db: &SqliteDb, owner_id: &str) -> String {
+    let now = now_rfc3339();
+    let daemon_id = new_uuid_v4();
+    DaemonRepo::upsert_by_machine_id(
+        db,
+        UpsertDaemon {
+            id: daemon_id.clone(),
+            machine_id: format!("machine-{daemon_id}"),
+            hostname: "test-host".to_owned(),
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            agent_version: None,
+            labels_json: "{}".to_owned(),
+            status: DaemonStatus::Online,
+            registration_token_hash: Some("fixture-registration-token-hash".to_owned()),
+            owner_id: Some(owner_id.to_owned()),
+            visibility: "account".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("owned daemon creates");
+    DaemonRepo::update_report(
+        db,
+        UpdateDaemonReport {
+            id: daemon_id.clone(),
+            last_report_at: now.clone(),
+            status: DaemonStatus::Online,
+            detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
+            labels_json: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("owned daemon reports authenticated shell");
+    daemon_id
 }
 
 async fn seed_project(db: &SqliteDb, name: &str, owner_id: Option<String>) -> String {
@@ -852,6 +911,47 @@ async fn seed_pr6_orchestrator_event(
     db: &SqliteDb,
 ) -> (String, String, String, crate::DomainEvent) {
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(db).await;
+    let owner_id = seed_user(db).await;
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&owner_id)
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("Project has a durable owner");
+    sqlx::query("UPDATE agent_identity SET owner_id = ? WHERE id = ?")
+        .bind(&owner_id)
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .expect("Agent has a durable owner");
+    sqlx::query(
+        "UPDATE daemon SET owner_id = ?
+         WHERE id = (SELECT daemon_id FROM agent_current WHERE id = ?)",
+    )
+    .bind(&owner_id)
+    .bind(&agent_id)
+    .execute(db.pool())
+    .await
+    .expect("Agent daemon has the same durable owner");
+    let daemon_id = AgentRepo::get_by_id(db, &agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists")
+        .daemon_id
+        .expect("Agent has its daemon");
+    DaemonRepo::update_report(
+        db,
+        crate::UpdateDaemonReport {
+            id: daemon_id,
+            detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
+            labels_json: None,
+            status: DaemonStatus::Online,
+            last_report_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("Agent daemon reports its authenticated harness");
     let task_id = seed_task(
         db,
         &project_id,
@@ -912,6 +1012,168 @@ async fn seed_pr6_orchestrator_event(
     .await
     .expect("durable event appends");
     (task_id, agent_id, role.id, event)
+}
+
+async fn authorized_agent_execution_snapshot(db: &SqliteDb, agent_id: &str) -> String {
+    let agent = AgentRepo::get_by_id(db, agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    let daemon_id = agent.daemon_id.as_deref().expect("Agent daemon binding");
+    let daemon = DaemonRepo::get_by_id(db, daemon_id)
+        .await
+        .expect("daemon loads")
+        .expect("daemon exists");
+    serde_json::json!({
+        "agent_id": agent.id,
+        "agent_daemon_id": agent.daemon_id,
+        "daemon_authority": crate::daemon_authority_snapshot(&agent, &daemon),
+        "executor_type": agent.executor_type,
+        "resolved_daemon_id": daemon.id,
+        "config": {},
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn orchestrator_execution_admission_rechecks_project_account() {
+    let db = sqlite_db().await;
+    let (task_id, agent_id, task_role_id, source_event) = seed_pr6_orchestrator_event(&db).await;
+    let other_owner_id = seed_user(&db).await;
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("Task loads")
+        .expect("Task exists");
+    let now = now_rfc3339();
+    let wake_id = new_uuid_v4();
+    OrchestratorWakeRepo::admit_orchestrator_wake(
+        &db,
+        CreateOrchestratorWake {
+            id: wake_id.clone(),
+            event_id: source_event.id.clone(),
+            event_sequence: source_event.sequence,
+            task_id: task_id.clone(),
+            task_role_id,
+            coordination_mode: Some(CoordinationMode::Collaborative),
+            actor_kind: ActorKind::Agent,
+            actor_id: agent_id.clone(),
+            work_unit_id: None,
+            correlation_id: source_event.correlation_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            policy_ref: "forge.orchestrator.wake-policy".to_owned(),
+            policy_version: 1,
+            policy_digest: "digest-v1".to_owned(),
+            task_role_version: 2,
+            task_role_policy_json: "{}".to_owned(),
+            available_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("wake admits under the initial same-account authority");
+    let lease_owner = "orchestrator-project-account-fence";
+    OrchestratorWakeRepo::claim_orchestrator_wake(
+        &db,
+        ClaimOrchestratorWake {
+            lease_owner: lease_owner.to_owned(),
+            now: now.clone(),
+            leased_until: "2099-01-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("wake claim succeeds")
+    .expect("wake is leased");
+    let execution_id = new_uuid_v4();
+    let attempt = OrchestratorWakeRepo::reserve_orchestrator_wake_execution(
+        &db,
+        crate::ReserveOrchestratorWakeExecution {
+            wake_id: wake_id.clone(),
+            lease_owner: lease_owner.to_owned(),
+            execution_id: execution_id.clone(),
+            now: now.clone(),
+        },
+    )
+    .await
+    .expect("exact attempt reserves");
+    let execution_config_snapshot = authorized_agent_execution_snapshot(&db, &agent_id).await;
+
+    // Model an authority change after service preflight and before the
+    // transactional Execution admission.
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(other_owner_id)
+        .bind(&task.project_id)
+        .execute(db.pool())
+        .await
+        .expect("Project authority changes before durable admission");
+
+    let result = ExecutionRepo::create_orchestrator_execution(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
+            role: "orchestrator".to_owned(),
+            purpose: Some(crate::ExecutionPurpose::Orchestrate),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("orchestrate".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(execution_config_snapshot),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        &wake_id,
+        attempt.attempt_number,
+        lease_owner,
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "execution.started".to_owned(),
+            entity_type: "execution".to_owned(),
+            entity_id: execution_id.clone(),
+            actor_type: "agent".to_owned(),
+            actor_id: Some(agent_id),
+            scope_type: "task".to_owned(),
+            scope_id: task_id,
+            correlation_id: source_event.correlation_id,
+            causation_id: Some(source_event.id),
+            causation_depth: 1,
+            dedupe_key: Some(format!("execution.started:{execution_id}")),
+            payload_json: "{}".to_owned(),
+            created_at: now,
+        },
+    )
+    .await;
+
+    assert!(matches!(result, Err(DbError::VersionConflict)));
+    let execution_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE id = ?")
+        .bind(&execution_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("Execution absence is checked");
+    assert_eq!(execution_count, 0);
+    let started_receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE entity_id = ? AND event_type = 'execution.started'",
+    )
+    .bind(&execution_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("start receipt absence is checked");
+    assert_eq!(started_receipt_count, 0);
 }
 
 #[derive(Clone, Copy)]
@@ -1121,6 +1383,7 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
     )
     .await
     .expect("exact attempt reserves");
+    let execution_config_snapshot = authorized_agent_execution_snapshot(&db, &agent_id).await;
     let started_event_id = new_uuid_v4();
     ExecutionRepo::create_orchestrator_execution(
         &db,
@@ -1145,7 +1408,7 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: Some("{}".to_owned()),
+            executor_config_snapshot_json: Some(execution_config_snapshot),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1800,6 +2063,7 @@ async fn pr6_action_reservation_reuses_one_uuid_and_rejects_changed_replay() {
     )
     .await
     .expect("Execution attempt reservation succeeds");
+    let execution_config_snapshot = authorized_agent_execution_snapshot(&db, &agent_id).await;
     let started_event_id = new_uuid_v4();
     let (_execution, _) = ExecutionRepo::create_orchestrator_execution(
         &db,
@@ -1824,7 +2088,7 @@ async fn pr6_action_reservation_reuses_one_uuid_and_rejects_changed_replay() {
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: Some("{}".to_owned()),
+            executor_config_snapshot_json: Some(execution_config_snapshot),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1948,7 +2212,7 @@ async fn seed_workspace_for_task(db: &SqliteDb, task_id: &str, repo_id: &str) ->
 #[tokio::test]
 async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, repo_id, agent_id) = seed_authorized_project_repo_agent(&db).await;
     let task_id = seed_task(
         &db,
         &project_id,
@@ -1962,6 +2226,7 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
         .await
         .expect("task lookup after target membership seeding")
         .expect("task exists after assignment");
+    let executor_config_snapshot_json = authorized_agent_execution_snapshot(&db, &agent_id).await;
     let now = chrono::Utc::now();
     let execution = ExecutionRepo::create(
         &db,
@@ -1986,7 +2251,7 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(executor_config_snapshot_json),
             workspace_id: None,
             created_at: now.to_rfc3339(),
             updated_at: now.to_rfc3339(),
@@ -2109,7 +2374,7 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
 #[tokio::test]
 async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, role_agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, repo_id, role_agent_id) = seed_authorized_project_repo_agent(&db).await;
     let task_id = seed_task(
         &db,
         &project_id,
@@ -2152,6 +2417,8 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
     )
     .await
     .expect("canonical TaskRole membership creates");
+    let executor_config_snapshot_json =
+        authorized_agent_execution_snapshot(&db, &role_agent_id).await;
     let now = chrono::Utc::now();
     let execution = ExecutionRepo::create(
         &db,
@@ -2176,7 +2443,7 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(executor_config_snapshot_json),
             workspace_id: None,
             created_at: now.to_rfc3339(),
             updated_at: now.to_rfc3339(),
@@ -6105,7 +6372,7 @@ async fn sqlite_repositories_enforce_versions_and_cursors() {
 #[tokio::test]
 async fn agent_active_execution_count_counts_only_exact_running_executions() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, repo_id, agent_id) = seed_authorized_project_repo_agent(&db).await;
     let task_id = seed_task(
         &db,
         &project_id,
@@ -6145,6 +6412,8 @@ async fn agent_active_execution_count_counts_only_exact_running_executions() {
     .await
     .expect("active Agent RoleMembership creates");
 
+    let executor_config_snapshot_json = authorized_agent_execution_snapshot(&db, &agent_id).await;
+
     // Lifecycle and membership describe the Task and its participants; neither
     // means that the Agent currently has work in progress.
     assert_eq!(
@@ -6177,7 +6446,7 @@ async fn agent_active_execution_count_counts_only_exact_running_executions() {
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(executor_config_snapshot_json),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now.clone(),

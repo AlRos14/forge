@@ -69,12 +69,37 @@ fn execution_started_event(task_id: &str, execution_id: &str, agent_id: &str) ->
     }
 }
 
-fn running_execution(
+async fn running_execution(
+    db: &SqliteDb,
     task_id: &str,
     work_unit_workspace_id: &str,
     agent_id: &str,
 ) -> CreateExecution {
     let now = now_rfc3339();
+    let agent = db::AgentRepo::get_by_id(db, agent_id)
+        .await
+        .expect("Agent loads for execution authority")
+        .expect("Agent exists for execution authority");
+    let daemon_id = agent
+        .daemon_id
+        .as_deref()
+        .expect("Agent has its authorized daemon")
+        .to_owned();
+    let daemon = db::DaemonRepo::get_by_id(db, &daemon_id)
+        .await
+        .expect("daemon loads for execution authority")
+        .expect("daemon exists for execution authority");
+    let snapshot = serde_json::json!({
+        "agent_id": agent.id,
+        "profile_id": agent.profile_id,
+        "executor_type": agent.executor_type,
+        "resolved_daemon_id": daemon_id,
+        "daemon_authority": db::daemon_authority_snapshot(&agent, &daemon),
+        "capabilities": serde_json::from_str::<serde_json::Value>(&agent.capabilities_json)
+            .expect("Agent capabilities parse"),
+        "config": serde_json::from_str::<serde_json::Value>(&agent.config_json)
+            .expect("Agent config parses")
+    });
     CreateExecution {
         id: new_uuid_v4(),
         task_id: task_id.to_owned(),
@@ -96,11 +121,54 @@ fn running_execution(
         before_sha: Some("base-sha".to_owned()),
         after_sha: None,
         error: None,
-        executor_config_snapshot_json: None,
+        executor_config_snapshot_json: Some(snapshot.to_string()),
         workspace_id: Some(work_unit_workspace_id.to_owned()),
         created_at: now.clone(),
         updated_at: now,
     }
+}
+
+async fn seed_authorized_daemon(db: &SqliteDb, owner_id: &str, executor_type: &str) -> String {
+    let now = now_rfc3339();
+    let daemon_id = new_uuid_v4();
+    db::DaemonRepo::upsert_by_machine_id(
+        db,
+        db::UpsertDaemon {
+            id: daemon_id.clone(),
+            machine_id: format!("pr5-external-machine-{daemon_id}"),
+            hostname: "pr5-external-daemon".to_owned(),
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            agent_version: Some("fixture".to_owned()),
+            labels_json: "{}".to_owned(),
+            status: db::DaemonStatus::Online,
+            registration_token_hash: Some(format!("pr5-registration-token-{daemon_id}")),
+            owner_id: Some(owner_id.to_owned()),
+            visibility: "account".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("authorized external daemon creates");
+    db::DaemonRepo::update_report(
+        db,
+        db::UpdateDaemonReport {
+            id: daemon_id.clone(),
+            last_report_at: now.clone(),
+            status: db::DaemonStatus::Online,
+            detected_clis_json: serde_json::json!([{
+                "kind": executor_type,
+                "availability": "authenticated"
+            }])
+            .to_string(),
+            labels_json: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("external daemon reports authenticated CLI");
+    daemon_id
 }
 
 struct WorkUnitLeaseBinding<'a> {
@@ -180,6 +248,7 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
     )
     .await
     .expect("Human");
+    let daemon_id = seed_authorized_daemon(db, &fixture.human_id, "shell").await;
     ProjectRepo::create(
         db,
         CreateProject {
@@ -233,7 +302,7 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
             id: new_uuid_v4(),
             identity_id: fixture.agent_id.clone(),
             backend_kind: "cli".to_owned(),
-            executor_type: "codex".to_owned(),
+            executor_type: "shell".to_owned(),
             provider: None,
             model: None,
             reasoning_effort: None,
@@ -243,7 +312,7 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
             tool_policy_json: "{}".to_owned(),
             config_json: "{}".to_owned(),
             credential_ref: None,
-            daemon_id: None,
+            daemon_id: Some(daemon_id),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -456,10 +525,17 @@ async fn integration_lookup_stays_exact_with_multiple_work_unit_workspaces() {
     assert_ne!(selected_second_unit.id, first_unit_workspace.id);
 }
 
-fn cleanup_admission_attempt(
+async fn cleanup_admission_attempt(
+    db: &SqliteDb,
     fixture: &CleanupAdmissionFixture,
 ) -> (CreateWorkUnitExecution, CreateDomainEvent) {
-    let execution = running_execution(&fixture.task_id, &fixture.workspace_id, &fixture.agent_id);
+    let execution = running_execution(
+        db,
+        &fixture.task_id,
+        &fixture.workspace_id,
+        &fixture.agent_id,
+    )
+    .await;
     let execution_id = execution.id.clone();
     let task = fixture.task_id.as_str();
     let lease = work_unit_lease(WorkUnitLeaseBinding {
@@ -496,7 +572,7 @@ async fn execution_admission_wins_over_cleanup_claim_across_sqlite_pools() {
         .await
         .expect("independent pool on the same database file");
     let competing_db = SqliteDb::new(competing_pool);
-    let (attempt, event) = cleanup_admission_attempt(&fixture);
+    let (attempt, event) = cleanup_admission_attempt(&db, &fixture).await;
     let execution_id = attempt.execution.id.clone();
 
     WorkUnitExecutionRepo::create_for_work_unit(&db, attempt, event)
@@ -583,7 +659,7 @@ async fn cleanup_claim_wins_and_database_rejects_work_unit_execution_admission()
     .expect("Ready Workspace has no competing execution or lease");
     assert_eq!(claimed.status, WorkspaceStatus::Cleaning);
 
-    let (attempt, event) = cleanup_admission_attempt(&fixture);
+    let (attempt, event) = cleanup_admission_attempt(&db, &fixture).await;
     let execution_id = attempt.execution.id.clone();
     assert!(
         WorkUnitExecutionRepo::create_for_work_unit(&competing_db, attempt, event)
@@ -680,7 +756,7 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
     )
     .await
     .expect("membership is suspended after preflight");
-    let (attempt, event_input) = cleanup_admission_attempt(&paused_membership);
+    let (attempt, event_input) = cleanup_admission_attempt(&db, &paused_membership).await;
     assert_failed_admission_has_no_execution_lease_or_event(
         &db,
         attempt,
@@ -708,7 +784,7 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
     )
     .await
     .expect("WorkUnit closes after preflight");
-    let (attempt, event_input) = cleanup_admission_attempt(&closed_work_unit);
+    let (attempt, event_input) = cleanup_admission_attempt(&db, &closed_work_unit).await;
     assert_failed_admission_has_no_execution_lease_or_event(
         &db,
         attempt,
@@ -723,7 +799,7 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
         .execute(db.pool())
         .await
         .expect("workspace becomes unavailable after preflight");
-    let (attempt, event_input) = cleanup_admission_attempt(&unavailable_workspace);
+    let (attempt, event_input) = cleanup_admission_attempt(&db, &unavailable_workspace).await;
     assert_failed_admission_has_no_execution_lease_or_event(
         &db,
         attempt,
@@ -805,10 +881,12 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
     .await
     .expect("unsatisfied dependency added after preflight");
     let mut execution = running_execution(
+        &db,
         &blocked_dependency.task_id,
         "unused",
         &blocked_dependency.agent_id,
-    );
+    )
+    .await;
     execution.workspace_id = None;
     let execution_id = execution.id.clone();
     let attempt = CreateWorkUnitExecution {
@@ -831,7 +909,7 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
     .await;
 
     let integration_human = cleanup_admission_fixture(&db, root.path()).await;
-    let (mut attempt, mut event_input) = cleanup_admission_attempt(&integration_human);
+    let (mut attempt, mut event_input) = cleanup_admission_attempt(&db, &integration_human).await;
     attempt.execution.actor_ref = Some(ActorRef::Human(integration_human.human_id.clone()));
     attempt.execution.agent_id = None;
     attempt.workspace_lease = None;
@@ -847,13 +925,14 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
 
     let at_capacity = cleanup_admission_fixture(&db, root.path()).await;
     for _ in 0..4 {
-        let mut running = running_execution(&at_capacity.task_id, "unused", &at_capacity.agent_id);
+        let mut running =
+            running_execution(&db, &at_capacity.task_id, "unused", &at_capacity.agent_id).await;
         running.workspace_id = None;
         ExecutionRepo::create(&db, running)
             .await
             .expect("fill the real Agent concurrency limit");
     }
-    let (attempt, event_input) = cleanup_admission_attempt(&at_capacity);
+    let (attempt, event_input) = cleanup_admission_attempt(&db, &at_capacity).await;
     assert_failed_admission_has_no_execution_lease_or_event(
         &db,
         attempt,
@@ -876,8 +955,8 @@ async fn concurrent_work_unit_execution_admission_returns_running_conflict_atomi
         .await
         .expect("second pool for a competing writer");
     let competing_db = SqliteDb::new(competing_pool);
-    let (attempt_a, event_a) = cleanup_admission_attempt(&fixture);
-    let (attempt_b, event_b) = cleanup_admission_attempt(&fixture);
+    let (attempt_a, event_a) = cleanup_admission_attempt(&db, &fixture).await;
+    let (attempt_b, event_b) = cleanup_admission_attempt(&db, &fixture).await;
     let execution_a = attempt_a.execution.id.clone();
     let execution_b = attempt_b.execution.id.clone();
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
@@ -1202,6 +1281,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     )
     .await
     .expect("human");
+    let daemon_id = seed_authorized_daemon(&db, &human_id, "shell").await;
     db::AgentRepo::create_identity_with_profile(
         &db,
         db::CreateAgentIdentity {
@@ -1225,7 +1305,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
             id: new_uuid_v4(),
             identity_id: agent_id.clone(),
             backend_kind: "cli".into(),
-            executor_type: "codex".into(),
+            executor_type: "shell".into(),
             provider: None,
             model: None,
             reasoning_effort: None,
@@ -1235,7 +1315,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
             tool_policy_json: "{}".into(),
             config_json: "{}".into(),
             credential_ref: None,
-            daemon_id: None,
+            daemon_id: Some(daemon_id),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -1298,7 +1378,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
         .expect("membership");
     }
 
-    let mut task_scoped_execution = running_execution(&task_id, "unused", &agent_id);
+    let mut task_scoped_execution = running_execution(&db, &task_id, "unused", &agent_id).await;
     task_scoped_execution.workspace_id = None;
     let task_scoped_execution_id = task_scoped_execution.id.clone();
     ExecutionRepo::create(&db, task_scoped_execution)
@@ -1449,7 +1529,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
         "rejected non-member allocation leaves WorkUnit unchanged",
     );
     let legacy_execution_id = new_uuid_v4();
-    let mut legacy_execution = running_execution(&other_task_id, "unused", &agent_id);
+    let mut legacy_execution = running_execution(&db, &other_task_id, "unused", &agent_id).await;
     legacy_execution.id = legacy_execution_id.clone();
     legacy_execution.workspace_id = None;
     ExecutionRepo::create(&db, legacy_execution)
@@ -1853,7 +1933,8 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     )
     .await
     .is_err());
-    let legacy_writer = running_execution(&task_id, &integration_workspace.id, &agent_id);
+    let legacy_writer =
+        running_execution(&db, &task_id, &integration_workspace.id, &agent_id).await;
     assert!(ExecutionRepo::create(&db, legacy_writer).await.is_err());
     let task = TaskRepo::get_by_id(&db, &task_id, false)
         .await
@@ -1883,7 +1964,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
         )
         .await
         .expect("WorkUnit Workspace");
-        let execution = running_execution(&task_id, &workspace_id, &agent_id);
+        let execution = running_execution(&db, &task_id, &workspace_id, &agent_id).await;
         let execution_id = execution.id.clone();
         let lease = work_unit_lease(WorkUnitLeaseBinding {
             task_id: &task_id,
@@ -1947,7 +2028,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     )
     .await
     .expect("WorkUnit exists for capacity check");
-    let mut over_capacity_execution = running_execution(&task_id, "unused", &agent_id);
+    let mut over_capacity_execution = running_execution(&db, &task_id, "unused", &agent_id).await;
     over_capacity_execution.workspace_id = None;
     let over_capacity_execution_id = over_capacity_execution.id.clone();
     let capacity_result = WorkUnitExecutionRepo::create_for_work_unit(
@@ -2011,7 +2092,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     .is_err());
 
     let (unit_d, workspace_d) = &unit_workspaces[0];
-    let blocked_retry = running_execution(&task_id, workspace_d, &agent_id);
+    let blocked_retry = running_execution(&db, &task_id, workspace_d, &agent_id).await;
     assert!(WorkUnitExecutionRepo::create_for_work_unit(
         &db,
         CreateWorkUnitExecution {

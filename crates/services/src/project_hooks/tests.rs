@@ -5,7 +5,7 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
     CreateAgent, CreateProject, CreateProjectHookRun, CreateTask, DaemonRepo, DaemonStatus,
     ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus, ProjectRepo, RoleMembershipRepo,
-    SqliteDb, Task, TaskLifecycleState, TaskRepo, UpdateDaemonReport, UpsertDaemon,
+    SqliteDb, Task, TaskLifecycleState, TaskRepo, UpdateDaemonReport, UpsertDaemon, User, UserRepo,
 };
 use events::{EventBus, EventContext, ForgeEvent};
 use serde_json::json;
@@ -136,8 +136,31 @@ async fn concurrent_duplicate_evaluation_claims_one_run_and_executes_one_action(
 #[tokio::test]
 async fn dispatch_agent_launch_failure_links_created_automation_task() {
     let (db, service) = test_service().await;
-    let project = seed_project(&db).await;
-    let agent_id = seed_available_agent(&db).await;
+    let mut project = seed_project(&db).await;
+    let owner_id = new_uuid_v4();
+    let now = now_rfc3339();
+    UserRepo::create_user(
+        &*db,
+        &User {
+            id: owner_id.clone(),
+            email: format!("{owner_id}@hooks.test"),
+            password_hash: "test-only".to_owned(),
+            display_name: Some("Project hook fixture owner".to_owned()),
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("durable project owner creates");
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&owner_id)
+        .bind(&project.id)
+        .execute(db.pool())
+        .await
+        .expect("Project receives its durable owner");
+    project.owner_id = Some(owner_id.clone());
+    let agent_id = seed_available_agent(&db, &owner_id).await;
     let rule = ProjectHookRule {
         id: "dispatch".to_owned(),
         enabled: true,
@@ -556,7 +579,7 @@ async fn test_service() -> (Arc<SqliteDb>, ProjectHookService) {
     (db, service)
 }
 
-async fn seed_available_agent(db: &SqliteDb) -> String {
+async fn seed_available_agent(db: &SqliteDb, owner_id: &str) -> String {
     let now = now_rfc3339();
     let daemon_id = new_uuid_v4();
     DaemonRepo::upsert_by_machine_id(
@@ -570,9 +593,9 @@ async fn seed_available_agent(db: &SqliteDb) -> String {
             agent_version: None,
             labels_json: "{}".to_owned(),
             status: DaemonStatus::Online,
-            registration_token_hash: None,
-            owner_id: None,
-            visibility: "global".to_owned(),
+            registration_token_hash: Some(format!("hooks-registration-{daemon_id}")),
+            owner_id: Some(owner_id.to_owned()),
+            visibility: "account".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -615,8 +638,8 @@ async fn seed_available_agent(db: &SqliteDb) -> String {
             last_heartbeat_at: None,
             is_default: false,
             paused: false,
-            owner_id: None,
-            visibility: "global".to_owned(),
+            owner_id: Some(owner_id.to_owned()),
+            visibility: "account".to_owned(),
             prompt_template: None,
             created_at: now.clone(),
             updated_at: now,

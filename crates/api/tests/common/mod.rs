@@ -66,7 +66,7 @@ pub async fn test_app_with_pool(
                 email: "test@example.com".to_owned(),
                 password_hash: "$2b$04$placeholder".to_owned(),
                 display_name: None,
-                is_admin: false,
+                is_admin: true,
                 created_at: now.clone(),
                 updated_at: now,
             },
@@ -201,10 +201,12 @@ pub async fn create_shell_agents(
     workspace_root: &Path,
     prefix: &str,
 ) -> (String, String) {
-    let registration: DaemonRegisterResponse = json_request(
+    let admin_token = admin_jwt();
+    let registration: DaemonRegisterResponse = json_request_with_bearer(
         app,
         Method::POST,
         "/api/v1/daemons/register",
+        &admin_token,
         json!({
             "machine_id": services::embedded_daemon::embedded_machine_id(),
             "hostname": format!("{prefix}-host"),
@@ -216,29 +218,18 @@ pub async fn create_shell_agents(
     )
     .await;
     let daemon_id = registration.daemon_id;
-
     let _: DaemonResponse = json_request_with_bearer(
         app,
         Method::POST,
         &format!("/api/v1/daemons/{daemon_id}/report"),
         &registration.registration_token,
         json!({
-            "detected_clis": [{
-                "kind": "shell",
-                "availability": "authenticated",
-                "path": "/bin/sh"
-            }],
-            "runtimes": [{
-                "kind": "local",
-                "workspace_root": workspace_root.to_string_lossy(),
-                "status": "ready"
-            }]
+            "detected_clis": [{ "kind": "shell", "availability": "authenticated", "path": "/bin/sh" }],
+            "runtimes": [{ "kind": "local", "workspace_root": workspace_root.to_string_lossy(), "status": "ready" }]
         }),
         StatusCode::OK,
-    )
-    .await;
+    ).await;
 
-    let admin_token = admin_jwt();
     let agent_a: AgentResponse = json_request_with_bearer(
         app,
         Method::POST,
@@ -491,6 +482,27 @@ pub async fn raw_json_request(
                 .header(header::AUTHORIZATION, format!("Bearer {}", test_jwt()))
                 .body(Body::from(serde_json::to_string(&body).unwrap()))
                 .expect("build JSON request"),
+        )
+        .await
+        .expect("router response")
+}
+
+pub async fn raw_json_request_with_bearer(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    token: &str,
+    body: Value,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .expect("build authorized JSON request"),
         )
         .await
         .expect("router response")

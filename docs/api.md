@@ -228,6 +228,16 @@ workflows. WorkUnit readiness is a current deterministic projection.
 | `GET /executor-types`, `GET /executor-types/{type_name}/discovered-options`, `GET /clis` | Inspect supported executor/provider capabilities. |
 | `GET /daemons`, `POST /daemons/register`, `GET /daemons/{id}`, `GET /daemons/{id}/connect`, `POST /daemons/{id}/report` | Register and communicate with daemon harness hosts. |
 
+Daemon registration requires an existing authenticated account. The embedded
+machine identity is reserved for server startup or an explicit administrator
+registration. `visibility = global` affects record visibility only; it does not
+grant execution. An Agent can use a daemon with a verified owner only when both
+belong to the same account. Orphaned historical daemons remain stored but are
+ineligible to ordinary accounts. Agent availability and discovered options
+apply the same account and authenticated-capability checks as dispatch.
+Selecting a profile with a fixed daemon applies that check before the profile
+becomes active.
+
 Credential and provider infrastructure remains usable after PR10. It does not
 restore Forge-owned cognition or native runtime dispatch.
 

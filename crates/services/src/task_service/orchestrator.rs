@@ -2,8 +2,8 @@ use super::*;
 use crate::orchestrator_runtime::TaskRoleOrchestratorPolicy;
 use db::{
     ActorKind, ActorRef, CreateDomainEvent, CreateExecution, DomainEventRepo, OrchestratorWake,
-    OrchestratorWakeExecution, OrchestratorWakeRepo, RoleMembershipRepo, RoleMembershipStatus,
-    TaskRoleRepo,
+    OrchestratorWakeExecution, OrchestratorWakeRepo, ProjectRepo, RoleMembershipRepo,
+    RoleMembershipStatus, TaskRoleRepo,
 };
 
 impl TaskService {
@@ -42,6 +42,16 @@ impl TaskService {
                 "orchestrator Execution does not match its durable wake and current attempt",
             ));
         }
+        let task = TaskRepo::get_by_id(&*self.db, &wake.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", wake.task_id.clone()))?;
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let agent = AgentRepo::get_by_id(&*self.db, &wake.actor_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent", wake.actor_id.clone()))?;
+        ensure_orchestrator_agent_project_authority(&project, &agent)?;
         let role = TaskRoleRepo::get_by_id(&*self.db, &wake.task_role_id)
             .await?
             .ok_or_else(|| ServiceError::invalid_operation("orchestrator TaskRole is missing"))?;
@@ -95,6 +105,9 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &wake.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", wake.task_id.clone()))?;
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
         let task_role = TaskRoleRepo::get_by_id(&*self.db, &wake.task_role_id)
             .await?
             .ok_or_else(|| ServiceError::invalid_operation("orchestrator TaskRole is missing"))?;
@@ -133,6 +146,7 @@ impl TaskService {
         let agent = AgentRepo::get_by_id(&*self.db, &wake.actor_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", wake.actor_id.clone()))?;
+        ensure_orchestrator_agent_project_authority(&project, &agent)?;
         // The current safe automatic profile is a Codex CLI with an explicit
         // read-only sandbox. Other adapters stay durable and fail closed until
         // they expose an equally strong, verified sandbox capability.
@@ -285,6 +299,21 @@ impl TaskService {
         self.publish_committed_domain_event(&committed_event);
         Ok(execution)
     }
+}
+
+/// Global Agent visibility supports discovery. Automatic orchestration may use
+/// the Agent's daemon only within the account that owns the Task's Project.
+/// Cross-account grants are not currently modeled, so this boundary fails closed.
+fn ensure_orchestrator_agent_project_authority(
+    project: &db::Project,
+    agent: &db::Agent,
+) -> Result<()> {
+    if project.owner_id.is_some() && project.owner_id == agent.owner_id {
+        return Ok(());
+    }
+    Err(ServiceError::AuthorizationDenied {
+        message: "automatic orchestrator Agent must belong to the Task Project account; global visibility does not grant cross-account execution".to_owned(),
+    })
 }
 
 impl TaskService {

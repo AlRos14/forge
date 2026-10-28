@@ -37,7 +37,8 @@ async fn auth_header_value(app: &Router, email: &str) -> (String, AuthResponse) 
 }
 
 async fn register_daemon(app: &Router, machine_id: &str) -> DaemonRegisterResponse {
-    register_daemon_with_auth(app, machine_id, None).await
+    let bearer = format!("Bearer {}", common::admin_jwt());
+    register_daemon_with_auth(app, machine_id, Some(&bearer)).await
 }
 
 async fn register_daemon_with_auth(
@@ -166,6 +167,137 @@ async fn daemon_register_with_invalid_user_token_returns_401() {
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn daemon_registration_without_account_is_rejected() {
+    let workspace = common::TestDir::new("daemon-registration-anonymous");
+    let harness = common::test_app(workspace.path(), "daemon-registration-anonymous").await;
+    let response = harness.app.clone().oneshot(
+        Request::builder().method(Method::POST).uri("/api/v1/daemons/register")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({
+                "machine_id": "anonymous-machine", "hostname": "host", "os": "linux", "arch": "x86_64"
+            }).to_string()))
+            .unwrap()
+    ).await.expect("anonymous registration response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn another_account_cannot_reclaim_a_daemon_machine_identity() {
+    let workspace = common::TestDir::new("daemon-machine-owner-fence");
+    let harness = common::test_app(workspace.path(), "daemon-machine-owner-fence").await;
+    let owner = format!("Bearer {}", common::test_jwt());
+    let first = register_daemon_with_auth(&harness.app, "machine-owner-fence", Some(&owner)).await;
+    let now = db::now_rfc3339();
+    let second_id = "account-b";
+    db::UserRepo::create_user(
+        &*harness.state.db,
+        &db::User {
+            id: second_id.to_owned(),
+            email: "account-b@tests.invalid".to_owned(),
+            password_hash: "x".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("second account creates");
+    let second = format!(
+        "Bearer {}",
+        common::test_jwt_for_user(second_id, "account-b@tests.invalid", false)
+    );
+    let response = harness.app.clone().oneshot(
+        Request::builder().method(Method::POST).uri("/api/v1/daemons/register")
+            .header(header::AUTHORIZATION, second).header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({
+                "machine_id": "machine-owner-fence", "hostname": "claimed", "os": "linux", "arch": "x86_64"
+            }).to_string())).unwrap()
+    ).await.expect("foreign re-registration response");
+    assert!(
+        !response.status().is_success(),
+        "foreign account cannot rotate the daemon identity token"
+    );
+    let (owner_id, token_hash): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT owner_id, registration_token_hash FROM daemon WHERE id = ?")
+            .bind(&first.daemon_id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("original record remains");
+    assert_eq!(owner_id.as_deref(), Some("test-user-id"));
+    assert!(token_hash.is_some());
+}
+
+#[tokio::test]
+async fn another_admin_cannot_reconnect_a_locally_owned_embedded_daemon() {
+    let workspace = common::TestDir::new("embedded-daemon-admin-owner-fence");
+    let harness = common::test_app(workspace.path(), "embedded-daemon-admin-owner-fence").await;
+    let machine_id = services::embedded_daemon::embedded_machine_id();
+    let original = register_daemon(&harness.app, &machine_id).await;
+    let (owner_before, token_hash_before): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT owner_id, registration_token_hash FROM daemon WHERE id = ?")
+            .bind(&original.daemon_id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("embedded daemon record loads");
+
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*harness.state.db,
+        &db::User {
+            id: "other-admin".to_owned(),
+            email: "other-admin@tests.invalid".to_owned(),
+            password_hash: "x".to_owned(),
+            display_name: None,
+            is_admin: true,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("second admin creates");
+    let other_admin = format!(
+        "Bearer {}",
+        common::test_jwt_for_user("other-admin", "other-admin@tests.invalid", true)
+    );
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/daemons/register")
+                .header(header::AUTHORIZATION, other_admin)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&json!({
+                        "machine_id": machine_id,
+                        "hostname": "other-admin-host",
+                        "os": "linux",
+                        "arch": "x86_64"
+                    }))
+                    .unwrap(),
+                ))
+                .expect("build embedded re-registration request"),
+        )
+        .await
+        .expect("embedded re-registration response");
+    assert!(
+        !response.status().is_success(),
+        "an administrator cannot rebind another account's embedded identity"
+    );
+
+    let (owner_after, token_hash_after): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT owner_id, registration_token_hash FROM daemon WHERE id = ?")
+            .bind(&original.daemon_id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("embedded daemon remains present");
+    assert_eq!(owner_after, owner_before);
+    assert_eq!(token_hash_after, token_hash_before);
 }
 
 #[tokio::test]

@@ -39,6 +39,8 @@ TaskRole and RoleMembership govern eligibility. WorkUnit allocation names the ex
 
 Forge's Orchestrator reacts to durable domain events. Its implemented output set is bounded to Messages, Handoffs, limited WorkUnit creation, and Proposals. It does not directly steer or stop a harness, reassign work, merge repositories, or execute a Proposal or Decision. Human and Agent actions remain subject to the same domain authority.
 
+Automatic Orchestrator execution requires the Agent owner and Task Project owner to be the same account. Global Agent visibility supports discovery and TaskRole membership; it does not grant cross-account execution. Forge has no cross-account Agent execution grants, so a missing or mismatched owner fails closed at Execution admission and the transactional Provider Start claim.
+
 ## Harnesses and Executions
 
 `HarnessAdapter` is the boundary for supported harness detection, profile/configuration translation, capability evidence, Start/Resume, cancellation, normalized results, and usage observations. Forge fails closed when a required capability is unknown or unsupported. It does not read a harness's private credential store.
@@ -119,6 +121,17 @@ The API and UI do not expose the retired Main Agent, Project Agent, Agent Chat, 
 | Default heartbeat interval | `30` seconds. |
 
 Supported settings are defined in `crates/config/`. Common environment variables include `FORGE_SERVER_BIND`, `FORGE_PUBLIC_BASE_URL`, `FORGE_DATA_DIR`, `FORGE_WORKSPACE_ROOT`, `FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_AGENT_MAX_CONCURRENT_TASKS`, `FORGE_AGENT_HEARTBEAT_INTERVAL_SECONDS`, `FORGE_AGENT_MAX_MISSED_HEARTBEATS`, `FORGE_JWT_SECRET`, `FORGE_BCRYPT_COST`, `FORGE_CORS_ORIGINS`, and `FORGE_MEDIA_UPLOAD_LIMIT_BYTES`. `RUST_LOG` and `FORGE_LOG_FORMAT` configure logging.
+
+## Container execution privilege
+
+The published Docker image currently runs Forge as root, and Compose binds the
+server port on all host interfaces. The embedded shell therefore inherits the
+container's root identity. This PR restricts which account can reach that shell
+through Forge authority, but does not yet drop container privileges. A safe
+non-root image requires a forward-compatible ownership strategy for existing
+`/data` volumes and workspace mounts; treat container privilege reduction as a
+separate operational migration. Do not infer daemon ownership for historical
+records during that migration.
 
 ## Upstream
 

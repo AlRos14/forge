@@ -6,6 +6,30 @@ use db::{
     TaskLifecycleRepo, TaskRoleRepo,
 };
 
+async fn authorized_agent_execution_snapshot(db: &db::SqliteDb, agent_id: &str) -> String {
+    let agent = db::AgentRepo::get_by_id(db, agent_id)
+        .await
+        .expect("Agent loads for authority snapshot")
+        .expect("Agent exists for authority snapshot");
+    let daemon_id = agent
+        .daemon_id
+        .as_deref()
+        .expect("Agent has its authorized daemon");
+    let daemon = db::DaemonRepo::get_by_id(db, daemon_id)
+        .await
+        .expect("daemon loads for authority snapshot")
+        .expect("daemon exists for authority snapshot");
+    serde_json::json!({
+        "agent_id": agent.id,
+        "profile_id": agent.profile_id,
+        "executor_type": agent.executor_type,
+        "resolved_daemon_id": daemon.id,
+        "daemon_authority": db::daemon_authority_snapshot(&agent, &daemon),
+        "config": {}
+    })
+    .to_string()
+}
+
 struct RecordingExecutionProvider {
     executor: Arc<RecordingCancelExecutor>,
 }
@@ -197,6 +221,11 @@ async fn authoritative_memberships_preserve_multi_actor_cross_role_and_human_par
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    sqlx::query("UPDATE agent_identity SET visibility = 'global' WHERE id = ?")
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .expect("cross-role Agent is globally discoverable");
     let human_id = seed_human_user(&db).await;
     sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
         .bind(&human_id)
@@ -530,6 +559,8 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
         .await
         .expect("WorkUnit Workspace creates");
         let execution_id = new_uuid_v4();
+        let executor_config_snapshot_json =
+            authorized_agent_execution_snapshot(database, actor_id).await;
         let execution = db::CreateExecution {
             id: execution_id.clone(),
             task_id: task.id.clone(),
@@ -551,7 +582,7 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
             before_sha: Some("base-sha".to_owned()),
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(executor_config_snapshot_json),
             workspace_id: Some(workspace.id.clone()),
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
@@ -687,6 +718,7 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
         .is_err());
 
     let competing_execution_id = new_uuid_v4();
+    let competing_snapshot = authorized_agent_execution_snapshot(&db, &agent_a).await;
     let competing_execution = db::CreateExecution {
         id: competing_execution_id.clone(),
         task_id: task.id.clone(),
@@ -708,7 +740,7 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
         before_sha: Some("base-sha".to_owned()),
         after_sha: None,
         error: None,
-        executor_config_snapshot_json: None,
+        executor_config_snapshot_json: Some(competing_snapshot),
         workspace_id: Some(workspace_a.id.clone()),
         created_at: now.clone(),
         updated_at: now.clone(),
@@ -900,7 +932,17 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
     .await
     .expect("out-of-scope Agent identity updates");
     let global_agent = seed_agent(&db).await;
+    sqlx::query("UPDATE agent_identity SET visibility = 'global' WHERE id = ?")
+        .bind(&global_agent)
+        .execute(db.pool())
+        .await
+        .expect("global Agent visibility updates");
     let paused_agent = seed_agent(&db).await;
+    sqlx::query("UPDATE agent_identity SET visibility = 'global' WHERE id = ?")
+        .bind(&paused_agent)
+        .execute(db.pool())
+        .await
+        .expect("paused global Agent visibility updates");
     sqlx::query("UPDATE agent_identity SET paused = 1 WHERE id = ?")
         .bind(&paused_agent)
         .execute(db.pool())

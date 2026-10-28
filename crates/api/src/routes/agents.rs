@@ -275,6 +275,21 @@ pub async fn update_agent(
             "Admin access required to pin an agent to a daemon",
         ));
     }
+    if let Some(Some(daemon_id)) = request.daemon_id.as_ref() {
+        let owner_id = existing.owner_id.as_deref().ok_or_else(|| {
+            ApiError::forbidden_with_code(
+                "agent_owner_required",
+                "Agent has no verified account authority for daemon selection",
+            )
+        })?;
+        services::agent_service::resolve_daemon_for_account(
+            &state.db,
+            owner_id,
+            &existing.executor_type,
+            Some(daemon_id),
+        )
+        .await?;
+    }
 
     let agent = AgentRepo::update(
         &*state.db,
@@ -407,6 +422,14 @@ pub async fn agent_availability(
         .await?
         .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
     require_agent_visible(&agent, &user, &id)?;
+    services::agent_service::require_agent_account(&state.db, &id, &user.user_id)
+        .await
+        .map_err(|_| {
+            ApiError::forbidden_with_code(
+                "agent_account_required",
+                "Agent availability belongs to another account",
+            )
+        })?;
     let active_execution_count = AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
     let effective_status = compute_effective_status(&state.db, &agent).await?;
     let resolved_daemon = resolve_daemon_for_agent(&state.db, &agent).await.ok();
@@ -457,8 +480,10 @@ pub async fn agent_discovered_options(
             agent.executor_type
         ))
     })?;
-    let daemons = if user.is_admin {
-        DaemonRepo::list_available_for_executor(&*state.db, &agent.executor_type).await?
+    let is_agent_owner = agent.owner_id.as_deref() == Some(user.user_id.as_str());
+    let daemons = if user.is_admin && is_agent_owner {
+        DaemonRepo::list_available_for_executor(&*state.db, &agent.executor_type, &user.user_id)
+            .await?
     } else {
         Vec::new()
     };
@@ -518,8 +543,12 @@ async fn build_agent_response_for_user(
     active_execution_count: Option<i64>,
     user: &AuthenticatedUser,
 ) -> ApiResult<AgentResponse> {
+    let belongs_to_user = agent.owner_id.as_deref() == Some(user.user_id.as_str());
     let mut response = build_agent_response(state, agent, active_execution_count).await?;
-    if !user.is_admin {
+    if !belongs_to_user {
+        response.effective_status = Some("daemon_unavailable".to_owned());
+    }
+    if !user.is_admin || !belongs_to_user {
         response.daemon_id = None;
     }
     Ok(response)

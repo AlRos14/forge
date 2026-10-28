@@ -45,6 +45,9 @@ pub async fn start_task_execution(
         .await?
         .filter(|work_unit| work_unit.task_id == task_id)
         .ok_or_else(|| ApiError::not_found("work_unit", request.work_unit_id.clone()))?;
+    if let Some(db::ActorRef::Agent(agent_id)) = work_unit.assigned_actor.as_ref() {
+        services::agent_service::require_agent_account(&state.db, agent_id, &user.user_id).await?;
+    }
     if work_unit.requires_integration {
         state
             .work_unit_service
@@ -97,6 +100,12 @@ pub async fn recover_work_unit_execution(
     Json(request): Json<api_types::RecoverWorkUnitExecutionRequest>,
 ) -> ApiResult<Json<ExecutionResponse>> {
     crate::routes::tasks::require_task_mutable(&state, &task_id, &user).await?;
+    let parent = db::ExecutionRepo::get_by_id(&*state.db, &execution_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("execution", execution_id.clone()))?;
+    if let Some(agent_id) = parent.agent_id.as_deref() {
+        services::agent_service::require_agent_account(&state.db, agent_id, &user.user_id).await?;
+    }
     let launched = state
         .task_service
         .recover_work_unit_execution(task_id, execution_id, request, user.user_id)
@@ -265,6 +274,8 @@ pub async fn follow_up_execution(
         reasoning_effort: overrides.reasoning_effort,
         permission_policy: overrides.permission_policy,
     });
+    services::agent_service::require_agent_account(&state.db, &request.agent_id, &user.user_id)
+        .await?;
     let launched = state
         .task_service
         .follow_up_execution(

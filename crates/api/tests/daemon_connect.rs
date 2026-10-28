@@ -13,7 +13,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{
     connect_async,
@@ -206,6 +206,21 @@ async fn test_state() -> Arc<AppState> {
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*db,
+        &db::User {
+            id: "test-user-id".to_owned(),
+            email: "test@example.com".to_owned(),
+            password_hash: "x".to_owned(),
+            display_name: None,
+            is_admin: true,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("admin daemon test account creates");
     let event_bus = Arc::new(events::EventBus::new(16));
     Arc::new(AppState::new(db, event_bus, true))
 }
@@ -215,21 +230,25 @@ fn test_app(state: &AppState) -> Router {
 }
 
 async fn register_daemon(app: &Router, machine_id: &str) -> DaemonRegisterResponse {
-    json_request(
-        app,
-        Method::POST,
-        "/api/v1/daemons/register",
-        json!({
-            "machine_id": machine_id,
-            "hostname": "daemon-connect-test-host",
-            "os": "linux",
-            "arch": "x86_64",
-            "agent_version": "daemon-connect-test",
-            "labels": { "suite": "daemon_connect" }
-        }),
-        StatusCode::OK,
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = serde_json::json!({ "sub":"test-user-id", "email":"test@example.com", "is_admin":true,
+        "iat":now, "exp":now + 900 });
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(b"test-jwt-secret-for-development"),
     )
-    .await
+    .unwrap();
+    let response = app.clone().oneshot(Request::builder().method(Method::POST)
+        .uri("/api/v1/daemons/register").header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(json!({ "machine_id":machine_id, "hostname":"daemon-connect-test-host",
+            "os":"linux", "arch":"x86_64", "agent_version":"daemon-connect-test", "labels":{"suite":"daemon_connect"} }).to_string())).unwrap())
+        .await.expect("daemon registration response");
+    parse_response(response, StatusCode::OK).await
 }
 
 async fn connect_daemon(
@@ -331,31 +350,6 @@ fn assert_ws_http_status(error: WsError, expected: StatusCode) {
         WsError::Http(response) => assert_eq!(response.status().as_u16(), expected.as_u16()),
         other => panic!("expected HTTP websocket error {expected}, got {other:?}"),
     }
-}
-
-async fn json_request<T>(
-    app: &Router,
-    method: Method,
-    uri: &str,
-    body: Value,
-    expected_status: StatusCode,
-) -> T
-where
-    T: DeserializeOwned,
-{
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(uri)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .expect("build JSON request"),
-        )
-        .await
-        .expect("router response");
-    parse_response(response, expected_status).await
 }
 
 async fn parse_response<T>(response: axum::response::Response, expected_status: StatusCode) -> T

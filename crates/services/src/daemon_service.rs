@@ -82,6 +82,59 @@ impl DaemonService {
         fields(machine_id = %input.machine_id, hostname = %input.hostname, os = %input.os, arch = %input.arch)
     )]
     pub async fn register(&self, input: DaemonRegisterInput) -> Result<DaemonRegistration> {
+        if input.machine_id.starts_with("embedded:") {
+            return Err(ServiceError::invalid_operation(
+                "embedded daemon identity is reserved for local server startup",
+            ));
+        }
+        if input.owner_id.is_none() {
+            return Err(ServiceError::invalid_operation(
+                "daemon registration requires an authenticated account",
+            ));
+        }
+        self.register_inner(input).await
+    }
+
+    pub async fn register_embedded(
+        &self,
+        mut input: DaemonRegisterInput,
+    ) -> Result<DaemonRegistration> {
+        if !crate::embedded_daemon::is_embedded_daemon_machine(&input.machine_id) {
+            return Err(ServiceError::invalid_operation(
+                "invalid local daemon identity",
+            ));
+        }
+        if let Some(owner_id) = input.owner_id.as_deref() {
+            let owner_is_admin =
+                sqlx::query_scalar::<_, bool>("SELECT is_admin FROM user WHERE id = ?")
+                    .bind(owner_id)
+                    .fetch_optional(self.db.pool())
+                    .await?
+                    .unwrap_or(false);
+            if !owner_is_admin {
+                return Err(ServiceError::invalid_operation(
+                    "embedded shell requires an authorized administrator",
+                ));
+            }
+        }
+        // Preserve an existing identity's ownership; startup never reassigns historical records.
+        if let Some(existing) = DaemonRepo::get_by_machine_id(&*self.db, &input.machine_id).await? {
+            if let (Some(request_owner), Some(existing_owner)) =
+                (input.owner_id.as_deref(), existing.owner_id.as_deref())
+            {
+                if request_owner != existing_owner {
+                    return Err(ServiceError::invalid_operation(
+                        "embedded daemon identity belongs to another administrator account",
+                    ));
+                }
+            }
+            input.owner_id = existing.owner_id;
+            input.visibility = Some(existing.visibility);
+        }
+        self.register_inner(input).await
+    }
+
+    async fn register_inner(&self, input: DaemonRegisterInput) -> Result<DaemonRegistration> {
         validate_required("machine_id", &input.machine_id)?;
         validate_required("hostname", &input.hostname)?;
         validate_required("os", &input.os)?;
@@ -544,7 +597,7 @@ fn executor_display_name(executor_type: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use db::{create_sqlite_pool, run_migrations, DaemonStatus, User, UserRepo};
+    use db::{create_sqlite_pool, run_migrations, DaemonStatus, UserRepo};
 
     async fn service() -> DaemonService {
         let pool = create_sqlite_pool("sqlite::memory:")
@@ -552,6 +605,21 @@ mod tests {
             .expect("pool creates");
         run_migrations(&pool).await.expect("migrations run");
         let db = Arc::new(SqliteDb::new(pool));
+        let now = now_rfc3339();
+        UserRepo::create_user(
+            &*db,
+            &db::User {
+                id: "daemon-owner".to_owned(),
+                email: "daemon-owner@test.invalid".to_owned(),
+                password_hash: "x".to_owned(),
+                display_name: None,
+                is_admin: true,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("test daemon owner creates");
         let event_bus = Arc::new(EventBus::new(16));
         DaemonService::new(db, event_bus)
     }
@@ -565,8 +633,8 @@ mod tests {
             agent_version: Some("0.1.0".to_owned()),
             labels: serde_json::json!({}),
             runtimes: Vec::new(),
-            owner_id: None,
-            visibility: Some("global".to_owned()),
+            owner_id: Some("daemon-owner".to_owned()),
+            visibility: Some("account".to_owned()),
         }
     }
 
@@ -614,22 +682,7 @@ mod tests {
     #[tokio::test]
     async fn report_full_cli_set_is_idempotent_for_daemon_agents() {
         let service = service().await;
-        let now = now_rfc3339();
-        let user_id = "user-1".to_owned();
-        UserRepo::create_user(
-            &*service.db,
-            &User {
-                id: user_id.clone(),
-                email: "daemon-owner@example.com".to_owned(),
-                password_hash: "hash".to_owned(),
-                display_name: None,
-                is_admin: true,
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await
-        .expect("user creates");
+        let user_id = "daemon-owner".to_owned();
 
         let mut input = register_input("machine-1");
         input.owner_id = Some(user_id);
@@ -679,7 +732,7 @@ mod tests {
             .expect("external daemon registers");
         let embedded_machine_id = crate::embedded_daemon::embedded_machine_id();
         let embedded = service
-            .register(register_input(&embedded_machine_id))
+            .register_embedded(register_input(&embedded_machine_id))
             .await
             .expect("embedded daemon registers");
 

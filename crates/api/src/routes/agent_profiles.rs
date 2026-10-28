@@ -45,6 +45,15 @@ pub async fn select_profile(
             "native runtime profiles cannot be selected for current Agent work",
         ));
     }
+    if let Some(daemon_id) = profile.daemon_id.as_deref() {
+        services::agent_service::resolve_daemon_for_account(
+            &state.db,
+            &user.user_id,
+            &profile.executor_type,
+            Some(daemon_id),
+        )
+        .await?;
+    }
     let agent = AgentProfileRepo::select_profile(
         &*state.db,
         SelectAgentProfile {
