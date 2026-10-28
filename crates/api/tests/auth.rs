@@ -14,7 +14,7 @@ use tower::ServiceExt;
 
 fn test_password() -> &'static str {
     static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PASSWORD.get_or_init(|| format!("test-password-{}", std::process::id()))
+    PASSWORD.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
 async fn register(app: &axum::Router, email: &str, password: &str) -> axum::response::Response {

@@ -501,8 +501,11 @@ mod tests {
         AuthService::new(Arc::new(SqliteDb::new(pool)), b"test-secret".to_vec(), 4)
     }
 
-    fn test_password(tag: &str) -> String {
-        format!("test-password-{tag}-{}", std::process::id())
+    fn test_password(_tag: &str) -> String {
+        static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PASSWORD
+            .get_or_init(|| uuid::Uuid::new_v4().to_string())
+            .clone()
     }
 
     async fn seed_orphan_agent(db: &SqliteDb, id: &str, name: &str, is_default: bool) {

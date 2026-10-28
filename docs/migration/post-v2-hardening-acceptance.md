@@ -61,9 +61,11 @@ listed in [security-audit.md](../security-audit.md),
 
 ## F. Recorded local evidence
 
-These checks ran on 2026-10-28 at code HEAD `2de74710` on the working branch.
-The documentation commit that follows this ledger does not change runtime code.
-The PR check rollup at the exact final HEAD remains the merge gate.
+These checks ran on 2026-10-28 on the working branch. The full API suite was
+collected at `2de74710`; after a test-only password-helper change, the `auth`
+targets were rerun and passed again (9 API and 19 services tests). The
+documentation commit that follows does not change runtime code. The PR check
+rollup at the exact final HEAD remains the merge gate.
 
 | Check | Command | Result |
 |---|---|---|
