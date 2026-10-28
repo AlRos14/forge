@@ -862,6 +862,7 @@ async fn actor_validation_requires_project_human_and_rejects_sentinel() {
         .execute(db.pool())
         .await
         .expect("project owner updates");
+    add_project_member(&db, &project_id, &human_id, "owner").await;
     service
         .add_task_role_member(&task.id, "reviewer", ActorRef::Human(human_id))
         .await
