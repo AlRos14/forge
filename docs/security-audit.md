@@ -42,8 +42,17 @@ At the hardening HEAD:
 - MCP configuration responses redact credential-like query parameters, reject
   foreign/tokenized URLs as unusable, reject symlinked config files, and require
   a server administrator for server-global `user`/`local` scopes.
-- Terminal WebSockets recheck project write authority every five seconds and on
-  attach-token consumption.
+- Terminal WebSockets recheck project write authority on attach-token
+  consumption, before every input/resize frame, and every five seconds while
+  idle. A revoked account cannot submit another keystroke.
+- Project/local MCP client configs written by `forge-ctl mcp install` contain an
+  environment reference, not a literal Bearer token. The command fails closed
+  when the referenced variable is unavailable. `user`-scope files use `0600`.
+- Project-scoped MCP config APIs require an explicit `project_id`; they no longer
+  fall back to the server working directory.
+- MCP config reads and writes traverse from a canonical root using directory
+  descriptors with `O_NOFOLLOW`, reject intermediate and final symlinks, and
+  confine relative paths to normal components.
 - Agent/orchestrator/Execution admission requires the Agent owner's current
   Project membership, not owner equality alone.
 - A historical Project whose canonical `owner_id` points to a deleted user and

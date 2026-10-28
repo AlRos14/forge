@@ -88,3 +88,31 @@ Native harness execution (Level C) was not run. No private harness credentials
 were used. The full-workspace Rust check, including the complete `services`
 suite, runs in CI with `./scripts/ci-rust.sh`; an empty or pending check is not
 evidence of success.
+
+## G. Human review closure
+
+| Finding | Root cause | Repair | Regression evidence |
+|---|---|---|---|
+| P1-1 terminal input after revocation | Authorization ran on attach and every five seconds, but `Input`/`Resize` frames did not revalidate before dispatch | `TerminalService` checks current Project write authority before every input and resize; the route closes the socket on `AuthorizationDenied` | `terminal_service::tests::input_and_resize_recheck_current_authority`: allowed before revocation reaches dispatch, denied after; API terminal suite and happy-path terminal execution pass |
+| P1-2 literal MCP bearer tokens | `forge-ctl mcp install` wrote the token into project/local files with default permissions | Project/local configs use Claude `${VAR}`, Cursor `${env:VAR}`, or Codex `bearer_token_env_var`; install fails closed without the referenced variable. `user` scope writes literal tokens with `0600` | `forge-client` MCP tests: env-reference output for all three clients, no token in file, fail-closed without env, `--token` rejection, private user-file mode |
+| P2-1 cwd MCP config fallback | Project scope with no `project_id` resolved `env::current_dir()` before URL validation | Project scope requires a non-empty `project_id` before path resolution; GET and POST share the check | `api/tests/mcp_config_http.rs`: non-admin GET/POST without `project_id` and a blank id return `400 project_id_required`; server-global scopes still return `403 admin_required` |
+| P2-2 intermediate symlinks | Only the final path component was checked; `create_dir_all`/`write` followed directory symlinks | Canonical root plus descriptor-relative traversal, `O_NOFOLLOW` on every directory and final file, normal-component-only relative paths, private `0600` writes | MCP unit tests: parent traversal/absolute paths reject, symlinked config directory rejects without outside write, symlinked final file rejects without changing its target, written file mode is `0600` |
+
+Focused commands:
+
+```bash
+FORGE_SKIP_WEB_BUILD=1 cargo test -p forge-client mcp::tests --offline
+FORGE_SKIP_WEB_BUILD=1 cargo test -p services --lib terminal_service::tests::input_and_resize_recheck_current_authority --offline
+FORGE_SKIP_WEB_BUILD=1 cargo test -p api --lib routes::mcp_config::tests --offline
+FORGE_SKIP_WEB_BUILD=1 cargo test -p api --test mcp_config_http --offline
+FORGE_SKIP_WEB_BUILD=1 cargo test -p api --test terminal_sessions --offline
+FORGE_SKIP_WEB_BUILD=1 cargo test -p api --test happy_path forge_happy_path_end_to_end --offline
+FORGE_SKIP_WEB_BUILD=1 cargo clippy -p api -p services -p forge-client --all-targets --offline -- -D warnings
+```
+
+Adversarial review of the changed surfaces found no remaining P0/P1 in the
+terminal or MCP-config paths. Residual notes: the terminal idle revalidation
+timer still closes silent connections within five seconds, but input/resize no
+longer wait for it; MCP config writes are Unix-hardened with descriptor-relative
+traversal (non-Unix builds use canonical-root checks); `--token-env` requires
+the operator to export the variable in the client's environment.

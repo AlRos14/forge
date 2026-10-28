@@ -98,9 +98,15 @@ exposure is controlled by the published port.
   Treat `/data` as private user data.
 - Request logging records the path without the query string. Authentication
   failures do not echo credentials.
-- MCP client configuration written by `forge-ctl mcp install` contains a Bearer
-  token in a local config file. Keep normal user-only permissions and do not
-  commit it.
+- `forge-ctl mcp install` never writes a literal Bearer token into a
+  project/local MCP configuration. It writes the client's environment-reference
+  syntax and fails closed unless the referenced variable is set. `user`-scope
+  files may contain a literal token and are written with `0600` permissions.
+- MCP configuration writes resolve through directory descriptors and reject
+  symlinks in intermediate directories and the final file. A symlinked config
+  path is a hard failure, not a redirect.
+- Terminal input and resize frames recheck the current Project write authority;
+  revoking membership or deleting the account rejects the next frame.
 
 ## Controlled failure
 
