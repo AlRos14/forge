@@ -607,6 +607,7 @@ pub(super) async fn forge_update_project_hooks(
         },
         params.version,
         Some(project_hooks),
+        None,
     )
     .await?;
     project_value(project)

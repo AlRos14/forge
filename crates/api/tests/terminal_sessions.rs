@@ -201,19 +201,6 @@ async fn seed_task(harness: &Harness) -> SeededTask {
     )
     .await
     .unwrap();
-    db::ProjectMemberRepo::add_member(
-        &*harness.state.db,
-        db::CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: project_id.clone(),
-            user_id: TEST_USER_ID.to_owned(),
-            role: "owner".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .unwrap();
     db::RepoRepo::create(
         &*harness.state.db,
         db::CreateRepo {
@@ -492,6 +479,7 @@ async fn unauthorized_user_rejected() {
     let harness = setup(enabled_terminal()).await;
     let task = seed_task(&harness).await;
     seed_ready_workspace(&harness, &task).await;
+    seed_user(&harness.state.db, "second-user-id", "second@example.com").await;
     let token = test_jwt_for("second-user-id", "second@example.com", false);
 
     let (status, _) = request_with_bearer(

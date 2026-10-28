@@ -16,6 +16,15 @@ pub enum DbError {
     #[error("Project has immutable Releases")]
     ProjectHasReleases,
 
+    #[error("Project {project_id} has no other owner to receive canonical ownership")]
+    ProjectOwnerRequired { project_id: String },
+
+    #[error("cannot remove the last administrator")]
+    LastAdmin,
+
+    #[error("project owner or administrator membership is required")]
+    ProjectAdminRequired,
+
     #[error("version conflict")]
     VersionConflict,
 

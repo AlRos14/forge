@@ -53,7 +53,7 @@ async fn project_delete_removes_a_parent_and_child_together() {
     let parent = create_task(&db, &project_id, &repo_id, None, None, "P").await;
     let child = create_task(&db, &project_id, &repo_id, Some(&parent.id), Some(0), "C").await;
 
-    ProjectRepo::delete(&db, &project_id)
+    ProjectRepo::delete(&db, &project_id, None)
         .await
         .expect("Project delete succeeds");
 

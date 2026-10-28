@@ -1585,20 +1585,6 @@ mod tests {
         let human_id = new_uuid_v4();
         let agent_id = new_uuid_v4();
         let task_role_id = new_uuid_v4();
-        ProjectRepo::create(
-            &*db,
-            CreateProject {
-                id: project_id.clone(),
-                name: "PR5 integration".to_owned(),
-                settings: "{}".to_owned(),
-                primary_repo_id: None,
-                owner_id: Some(human_id.clone()),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("Project");
         db::UserRepo::create_user(
             &*db,
             &db::User {
@@ -1613,6 +1599,20 @@ mod tests {
         )
         .await
         .expect("Human");
+        ProjectRepo::create(
+            &*db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "PR5 integration".to_owned(),
+                settings: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: Some(human_id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Project");
         let daemon_id = new_uuid_v4();
         DaemonRepo::upsert_by_machine_id(
             &*db,

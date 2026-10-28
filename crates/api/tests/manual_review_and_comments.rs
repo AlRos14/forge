@@ -66,6 +66,21 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*db,
+        &db::User {
+            id: "test-user-id".to_owned(),
+            email: "test@example.com".to_owned(),
+            password_hash: "not-a-real-hash".to_owned(),
+            display_name: None,
+            is_admin: true,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("test user seeds");
     let adapter_registry = Arc::new(executors::HarnessAdapterRegistry::new());
     let event_bus = Arc::new(EventBus::new(256));
     let merge_service = Arc::new(services::MergeService::new(

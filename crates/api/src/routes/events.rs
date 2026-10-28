@@ -194,7 +194,7 @@ async fn project_is_visible(db: &SqliteDb, project_id: &str, user_id: &str) -> b
     let Ok(Some(project)) = ProjectRepo::get_by_id(db, project_id).await else {
         return false;
     };
-    if project.owner_id.is_none() || project.owner_id.as_deref() == Some(user_id) {
+    if project.owner_id.is_none() {
         return true;
     }
     matches!(
@@ -425,6 +425,20 @@ mod tests {
         db::run_migrations(&pool).await.expect("migrations");
         let db = SqliteDb::new(pool);
         let now = db::now_rfc3339();
+        db::UserRepo::create_user(
+            &db,
+            &db::User {
+                id: "owner-a".to_owned(),
+                email: "owner-a@example.invalid".to_owned(),
+                password_hash: "unused".to_owned(),
+                display_name: None,
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("seed Project owner");
         db::ProjectRepo::create(
             &db,
             db::CreateProject {

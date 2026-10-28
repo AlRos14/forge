@@ -4,7 +4,9 @@ use crate::{new_uuid_v4, now_rfc3339};
 #[async_trait]
 impl ProjectRepo for SqliteDb {
     async fn create(&self, input: CreateProject) -> Result<Project> {
-        self.create_project_record(input, None).await
+        let member_id = input.owner_id.as_ref().map(|_| new_uuid_v4());
+        self.create_project_record(input, member_id.as_deref())
+            .await
     }
 
     async fn create_with_owner_membership(
@@ -91,7 +93,7 @@ impl ProjectRepo for SqliteDb {
         page: PageRequest,
     ) -> Result<Page<Project>> {
         let offset = decode_offset(&page.cursor)?;
-        let visibility_filter = "owner_id IS NULL OR owner_id = ? OR EXISTS (
+        let visibility_filter = "owner_id IS NULL OR EXISTS (
             SELECT 1 FROM project_member
             WHERE project_member.project_id = project.id AND project_member.user_id = ?
         )";
@@ -100,7 +102,6 @@ impl ProjectRepo for SqliteDb {
             order_clause_without_priority(&page)
         );
         let rows = sqlx::query(&sql)
-            .bind(user_id)
             .bind(user_id)
             .bind(limit(&page) + 1)
             .bind(offset)
@@ -115,7 +116,6 @@ impl ProjectRepo for SqliteDb {
                 sqlx::query_scalar::<_, i64>(&format!(
                     "SELECT COUNT(*) FROM project WHERE ({visibility_filter})"
                 ))
-                .bind(user_id)
                 .bind(user_id)
                 .fetch_one(&self.pool)
                 .await?,
@@ -164,8 +164,25 @@ impl ProjectRepo for SqliteDb {
         input: UpdateProject,
         expected_version: i64,
         project_hooks_json: Option<String>,
+        caller_user_id: Option<&str>,
     ) -> Result<Project> {
-        let mut project = ProjectRepo::get_by_id(self, &input.id)
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(caller_user_id) = caller_user_id {
+            let is_admin: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM project_member
+                    WHERE project_id = ? AND user_id = ? AND role IN ('owner', 'admin')
+                )",
+            )
+            .bind(&input.id)
+            .bind(caller_user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if is_admin == 0 {
+                return Err(DbError::ProjectAdminRequired);
+            }
+        }
+        let mut project = ProjectRepo::get_by_id_in_tx(self, &mut tx, &input.id)
             .await?
             .ok_or(DbError::NotFound)?;
         if project.version != expected_version {
@@ -201,11 +218,12 @@ impl ProjectRepo for SqliteDb {
         .bind(&project.updated_at)
         .bind(&project.id)
         .bind(expected_version)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
+        tx.commit().await?;
         ProjectRepo::get_by_id(self, &project.id)
             .await?
             .ok_or(DbError::NotFound)
@@ -246,21 +264,58 @@ impl ProjectRepo for SqliteDb {
         epoch.ok_or(DbError::NotFound)
     }
 
-    async fn set_paused_at(&self, id: &str, paused_at: Option<String>) -> Result<()> {
+    async fn set_paused_at(
+        &self,
+        id: &str,
+        paused_at: Option<String>,
+        caller_user_id: Option<&str>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(caller_user_id) = caller_user_id {
+            let is_admin: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM project_member
+                    WHERE project_id = ? AND user_id = ? AND role IN ('owner', 'admin')
+                )",
+            )
+            .bind(id)
+            .bind(caller_user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if is_admin == 0 {
+                return Err(DbError::ProjectAdminRequired);
+            }
+        }
         let result = sqlx::query("UPDATE project SET paused_at = ?, updated_at = ? WHERE id = ?")
             .bind(paused_at.as_deref())
             .bind(now_rfc3339())
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn delete(&self, id: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+    async fn delete(&self, id: &str, caller_user_id: Option<&str>) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(caller_user_id) = caller_user_id {
+            let is_admin: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM project_member
+                    WHERE project_id = ? AND user_id = ? AND role IN ('owner', 'admin')
+                )",
+            )
+            .bind(id)
+            .bind(caller_user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if is_admin == 0 {
+                return Err(DbError::ProjectAdminRequired);
+            }
+        }
         let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM project WHERE id = ?")
             .bind(id)
             .fetch_optional(&mut *tx)

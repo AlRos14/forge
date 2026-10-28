@@ -84,6 +84,36 @@ impl UserRepo for SqliteDb {
         Ok(())
     }
 
+    async fn set_admin_checked(&self, id: &str, is_admin: bool) -> Result<()> {
+        if is_admin {
+            return self.set_admin(id, true).await;
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current_is_admin: Option<bool> =
+            sqlx::query_scalar("SELECT is_admin FROM user WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(current_is_admin) = current_is_admin else {
+            return Err(DbError::NotFound);
+        };
+        if current_is_admin {
+            let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user WHERE is_admin = 1")
+                .fetch_one(&mut *tx)
+                .await?;
+            if admins <= 1 {
+                return Err(DbError::LastAdmin);
+            }
+        }
+        sqlx::query("UPDATE user SET is_admin = 0, updated_at = ? WHERE id = ?")
+            .bind(crate::now_rfc3339())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn update_profile(
         &self,
         id: &str,
@@ -114,10 +144,73 @@ impl UserRepo for SqliteDb {
     }
 
     async fn delete_user(&self, id: &str) -> Result<bool> {
+        self.delete_user_record(id, false).await
+    }
+
+    async fn delete_user_checked(&self, id: &str) -> Result<bool> {
+        self.delete_user_record(id, true).await
+    }
+}
+
+impl SqliteDb {
+    async fn delete_user_record(&self, id: &str, check_last_admin: bool) -> Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if check_last_admin {
+            let current_is_admin: Option<bool> =
+                sqlx::query_scalar("SELECT is_admin FROM user WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some(current_is_admin) = current_is_admin else {
+                return Ok(false);
+            };
+            if current_is_admin {
+                let admins: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM user WHERE is_admin = 1")
+                        .fetch_one(&mut *tx)
+                        .await?;
+                if admins <= 1 {
+                    return Err(DbError::LastAdmin);
+                }
+            }
+        }
+        let owned_projects: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM project WHERE owner_id = ? ORDER BY id")
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?;
+        let now = crate::now_rfc3339();
+        for project_id in owned_projects {
+            let replacement: Option<String> = sqlx::query_scalar(
+                "SELECT user_id FROM project_member
+                 WHERE project_id = ? AND role = 'owner' AND user_id <> ?
+                 ORDER BY created_at, id LIMIT 1",
+            )
+            .bind(&project_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(replacement) = replacement else {
+                return Err(DbError::ProjectOwnerRequired { project_id });
+            };
+            sqlx::query(
+                "UPDATE project
+                 SET owner_id = ?, updated_at = ?, version = version + 1
+                 WHERE id = ? AND owner_id = ?",
+            )
+            .bind(&replacement)
+            .bind(&now)
+            .bind(&project_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         let result = sqlx::query("DELETE FROM user WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 }

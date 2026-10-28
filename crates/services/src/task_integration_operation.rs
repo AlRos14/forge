@@ -3158,7 +3158,7 @@ mod tests {
             .fetch_one(fixture.db.pool())
             .await
             .expect("Project identity for teardown");
-        ProjectRepo::delete(&*fixture.db, &project_id)
+        ProjectRepo::delete(&*fixture.db, &project_id, None)
             .await
             .expect("guarded teardown removes archived legacy history and current admission");
         let archived_after_teardown: i64 =
@@ -4396,7 +4396,7 @@ mod tests {
             .fetch_one(fixture.db.pool())
             .await
             .expect("Task project lookup");
-        ProjectRepo::delete(&*fixture.db, &project_id)
+        ProjectRepo::delete(&*fixture.db, &project_id, None)
             .await
             .expect("guarded Project teardown cascades remote admission history");
         let remaining_remote_admissions: i64 =
@@ -4891,7 +4891,7 @@ mod tests {
             .fetch_one(fixture.db.pool())
             .await
             .expect("Project lookup before teardown");
-        ProjectRepo::delete(&*fixture.db, &project_id)
+        ProjectRepo::delete(&*fixture.db, &project_id, None)
             .await
             .expect("guarded teardown removes the remote PR history");
         let remaining_history: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM remote_pr_history")

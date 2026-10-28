@@ -82,6 +82,9 @@ async fn operations_status_response_has_expected_structure() {
 async fn operations_status_requires_admin() {
     let workspace_root = common::TestDir::new("operations-status-non-admin");
     let harness = common::test_app(workspace_root.path(), "operations-status-non-admin").await;
+    db::UserRepo::set_admin(&*harness.state.db, "test-user-id", false)
+        .await
+        .expect("demote test user");
 
     let error: Value = common::empty_request(
         &harness.app,

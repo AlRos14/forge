@@ -85,7 +85,7 @@ impl NotificationRepo for SqliteDb {
     ) -> Result<Page<Notification>> {
         let offset = decode_offset(&query.page.cursor)?;
         let mut where_parts = vec![
-            "EXISTS (SELECT 1 FROM project p WHERE p.id = notification.project_id AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (SELECT 1 FROM project_member pm WHERE pm.project_id = p.id AND pm.user_id = ?)))",
+            "EXISTS (SELECT 1 FROM project p WHERE p.id = notification.project_id AND (p.owner_id IS NULL OR EXISTS (SELECT 1 FROM project_member pm WHERE pm.project_id = p.id AND pm.user_id = ?)))",
         ];
         if query.project_id.is_some() {
             where_parts.push("project_id = ?");
@@ -98,7 +98,7 @@ impl NotificationRepo for SqliteDb {
         let sql = format!(
             "SELECT * FROM notification {where_sql} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
         );
-        let mut q = sqlx::query(&sql).bind(user_id).bind(user_id);
+        let mut q = sqlx::query(&sql).bind(user_id);
         if let Some(project_id) = &query.project_id {
             q = q.bind(project_id);
         }
@@ -117,9 +117,7 @@ impl NotificationRepo for SqliteDb {
 
         let total = if query.page.include_total {
             let count_sql = format!("SELECT COUNT(*) FROM notification {where_sql}");
-            let mut cq = sqlx::query_scalar::<_, i64>(&count_sql)
-                .bind(user_id)
-                .bind(user_id);
+            let mut cq = sqlx::query_scalar::<_, i64>(&count_sql).bind(user_id);
             if let Some(project_id) = &query.project_id {
                 cq = cq.bind(project_id);
             }
@@ -163,11 +161,9 @@ impl NotificationRepo for SqliteDb {
             ""
         };
         let sql = format!(
-            "SELECT COUNT(*) FROM notification WHERE read = 0 AND EXISTS (SELECT 1 FROM project p WHERE p.id = notification.project_id AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (SELECT 1 FROM project_member pm WHERE pm.project_id = p.id AND pm.user_id = ?))){project_filter}"
+            "SELECT COUNT(*) FROM notification WHERE read = 0 AND EXISTS (SELECT 1 FROM project p WHERE p.id = notification.project_id AND (p.owner_id IS NULL OR EXISTS (SELECT 1 FROM project_member pm WHERE pm.project_id = p.id AND pm.user_id = ?))){project_filter}"
         );
-        let mut query = sqlx::query_scalar::<_, i64>(&sql)
-            .bind(user_id)
-            .bind(user_id);
+        let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(user_id);
         if let Some(project_id) = project_id {
             query = query.bind(project_id);
         }
@@ -195,10 +191,9 @@ impl NotificationRepo for SqliteDb {
     async fn mark_read_for_user(&self, id: &str, user_id: &str) -> Result<Notification> {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE notification SET read = 1 WHERE id = ? AND EXISTS (SELECT 1 FROM project p WHERE p.id = notification.project_id AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (SELECT 1 FROM project_member pm WHERE pm.project_id = p.id AND pm.user_id = ?)))",
+            "UPDATE notification SET read = 1 WHERE id = ? AND EXISTS (SELECT 1 FROM project p WHERE p.id = notification.project_id AND (p.owner_id IS NULL OR EXISTS (SELECT 1 FROM project_member pm WHERE pm.project_id = p.id AND pm.user_id = ?)))",
         )
         .bind(id)
-        .bind(user_id)
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
@@ -243,9 +238,9 @@ impl NotificationRepo for SqliteDb {
             ""
         };
         let sql = format!(
-            "UPDATE notification SET read = 1 WHERE read = 0 AND EXISTS (SELECT 1 FROM project p WHERE p.id = notification.project_id AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (SELECT 1 FROM project_member pm WHERE pm.project_id = p.id AND pm.user_id = ?))){project_filter}"
+            "UPDATE notification SET read = 1 WHERE read = 0 AND EXISTS (SELECT 1 FROM project p WHERE p.id = notification.project_id AND (p.owner_id IS NULL OR EXISTS (SELECT 1 FROM project_member pm WHERE pm.project_id = p.id AND pm.user_id = ?))){project_filter}"
         );
-        let mut query = sqlx::query(&sql).bind(user_id).bind(user_id);
+        let mut query = sqlx::query(&sql).bind(user_id);
         if let Some(project_id) = project_id {
             query = query.bind(project_id);
         }
@@ -265,10 +260,9 @@ impl NotificationRepo for SqliteDb {
 
     async fn delete_for_user(&self, id: &str, user_id: &str) -> Result<()> {
         let result = sqlx::query(
-            "DELETE FROM notification WHERE id = ? AND EXISTS (SELECT 1 FROM project p WHERE p.id = notification.project_id AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (SELECT 1 FROM project_member pm WHERE pm.project_id = p.id AND pm.user_id = ?)))",
+            "DELETE FROM notification WHERE id = ? AND EXISTS (SELECT 1 FROM project p WHERE p.id = notification.project_id AND (p.owner_id IS NULL OR EXISTS (SELECT 1 FROM project_member pm WHERE pm.project_id = p.id AND pm.user_id = ?)))",
         )
         .bind(id)
-        .bind(user_id)
         .bind(user_id)
         .execute(&self.pool)
         .await?;

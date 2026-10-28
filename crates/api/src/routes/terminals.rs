@@ -179,9 +179,22 @@ async fn run_terminal_socket(
 ) {
     let mut terminal_rx = state.terminal_service.attach_client(&session_id).await;
     let (mut sink, mut stream) = socket.split();
+    let mut authority_check = tokio::time::interval(tokio::time::Duration::from_secs(5));
+    authority_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
+            _ = authority_check.tick() => {
+                let allowed = state
+                    .terminal_service
+                    .user_can_attach(&session_id, &user_id)
+                    .await
+                    .unwrap_or(false);
+                if !allowed {
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                }
+            }
             server_frame = terminal_rx.recv() => {
                 let Some(frame) = server_frame else {
                     break;

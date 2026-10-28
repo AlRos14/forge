@@ -108,9 +108,16 @@ pub async fn auth_middleware(
         // never accepted here or on any other route.
         if path == "/api/v1/events" {
             if let Some(ticket) = extract_query_parameter(req.uri(), "ticket") {
-                if let Some(user) = state.sse_tickets.consume(&ticket) {
-                    req.extensions_mut().insert(user);
-                    return next.run(req).await;
+                if let Some(ticket_user) = state.sse_tickets.consume(&ticket) {
+                    if let Ok(current) = state.auth_service.get_user(&ticket_user.user_id).await {
+                        req.extensions_mut()
+                            .insert(crate::routes::auth::AuthenticatedUser {
+                                user_id: current.id,
+                                email: current.email,
+                                is_admin: current.is_admin,
+                            });
+                        return next.run(req).await;
+                    }
                 }
             }
         }

@@ -37,6 +37,16 @@ async fn fixture_rows(pool: SqlitePool) -> (SqliteDb, String, String) {
     .await
     .expect("project");
     sqlx::query(
+        "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at)
+         VALUES ('member-media-owner', ?, 'user-media', 'owner', ?, ?)",
+    )
+    .bind(&project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("project owner membership");
+    sqlx::query(
         "INSERT INTO repo (id, project_id, name, remote_url, local_path, work_mode, default_branch, created_at, updated_at)
          VALUES ('repo-media', ?, 'Media Repo', '/tmp/media-repo', '/tmp/media-repo', 'direct_merge', 'main', ?, ?)",
     )

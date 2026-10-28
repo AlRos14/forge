@@ -360,6 +360,15 @@ async fn generic_api_derives_sender_authorizes_ids_and_hides_content_ref() {
     .await
     .expect("independent Project B");
     sqlx::query(
+        "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at)
+         VALUES ('pr4-api-member-b', 'pr4-api-project-b', 'pr4-api-user-b', 'owner', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(harness.state.db.pool())
+    .await
+    .expect("Project B owner membership");
+    sqlx::query(
         "INSERT INTO repo (
              id, project_id, name, remote_url, local_path, work_mode,
              default_branch, created_at, updated_at

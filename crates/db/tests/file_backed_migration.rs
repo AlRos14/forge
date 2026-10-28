@@ -2865,6 +2865,8 @@ async fn v135_repairs_canonical_owner_membership_and_preserves_ownerless_project
         ("p-wrong-role", Some("owner-a")),
         ("p-ownerless", None),
         ("p-extra-owner", Some("owner-a")),
+        ("p-dangling", Some("deleted-user")),
+        ("p-dangling-with-owner", Some("deleted-user")),
     ] {
         sqlx::query(
             "INSERT INTO project (id, name, settings, owner_id, created_at, updated_at) \
@@ -2885,6 +2887,12 @@ async fn v135_repairs_canonical_owner_membership_and_preserves_ownerless_project
         ("m-ownerless", "p-ownerless", "owner-b", "owner"),
         ("m-extra-a", "p-extra-owner", "owner-a", "member"),
         ("m-extra-b", "p-extra-owner", "owner-b", "owner"),
+        (
+            "m-dangling-owner",
+            "p-dangling-with-owner",
+            "owner-b",
+            "owner",
+        ),
     ] {
         sqlx::query(
             "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) \
@@ -2947,6 +2955,34 @@ async fn v135_repairs_canonical_owner_membership_and_preserves_ownerless_project
     .await
     .expect("canonical role loads");
     assert_eq!(canonical_role, "owner");
+
+    let dangling_owner: Option<String> =
+        sqlx::query_scalar("SELECT owner_id FROM project WHERE id = 'p-dangling'")
+            .fetch_one(&pool)
+            .await
+            .expect("dangling project loads");
+    assert_eq!(
+        dangling_owner.as_deref(),
+        Some("deleted-user"),
+        "V135 does not invent a user row or rewrite a dangling owner"
+    );
+    let dangling_members: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM project_member WHERE project_id = 'p-dangling'")
+            .fetch_one(&pool)
+            .await
+            .expect("dangling membership count loads");
+    assert_eq!(dangling_members, 0);
+
+    let transferred_owner: Option<String> =
+        sqlx::query_scalar("SELECT owner_id FROM project WHERE id = 'p-dangling-with-owner'")
+            .fetch_one(&pool)
+            .await
+            .expect("dangling-with-owner Project loads");
+    assert_eq!(
+        transferred_owner.as_deref(),
+        Some("owner-b"),
+        "V135 transfers a dangling owner to an existing owner membership"
+    );
 
     let _ = fs::remove_file(db_path);
 }

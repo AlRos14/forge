@@ -163,7 +163,8 @@ async fn project_member_repo_crud_uniqueness_and_role_update() {
     let db = &*harness.state.db;
 
     let now = now_rfc3339();
-    let project = ProjectRepo::create(
+    let member_id = new_uuid_v4();
+    let project = ProjectRepo::create_with_owner_membership(
         db,
         CreateProject {
             id: new_uuid_v4(),
@@ -174,26 +175,15 @@ async fn project_member_repo_crud_uniqueness_and_role_update() {
             created_at: now.clone(),
             updated_at: now.clone(),
         },
+        &member_id,
     )
     .await
     .unwrap();
 
-    let member_id = new_uuid_v4();
-
-    // Add member
-    let member = ProjectMemberRepo::add_member(
-        db,
-        CreateProjectMember {
-            id: member_id.clone(),
-            project_id: project.id.clone(),
-            user_id: "test-user-id".to_owned(),
-            role: "owner".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .unwrap();
+    let member = ProjectMemberRepo::get_member(db, &project.id, "test-user-id")
+        .await
+        .unwrap()
+        .expect("canonical owner membership exists");
     assert_eq!(member.role, "owner");
     assert_eq!(member.id, member_id);
 
@@ -639,10 +629,28 @@ async fn non_admin_cannot_pin_agent_to_daemon() {
     let harness = common::test_app(ws.path(), "agent-daemon-pin").await;
     let app = &harness.app;
 
-    let registration: api_types::DaemonRegisterResponse = common::json_request(
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*harness.state.db,
+        &db::User {
+            id: "non-admin-pin".to_owned(),
+            email: "non-admin-pin@example.com".to_owned(),
+            password_hash: "$2b$04$placeholder".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("non-admin user seeds");
+    let non_admin = common::test_jwt_for_user("non-admin-pin", "non-admin-pin@example.com", false);
+
+    let registration: api_types::DaemonRegisterResponse = common::json_request_with_bearer(
         app,
         Method::POST,
         "/api/v1/daemons/register",
+        &non_admin,
         json!({
             "machine_id": "agent-daemon-pin-machine",
             "hostname": "agent-daemon-pin-host",
@@ -658,7 +666,7 @@ async fn non_admin_cannot_pin_agent_to_daemon() {
         app,
         Method::POST,
         "/api/v1/agents",
-        &common::test_jwt(),
+        &non_admin,
         json!({
             "name": "pinned-by-non-admin",
             "executor_type": "shell",

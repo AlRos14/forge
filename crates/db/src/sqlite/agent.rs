@@ -609,12 +609,12 @@ impl SqliteDb {
              WHERE agent.visibility = 'global'
                 OR (agent.visibility = 'account'
                     AND agent.owner_id IS NOT NULL
-                    AND (agent.owner_id = p.owner_id
-                         OR EXISTS (
-                             SELECT 1 FROM project_member pm
-                             WHERE pm.project_id = p.id
-                               AND pm.user_id = agent.owner_id
-                         )))
+                    AND EXISTS (
+                        SELECT 1 FROM project_member pm
+                        WHERE pm.project_id = p.id
+                          AND pm.user_id = agent.owner_id
+                          AND pm.role IN ('owner', 'admin', 'member')
+                    ))
              ORDER BY agent.created_at ASC, agent.id ASC",
         )
         .bind(project_id)

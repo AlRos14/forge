@@ -175,6 +175,94 @@ async fn rest_owner_transfer_and_removal_preserve_one_canonical_owner() {
 }
 
 #[tokio::test]
+async fn admin_user_deletion_transfers_or_rejects_canonical_ownership() {
+    let workspace = common::TestDir::new("project-owner-admin-delete");
+    let harness = common::test_app(workspace.path(), "project-owner-admin-delete").await;
+    seed_user(&harness, "owner-a", "owner-a@example.com").await;
+    seed_user(&harness, "owner-b", "owner-b@example.com").await;
+    seed_user(&harness, "solo-owner", "solo-owner@example.com").await;
+    let now = db::now_rfc3339();
+
+    let shared = db::ProjectRepo::create_with_owner_membership(
+        &*harness.state.db,
+        db::CreateProject {
+            id: db::new_uuid_v4(),
+            name: "Shared owner".to_owned(),
+            settings: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some("owner-a".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        &db::new_uuid_v4(),
+    )
+    .await
+    .expect("shared project creates");
+    db::ProjectMemberRepo::add_member(
+        &*harness.state.db,
+        db::CreateProjectMember {
+            id: db::new_uuid_v4(),
+            project_id: shared.id.clone(),
+            user_id: "owner-b".to_owned(),
+            role: "owner".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("second owner creates");
+
+    let solo = db::ProjectRepo::create_with_owner_membership(
+        &*harness.state.db,
+        db::CreateProject {
+            id: db::new_uuid_v4(),
+            name: "Solo owner".to_owned(),
+            settings: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some("solo-owner".to_owned()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        &db::new_uuid_v4(),
+    )
+    .await
+    .expect("solo project creates");
+
+    let admin = common::test_jwt();
+    let transferred = request(
+        &harness,
+        Method::DELETE,
+        "/api/v1/admin/users/owner-a",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(transferred.status(), StatusCode::NO_CONTENT);
+    let owner: Option<String> = sqlx::query_scalar("SELECT owner_id FROM project WHERE id = ?")
+        .bind(&shared.id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .expect("shared owner loads");
+    assert_eq!(owner.as_deref(), Some("owner-b"));
+
+    let rejected = request(
+        &harness,
+        Method::DELETE,
+        "/api/v1/admin/users/solo-owner",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    let owner: Option<String> = sqlx::query_scalar("SELECT owner_id FROM project WHERE id = ?")
+        .bind(&solo.id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .expect("solo owner loads");
+    assert_eq!(owner.as_deref(), Some("solo-owner"));
+}
+
+#[tokio::test]
 async fn ownerless_historical_project_is_never_claimed_automatically() {
     let workspace = common::TestDir::new("project-ownerless");
     let harness = common::test_app(workspace.path(), "project-ownerless").await;

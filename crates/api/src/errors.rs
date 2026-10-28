@@ -460,6 +460,17 @@ impl From<DbError> for ApiError {
                     .to_owned(),
                 details: None,
             },
+            DbError::ProjectOwnerRequired { project_id } => Self::conflict_with_code(
+                "last_project_owner",
+                format!("account deletion would leave Project {project_id} without another owner"),
+            ),
+            DbError::LastAdmin => {
+                Self::conflict_with_code("last_admin", "Cannot remove the last administrator")
+            }
+            DbError::ProjectAdminRequired => Self::forbidden_with_code(
+                "project_admin_required",
+                "Project owner or admin role is required",
+            ),
             DbError::VersionConflict => Self {
                 status: StatusCode::CONFLICT,
                 code: "version_conflict",

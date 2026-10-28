@@ -347,6 +347,16 @@ async fn seed_authentic_v120_release_history(pool: &sqlx::SqlitePool) -> Vec<Pro
     .execute(pool)
     .await
     .expect("V120 Project owned by test principal");
+    sqlx::query(
+        "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at)
+         VALUES ('v120-history-owner-membership', ?, 'test-user-id', 'owner', ?, ?)",
+    )
+    .bind(PROJECT)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(pool)
+    .await
+    .expect("V120 Project owner membership");
 
     for trigger in [
         "pr11_retired_insert_project_charter",

@@ -32,6 +32,12 @@ struct Claims {
     email: String,
     iat: u64,
     exp: u64,
+    #[serde(default)]
+    token_use: Option<String>,
+    #[serde(default)]
+    aud: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 impl AuthService {
@@ -266,6 +272,17 @@ impl AuthService {
             _ => "invalid_token".to_string(),
         })?;
 
+        // OAuth MCP access tokens share this signing key and claim shape. They
+        // carry token_use=mcp and an audience/scope and are not general REST
+        // access tokens. Missing token_use is accepted only for pre-upgrade
+        // access tokens, which expire within 15 minutes.
+        if token_data.claims.token_use.as_deref() == Some("mcp")
+            || token_data.claims.aud.is_some()
+            || token_data.claims.scope.is_some()
+        {
+            return Err("invalid_token".to_string());
+        }
+
         let user = UserRepo::get_user_by_id(&*self.db, &token_data.claims.sub)
             .await
             .map_err(|_| "invalid_token".to_string())?
@@ -374,42 +391,9 @@ impl AuthService {
         .execute(&mut *tx)
         .await?;
 
-        let orphaned_projects: Vec<(String,)> =
-            sqlx::query_as("SELECT id FROM project WHERE owner_id IS NULL")
-                .fetch_all(&mut *tx)
-                .await?;
-
+        // Ownerless Projects retain their explicit ownerless contract. Bootstrap
+        // does not appropriate historical Projects for the first account.
         let now = now_rfc3339();
-        for (project_id,) in &orphaned_projects {
-            sqlx::query("UPDATE project SET owner_id = ? WHERE id = ? AND owner_id IS NULL")
-                .bind(user_id)
-                .bind(project_id)
-                .execute(&mut *tx)
-                .await?;
-
-            let member_exists: bool = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM project_member WHERE project_id = ? AND user_id = ?",
-            )
-            .bind(project_id)
-            .bind(user_id)
-            .fetch_one(&mut *tx)
-            .await?
-                > 0;
-
-            if !member_exists {
-                sqlx::query(
-                    "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) \
-                     VALUES (?, ?, ?, 'owner', ?, ?)",
-                )
-                .bind(new_uuid_v4())
-                .bind(project_id)
-                .bind(user_id)
-                .bind(&now)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await?;
-            }
-        }
 
         sqlx::query(
             "INSERT INTO system_setting (key, value, updated_at) VALUES ('bootstrap_completed', 'true', ?) \
@@ -446,6 +430,9 @@ impl AuthService {
             email: user.email.clone(),
             iat: now,
             exp: now + ACCESS_TOKEN_EXPIRY_SECS,
+            token_use: Some("access".to_owned()),
+            aud: None,
+            scope: None,
         };
 
         let header = Header::new(Algorithm::HS256);
@@ -746,6 +733,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_token_rejects_oauth_mcp_tokens() {
+        let svc = test_service().await;
+        let user = svc
+            .register("mcp@test.com", "password123", None)
+            .await
+            .expect("register");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token = svc
+            .issue_mcp_token(McpAccessTokenClaims {
+                sub: user.id,
+                email: user.email,
+                iat: now,
+                exp: now + 900,
+                aud: "http://127.0.0.1:8080/mcp".to_owned(),
+                scope: "mcp".to_owned(),
+                client_id: "client".to_owned(),
+                token_use: "mcp".to_owned(),
+            })
+            .expect("mint MCP token");
+
+        assert_eq!(svc.verify_token(&token).await.unwrap_err(), "invalid_token");
+        assert!(svc.verify_mcp_token(&token).is_ok());
+    }
+
+    #[tokio::test]
     async fn verify_token_rejects_deleted_user() {
         let svc = test_service().await;
         let user = svc
@@ -832,7 +847,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_claims_agents_and_projects_but_preserves_orphan_daemons() {
+    async fn bootstrap_claims_agents_but_preserves_ownerless_projects_and_daemons() {
         let svc = test_service().await;
         let db = &svc.db;
         let now = now_rfc3339();
@@ -879,16 +894,17 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(project_owner, Some(user.id.clone()));
+        assert_eq!(
+            project_owner, None,
+            "bootstrap must not appropriate a historical ownerless Project"
+        );
 
-        let member_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM project_member WHERE project_id = 'p1' AND user_id = ?",
-        )
-        .bind(&user.id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(member_count, 1);
+        let member_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM project_member WHERE project_id = 'p1'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(member_count, 0);
     }
 
     #[tokio::test]

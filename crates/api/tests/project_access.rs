@@ -7,7 +7,7 @@ use axum::{http::Method, http::StatusCode};
 use serde_json::json;
 
 #[tokio::test]
-async fn project_owner_can_list_and_get_without_membership_row() {
+async fn project_owner_visibility_requires_the_canonical_membership_row() {
     let workspace = common::TestDir::new("project-owner-visibility");
     let harness = common::test_app(workspace.path(), "project-owner-visibility").await;
     let token = common::test_jwt();
@@ -21,23 +21,31 @@ async fn project_owner_can_list_and_get_without_membership_row() {
     )
     .await;
 
-    // Direct/API creation labels the owner on the Project itself; membership
-    // is not the authority source and may be absent on a legacy row.
+    let owner_row: (String, String) =
+        sqlx::query_as("SELECT user_id, role FROM project_member WHERE project_id = ?")
+            .bind(&project.id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("Project creation writes the canonical owner membership");
+    assert_eq!(owner_row, ("test-user-id".to_owned(), "owner".to_owned()));
+
+    // Simulate a legacy/corrupt row that violates INV-040. Authorization fails
+    // closed until the forward migration or an explicit repair restores it.
     sqlx::query("DELETE FROM project_member WHERE project_id = ?")
         .bind(&project.id)
         .execute(harness.state.db.pool())
         .await
         .expect("remove owner membership row");
 
-    let fetched: ProjectResponse = common::empty_request_with_bearer(
+    let missing: serde_json::Value = common::empty_request_with_bearer(
         &harness.app,
         Method::GET,
         &format!("/api/v1/projects/{}", project.id),
         &token,
-        StatusCode::OK,
+        StatusCode::NOT_FOUND,
     )
     .await;
-    assert_eq!(fetched.id, project.id);
+    assert_eq!(missing["code"], "not_found");
 
     let listed: PaginatedResponse<ProjectResponse> = common::empty_request_with_bearer(
         &harness.app,
@@ -47,5 +55,5 @@ async fn project_owner_can_list_and_get_without_membership_row() {
         StatusCode::OK,
     )
     .await;
-    assert!(listed.items.iter().any(|item| item.id == project.id));
+    assert!(!listed.items.iter().any(|item| item.id == project.id));
 }

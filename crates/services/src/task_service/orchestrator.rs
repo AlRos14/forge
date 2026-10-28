@@ -2,8 +2,8 @@ use super::*;
 use crate::orchestrator_runtime::TaskRoleOrchestratorPolicy;
 use db::{
     ActorKind, ActorRef, CreateDomainEvent, CreateExecution, DomainEventRepo, OrchestratorWake,
-    OrchestratorWakeExecution, OrchestratorWakeRepo, ProjectRepo, RoleMembershipRepo,
-    RoleMembershipStatus, TaskRoleRepo,
+    OrchestratorWakeExecution, OrchestratorWakeRepo, ProjectMemberRepo, ProjectRepo,
+    RoleMembershipRepo, RoleMembershipStatus, TaskRoleRepo,
 };
 
 impl TaskService {
@@ -51,7 +51,7 @@ impl TaskService {
         let agent = AgentRepo::get_by_id(&*self.db, &wake.actor_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", wake.actor_id.clone()))?;
-        ensure_orchestrator_agent_project_authority(&project, &agent)?;
+        ensure_orchestrator_agent_project_authority(&self.db, &project, &agent).await?;
         let role = TaskRoleRepo::get_by_id(&*self.db, &wake.task_role_id)
             .await?
             .ok_or_else(|| ServiceError::invalid_operation("orchestrator TaskRole is missing"))?;
@@ -146,7 +146,7 @@ impl TaskService {
         let agent = AgentRepo::get_by_id(&*self.db, &wake.actor_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", wake.actor_id.clone()))?;
-        ensure_orchestrator_agent_project_authority(&project, &agent)?;
+        ensure_orchestrator_agent_project_authority(&self.db, &project, &agent).await?;
         // The current safe automatic profile is a Codex CLI with an explicit
         // read-only sandbox. Other adapters stay durable and fail closed until
         // they expose an equally strong, verified sandbox capability.
@@ -304,15 +304,25 @@ impl TaskService {
 /// Global Agent visibility supports discovery. Automatic orchestration may use
 /// the Agent's daemon only within the account that owns the Task's Project.
 /// Cross-account grants are not currently modeled, so this boundary fails closed.
-fn ensure_orchestrator_agent_project_authority(
+async fn ensure_orchestrator_agent_project_authority(
+    db: &db::SqliteDb,
     project: &db::Project,
     agent: &db::Agent,
 ) -> Result<()> {
-    if project.owner_id.is_some() && project.owner_id == agent.owner_id {
-        return Ok(());
+    if let (Some(project_owner), Some(agent_owner)) =
+        (project.owner_id.as_deref(), agent.owner_id.as_deref())
+    {
+        if project_owner == agent_owner {
+            let membership = ProjectMemberRepo::get_member(db, &project.id, agent_owner)
+                .await?
+                .is_some_and(|member| matches!(member.role.as_str(), "owner" | "admin" | "member"));
+            if membership {
+                return Ok(());
+            }
+        }
     }
     Err(ServiceError::AuthorizationDenied {
-        message: "automatic orchestrator Agent must belong to the Task Project account; global visibility does not grant cross-account execution".to_owned(),
+        message: "automatic orchestrator Agent must belong to a current Task Project member account; global visibility does not grant cross-account execution".to_owned(),
     })
 }
 

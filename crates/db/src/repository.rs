@@ -1308,6 +1308,7 @@ pub trait ProjectRepo: Send + Sync {
         input: UpdateProject,
         expected_version: i64,
         project_hooks_json: Option<String>,
+        caller_user_id: Option<&str>,
     ) -> Result<Project>;
     async fn set_project_hooks_json(
         &self,
@@ -1321,8 +1322,15 @@ pub trait ProjectRepo: Send + Sync {
         project_id: &str,
         by: i64,
     ) -> Result<i64>;
-    async fn set_paused_at(&self, id: &str, paused_at: Option<String>) -> Result<()>;
-    async fn delete(&self, id: &str) -> Result<()>;
+    async fn set_paused_at(
+        &self,
+        id: &str,
+        paused_at: Option<String>,
+        caller_user_id: Option<&str>,
+    ) -> Result<()>;
+    /// Deletes a Project. When `caller_user_id` is provided, the exact
+    /// owner/admin membership is rechecked inside the deletion transaction.
+    async fn delete(&self, id: &str, caller_user_id: Option<&str>) -> Result<()>;
 }
 
 #[async_trait]
@@ -2234,6 +2242,8 @@ pub trait UserRepo: Send + Sync {
     async fn search_users(&self, query: &str, limit: i64) -> Result<Vec<User>>;
     async fn list_users(&self, page: PageRequest) -> Result<Page<User>>;
     async fn set_admin(&self, id: &str, is_admin: bool) -> Result<()>;
+    /// Demotes an administrator only while another administrator remains.
+    async fn set_admin_checked(&self, id: &str, is_admin: bool) -> Result<()>;
     async fn update_profile(
         &self,
         id: &str,
@@ -2243,6 +2253,9 @@ pub trait UserRepo: Send + Sync {
     ) -> Result<()>;
     async fn count_admins(&self) -> Result<i64>;
     async fn delete_user(&self, id: &str) -> Result<bool>;
+    /// Deletes a user unless they are the last administrator or the sole owner
+    /// of a Project without another owner.
+    async fn delete_user_checked(&self, id: &str) -> Result<bool>;
 }
 
 #[async_trait]

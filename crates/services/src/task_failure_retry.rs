@@ -2039,7 +2039,7 @@ mod tests {
         .expect("one exact override");
         assert_eq!(override_count, 1);
 
-        ProjectRepo::delete(&*db, &project_id)
+        ProjectRepo::delete(&*db, &project_id, None)
             .await
             .expect("guarded project teardown removes override rows before their immutable facts");
         let remaining_overrides: i64 =

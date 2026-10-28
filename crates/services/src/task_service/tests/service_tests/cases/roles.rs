@@ -233,6 +233,7 @@ async fn authoritative_memberships_preserve_multi_actor_cross_role_and_human_par
         .execute(db.pool())
         .await
         .expect("project owner updates");
+    add_project_member(&db, &project_id, &human_id, "owner").await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Ready).await;
 
     for role in ["planner", "orchestrator", "reviewer"] {
@@ -882,6 +883,7 @@ async fn agent_validation_requires_project_scope_but_not_runtime_status() {
         .execute(db.pool())
         .await
         .expect("project owner updates");
+    add_project_member(&db, &project_id, &project_owner, "owner").await;
     ProjectMemberRepo::add_member(
         &*db,
         CreateProjectMember {
@@ -1001,6 +1003,7 @@ async fn invalid_actor_cannot_join_a_target_task_role() {
         .execute(db.pool())
         .await
         .expect("project owner updates");
+    add_project_member(&db, &project_id, &project_owner, "owner").await;
     let invalid_agent = seed_agent(&db).await;
     sqlx::query(
         "UPDATE agent_identity

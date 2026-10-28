@@ -8601,7 +8601,7 @@ async fn follow_up_retry_replays_exact_child_and_new_key_authorizes_next_child()
     .await
     .expect("follow-up receipt count loads");
     assert_eq!(receipt_count, 2);
-    db::ProjectRepo::delete(&*fixture.db, &fixture.task.project_id)
+    db::ProjectRepo::delete(&*fixture.db, &fixture.task.project_id, None)
         .await
         .expect("guarded Project teardown removes immutable follow-up receipts");
     let teardown_receipts: i64 = sqlx::query_scalar(

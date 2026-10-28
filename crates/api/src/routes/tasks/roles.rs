@@ -120,7 +120,7 @@ async fn validate_actor_request(
             let project = ProjectRepo::get_by_id(db, project_id)
                 .await?
                 .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-            if project.owner_id.as_deref() != Some(user_id)
+            if project.owner_id.is_some()
                 && db::ProjectMemberRepo::get_member(db, project_id, user_id)
                     .await?
                     .is_none()

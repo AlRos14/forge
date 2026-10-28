@@ -27,8 +27,9 @@ pub async fn get_mcp_config(
 ) -> ApiResult<Json<McpConfigResponse>> {
     let agent = parse_agent(&params.agent)?;
     let scope = parse_scope(params.scope.as_deref())?;
+    require_mcp_scope_admin(&scope, &user)?;
     if let Some(project_id) = params.project_id.as_deref() {
-        crate::routes::projects::require_project_visible(&state, project_id, &user.user_id).await?;
+        crate::routes::projects::require_project_admin(&state, project_id, &user.user_id).await?;
     }
     let config_path =
         resolve_config_path(&state, &agent, &scope, params.project_id.as_deref()).await?;
@@ -45,9 +46,11 @@ pub async fn get_mcp_config(
             forge_url(&config)
         }
     };
+    let installed = mcp_url_is_usable(url.as_deref(), &expected_url);
+    let url = url.as_deref().map(redact_mcp_url);
 
     Ok(Json(McpConfigResponse {
-        installed: mcp_url_is_usable(url.as_deref(), &expected_url),
+        installed,
         url,
         expected_url,
         config_path: config_path.to_string_lossy().into_owned(),
@@ -63,6 +66,7 @@ pub async fn update_mcp_config(
     let agent = parse_agent(&body.agent)?;
     let scope = parse_scope(body.scope.as_deref())?;
     let action = parse_action(&body.action)?;
+    require_mcp_scope_admin(&scope, &user)?;
     if let Some(project_id) = body.project_id.as_deref() {
         crate::routes::projects::require_project_admin(&state, project_id, &user.user_id).await?;
     }
@@ -112,13 +116,26 @@ pub async fn update_mcp_config(
         }
     };
 
+    let installed = mcp_url_is_usable(url.as_deref(), &expected_url);
+    let url = url.as_deref().map(redact_mcp_url);
+
     Ok(Json(McpConfigResponse {
-        installed: mcp_url_is_usable(url.as_deref(), &expected_url),
+        installed,
         url,
         expected_url,
         config_path: config_path.to_string_lossy().into_owned(),
         agents: supported_agents(),
     }))
+}
+
+fn require_mcp_scope_admin(scope: &McpScope, user: &AuthenticatedUser) -> ApiResult<()> {
+    if !matches!(scope, McpScope::Project) && !user.is_admin {
+        return Err(ApiError::forbidden_with_code(
+            "admin_required",
+            "server-global MCP configuration requires administrator access",
+        ));
+    }
+    Ok(())
 }
 
 fn mcp_url_for_scope_from_request(
@@ -205,18 +222,23 @@ fn mcp_url_is_usable(url: Option<&str>, expected_url: &str) -> bool {
     let Some(url) = url else {
         return false;
     };
-    if url == expected_url {
-        return true;
+    if mcp_url_has_credentials(url) {
+        // A legacy tokenized URL is installed but no longer authenticates.
+        return false;
     }
-    // A legacy `?token=` URL is installed but no longer authenticates. Report it
-    // as not usable so the UI prompts a reinstall with OAuth or a Bearer header.
-    mcp_url_token(url).is_none() && mcp_url_matches_expected_scope(url, expected_url)
+    mcp_url_matches_expected_scope(url, expected_url)
 }
 
 fn mcp_url_matches_expected_scope(url: &str, expected_url: &str) -> bool {
     let (Ok(url), Ok(expected_url)) = (url::Url::parse(url), url::Url::parse(expected_url)) else {
         return false;
     };
+    if url.origin() != expected_url.origin()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
 
     url.path() == expected_url.path()
         && query_param(&url, "project_id") == query_param(&expected_url, "project_id")
@@ -228,12 +250,51 @@ fn query_param(url: &url::Url, name: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
-fn mcp_url_token(url: &str) -> Option<String> {
-    url::Url::parse(url)
-        .ok()?
+fn is_credential_query_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "token"
+            | "access_token"
+            | "api_key"
+            | "apikey"
+            | "authorization"
+            | "auth"
+            | "secret"
+            | "key"
+            | "password"
+    )
+}
+
+fn mcp_url_has_credentials(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return true;
+    };
+    !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed
+            .query_pairs()
+            .any(|(key, value)| is_credential_query_key(&key) && !value.trim().is_empty())
+}
+
+fn redact_mcp_url(url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return String::new();
+    };
+    let safe_pairs = parsed
         .query_pairs()
-        .find(|(key, value)| key == "token" && !value.trim().is_empty())
-        .map(|(_, value)| value.into_owned())
+        .filter(|(key, _)| !is_credential_query_key(key))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    parsed.set_query(None);
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    if !safe_pairs.is_empty() {
+        let mut query = parsed.query_pairs_mut();
+        for (key, value) in safe_pairs {
+            query.append_pair(&key, &value);
+        }
+    }
+    parsed.to_string()
 }
 
 fn parse_agent(value: &str) -> ApiResult<McpAgent> {
@@ -328,7 +389,20 @@ fn resolve_config_path_from(
     }
 }
 
+async fn reject_symlink(path: &Path) -> ApiResult<()> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(ApiError::forbidden_with_code(
+            "config_path_symlink",
+            "MCP configuration path must not be a symlink",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn read_config(path: &Path) -> ApiResult<Value> {
+    reject_symlink(path).await?;
     match fs::read_to_string(path).await {
         Ok(contents) => Ok(serde_json::from_str(&contents)?),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Map::new())),
@@ -337,6 +411,7 @@ async fn read_config(path: &Path) -> ApiResult<Value> {
 }
 
 async fn write_config(path: &Path, value: &Value) -> ApiResult<()> {
+    reject_symlink(path).await?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -391,6 +466,7 @@ fn forge_url(config: &Value) -> Option<String> {
 }
 
 async fn read_codex_config(path: &Path) -> ApiResult<String> {
+    reject_symlink(path).await?;
     match fs::read_to_string(path).await {
         Ok(contents) => Ok(contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
@@ -421,6 +497,7 @@ async fn update_codex_config(
 
 async fn write_codex_config_if_changed(path: &Path, previous: &str, next: String) -> ApiResult<()> {
     if next != previous {
+        reject_symlink(path).await?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -833,8 +910,32 @@ command = "other"
             !response.installed,
             "a query-token URL no longer authenticates and must be reinstalled"
         );
-        assert_eq!(response.url.as_deref(), Some(installed_url.as_str()));
+        assert_eq!(response.url.as_deref(), Some(expected_url.as_str()));
+        assert!(!response.url.as_deref().unwrap().contains("token="));
         let _ = std::fs::remove_dir_all(repo_dir);
+    }
+
+    #[test]
+    fn mcp_redaction_removes_credentials_and_foreign_origins_are_not_usable() {
+        let expected = "http://127.0.0.1:8080/mcp?project_id=project-1";
+        assert!(!mcp_url_is_usable(
+            Some("https://attacker.example/mcp?project_id=project-1"),
+            expected
+        ));
+        assert!(!mcp_url_is_usable(
+            Some("http://127.0.0.1:8080/mcp?project_id=project-1&access_token=secret"),
+            expected
+        ));
+        assert!(!mcp_url_is_usable(
+            Some("http://127.0.0.1:8080/mcp?project_id=project-1&token=fg_secret"),
+            expected
+        ));
+        assert_eq!(
+            redact_mcp_url(
+                "http://127.0.0.1:8080/mcp?project_id=project-1&token=fg_secret&access_token=x"
+            ),
+            expected
+        );
     }
 
     #[tokio::test]
@@ -1045,8 +1146,20 @@ command = "other"
         AuthenticatedUser {
             user_id: "test-user-id".to_owned(),
             email: "test@example.com".to_owned(),
-            is_admin: false,
+            is_admin: true,
         }
+    }
+
+    #[test]
+    fn server_global_mcp_scope_requires_admin() {
+        let non_admin = AuthenticatedUser {
+            user_id: "user".to_owned(),
+            email: "user@example.com".to_owned(),
+            is_admin: false,
+        };
+        assert!(require_mcp_scope_admin(&McpScope::Project, &non_admin).is_ok());
+        assert!(require_mcp_scope_admin(&McpScope::User, &non_admin).is_err());
+        assert!(require_mcp_scope_admin(&McpScope::Local, &non_admin).is_err());
     }
 
     struct EnvVarGuard {

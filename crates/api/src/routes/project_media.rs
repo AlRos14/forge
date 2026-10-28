@@ -526,22 +526,17 @@ async fn require_project_access(
     let project = ProjectRepo::get_by_id(&*state.db, project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    let membership_exists = match project.owner_id.as_deref() {
-        Some(owner_id) if owner_id != user_id => {
-            ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-                .await?
-                .is_some()
-        }
-        _ => false,
-    };
-    if !project_access_allowed(project.owner_id.as_deref(), user_id, membership_exists) {
+    let membership_exists = ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
+        .await?
+        .is_some();
+    if !project_access_allowed(project.owner_id.is_none(), membership_exists) {
         return Err(ApiError::not_found("project", project_id.to_owned()));
     }
     Ok(())
 }
 
-fn project_access_allowed(owner_id: Option<&str>, user_id: &str, membership_exists: bool) -> bool {
-    owner_id.is_none() || owner_id == Some(user_id) || membership_exists
+fn project_access_allowed(ownerless: bool, membership_exists: bool) -> bool {
+    ownerless || membership_exists
 }
 
 async fn require_project_media_admin(
@@ -549,12 +544,9 @@ async fn require_project_media_admin(
     project_id: &str,
     user_id: &str,
 ) -> ApiResult<()> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
+    let _project = ProjectRepo::get_by_id(&*state.db, project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.as_deref() == Some(user_id) {
-        return Ok(());
-    }
     let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
@@ -1008,10 +1000,9 @@ mod tests {
     }
 
     #[test]
-    fn project_owner_access_does_not_require_membership_row() {
-        assert!(project_access_allowed(Some("owner"), "owner", false));
-        assert!(!project_access_allowed(Some("owner"), "other", false));
-        assert!(project_access_allowed(Some("owner"), "member", true));
-        assert!(project_access_allowed(None, "any-user", false));
+    fn project_access_requires_membership_except_for_ownerless_projects() {
+        assert!(!project_access_allowed(false, false));
+        assert!(project_access_allowed(false, true));
+        assert!(project_access_allowed(true, false));
     }
 }

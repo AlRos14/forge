@@ -180,7 +180,11 @@ async fn admin_can_upsert_and_delete_setting_but_not_protected_setting() {
 
 async fn test_harness(prefix: &str) -> common::Harness {
     let workspace_root = common::TestDir::new(&format!("{prefix}-ws"));
-    common::test_app(workspace_root.path(), prefix).await
+    let harness = common::test_app(workspace_root.path(), prefix).await;
+    db::UserRepo::set_admin(&*harness.state.db, TEST_USER_ID, false)
+        .await
+        .expect("test user starts non-admin");
+    harness
 }
 
 async fn admin_harness(prefix: &str) -> common::Harness {

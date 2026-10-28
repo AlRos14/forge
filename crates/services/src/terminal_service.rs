@@ -23,11 +23,11 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use config::TerminalConfig;
 use db::{
-    new_uuid_v4, now_rfc3339, AgentRepo, CreateTerminalSession, ExecutionRepo, SqliteDb, Task,
-    TaskLifecycleRepo, TaskLifecycleState, TaskRepo, TerminalSession, TerminalSessionRepo,
-    TerminalSessionStatus as DbTerminalSessionStatus, UpdateTerminalSessionStatus,
-    WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceScopeKind,
-    WorkspaceStatus,
+    new_uuid_v4, now_rfc3339, AgentRepo, CreateTerminalSession, ExecutionRepo, ProjectRepo,
+    SqliteDb, Task, TaskLifecycleRepo, TaskLifecycleState, TaskRepo, TerminalSession,
+    TerminalSessionRepo, TerminalSessionStatus as DbTerminalSessionStatus,
+    UpdateTerminalSessionStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo,
+    WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -475,12 +475,35 @@ impl TerminalService {
         };
 
         let session = self.load_session(&record_session_id).await?;
-        if session.task_id != record_task_id {
+        if session.task_id != record_task_id
+            || !self.user_can_attach(&record_session_id, &user_id).await?
+        {
             return Err(ServiceError::TerminalAttachTokenInvalid);
         }
         self.publish_session_changed(&session, "attached", None);
 
         Ok(user_id)
+    }
+
+    pub async fn user_can_attach(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<bool, ServiceError> {
+        if db::UserRepo::get_user_by_id(&*self.db, user_id)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let session = self.load_session(session_id).await?;
+        let Some(task) = TaskRepo::get_by_id(&*self.db, &session.task_id, false).await? else {
+            return Ok(false);
+        };
+        let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
+            return Ok(false);
+        };
+        Ok(crate::project_authority::user_can_write_project(&self.db, &project, user_id).await?)
     }
 
     pub async fn resize_session(

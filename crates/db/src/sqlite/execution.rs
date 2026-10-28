@@ -463,6 +463,12 @@ impl ExecutionRepo for SqliteDb {
                   )
                   AND current_project.owner_id IS NOT NULL
                   AND current_project.owner_id = current_agent.owner_id
+                  AND EXISTS (
+                      SELECT 1 FROM project_member pm
+                      WHERE pm.project_id = current_project.id
+                        AND pm.user_id = current_agent.owner_id
+                        AND pm.role IN ('owner', 'admin', 'member')
+                  )
                   AND w.state = 'leased' AND w.lease_owner = ?
                   AND EXISTS (
                       SELECT 1 FROM role_membership rm
@@ -1042,6 +1048,12 @@ impl ExecutionRepo for SqliteDb {
                       AND current_task.deleted_at IS NULL
                       AND current_project.owner_id IS NOT NULL
                       AND current_project.owner_id = current_agent.owner_id
+                      AND EXISTS (
+                          SELECT 1 FROM project_member pm
+                          WHERE pm.project_id = current_project.id
+                            AND pm.user_id = current_agent.owner_id
+                            AND pm.role IN ('owner', 'admin', 'member')
+                      )
                       AND current_agent.paused = 0
                       AND wake.actor_kind = ?
                       AND wake.actor_id = ?

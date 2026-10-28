@@ -169,6 +169,19 @@ async fn create_foreign_project(f: &Fixture) -> ForeignProjectFixture {
     .execute(f.db.pool())
     .await
     .expect("independent Project B");
+    ProjectMemberRepo::add_member(
+        &*f.db,
+        CreateProjectMember {
+            id: new_uuid_v4(),
+            project_id: project_id.clone(),
+            user_id: user_id.clone(),
+            role: "owner".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project B owner membership");
     sqlx::query(
         "INSERT INTO repo (
              id, project_id, name, remote_url, local_path, work_mode,
@@ -847,7 +860,7 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
             ..
         }
     ));
-    ProjectRepo::delete(&*f.db, &foreign.project_id)
+    ProjectRepo::delete(&*f.db, &foreign.project_id, None)
         .await
         .expect("remove the independent Project fixture");
     let proposal_event: String = sqlx::query_scalar(
@@ -951,7 +964,7 @@ async fn generic_collaboration_is_scoped_immutable_evented_and_teardown_safe() {
         assert_eq!(count, 0, "PR13 removes legacy table {legacy_table}");
     }
 
-    ProjectRepo::delete(&*f.db, &f.project_id)
+    ProjectRepo::delete(&*f.db, &f.project_id, None)
         .await
         .expect("official Project teardown");
     for table in [
