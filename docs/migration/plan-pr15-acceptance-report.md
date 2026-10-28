@@ -1,5 +1,10 @@
 # PR15 acceptance report
 
+> **Historical acceptance evidence.** PR15 is merged. This report pins the tests
+> and CI evidence at the named SHAs; it is not a statement that later changes
+> have the same evidence. Post-V2 security and ownership evidence is recorded in
+> the current pull request.
+
 **Implementation/evidence SHA:** `d3bbb1352df4e341e6ee1751937335687341e422` (S02/S09 test and documentation change set).
 **Prior CI-tested implementation SHA:** `60120adc4341dac33d6ce3694643a0dad13c81ac`
 **Base:** `origin/main` at `ca9cbdd38c75a72dcf3a8348bf97ef30739c8d29`

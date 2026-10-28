@@ -1,5 +1,7 @@
 # Plan PR3 — Capability-Driven HarnessAdapter Exit Ledger
 
+> **Historical migration ledger.** This document records the state at its named baseline. PR0–PR15 are complete and merged; status statements such as "not merged" or "ready for review" describe the authoring moment. Current behavior is documented in [architecture.md](../architecture.md) and [concepts](../concepts/).
+
 ## Boundary and result
 
 Plan PR3 replaces the external harness protocol authority with the typed

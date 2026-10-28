@@ -1,5 +1,7 @@
 # Plan PR3 Static Preflight
 
+> **Historical migration ledger.** This document records the state at its named baseline. PR0–PR15 are complete and merged; status statements such as "not merged" or "ready for review" describe the authoring moment. Current behavior is documented in [architecture.md](../architecture.md) and [concepts](../concepts/).
+
 ## Audit baseline and limits
 
 The required source reader/writer audit was performed before source edits,

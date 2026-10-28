@@ -1,5 +1,7 @@
 # Plan PR10: remove embedded Agent Host cognition
 
+> **Historical migration ledger.** This document records the state at its named baseline. PR0–PR15 are complete and merged; status statements such as "not merged" or "ready for review" describe the authoring moment. Current behavior is documented in [architecture.md](../architecture.md) and [concepts](../concepts/).
+
 Status: complete. Base: `e8b21cf448ea4793b86dffe40722a269241528ba` (`origin/main`, PR9).
 
 ## Authority map at the verified base

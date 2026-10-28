@@ -1,5 +1,13 @@
 # Forge V2 — Autonomous Work Management
 
+> **Historical proposal.** This package is retained as planning evidence from
+> 2026-08-08. It is not the shipped Forge V2 contract. The current architecture
+> and invariants are in [../../architecture.md](../../architecture.md) and
+> [../../migration/architecture-v2.md](../../migration/architecture-v2.md).
+> References below to the workflow engine, a single owner agent, Project Agent,
+> Genesis, or Project OS describe proposals that were replaced or retired during
+> the PR0–PR15 migration.
+
 **Status:** Draft for implementation planning  
 **Date:** 2026-08-08  
 **Product:** Forge  

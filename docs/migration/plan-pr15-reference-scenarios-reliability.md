@@ -1,6 +1,10 @@
 # Plan PR15 — Reference scenarios and reliability
 
-**Status:** S02/S09 microplan changes are implemented and their focused local tests pass. Final GitHub Actions and CodeQL are tracked at [PR #19 checks](https://github.com/AlRos14/forge/pull/19/checks). PR #19 remains draft and unmerged.
+> **Historical implementation ledger.** PR #19 and the PR0–PR15 sequence are
+> merged. Check-status statements below describe the authoring-time draft.
+
+**Status:** Historical. S02/S09 microplan changes and their focused tests were
+recorded before merge; the named PR #19 check page is retained as provenance.
 **Branch:** `feat/plan-pr15-reference-scenarios-reliability`
 **Base:** `origin/main` at `ca9cbdd38c75a72dcf3a8348bf97ef30739c8d29`
 **PR14 provenance:** normal merge `ca9cbdd38c75a72dcf3a8348bf97ef30739c8d29`, parents `87c22862917a6059308cfb2a5dcb820cfcfb66ab` and approved PR14 HEAD `3e9e23de73cf12c60014237eb4f356ea3d3a1aa8`; PR #17 is merged.

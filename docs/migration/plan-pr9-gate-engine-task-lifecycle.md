@@ -1,5 +1,7 @@
 # Plan PR9: Gate Engine and aggregate Task lifecycle
 
+> **Historical migration ledger.** This document records the state at its named baseline. PR0–PR15 are complete and merged; status statements such as "not merged" or "ready for review" describe the authoring moment. Current behavior is documented in [architecture.md](../architecture.md) and [concepts](../concepts/).
+
 Status: **READY FOR REVIEW**. This iteration closes the one residual P2
 found after HEAD `9a2033d3730ef5d9bba256d0606b44178ff7544d`; PR9 is not merged. The
 merge-readiness decision is a deterministic evaluation of immutable exact

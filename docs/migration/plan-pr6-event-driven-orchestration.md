@@ -1,5 +1,7 @@
 # Plan PR6: Event-driven orchestrator role and policy
 
+> **Historical migration ledger.** This document records the state at its named baseline. PR0–PR15 are complete and merged; status statements such as "not merged" or "ready for review" describe the authoring moment. Current behavior is documented in [architecture.md](../architecture.md) and [concepts](../concepts/).
+
 Status: implementation ledger for `feat/plan-pr6-event-driven-orchestrator`.
 
 ## Baseline and scope

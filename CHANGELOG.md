@@ -10,11 +10,24 @@ PR14 audit on 2026-10-16.
 
 ### Security
 
+- Redact credential-like query parameters from MCP configuration responses, reject foreign-origin and tokenized installed URLs as unusable, reject symlinked configuration files, require Project admin for Project MCP config reads/writes, and require a server administrator for `user`/`local` MCP config scopes.
+- Reject reusable JWT, PAT, OAuth, and daemon credentials in `?token=` on REST, MCP, and daemon WebSocket routes. Bearer Authorization is the only reusable credential transport. The browser SSE endpoint now requires a 30-second, single-use ticket from `POST /api/v1/events/ticket`; terminal WebSocket attach tokens remain short-lived and single-use.
+- Resolve current durable account authority on every JWT, PAT, OAuth MCP, and refresh authentication path. Deleted users are rejected, and a degraded administrator loses `is_admin` immediately instead of retaining a frozen claim until token expiry. OAuth MCP access tokens are marked and rejected as general REST access tokens.
+- Run the container as unprivileged UID/GID `10001` and fail closed on unapproved root-owned `/data` volumes. Existing root-owned data requires an explicit one-time `FORGE_MIGRATE_ROOT_OWNED_DATA=1` migration; workspace mounts are never recursively rewritten.
+- Revalidate terminal WebSocket authority on attach and every five seconds so membership removal or account deletion ends shell access. Agent/orchestrator/Execution admission now requires the Agent owner's current Project membership instead of canonical owner equality alone.
 - Require authenticated account ownership for daemon registration and Agent routing. `global` daemon visibility no longer grants cross-account execution; ownerless historical daemons remain preserved and ineligible for ordinary accounts. The embedded host shell is restricted to an administrator's Agent and, when the daemon has a verified owner, to that same administrator account. This intentionally breaks implicit multi-account daemon sharing.
 - Require an automatic Orchestrator Agent and its Task Project to share the same owner account. `global` Agent visibility continues to support discovery and TaskRole membership without granting use of another account's Agent daemon; the check runs at Execution admission and again in the transactional Provider Start claim. Cross-account Agent execution grants are not implemented.
 
 ### Documentation
 
+- Removed the retired Main Agent, Project Agent, and Project OS skills from active
+  Codex discovery. Their history remains in Git.
+- Classified `docs/spec/` as historical planning evidence, repaired its index,
+  and marked retired or never-shipped proposals. Added a migration ledger index
+  and historical banners so authoring-time status text is not read as current
+  behavior.
+- Documented the container identity, root-owned volume migration, loopback
+  default, and public-exposure requirements in `docs/deployment.md`.
 - Rewrote the product entry points and current architecture, REST/MCP/SSE, CLI,
   execution-log, contributor, agent-guidance, and release documentation to
   describe the post-PR13 implementation. The Getting Started guide now builds
@@ -28,6 +41,20 @@ PR14 audit on 2026-10-16.
 
 ### Fixed
 
+- Serialize Project owner additions, removals, and role changes inside
+  `BEGIN IMMEDIATE` transactions. Caller, target, last-owner, and canonical
+  owner state are re-read after the writer lock, so concurrent owner removal
+  cannot leave a Project without a valid owner.
+- Make `Project.owner_id` and its exact role-`owner` membership one invariant.
+  New Projects create both atomically; removing or demoting the canonical owner
+  transfers canonical identity to another current owner or returns `409
+  last_owner`. Project reads, writes, and administration now require the exact
+  membership representation; `owner_id` no longer bypasses a missing row.
+  V135 repairs historical representation without assigning owners to ownerless
+  Projects, and first-user bootstrap no longer claims them.
+- Admin account deletion now transfers canonical Project ownership to another
+  current owner, or rejects with `last_project_owner`. Last-admin demotion and
+  deletion checks run inside the write transaction.
 - Restricted the inherited npm and Homebrew publication jobs to their upstream
   repository, so a tag in AlRos14/forge cannot publish to third-party registries.
 - Set a fixed loopback port for Makefile development to match the Vite proxy,
@@ -41,6 +68,9 @@ PR14 audit on 2026-10-16.
 
 ### Breaking
 
+- REST, MCP, daemon command WebSocket, and SSE clients can no longer authenticate with `?token=`. Use `Authorization: Bearer`; EventSource clients must request `POST /api/v1/events/ticket`. `forge-ctl mcp install` now writes a Bearer header instead of a tokenized URL, and legacy tokenized MCP configurations must be reinstalled. JWT payloads no longer carry `is_admin`; authorization reads the current user row.
+- The container process runs as `forge` UID/GID `10001`, and Compose publishes to `127.0.0.1` by default. Root-owned existing `/data` volumes require the documented one-time migration or a manual ownership fix.
+- Removing or demoting the canonical Project owner without another current owner returns `409 last_owner`. A canonical owner without its required membership fails closed until V135 or an explicit repair restores it.
 - `db::PendingProviderStartFailure::Resolved` and
   `db::RunningExecutionFailure::Failed` now hold `Box<Execution>` to reduce
   the size of these public enums. Consumers matching these variants must

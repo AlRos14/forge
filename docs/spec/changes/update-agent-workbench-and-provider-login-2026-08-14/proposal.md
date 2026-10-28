@@ -3,6 +3,12 @@ created_at: 2026-08-14T22:34:11Z
 updated_at: 2026-08-15T10:50:28Z
 ---
 
+> **Historical, partially retired proposal.** Project Agent workbenches and
+> Agent Chat were removed from current public surfaces. Current Agent, provider,
+> daemon, and credential settings are documented in
+> [../../../concepts/](../../../concepts/) and [../../../api.md](../../../api.md).
+> This file is retained as migration evidence.
+
 ## Why
 
 Forge already has one global Main Agent, one Project Agent per Project, durable chats, provider-backed identities, and protected credentials. The current web information architecture does not communicate that model cleanly:

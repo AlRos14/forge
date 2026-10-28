@@ -1,5 +1,12 @@
 # Prompt Design Report
 
+> **Historical analysis.** This report describes the retired workflow prompt
+> builder/dispatch architecture. Prompt builders, workflow dispatch, and the
+> named coder/reviewer/planner roles no longer define current Execution
+> contracts. Current cognition belongs to the harness; Forge records Executions,
+> Roles, Purposes, WorkUnits, and Artifacts. See
+> [architecture.md](architecture.md) and [concepts](concepts/).
+
 ## Executive Summary
 
 Forge 已经有 prompt 系统的骨架：workflow dispatch 里有 `PromptBuilder` registry，默认有 coder、reviewer、planner、generic builders；执行时会构造 `AgentPrompt { system, user, tools }`，再通过 CLI adapters 送给 Codex、Claude Code、Cursor、Gemini、opencode 等执行器。

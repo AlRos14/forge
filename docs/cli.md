@@ -59,6 +59,8 @@ Provider entries store a credential reference and metadata; secret values are no
 
 ## MCP client configuration
 
-`forge-ctl mcp install` writes the selected client's local configuration and points it at the Forge MCP endpoint. The supported client names are `claude`, `codex`, and `cursor`; scopes are `project`, `local`, and `user`. A token is required. A Project-scoped install can restrict tools to one Project.
+`forge-ctl mcp install` writes the selected client's local configuration and points it at the Forge MCP endpoint. The supported client names are `claude`, `codex`, and `cursor`; scopes are `project`, `local`, and `user`. A token is required. It is written as an `Authorization: Bearer ...` header (`headers` for Claude/Cursor JSON and `http_headers` for Codex TOML), never as a URL parameter. The configuration file therefore contains a secret: keep its normal file permissions and do not commit it. A Project-scoped install can restrict tools to one Project.
+
+MCP no longer accepts `?token=` credentials. Existing configurations that contain a tokenized URL must be reinstalled; the web MCP configuration view reports such a legacy URL as not usable. OAuth-capable clients can use the `/oauth` and `/.well-known` flows with a bare `/mcp` URL instead.
 
 The active tool names and schemas are exposed by MCP `tools/list`. REST and MCP use the same domain authority. Neither surface restores retired Main/Project Agent, Agent Chat, Project OS, or legacy WorkflowEngine operations.

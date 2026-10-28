@@ -1,5 +1,11 @@
 # Synapsis Memory Report
 
+> **Historical research note.** The scoped memory and Agent Chat systems
+> described here were retired by PR10–PR13. The current durable knowledge
+> surfaces are Artifacts, Evidence, execution history, and the collaboration
+> primitives documented in [concepts](concepts/). This is not a current feature
+> specification.
+
 ## Executive Summary
 
 TeamOlimpo 的 Synapsis 不是一个执行控制平面，也不是模型训练系统。它更像 agent-facing 的操作记忆层：把 session、observation、task、handoff、deliverable、knowledge chunk 和摘要统一存进 SQLite/FTS，然后通过 MCP 工具让 agent 主动检索、记录和交接。

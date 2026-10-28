@@ -1,5 +1,7 @@
 # PR13 — Destructive persistence cleanup ledger
 
+> **Historical migration ledger.** This document records the state at its named baseline. PR0–PR15 are complete and merged; status statements such as "not merged" or "ready for review" describe the authoring moment. Current behavior is documented in [architecture.md](../architecture.md) and [concepts](../concepts/).
+
 This document records the PR13 cutovers and their focused acceptance evidence.
 Architecture V2 remains the contract for the surrounding plan. PR13 does not
 change PR14 branding or introduce PR15 scenarios.
