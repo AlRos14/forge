@@ -1280,7 +1280,25 @@ pub trait TerminalSessionRepo: Send + Sync {
 #[async_trait]
 pub trait ProjectRepo: Send + Sync {
     async fn create(&self, input: CreateProject) -> Result<Project>;
+    /// Atomically creates a Project and its canonical owner membership.
+    async fn create_with_owner_membership(
+        &self,
+        input: CreateProject,
+        member_id: &str,
+    ) -> Result<Project>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Project>>;
+    async fn get_by_id_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &str,
+    ) -> Result<Option<Project>>;
+    async fn set_owner_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        owner_id: &str,
+        updated_at: &str,
+    ) -> Result<()>;
     async fn list(&self, page: PageRequest) -> Result<Page<Project>>;
     async fn list_visible_to_user(&self, user_id: &str, page: PageRequest)
         -> Result<Page<Project>>;
@@ -2304,10 +2322,34 @@ pub trait OAuthRefreshTokenRepo: Send + Sync {
 #[async_trait]
 pub trait ProjectMemberRepo: Send + Sync {
     async fn add_member(&self, input: CreateProjectMember) -> Result<ProjectMember>;
+    async fn add_member_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateProjectMember,
+    ) -> Result<ProjectMember>;
     async fn get_member(&self, project_id: &str, user_id: &str) -> Result<Option<ProjectMember>>;
+    async fn get_member_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ProjectMember>>;
     async fn list_members(&self, project_id: &str) -> Result<Vec<ProjectMember>>;
+    async fn list_members_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        project_id: &str,
+    ) -> Result<Vec<ProjectMember>>;
     async fn update_member_role(
         &self,
+        project_id: &str,
+        user_id: &str,
+        role: &str,
+        updated_at: &str,
+    ) -> Result<ProjectMember>;
+    async fn update_member_role_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
         project_id: &str,
         user_id: &str,
         role: &str,

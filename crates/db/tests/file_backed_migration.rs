@@ -2825,3 +2825,128 @@ async fn pr13_fresh_database_drops_legacy_storage_and_keeps_exact_builtin_skill_
         "migration archives the original built-in identities without synthesis"
     );
 }
+
+#[tokio::test]
+async fn v135_repairs_canonical_owner_membership_and_preserves_ownerless_projects() {
+    let baseline_dir = unique_temp_path("v135-owner-baseline");
+    fs::create_dir_all(&baseline_dir).expect("baseline migration dir creates");
+    copy_migrations_up_to(134, &baseline_dir);
+
+    let db_path = unique_temp_path("v135-owner").with_extension("db");
+    let url = format!("sqlite://{}", db_path.display());
+    let pool = create_sqlite_pool(&url).await.expect("pool creates");
+    run_migrations_from(&pool, &baseline_dir)
+        .await
+        .expect("V134 baseline applies");
+
+    let now = db::now_rfc3339();
+    for (id, email) in [
+        ("owner-a", "owner-a@example.com"),
+        ("owner-b", "owner-b@example.com"),
+    ] {
+        db::UserRepo::create_user(
+            &SqliteDb::new(pool.clone()),
+            &User {
+                id: id.to_owned(),
+                email: email.to_owned(),
+                password_hash: "pw".to_owned(),
+                display_name: None,
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("user inserts");
+    }
+
+    for (project_id, owner_id) in [
+        ("p-missing", Some("owner-a")),
+        ("p-wrong-role", Some("owner-a")),
+        ("p-ownerless", None),
+        ("p-extra-owner", Some("owner-a")),
+    ] {
+        sqlx::query(
+            "INSERT INTO project (id, name, settings, owner_id, created_at, updated_at) \
+             VALUES (?, ?, '{}', ?, ?, ?)",
+        )
+        .bind(project_id)
+        .bind(project_id)
+        .bind(owner_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("project inserts");
+    }
+
+    for (member_id, project_id, user_id, role) in [
+        ("m-wrong", "p-wrong-role", "owner-a", "member"),
+        ("m-ownerless", "p-ownerless", "owner-b", "owner"),
+        ("m-extra-a", "p-extra-owner", "owner-a", "member"),
+        ("m-extra-b", "p-extra-owner", "owner-b", "owner"),
+    ] {
+        sqlx::query(
+            "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(member_id)
+        .bind(project_id)
+        .bind(user_id)
+        .bind(role)
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("member inserts");
+    }
+
+    run_migrations(&pool).await.expect("V135 applies");
+    run_migrations(&pool).await.expect("V135 is idempotent");
+
+    let missing: (String, String) =
+        sqlx::query_as("SELECT role, user_id FROM project_member WHERE project_id = 'p-missing'")
+            .fetch_one(&pool)
+            .await
+            .expect("repaired owner membership loads");
+    assert_eq!(missing, ("owner".to_owned(), "owner-a".to_owned()));
+
+    let wrong: (String, String) = sqlx::query_as(
+        "SELECT role, user_id FROM project_member WHERE project_id = 'p-wrong-role'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("canonical membership loads");
+    assert_eq!(wrong, ("owner".to_owned(), "owner-a".to_owned()));
+
+    let ownerless_owner: Option<String> =
+        sqlx::query_scalar("SELECT owner_id FROM project WHERE id = 'p-ownerless'")
+            .fetch_one(&pool)
+            .await
+            .expect("ownerless project loads");
+    assert_eq!(ownerless_owner, None, "migration never invents an owner");
+    let ownerless_role: String = sqlx::query_scalar(
+        "SELECT role FROM project_member WHERE project_id = 'p-ownerless' AND user_id = 'owner-b'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("ownerless membership remains");
+    assert_eq!(ownerless_role, "owner");
+
+    let extra_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM project_member WHERE project_id = 'p-extra-owner'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("extra-owner count loads");
+    assert_eq!(extra_rows, 2, "migration does not duplicate existing rows");
+    let canonical_role: String = sqlx::query_scalar(
+        "SELECT role FROM project_member WHERE project_id = 'p-extra-owner' AND user_id = 'owner-a'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("canonical role loads");
+    assert_eq!(canonical_role, "owner");
+
+    let _ = fs::remove_file(db_path);
+}

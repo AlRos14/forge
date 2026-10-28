@@ -4,50 +4,15 @@ use crate::{new_uuid_v4, now_rfc3339};
 #[async_trait]
 impl ProjectRepo for SqliteDb {
     async fn create(&self, input: CreateProject) -> Result<Project> {
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("INSERT INTO project (id, name, settings, primary_repo_id, owner_id, project_hooks_json, project_work_epoch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '[]', 0, ?, ?)")
-            .bind(&input.id)
-            .bind(&input.name)
-            .bind(&input.settings)
-            .bind(&input.primary_repo_id)
-            .bind(&input.owner_id)
-            .bind(&input.created_at)
-            .bind(&input.updated_at)
-            .execute(&mut *transaction)
-            .await?;
-        let correlation_id = new_uuid_v4();
-        let actor_type = if input.owner_id.is_some() {
-            "user"
-        } else {
-            "system"
-        }
-        .to_owned();
-        let actor_id = input.owner_id.clone();
-        let event = CreateDomainEvent {
-            id: new_uuid_v4(),
-            event_type: "project.created".to_owned(),
-            entity_type: "project".to_owned(),
-            entity_id: input.id.clone(),
-            actor_type,
-            actor_id,
-            scope_type: "project".to_owned(),
-            scope_id: input.id.clone(),
-            correlation_id,
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some(format!("project-created:{}", input.id)),
-            payload_json: serde_json::json!({
-                "project_id": input.id,
-                "name": input.name,
-            })
-            .to_string(),
-            created_at: input.created_at.clone(),
-        };
-        DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
-        transaction.commit().await?;
-        ProjectRepo::get_by_id(self, &input.id)
-            .await?
-            .ok_or(DbError::NotFound)
+        self.create_project_record(input, None).await
+    }
+
+    async fn create_with_owner_membership(
+        &self,
+        input: CreateProject,
+        member_id: &str,
+    ) -> Result<Project> {
+        self.create_project_record(input, Some(member_id)).await
     }
 
     async fn get_by_id(&self, id: &str) -> Result<Option<Project>> {
@@ -59,6 +24,42 @@ impl ProjectRepo for SqliteDb {
         .await?
         .map(map_project)
         .transpose()
+    }
+
+    async fn get_by_id_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        id: &str,
+    ) -> Result<Option<Project>> {
+        sqlx::query(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM project WHERE id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .map(map_project)
+        .transpose()
+    }
+
+    async fn set_owner_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        id: &str,
+        owner_id: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE project SET owner_id = ?, updated_at = ?, version = version + 1 WHERE id = ?",
+        )
+        .bind(owner_id)
+        .bind(updated_at)
+        .bind(id)
+        .execute(&mut **transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
     }
 
     async fn list(&self, page: PageRequest) -> Result<Page<Project>> {
@@ -412,5 +413,79 @@ impl ProjectRepo for SqliteDb {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+}
+
+impl SqliteDb {
+    async fn create_project_record(
+        &self,
+        input: CreateProject,
+        owner_member_id: Option<&str>,
+    ) -> Result<Project> {
+        if owner_member_id.is_some() && input.owner_id.is_none() {
+            return Err(DbError::Check(
+                "owner membership requires a canonical Project owner".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("INSERT INTO project (id, name, settings, primary_repo_id, owner_id, project_hooks_json, project_work_epoch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '[]', 0, ?, ?)")
+            .bind(&input.id)
+            .bind(&input.name)
+            .bind(&input.settings)
+            .bind(&input.primary_repo_id)
+            .bind(&input.owner_id)
+            .bind(&input.created_at)
+            .bind(&input.updated_at)
+            .execute(&mut *transaction)
+            .await?;
+
+        if let (Some(member_id), Some(owner_id)) = (owner_member_id, input.owner_id.as_deref()) {
+            sqlx::query(
+                "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) \
+                 VALUES (?, ?, ?, 'owner', ?, ?)",
+            )
+            .bind(member_id)
+            .bind(&input.id)
+            .bind(owner_id)
+            .bind(&input.created_at)
+            .bind(&input.updated_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        let correlation_id = new_uuid_v4();
+        let actor_type = if input.owner_id.is_some() {
+            "user"
+        } else {
+            "system"
+        }
+        .to_owned();
+        let actor_id = input.owner_id.clone();
+        let event = CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "project.created".to_owned(),
+            entity_type: "project".to_owned(),
+            entity_id: input.id.clone(),
+            actor_type,
+            actor_id,
+            scope_type: "project".to_owned(),
+            scope_id: input.id.clone(),
+            correlation_id,
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("project-created:{}", input.id)),
+            payload_json: serde_json::json!({
+                "project_id": input.id,
+                "name": input.name,
+            })
+            .to_string(),
+            created_at: input.created_at.clone(),
+        };
+        DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+        transaction.commit().await?;
+        ProjectRepo::get_by_id(self, &input.id)
+            .await?
+            .ok_or(DbError::NotFound)
     }
 }

@@ -29,7 +29,7 @@ pub async fn create_project(
     let now = now_rfc3339();
     let settings = serde_json::json!({});
     let settings = serialize_settings(&settings)?;
-    let project = ProjectRepo::create(
+    let project = ProjectRepo::create_with_owner_membership(
         &*state.db,
         CreateProject {
             id: new_uuid_v4(),
@@ -40,22 +40,9 @@ pub async fn create_project(
             created_at: now.clone(),
             updated_at: now.clone(),
         },
+        &new_uuid_v4(),
     )
     .await?;
-
-    // Auto-create owner membership (best-effort; may fail if user row doesn't exist yet)
-    let _ = db::ProjectMemberRepo::add_member(
-        &*state.db,
-        db::CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: project.id.clone(),
-            user_id: user.user_id,
-            role: "owner".to_owned(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await;
 
     state.event_bus.publish(ForgeEvent {
         event_type: "project.created".to_owned(),

@@ -7,9 +7,9 @@ use api_types::{
 use db::{
     new_uuid_v4, now_rfc3339, AgentListQuery, AgentProfileRepo, AgentRepo, ArtifactKind,
     CollaborationRepo, CreateProject, ExecutionPurpose, ExecutionRepo, GateRepo, GateScopeKind,
-    PageRequest, ProjectMemberRepo, ProjectRepo, RoleMembershipRepo, SortBy, SortOrder, Task,
-    TaskDependencyRepo, TaskLifecycleRepo, TaskListQuery, TaskRepo, TaskRoleRepo, UpdateProject,
-    UpdateTask, ValidationRunRepo,
+    PageRequest, ProjectRepo, RoleMembershipRepo, SortBy, SortOrder, Task, TaskDependencyRepo,
+    TaskLifecycleRepo, TaskListQuery, TaskRepo, TaskRoleRepo, UpdateProject, UpdateTask,
+    ValidationRunRepo,
 };
 use executors::ExecutionOverrides;
 use serde_json::{json, Map, Value};
@@ -531,7 +531,7 @@ pub(super) async fn forge_create_project(
         return Err(McpToolError::new(-32602, "name must not be empty"));
     }
     let now = now_rfc3339();
-    let project = ProjectRepo::create(
+    let project = ProjectRepo::create_with_owner_membership(
         &*state.db,
         CreateProject {
             id: new_uuid_v4(),
@@ -542,20 +542,9 @@ pub(super) async fn forge_create_project(
             created_at: now.clone(),
             updated_at: now.clone(),
         },
+        &new_uuid_v4(),
     )
     .await?;
-    let _ = ProjectMemberRepo::add_member(
-        &*state.db,
-        db::CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: project.id.clone(),
-            user_id,
-            role: "owner".to_owned(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await;
     project_value(project)
 }
 
