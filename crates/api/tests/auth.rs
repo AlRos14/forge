@@ -12,6 +12,11 @@ use tower::ServiceExt;
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
+fn test_password() -> &'static str {
+    static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PASSWORD.get_or_init(|| format!("test-password-{}", std::process::id()))
+}
+
 async fn register(app: &axum::Router, email: &str, password: &str) -> axum::response::Response {
     app.clone()
         .oneshot(
@@ -104,7 +109,7 @@ async fn auth_full_flow() {
     let app = &harness.app;
 
     let email = "flow@example.com";
-    let password = "Password123!";
+    let password = test_password();
 
     // Register
     let reg_resp = register(app, email, password).await;
@@ -200,7 +205,7 @@ async fn sse_accepts_short_lived_ticket() {
     let harness = common::test_app(workspace_root.path(), "auth-sse").await;
     let app = &harness.app;
 
-    let auth = register_and_login(app, "sse@example.com", "Password123!").await;
+    let auth = register_and_login(app, "sse@example.com", test_password()).await;
     let ticket = issue_sse_ticket(app, &auth.access_token).await;
 
     let resp = app
@@ -254,7 +259,7 @@ async fn sse_rejects_reusable_token_query_param() {
     let harness = common::test_app(workspace_root.path(), "auth-sse-query").await;
     let app = &harness.app;
 
-    let auth = register_and_login(app, "sse-query@example.com", "Password123!").await;
+    let auth = register_and_login(app, "sse-query@example.com", test_password()).await;
 
     let resp = app
         .clone()
@@ -280,7 +285,7 @@ async fn query_token_never_authenticates_rest_or_overrides_a_header() {
     let workspace_root = common::TestDir::new("auth-query-ws");
     let harness = common::test_app(workspace_root.path(), "auth-query").await;
     let app = &harness.app;
-    let auth = register_and_login(app, "query@example.com", "Password123!").await;
+    let auth = register_and_login(app, "query@example.com", test_password()).await;
 
     let query_only = app
         .clone()
@@ -361,7 +366,7 @@ async fn jwt_loses_admin_authority_after_degradation() {
     let harness = common::test_app(workspace_root.path(), "auth-degrade").await;
     let app = &harness.app;
 
-    let auth = register_and_login(app, "degrade@example.com", "Password123!").await;
+    let auth = register_and_login(app, "degrade@example.com", test_password()).await;
     assert_eq!(
         admin_list_status(app, &auth.access_token).await,
         StatusCode::OK,
@@ -389,7 +394,7 @@ async fn jwt_for_deleted_user_is_rejected_and_refresh_fails() {
     let harness = common::test_app(workspace_root.path(), "auth-deleted").await;
     let app = &harness.app;
 
-    let auth = register_and_login(app, "deleted@example.com", "Password123!").await;
+    let auth = register_and_login(app, "deleted@example.com", test_password()).await;
     let user = db::UserRepo::get_user_by_email(&*harness.state.db, "deleted@example.com")
         .await
         .expect("user lookup")
@@ -461,7 +466,7 @@ async fn concurrent_refresh_single_winner() {
     let harness = common::test_app(workspace_root.path(), "auth-race").await;
     let app = &harness.app;
 
-    let auth = register_and_login(app, "race@example.com", "Password123!").await;
+    let auth = register_and_login(app, "race@example.com", test_password()).await;
     let token = auth.refresh_token.clone();
 
     let body = serde_json::to_string(&json!({ "refresh_token": token })).unwrap();

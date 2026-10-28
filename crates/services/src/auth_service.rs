@@ -501,6 +501,10 @@ mod tests {
         AuthService::new(Arc::new(SqliteDb::new(pool)), b"test-secret".to_vec(), 4)
     }
 
+    fn test_password(tag: &str) -> String {
+        format!("test-password-{tag}-{}", std::process::id())
+    }
+
     async fn seed_orphan_agent(db: &SqliteDb, id: &str, name: &str, is_default: bool) {
         let now = now_rfc3339();
         AgentRepo::create(
@@ -539,7 +543,7 @@ mod tests {
     async fn register_success() {
         let svc = test_service().await;
         let user = svc
-            .register("Test@Example.COM", "password123", Some("Alice"))
+            .register("Test@Example.COM", &test_password("123"), Some("Alice"))
             .await
             .expect("register succeeds");
         assert_eq!(
@@ -554,11 +558,11 @@ mod tests {
         let svc = test_service().await;
 
         let first_registered = svc
-            .register("first-admin@test.com", "password123", None)
+            .register("first-admin@test.com", &test_password("123"), None)
             .await
             .expect("first user registers");
         let second_registered = svc
-            .register("second-user@test.com", "password123", None)
+            .register("second-user@test.com", &test_password("123"), None)
             .await
             .expect("second user registers");
 
@@ -581,7 +585,9 @@ mod tests {
     #[tokio::test]
     async fn register_invalid_email() {
         let svc = test_service().await;
-        let err = svc.register("not-an-email", "password123", None).await;
+        let err = svc
+            .register("not-an-email", &test_password("123"), None)
+            .await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("invalid_email"));
     }
@@ -597,10 +603,12 @@ mod tests {
     #[tokio::test]
     async fn register_duplicate_email() {
         let svc = test_service().await;
-        svc.register("dup@test.com", "password123", None)
+        svc.register("dup@test.com", &test_password("123"), None)
             .await
             .expect("first registration");
-        let err = svc.register("dup@test.com", "password456", None).await;
+        let err = svc
+            .register("dup@test.com", &test_password("456"), None)
+            .await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("email_exists"));
     }
@@ -608,11 +616,11 @@ mod tests {
     #[tokio::test]
     async fn login_success_returns_token_pair() {
         let svc = test_service().await;
-        svc.register("login@test.com", "password123", None)
+        svc.register("login@test.com", &test_password("123"), None)
             .await
             .expect("register");
         let pair = svc
-            .login("login@test.com", "password123")
+            .login("login@test.com", &test_password("123"))
             .await
             .expect("login");
         assert!(!pair.access_token.is_empty());
@@ -623,7 +631,7 @@ mod tests {
     #[tokio::test]
     async fn login_wrong_password() {
         let svc = test_service().await;
-        svc.register("wp@test.com", "password123", None)
+        svc.register("wp@test.com", &test_password("123"), None)
             .await
             .expect("register");
         let err = svc.login("wp@test.com", "wrongpassword").await;
@@ -634,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn login_nonexistent_user_returns_invalid_credentials() {
         let svc = test_service().await;
-        let err = svc.login("ghost@test.com", "password123").await;
+        let err = svc.login("ghost@test.com", &test_password("123")).await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("invalid_credentials"));
     }
@@ -642,11 +650,11 @@ mod tests {
     #[tokio::test]
     async fn refresh_rotates_token() {
         let svc = test_service().await;
-        svc.register("refresh@test.com", "password123", None)
+        svc.register("refresh@test.com", &test_password("123"), None)
             .await
             .expect("register");
         let pair1 = svc
-            .login("refresh@test.com", "password123")
+            .login("refresh@test.com", &test_password("123"))
             .await
             .expect("login");
 
@@ -666,11 +674,11 @@ mod tests {
     #[tokio::test]
     async fn logout_invalidates_refresh_token() {
         let svc = test_service().await;
-        svc.register("logout@test.com", "password123", None)
+        svc.register("logout@test.com", &test_password("123"), None)
             .await
             .expect("register");
         let pair = svc
-            .login("logout@test.com", "password123")
+            .login("logout@test.com", &test_password("123"))
             .await
             .expect("login");
 
@@ -683,11 +691,11 @@ mod tests {
     #[tokio::test]
     async fn verify_token_valid() {
         let svc = test_service().await;
-        svc.register("vt@test.com", "password123", None)
+        svc.register("vt@test.com", &test_password("123"), None)
             .await
             .expect("register");
         let pair = svc
-            .login("vt@test.com", "password123")
+            .login("vt@test.com", &test_password("123"))
             .await
             .expect("login");
         let (user_id, email, _is_admin) = svc
@@ -702,14 +710,14 @@ mod tests {
     async fn verify_token_uses_current_admin_authority() {
         let svc = test_service().await;
         let user = svc
-            .register("admin@test.com", "password123", None)
+            .register("admin@test.com", &test_password("123"), None)
             .await
             .expect("register");
         svc.bootstrap_first_user(&user.id)
             .await
             .expect("bootstrap admin");
         let pair = svc
-            .login("admin@test.com", "password123")
+            .login("admin@test.com", &test_password("123"))
             .await
             .expect("login");
 
@@ -736,7 +744,7 @@ mod tests {
     async fn verify_token_rejects_oauth_mcp_tokens() {
         let svc = test_service().await;
         let user = svc
-            .register("mcp@test.com", "password123", None)
+            .register("mcp@test.com", &test_password("123"), None)
             .await
             .expect("register");
         let now = std::time::SystemTime::now()
@@ -764,11 +772,11 @@ mod tests {
     async fn verify_token_rejects_deleted_user() {
         let svc = test_service().await;
         let user = svc
-            .register("deleted@test.com", "password123", None)
+            .register("deleted@test.com", &test_password("123"), None)
             .await
             .expect("register");
         let pair = svc
-            .login("deleted@test.com", "password123")
+            .login("deleted@test.com", &test_password("123"))
             .await
             .expect("login");
 
@@ -863,7 +871,7 @@ mod tests {
             .execute(db.pool()).await.unwrap();
 
         let user = svc
-            .register("admin@test.com", "password123", None)
+            .register("admin@test.com", &test_password("123"), None)
             .await
             .expect("register succeeds");
 
@@ -913,14 +921,14 @@ mod tests {
         let db = &svc.db;
 
         let _first = svc
-            .register("first@test.com", "password123", None)
+            .register("first@test.com", &test_password("123"), None)
             .await
             .expect("first user");
 
         seed_orphan_agent(db, "a2", "agent2", false).await;
 
         let _second = svc
-            .register("second@test.com", "password456", None)
+            .register("second@test.com", &test_password("456"), None)
             .await
             .expect("second user");
 
