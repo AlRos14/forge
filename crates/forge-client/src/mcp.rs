@@ -6,6 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(unix)]
+use std::io::Write;
+
 use crate::auth::resolve_access_token_for_server;
 
 #[derive(clap::Args)]
@@ -21,9 +24,13 @@ pub enum McpCmd {
         agent: AgentTarget,
         #[arg(long, value_enum, default_value = "project")]
         scope: ConfigScope,
-        /// User access token to write as a Bearer Authorization header. Overrides FORGE_TOKEN and stored login.
+        /// User access token for `user` scope. Project/local scopes require an environment reference.
         #[arg(long)]
         token: Option<String>,
+        /// Environment variable the client expands at connection time. Required for project/local
+        /// scopes unless FORGE_TOKEN is already set.
+        #[arg(long)]
+        token_env: Option<String>,
         /// Scope this MCP endpoint to a single Forge project.
         #[arg(long)]
         project_id: Option<String>,
@@ -63,12 +70,14 @@ impl McpArgs {
                 agent,
                 scope,
                 token,
+                token_env,
                 project_id,
             } => install(
                 server,
                 *agent,
                 *scope,
                 token.as_deref(),
+                token_env.as_deref(),
                 project_id.as_deref(),
             ),
             McpCmd::Uninstall { agent, scope } => uninstall(*agent, *scope),
@@ -128,15 +137,42 @@ pub fn write_config(path: &Path, config: &Value) -> Result<()> {
         return Err(anyhow!("config at {} is not a JSON object", path.display()));
     }
 
+    let mut body = serde_json::to_string_pretty(config)
+        .with_context(|| format!("failed to serialize {}", path.display()))?;
+    body.push('\n');
+    write_private_file(path, body.as_bytes())
+}
+
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let mut body = serde_json::to_string_pretty(config)
-        .with_context(|| format!("failed to serialize {}", path.display()))?;
-    body.push('\n');
-    fs::write(path, body).with_context(|| format!("failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    }
+
     Ok(())
 }
 
@@ -145,18 +181,21 @@ pub fn install(
     agent: AgentTarget,
     scope: ConfigScope,
     token: Option<&str>,
+    token_env: Option<&str>,
     project_id: Option<&str>,
 ) -> Result<()> {
     let path = config_path(agent, scope)?;
-    let access_token = resolve_install_token(server, token)?;
+    let auth = resolve_install_auth(server, scope, token, token_env)?;
     let install_url = install_url(server, project_id)?;
     if agent == AgentTarget::Codex {
         let contents = read_codex_config(&path)?;
-        write_codex_config_if_changed(
-            &path,
-            &contents,
-            set_codex_forge_config(&contents, &install_url, &access_token),
-        )?;
+        let next = match &auth {
+            InstallAuth::Literal(access_token) => {
+                set_codex_forge_config(&contents, &install_url, access_token)
+            }
+            InstallAuth::Env(name) => set_codex_forge_env_config(&contents, &install_url, name),
+        };
+        write_codex_config_if_changed(&path, &contents, next)?;
         println!("Installed Forge MCP at {}", path.display());
         return Ok(());
     }
@@ -184,17 +223,83 @@ pub fn install(
         .and_then(Value::as_object_mut)
         .ok_or_else(|| anyhow!("mcpServers in {} is not a JSON object", path.display()))?;
 
+    let authorization = match &auth {
+        InstallAuth::Literal(access_token) => format!("Bearer {access_token}"),
+        InstallAuth::Env(name) => match agent {
+            AgentTarget::Claude => format!("Bearer ${{{name}}}"),
+            AgentTarget::Cursor => format!("Bearer ${{env:{name}}}"),
+            AgentTarget::Codex => unreachable!("Codex uses TOML bearer_token_env_var"),
+        },
+    };
     let mut forge = Map::new();
     forge.insert("type".to_owned(), Value::String("http".to_string()));
     forge.insert("url".to_owned(), Value::String(install_url));
     forge.insert(
         "headers".to_owned(),
-        serde_json::json!({ "Authorization": format!("Bearer {access_token}") }),
+        serde_json::json!({ "Authorization": authorization }),
     );
     mcp_servers.insert("forge".to_owned(), Value::Object(forge));
 
     write_config(&path, &config)?;
     println!("Installed Forge MCP at {}", path.display());
+    Ok(())
+}
+
+enum InstallAuth {
+    Literal(String),
+    Env(String),
+}
+
+fn resolve_install_auth(
+    server: &str,
+    scope: ConfigScope,
+    token: Option<&str>,
+    token_env: Option<&str>,
+) -> Result<InstallAuth> {
+    if let Some(name) = token_env.map(str::trim).filter(|value| !value.is_empty()) {
+        validate_env_name(name)?;
+        require_env_value(name)?;
+        return Ok(InstallAuth::Env(name.to_owned()));
+    }
+    if scope != ConfigScope::User {
+        if token.is_some() {
+            return Err(anyhow!(
+                "--token cannot be embedded in a project/local MCP config; export FORGE_TOKEN or pass --token-env NAME"
+            ));
+        }
+        require_env_value("FORGE_TOKEN")?;
+        return Ok(InstallAuth::Env("FORGE_TOKEN".to_owned()));
+    }
+    let access_token = resolve_install_token(server, token)?;
+    Ok(InstallAuth::Literal(access_token))
+}
+
+fn validate_env_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(anyhow!("token environment variable name must not be empty"));
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|value| value.is_ascii_alphanumeric() || value == '_')
+    {
+        return Err(anyhow!(
+            "token environment variable name must contain only letters, digits, and underscores"
+        ));
+    }
+    Ok(())
+}
+
+fn require_env_value(name: &str) -> Result<()> {
+    if env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err(anyhow!(
+            "environment variable {name} is not set; project/local MCP configs reference the token instead of embedding it"
+        ));
+    }
     Ok(())
 }
 
@@ -323,12 +428,7 @@ fn read_codex_config(path: &Path) -> Result<String> {
 
 fn write_codex_config_if_changed(path: &Path, previous: &str, next: String) -> Result<()> {
     if next != previous {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::write(path, next.as_bytes())
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        write_private_file(path, next.as_bytes())?;
     }
     Ok(())
 }
@@ -360,6 +460,24 @@ fn set_codex_forge_config(contents: &str, url: &str, token: &str) -> String {
     next.push_str("http_headers = { Authorization = ");
     next.push_str(&toml_string(&format!("Bearer {token}")));
     next.push_str(" }\n");
+    next
+}
+
+fn set_codex_forge_env_config(contents: &str, url: &str, token_env: &str) -> String {
+    let mut next = remove_codex_forge(contents);
+    if !next.ends_with('\n') && !next.is_empty() {
+        next.push('\n');
+    }
+    if !next.is_empty() {
+        next.push('\n');
+    }
+    next.push_str("[mcp_servers.forge]\n");
+    next.push_str("url = ");
+    next.push_str(&toml_string(url));
+    next.push('\n');
+    next.push_str("bearer_token_env_var = ");
+    next.push_str(&toml_string(token_env));
+    next.push('\n');
     next
 }
 
@@ -568,12 +686,12 @@ command = "other"
     }
 
     #[test]
-    fn install_writes_bearer_header_without_putting_token_in_url() {
+    fn project_installs_use_client_environment_references() {
         let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
-        let data_dir = unique_temp_dir("forge-client-mcp-install-data");
-        let _token = EnvVarGuard::unset("FORGE_TOKEN");
+        let data_dir = unique_temp_dir("forge-client-mcp-env-data");
+        let _env = EnvVarGuard::set("FORGE_TOKEN", "fg_env_reference");
         let _data = EnvVarGuard::set("FORGE_DATA_DIR", data_dir.to_string_lossy().as_ref());
-        let repo_dir = unique_temp_dir("forge-client-mcp-install");
+        let repo_dir = unique_temp_dir("forge-client-mcp-env-install");
         fs::create_dir_all(&repo_dir).expect("repo dir creates");
         let cwd_guard = CurrentDirGuard::set(&repo_dir);
 
@@ -581,25 +699,160 @@ command = "other"
             "http://127.0.0.1:8080",
             AgentTarget::Claude,
             ConfigScope::Project,
-            Some("fg_test"),
+            None,
+            None,
             Some("project-1"),
         )
-        .expect("install succeeds");
+        .expect("Claude install succeeds");
+        install(
+            "http://127.0.0.1:8080",
+            AgentTarget::Cursor,
+            ConfigScope::Project,
+            None,
+            None,
+            Some("project-1"),
+        )
+        .expect("Cursor install succeeds");
+        install(
+            "http://127.0.0.1:8080",
+            AgentTarget::Codex,
+            ConfigScope::Project,
+            None,
+            None,
+            Some("project-1"),
+        )
+        .expect("Codex install succeeds");
         drop(cwd_guard);
 
-        let path = repo_dir.join(".claude/settings.json");
-        let config = read_config(&path).expect("config reads");
-        let url = forge_url(&config, &path)
-            .expect("forge url reads")
-            .expect("forge url installed");
+        let claude_path = repo_dir.join(".claude/settings.json");
+        let claude = read_config(&claude_path).expect("Claude config reads");
+        assert_eq!(
+            claude["mcpServers"]["forge"]["headers"]["Authorization"],
+            "Bearer ${FORGE_TOKEN}"
+        );
+        assert!(!fs::read_to_string(&claude_path)
+            .expect("Claude config reads")
+            .contains("fg_env_reference"));
 
-        assert_eq!(url, "http://127.0.0.1:8080/mcp?project_id=project-1");
-        assert!(!url.contains("token="));
+        let cursor_path = repo_dir.join(".cursor/mcp.json");
+        let cursor = read_config(&cursor_path).expect("Cursor config reads");
+        assert_eq!(
+            cursor["mcpServers"]["forge"]["headers"]["Authorization"],
+            "Bearer ${env:FORGE_TOKEN}"
+        );
+        assert!(!fs::read_to_string(&cursor_path)
+            .expect("Cursor config reads")
+            .contains("fg_env_reference"));
+
+        let codex_path = repo_dir.join(".codex/config.toml");
+        let codex = fs::read_to_string(&codex_path).expect("Codex config reads");
+        assert!(codex.contains("bearer_token_env_var = \"FORGE_TOKEN\""));
+        assert!(!codex.contains("fg_env_reference"));
+        assert!(!codex.contains("http_headers"));
+
+        let _ = fs::remove_dir_all(repo_dir);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn custom_token_env_name_is_validated() {
+        let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
+        let _env = EnvVarGuard::set("MY_FORGE_TOKEN", "fg_custom_env");
+
+        match resolve_install_auth(
+            "http://127.0.0.1:8080",
+            ConfigScope::Project,
+            None,
+            Some("MY_FORGE_TOKEN"),
+        )
+        .expect("custom env resolves")
+        {
+            InstallAuth::Env(name) => assert_eq!(name, "MY_FORGE_TOKEN"),
+            InstallAuth::Literal(_) => panic!("expected an environment reference"),
+        }
+        assert!(resolve_install_auth(
+            "http://127.0.0.1:8080",
+            ConfigScope::Project,
+            None,
+            Some("BAD-NAME")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn project_install_fails_closed_without_an_env_reference() {
+        let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
+        let data_dir = unique_temp_dir("forge-client-mcp-fail-data");
+        let _token = EnvVarGuard::unset("FORGE_TOKEN");
+        let _data = EnvVarGuard::set("FORGE_DATA_DIR", data_dir.to_string_lossy().as_ref());
+        let repo_dir = unique_temp_dir("forge-client-mcp-fail-install");
+        fs::create_dir_all(&repo_dir).expect("repo dir creates");
+        let cwd_guard = CurrentDirGuard::set(&repo_dir);
+
+        let error = install(
+            "http://127.0.0.1:8080",
+            AgentTarget::Claude,
+            ConfigScope::Project,
+            Some("fg_literal"),
+            None,
+            Some("project-1"),
+        )
+        .expect_err("literal project token rejects");
+        assert!(error.to_string().contains("--token cannot be embedded"));
+
+        let error = install(
+            "http://127.0.0.1:8080",
+            AgentTarget::Claude,
+            ConfigScope::Project,
+            None,
+            None,
+            Some("project-1"),
+        )
+        .expect_err("missing env rejects");
+        assert!(error.to_string().contains("FORGE_TOKEN is not set"));
+        drop(cwd_guard);
+
+        assert!(!repo_dir.join(".claude/settings.json").exists());
+        let _ = fs::remove_dir_all(repo_dir);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn user_install_writes_literal_header_with_private_permissions() {
+        let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
+        let data_dir = unique_temp_dir("forge-client-mcp-user-data");
+        let home_dir = unique_temp_dir("forge-client-mcp-user-home");
+        fs::create_dir_all(&home_dir).expect("home dir creates");
+        let _data = EnvVarGuard::set("FORGE_DATA_DIR", data_dir.to_string_lossy().as_ref());
+        let _home = EnvVarGuard::set("HOME", home_dir.to_string_lossy().as_ref());
+
+        install(
+            "http://127.0.0.1:8080",
+            AgentTarget::Claude,
+            ConfigScope::User,
+            Some("fg_user"),
+            None,
+            None,
+        )
+        .expect("user install succeeds");
+
+        let path = home_dir.join(".claude/settings.json");
+        let config = read_config(&path).expect("config reads");
         assert_eq!(
             config["mcpServers"]["forge"]["headers"]["Authorization"],
-            "Bearer fg_test"
+            "Bearer fg_user"
         );
-        let _ = fs::remove_dir_all(repo_dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path)
+                .expect("config metadata reads")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = fs::remove_dir_all(home_dir);
         let _ = fs::remove_dir_all(data_dir);
     }
 
