@@ -269,7 +269,7 @@ async fn handle_client_text_frame(
     let result = match frame {
         TerminalClientFrame::Input { data } => state
             .terminal_service
-            .handle_terminal_input(session_id, &data)
+            .handle_terminal_input(session_id, user_id, &data)
             .await
             .map(|_| None),
         TerminalClientFrame::Resize { rows, cols } => state
@@ -284,14 +284,20 @@ async fn handle_client_text_frame(
         Ok(Some(frame)) => send_server_frame(sink, frame).await,
         Ok(None) => true,
         Err(error) => {
-            send_server_frame(
-                sink,
+            let revoked = matches!(&error, services::ServiceError::AuthorizationDenied { .. });
+            let frame = if revoked {
+                TerminalServerFrame::Error {
+                    code: "authorization_revoked".to_owned(),
+                    message: "terminal authority was revoked".to_owned(),
+                }
+            } else {
                 TerminalServerFrame::Error {
                     code: "terminal_error".to_owned(),
                     message: error.to_string(),
-                },
-            )
-            .await
+                }
+            };
+            let sent = send_server_frame(sink, frame).await;
+            sent && !revoked
         }
     }
 }

@@ -948,7 +948,11 @@ async fn exercise_terminal_session(
     harness
         .state
         .terminal_service
-        .handle_terminal_input(&created.session.id, "ZWNobyBmb3JnZS10ZXJtaW5hbC1vawo=")
+        .handle_terminal_input(
+            &created.session.id,
+            "test-user-id",
+            "ZWNobyBmb3JnZS10ZXJtaW5hbC1vawo=",
+        )
         .await
         .expect("terminal input accepted");
     wait_for_terminal_output(&mut live_rx, "forge-terminal-ok").await;

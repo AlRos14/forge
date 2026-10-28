@@ -485,6 +485,20 @@ impl TerminalService {
         Ok(user_id)
     }
 
+    async fn require_current_write_authority(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<(), ServiceError> {
+        if self.user_can_attach(session_id, user_id).await? {
+            Ok(())
+        } else {
+            Err(ServiceError::AuthorizationDenied {
+                message: "terminal authority was revoked".to_owned(),
+            })
+        }
+    }
+
     pub async fn user_can_attach(
         &self,
         session_id: &str,
@@ -509,11 +523,13 @@ impl TerminalService {
     pub async fn resize_session(
         &self,
         session_id: &str,
-        _user_id: &str,
+        user_id: &str,
         rows: u16,
         cols: u16,
     ) -> Result<TerminalSessionResponse, ServiceError> {
         validate_terminal_size(rows, cols)?;
+        self.require_current_write_authority(session_id, user_id)
+            .await?;
 
         let session = self.load_session(session_id).await?;
         if !terminal_session_is_active(&session.status) {
@@ -637,8 +653,11 @@ impl TerminalService {
     pub async fn handle_terminal_input(
         &self,
         session_id: &str,
+        user_id: &str,
         data_b64: &str,
     ) -> Result<(), ServiceError> {
+        self.require_current_write_authority(session_id, user_id)
+            .await?;
         let session = self.load_session(session_id).await?;
         if !terminal_session_is_active(&session.status) {
             return Err(ServiceError::TerminalNotFound);
@@ -1612,6 +1631,7 @@ mod tests {
     struct SeededTerminal {
         session_id: String,
         workspace_id: String,
+        project_id: String,
     }
 
     async fn test_service(
@@ -1701,7 +1721,7 @@ mod tests {
             db,
             CreateTask {
                 id: task_id.clone(),
-                project_id,
+                project_id: project_id.clone(),
                 repo_id: Some(repo_id.clone()),
                 parent_task_id: None,
                 title: "Terminal task".to_owned(),
@@ -1769,6 +1789,7 @@ mod tests {
         SeededTerminal {
             session_id: running.id,
             workspace_id,
+            project_id,
         }
     }
 
@@ -1879,6 +1900,41 @@ mod tests {
             .expect_err("too-small resize rejects");
 
         assert!(matches!(error, ServiceError::TerminalInvalidInput { .. }));
+    }
+
+    #[tokio::test]
+    async fn input_and_resize_recheck_current_authority() {
+        let (service, db, root) = test_service(enabled_terminal()).await;
+        let seeded = seed_running_terminal(&db, root.path()).await;
+
+        // With current authority the call reaches terminal dispatch. The seeded
+        // session has no PTY, so the expected control error is NotFound.
+        let allowed = service
+            .handle_terminal_input(&seeded.session_id, TEST_USER_ID, "aGk=")
+            .await
+            .expect_err("seeded session has no terminal process");
+        assert!(matches!(allowed, ServiceError::TerminalNotFound));
+
+        db::ProjectMemberRepo::remove_member(&*db, &seeded.project_id, TEST_USER_ID)
+            .await
+            .expect("membership removes");
+        sqlx::query("UPDATE project SET owner_id = NULL WHERE id = ?")
+            .bind(&seeded.project_id)
+            .execute(db.pool())
+            .await
+            .expect("owner clears");
+
+        let input = service
+            .handle_terminal_input(&seeded.session_id, TEST_USER_ID, "aGk=")
+            .await
+            .expect_err("revoked input rejects");
+        assert!(matches!(input, ServiceError::AuthorizationDenied { .. }));
+
+        let resize = service
+            .resize_session(&seeded.session_id, TEST_USER_ID, 24, 80)
+            .await
+            .expect_err("revoked resize rejects");
+        assert!(matches!(resize, ServiceError::AuthorizationDenied { .. }));
     }
 
     #[tokio::test]
