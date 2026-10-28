@@ -6,6 +6,9 @@ on:
   schedule:
     - cron: "41 10 * * 1"
 
+permissions:
+  contents: read
+
 jobs:
   scorecard:
     name: Scorecard
