@@ -60,8 +60,12 @@ scanning. Triage at the hardening pass:
 - GitHub Actions permissions were reduced to top-level `contents: read` with
   job-scoped write permissions. This addresses the `TokenPermissionsID` findings.
 - The npx bootstrapper now validates that `server.json` resolves to a loopback
-  HTTP(S) URL before its health request, and writes its ready marker with
-  exclusive-create semantics.
+  HTTP(S) URL before its health request, and writes its ready marker inside the
+  private staging directory before the atomic publish rename. This avoids a
+  check-then-use race on the published ready-marker path.
+- New auth tests generate their password at runtime instead of embedding a
+  literal. The CodeQL `rust/hard-coded-cryptographic-value` findings were
+  resolved in test code; the rule and test paths were not excluded.
 - `web/scripts/lighthouse-board.mjs` remains a local developer benchmark that
   writes Lighthouse output to the ignored `test/lighthouse` directory. CodeQL's
   `js/http-to-file-access` finding describes that intentional audit artifact;

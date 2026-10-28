@@ -58,3 +58,31 @@ external, credential-dependent action.
 Results are recorded at the exact final HEAD in the pull request. Commands are
 listed in [security-audit.md](../security-audit.md),
 [release_checklist.md](../release_checklist.md), and the PR body.
+
+## F. Recorded local evidence
+
+These checks ran on 2026-10-28 at code HEAD `2de74710` on the working branch.
+The documentation commit that follows this ledger does not change runtime code.
+The PR check rollup at the exact final HEAD remains the merge gate.
+
+| Check | Command | Result |
+|---|---|---|
+| Formatting | `cargo fmt --all -- --check` | PASS |
+| Clippy | `FORGE_SKIP_WEB_BUILD=1 cargo clippy -p services -p api -p db -p mcp-server --all-targets --locked --offline -- -D warnings` | PASS, no warnings |
+| API suite | `FORGE_SKIP_WEB_BUILD=1 cargo test -p api --tests --no-fail-fast --locked --offline -- --test-threads=4` | PASS: 230 passed, 1 ignored, 0 failed across the lib plus 38 integration binaries; EXIT 0 |
+| Auth target after test-password change | `FORGE_SKIP_WEB_BUILD=1 cargo test -p api --test auth --locked --offline` | PASS: 9 passed |
+| Auth service tests after test-password change | `FORGE_SKIP_WEB_BUILD=1 cargo test -p services --lib auth_service::tests --locked --offline` | PASS: 19 passed, 428 filtered |
+| Services library | `FORGE_SKIP_WEB_BUILD=1 cargo test -p services --lib --locked --offline` | Partial, not a completed run: 205 passed and 0 failed before the run was stopped to avoid duplicating the CI workspace run |
+| Frontend | `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm build` in `web/` | PASS; unit tests 118 passed; web tree unchanged by later code commits |
+| Rust dependencies | `cargo audit` | No vulnerabilities; two documented non-vulnerability warnings |
+| npm dependencies | `pnpm audit --prod` in `web/` | Clean |
+| Docker image | `docker build -t forge-postv2-rc:local .` | PASS |
+| Container identity | `docker top forge-postv2-test -o pid,user,args` | `forge --data-dir /data` runs as UID/GID `10001`; PID 1 is `docker-init` under `--init` |
+| Container health and exposure | `curl -fsS http://127.0.0.1:18081/healthz`; `docker port forge-postv2-test` | `ok`; published only on `127.0.0.1` |
+| Restart persistence | Register, create a Project, restart the container, list Projects with the same token | Project count remained `1` |
+| Root-owned volume | Start without opt-in, then with `FORGE_MIGRATE_ROOT_OWNED_DATA=1` | Without opt-in: exit 1, no files changed. With opt-in: process UID `10001`, health `ok` |
+
+Native harness execution (Level C) was not run. No private harness credentials
+were used. The full-workspace Rust check, including the complete `services`
+suite, runs in CI with `./scripts/ci-rust.sh`; an empty or pending check is not
+evidence of success.
