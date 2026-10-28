@@ -5,6 +5,14 @@ DATA_DIR="${FORGE_DATA_DIR:-/data}"
 APP_USER="${FORGE_CONTAINER_USER:-forge}"
 APP_GROUP="${FORGE_CONTAINER_GROUP:-forge}"
 
+if [ "$#" -eq 0 ]; then
+    set -- forge
+elif [ "${1#-}" != "$1" ]; then
+    # Allow `docker run IMAGE --help` while keeping an explicit command like
+    # `docker run IMAGE forge-ctl ...` unchanged.
+    set -- forge "$@"
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
     # An explicit --user already chose the runtime identity. Do not attempt
     # privileged ownership changes.
