@@ -108,7 +108,8 @@ exposure is controlled by the published port.
   preserved.
 - MCP configuration writes resolve through directory descriptors and reject
   symlinks in intermediate directories and the final file. A symlinked config
-  path is a hard failure, not a redirect.
+  path is a hard failure, not a redirect. `forge-ctl mcp` applies the same rule
+  to Claude, Codex, and Cursor files before install, status, or uninstall.
 - Terminal input and resize frames recheck the current Project write authority;
   revoking membership or deleting the account rejects the next frame.
 

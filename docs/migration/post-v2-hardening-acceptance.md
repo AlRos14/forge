@@ -154,3 +154,23 @@ Focused evidence:
 The native check verified discovery only, using a fictitious token and no real
 credentials. It did not connect to a live MCP endpoint; Level C execution
 remains **NOT RUN**.
+
+## I. `forge-ctl mcp` path confinement
+
+`forge-ctl mcp` now uses the same descriptor-relative strategy as the API for
+Claude, Codex, and Cursor configuration. A canonical cwd/home root is traversed
+one component at a time with `O_NOFOLLOW`; the final file is opened with
+`O_NOFOLLOW`, `O_CREAT`, and `0600`. Missing destinations are created inside the
+root. A symlinked intermediate directory or final file fails closed before any
+external file is created or modified. Install, status, and uninstall all use the
+same reader/writer.
+
+Focused evidence:
+
+- `forge-client` MCP tests: **17 passed**, adding final-file symlink
+  install/uninstall rejection, intermediate-directory symlink
+  install/uninstall rejection for Cursor and Codex, missing-target creation,
+  and positive install/uninstall controls. Existing Claude local/user,
+  foreign-key preservation, and `0600` tests remain green.
+- The native Claude discovery check remains valid because the file locations and
+  structures are unchanged by this path-confinement layer.
