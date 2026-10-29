@@ -9,6 +9,7 @@ pub mod daemon_fs;
 pub mod daemon_link;
 pub mod daemon_runtime;
 pub mod mcp;
+mod mcp_fs;
 pub mod output;
 mod password_prompt;
 pub mod project;

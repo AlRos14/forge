@@ -6,10 +6,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(unix)]
-use std::io::Write;
-
-use crate::auth::resolve_access_token_for_server;
+use crate::{
+    auth::resolve_access_token_for_server,
+    mcp_fs::{self, ConfigFile},
+};
 
 #[derive(clap::Args)]
 pub struct McpArgs {
@@ -87,15 +87,18 @@ impl McpArgs {
 }
 
 pub fn config_path(agent: AgentTarget, scope: ConfigScope) -> Result<PathBuf> {
-    let relative = config_relative_path(agent, scope);
+    Ok(config_file(agent, scope)?.path())
+}
 
-    match (agent, scope) {
-        (AgentTarget::Claude, ConfigScope::Local) => home_dir().map(|home| home.join(relative)),
-        (_, ConfigScope::User) => home_dir().map(|home| home.join(relative)),
-        (_, ConfigScope::Project | ConfigScope::Local) => env::current_dir()
-            .map(|cwd| cwd.join(relative))
-            .context("failed to resolve current directory"),
-    }
+fn config_file(agent: AgentTarget, scope: ConfigScope) -> Result<ConfigFile> {
+    let relative = config_relative_path(agent, scope);
+    let root = match (agent, scope) {
+        (AgentTarget::Claude, ConfigScope::Local) | (_, ConfigScope::User) => home_dir()?,
+        (_, ConfigScope::Project | ConfigScope::Local) => {
+            env::current_dir().context("failed to resolve current directory")?
+        }
+    };
+    Ok(ConfigFile { root, relative })
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -122,17 +125,17 @@ fn config_relative_path(agent: AgentTarget, scope: ConfigScope) -> PathBuf {
 }
 
 struct ClaudeConfigLocation {
-    path: PathBuf,
+    file: ConfigFile,
     project_key: Option<String>,
 }
 
 fn claude_config_location(scope: ConfigScope) -> Result<ClaudeConfigLocation> {
-    let path = config_path(AgentTarget::Claude, scope)?;
+    let file = config_file(AgentTarget::Claude, scope)?;
     let project_key = match scope {
         ConfigScope::Local => Some(canonical_project_path()?),
         ConfigScope::Project | ConfigScope::User => None,
     };
-    Ok(ClaudeConfigLocation { path, project_key })
+    Ok(ClaudeConfigLocation { file, project_key })
 }
 
 fn canonical_project_path() -> Result<String> {
@@ -259,9 +262,10 @@ fn remove_claude_forge(config: &mut Value, project_key: Option<&str>) -> Result<
     Ok(servers.remove("forge").is_some())
 }
 
-pub fn read_config(path: &Path) -> Result<Value> {
-    match fs::read_to_string(path) {
-        Ok(contents) => {
+fn read_config(file: &ConfigFile) -> Result<Value> {
+    let path = file.path();
+    match mcp_fs::read_text(file)? {
+        Some(contents) => {
             let value: Value = serde_json::from_str(&contents)
                 .with_context(|| format!("failed to parse JSON at {}", path.display()))?;
             if value.is_object() {
@@ -270,12 +274,12 @@ pub fn read_config(path: &Path) -> Result<Value> {
                 Err(anyhow!("config at {} is not a JSON object", path.display()))
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Map::new())),
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+        None => Ok(Value::Object(Map::new())),
     }
 }
 
-pub fn write_config(path: &Path, config: &Value) -> Result<()> {
+fn write_config(file: &ConfigFile, config: &Value) -> Result<()> {
+    let path = file.path();
     if !config.is_object() {
         return Err(anyhow!("config at {} is not a JSON object", path.display()));
     }
@@ -283,40 +287,7 @@ pub fn write_config(path: &Path, config: &Value) -> Result<()> {
     let mut body = serde_json::to_string_pretty(config)
         .with_context(|| format!("failed to serialize {}", path.display()))?;
     body.push('\n');
-    write_private_file(path, body.as_bytes())
-}
-
-fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
-        file.write_all(contents)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("failed to sync {}", path.display()))?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))?;
-    }
-
-    Ok(())
+    mcp_fs::write_text(file, body.as_bytes())
 }
 
 pub fn install(
@@ -327,18 +298,19 @@ pub fn install(
     token_env: Option<&str>,
     project_id: Option<&str>,
 ) -> Result<()> {
-    let path = config_path(agent, scope)?;
+    let file = config_file(agent, scope)?;
+    let path = file.path();
     let auth = resolve_install_auth(server, scope, token, token_env)?;
     let install_url = install_url(server, project_id)?;
     if agent == AgentTarget::Codex {
-        let contents = read_codex_config(&path)?;
+        let contents = read_codex_config(&file)?;
         let next = match &auth {
             InstallAuth::Literal(access_token) => {
                 set_codex_forge_config(&contents, &install_url, access_token)
             }
             InstallAuth::Env(name) => set_codex_forge_env_config(&contents, &install_url, name),
         };
-        write_codex_config_if_changed(&path, &contents, next)?;
+        write_codex_config_if_changed(&file, &contents, next)?;
         println!("Installed Forge MCP at {}", path.display());
         return Ok(());
     }
@@ -349,19 +321,19 @@ pub fn install(
             InstallAuth::Literal(access_token) => format!("Bearer {access_token}"),
             InstallAuth::Env(name) => format!("Bearer ${{{name}}}"),
         };
-        let mut config = read_config(&location.path)?;
+        let mut config = read_config(&location.file)?;
         set_claude_forge(
             &mut config,
             location.project_key.as_deref(),
             &install_url,
             &authorization,
         )?;
-        write_config(&location.path, &config)?;
-        println!("Installed Forge MCP at {}", location.path.display());
+        write_config(&location.file, &config)?;
+        println!("Installed Forge MCP at {}", location.file.path().display());
         return Ok(());
     }
 
-    let mut config = read_config(&path)?;
+    let mut config = read_config(&file)?;
     let root = config
         .as_object_mut()
         .ok_or_else(|| anyhow!("config at {} is not a JSON object", path.display()))?;
@@ -401,7 +373,7 @@ pub fn install(
     );
     mcp_servers.insert("forge".to_owned(), Value::Object(forge));
 
-    write_config(&path, &config)?;
+    write_config(&file, &config)?;
     println!("Installed Forge MCP at {}", path.display());
     Ok(())
 }
@@ -465,27 +437,31 @@ fn require_env_value(name: &str) -> Result<()> {
 }
 
 pub fn uninstall(agent: AgentTarget, scope: ConfigScope) -> Result<()> {
-    let path = config_path(agent, scope)?;
+    let file = config_file(agent, scope)?;
+    let path = file.path();
     if agent == AgentTarget::Codex {
-        let contents = read_codex_config(&path)?;
-        write_codex_config_if_changed(&path, &contents, remove_codex_forge(&contents))?;
+        let contents = read_codex_config(&file)?;
+        write_codex_config_if_changed(&file, &contents, remove_codex_forge(&contents))?;
         println!("Removed Forge MCP from {}", path.display());
         return Ok(());
     }
 
     if agent == AgentTarget::Claude {
         let location = claude_config_location(scope)?;
-        let mut config = read_config(&location.path)?;
+        let mut config = read_config(&location.file)?;
         if remove_claude_forge(&mut config, location.project_key.as_deref())? {
-            write_config(&location.path, &config)?;
-            println!("Removed Forge MCP from {}", location.path.display());
+            write_config(&location.file, &config)?;
+            println!("Removed Forge MCP from {}", location.file.path().display());
         } else {
-            println!("Forge MCP is not installed at {}", location.path.display());
+            println!(
+                "Forge MCP is not installed at {}",
+                location.file.path().display()
+            );
         }
         return Ok(());
     }
 
-    let mut config = read_config(&path)?;
+    let mut config = read_config(&file)?;
     let root = config
         .as_object_mut()
         .ok_or_else(|| anyhow!("config at {} is not a JSON object", path.display()))?;
@@ -504,23 +480,24 @@ pub fn uninstall(agent: AgentTarget, scope: ConfigScope) -> Result<()> {
         return Ok(());
     }
 
-    write_config(&path, &config)?;
+    write_config(&file, &config)?;
     println!("Removed Forge MCP from {}", path.display());
     Ok(())
 }
 
 pub fn status(agent: AgentTarget, scope: ConfigScope) -> Result<()> {
-    let path = config_path(agent, scope)?;
+    let file = config_file(agent, scope)?;
+    let path = file.path();
     let url = if agent == AgentTarget::Codex {
-        codex_forge_url(&read_codex_config(&path)?)
+        codex_forge_url(&read_codex_config(&file)?)
     } else if agent == AgentTarget::Claude {
         let location = claude_config_location(scope)?;
         claude_forge_url(
-            &read_config(&location.path)?,
+            &read_config(&location.file)?,
             location.project_key.as_deref(),
         )?
     } else {
-        let config = read_config(&path)?;
+        let config = read_config(&file)?;
         forge_url(&config, &path)?
     };
 
@@ -597,17 +574,13 @@ fn install_url(server: &str, project_id: Option<&str>) -> Result<String> {
     Ok(url.to_string())
 }
 
-fn read_codex_config(path: &Path) -> Result<String> {
-    match fs::read_to_string(path) {
-        Ok(contents) => Ok(contents),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
-    }
+fn read_codex_config(file: &ConfigFile) -> Result<String> {
+    Ok(mcp_fs::read_text(file)?.unwrap_or_default())
 }
 
-fn write_codex_config_if_changed(path: &Path, previous: &str, next: String) -> Result<()> {
+fn write_codex_config_if_changed(file: &ConfigFile, previous: &str, next: String) -> Result<()> {
     if next != previous {
-        write_private_file(path, next.as_bytes())?;
+        mcp_fs::write_text(file, next.as_bytes())?;
     }
     Ok(())
 }
@@ -723,6 +696,11 @@ fn unquote_toml_string(value: &str) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).expect("config reads"))
+            .expect("config parses")
+    }
 
     #[test]
     fn config_relative_path_uses_claude_mcp_locations() {
@@ -915,7 +893,7 @@ command = "other"
         drop(cwd_guard);
 
         let claude_path = repo_dir.join(".mcp.json");
-        let claude = read_config(&claude_path).expect("Claude config reads");
+        let claude = read_json(&claude_path);
         assert_eq!(
             claude["mcpServers"]["forge"]["headers"]["Authorization"],
             "Bearer ${FORGE_TOKEN}"
@@ -930,7 +908,7 @@ command = "other"
         );
 
         let cursor_path = repo_dir.join(".cursor/mcp.json");
-        let cursor = read_config(&cursor_path).expect("Cursor config reads");
+        let cursor = read_json(&cursor_path);
         assert_eq!(
             cursor["mcpServers"]["forge"]["headers"]["Authorization"],
             "Bearer ${env:FORGE_TOKEN}"
@@ -949,7 +927,7 @@ command = "other"
         uninstall(AgentTarget::Claude, ConfigScope::Project)
             .expect("Claude project uninstall succeeds");
         drop(cwd_guard);
-        let claude = read_config(&claude_path).expect("Claude config reads after uninstall");
+        let claude = read_json(&claude_path);
         assert!(claude["mcpServers"].get("forge").is_none());
         assert_eq!(claude["foreign"], true);
         assert_eq!(
@@ -1046,7 +1024,7 @@ command = "other"
         )
         .expect("user install succeeds");
 
-        let config = read_config(&claude_path).expect("Claude config reads");
+        let config = read_json(&claude_path);
         assert_eq!(config["numStartups"], 7);
         assert_eq!(
             config["mcpServers"]["user-other"]["url"],
@@ -1098,7 +1076,7 @@ command = "other"
         let cwd_a = CurrentDirGuard::set(&repo_a);
         uninstall(AgentTarget::Claude, ConfigScope::Local).expect("local A uninstall succeeds");
         drop(cwd_a);
-        let config = read_config(&claude_path).expect("Claude config reads after local uninstall");
+        let config = read_json(&claude_path);
         assert!(config["projects"][key_a.as_str()]["mcpServers"]
             .get("forge")
             .is_none());
@@ -1116,7 +1094,7 @@ command = "other"
         );
 
         uninstall(AgentTarget::Claude, ConfigScope::User).expect("user uninstall succeeds");
-        let config = read_config(&claude_path).expect("Claude config reads after user uninstall");
+        let config = read_json(&claude_path);
         assert!(config["mcpServers"].get("forge").is_none());
         assert_eq!(
             config["mcpServers"]["user-other"]["url"],
@@ -1130,6 +1108,119 @@ command = "other"
         let _ = fs::remove_dir_all(home_dir);
         let _ = fs::remove_dir_all(repo_a);
         let _ = fs::remove_dir_all(repo_b);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_and_uninstall_reject_symlinked_final_file() {
+        let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
+        let data_dir = unique_temp_dir("forge-client-mcp-symlink-final-data");
+        let repo_dir = unique_temp_dir("forge-client-mcp-symlink-final");
+        let outside_dir = unique_temp_dir("forge-client-mcp-symlink-final-outside");
+        fs::create_dir_all(&repo_dir).expect("repo creates");
+        fs::create_dir_all(&outside_dir).expect("outside creates");
+        let outside_file = outside_dir.join("target.json");
+        fs::write(&outside_file, "{\"keep\":true}\n").expect("outside writes");
+        std::os::unix::fs::symlink(&outside_file, repo_dir.join(".mcp.json"))
+            .expect("symlink creates");
+        let _env = EnvVarGuard::set("FORGE_TOKEN", "fg_symlink");
+        let _data = EnvVarGuard::set("FORGE_DATA_DIR", data_dir.to_string_lossy().as_ref());
+        let cwd_guard = CurrentDirGuard::set(&repo_dir);
+
+        let error = install(
+            "http://127.0.0.1:8080",
+            AgentTarget::Claude,
+            ConfigScope::Project,
+            None,
+            None,
+            Some("project-1"),
+        )
+        .expect_err("symlink install rejects");
+        assert!(error.to_string().contains("symlink"));
+        let error = uninstall(AgentTarget::Claude, ConfigScope::Project)
+            .expect_err("symlink uninstall rejects");
+        assert!(error.to_string().contains("symlink"));
+        drop(cwd_guard);
+
+        assert_eq!(
+            fs::read_to_string(&outside_file).expect("outside reads"),
+            "{\"keep\":true}\n"
+        );
+        let _ = fs::remove_dir_all(repo_dir);
+        let _ = fs::remove_dir_all(outside_dir);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_symlinked_intermediate_directories() {
+        let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
+        let data_dir = unique_temp_dir("forge-client-mcp-symlink-dir-data");
+        let repo_dir = unique_temp_dir("forge-client-mcp-symlink-dir");
+        let outside_dir = unique_temp_dir("forge-client-mcp-symlink-dir-outside");
+        fs::create_dir_all(&repo_dir).expect("repo creates");
+        fs::create_dir_all(&outside_dir).expect("outside creates");
+        let _env = EnvVarGuard::set("FORGE_TOKEN", "fg_symlink");
+        let _data = EnvVarGuard::set("FORGE_DATA_DIR", data_dir.to_string_lossy().as_ref());
+        let cwd_guard = CurrentDirGuard::set(&repo_dir);
+
+        for (agent, directory, output) in [
+            (AgentTarget::Cursor, ".cursor", "mcp.json"),
+            (AgentTarget::Codex, ".codex", "config.toml"),
+        ] {
+            std::os::unix::fs::symlink(&outside_dir, repo_dir.join(directory))
+                .expect("directory symlink creates");
+            let error = install(
+                "http://127.0.0.1:8080",
+                agent,
+                ConfigScope::Project,
+                None,
+                None,
+                Some("project-1"),
+            )
+            .expect_err("intermediate symlink rejects");
+            assert!(error.to_string().contains("symlink"));
+            let error = uninstall(agent, ConfigScope::Project)
+                .expect_err("intermediate symlink uninstall rejects");
+            assert!(error.to_string().contains("symlink"));
+            assert!(!outside_dir.join(output).exists());
+            fs::remove_file(repo_dir.join(directory)).expect("symlink removes");
+        }
+        drop(cwd_guard);
+
+        let _ = fs::remove_dir_all(repo_dir);
+        let _ = fs::remove_dir_all(outside_dir);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn install_creates_missing_targets_and_uninstall_keeps_foreign_keys() {
+        let _guard = crate::auth::TEST_ENV_LOCK.lock().expect("test env lock");
+        let data_dir = unique_temp_dir("forge-client-mcp-missing-data");
+        let repo_dir = unique_temp_dir("forge-client-mcp-missing");
+        fs::create_dir_all(&repo_dir).expect("repo creates");
+        let _env = EnvVarGuard::set("FORGE_TOKEN", "fg_missing");
+        let _data = EnvVarGuard::set("FORGE_DATA_DIR", data_dir.to_string_lossy().as_ref());
+        let cwd_guard = CurrentDirGuard::set(&repo_dir);
+
+        install(
+            "http://127.0.0.1:8080",
+            AgentTarget::Cursor,
+            ConfigScope::Project,
+            None,
+            None,
+            Some("project-1"),
+        )
+        .expect("missing target creates");
+        let path = repo_dir.join(".cursor/mcp.json");
+        assert!(path.exists());
+        uninstall(AgentTarget::Cursor, ConfigScope::Project).expect("uninstall succeeds");
+        let config = read_json(&path);
+        assert!(config["mcpServers"].get("forge").is_none());
+        drop(cwd_guard);
+
+        let _ = fs::remove_dir_all(repo_dir);
         let _ = fs::remove_dir_all(data_dir);
     }
 
@@ -1216,7 +1307,7 @@ command = "other"
         .expect("user install succeeds");
 
         let path = home_dir.join(".claude.json");
-        let config = read_config(&path).expect("config reads");
+        let config = read_json(&path);
         assert_eq!(
             config["mcpServers"]["forge"]["headers"]["Authorization"],
             "Bearer fg_user"
