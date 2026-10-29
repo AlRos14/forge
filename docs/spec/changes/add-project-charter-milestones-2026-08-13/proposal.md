@@ -3,6 +3,11 @@ created_at: 2026-08-13T19:04:05Z
 updated_at: 2026-08-13T19:04:05Z
 ---
 
+> **Historical proposal.** The charter, Genesis, Project document, milestone, and
+> readiness workflows were retired by PR11–PR13. ProjectRelease remains as a
+> read-only historical snapshot only. This proposal is not a current operating
+> contract.
+
 # Project Charters, Durable Project Documents, and Evidence-Backed Milestones
 
 ## Why

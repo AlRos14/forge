@@ -1669,8 +1669,9 @@ impl CollaborationService {
         let member = ProjectMemberRepo::get_member(&*self.db, &project.id, user_id)
             .await?
             .is_some();
-        // This matches the current local-first Project access contract.
-        if project.owner_id.is_some() && project.owner_id.as_deref() != Some(user_id) && !member {
+        // A non-ownerless Project is readable only through its exact
+        // membership representation (INV-040).
+        if project.owner_id.is_some() && !member {
             return Err(not_found("project", project.id.clone()));
         }
         if UserRepo::get_user_by_id(&*self.db, user_id)

@@ -1,12 +1,18 @@
 services:
   forge:
     build: .
+    init: true
     ports:
-      - "8080:8080"
+      # Loopback by default. Set FORGE_BIND_ADDRESS only behind a reviewed
+      # proxy/TLS boundary; do not publish this port directly to the Internet.
+      - "${FORGE_BIND_ADDRESS:-127.0.0.1}:${FORGE_PORT:-8080}:8080"
     volumes:
       - forge-data:/data
     environment:
-      - RUST_LOG=info
+      RUST_LOG: ${RUST_LOG:-info}
+      # Existing root-owned /data volumes fail closed unless this migration is
+      # explicitly authorized once. It is never enabled by default.
+      FORGE_MIGRATE_ROOT_OWNED_DATA: ${FORGE_MIGRATE_ROOT_OWNED_DATA:-0}
     restart: unless-stopped
 
 volumes:

@@ -12,6 +12,11 @@ use tower::ServiceExt;
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
+fn test_password() -> &'static str {
+    static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PASSWORD.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
 async fn register(app: &axum::Router, email: &str, password: &str) -> axum::response::Response {
     app.clone()
         .oneshot(
@@ -104,7 +109,7 @@ async fn auth_full_flow() {
     let app = &harness.app;
 
     let email = "flow@example.com";
-    let password = "Password123!";
+    let password = test_password();
 
     // Register
     let reg_resp = register(app, email, password).await;
@@ -173,15 +178,88 @@ async fn auth_full_flow() {
     );
 }
 
-// ── 4.8: SSE with ?token= query param ─────────────────────────────────────
+// ── 4.8: SSE with a short-lived, single-use ticket ────────────────────────
+
+async fn issue_sse_ticket(
+    app: &axum::Router,
+    access_token: &str,
+) -> api_types::EventTicketResponse {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/events/ticket")
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    parse_body(resp, StatusCode::OK).await
+}
 
 #[tokio::test]
-async fn sse_accepts_token_query_param() {
+async fn sse_accepts_short_lived_ticket() {
     let workspace_root = common::TestDir::new("auth-sse-ws");
     let harness = common::test_app(workspace_root.path(), "auth-sse").await;
     let app = &harness.app;
 
-    let auth = register_and_login(app, "sse@example.com", "Password123!").await;
+    let auth = register_and_login(app, "sse@example.com", test_password()).await;
+    let ticket = issue_sse_ticket(app, &auth.access_token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/events?ticket={}", ticket.ticket))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "SSE with a ticket must be accepted"
+    );
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("text/event-stream"),
+        "response must be SSE stream"
+    );
+
+    let replay = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/events?ticket={}", ticket.ticket))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.status(),
+        StatusCode::UNAUTHORIZED,
+        "SSE tickets must be single-use"
+    );
+}
+
+#[tokio::test]
+async fn sse_rejects_reusable_token_query_param() {
+    let workspace_root = common::TestDir::new("auth-sse-query-ws");
+    let harness = common::test_app(workspace_root.path(), "auth-sse-query").await;
+    let app = &harness.app;
+
+    let auth = register_and_login(app, "sse-query@example.com", test_password()).await;
 
     let resp = app
         .clone()
@@ -197,17 +275,50 @@ async fn sse_accepts_token_query_param() {
 
     assert_eq!(
         resp.status(),
-        StatusCode::OK,
-        "SSE with ?token= must be accepted"
+        StatusCode::UNAUTHORIZED,
+        "reusable access tokens are not valid SSE query credentials"
     );
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert!(
-        ct.contains("text/event-stream"),
-        "response must be SSE stream"
+}
+
+#[tokio::test]
+async fn query_token_never_authenticates_rest_or_overrides_a_header() {
+    let workspace_root = common::TestDir::new("auth-query-ws");
+    let harness = common::test_app(workspace_root.path(), "auth-query").await;
+    let app = &harness.app;
+    let auth = register_and_login(app, "query@example.com", test_password()).await;
+
+    let query_only = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/auth/me?token={}", auth.access_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(query_only.status(), StatusCode::UNAUTHORIZED);
+
+    let header_wins = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/auth/me?token=not-a-valid-token")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", auth.access_token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        header_wins.status(),
+        StatusCode::OK,
+        "an invalid query value must never override a valid Authorization header"
     );
 }
 
@@ -230,6 +341,87 @@ async fn sse_rejects_missing_token() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── 4.8b: JWTs use current durable authority, not frozen claims ───────────
+
+async fn admin_list_status(app: &axum::Router, access_token: &str) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/admin/users")
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn jwt_loses_admin_authority_after_degradation() {
+    let workspace_root = common::TestDir::new("auth-degrade-ws");
+    let harness = common::test_app(workspace_root.path(), "auth-degrade").await;
+    let app = &harness.app;
+
+    let auth = register_and_login(app, "degrade@example.com", test_password()).await;
+    assert_eq!(
+        admin_list_status(app, &auth.access_token).await,
+        StatusCode::OK,
+        "bootstrap user starts as admin"
+    );
+
+    let user = db::UserRepo::get_user_by_email(&*harness.state.db, "degrade@example.com")
+        .await
+        .expect("user lookup")
+        .expect("user exists");
+    db::UserRepo::set_admin(&*harness.state.db, &user.id, false)
+        .await
+        .expect("degrade admin");
+
+    assert_eq!(
+        admin_list_status(app, &auth.access_token).await,
+        StatusCode::FORBIDDEN,
+        "the existing JWT must lose administrative authority immediately"
+    );
+}
+
+#[tokio::test]
+async fn jwt_for_deleted_user_is_rejected_and_refresh_fails() {
+    let workspace_root = common::TestDir::new("auth-deleted-ws");
+    let harness = common::test_app(workspace_root.path(), "auth-deleted").await;
+    let app = &harness.app;
+
+    let auth = register_and_login(app, "deleted@example.com", test_password()).await;
+    let user = db::UserRepo::get_user_by_email(&*harness.state.db, "deleted@example.com")
+        .await
+        .expect("user lookup")
+        .expect("user exists");
+    db::UserRepo::delete_user(&*harness.state.db, &user.id)
+        .await
+        .expect("delete user");
+
+    let me = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/auth/me")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", auth.access_token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(me.status(), StatusCode::UNAUTHORIZED);
+
+    let refresh = do_refresh(app, &auth.refresh_token).await;
+    assert_eq!(refresh.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ── 4.9: daemon registration requires an authenticated user ────────────────
@@ -274,7 +466,7 @@ async fn concurrent_refresh_single_winner() {
     let harness = common::test_app(workspace_root.path(), "auth-race").await;
     let app = &harness.app;
 
-    let auth = register_and_login(app, "race@example.com", "Password123!").await;
+    let auth = register_and_login(app, "race@example.com", test_password()).await;
     let token = auth.refresh_token.clone();
 
     let body = serde_json::to_string(&json!({ "refresh_token": token })).unwrap();

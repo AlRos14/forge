@@ -20,10 +20,9 @@ pub(crate) async fn actor_is_valid_for_project(
             if user_id == "human" || UserRepo::get_user_by_id(db, user_id).await?.is_none() {
                 return Ok(false);
             }
-            let is_project_member = ProjectMemberRepo::get_member(db, &project.id, user_id)
+            Ok(ProjectMemberRepo::get_member(db, &project.id, user_id)
                 .await?
-                .is_some();
-            Ok(project.owner_id.as_deref() == Some(user_id) || is_project_member)
+                .is_some())
         }
         ActorRef::Agent(agent_id) => {
             if agent_id == "human" {
@@ -33,7 +32,6 @@ pub(crate) async fn actor_is_valid_for_project(
                 return Ok(false);
             };
             let owner_is_project_actor = match agent.owner_id.as_deref() {
-                Some(owner_id) if project.owner_id.as_deref() == Some(owner_id) => true,
                 Some(owner_id) => ProjectMemberRepo::get_member(db, &project.id, owner_id)
                     .await?
                     .is_some(),
@@ -53,7 +51,7 @@ pub(crate) async fn actor_is_valid_for_project(
 pub(crate) async fn actor_is_valid_for_project_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     project_id: &str,
-    project_owner_id: Option<&str>,
+    _project_owner_id: Option<&str>,
     actor: &ActorRef,
 ) -> Result<bool> {
     match actor {
@@ -78,7 +76,7 @@ pub(crate) async fn actor_is_valid_for_project_in_tx(
             .bind(user_id)
             .fetch_one(&mut **transaction)
             .await?;
-            Ok(project_owner_id == Some(user_id) || member_exists != 0)
+            Ok(member_exists != 0)
         }
         ActorRef::Agent(agent_id) => {
             if agent_id == "human" {
@@ -95,7 +93,6 @@ pub(crate) async fn actor_is_valid_for_project_in_tx(
             let visibility: String = agent.try_get("visibility")?;
             let owner_id: Option<String> = agent.try_get("owner_id")?;
             let owner_is_project_actor = match owner_id.as_deref() {
-                Some(owner_id) if project_owner_id == Some(owner_id) => true,
                 Some(owner_id) => {
                     let member_exists: i64 = sqlx::query_scalar(
                         "SELECT EXISTS(

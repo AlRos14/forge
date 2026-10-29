@@ -347,9 +347,19 @@ async function ensureRelease(release) {
     throw new Error("Release archive did not include web/dist assets");
   }
 
+  // Write the readiness marker inside the private temp directory, then publish
+  // the whole directory with one rename. The marker is never created after a
+  // separate existsSync check on the published path.
+  const tempReadyFile = path.join(tempDir, ".ready");
+  const readyFd = fs.openSync(tempReadyFile, "wx", 0o444);
+  try {
+    fs.writeFileSync(readyFd, `${new Date().toISOString()}\n`);
+  } finally {
+    fs.closeSync(readyFd);
+  }
+
   fs.rmSync(installDir, { recursive: true, force: true });
   fs.renameSync(tempDir, installDir);
-  fs.writeFileSync(readyFile, `${new Date().toISOString()}\n`);
 
   return { binaryPath, ctlPath, installDir, tag };
 }
@@ -386,13 +396,27 @@ function openBrowserWhenReady(child, dataDir) {
   setTimeout(tick, 500);
 }
 
+function loopbackServerUrl(raw) {
+  try {
+    const parsed = new URL(raw);
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, "");
+    if (
+      (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      (hostname === "127.0.0.1" || hostname === "::1" || hostname === "localhost")
+    ) {
+      return parsed.toString().replace(/\/+$/, "");
+    }
+  } catch {}
+  return null;
+}
+
 function readServerUrl(dataDir) {
   try {
     const state = JSON.parse(
       fs.readFileSync(path.join(dataDir, SERVER_STATE_FILE), "utf8")
     );
     if (typeof state.server_url === "string" && state.server_url.trim()) {
-      return state.server_url.trim().replace(/\/+$/, "");
+      return loopbackServerUrl(state.server_url.trim());
     }
   } catch {}
   return null;

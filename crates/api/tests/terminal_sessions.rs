@@ -124,11 +124,32 @@ async fn request_with_bearer(
 }
 
 async fn sse_request(app: &Router) -> axum::response::Response {
+    let ticket_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/events/ticket")
+                .header(header::AUTHORIZATION, format!("Bearer {}", test_jwt()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ticket_response.status(), StatusCode::OK);
+    let bytes = to_bytes(ticket_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let ticket: Value = serde_json::from_slice(&bytes).unwrap();
+
     app.clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(format!("/api/v1/events?token={}", test_jwt()))
+                .uri(format!(
+                    "/api/v1/events?ticket={}",
+                    ticket["ticket"].as_str().unwrap()
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -174,19 +195,6 @@ async fn seed_task(harness: &Harness) -> SeededTask {
             settings: "{}".to_owned(),
             primary_repo_id: None,
             owner_id: Some(TEST_USER_ID.to_owned()),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    db::ProjectMemberRepo::add_member(
-        &*harness.state.db,
-        db::CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: project_id.clone(),
-            user_id: TEST_USER_ID.to_owned(),
-            role: "owner".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -471,6 +479,7 @@ async fn unauthorized_user_rejected() {
     let harness = setup(enabled_terminal()).await;
     let task = seed_task(&harness).await;
     seed_ready_workspace(&harness, &task).await;
+    seed_user(&harness.state.db, "second-user-id", "second@example.com").await;
     let token = test_jwt_for("second-user-id", "second@example.com", false);
 
     let (status, _) = request_with_bearer(

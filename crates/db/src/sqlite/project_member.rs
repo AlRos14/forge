@@ -4,6 +4,17 @@ use crate::{CreateProjectMember, ProjectMember, ProjectMemberRepo};
 #[async_trait]
 impl ProjectMemberRepo for SqliteDb {
     async fn add_member(&self, input: CreateProjectMember) -> Result<ProjectMember> {
+        let mut transaction = self.pool.begin().await?;
+        let member = self.add_member_in_tx(&mut transaction, input).await?;
+        transaction.commit().await?;
+        Ok(member)
+    }
+
+    async fn add_member_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: CreateProjectMember,
+    ) -> Result<ProjectMember> {
         sqlx::query(
             "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -14,7 +25,7 @@ impl ProjectMemberRepo for SqliteDb {
         .bind(&input.role)
         .bind(&input.created_at)
         .bind(&input.updated_at)
-        .execute(&self.pool)
+        .execute(&mut **transaction)
         .await
         .map_err(|e| {
             if e.to_string().contains("UNIQUE") {
@@ -44,6 +55,21 @@ impl ProjectMemberRepo for SqliteDb {
             .transpose()
     }
 
+    async fn get_member_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ProjectMember>> {
+        sqlx::query("SELECT * FROM project_member WHERE project_id = ? AND user_id = ?")
+            .bind(project_id)
+            .bind(user_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .map(map_project_member)
+            .transpose()
+    }
+
     async fn list_members(&self, project_id: &str) -> Result<Vec<ProjectMember>> {
         let rows = sqlx::query(
             "SELECT * FROM project_member WHERE project_id = ? ORDER BY created_at ASC",
@@ -54,8 +80,38 @@ impl ProjectMemberRepo for SqliteDb {
         rows.into_iter().map(map_project_member).collect()
     }
 
+    async fn list_members_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        project_id: &str,
+    ) -> Result<Vec<ProjectMember>> {
+        let rows = sqlx::query(
+            "SELECT * FROM project_member WHERE project_id = ? ORDER BY created_at ASC",
+        )
+        .bind(project_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+        rows.into_iter().map(map_project_member).collect()
+    }
+
     async fn update_member_role(
         &self,
+        project_id: &str,
+        user_id: &str,
+        role: &str,
+        updated_at: &str,
+    ) -> Result<ProjectMember> {
+        let mut transaction = self.pool.begin().await?;
+        let member = self
+            .update_member_role_in_tx(&mut transaction, project_id, user_id, role, updated_at)
+            .await?;
+        transaction.commit().await?;
+        Ok(member)
+    }
+
+    async fn update_member_role_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         project_id: &str,
         user_id: &str,
         role: &str,
@@ -70,7 +126,7 @@ impl ProjectMemberRepo for SqliteDb {
         .bind(updated_at)
         .bind(project_id)
         .bind(user_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut **transaction)
         .await?;
 
         match result {

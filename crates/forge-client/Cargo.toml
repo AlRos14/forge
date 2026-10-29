@@ -30,6 +30,9 @@ dirs = "6"
 time = { version = "0.3", features = ["formatting", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 async-trait = "0.1"
 api = { path = "../api" }

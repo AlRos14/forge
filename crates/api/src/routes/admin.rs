@@ -45,22 +45,12 @@ pub async fn list_users(
 }
 
 pub async fn update_user_admin(
-    RequireAdmin(requester): RequireAdmin,
+    RequireAdmin(_requester): RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<UpdateAdminRequest>,
 ) -> ApiResult<Json<AdminUserResponse>> {
-    if !body.is_admin && id == requester.user_id {
-        let count = UserRepo::count_admins(&*state.db).await?;
-        if count <= 1 {
-            return Err(ApiError::conflict_with_code(
-                "last_admin",
-                "Cannot revoke the last admin",
-            ));
-        }
-    }
-
-    UserRepo::set_admin(&*state.db, &id, body.is_admin).await?;
+    UserRepo::set_admin_checked(&*state.db, &id, body.is_admin).await?;
     let user = UserRepo::get_user_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("user", id.clone()))?;
@@ -73,21 +63,7 @@ pub async fn delete_user(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let user = UserRepo::get_user_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("user", id.clone()))?;
-
-    if user.is_admin {
-        let count = UserRepo::count_admins(&*state.db).await?;
-        if count <= 1 {
-            return Err(ApiError::conflict_with_code(
-                "last_admin",
-                "Cannot delete the last admin",
-            ));
-        }
-    }
-
-    if !UserRepo::delete_user(&*state.db, &id).await? {
+    if !UserRepo::delete_user_checked(&*state.db, &id).await? {
         return Err(ApiError::not_found("user", id));
     }
 

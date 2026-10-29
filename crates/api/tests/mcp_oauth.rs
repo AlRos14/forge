@@ -103,6 +103,54 @@ async fn mcp_request_with_wrong_audience_oauth_token_rejected() {
 }
 
 #[tokio::test]
+async fn oauth_mcp_token_is_not_a_general_rest_access_token() {
+    let workspace = common::TestDir::new("mcp-oauth-rest-boundary");
+    let harness = common::test_app(workspace.path(), "mcp-oauth-rest-boundary").await;
+
+    let auth = register_user(&harness.app, "mcp-rest-boundary@example.com").await;
+    let user = current_user(&harness.app, &auth.access_token).await;
+    let access_token = mint_oauth_access_token(&harness, &user.id, &user.email).await;
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/auth/me")
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .body(Body::empty())
+                .expect("build REST request"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn mcp_oauth_token_for_deleted_user_is_rejected() {
+    let workspace = common::TestDir::new("mcp-oauth-deleted-user");
+    let harness = common::test_app(workspace.path(), "mcp-oauth-deleted-user").await;
+
+    let auth = register_user(&harness.app, "mcp-deleted@example.com").await;
+    let user = current_user(&harness.app, &auth.access_token).await;
+    let access_token = mint_oauth_access_token(&harness, &user.id, &user.email).await;
+
+    db::UserRepo::delete_user(&*harness.state.db, &user.id)
+        .await
+        .expect("delete OAuth subject");
+
+    let response = mcp_post(
+        &harness.app,
+        "/mcp",
+        Some(&access_token),
+        tools_list_request(),
+    )
+    .await;
+    assert_challenged_unauthorized(response, "invalid_token").await;
+}
+
+#[tokio::test]
 async fn mcp_oauth_token_subject_is_used_for_membership() {
     let workspace = common::TestDir::new("mcp-oauth-membership");
     let harness = common::test_app(workspace.path(), "mcp-oauth-membership").await;
@@ -148,7 +196,7 @@ async fn mcp_oauth_token_subject_is_used_for_membership() {
 }
 
 #[tokio::test]
-async fn mcp_query_token_takes_precedence_over_header() {
+async fn mcp_rejects_reusable_query_tokens() {
     let workspace = common::TestDir::new("mcp-oauth-query-token");
     let harness = common::test_app(workspace.path(), "mcp-oauth-query-token").await;
 
@@ -158,7 +206,30 @@ async fn mcp_query_token_takes_precedence_over_header() {
     let response = mcp_post(
         &harness.app,
         &format!("/mcp?token={pat}"),
-        Some("not-a-real-token"),
+        None,
+        tools_list_request(),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "a PAT in the query string must not authenticate MCP"
+    );
+}
+
+#[tokio::test]
+async fn mcp_bearer_header_wins_over_invalid_query_value() {
+    let workspace = common::TestDir::new("mcp-oauth-header-token");
+    let harness = common::test_app(workspace.path(), "mcp-oauth-header-token").await;
+
+    let auth = register_user(&harness.app, "mcp-header-token@example.com").await;
+    let pat = create_pat(&harness.app, &auth.access_token, "mcp-header-pat").await;
+
+    let response = mcp_post(
+        &harness.app,
+        "/mcp?token=not-a-valid-token",
+        Some(&pat),
         tools_list_request(),
     )
     .await;

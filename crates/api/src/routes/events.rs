@@ -1,15 +1,24 @@
 use std::{convert::Infallible, sync::Arc};
 
-use api_types::{PublicEventEnvelope, PublicEventType};
+use api_types::{EventTicketResponse, PublicEventEnvelope, PublicEventType};
 use axum::{
     extract::State,
     response::sse::{Event, KeepAlive, Sse},
+    Json,
 };
 use db::{DomainEvent, DomainEventRepo, ProjectMemberRepo, ProjectRepo, SqliteDb, TaskRepo};
 use serde_json::{json, Map, Value};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::{routes::auth::AuthenticatedUser, state::AppState};
+
+pub async fn issue_event_ticket(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+) -> Json<EventTicketResponse> {
+    let (ticket, expires_at) = state.sse_tickets.issue(&user);
+    Json(EventTicketResponse { ticket, expires_at })
+}
 
 pub async fn stream_events(
     State(state): State<AppState>,
@@ -185,7 +194,7 @@ async fn project_is_visible(db: &SqliteDb, project_id: &str, user_id: &str) -> b
     let Ok(Some(project)) = ProjectRepo::get_by_id(db, project_id).await else {
         return false;
     };
-    if project.owner_id.is_none() || project.owner_id.as_deref() == Some(user_id) {
+    if project.owner_id.is_none() {
         return true;
     }
     matches!(
@@ -416,6 +425,20 @@ mod tests {
         db::run_migrations(&pool).await.expect("migrations");
         let db = SqliteDb::new(pool);
         let now = db::now_rfc3339();
+        db::UserRepo::create_user(
+            &db,
+            &db::User {
+                id: "owner-a".to_owned(),
+                email: "owner-a@example.invalid".to_owned(),
+                password_hash: "unused".to_owned(),
+                display_name: None,
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("seed Project owner");
         db::ProjectRepo::create(
             &db,
             db::CreateProject {

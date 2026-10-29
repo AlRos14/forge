@@ -960,7 +960,7 @@ async fn v118_preserves_history_and_revokes_only_binding_only_memberships() {
     );
 
     let db = db::SqliteDb::new(pool.clone());
-    let release_project_delete = db::ProjectRepo::delete(&db, "pr11-fixture-project")
+    let release_project_delete = db::ProjectRepo::delete(&db, "pr11-fixture-project", None)
         .await
         .expect_err("a Project with an immutable Release cannot be deleted");
     assert!(

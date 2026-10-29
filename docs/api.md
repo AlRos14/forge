@@ -11,7 +11,8 @@ TaskLifecycle records.
 Main/Project Agent, Product Genesis, Agent Chat, Attention, Charter, baseline,
 milestone governance, legacy review rows, workflow state, and native runtime
 controls are not operational REST resources. PR13 migrations V121–V134 complete
-the persistence cutover and provider-start receipt changes. Retired runtime
+the persistence cutover and provider-start receipt changes. V135 repairs the
+canonical Project owner membership representation. Retired runtime
 schemas were removed after exact-history cutovers; preserved legacy records
 remain in dedicated immutable history and migration ledgers. Unknown `/api/v1`
 paths return the normal API `404 not_found` response;
@@ -21,9 +22,19 @@ reject unknown legacy fields.
 ## Authentication, errors, and pagination
 
 REST resources require a Bearer access token unless the route is part of the
-public authentication or OAuth bootstrap flow. The browser EventSource passes
-its access token as `?token=` because the native EventSource API cannot set an
-Authorization header.
+public authentication or OAuth bootstrap flow. Reusable JWT, PAT, OAuth, and
+daemon credentials are accepted only in the `Authorization: Bearer` header;
+`?token=` credentials are rejected on REST, MCP, and daemon WebSocket routes. A
+valid Authorization header always wins, and an invalid query value never
+overrides it.
+
+The browser EventSource cannot set an Authorization header. It first calls
+`POST /events/ticket` with its Bearer token, then connects to
+`GET /events?ticket=...`. The ticket is opaque, scoped to that user, expires
+after 30 seconds, and is consumed on first use. It is not a JWT or a reusable API
+credential. SSE reconnects request a fresh ticket. Terminal WebSocket attach
+tokens remain short-lived and single-use, and daemon command WebSockets use the
+daemon registration credential in the Authorization header.
 
 Errors use `{ "code": string, "message": string, "details": object | null,
 "request_id": string }`. Common outcomes are `400` for invalid input or an
@@ -69,25 +80,33 @@ the maximum is 100.
 | `GET /projects/{id}/integration`, `POST /projects/{id}/integration`, `PATCH /projects/{id}/integration`, `POST /projects/{id}/integration/sync` | Manage the Project's external issue integration. Create accepts and GET/PATCH return `credential_env_var`, the environment variable name Forge reads during sync; the credential value is never returned or stored. Optional `default_implementer` is an exact `ActorRef`; imported issues create ordinary Tasks and, when configured, an `implementer` TaskRole with that Actor as a RoleMembership. Sync fails closed if the configured Actor is not valid for the Project. Lifecycle begins at the normal Task creation state; legacy `default_task_state` and singular assignment fields are rejected. |
 | `GET /projects/{id}/members`, `POST /projects/{id}/members`, `PATCH /projects/{id}/members/{user_id}`, `DELETE /projects/{id}/members/{user_id}` | Manage Project membership. |
 
-Project reads require the authenticated user to own the Project or have a
-`project_member` row; every membership role, including `viewer`, can read, and
-ownerless system Projects retain public read behavior. Invisible reads return
-the normal `404 not_found` response. Project lists filter by this read rule
-before pagination and report counts only for the caller's visible Projects.
+Project reads require an exact `project_member` row for a Project with a
+canonical owner; every membership role, including `viewer`, can read. Ownerless
+system Projects retain public read behavior. The canonical owner is represented
+by that owner membership (INV-040), not by an authorization shortcut.
+Invisible reads return the normal `404 not_found` response. Project lists filter
+by this read rule before pagination and report counts only for the caller's
+visible Projects.
 
 Visibility does not grant mutation authority. Ordinary Project-derived work
-requires the owner or an explicit `owner`, `admin`, or `member` membership;
-the member write rule follows the earlier Task/resource handlers, which used
-the same owner-or-membership visibility check for ordinary writes. Project
+requires an explicit `owner`, `admin`, or `member` membership. Project
 membership add/update/remove already requires owner/admin in
 `ProjectMemberService`. Viewers retain reads but no longer inherit writes from
 visibility. Project administration and
 sensitive configuration, including Project update/delete/pause/resume, generic
 hooks, Repo/PR provider configuration, and integrations, require owner/admin.
-Membership administration keeps its existing owner/admin checks. Ownerless
-Projects remain readable, but are writable only through an explicit membership
-with the role required for that operation; public visibility does not select or
-create an owner. Media upload and evidence attachment use ordinary write
+Membership administration keeps its existing owner/admin checks. `owner_id` is
+the canonical owner and must have an exact `project_member` row with role
+`owner`; V135 repairs historical representation without inventing an owner for
+an ownerless Project. Additional owner memberships are allowed. Removing or
+demoting the canonical owner atomically transfers canonical identity to another
+current owner, or returns `409 last_owner`. All owner mutations revalidate the
+caller, target, role set, and Project inside one `BEGIN IMMEDIATE` transaction,
+so a stale preflight cannot authorize a last-owner race. Ownerless Projects
+remain readable, but are writable only through an explicit membership with the
+role required for that operation; public visibility does not select or create
+an owner, and first-user bootstrap does not claim historical ownerless
+Projects. Media upload and evidence attachment use ordinary write
 authority; redaction and purge keep the existing media owner/admin disposition
 check. Foreign private Project reads continue to return `404`; visible callers
 without write authority receive `403`.
@@ -96,8 +115,8 @@ MCP uses the authenticated `McpContext.user_id` for the same read, write, and
 admin rules as REST. `McpContext.project_id` only narrows resource scope. A
 Project-scoped call cannot gain authority from its scope, and user/local calls
 still authorize each exact resource. Creating a Project through REST or MCP
-records the authenticated Human as owner and creates the owner's membership
-row.
+records the authenticated Human as owner and creates the owner membership in
+the same SQLite transaction as the Project.
 
 Repo and integration endpoints resolve the owning Project before access. Task,
 Workspace, Execution, dependency, external-link, Review, ValidationRun,
@@ -249,16 +268,17 @@ TaskLifecycle state and TaskRole membership do not imply running work.
 
 | Method and path | Contract |
 | --- | --- |
-| `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /auth/me`, `PATCH /auth/me` | Account authentication and profile. |
+| `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /auth/me`, `PATCH /auth/me` | Account authentication and profile. JWT verification resolves the durable user and current `is_admin`; deleted users are rejected and degraded administrators lose authority without waiting for expiry. Refresh resolves the same current user. |
 | `GET /auth/tokens`, `POST /auth/tokens`, `DELETE /auth/tokens/{id}` | Manage personal access tokens. |
+| `POST /events/ticket` | Issue a 30-second, single-use SSE ticket for the authenticated user. |
 | `GET /users/search` | Search users available for Project membership. |
-| `GET /admin/users`, `PATCH /admin/users/{id}`, `DELETE /admin/users/{id}`, `GET /admin/settings`, `PUT /admin/settings/{key}`, `DELETE /admin/settings/{key}` | Administrative account/settings operations. |
+| `GET /admin/users`, `PATCH /admin/users/{id}`, `DELETE /admin/users/{id}`, `GET /admin/settings`, `PUT /admin/settings/{key}`, `DELETE /admin/settings/{key}` | Administrative account/settings operations. Last-admin demotion/deletion returns `409 last_admin` inside the write transaction. Deleting an account that is the canonical owner of a Project transfers ownership to another current owner in the same transaction, or returns `409 last_project_owner`. |
 | `GET /settings`, `PUT /settings` | Read or update supported server settings. |
-| `GET /config/mcp`, `POST /config/mcp` | Read or update MCP connection configuration. |
+| `GET /config/mcp`, `POST /config/mcp` | Read or update MCP connection configuration. `scope=project` requires a non-empty `project_id` and Project admin; `user`/`local` scope requires a server administrator. Claude Code uses `.mcp.json` for project, and `~/.claude.json` under `projects[<canonical path>].mcpServers` for local or top-level `mcpServers` for user; local requires `project_id` so the canonical key is explicit. Returned URLs redact credential-like query parameters and userinfo; a legacy tokenized URL is reported as not installed. Configuration paths stay inside the selected Project/repo, cwd, or home root; symlinks in intermediate directories or the final file are rejected. |
 | `GET /operations/status`, `POST /operations/refresh` | Read or refresh operational health. Blocked Tasks carry TaskLifecycle state/version and an exact transition ID when a current receipt exists. Retry pressure lists exact immutable retry receipts and source/receipt DomainEvent IDs; it does not count legacy transition-log rows or read Task status. Active Executions expose only their exact `harness_session_id`. |
 | `GET /notifications`, `GET /notifications/unread-count`, `POST /notifications/mark-all-read`, `PATCH /notifications/{id}/read`, `DELETE /notifications/{id}` | Read and manage notifications for visible Projects. Unscoped lists/counts and mark-all-read operate only on the caller's visible Project set; an explicit invisible Project or another user's notification returns `404`. |
 | `GET /fs/list`, `GET /fs/branches` | Inspect supported local filesystem paths and branches. |
-| `POST /tasks/{id}/terminals`, `GET /tasks/{id}/terminals`, `GET /tasks/{id}/terminals/availability`, `GET /terminals/{id}`, `POST /terminals/{id}/attach-token`, `POST /terminals/{id}/resize`, `POST /terminals/{id}/terminate`, `GET /terminals/{id}/ws` | Manage a terminal bound to a Task workspace and its exact active lease. |
+| `POST /tasks/{id}/terminals`, `GET /tasks/{id}/terminals`, `GET /tasks/{id}/terminals/availability`, `GET /terminals/{id}`, `POST /terminals/{id}/attach-token`, `POST /terminals/{id}/resize`, `POST /terminals/{id}/terminate`, `GET /terminals/{id}/ws` | Manage a terminal bound to a Task workspace and its exact active lease. Attach tokens are short-lived and single-use. The WebSocket rechecks current Project write authority on attach and every five seconds; membership removal or account deletion closes access. |
 | `GET /tasks/{id}/external-links`, `POST /tasks/{id}/external-links`, `DELETE /tasks/{id}/external-links/{link_id}` | Manage generic external Task links. |
 
 OAuth endpoints for MCP clients are `/oauth/register`, `/oauth/authorize`,
@@ -304,8 +324,10 @@ Runtime hint names are `project.created`, `project.updated`, `project.deleted`,
 gap. Agent Chat, Attention, old workflow transitions, `task.status`, and
 legacy Review-row events are not public event types.
 
-SSE requires authentication and filters Project- and Task-scoped events through
-the same read visibility rule as REST. Before deleting a Project, Forge captures
+SSE requires authentication through either a Bearer header or a single-use
+`ticket` issued by `POST /events/ticket`; a JWT/PAT in `?token=` is not accepted.
+Both transports resolve current durable user authority. SSE filters Project- and
+Task-scoped events through the same read visibility rule as REST. Before deleting a Project, Forge captures
 the exact owner and Project member recipients. After teardown it sends a
 per-user `project.deleted` invalidation hint to that snapshot. The public payload
 contains no recipient list, outsider streams receive no hint, and recipient
@@ -313,6 +335,14 @@ authorization does not query the deleted Project. Operations status hints are
 limited to administrators; resync hints carry no Project data.
 
 ## MCP
+
+MCP accepts the same current-authority Bearer credentials as REST: a PAT, an
+access JWT, or a valid OAuth MCP token. Query-string credentials are not
+accepted. OAuth access tokens are checked against their issuer, audience, and
+`mcp` scope and then against the current user row, so account deletion or
+administrator degradation applies immediately. OAuth MCP tokens carry
+`token_use=mcp` and are not accepted as general REST access tokens.
+`tools/list` is authoritative.
 
 The MCP server advertises only registered tools. The current tool names are:
 

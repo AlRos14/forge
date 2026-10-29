@@ -179,9 +179,22 @@ async fn run_terminal_socket(
 ) {
     let mut terminal_rx = state.terminal_service.attach_client(&session_id).await;
     let (mut sink, mut stream) = socket.split();
+    let mut authority_check = tokio::time::interval(tokio::time::Duration::from_secs(5));
+    authority_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
+            _ = authority_check.tick() => {
+                let allowed = state
+                    .terminal_service
+                    .user_can_attach(&session_id, &user_id)
+                    .await
+                    .unwrap_or(false);
+                if !allowed {
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                }
+            }
             server_frame = terminal_rx.recv() => {
                 let Some(frame) = server_frame else {
                     break;
@@ -256,7 +269,7 @@ async fn handle_client_text_frame(
     let result = match frame {
         TerminalClientFrame::Input { data } => state
             .terminal_service
-            .handle_terminal_input(session_id, &data)
+            .handle_terminal_input(session_id, user_id, &data)
             .await
             .map(|_| None),
         TerminalClientFrame::Resize { rows, cols } => state
@@ -271,14 +284,20 @@ async fn handle_client_text_frame(
         Ok(Some(frame)) => send_server_frame(sink, frame).await,
         Ok(None) => true,
         Err(error) => {
-            send_server_frame(
-                sink,
+            let revoked = matches!(&error, services::ServiceError::AuthorizationDenied { .. });
+            let frame = if revoked {
+                TerminalServerFrame::Error {
+                    code: "authorization_revoked".to_owned(),
+                    message: "terminal authority was revoked".to_owned(),
+                }
+            } else {
                 TerminalServerFrame::Error {
                     code: "terminal_error".to_owned(),
                     message: error.to_string(),
-                },
-            )
-            .await
+                }
+            };
+            let sent = send_server_frame(sink, frame).await;
+            sent && !revoked
         }
     }
 }

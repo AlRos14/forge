@@ -1,5 +1,7 @@
 # Plan PR1 preflight: Actor and multi-actor TaskRole migration
 
+> **Historical migration ledger.** This document records the state at its named baseline. PR0–PR15 are complete and merged; status statements such as "not merged" or "ready for review" describe the authoring moment. Current behavior is documented in [architecture.md](../architecture.md) and [concepts](../concepts/).
+
 Status: audit only. No Plan PR1 schema, writer, reader, scheduler, execution,
 HarnessSession, or authority implementation is included in Plan PR0.
 

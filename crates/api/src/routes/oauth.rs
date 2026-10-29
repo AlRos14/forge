@@ -591,6 +591,13 @@ mod tests {
     }
 
     async fn seed_test_user(state: &AppState) {
+        if UserRepo::get_user_by_id(&*state.db, "test-user-id")
+            .await
+            .expect("test user lookup")
+            .is_some()
+        {
+            return;
+        }
         let now = now_rfc3339();
         UserRepo::create_user(
             &*state.db,

@@ -3,9 +3,10 @@ use std::sync::Arc;
 use api_types::{parse_project_hooks_json, ProjectHookAction, ProjectHookRule, ProjectHookTrigger};
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
-    CreateAgent, CreateProject, CreateProjectHookRun, CreateTask, DaemonRepo, DaemonStatus,
-    ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus, ProjectRepo, RoleMembershipRepo,
-    SqliteDb, Task, TaskLifecycleState, TaskRepo, UpdateDaemonReport, UpsertDaemon, User, UserRepo,
+    CreateAgent, CreateProject, CreateProjectHookRun, CreateProjectMember, CreateTask, DaemonRepo,
+    DaemonStatus, ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus, ProjectMemberRepo,
+    ProjectRepo, RoleMembershipRepo, SqliteDb, Task, TaskLifecycleState, TaskRepo,
+    UpdateDaemonReport, UpsertDaemon, User, UserRepo,
 };
 use events::{EventBus, EventContext, ForgeEvent};
 use serde_json::json;
@@ -159,6 +160,19 @@ async fn dispatch_agent_launch_failure_links_created_automation_task() {
         .execute(db.pool())
         .await
         .expect("Project receives its durable owner");
+    ProjectMemberRepo::add_member(
+        &*db,
+        CreateProjectMember {
+            id: new_uuid_v4(),
+            project_id: project.id.clone(),
+            user_id: owner_id.clone(),
+            role: "owner".to_owned(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("Project owner membership creates");
     project.owner_id = Some(owner_id.clone());
     let agent_id = seed_available_agent(&db, &owner_id).await;
     let rule = ProjectHookRule {

@@ -30,10 +30,14 @@ pub struct TokenPair {
 struct Claims {
     sub: String,
     email: String,
-    #[serde(default)]
-    is_admin: bool,
     iat: u64,
     exp: u64,
+    #[serde(default)]
+    token_use: Option<String>,
+    #[serde(default)]
+    aud: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 impl AuthService {
@@ -243,7 +247,15 @@ impl AuthService {
         Ok(RefreshTokenRepo::delete_expired_refresh_tokens(&*self.db).await?)
     }
 
-    pub fn verify_token(&self, token: &str) -> std::result::Result<(String, String, bool), String> {
+    /// Verifies the JWT signature and lifetime, then resolves the durable user.
+    ///
+    /// Privileges are never taken from the token: a deleted user is rejected and
+    /// `is_admin` is read from the current user row, so a degraded account loses
+    /// administrative authority immediately.
+    pub async fn verify_token(
+        &self,
+        token: &str,
+    ) -> std::result::Result<(String, String, bool), String> {
         use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 
         let mut validation = Validation::new(Algorithm::HS256);
@@ -260,11 +272,23 @@ impl AuthService {
             _ => "invalid_token".to_string(),
         })?;
 
-        Ok((
-            token_data.claims.sub,
-            token_data.claims.email,
-            token_data.claims.is_admin,
-        ))
+        // OAuth MCP access tokens share this signing key and claim shape. They
+        // carry token_use=mcp and an audience/scope and are not general REST
+        // access tokens. Missing token_use is accepted only for pre-upgrade
+        // access tokens, which expire within 15 minutes.
+        if token_data.claims.token_use.as_deref() == Some("mcp")
+            || token_data.claims.aud.is_some()
+            || token_data.claims.scope.is_some()
+        {
+            return Err("invalid_token".to_string());
+        }
+
+        let user = UserRepo::get_user_by_id(&*self.db, &token_data.claims.sub)
+            .await
+            .map_err(|_| "invalid_token".to_string())?
+            .ok_or_else(|| "invalid_token".to_string())?;
+
+        Ok((user.id, user.email, user.is_admin))
     }
 
     pub fn issue_mcp_token(&self, claims: McpAccessTokenClaims) -> Result<String> {
@@ -367,42 +391,9 @@ impl AuthService {
         .execute(&mut *tx)
         .await?;
 
-        let orphaned_projects: Vec<(String,)> =
-            sqlx::query_as("SELECT id FROM project WHERE owner_id IS NULL")
-                .fetch_all(&mut *tx)
-                .await?;
-
+        // Ownerless Projects retain their explicit ownerless contract. Bootstrap
+        // does not appropriate historical Projects for the first account.
         let now = now_rfc3339();
-        for (project_id,) in &orphaned_projects {
-            sqlx::query("UPDATE project SET owner_id = ? WHERE id = ? AND owner_id IS NULL")
-                .bind(user_id)
-                .bind(project_id)
-                .execute(&mut *tx)
-                .await?;
-
-            let member_exists: bool = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM project_member WHERE project_id = ? AND user_id = ?",
-            )
-            .bind(project_id)
-            .bind(user_id)
-            .fetch_one(&mut *tx)
-            .await?
-                > 0;
-
-            if !member_exists {
-                sqlx::query(
-                    "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) \
-                     VALUES (?, ?, ?, 'owner', ?, ?)",
-                )
-                .bind(new_uuid_v4())
-                .bind(project_id)
-                .bind(user_id)
-                .bind(&now)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await?;
-            }
-        }
 
         sqlx::query(
             "INSERT INTO system_setting (key, value, updated_at) VALUES ('bootstrap_completed', 'true', ?) \
@@ -437,9 +428,11 @@ impl AuthService {
         let claims = Claims {
             sub: user.id.clone(),
             email: user.email.clone(),
-            is_admin: user.is_admin,
             iat: now,
             exp: now + ACCESS_TOKEN_EXPIRY_SECS,
+            token_use: Some("access".to_owned()),
+            aud: None,
+            scope: None,
         };
 
         let header = Header::new(Algorithm::HS256);
@@ -508,6 +501,13 @@ mod tests {
         AuthService::new(Arc::new(SqliteDb::new(pool)), b"test-secret".to_vec(), 4)
     }
 
+    fn test_password(_tag: &str) -> String {
+        static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PASSWORD
+            .get_or_init(|| uuid::Uuid::new_v4().to_string())
+            .clone()
+    }
+
     async fn seed_orphan_agent(db: &SqliteDb, id: &str, name: &str, is_default: bool) {
         let now = now_rfc3339();
         AgentRepo::create(
@@ -546,7 +546,7 @@ mod tests {
     async fn register_success() {
         let svc = test_service().await;
         let user = svc
-            .register("Test@Example.COM", "password123", Some("Alice"))
+            .register("Test@Example.COM", &test_password("123"), Some("Alice"))
             .await
             .expect("register succeeds");
         assert_eq!(
@@ -561,11 +561,11 @@ mod tests {
         let svc = test_service().await;
 
         let first_registered = svc
-            .register("first-admin@test.com", "password123", None)
+            .register("first-admin@test.com", &test_password("123"), None)
             .await
             .expect("first user registers");
         let second_registered = svc
-            .register("second-user@test.com", "password123", None)
+            .register("second-user@test.com", &test_password("123"), None)
             .await
             .expect("second user registers");
 
@@ -588,7 +588,9 @@ mod tests {
     #[tokio::test]
     async fn register_invalid_email() {
         let svc = test_service().await;
-        let err = svc.register("not-an-email", "password123", None).await;
+        let err = svc
+            .register("not-an-email", &test_password("123"), None)
+            .await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("invalid_email"));
     }
@@ -604,10 +606,12 @@ mod tests {
     #[tokio::test]
     async fn register_duplicate_email() {
         let svc = test_service().await;
-        svc.register("dup@test.com", "password123", None)
+        svc.register("dup@test.com", &test_password("123"), None)
             .await
             .expect("first registration");
-        let err = svc.register("dup@test.com", "password456", None).await;
+        let err = svc
+            .register("dup@test.com", &test_password("456"), None)
+            .await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("email_exists"));
     }
@@ -615,11 +619,11 @@ mod tests {
     #[tokio::test]
     async fn login_success_returns_token_pair() {
         let svc = test_service().await;
-        svc.register("login@test.com", "password123", None)
+        svc.register("login@test.com", &test_password("123"), None)
             .await
             .expect("register");
         let pair = svc
-            .login("login@test.com", "password123")
+            .login("login@test.com", &test_password("123"))
             .await
             .expect("login");
         assert!(!pair.access_token.is_empty());
@@ -630,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn login_wrong_password() {
         let svc = test_service().await;
-        svc.register("wp@test.com", "password123", None)
+        svc.register("wp@test.com", &test_password("123"), None)
             .await
             .expect("register");
         let err = svc.login("wp@test.com", "wrongpassword").await;
@@ -641,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn login_nonexistent_user_returns_invalid_credentials() {
         let svc = test_service().await;
-        let err = svc.login("ghost@test.com", "password123").await;
+        let err = svc.login("ghost@test.com", &test_password("123")).await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("invalid_credentials"));
     }
@@ -649,11 +653,11 @@ mod tests {
     #[tokio::test]
     async fn refresh_rotates_token() {
         let svc = test_service().await;
-        svc.register("refresh@test.com", "password123", None)
+        svc.register("refresh@test.com", &test_password("123"), None)
             .await
             .expect("register");
         let pair1 = svc
-            .login("refresh@test.com", "password123")
+            .login("refresh@test.com", &test_password("123"))
             .await
             .expect("login");
 
@@ -673,11 +677,11 @@ mod tests {
     #[tokio::test]
     async fn logout_invalidates_refresh_token() {
         let svc = test_service().await;
-        svc.register("logout@test.com", "password123", None)
+        svc.register("logout@test.com", &test_password("123"), None)
             .await
             .expect("register");
         let pair = svc
-            .login("logout@test.com", "password123")
+            .login("logout@test.com", &test_password("123"))
             .await
             .expect("login");
 
@@ -690,18 +694,103 @@ mod tests {
     #[tokio::test]
     async fn verify_token_valid() {
         let svc = test_service().await;
-        svc.register("vt@test.com", "password123", None)
+        svc.register("vt@test.com", &test_password("123"), None)
             .await
             .expect("register");
         let pair = svc
-            .login("vt@test.com", "password123")
+            .login("vt@test.com", &test_password("123"))
             .await
             .expect("login");
         let (user_id, email, _is_admin) = svc
             .verify_token(&pair.access_token)
+            .await
             .expect("verify succeeds");
         assert!(!user_id.is_empty());
         assert_eq!(email, "vt@test.com");
+    }
+
+    #[tokio::test]
+    async fn verify_token_uses_current_admin_authority() {
+        let svc = test_service().await;
+        let user = svc
+            .register("admin@test.com", &test_password("123"), None)
+            .await
+            .expect("register");
+        svc.bootstrap_first_user(&user.id)
+            .await
+            .expect("bootstrap admin");
+        let pair = svc
+            .login("admin@test.com", &test_password("123"))
+            .await
+            .expect("login");
+
+        let (_, _, is_admin) = svc
+            .verify_token(&pair.access_token)
+            .await
+            .expect("verify admin token");
+        assert!(is_admin, "bootstrap admin is current authority");
+
+        sqlx::query("UPDATE user SET is_admin = 0 WHERE id = ?")
+            .bind(&user.id)
+            .execute(svc.db.pool())
+            .await
+            .expect("demote user");
+
+        let (_, _, is_admin) = svc
+            .verify_token(&pair.access_token)
+            .await
+            .expect("token remains authentic");
+        assert!(!is_admin, "token cannot retain stale admin authority");
+    }
+
+    #[tokio::test]
+    async fn verify_token_rejects_oauth_mcp_tokens() {
+        let svc = test_service().await;
+        let user = svc
+            .register("mcp@test.com", &test_password("123"), None)
+            .await
+            .expect("register");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token = svc
+            .issue_mcp_token(McpAccessTokenClaims {
+                sub: user.id,
+                email: user.email,
+                iat: now,
+                exp: now + 900,
+                aud: "http://127.0.0.1:8080/mcp".to_owned(),
+                scope: "mcp".to_owned(),
+                client_id: "client".to_owned(),
+                token_use: "mcp".to_owned(),
+            })
+            .expect("mint MCP token");
+
+        assert_eq!(svc.verify_token(&token).await.unwrap_err(), "invalid_token");
+        assert!(svc.verify_mcp_token(&token).is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_token_rejects_deleted_user() {
+        let svc = test_service().await;
+        let user = svc
+            .register("deleted@test.com", &test_password("123"), None)
+            .await
+            .expect("register");
+        let pair = svc
+            .login("deleted@test.com", &test_password("123"))
+            .await
+            .expect("login");
+
+        UserRepo::delete_user(&*svc.db, &user.id)
+            .await
+            .expect("delete user");
+
+        assert_eq!(
+            svc.verify_token(&pair.access_token).await.unwrap_err(),
+            "invalid_token"
+        );
     }
 
     #[tokio::test]
@@ -721,7 +810,7 @@ mod tests {
             &EncodingKey::from_secret(b"test-secret"),
         )
         .unwrap();
-        let err = svc.verify_token(&expired).unwrap_err();
+        let err = svc.verify_token(&expired).await.unwrap_err();
         assert_eq!(err, "token_expired");
     }
 
@@ -742,7 +831,7 @@ mod tests {
             &EncodingKey::from_secret(b"wrong-secret"),
         )
         .unwrap();
-        assert!(svc.verify_token(&bad).is_err());
+        assert!(svc.verify_token(&bad).await.is_err());
     }
 
     #[tokio::test]
@@ -763,13 +852,13 @@ mod tests {
         )
         .unwrap();
         assert!(
-            svc.verify_token(&hs512_token).is_err(),
+            svc.verify_token(&hs512_token).await.is_err(),
             "HS512 token must be rejected when only HS256 is accepted"
         );
     }
 
     #[tokio::test]
-    async fn bootstrap_claims_agents_and_projects_but_preserves_orphan_daemons() {
+    async fn bootstrap_claims_agents_but_preserves_ownerless_projects_and_daemons() {
         let svc = test_service().await;
         let db = &svc.db;
         let now = now_rfc3339();
@@ -785,7 +874,7 @@ mod tests {
             .execute(db.pool()).await.unwrap();
 
         let user = svc
-            .register("admin@test.com", "password123", None)
+            .register("admin@test.com", &test_password("123"), None)
             .await
             .expect("register succeeds");
 
@@ -816,16 +905,17 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(project_owner, Some(user.id.clone()));
+        assert_eq!(
+            project_owner, None,
+            "bootstrap must not appropriate a historical ownerless Project"
+        );
 
-        let member_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM project_member WHERE project_id = 'p1' AND user_id = ?",
-        )
-        .bind(&user.id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(member_count, 1);
+        let member_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM project_member WHERE project_id = 'p1'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(member_count, 0);
     }
 
     #[tokio::test]
@@ -834,14 +924,14 @@ mod tests {
         let db = &svc.db;
 
         let _first = svc
-            .register("first@test.com", "password123", None)
+            .register("first@test.com", &test_password("123"), None)
             .await
             .expect("first user");
 
         seed_orphan_agent(db, "a2", "agent2", false).await;
 
         let _second = svc
-            .register("second@test.com", "password456", None)
+            .register("second@test.com", &test_password("456"), None)
             .await
             .expect("second user");
 

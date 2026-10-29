@@ -1,5 +1,7 @@
 # Plan PR0A — Reconcile pre-migration operational fixes
 
+> **Historical migration ledger.** This document records the state at its named baseline. PR0–PR15 are complete and merged; status statements such as "not merged" or "ready for review" describe the authoring moment. Current behavior is documented in [architecture.md](../architecture.md) and [concepts](../concepts/).
+
 Status: completed and merged. Plan PR0 / Repo PR #3 and Plan PR0A / Repo PR #4
 are closed; Plan PR1 is ready to begin.
 

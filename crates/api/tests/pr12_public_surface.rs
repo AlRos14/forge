@@ -1999,7 +1999,7 @@ async fn project_deleted_hint_targets_only_pre_delete_recipients() {
         .expect("Project recipient user creates");
     }
     let now = db::now_rfc3339();
-    let project = db::ProjectRepo::create(
+    let project = db::ProjectRepo::create_with_owner_membership(
         &*harness.state.db,
         db::CreateProject {
             id: db::new_uuid_v4(),
@@ -2010,6 +2010,7 @@ async fn project_deleted_hint_targets_only_pre_delete_recipients() {
             created_at: now.clone(),
             updated_at: now.clone(),
         },
+        &db::new_uuid_v4(),
     )
     .await
     .expect("private Project creates");

@@ -1,8 +1,9 @@
 # Independent orchestration architecture: Plan PR0 contract
 
-Status: accepted migration target. PR13's V121–V134 destructive cutover and
-admission reliability corrections are implemented in the current branch and
-remain subject to PR review and merge.
+Status: accepted migration target and current invariant contract. PR0–PR15 are
+complete and merged; PR13's V121–V134 destructive cutover and the admission
+reliability corrections are in the current runtime. This document also retains
+baseline tables and implementation notes as historical migration evidence.
 
 This document records the accepted architecture and migration ledger. The
 Plan PR0 baseline and pre-PR13 dependency audit below are historical snapshots;
@@ -279,13 +280,15 @@ delivery mechanism, never lifecycle or Gate authority.
 
 ### INV-038 — Visibility is not mutation authority
 
-Project read visibility and write authority are separate checks. Owners and
-all explicit Project members, including viewers, retain the current read rule;
-ownerless system Projects retain public reads. Ordinary Project-derived
-mutations require an owner or explicit owner/admin/member membership.
-Administrative operations require owner/admin authority. Ownerless visibility
-never grants write access, and MCP Project scope only narrows the exact resource
-scope; the authenticated Human remains the authority source. Every mutable
+Project read visibility and write authority are separate checks. A Project with
+a canonical owner is readable through its exact membership row; all explicit
+Project members, including viewers, retain the current read rule. Ownerless
+system Projects retain public reads. Ordinary Project-derived mutations require
+explicit owner/admin/member membership, and administrative operations require
+owner/admin membership. Canonical `owner_id` does not bypass the membership
+representation (INV-040). Ownerless visibility never grants write access, and
+MCP Project scope only narrows the exact resource scope; the authenticated
+Human remains the authority source. Every mutable
 Project-derived REST and MCP resource must pass the same operation-appropriate
 Project authority boundary.
 
@@ -318,6 +321,22 @@ cleared. Defensive FK/trigger protections may remain, but this preflight and
 conflict response are the domain/public contract. This PR does not rewrite
 legacy rows; any historical root with a non-null `subtask_order` remains a
 PR13 cleanup item if found.
+
+### INV-040 — Canonical Project owner has an exact owner membership
+
+`Project.owner_id` is the canonical owner identity. When it is non-null, the
+same user has a `project_member` row with role `owner`; V135 repairs historical
+rows without inventing an owner for an ownerless Project. Additional owner
+memberships are allowed, but every operation that removes or demotes the
+canonical owner must transfer canonical identity to another current owner inside
+the same SQLite `BEGIN IMMEDIATE` transaction, or fail with `last_owner`.
+
+Project creation writes the Project and its canonical owner membership in one
+transaction. Owner mutations re-read the caller, target, owner set, and Project
+inside the write transaction; a stale preflight is never authority. A canonical
+owner without the required membership fails closed until the forward migration
+or an explicit repair restores representation. Ownerless Projects remain
+ownerless: public read visibility never grants write access or claims ownership.
 
 ## Current repository baseline
 
@@ -701,8 +720,9 @@ that is documented and reviewed.
 
 ## Plan PR13 implementation status
 
-The current branch applies migrations V121–V134 after the PR12 V120 baseline.
-The cutover preserves historical values in dedicated history tables and
+PR13 applied migrations V121–V134 after the PR12 V120 baseline. The post-V2
+security hardening adds V135, a forward-only canonical Project owner membership
+repair. The cutover preserves historical values in dedicated history tables and
 migration receipts; those records do not authorize legacy runtime reads or
 writes.
 
@@ -718,6 +738,7 @@ writes.
 | V132 | Preserve Main/Project Agent, Agent Chat, memory, Attention, Room, Genesis, and Project OS rows in exact legacy-record history, then drop their runtime schema and Project columns. |
 | V133 | Add immutable follow-up operation receipts so one idempotency key replays its exact child Execution and cannot authorize different request content. |
 | V134 | Replace the WorkUnit Execution admission trigger with distinct rejection markers, preserving exact typed causes for capacity, RoleMembership, WorkUnit, Workspace, dependency, and concurrent-Execution failures. |
+| V135 | Repair `Project.owner_id` representation by inserting or aligning the exact role-`owner` membership, without inventing an owner for an ownerless Project. |
 
 ProjectRelease GETs are read-only and reconstruct only from `project_release`,
 `project_release_history_*`, shared media assets, and tombstones. They validate

@@ -73,6 +73,27 @@ async fn daemon_connect_rejects_missing_or_invalid_token() {
 }
 
 #[tokio::test]
+async fn daemon_connect_rejects_reusable_query_token() {
+    let state = test_state().await;
+    let app = test_app(&state);
+    let registration = register_daemon(&app, "connect-query-token").await;
+    let server = TestServer::start(Arc::clone(&state)).await;
+
+    let url = format!(
+        "ws://{}/api/v1/daemons/{}/connect?token={}",
+        server.addr, registration.daemon_id, registration.registration_token
+    );
+    let error = match connect_async(url.into_client_request().expect("request builds")).await {
+        Ok(_) => panic!("query token unexpectedly upgraded websocket"),
+        Err(error) => error,
+    };
+    assert_ws_http_status(error, StatusCode::UNAUTHORIZED);
+    assert!(!state
+        .daemon_connections
+        .is_connected(&registration.daemon_id));
+}
+
+#[tokio::test]
 async fn daemon_connect_replaces_stale_connection() {
     let state = test_state().await;
     let app = test_app(&state);

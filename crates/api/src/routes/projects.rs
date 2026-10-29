@@ -29,7 +29,7 @@ pub async fn create_project(
     let now = now_rfc3339();
     let settings = serde_json::json!({});
     let settings = serialize_settings(&settings)?;
-    let project = ProjectRepo::create(
+    let project = ProjectRepo::create_with_owner_membership(
         &*state.db,
         CreateProject {
             id: new_uuid_v4(),
@@ -40,22 +40,9 @@ pub async fn create_project(
             created_at: now.clone(),
             updated_at: now.clone(),
         },
+        &new_uuid_v4(),
     )
     .await?;
-
-    // Auto-create owner membership (best-effort; may fail if user row doesn't exist yet)
-    let _ = db::ProjectMemberRepo::add_member(
-        &*state.db,
-        db::CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: project.id.clone(),
-            user_id: user.user_id,
-            role: "owner".to_owned(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await;
 
     state.event_bus.publish(ForgeEvent {
         event_type: "project.created".to_owned(),
@@ -156,6 +143,7 @@ pub async fn delete_project(
         state.db.clone(),
         state.cleanup_scheduler.workspace_root(),
         &id,
+        Some(&user.user_id),
     )
     .await?;
     for recipient_user_id in recipients {
@@ -183,7 +171,13 @@ pub async fn pause_project(
     }
 
     let paused_at = now_rfc3339();
-    ProjectRepo::set_paused_at(&*state.db, &id, Some(paused_at.clone())).await?;
+    ProjectRepo::set_paused_at(
+        &*state.db,
+        &id,
+        Some(paused_at.clone()),
+        Some(&user.user_id),
+    )
+    .await?;
     let project = ProjectRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
@@ -208,7 +202,7 @@ pub async fn resume_project(
         return Ok(Json(project_response(project)?));
     }
 
-    ProjectRepo::set_paused_at(&*state.db, &id, None).await?;
+    ProjectRepo::set_paused_at(&*state.db, &id, None, Some(&user.user_id)).await?;
     let project = ProjectRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
@@ -258,6 +252,7 @@ pub async fn update_project(
         },
         version,
         project_hooks_json,
+        Some(&user.user_id),
     )
     .await?;
     state.event_bus.publish(ForgeEvent {

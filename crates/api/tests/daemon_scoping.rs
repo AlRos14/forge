@@ -461,7 +461,7 @@ async fn mcp_request_without_token_returns_401() {
 }
 
 #[tokio::test]
-async fn mcp_query_token_takes_precedence_over_oauth_bearer() {
+async fn mcp_rejects_query_token_even_when_it_is_valid() {
     let workspace = common::TestDir::new("mcp-query-token");
     let harness = common::test_app(workspace.path(), "mcp-query-token").await;
 
@@ -492,10 +492,6 @@ async fn mcp_query_token_takes_precedence_over_oauth_bearer() {
             Request::builder()
                 .method(Method::POST)
                 .uri(format!("/mcp?token={raw}"))
-                .header(
-                    header::AUTHORIZATION,
-                    "Bearer oauth-token-that-forge-cannot-verify",
-                )
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::to_string(&json!({
@@ -510,7 +506,7 @@ async fn mcp_query_token_takes_precedence_over_oauth_bearer() {
         .await
         .expect("response");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -598,7 +594,7 @@ async fn daemon_report_with_invalid_token_returns_401() {
 }
 
 #[tokio::test]
-async fn bootstrap_assigns_orphaned_resources_to_first_user() {
+async fn bootstrap_assigns_orphaned_agents_but_not_ownerless_projects() {
     let workspace = common::TestDir::new("bootstrap-first");
     let harness = common::test_app(workspace.path(), "bootstrap-first").await;
 
@@ -648,9 +644,9 @@ async fn bootstrap_assigns_orphaned_resources_to_first_user() {
             .fetch_one(harness.state.db.pool())
             .await
             .expect("query");
-    assert!(
-        project_owner.is_some(),
-        "project should be claimed by first user"
+    assert_eq!(
+        project_owner, None,
+        "ownerless historical Projects must not be claimed by bootstrap"
     );
 
     let member_count: i64 = sqlx::query_scalar::<_, i64>(
@@ -659,5 +655,5 @@ async fn bootstrap_assigns_orphaned_resources_to_first_user() {
     .fetch_one(harness.state.db.pool())
     .await
     .expect("query");
-    assert_eq!(member_count, 1, "first user should be project owner member");
+    assert_eq!(member_count, 0, "bootstrap writes no Project membership");
 }

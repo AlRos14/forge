@@ -1,5 +1,7 @@
 # Plan PR12 — Public Surface Alignment
 
+> **Historical migration ledger.** This document records the state at its named baseline. PR0–PR15 are complete and merged; status statements such as "not merged" or "ready for review" describe the authoring moment. Current behavior is documented in [architecture.md](../architecture.md) and [concepts](../concepts/).
+
 Status: **READY FOR REVIEW — implementation and focused validation complete**.
 
 ```text

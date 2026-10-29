@@ -48,6 +48,10 @@ The server prints its local management URL and records its address in the data d
 
 The retained `npx-cli` wrapper downloads ForgeAILab release assets; it is upstream-owned and does not install this fork. The inherited release workflow restricts npm and Homebrew publication to `ForgeAILab/forge`. This repository's `install.sh` targets `AlRos14/forge`, but it cannot install until this repository publishes a release; use the source build above for now. See [the upstream and attribution note](docs/upstream.md).
 
+The container image runs the server as an unprivileged `forge` user. Docker Compose binds to `127.0.0.1` by default; exposing Forge beyond loopback requires an explicit setting and a reviewed TLS/proxy boundary. See [deployment](docs/deployment.md).
+
+Authentication uses current durable account authority. Reusable JWT/PAT/OAuth credentials are accepted in the `Authorization: Bearer` header, not in URLs. The browser SSE connection uses a short-lived, single-use ticket.
+
 ## Documentation
 
 - [Architecture after PR13](docs/architecture.md)
@@ -55,12 +59,15 @@ The retained `npx-cli` wrapper downloads ForgeAILab release assets; it is upstre
 - [REST, MCP, and SSE reference](docs/api.md)
 - [`forge-ctl` reference](docs/cli.md)
 - [Execution logs and session identity](docs/execution-logs.md)
+- [Deployment and container permissions](docs/deployment.md)
+- [Post-V2 security audit notes](docs/security-audit.md)
+- [Documentation audit and legacy classification](docs/documentation-audit-2026-10-28.md)
 - [Release checklist](docs/release_checklist.md)
 - [Upstream relationship and attribution](docs/upstream.md)
 - [Changelog](CHANGELOG.md)
 
 ## Project identity and history
 
-The workspace version is `0.8.0`; it does not identify a published release. The current schema contains migrations through V134. Migration records, earlier design documents, and historical ProjectRelease snapshots remain historical evidence.
+The workspace version is `0.8.0`; it does not identify a published release. The current schema contains migrations through V135. Migration records, historical specification packages, earlier design documents, and ProjectRelease snapshots remain historical evidence.
 
 The public product name remains **Forge** until the owner provides a replacement name. This repository preserves its MIT license and upstream attribution.

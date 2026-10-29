@@ -101,16 +101,33 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    let token = extract_bearer_token(req.headers()).or_else(|| extract_query_token(req.uri()));
-
-    let Some(token) = token else {
+    let Some(token) = extract_bearer_token(req.headers()) else {
+        // EventSource cannot set an Authorization header. Only the SSE route
+        // accepts a short-lived, single-use ticket, and only after the client
+        // authenticated to obtain it. Reusable JWT/PAT query credentials are
+        // never accepted here or on any other route.
+        if path == "/api/v1/events" {
+            if let Some(ticket) = extract_query_parameter(req.uri(), "ticket") {
+                if let Some(ticket_user) = state.sse_tickets.consume(&ticket) {
+                    if let Ok(current) = state.auth_service.get_user(&ticket_user.user_id).await {
+                        req.extensions_mut()
+                            .insert(crate::routes::auth::AuthenticatedUser {
+                                user_id: current.id,
+                                email: current.email,
+                                is_admin: current.is_admin,
+                            });
+                        return next.run(req).await;
+                    }
+                }
+            }
+        }
         return unauthorized_response("missing_token", "Authentication required");
     };
 
     let result = if token.starts_with("fg_") {
         state.auth_service.verify_pat(&token).await
     } else {
-        state.auth_service.verify_token(&token)
+        state.auth_service.verify_token(&token).await
     };
 
     match result {
@@ -148,9 +165,7 @@ pub async fn mcp_auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let token = extract_query_token(req.uri()).or_else(|| extract_bearer_token(req.headers()));
-
-    let Some(token) = token else {
+    let Some(token) = extract_bearer_token(req.headers()) else {
         return unauthorized_response_with_challenge(
             "missing_token",
             "Authentication required",
@@ -160,11 +175,11 @@ pub async fn mcp_auth_middleware(
 
     let result: Result<(String, String, bool), String> = if token.starts_with("fg_") {
         state.auth_service.verify_pat(&token).await
-    } else if let Ok(claims) = state.auth_service.verify_token(&token) {
+    } else if let Ok(claims) = state.auth_service.verify_token(&token).await {
         Ok(claims)
     } else {
-        match state.oauth_service.verify_mcp_access_token(&token) {
-            Ok((user_id, email)) => Ok((user_id, email, false)),
+        match state.oauth_service.verify_mcp_access_token(&token).await {
+            Ok(claims) => Ok(claims),
             Err(_) => Err("invalid_token".to_string()),
         }
     };
@@ -209,10 +224,12 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn extract_query_token(uri: &axum::http::Uri) -> Option<String> {
-    uri.query().and_then(|q| {
-        q.split('&')
-            .find_map(|pair| pair.strip_prefix("token=").map(str::to_owned))
+fn extract_query_parameter(uri: &axum::http::Uri, name: &str) -> Option<String> {
+    uri.query().and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == name).then(|| value.to_owned())
+        })
     })
 }
 

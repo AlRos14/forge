@@ -6,12 +6,17 @@ This repository has no verified published release artifacts as of the PR14 docum
 
 **Please do not open a public issue for security vulnerabilities.**
 
-GitHub private vulnerability reporting is disabled for this repository as of
-the PR14 audit on 2026-10-16. Do not send reports for this fork to the
-upstream project's contact address or post vulnerability details publicly. The
-repository owner must enable private vulnerability reporting or publish a
-private contact method before this repository can accept reports through a
-documented channel.
+GitHub private vulnerability reporting is **disabled** for this repository as
+of the post-V2 security audit (checked again on 2026-10-28). Do not send reports
+for this fork to the upstream project's contact address or post vulnerability
+details publicly.
+
+**Pending external action:** the repository owner must open
+`Settings → Code security → Private vulnerability reporting` for
+`AlRos14/forge` and select **Enable**, or publish a private security contact.
+Do not invent or guess a contact address. Until that setting is enabled, this
+repository has no documented private intake channel; this is a repository-owner
+action, not something a code change can complete.
 
 ## Scope
 

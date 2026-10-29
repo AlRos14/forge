@@ -3,6 +3,11 @@ created_at: 2026-08-12T19:22:52Z
 updated_at: 2026-08-13T03:35:37Z
 ---
 
+> **Historical, retired proposal.** Main Agent, Project Agent, Agent Chat,
+> Attention, Mission Control, scoped memory, and the embedded Agent Runtime were
+> retired from current runtime/public authority by PR10–PR13. This file is
+> retained as migration evidence; it is not a current operating contract.
+
 ## Revision Note — Direct Agent Chats, Not Rooms
 
 The first implementation and live browser acceptance established a useful baseline, but the product model was corrected on 2026-08-13: Forge does not need general-purpose Rooms, participants, addressing, or multi-agent rounds. The intended experience is one global Main Agent plus exactly one Project Agent for each operational Project. The user switches among those agents' durable chats from the left navigation, while the global chat is also always reachable from a bottom-right launcher.

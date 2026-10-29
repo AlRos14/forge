@@ -1,5 +1,11 @@
 # Glue-Code & Dead-Path Audit
 
+> **Historical audit.** This document records the pre-migration codebase as of
+> 2026-07-01. Several findings were fixed and several subsystems were retired by
+> PR0–PR15. It is not current architecture guidance. See
+> [architecture.md](architecture.md) and
+> [migration/architecture-v2.md](migration/architecture-v2.md).
+
 **Date:** 2026-07-01
 **Scope:** whole workspace (16 crates + `web/`), focused on (a) glue code — duplicated wiring, parallel implementations, construct-then-patch patterns — and (b) features that exist but don't actually work end to end.
 **Method:** codegraph structural queries, targeted greps, full `cargo test --workspace --no-fail-fast` (98 test binaries), two scoped exploration passes (daemon/executor layering; API-surface drift), and manual review of the `add-user-transition-override` change (Codex gate timed out).

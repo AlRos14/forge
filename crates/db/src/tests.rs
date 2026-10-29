@@ -604,19 +604,6 @@ async fn test_list_agents_eligible_for_project_uses_generic_identity_rules() {
         CreateProjectMember {
             id: new_uuid_v4(),
             project_id: project_id.clone(),
-            user_id: u1_id.clone(),
-            role: "owner".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("u1 project member creates");
-    ProjectMemberRepo::add_member(
-        &db,
-        CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: project_id.clone(),
             user_id: u2_id.clone(),
             role: "member".to_owned(),
             created_at: now.clone(),
@@ -918,6 +905,19 @@ async fn seed_pr6_orchestrator_event(
         .execute(db.pool())
         .await
         .expect("Project has a durable owner");
+    ProjectMemberRepo::add_member(
+        db,
+        CreateProjectMember {
+            id: new_uuid_v4(),
+            project_id: project_id.clone(),
+            user_id: owner_id.clone(),
+            role: "owner".to_owned(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("Project owner membership");
     sqlx::query("UPDATE agent_identity SET owner_id = ? WHERE id = ?")
         .bind(&owner_id)
         .bind(&agent_id)
@@ -2171,7 +2171,7 @@ async fn pr6_action_reservation_reuses_one_uuid_and_rejects_changed_replay() {
         .await
         .expect("Task remains readable before bounded teardown")
         .expect("Task exists");
-    ProjectRepo::delete(&db, &task.project_id)
+    ProjectRepo::delete(&db, &task.project_id, None)
         .await
         .expect("guarded Project teardown removes PR6 wake history in dependency order");
     for table in [
@@ -4002,7 +4002,7 @@ async fn pr8_review_subject_is_immutable_and_report_digest_must_match() {
     )
     .await
     .expect("Review Execution completes with its exact report");
-    ProjectRepo::delete(&db, &project_id)
+    ProjectRepo::delete(&db, &project_id, None)
         .await
         .expect("Project teardown removes the immutable Review subject");
 }
@@ -5164,7 +5164,7 @@ async fn delete_lifecycle_foreign_keys_match_repository_operations() {
         .expect("execution remains");
     assert_eq!(execution.workspace_id, None);
 
-    ProjectRepo::delete(&db, &project_id)
+    ProjectRepo::delete(&db, &project_id, None)
         .await
         .expect("project delete cascades through task data");
     assert_eq!(
@@ -5694,7 +5694,7 @@ async fn notification_repo_crud_and_project_cascade_delete() {
             .expect("count notifications before cascade");
     assert_eq!(remaining_before_cascade, 2);
 
-    ProjectRepo::delete(&db, &project_id)
+    ProjectRepo::delete(&db, &project_id, None)
         .await
         .expect("project delete cascade");
     let remaining_after_project_delete: i64 =

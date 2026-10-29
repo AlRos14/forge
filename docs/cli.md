@@ -59,6 +59,24 @@ Provider entries store a credential reference and metadata; secret values are no
 
 ## MCP client configuration
 
-`forge-ctl mcp install` writes the selected client's local configuration and points it at the Forge MCP endpoint. The supported client names are `claude`, `codex`, and `cursor`; scopes are `project`, `local`, and `user`. A token is required. A Project-scoped install can restrict tools to one Project.
+`forge-ctl mcp install` writes the selected client's local configuration and points it at the Forge MCP endpoint. The supported client names are `claude`, `codex`, and `cursor`; scopes are `project`, `local`, and `user`. A token is required.
+
+For Claude Code, the command writes the locations Claude Code reads:
+- `project`: `<repo>/.mcp.json` with a top-level `mcpServers` entry.
+- `local`: `~/.claude.json` under `projects[<canonical project path>].mcpServers`.
+- `user`: `~/.claude.json` under top-level `mcpServers`.
+
+Project and local configurations must not contain a literal token because the file may be versioned. `forge-ctl mcp install` therefore writes a client-supported environment reference:
+- Claude: `Authorization: Bearer ${FORGE_TOKEN}`.
+- Cursor: `Authorization: Bearer ${env:FORGE_TOKEN}`.
+- Codex: `bearer_token_env_var = "FORGE_TOKEN"`.
+
+The referenced variable must be set when the client connects. By default the command requires `FORGE_TOKEN`; `--token-env NAME` selects another variable. If the variable is not set, or if `--token` is supplied for a project/local scope, the command fails closed and writes nothing. Existing project/local configurations with a literal Bearer token must be reinstalled after exporting the variable.
+
+`user` scope is not treated as versioned. It may use a literal Bearer token from `--token`, `FORGE_TOKEN`, or the stored login, and the file is written with `0600` permissions. `--token-env` also works for user scope. A Project-scoped install can restrict tools to one Project and requires `--project-id`. Never put a reusable credential in the MCP URL; query-token transport is rejected.
+
+All client configs are read and written through a canonical cwd/home root with descriptor-relative traversal. A symlinked final file or intermediate directory is rejected, and a rejected destination creates or modifies nothing outside that root. Missing destinations are created with `0600`.
+
+MCP no longer accepts `?token=` credentials. Existing configurations that contain a tokenized URL must be reinstalled; the web MCP configuration view reports such a legacy URL as not usable. OAuth-capable clients can use the `/oauth` and `/.well-known` flows with a bare `/mcp` URL instead.
 
 The active tool names and schemas are exposed by MCP `tools/list`. REST and MCP use the same domain authority. Neither surface restores retired Main/Project Agent, Agent Chat, Project OS, or legacy WorkflowEngine operations.

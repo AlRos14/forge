@@ -15,7 +15,6 @@ use axum::{
     Json,
 };
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
 use services::daemon_service::{DetectedCliInput, RuntimeReportInput};
 use tokio::sync::mpsc;
 
@@ -112,19 +111,13 @@ pub async fn report_daemon(
     Ok(Json(daemon_response(daemon)))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ConnectQuery {
-    pub token: Option<String>,
-}
-
 pub async fn connect_daemon(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Query(query): Query<ConnectQuery>,
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
-    let token = connect_token(&headers, query.token)?;
+    let token = connect_token(&headers)?;
     state
         .daemon_service
         .authenticate(&id, &token)
@@ -422,7 +415,7 @@ async fn registration_principal(
     let result = if token.starts_with("fg_") {
         state.auth_service.verify_pat(token).await
     } else {
-        state.auth_service.verify_token(token)
+        state.auth_service.verify_token(token).await
     };
 
     let (user_id, _email, is_admin) = result.map_err(|code| {
@@ -467,14 +460,9 @@ fn bearer_token(headers: &HeaderMap) -> ApiResult<&str> {
         .ok_or_else(|| ApiError::unauthorized("invalid Authorization bearer token"))
 }
 
-fn connect_token(headers: &HeaderMap, query_token: Option<String>) -> ApiResult<String> {
-    if let Some(token) = optional_bearer_token(headers)? {
-        return Ok(token.to_owned());
-    }
-
-    query_token
-        .map(|token| token.trim().to_owned())
-        .filter(|token| !token.is_empty())
+fn connect_token(headers: &HeaderMap) -> ApiResult<String> {
+    optional_bearer_token(headers)?
+        .map(str::to_owned)
         .ok_or_else(|| ApiError::unauthorized("missing daemon bearer token"))
 }
 

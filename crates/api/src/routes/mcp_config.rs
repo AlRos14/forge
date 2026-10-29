@@ -11,15 +11,34 @@ use axum::{
     Json,
 };
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
-use tokio::fs;
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::auth::AuthenticatedUser,
+    routes::{
+        auth::AuthenticatedUser,
+        mcp_config_fs::{self, ConfigTarget},
+    },
     state::AppState,
 };
-use db::{now_rfc3339, PersonalAccessTokenRepo, ProjectRepo, RepoRepo};
+use db::{ProjectRepo, RepoRepo};
+
+#[derive(Debug, Clone)]
+enum ClaudeSection {
+    Root,
+    Project { key: String },
+}
+
+#[derive(Debug, Clone)]
+struct McpConfigTarget {
+    file: ConfigTarget,
+    claude_section: Option<ClaudeSection>,
+}
+
+impl McpConfigTarget {
+    fn path(&self) -> &Path {
+        &self.file.path
+    }
+}
 
 pub async fn get_mcp_config(
     Query(params): Query<McpConfigQuery>,
@@ -28,30 +47,37 @@ pub async fn get_mcp_config(
 ) -> ApiResult<Json<McpConfigResponse>> {
     let agent = parse_agent(&params.agent)?;
     let scope = parse_scope(params.scope.as_deref())?;
-    if let Some(project_id) = params.project_id.as_deref() {
-        crate::routes::projects::require_project_visible(&state, project_id, &user.user_id).await?;
+    let project_id = require_scope_project_id(&scope, params.project_id.as_deref())?;
+    require_mcp_scope_admin(&scope, &user)?;
+    if let Some(project_id) = project_id {
+        crate::routes::projects::require_project_admin(&state, project_id, &user.user_id).await?;
     }
-    let config_path =
-        resolve_config_path(&state, &agent, &scope, params.project_id.as_deref()).await?;
+    let config_path = resolve_config_path(&state, &agent, &scope, project_id).await?;
     let expected_url = mcp_url_for_scope_from_request(
         &state,
         params.public_base_url.as_deref(),
         &scope,
-        params.project_id.as_deref(),
+        project_id,
     )?;
     let url = match agent {
-        McpAgent::Codex => read_codex_forge_url(&config_path).await?,
-        _ => {
-            let config = read_config(&config_path).await?;
+        McpAgent::Codex => read_codex_forge_url(&config_path.file).await?,
+        McpAgent::Claude => {
+            let config = read_config(&config_path.file).await?;
+            claude_forge_url(&config, config_path.claude_section.as_ref())?
+        }
+        McpAgent::Cursor => {
+            let config = read_config(&config_path.file).await?;
             forge_url(&config)
         }
     };
+    let installed = mcp_url_is_usable(url.as_deref(), &expected_url);
+    let url = url.as_deref().map(redact_mcp_url);
 
     Ok(Json(McpConfigResponse {
-        installed: mcp_url_is_usable(&state, &user, url.as_deref(), &expected_url).await,
+        installed,
         url,
         expected_url,
-        config_path: config_path.to_string_lossy().into_owned(),
+        config_path: config_path.path().to_string_lossy().into_owned(),
         agents: supported_agents(),
     }))
 }
@@ -63,26 +89,27 @@ pub async fn update_mcp_config(
 ) -> ApiResult<Json<McpConfigResponse>> {
     let agent = parse_agent(&body.agent)?;
     let scope = parse_scope(body.scope.as_deref())?;
+    let project_id = require_scope_project_id(&scope, body.project_id.as_deref())?;
     let action = parse_action(&body.action)?;
-    if let Some(project_id) = body.project_id.as_deref() {
+    require_mcp_scope_admin(&scope, &user)?;
+    if let Some(project_id) = project_id {
         crate::routes::projects::require_project_admin(&state, project_id, &user.user_id).await?;
     }
-    let config_path =
-        resolve_config_path(&state, &agent, &scope, body.project_id.as_deref()).await?;
+    let config_path = resolve_config_path(&state, &agent, &scope, project_id).await?;
     let expected_url = mcp_url_for_scope_from_request(
         &state,
         body.public_base_url.as_deref(),
         &scope,
-        body.project_id.as_deref(),
+        project_id,
     )?;
 
     let url = match agent {
         McpAgent::Codex => match action {
             McpAction::Install => {
-                let contents = read_codex_config(&config_path).await?;
+                let contents = read_codex_config(&config_path.file).await?;
                 let install_url = expected_url.clone();
                 write_codex_config_if_changed(
-                    &config_path,
+                    &config_path.file,
                     &contents,
                     set_codex_forge_url(&contents, &install_url),
                 )
@@ -90,21 +117,43 @@ pub async fn update_mcp_config(
                 Some(install_url)
             }
             McpAction::Uninstall => {
-                update_codex_config(&config_path, &expected_url, action).await?
+                update_codex_config(&config_path.file, &expected_url, action).await?
             }
         },
-        _ => {
-            let mut config = read_config(&config_path).await?;
+        McpAgent::Claude => {
+            let section = config_path
+                .claude_section
+                .as_ref()
+                .ok_or_else(|| ApiError::internal("Claude MCP target is missing its section"))?;
+            let mut config = read_config(&config_path.file).await?;
+
+            match action {
+                McpAction::Install => {
+                    let install_url = expected_url.clone();
+                    set_claude_forge_url(&mut config, section, &install_url)?;
+                    write_config(&config_path.file, &config).await?;
+                }
+                McpAction::Uninstall => {
+                    if remove_claude_forge(&mut config, section)? {
+                        write_config(&config_path.file, &config).await?;
+                    }
+                }
+            }
+
+            claude_forge_url(&config, Some(section))?
+        }
+        McpAgent::Cursor => {
+            let mut config = read_config(&config_path.file).await?;
 
             match action {
                 McpAction::Install => {
                     let install_url = expected_url.clone();
                     set_forge_url(&mut config, &install_url)?;
-                    write_config(&config_path, &config).await?;
+                    write_config(&config_path.file, &config).await?;
                 }
                 McpAction::Uninstall => {
                     if remove_forge(&mut config)? {
-                        write_config(&config_path, &config).await?;
+                        write_config(&config_path.file, &config).await?;
                     }
                 }
             }
@@ -113,13 +162,26 @@ pub async fn update_mcp_config(
         }
     };
 
+    let installed = mcp_url_is_usable(url.as_deref(), &expected_url);
+    let url = url.as_deref().map(redact_mcp_url);
+
     Ok(Json(McpConfigResponse {
-        installed: mcp_url_is_usable(&state, &user, url.as_deref(), &expected_url).await,
+        installed,
         url,
         expected_url,
-        config_path: config_path.to_string_lossy().into_owned(),
+        config_path: config_path.path().to_string_lossy().into_owned(),
         agents: supported_agents(),
     }))
+}
+
+fn require_mcp_scope_admin(scope: &McpScope, user: &AuthenticatedUser) -> ApiResult<()> {
+    if !matches!(scope, McpScope::Project) && !user.is_admin {
+        return Err(ApiError::forbidden_with_code(
+            "admin_required",
+            "server-global MCP configuration requires administrator access",
+        ));
+    }
+    Ok(())
 }
 
 fn mcp_url_for_scope_from_request(
@@ -154,7 +216,7 @@ fn mcp_url_for_scope_with_public_base_url(
         scope,
         project_id.map(str::trim).filter(|value| !value.is_empty()),
     ) {
-        (McpScope::Project, Some(project_id)) => Ok(format!(
+        (McpScope::Project | McpScope::Local, Some(project_id)) => Ok(format!(
             "{base}?project_id={}",
             percent_encode_query(project_id)
         )),
@@ -202,31 +264,27 @@ fn percent_encode_query(value: &str) -> String {
     encoded
 }
 
-async fn mcp_url_is_usable(
-    state: &AppState,
-    user: &AuthenticatedUser,
-    url: Option<&str>,
-    expected_url: &str,
-) -> bool {
+fn mcp_url_is_usable(url: Option<&str>, expected_url: &str) -> bool {
     let Some(url) = url else {
         return false;
     };
-    if url == expected_url {
-        return true;
-    }
-    if !mcp_url_matches_expected_scope(url, expected_url) {
+    if mcp_url_has_credentials(url) {
+        // A legacy tokenized URL is installed but no longer authenticates.
         return false;
     }
-    let Some(token) = mcp_url_token(url) else {
-        return false;
-    };
-    mcp_token_belongs_to_user(state, user, &token).await
+    mcp_url_matches_expected_scope(url, expected_url)
 }
 
 fn mcp_url_matches_expected_scope(url: &str, expected_url: &str) -> bool {
     let (Ok(url), Ok(expected_url)) = (url::Url::parse(url), url::Url::parse(expected_url)) else {
         return false;
     };
+    if url.origin() != expected_url.origin()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
 
     url.path() == expected_url.path()
         && query_param(&url, "project_id") == query_param(&expected_url, "project_id")
@@ -238,42 +296,51 @@ fn query_param(url: &url::Url, name: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
-async fn mcp_token_belongs_to_user(
-    state: &AppState,
-    user: &AuthenticatedUser,
-    token: &str,
-) -> bool {
-    if !token.starts_with("fg_") {
-        return state
-            .auth_service
-            .verify_token(token)
-            .is_ok_and(|(user_id, _, _)| user_id == user.user_id);
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    let token_hash = hex::encode(hasher.finalize());
-    let Ok(Some(pat)) =
-        PersonalAccessTokenRepo::get_pat_by_token_hash(&*state.db, &token_hash).await
-    else {
-        return false;
-    };
-    if pat.user_id != user.user_id {
-        return false;
-    }
-    if let Some(expires_at) = pat.expires_at {
-        expires_at >= now_rfc3339()
-    } else {
-        true
-    }
+fn is_credential_query_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "token"
+            | "access_token"
+            | "api_key"
+            | "apikey"
+            | "authorization"
+            | "auth"
+            | "secret"
+            | "key"
+            | "password"
+    )
 }
 
-fn mcp_url_token(url: &str) -> Option<String> {
-    url::Url::parse(url)
-        .ok()?
+fn mcp_url_has_credentials(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return true;
+    };
+    !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed
+            .query_pairs()
+            .any(|(key, value)| is_credential_query_key(&key) && !value.trim().is_empty())
+}
+
+fn redact_mcp_url(url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return String::new();
+    };
+    let safe_pairs = parsed
         .query_pairs()
-        .find(|(key, value)| key == "token" && !value.trim().is_empty())
-        .map(|(_, value)| value.into_owned())
+        .filter(|(key, _)| !is_credential_query_key(key))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    parsed.set_query(None);
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    if !safe_pairs.is_empty() {
+        let mut query = parsed.query_pairs_mut();
+        for (key, value) in safe_pairs {
+            query.append_pair(&key, &value);
+        }
+    }
+    parsed.to_string()
 }
 
 fn parse_agent(value: &str) -> ApiResult<McpAgent> {
@@ -298,6 +365,20 @@ fn parse_scope(value: Option<&str>) -> ApiResult<McpScope> {
     }
 }
 
+fn require_scope_project_id<'a>(
+    scope: &McpScope,
+    project_id: Option<&'a str>,
+) -> ApiResult<Option<&'a str>> {
+    let project_id = project_id.map(str::trim).filter(|value| !value.is_empty());
+    if matches!(scope, McpScope::Project) && project_id.is_none() {
+        return Err(ApiError::bad_request_with_code(
+            "project_id_required",
+            "project MCP configuration requires project_id",
+        ));
+    }
+    Ok(project_id)
+}
+
 fn parse_action(value: &str) -> ApiResult<McpAction> {
     match value {
         "install" => Ok(McpAction::Install),
@@ -313,7 +394,11 @@ async fn resolve_config_path(
     agent: &McpAgent,
     scope: &McpScope,
     project_id: Option<&str>,
-) -> ApiResult<PathBuf> {
+) -> ApiResult<McpConfigTarget> {
+    if matches!(agent, McpAgent::Claude) {
+        return resolve_claude_config_path(state, scope, project_id).await;
+    }
+
     let root = match scope {
         McpScope::Project | McpScope::Local => match project_id.map(str::trim) {
             Some(project_id) if !project_id.is_empty() => {
@@ -321,12 +406,94 @@ async fn resolve_config_path(
             }
             _ => env::current_dir()?,
         },
-        McpScope::User => env::current_dir()?,
+        McpScope::User => home_dir()?,
     };
-    let home = env::var("HOME")
+    let relative = config_relative_path(agent, scope);
+    let path = root.join(&relative);
+    Ok(McpConfigTarget {
+        file: ConfigTarget {
+            root,
+            relative,
+            path,
+        },
+        claude_section: None,
+    })
+}
+
+async fn resolve_claude_config_path(
+    state: &AppState,
+    scope: &McpScope,
+    project_id: Option<&str>,
+) -> ApiResult<McpConfigTarget> {
+    let home = home_dir()?;
+    let (root, relative, section) = match scope {
+        McpScope::User => (home, PathBuf::from(".claude.json"), ClaudeSection::Root),
+        McpScope::Project => {
+            let project_id = project_id.ok_or_else(|| {
+                ApiError::bad_request_with_code(
+                    "project_id_required",
+                    "project MCP configuration requires project_id",
+                )
+            })?;
+            (
+                project_config_root(state, project_id).await?,
+                PathBuf::from(".mcp.json"),
+                ClaudeSection::Root,
+            )
+        }
+        McpScope::Local => {
+            let project_id = project_id.ok_or_else(|| {
+                ApiError::bad_request_with_code(
+                    "project_id_required",
+                    "Claude local MCP configuration requires project_id to identify the client project",
+                )
+            })?;
+            let key = canonical_project_root(state, project_id).await?;
+            (
+                home,
+                PathBuf::from(".claude.json"),
+                ClaudeSection::Project {
+                    key: key.to_string_lossy().into_owned(),
+                },
+            )
+        }
+    };
+    let path = root.join(&relative);
+    Ok(McpConfigTarget {
+        file: ConfigTarget {
+            root,
+            relative,
+            path,
+        },
+        claude_section: Some(section),
+    })
+}
+
+async fn canonical_project_root(state: &AppState, project_id: &str) -> ApiResult<PathBuf> {
+    let root = project_config_root(state, project_id).await?;
+    let canonical = std::fs::canonicalize(&root).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ApiError::bad_request_with_code(
+                "project_path_unavailable",
+                "Project repository path does not exist",
+            )
+        } else {
+            ApiError::from(error)
+        }
+    })?;
+    if !canonical.is_dir() {
+        return Err(ApiError::bad_request_with_code(
+            "project_path_unavailable",
+            "Project repository path must be a directory",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn home_dir() -> ApiResult<PathBuf> {
+    env::var("HOME")
         .map(PathBuf::from)
-        .map_err(|_| ApiError::internal("HOME is not set"))?;
-    Ok(resolve_config_path_from(agent, scope, &root, &home))
+        .map_err(|_| ApiError::internal("HOME is not set"))
 }
 
 async fn project_config_root(state: &AppState, project_id: &str) -> ApiResult<PathBuf> {
@@ -351,6 +518,22 @@ async fn project_config_root(state: &AppState, project_id: &str) -> ApiResult<Pa
     Ok(PathBuf::from(local_path))
 }
 
+fn config_relative_path(agent: &McpAgent, scope: &McpScope) -> PathBuf {
+    match (agent, scope) {
+        (McpAgent::Claude, McpScope::Project) => PathBuf::from(".mcp.json"),
+        (McpAgent::Claude, McpScope::Local | McpScope::User) => PathBuf::from(".claude.json"),
+        (McpAgent::Cursor, McpScope::Project | McpScope::Local) => {
+            PathBuf::from(".cursor/mcp.json")
+        }
+        (McpAgent::Cursor, McpScope::User) => PathBuf::from(".cursor/mcp.json"),
+        (McpAgent::Codex, McpScope::Project | McpScope::Local) => {
+            PathBuf::from(".codex/config.toml")
+        }
+        (McpAgent::Codex, McpScope::User) => PathBuf::from(".codex/config.toml"),
+    }
+}
+
+#[cfg(test)]
 fn resolve_config_path_from(
     agent: &McpAgent,
     scope: &McpScope,
@@ -358,33 +541,139 @@ fn resolve_config_path_from(
     home: &Path,
 ) -> PathBuf {
     match (agent, scope) {
-        (McpAgent::Claude, McpScope::Project) => cwd.join(".claude/settings.json"),
-        (McpAgent::Claude, McpScope::Local) => cwd.join(".claude/settings.local.json"),
-        (McpAgent::Claude, McpScope::User) => home.join(".claude/settings.json"),
-        (McpAgent::Cursor, McpScope::Project | McpScope::Local) => cwd.join(".cursor/mcp.json"),
-        (McpAgent::Cursor, McpScope::User) => home.join(".cursor/mcp.json"),
-        (McpAgent::Codex, McpScope::Project | McpScope::Local) => cwd.join(".codex/config.toml"),
-        (McpAgent::Codex, McpScope::User) => home.join(".codex/config.toml"),
+        (McpAgent::Claude, McpScope::Local) | (_, McpScope::User) => {
+            home.join(config_relative_path(agent, scope))
+        }
+        (_, McpScope::Project | McpScope::Local) => cwd.join(config_relative_path(agent, scope)),
     }
 }
 
-async fn read_config(path: &Path) -> ApiResult<Value> {
-    match fs::read_to_string(path).await {
-        Ok(contents) => Ok(serde_json::from_str(&contents)?),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Map::new())),
-        Err(error) => Err(error.into()),
+async fn read_config(target: &ConfigTarget) -> ApiResult<Value> {
+    match mcp_config_fs::read_text(target)? {
+        Some(contents) => Ok(serde_json::from_str(&contents)?),
+        None => Ok(Value::Object(Map::new())),
     }
 }
 
-async fn write_config(path: &Path, value: &Value) -> ApiResult<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-
+async fn write_config(target: &ConfigTarget, value: &Value) -> ApiResult<()> {
     let mut contents = serde_json::to_vec_pretty(value)?;
     contents.push(b'\n');
-    fs::write(path, contents).await?;
+    mcp_config_fs::write_text(target, &contents)
+}
+
+fn claude_servers_mut<'a>(
+    config: &'a mut Value,
+    section: &ClaudeSection,
+) -> ApiResult<&'a mut Map<String, Value>> {
+    let root = config
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad_request("config must be a JSON object"))?;
+    let owner = match section {
+        ClaudeSection::Root => root,
+        ClaudeSection::Project { key } => {
+            let projects = root
+                .entry("projects".to_owned())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| ApiError::bad_request("projects must be a JSON object"))?;
+            projects
+                .entry(key.clone())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| ApiError::bad_request("project entry must be a JSON object"))?
+        }
+    };
+    owner
+        .entry("mcpServers".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad_request("mcpServers must be a JSON object"))
+}
+
+fn claude_forge_url(config: &Value, section: Option<&ClaudeSection>) -> ApiResult<Option<String>> {
+    let section =
+        section.ok_or_else(|| ApiError::internal("Claude MCP target is missing its section"))?;
+    let root = config
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("config must be a JSON object"))?;
+    let owner = match section {
+        ClaudeSection::Root => root,
+        ClaudeSection::Project { key } => {
+            let Some(projects) = root.get("projects") else {
+                return Ok(None);
+            };
+            let projects = projects
+                .as_object()
+                .ok_or_else(|| ApiError::bad_request("projects must be a JSON object"))?;
+            let Some(owner) = projects.get(key) else {
+                return Ok(None);
+            };
+            owner
+                .as_object()
+                .ok_or_else(|| ApiError::bad_request("project entry must be a JSON object"))?
+        }
+    };
+    let Some(servers) = owner.get("mcpServers") else {
+        return Ok(None);
+    };
+    let servers = servers
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("mcpServers must be a JSON object"))?;
+    let Some(forge) = servers.get("forge") else {
+        return Ok(None);
+    };
+    let forge = forge
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("mcpServers.forge must be a JSON object"))?;
+    match forge.get("url") {
+        Some(Value::String(url)) => Ok(Some(url.clone())),
+        Some(_) => Err(ApiError::bad_request(
+            "mcpServers.forge.url must be a string",
+        )),
+        None => Ok(None),
+    }
+}
+
+fn set_claude_forge_url(config: &mut Value, section: &ClaudeSection, url: &str) -> ApiResult<()> {
+    let servers = claude_servers_mut(config, section)?;
+    let forge = servers
+        .entry("forge".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad_request("mcpServers.forge must be a JSON object"))?;
+    forge.insert("type".to_owned(), Value::String("http".to_owned()));
+    forge.insert("url".to_owned(), Value::String(url.to_owned()));
     Ok(())
+}
+
+fn remove_claude_forge(config: &mut Value, section: &ClaudeSection) -> ApiResult<bool> {
+    let root = config
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad_request("config must be a JSON object"))?;
+    let owner = match section {
+        ClaudeSection::Root => root,
+        ClaudeSection::Project { key } => {
+            let Some(projects) = root.get_mut("projects") else {
+                return Ok(false);
+            };
+            let projects = projects
+                .as_object_mut()
+                .ok_or_else(|| ApiError::bad_request("projects must be a JSON object"))?;
+            let Some(owner) = projects.get_mut(key) else {
+                return Ok(false);
+            };
+            owner
+                .as_object_mut()
+                .ok_or_else(|| ApiError::bad_request("project entry must be a JSON object"))?
+        }
+    };
+    let Some(servers) = owner.get_mut("mcpServers") else {
+        return Ok(false);
+    };
+    let servers = servers
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad_request("mcpServers must be a JSON object"))?;
+    Ok(servers.remove("forge").is_some())
 }
 
 fn set_forge_url(config: &mut Value, url: &str) -> ApiResult<()> {
@@ -430,41 +719,38 @@ fn forge_url(config: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-async fn read_codex_config(path: &Path) -> ApiResult<String> {
-    match fs::read_to_string(path).await {
-        Ok(contents) => Ok(contents),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(error.into()),
-    }
+async fn read_codex_config(target: &ConfigTarget) -> ApiResult<String> {
+    Ok(mcp_config_fs::read_text(target)?.unwrap_or_default())
 }
 
-async fn read_codex_forge_url(path: &Path) -> ApiResult<Option<String>> {
-    let contents = read_codex_config(path).await?;
+async fn read_codex_forge_url(target: &ConfigTarget) -> ApiResult<Option<String>> {
+    let contents = read_codex_config(target).await?;
     Ok(codex_forge_url(&contents))
 }
 
 async fn update_codex_config(
-    path: &Path,
+    target: &ConfigTarget,
     mcp_url: &str,
     action: McpAction,
 ) -> ApiResult<Option<String>> {
-    let contents = read_codex_config(path).await?;
+    let contents = read_codex_config(target).await?;
     let next = match action {
         McpAction::Install => set_codex_forge_url(&contents, mcp_url),
         McpAction::Uninstall => remove_codex_forge(&contents),
     };
 
-    write_codex_config_if_changed(path, &contents, next).await?;
+    write_codex_config_if_changed(target, &contents, next).await?;
 
-    Ok(codex_forge_url(&read_codex_config(path).await?))
+    Ok(codex_forge_url(&read_codex_config(target).await?))
 }
 
-async fn write_codex_config_if_changed(path: &Path, previous: &str, next: String) -> ApiResult<()> {
+async fn write_codex_config_if_changed(
+    target: &ConfigTarget,
+    previous: &str,
+    next: String,
+) -> ApiResult<()> {
     if next != previous {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        fs::write(path, next.as_bytes()).await?;
+        mcp_config_fs::write_text(target, next.as_bytes())?;
     }
     Ok(())
 }
@@ -578,15 +864,15 @@ mod tests {
 
         assert_eq!(
             resolve_config_path_from(&McpAgent::Claude, &McpScope::Project, cwd, home),
-            PathBuf::from("/repo/.claude/settings.json")
+            PathBuf::from("/repo/.mcp.json")
         );
         assert_eq!(
             resolve_config_path_from(&McpAgent::Claude, &McpScope::Local, cwd, home),
-            PathBuf::from("/repo/.claude/settings.local.json")
+            PathBuf::from("/home/test/.claude.json")
         );
         assert_eq!(
             resolve_config_path_from(&McpAgent::Claude, &McpScope::User, cwd, home),
-            PathBuf::from("/home/test/.claude/settings.json")
+            PathBuf::from("/home/test/.claude.json")
         );
     }
 
@@ -654,6 +940,16 @@ mod tests {
             mcp_url_for_scope_with_public_base_url(bind, None, &McpScope::User, None)
                 .expect("user URL builds"),
             "http://127.0.0.1:8080/mcp"
+        );
+        assert_eq!(
+            mcp_url_for_scope_with_public_base_url(
+                bind,
+                None,
+                &McpScope::Local,
+                Some("project 1"),
+            )
+            .expect("local project URL builds"),
+            "http://127.0.0.1:8080/mcp?project_id=project%201"
         );
         assert!(
             mcp_url_for_scope_with_public_base_url(bind, None, &McpScope::Project, None).is_err()
@@ -744,8 +1040,8 @@ command = "other"
         .expect("project config path resolves");
 
         assert_eq!(
-            config_path,
-            PathBuf::from("/Volumes/Data/codes/games/world/.claude/settings.json")
+            config_path.path(),
+            PathBuf::from("/Volumes/Data/codes/games/world/.mcp.json")
         );
     }
 
@@ -770,6 +1066,19 @@ command = "other"
     #[tokio::test]
     async fn install_project_scope_writes_bare_url() {
         let repo_dir = unique_temp_dir("forge-mcp-project");
+        std::fs::create_dir_all(&repo_dir).expect("repo dir creates");
+        let claude_path = repo_dir.join(".mcp.json");
+        std::fs::write(
+            &claude_path,
+            serde_json::json!({
+                "foreign": true,
+                "mcpServers": {
+                    "other": { "type": "http", "url": "https://example.com/other" }
+                }
+            })
+            .to_string(),
+        )
+        .expect("existing project config writes");
         let (state, project_id) =
             test_state_with_project_repo(Some(repo_dir.to_string_lossy().into_owned())).await;
 
@@ -778,6 +1087,28 @@ command = "other"
 
         assert!(url.contains("/mcp?project_id=project-1"));
         assert!(!url.contains("token="));
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(&claude_path).expect("project config reads"),
+        )
+        .expect("project config parses");
+        assert_eq!(config["foreign"], true);
+        assert_eq!(
+            config["mcpServers"]["other"]["url"],
+            "https://example.com/other"
+        );
+        assert_eq!(config["mcpServers"]["forge"]["url"], url);
+
+        uninstall_config(&state, "claude", Some("project"), Some(&project_id)).await;
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(&claude_path).expect("project config reads after uninstall"),
+        )
+        .expect("project config parses after uninstall");
+        assert!(config["mcpServers"].get("forge").is_none());
+        assert_eq!(config["foreign"], true);
+        assert_eq!(
+            config["mcpServers"]["other"]["url"],
+            "https://example.com/other"
+        );
         let _ = std::fs::remove_dir_all(repo_dir);
     }
 
@@ -851,7 +1182,7 @@ command = "other"
     }
 
     #[tokio::test]
-    async fn get_mcp_config_reports_installed_for_legacy_valid_pat_url() {
+    async fn get_mcp_config_marks_legacy_token_url_as_not_usable() {
         let repo_dir = unique_temp_dir("forge-mcp-pat");
         let (state, project_id) =
             test_state_with_project_repo(Some(repo_dir.to_string_lossy().into_owned())).await;
@@ -869,14 +1200,288 @@ command = "other"
 
         let response = get_config(&state, "claude", Some("project"), Some(&project_id)).await;
 
-        assert!(response.installed);
-        assert_eq!(response.url.as_deref(), Some(installed_url.as_str()));
+        assert!(
+            !response.installed,
+            "a query-token URL no longer authenticates and must be reinstalled"
+        );
+        assert_eq!(response.url.as_deref(), Some(expected_url.as_str()));
+        assert!(!response.url.as_deref().unwrap().contains("token="));
         let _ = std::fs::remove_dir_all(repo_dir);
+    }
+
+    #[test]
+    fn mcp_redaction_removes_credentials_and_foreign_origins_are_not_usable() {
+        let expected = "http://127.0.0.1:8080/mcp?project_id=project-1";
+        assert!(!mcp_url_is_usable(
+            Some("https://attacker.example/mcp?project_id=project-1"),
+            expected
+        ));
+        assert!(!mcp_url_is_usable(
+            Some("http://127.0.0.1:8080/mcp?project_id=project-1&access_token=secret"),
+            expected
+        ));
+        assert!(!mcp_url_is_usable(
+            Some("http://127.0.0.1:8080/mcp?project_id=project-1&token=fg_secret"),
+            expected
+        ));
+        assert_eq!(
+            redact_mcp_url(
+                "http://127.0.0.1:8080/mcp?project_id=project-1&token=fg_secret&access_token=x"
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn config_target_rejects_parent_and_absolute_components() {
+        let root = unique_temp_dir("forge-mcp-escape");
+        std::fs::create_dir_all(&root).expect("root creates");
+        for relative in [
+            "../outside.json",
+            "/absolute.json",
+            ".claude/../../outside.json",
+        ] {
+            let target = ConfigTarget {
+                root: root.clone(),
+                relative: PathBuf::from(relative),
+                path: root.join(relative),
+            };
+            let error = mcp_config_fs::write_text(&target, b"x").expect_err("escape rejects");
+            assert!(
+                format!("{error:?}").contains("config_path_escape"),
+                "unexpected error for {relative}: {error:?}"
+            );
+        }
+        assert!(!root.parent().unwrap().join("outside.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_rejects_symlinked_config_directory() {
+        let repo_dir = unique_temp_dir("forge-mcp-symlink-dir");
+        let outside_dir = unique_temp_dir("forge-mcp-symlink-outside");
+        std::fs::create_dir_all(&repo_dir).expect("repo creates");
+        std::fs::create_dir_all(&outside_dir).expect("outside creates");
+        std::os::unix::fs::symlink(&outside_dir, repo_dir.join(".cursor"))
+            .expect("config symlink creates");
+        let (state, project_id) =
+            test_state_with_project_repo(Some(repo_dir.to_string_lossy().into_owned())).await;
+
+        let error = update_mcp_config(
+            State(state),
+            test_authenticated_user(),
+            Json(McpConfigActionRequest {
+                agent: "cursor".to_owned(),
+                scope: Some("project".to_owned()),
+                project_id: Some(project_id),
+                public_base_url: None,
+                action: "install".to_owned(),
+            }),
+        )
+        .await
+        .expect_err("symlinked config directory rejects");
+
+        assert!(format!("{error:?}").contains("config_path_symlink"));
+        assert!(!outside_dir.join("mcp.json").exists());
+        let _ = std::fs::remove_dir_all(repo_dir);
+        let _ = std::fs::remove_dir_all(outside_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_rejects_symlinked_config_file() {
+        let repo_dir = unique_temp_dir("forge-mcp-symlink-file");
+        let outside_dir = unique_temp_dir("forge-mcp-symlink-file-outside");
+        std::fs::create_dir_all(&repo_dir).expect("repo creates");
+        std::fs::create_dir_all(&outside_dir).expect("outside creates");
+        let outside_file = outside_dir.join("mcp.json");
+        std::fs::write(&outside_file, "{\"keep\":true}\n").expect("outside file writes");
+        std::os::unix::fs::symlink(&outside_file, repo_dir.join(".mcp.json"))
+            .expect("config file symlink creates");
+        let (state, project_id) =
+            test_state_with_project_repo(Some(repo_dir.to_string_lossy().into_owned())).await;
+
+        let error = update_mcp_config(
+            State(state),
+            test_authenticated_user(),
+            Json(McpConfigActionRequest {
+                agent: "claude".to_owned(),
+                scope: Some("project".to_owned()),
+                project_id: Some(project_id),
+                public_base_url: None,
+                action: "install".to_owned(),
+            }),
+        )
+        .await
+        .expect_err("symlinked config file rejects");
+
+        assert!(format!("{error:?}").contains("config_path_symlink"));
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).expect("outside file reads"),
+            "{\"keep\":true}\n"
+        );
+        let _ = std::fs::remove_dir_all(repo_dir);
+        let _ = std::fs::remove_dir_all(outside_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_writes_private_config_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo_dir = unique_temp_dir("forge-mcp-private");
+        std::fs::create_dir_all(&repo_dir).expect("repo dir creates");
+        let (state, project_id) =
+            test_state_with_project_repo(Some(repo_dir.to_string_lossy().into_owned())).await;
+
+        install_config(&state, "claude", Some("project"), Some(&project_id)).await;
+
+        let mode = std::fs::metadata(repo_dir.join(".mcp.json"))
+            .expect("config metadata reads")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(repo_dir);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_local_and_user_scopes_preserve_existing_configuration() {
+        let _guard = TEST_ENV_LOCK.lock().expect("test env lock");
+        let home_dir = unique_temp_dir("forge-mcp-claude-home");
+        let repo_a = unique_temp_dir("forge-mcp-claude-repo-a");
+        let repo_b = unique_temp_dir("forge-mcp-claude-repo-b");
+        for path in [&home_dir, &repo_a, &repo_b] {
+            std::fs::create_dir_all(path).expect("test directory creates");
+        }
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str());
+        let canonical_a = std::fs::canonicalize(&repo_a).expect("repo A canonicalizes");
+        let canonical_b = std::fs::canonicalize(&repo_b).expect("repo B canonicalizes");
+        let state = test_state_with_user().await;
+        add_project_repo(&state, "project-a", "repo-a", &repo_a.to_string_lossy()).await;
+        add_project_repo(&state, "project-b", "repo-b", &repo_b.to_string_lossy()).await;
+
+        let key_a = canonical_a.to_string_lossy().into_owned();
+        let key_b = canonical_b.to_string_lossy().into_owned();
+        let claude_path = home_dir.join(".claude.json");
+        let mut initial = serde_json::json!({
+            "numStartups": 7,
+            "mcpServers": {
+                "user-other": { "type": "http", "url": "https://example.com/user" }
+            },
+            "projects": {
+                "/other/project": {
+                    "mcpServers": {
+                        "other": { "type": "http", "url": "https://example.com/other" }
+                    }
+                }
+            }
+        });
+        initial["projects"][&key_a] = serde_json::json!({
+            "allowedTools": ["Read"],
+            "mcpServers": {
+                "existing-a": { "type": "http", "url": "https://example.com/a" }
+            }
+        });
+        initial["projects"][&key_b] = serde_json::json!({
+            "mcpServers": {
+                "existing-b": { "type": "http", "url": "https://example.com/b" }
+            }
+        });
+        std::fs::write(
+            &claude_path,
+            serde_json::to_string_pretty(&initial).expect("initial config serializes"),
+        )
+        .expect("initial config writes");
+
+        let local_a = install_config(&state, "claude", Some("local"), Some("project-a")).await;
+        assert!(local_a.expected_url.contains("project_id=project-a"));
+        let local_b = install_config(&state, "claude", Some("local"), Some("project-b")).await;
+        assert!(local_b.expected_url.contains("project_id=project-b"));
+        let user = install_config(&state, "claude", Some("user"), None).await;
+        assert!(!user.expected_url.contains("project_id="));
+
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(&claude_path).expect("Claude config reads"),
+        )
+        .expect("Claude config parses");
+        assert_eq!(config["numStartups"], 7);
+        assert_eq!(
+            config["mcpServers"]["user-other"]["url"],
+            "https://example.com/user"
+        );
+        assert_eq!(config["mcpServers"]["forge"]["url"], user.expected_url);
+        assert_eq!(
+            config["projects"][key_a.as_str()]["mcpServers"]["forge"]["url"],
+            local_a.expected_url
+        );
+        assert_eq!(
+            config["projects"][key_b.as_str()]["mcpServers"]["forge"]["url"],
+            local_b.expected_url
+        );
+        assert_eq!(
+            config["projects"][key_a.as_str()]["allowedTools"][0],
+            "Read"
+        );
+        assert_eq!(
+            config["projects"][key_a.as_str()]["mcpServers"]["existing-a"]["url"],
+            "https://example.com/a"
+        );
+        assert_eq!(
+            config["projects"][key_b.as_str()]["mcpServers"]["existing-b"]["url"],
+            "https://example.com/b"
+        );
+        assert_eq!(
+            config["projects"]["/other/project"]["mcpServers"]["other"]["url"],
+            "https://example.com/other"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&claude_path)
+                .expect("Claude config metadata reads")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        uninstall_config(&state, "claude", Some("local"), Some("project-a")).await;
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(&claude_path).expect("Claude config reads after uninstall"),
+        )
+        .expect("Claude config parses after uninstall");
+        assert!(config["projects"][key_a.as_str()]["mcpServers"]
+            .get("forge")
+            .is_none());
+        assert_eq!(
+            config["projects"][key_b.as_str()]["mcpServers"]["forge"]["url"],
+            local_b.expected_url
+        );
+        assert_eq!(config["mcpServers"]["forge"]["url"], user.expected_url);
+        assert_eq!(
+            config["projects"][key_a.as_str()]["mcpServers"]["existing-a"]["url"],
+            "https://example.com/a"
+        );
+
+        let local_a_status = get_config(&state, "claude", Some("local"), Some("project-a")).await;
+        assert!(!local_a_status.installed);
+        let local_b_status = get_config(&state, "claude", Some("local"), Some("project-b")).await;
+        assert!(local_b_status.installed);
+        let user_status = get_config(&state, "claude", Some("user"), None).await;
+        assert!(user_status.installed);
+
+        let _ = std::fs::remove_dir_all(home_dir);
+        let _ = std::fs::remove_dir_all(repo_a);
+        let _ = std::fs::remove_dir_all(repo_b);
     }
 
     #[tokio::test]
     async fn install_does_not_create_personal_access_token_rows() {
         let repo_dir = unique_temp_dir("forge-mcp-no-pat");
+        std::fs::create_dir_all(&repo_dir).expect("repo dir creates");
         let (state, project_id) =
             test_state_with_project_repo(Some(repo_dir.to_string_lossy().into_owned())).await;
         let before = personal_access_token_count(&state).await;
@@ -966,6 +1571,53 @@ command = "other"
         (state, project_id)
     }
 
+    async fn add_project_repo(state: &AppState, project_id: &str, repo_id: &str, local_path: &str) {
+        let now = db::now_rfc3339();
+        db::ProjectRepo::create(
+            &*state.db,
+            db::CreateProject {
+                id: project_id.to_owned(),
+                name: project_id.to_owned(),
+                settings: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: Some("test-user-id".to_owned()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project creates");
+        db::RepoRepo::create(
+            &*state.db,
+            db::CreateRepo {
+                id: repo_id.to_owned(),
+                project_id: project_id.to_owned(),
+                name: repo_id.to_owned(),
+                remote_url: "https://example.com/repo.git".to_owned(),
+                local_path: Some(local_path.to_owned()),
+                work_mode: db::WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("repo creates");
+        db::ProjectRepo::update(
+            &*state.db,
+            db::UpdateProject {
+                id: project_id.to_owned(),
+                name: None,
+                settings: None,
+                primary_repo_id: Some(Some(repo_id.to_owned())),
+                paused_at: None,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("project updates");
+    }
+
     async fn install_config(
         state: &AppState,
         agent: &str,
@@ -998,6 +1650,28 @@ command = "other"
         .0
     }
 
+    async fn uninstall_config(
+        state: &AppState,
+        agent: &str,
+        scope: Option<&str>,
+        project_id: Option<&str>,
+    ) -> McpConfigResponse {
+        update_mcp_config(
+            State(state.clone()),
+            test_authenticated_user(),
+            Json(McpConfigActionRequest {
+                agent: agent.to_owned(),
+                scope: scope.map(str::to_owned),
+                project_id: project_id.map(str::to_owned),
+                public_base_url: None,
+                action: "uninstall".to_owned(),
+            }),
+        )
+        .await
+        .expect("uninstall succeeds")
+        .0
+    }
+
     async fn get_config(
         state: &AppState,
         agent: &str,
@@ -1020,9 +1694,9 @@ command = "other"
     }
 
     fn write_claude_config(repo_dir: &Path, url: &str) {
-        std::fs::create_dir_all(repo_dir.join(".claude")).expect("claude config dir creates");
+        std::fs::create_dir_all(repo_dir).expect("repo dir creates");
         std::fs::write(
-            repo_dir.join(".claude/settings.json"),
+            repo_dir.join(".mcp.json"),
             serde_json::json!({
                 "mcpServers": {
                     "forge": {
@@ -1082,8 +1756,20 @@ command = "other"
         AuthenticatedUser {
             user_id: "test-user-id".to_owned(),
             email: "test@example.com".to_owned(),
-            is_admin: false,
+            is_admin: true,
         }
+    }
+
+    #[test]
+    fn server_global_mcp_scope_requires_admin() {
+        let non_admin = AuthenticatedUser {
+            user_id: "user".to_owned(),
+            email: "user@example.com".to_owned(),
+            is_admin: false,
+        };
+        assert!(require_mcp_scope_admin(&McpScope::Project, &non_admin).is_ok());
+        assert!(require_mcp_scope_admin(&McpScope::User, &non_admin).is_err());
+        assert!(require_mcp_scope_admin(&McpScope::Local, &non_admin).is_err());
     }
 
     struct EnvVarGuard {

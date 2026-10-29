@@ -24,7 +24,7 @@ workspace:
     )
     .expect("config writes");
 
-    let app = test_app(workspace_root.path(), config_path.clone()).await;
+    let (app, _db) = test_app(workspace_root.path(), config_path.clone()).await;
     let admin_token = common::admin_jwt();
 
     let response: SettingsResponse = common::empty_request_with_bearer(
@@ -56,7 +56,7 @@ async fn settings_endpoint_updates_forge_yaml() {
     let config_dir = TestDir::new("settings-update-config");
     let config_path = config_dir.path().join("forge.yaml");
 
-    let app = test_app(workspace_root.path(), config_path.clone()).await;
+    let (app, _db) = test_app(workspace_root.path(), config_path.clone()).await;
     let admin_token = common::admin_jwt();
 
     let response: SettingsResponse = common::json_request_with_bearer(
@@ -94,7 +94,10 @@ async fn settings_endpoint_requires_admin() {
     let config_dir = TestDir::new("settings-non-admin-config");
     let config_path = config_dir.path().join("forge.yaml");
 
-    let app = test_app(workspace_root.path(), config_path).await;
+    let (app, db) = test_app(workspace_root.path(), config_path).await;
+    db::UserRepo::set_admin(&*db, "test-user-id", false)
+        .await
+        .expect("demote test user");
 
     let error: serde_json::Value =
         empty_request(&app, Method::GET, "/api/v1/settings", StatusCode::FORBIDDEN).await;
@@ -113,13 +116,28 @@ fn setting<'a>(response: &'a SettingsResponse, key: &str) -> &'a api_types::Forg
 async fn test_app(
     workspace_root: &std::path::Path,
     config_path: std::path::PathBuf,
-) -> axum::Router {
+) -> (axum::Router, Arc<db::SqliteDb>) {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
+    let now = db::now_rfc3339();
+    db::UserRepo::create_user(
+        &*db,
+        &db::User {
+            id: "test-user-id".to_owned(),
+            email: "test@example.com".to_owned(),
+            password_hash: "not-a-real-hash".to_owned(),
+            display_name: None,
+            is_admin: true,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("test user seeds");
     let adapter_registry = Arc::new(cli_adapters::default_registry());
     let event_bus = Arc::new(events::EventBus::new(16));
     let merge_service = Arc::new(services::MergeService::new(
@@ -133,7 +151,7 @@ async fn test_app(
         workspace_root.to_path_buf(),
     ));
     let state = AppState::with_adapter_registry_services_and_shutdown(
-        db,
+        Arc::clone(&db),
         event_bus,
         true,
         adapter_registry,
@@ -148,5 +166,5 @@ async fn test_app(
 
     let web_dist_dir = TestDir::new("settings-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
-    build_router(state, web_dist_dir.path().to_path_buf())
+    (build_router(state, web_dist_dir.path().to_path_buf()), db)
 }

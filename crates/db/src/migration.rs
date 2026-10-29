@@ -59,7 +59,9 @@ use std::{
 // V133 records exact follow-up request identities atomically with their child
 // Execution so uncertain retries replay the same admitted child. V134 replaces
 // the WorkUnit Execution admission trigger with distinct failure markers so
-// late SQLite guard rejections retain their exact typed cause.
+// late SQLite guard rejections retain their exact typed cause. V135 repairs the
+// canonical Project owner membership representation without inventing owners
+// for ownerless Projects.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

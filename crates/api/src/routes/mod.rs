@@ -30,6 +30,7 @@ pub mod external_links;
 pub mod fs;
 pub mod integrations;
 pub mod mcp_config;
+pub(crate) mod mcp_config_fs;
 pub mod members;
 pub mod notifications;
 pub mod oauth;

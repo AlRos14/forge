@@ -1280,7 +1280,25 @@ pub trait TerminalSessionRepo: Send + Sync {
 #[async_trait]
 pub trait ProjectRepo: Send + Sync {
     async fn create(&self, input: CreateProject) -> Result<Project>;
+    /// Atomically creates a Project and its canonical owner membership.
+    async fn create_with_owner_membership(
+        &self,
+        input: CreateProject,
+        member_id: &str,
+    ) -> Result<Project>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Project>>;
+    async fn get_by_id_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &str,
+    ) -> Result<Option<Project>>;
+    async fn set_owner_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        owner_id: &str,
+        updated_at: &str,
+    ) -> Result<()>;
     async fn list(&self, page: PageRequest) -> Result<Page<Project>>;
     async fn list_visible_to_user(&self, user_id: &str, page: PageRequest)
         -> Result<Page<Project>>;
@@ -1290,6 +1308,7 @@ pub trait ProjectRepo: Send + Sync {
         input: UpdateProject,
         expected_version: i64,
         project_hooks_json: Option<String>,
+        caller_user_id: Option<&str>,
     ) -> Result<Project>;
     async fn set_project_hooks_json(
         &self,
@@ -1303,8 +1322,15 @@ pub trait ProjectRepo: Send + Sync {
         project_id: &str,
         by: i64,
     ) -> Result<i64>;
-    async fn set_paused_at(&self, id: &str, paused_at: Option<String>) -> Result<()>;
-    async fn delete(&self, id: &str) -> Result<()>;
+    async fn set_paused_at(
+        &self,
+        id: &str,
+        paused_at: Option<String>,
+        caller_user_id: Option<&str>,
+    ) -> Result<()>;
+    /// Deletes a Project. When `caller_user_id` is provided, the exact
+    /// owner/admin membership is rechecked inside the deletion transaction.
+    async fn delete(&self, id: &str, caller_user_id: Option<&str>) -> Result<()>;
 }
 
 #[async_trait]
@@ -2216,6 +2242,8 @@ pub trait UserRepo: Send + Sync {
     async fn search_users(&self, query: &str, limit: i64) -> Result<Vec<User>>;
     async fn list_users(&self, page: PageRequest) -> Result<Page<User>>;
     async fn set_admin(&self, id: &str, is_admin: bool) -> Result<()>;
+    /// Demotes an administrator only while another administrator remains.
+    async fn set_admin_checked(&self, id: &str, is_admin: bool) -> Result<()>;
     async fn update_profile(
         &self,
         id: &str,
@@ -2225,6 +2253,9 @@ pub trait UserRepo: Send + Sync {
     ) -> Result<()>;
     async fn count_admins(&self) -> Result<i64>;
     async fn delete_user(&self, id: &str) -> Result<bool>;
+    /// Deletes a user unless they are the last administrator or the sole owner
+    /// of a Project without another owner.
+    async fn delete_user_checked(&self, id: &str) -> Result<bool>;
 }
 
 #[async_trait]
@@ -2304,10 +2335,34 @@ pub trait OAuthRefreshTokenRepo: Send + Sync {
 #[async_trait]
 pub trait ProjectMemberRepo: Send + Sync {
     async fn add_member(&self, input: CreateProjectMember) -> Result<ProjectMember>;
+    async fn add_member_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateProjectMember,
+    ) -> Result<ProjectMember>;
     async fn get_member(&self, project_id: &str, user_id: &str) -> Result<Option<ProjectMember>>;
+    async fn get_member_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ProjectMember>>;
     async fn list_members(&self, project_id: &str) -> Result<Vec<ProjectMember>>;
+    async fn list_members_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        project_id: &str,
+    ) -> Result<Vec<ProjectMember>>;
     async fn update_member_role(
         &self,
+        project_id: &str,
+        user_id: &str,
+        role: &str,
+        updated_at: &str,
+    ) -> Result<ProjectMember>;
+    async fn update_member_role_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
         project_id: &str,
         user_id: &str,
         role: &str,

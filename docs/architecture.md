@@ -39,7 +39,7 @@ TaskRole and RoleMembership govern eligibility. WorkUnit allocation names the ex
 
 Forge's Orchestrator reacts to durable domain events. Its implemented output set is bounded to Messages, Handoffs, limited WorkUnit creation, and Proposals. It does not directly steer or stop a harness, reassign work, merge repositories, or execute a Proposal or Decision. Human and Agent actions remain subject to the same domain authority.
 
-Automatic Orchestrator execution requires the Agent owner and Task Project owner to be the same account. Global Agent visibility supports discovery and TaskRole membership; it does not grant cross-account execution. Forge has no cross-account Agent execution grants, so a missing or mismatched owner fails closed at Execution admission and the transactional Provider Start claim.
+Automatic Orchestrator execution requires the Agent owner and Task Project owner to be the same account, with a current Project owner/admin/member membership. Global Agent visibility supports discovery and TaskRole membership; it does not grant cross-account execution. Forge has no cross-account Agent execution grants, so a missing or mismatched owner or membership fails closed at Execution admission and the transactional Provider Start claim.
 
 ## Harnesses and Executions
 
@@ -67,7 +67,7 @@ A Gate is a deterministic policy over exact durable records. Its immutable GateE
 
 ## Persistence and history
 
-SQLite is the current persistence layer. Numbered migrations V001–V134 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers.
+SQLite is the current persistence layer. Numbered migrations V001–V135 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects.
 
 Historical `agent_session_history`, immutable Execution records, ProjectRelease snapshots, Artifact and Evidence references, HarnessSession identities, cross-record IDs, migration decisions, ADRs, and upstream license attribution remain readable history. History does not regain runtime authority. ProjectRelease is a read-only historical snapshot and does not create a current Charter, milestone, readiness workflow, or release operation.
 
@@ -124,14 +124,17 @@ Supported settings are defined in `crates/config/`. Common environment variables
 
 ## Container execution privilege
 
-The published Docker image currently runs Forge as root, and Compose binds the
-server port on all host interfaces. The embedded shell therefore inherits the
-container's root identity. This PR restricts which account can reach that shell
-through Forge authority, but does not yet drop container privileges. A safe
-non-root image requires a forward-compatible ownership strategy for existing
-`/data` volumes and workspace mounts; treat container privilege reduction as a
-separate operational migration. Do not infer daemon ownership for historical
-records during that migration.
+The container image runs Forge and its embedded shell as the unprivileged
+`forge` user (UID/GID `10001`). The entrypoint starts as root only to inspect
+`/data`, fails closed on an unapproved root-owned volume, and drops privileges
+before `exec`; the application process is never root. An explicit
+`FORGE_MIGRATE_ROOT_OWNED_DATA=1` one-time run authorizes ownership repair only
+under `/data`. Workspace and repository mounts are never recursively rewritten.
+
+Compose binds the host port to `127.0.0.1` by default. Public exposure requires
+an explicit bind override, a reviewed proxy/TLS boundary, and the deployment
+controls in [deployment](deployment.md). Do not infer daemon or Project
+ownership for historical records during a container migration.
 
 ## Upstream
 

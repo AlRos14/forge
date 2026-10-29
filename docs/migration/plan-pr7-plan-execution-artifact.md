@@ -1,5 +1,7 @@
 # Plan PR7 — Planning Execution and generic Plan Artifact
 
+> **Historical migration ledger.** This document records the state at its named baseline. PR0–PR15 are complete and merged; status statements such as "not merged" or "ready for review" describe the authoring moment. Current behavior is documented in [architecture.md](../architecture.md) and [concepts](../concepts/).
+
 Status: ready for independent review on
 `feat/plan-pr7-plan-execution-artifact`, based on
 `27acb8cb1096eda099dcbc1a233d5e0251f1aece`. This branch is not merged.

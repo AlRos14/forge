@@ -146,6 +146,21 @@ async fn test_app() -> Harness {
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(SqliteDb::new(pool));
+    let now = now_rfc3339();
+    db::UserRepo::create_user(
+        &*db,
+        &db::User {
+            id: "test-user-id".to_owned(),
+            email: "test@example.com".to_owned(),
+            password_hash: "not-a-real-hash".to_owned(),
+            display_name: None,
+            is_admin: true,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("test user seeds");
     let state = AppState::with_adapter_registry(
         db,
         Arc::new(events::EventBus::new(32)),
@@ -165,7 +180,7 @@ async fn test_app() -> Harness {
 
 async fn create_project_and_repo(harness: &Harness) -> (String, String, PathBuf, String) {
     let now = now_rfc3339();
-    let project = ProjectRepo::create(
+    let project = ProjectRepo::create_with_owner_membership(
         &*harness.state.db,
         CreateProject {
             id: new_uuid_v4(),
@@ -176,6 +191,7 @@ async fn create_project_and_repo(harness: &Harness) -> (String, String, PathBuf,
             created_at: now.clone(),
             updated_at: now.clone(),
         },
+        &new_uuid_v4(),
     )
     .await
     .expect("project creates");

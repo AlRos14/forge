@@ -4,50 +4,17 @@ use crate::{new_uuid_v4, now_rfc3339};
 #[async_trait]
 impl ProjectRepo for SqliteDb {
     async fn create(&self, input: CreateProject) -> Result<Project> {
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("INSERT INTO project (id, name, settings, primary_repo_id, owner_id, project_hooks_json, project_work_epoch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '[]', 0, ?, ?)")
-            .bind(&input.id)
-            .bind(&input.name)
-            .bind(&input.settings)
-            .bind(&input.primary_repo_id)
-            .bind(&input.owner_id)
-            .bind(&input.created_at)
-            .bind(&input.updated_at)
-            .execute(&mut *transaction)
-            .await?;
-        let correlation_id = new_uuid_v4();
-        let actor_type = if input.owner_id.is_some() {
-            "user"
-        } else {
-            "system"
-        }
-        .to_owned();
-        let actor_id = input.owner_id.clone();
-        let event = CreateDomainEvent {
-            id: new_uuid_v4(),
-            event_type: "project.created".to_owned(),
-            entity_type: "project".to_owned(),
-            entity_id: input.id.clone(),
-            actor_type,
-            actor_id,
-            scope_type: "project".to_owned(),
-            scope_id: input.id.clone(),
-            correlation_id,
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some(format!("project-created:{}", input.id)),
-            payload_json: serde_json::json!({
-                "project_id": input.id,
-                "name": input.name,
-            })
-            .to_string(),
-            created_at: input.created_at.clone(),
-        };
-        DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
-        transaction.commit().await?;
-        ProjectRepo::get_by_id(self, &input.id)
-            .await?
-            .ok_or(DbError::NotFound)
+        let member_id = input.owner_id.as_ref().map(|_| new_uuid_v4());
+        self.create_project_record(input, member_id.as_deref())
+            .await
+    }
+
+    async fn create_with_owner_membership(
+        &self,
+        input: CreateProject,
+        member_id: &str,
+    ) -> Result<Project> {
+        self.create_project_record(input, Some(member_id)).await
     }
 
     async fn get_by_id(&self, id: &str) -> Result<Option<Project>> {
@@ -59,6 +26,42 @@ impl ProjectRepo for SqliteDb {
         .await?
         .map(map_project)
         .transpose()
+    }
+
+    async fn get_by_id_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        id: &str,
+    ) -> Result<Option<Project>> {
+        sqlx::query(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM project WHERE id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .map(map_project)
+        .transpose()
+    }
+
+    async fn set_owner_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        id: &str,
+        owner_id: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE project SET owner_id = ?, updated_at = ?, version = version + 1 WHERE id = ?",
+        )
+        .bind(owner_id)
+        .bind(updated_at)
+        .bind(id)
+        .execute(&mut **transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
     }
 
     async fn list(&self, page: PageRequest) -> Result<Page<Project>> {
@@ -90,7 +93,7 @@ impl ProjectRepo for SqliteDb {
         page: PageRequest,
     ) -> Result<Page<Project>> {
         let offset = decode_offset(&page.cursor)?;
-        let visibility_filter = "owner_id IS NULL OR owner_id = ? OR EXISTS (
+        let visibility_filter = "owner_id IS NULL OR EXISTS (
             SELECT 1 FROM project_member
             WHERE project_member.project_id = project.id AND project_member.user_id = ?
         )";
@@ -99,7 +102,6 @@ impl ProjectRepo for SqliteDb {
             order_clause_without_priority(&page)
         );
         let rows = sqlx::query(&sql)
-            .bind(user_id)
             .bind(user_id)
             .bind(limit(&page) + 1)
             .bind(offset)
@@ -114,7 +116,6 @@ impl ProjectRepo for SqliteDb {
                 sqlx::query_scalar::<_, i64>(&format!(
                     "SELECT COUNT(*) FROM project WHERE ({visibility_filter})"
                 ))
-                .bind(user_id)
                 .bind(user_id)
                 .fetch_one(&self.pool)
                 .await?,
@@ -163,8 +164,25 @@ impl ProjectRepo for SqliteDb {
         input: UpdateProject,
         expected_version: i64,
         project_hooks_json: Option<String>,
+        caller_user_id: Option<&str>,
     ) -> Result<Project> {
-        let mut project = ProjectRepo::get_by_id(self, &input.id)
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(caller_user_id) = caller_user_id {
+            let is_admin: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM project_member
+                    WHERE project_id = ? AND user_id = ? AND role IN ('owner', 'admin')
+                )",
+            )
+            .bind(&input.id)
+            .bind(caller_user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if is_admin == 0 {
+                return Err(DbError::ProjectAdminRequired);
+            }
+        }
+        let mut project = ProjectRepo::get_by_id_in_tx(self, &mut tx, &input.id)
             .await?
             .ok_or(DbError::NotFound)?;
         if project.version != expected_version {
@@ -200,11 +218,12 @@ impl ProjectRepo for SqliteDb {
         .bind(&project.updated_at)
         .bind(&project.id)
         .bind(expected_version)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
+        tx.commit().await?;
         ProjectRepo::get_by_id(self, &project.id)
             .await?
             .ok_or(DbError::NotFound)
@@ -245,21 +264,58 @@ impl ProjectRepo for SqliteDb {
         epoch.ok_or(DbError::NotFound)
     }
 
-    async fn set_paused_at(&self, id: &str, paused_at: Option<String>) -> Result<()> {
+    async fn set_paused_at(
+        &self,
+        id: &str,
+        paused_at: Option<String>,
+        caller_user_id: Option<&str>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(caller_user_id) = caller_user_id {
+            let is_admin: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM project_member
+                    WHERE project_id = ? AND user_id = ? AND role IN ('owner', 'admin')
+                )",
+            )
+            .bind(id)
+            .bind(caller_user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if is_admin == 0 {
+                return Err(DbError::ProjectAdminRequired);
+            }
+        }
         let result = sqlx::query("UPDATE project SET paused_at = ?, updated_at = ? WHERE id = ?")
             .bind(paused_at.as_deref())
             .bind(now_rfc3339())
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn delete(&self, id: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+    async fn delete(&self, id: &str, caller_user_id: Option<&str>) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(caller_user_id) = caller_user_id {
+            let is_admin: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM project_member
+                    WHERE project_id = ? AND user_id = ? AND role IN ('owner', 'admin')
+                )",
+            )
+            .bind(id)
+            .bind(caller_user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if is_admin == 0 {
+                return Err(DbError::ProjectAdminRequired);
+            }
+        }
         let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM project WHERE id = ?")
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -412,5 +468,79 @@ impl ProjectRepo for SqliteDb {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+}
+
+impl SqliteDb {
+    async fn create_project_record(
+        &self,
+        input: CreateProject,
+        owner_member_id: Option<&str>,
+    ) -> Result<Project> {
+        if owner_member_id.is_some() && input.owner_id.is_none() {
+            return Err(DbError::Check(
+                "owner membership requires a canonical Project owner".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("INSERT INTO project (id, name, settings, primary_repo_id, owner_id, project_hooks_json, project_work_epoch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '[]', 0, ?, ?)")
+            .bind(&input.id)
+            .bind(&input.name)
+            .bind(&input.settings)
+            .bind(&input.primary_repo_id)
+            .bind(&input.owner_id)
+            .bind(&input.created_at)
+            .bind(&input.updated_at)
+            .execute(&mut *transaction)
+            .await?;
+
+        if let (Some(member_id), Some(owner_id)) = (owner_member_id, input.owner_id.as_deref()) {
+            sqlx::query(
+                "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) \
+                 VALUES (?, ?, ?, 'owner', ?, ?)",
+            )
+            .bind(member_id)
+            .bind(&input.id)
+            .bind(owner_id)
+            .bind(&input.created_at)
+            .bind(&input.updated_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        let correlation_id = new_uuid_v4();
+        let actor_type = if input.owner_id.is_some() {
+            "user"
+        } else {
+            "system"
+        }
+        .to_owned();
+        let actor_id = input.owner_id.clone();
+        let event = CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "project.created".to_owned(),
+            entity_type: "project".to_owned(),
+            entity_id: input.id.clone(),
+            actor_type,
+            actor_id,
+            scope_type: "project".to_owned(),
+            scope_id: input.id.clone(),
+            correlation_id,
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("project-created:{}", input.id)),
+            payload_json: serde_json::json!({
+                "project_id": input.id,
+                "name": input.name,
+            })
+            .to_string(),
+            created_at: input.created_at.clone(),
+        };
+        DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+        transaction.commit().await?;
+        ProjectRepo::get_by_id(self, &input.id)
+            .await?
+            .ok_or(DbError::NotFound)
     }
 }

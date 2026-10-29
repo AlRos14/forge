@@ -40,6 +40,13 @@ pub struct AuthResponse {
 
 #[derive(Debug, Serialize, Deserialize, TS)]
 #[ts(export)]
+pub struct EventTicketResponse {
+    pub ticket: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct UserResponse {
     pub id: String,
     pub email: String,

@@ -1115,20 +1115,6 @@ async fn work_unit_task_binding_is_immutable_without_provenance() {
     let other_task_id = new_uuid_v4();
     let human_id = new_uuid_v4();
 
-    ProjectRepo::create(
-        &db,
-        CreateProject {
-            id: project_id.clone(),
-            name: "PR5 WorkUnit Task binding".into(),
-            settings: "{}".into(),
-            primary_repo_id: None,
-            owner_id: Some(human_id.clone()),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("Project");
     db::UserRepo::create_user(
         &db,
         &db::User {
@@ -1143,6 +1129,20 @@ async fn work_unit_task_binding_is_immutable_without_provenance() {
     )
     .await
     .expect("Human");
+    ProjectRepo::create(
+        &db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "PR5 WorkUnit Task binding".into(),
+            settings: "{}".into(),
+            primary_repo_id: None,
+            owner_id: Some(human_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project");
 
     for id in [&task_id, &other_task_id] {
         TaskRepo::create(
@@ -1237,6 +1237,20 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     let human_id = new_uuid_v4();
     let agent_id = new_uuid_v4();
 
+    db::UserRepo::create_user(
+        &db,
+        &db::User {
+            id: human_id.clone(),
+            email: "pr5@example.invalid".into(),
+            password_hash: "not-used".into(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Human");
     ProjectRepo::create(
         &db,
         CreateProject {
@@ -1267,20 +1281,6 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     )
     .await
     .expect("repo");
-    db::UserRepo::create_user(
-        &db,
-        &db::User {
-            id: human_id.clone(),
-            email: "pr5@example.invalid".into(),
-            password_hash: "not-used".into(),
-            display_name: None,
-            is_admin: false,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("human");
     let daemon_id = seed_authorized_daemon(&db, &human_id, "shell").await;
     db::AgentRepo::create_identity_with_profile(
         &db,
@@ -2363,7 +2363,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     )
     .await
     .expect("active Task operation exists");
-    assert!(ProjectRepo::delete(&db, &project_id).await.is_err());
+    assert!(ProjectRepo::delete(&db, &project_id, None).await.is_err());
     let finished_at = now_rfc3339();
     TaskIntegrationOperationRepo::finish(
         &db,
@@ -2379,7 +2379,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     .await
     .expect("abandon operation before teardown");
 
-    ProjectRepo::delete(&db, &project_id)
+    ProjectRepo::delete(&db, &project_id, None)
         .await
         .expect("guarded teardown");
     let remaining: i64 =

@@ -9,6 +9,7 @@ pub async fn delete_project(
     db: Arc<SqliteDb>,
     workspace_root: &Path,
     project_id: &str,
+    caller_user_id: Option<&str>,
 ) -> crate::Result<()> {
     let task_ids =
         sqlx::query_scalar::<_, String>("SELECT id FROM task WHERE project_id = ? ORDER BY id")
@@ -20,7 +21,7 @@ pub async fn delete_project(
     for task_id in task_ids {
         operations.reconcile_stale(&task_id).await?;
     }
-    ProjectRepo::delete(&*db, project_id).await?;
+    ProjectRepo::delete(&*db, project_id, caller_user_id).await?;
     Ok(())
 }
 
@@ -57,7 +58,7 @@ mod tests {
         .await
         .expect("clean Project");
 
-        delete_project(Arc::clone(&db), temp.path(), &project_id)
+        delete_project(Arc::clone(&db), temp.path(), &project_id, None)
             .await
             .expect("clean Project deletes through the service");
         assert!(ProjectRepo::get_by_id(&*db, &project_id)
@@ -196,7 +197,7 @@ mod tests {
         .await
         .expect("stale operation row");
 
-        assert!(ProjectRepo::delete(&*db, &project_id).await.is_err());
+        assert!(ProjectRepo::delete(&*db, &project_id, None).await.is_err());
         assert_eq!(
             TaskIntegrationOperationRepo::get_active_for_task(&*db, &task_id)
                 .await
@@ -205,7 +206,7 @@ mod tests {
                 .id,
             active.id
         );
-        delete_project(Arc::clone(&db), temp.path(), &project_id)
+        delete_project(Arc::clone(&db), temp.path(), &project_id, None)
             .await
             .expect("service reconciles then deletes the Project");
         assert!(ProjectRepo::get_by_id(&*db, &project_id)

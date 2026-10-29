@@ -663,7 +663,9 @@ async fn sqlite_file_db() -> (Arc<SqliteDb>, TempDir) {
         .await
         .expect("file-backed SQLite pool creates");
     run_migrations(&pool).await.expect("migrations run");
-    (Arc::new(SqliteDb::new(pool)), database_dir)
+    let db = SqliteDb::new(pool);
+    seed_test_account(&db).await;
+    (Arc::new(db), database_dir)
 }
 
 #[tokio::test]
