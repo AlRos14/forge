@@ -101,6 +101,28 @@ async fn project_scope_without_project_id_is_rejected_before_cwd_mutation() {
 }
 
 #[tokio::test]
+async fn claude_local_scope_without_project_id_fails_explicitly() {
+    let workspace = common::TestDir::new("mcp-config-claude-local");
+    let harness = common::test_app(workspace.path(), "mcp-config-claude-local").await;
+    let token = common::test_jwt();
+
+    let (status, body) = request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/config/mcp",
+        &token,
+        Some(json!({
+            "agent": "claude",
+            "scope": "local",
+            "action": "install"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "project_id_required");
+}
+
+#[tokio::test]
 async fn server_global_scope_still_requires_admin() {
     let workspace = common::TestDir::new("mcp-config-server-scope");
     let harness = common::test_app(workspace.path(), "mcp-config-server-scope").await;

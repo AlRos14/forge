@@ -87,7 +87,7 @@ mod imp {
     };
 
     use rustix::{
-        fs::{mkdirat, open, openat, Mode, OFlags},
+        fs::{fchmod, mkdirat, open, openat, Mode, OFlags},
         io::Errno,
     };
 
@@ -189,6 +189,8 @@ mod imp {
             Mode::RUSR.union(Mode::WUSR),
         )
         .map_err(free)?;
+        fchmod(&fd, Mode::RUSR.union(Mode::WUSR))
+            .map_err(|error| io_error(io::Error::from_raw_os_error(error.raw_os_error())))?;
         let mut file = std::fs::File::from(fd);
         file.write_all(contents).map_err(io_error)?;
         file.sync_all().map_err(io_error)?;

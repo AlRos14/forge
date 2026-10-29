@@ -22,6 +22,24 @@ use crate::{
 };
 use db::{ProjectRepo, RepoRepo};
 
+#[derive(Debug, Clone)]
+enum ClaudeSection {
+    Root,
+    Project { key: String },
+}
+
+#[derive(Debug, Clone)]
+struct McpConfigTarget {
+    file: ConfigTarget,
+    claude_section: Option<ClaudeSection>,
+}
+
+impl McpConfigTarget {
+    fn path(&self) -> &Path {
+        &self.file.path
+    }
+}
+
 pub async fn get_mcp_config(
     Query(params): Query<McpConfigQuery>,
     State(state): State<AppState>,
@@ -42,9 +60,13 @@ pub async fn get_mcp_config(
         project_id,
     )?;
     let url = match agent {
-        McpAgent::Codex => read_codex_forge_url(&config_path).await?,
-        _ => {
-            let config = read_config(&config_path).await?;
+        McpAgent::Codex => read_codex_forge_url(&config_path.file).await?,
+        McpAgent::Claude => {
+            let config = read_config(&config_path.file).await?;
+            claude_forge_url(&config, config_path.claude_section.as_ref())?
+        }
+        McpAgent::Cursor => {
+            let config = read_config(&config_path.file).await?;
             forge_url(&config)
         }
     };
@@ -55,7 +77,7 @@ pub async fn get_mcp_config(
         installed,
         url,
         expected_url,
-        config_path: config_path.path.to_string_lossy().into_owned(),
+        config_path: config_path.path().to_string_lossy().into_owned(),
         agents: supported_agents(),
     }))
 }
@@ -84,10 +106,10 @@ pub async fn update_mcp_config(
     let url = match agent {
         McpAgent::Codex => match action {
             McpAction::Install => {
-                let contents = read_codex_config(&config_path).await?;
+                let contents = read_codex_config(&config_path.file).await?;
                 let install_url = expected_url.clone();
                 write_codex_config_if_changed(
-                    &config_path,
+                    &config_path.file,
                     &contents,
                     set_codex_forge_url(&contents, &install_url),
                 )
@@ -95,21 +117,43 @@ pub async fn update_mcp_config(
                 Some(install_url)
             }
             McpAction::Uninstall => {
-                update_codex_config(&config_path, &expected_url, action).await?
+                update_codex_config(&config_path.file, &expected_url, action).await?
             }
         },
-        _ => {
-            let mut config = read_config(&config_path).await?;
+        McpAgent::Claude => {
+            let section = config_path
+                .claude_section
+                .as_ref()
+                .ok_or_else(|| ApiError::internal("Claude MCP target is missing its section"))?;
+            let mut config = read_config(&config_path.file).await?;
+
+            match action {
+                McpAction::Install => {
+                    let install_url = expected_url.clone();
+                    set_claude_forge_url(&mut config, section, &install_url)?;
+                    write_config(&config_path.file, &config).await?;
+                }
+                McpAction::Uninstall => {
+                    if remove_claude_forge(&mut config, section)? {
+                        write_config(&config_path.file, &config).await?;
+                    }
+                }
+            }
+
+            claude_forge_url(&config, Some(section))?
+        }
+        McpAgent::Cursor => {
+            let mut config = read_config(&config_path.file).await?;
 
             match action {
                 McpAction::Install => {
                     let install_url = expected_url.clone();
                     set_forge_url(&mut config, &install_url)?;
-                    write_config(&config_path, &config).await?;
+                    write_config(&config_path.file, &config).await?;
                 }
                 McpAction::Uninstall => {
                     if remove_forge(&mut config)? {
-                        write_config(&config_path, &config).await?;
+                        write_config(&config_path.file, &config).await?;
                     }
                 }
             }
@@ -125,7 +169,7 @@ pub async fn update_mcp_config(
         installed,
         url,
         expected_url,
-        config_path: config_path.path.to_string_lossy().into_owned(),
+        config_path: config_path.path().to_string_lossy().into_owned(),
         agents: supported_agents(),
     }))
 }
@@ -172,7 +216,7 @@ fn mcp_url_for_scope_with_public_base_url(
         scope,
         project_id.map(str::trim).filter(|value| !value.is_empty()),
     ) {
-        (McpScope::Project, Some(project_id)) => Ok(format!(
+        (McpScope::Project | McpScope::Local, Some(project_id)) => Ok(format!(
             "{base}?project_id={}",
             percent_encode_query(project_id)
         )),
@@ -350,31 +394,106 @@ async fn resolve_config_path(
     agent: &McpAgent,
     scope: &McpScope,
     project_id: Option<&str>,
-) -> ApiResult<ConfigTarget> {
-    let (root, home) = match scope {
-        McpScope::Project | McpScope::Local => {
-            let root = match project_id.map(str::trim) {
-                Some(project_id) if !project_id.is_empty() => {
-                    project_config_root(state, project_id).await?
-                }
-                _ => env::current_dir()?,
-            };
-            (root, env::current_dir()?)
-        }
-        McpScope::User => {
-            let home = env::var("HOME")
-                .map(PathBuf::from)
-                .map_err(|_| ApiError::internal("HOME is not set"))?;
-            (home.clone(), home)
-        }
+) -> ApiResult<McpConfigTarget> {
+    if matches!(agent, McpAgent::Claude) {
+        return resolve_claude_config_path(state, scope, project_id).await;
+    }
+
+    let root = match scope {
+        McpScope::Project | McpScope::Local => match project_id.map(str::trim) {
+            Some(project_id) if !project_id.is_empty() => {
+                project_config_root(state, project_id).await?
+            }
+            _ => env::current_dir()?,
+        },
+        McpScope::User => home_dir()?,
     };
     let relative = config_relative_path(agent, scope);
-    let path = resolve_config_path_from(agent, scope, &root, &home);
-    Ok(ConfigTarget {
-        root,
-        relative,
-        path,
+    let path = root.join(&relative);
+    Ok(McpConfigTarget {
+        file: ConfigTarget {
+            root,
+            relative,
+            path,
+        },
+        claude_section: None,
     })
+}
+
+async fn resolve_claude_config_path(
+    state: &AppState,
+    scope: &McpScope,
+    project_id: Option<&str>,
+) -> ApiResult<McpConfigTarget> {
+    let home = home_dir()?;
+    let (root, relative, section) = match scope {
+        McpScope::User => (home, PathBuf::from(".claude.json"), ClaudeSection::Root),
+        McpScope::Project => {
+            let project_id = project_id.ok_or_else(|| {
+                ApiError::bad_request_with_code(
+                    "project_id_required",
+                    "project MCP configuration requires project_id",
+                )
+            })?;
+            (
+                project_config_root(state, project_id).await?,
+                PathBuf::from(".mcp.json"),
+                ClaudeSection::Root,
+            )
+        }
+        McpScope::Local => {
+            let project_id = project_id.ok_or_else(|| {
+                ApiError::bad_request_with_code(
+                    "project_id_required",
+                    "Claude local MCP configuration requires project_id to identify the client project",
+                )
+            })?;
+            let key = canonical_project_root(state, project_id).await?;
+            (
+                home,
+                PathBuf::from(".claude.json"),
+                ClaudeSection::Project {
+                    key: key.to_string_lossy().into_owned(),
+                },
+            )
+        }
+    };
+    let path = root.join(&relative);
+    Ok(McpConfigTarget {
+        file: ConfigTarget {
+            root,
+            relative,
+            path,
+        },
+        claude_section: Some(section),
+    })
+}
+
+async fn canonical_project_root(state: &AppState, project_id: &str) -> ApiResult<PathBuf> {
+    let root = project_config_root(state, project_id).await?;
+    let canonical = std::fs::canonicalize(&root).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ApiError::bad_request_with_code(
+                "project_path_unavailable",
+                "Project repository path does not exist",
+            )
+        } else {
+            ApiError::from(error)
+        }
+    })?;
+    if !canonical.is_dir() {
+        return Err(ApiError::bad_request_with_code(
+            "project_path_unavailable",
+            "Project repository path must be a directory",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn home_dir() -> ApiResult<PathBuf> {
+    env::var("HOME")
+        .map(PathBuf::from)
+        .map_err(|_| ApiError::internal("HOME is not set"))
 }
 
 async fn project_config_root(state: &AppState, project_id: &str) -> ApiResult<PathBuf> {
@@ -401,9 +520,8 @@ async fn project_config_root(state: &AppState, project_id: &str) -> ApiResult<Pa
 
 fn config_relative_path(agent: &McpAgent, scope: &McpScope) -> PathBuf {
     match (agent, scope) {
-        (McpAgent::Claude, McpScope::Project) => PathBuf::from(".claude/settings.json"),
-        (McpAgent::Claude, McpScope::Local) => PathBuf::from(".claude/settings.local.json"),
-        (McpAgent::Claude, McpScope::User) => PathBuf::from(".claude/settings.json"),
+        (McpAgent::Claude, McpScope::Project) => PathBuf::from(".mcp.json"),
+        (McpAgent::Claude, McpScope::Local | McpScope::User) => PathBuf::from(".claude.json"),
         (McpAgent::Cursor, McpScope::Project | McpScope::Local) => {
             PathBuf::from(".cursor/mcp.json")
         }
@@ -415,15 +533,18 @@ fn config_relative_path(agent: &McpAgent, scope: &McpScope) -> PathBuf {
     }
 }
 
+#[cfg(test)]
 fn resolve_config_path_from(
     agent: &McpAgent,
     scope: &McpScope,
     cwd: &Path,
     home: &Path,
 ) -> PathBuf {
-    match scope {
-        McpScope::User => home.join(config_relative_path(agent, scope)),
-        McpScope::Project | McpScope::Local => cwd.join(config_relative_path(agent, scope)),
+    match (agent, scope) {
+        (McpAgent::Claude, McpScope::Local) | (_, McpScope::User) => {
+            home.join(config_relative_path(agent, scope))
+        }
+        (_, McpScope::Project | McpScope::Local) => cwd.join(config_relative_path(agent, scope)),
     }
 }
 
@@ -438,6 +559,121 @@ async fn write_config(target: &ConfigTarget, value: &Value) -> ApiResult<()> {
     let mut contents = serde_json::to_vec_pretty(value)?;
     contents.push(b'\n');
     mcp_config_fs::write_text(target, &contents)
+}
+
+fn claude_servers_mut<'a>(
+    config: &'a mut Value,
+    section: &ClaudeSection,
+) -> ApiResult<&'a mut Map<String, Value>> {
+    let root = config
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad_request("config must be a JSON object"))?;
+    let owner = match section {
+        ClaudeSection::Root => root,
+        ClaudeSection::Project { key } => {
+            let projects = root
+                .entry("projects".to_owned())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| ApiError::bad_request("projects must be a JSON object"))?;
+            projects
+                .entry(key.clone())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| ApiError::bad_request("project entry must be a JSON object"))?
+        }
+    };
+    owner
+        .entry("mcpServers".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad_request("mcpServers must be a JSON object"))
+}
+
+fn claude_forge_url(config: &Value, section: Option<&ClaudeSection>) -> ApiResult<Option<String>> {
+    let section =
+        section.ok_or_else(|| ApiError::internal("Claude MCP target is missing its section"))?;
+    let root = config
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("config must be a JSON object"))?;
+    let owner = match section {
+        ClaudeSection::Root => root,
+        ClaudeSection::Project { key } => {
+            let Some(projects) = root.get("projects") else {
+                return Ok(None);
+            };
+            let projects = projects
+                .as_object()
+                .ok_or_else(|| ApiError::bad_request("projects must be a JSON object"))?;
+            let Some(owner) = projects.get(key) else {
+                return Ok(None);
+            };
+            owner
+                .as_object()
+                .ok_or_else(|| ApiError::bad_request("project entry must be a JSON object"))?
+        }
+    };
+    let Some(servers) = owner.get("mcpServers") else {
+        return Ok(None);
+    };
+    let servers = servers
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("mcpServers must be a JSON object"))?;
+    let Some(forge) = servers.get("forge") else {
+        return Ok(None);
+    };
+    let forge = forge
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("mcpServers.forge must be a JSON object"))?;
+    match forge.get("url") {
+        Some(Value::String(url)) => Ok(Some(url.clone())),
+        Some(_) => Err(ApiError::bad_request(
+            "mcpServers.forge.url must be a string",
+        )),
+        None => Ok(None),
+    }
+}
+
+fn set_claude_forge_url(config: &mut Value, section: &ClaudeSection, url: &str) -> ApiResult<()> {
+    let servers = claude_servers_mut(config, section)?;
+    let forge = servers
+        .entry("forge".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad_request("mcpServers.forge must be a JSON object"))?;
+    forge.insert("type".to_owned(), Value::String("http".to_owned()));
+    forge.insert("url".to_owned(), Value::String(url.to_owned()));
+    Ok(())
+}
+
+fn remove_claude_forge(config: &mut Value, section: &ClaudeSection) -> ApiResult<bool> {
+    let root = config
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad_request("config must be a JSON object"))?;
+    let owner = match section {
+        ClaudeSection::Root => root,
+        ClaudeSection::Project { key } => {
+            let Some(projects) = root.get_mut("projects") else {
+                return Ok(false);
+            };
+            let projects = projects
+                .as_object_mut()
+                .ok_or_else(|| ApiError::bad_request("projects must be a JSON object"))?;
+            let Some(owner) = projects.get_mut(key) else {
+                return Ok(false);
+            };
+            owner
+                .as_object_mut()
+                .ok_or_else(|| ApiError::bad_request("project entry must be a JSON object"))?
+        }
+    };
+    let Some(servers) = owner.get_mut("mcpServers") else {
+        return Ok(false);
+    };
+    let servers = servers
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad_request("mcpServers must be a JSON object"))?;
+    Ok(servers.remove("forge").is_some())
 }
 
 fn set_forge_url(config: &mut Value, url: &str) -> ApiResult<()> {
@@ -628,15 +864,15 @@ mod tests {
 
         assert_eq!(
             resolve_config_path_from(&McpAgent::Claude, &McpScope::Project, cwd, home),
-            PathBuf::from("/repo/.claude/settings.json")
+            PathBuf::from("/repo/.mcp.json")
         );
         assert_eq!(
             resolve_config_path_from(&McpAgent::Claude, &McpScope::Local, cwd, home),
-            PathBuf::from("/repo/.claude/settings.local.json")
+            PathBuf::from("/home/test/.claude.json")
         );
         assert_eq!(
             resolve_config_path_from(&McpAgent::Claude, &McpScope::User, cwd, home),
-            PathBuf::from("/home/test/.claude/settings.json")
+            PathBuf::from("/home/test/.claude.json")
         );
     }
 
@@ -704,6 +940,16 @@ mod tests {
             mcp_url_for_scope_with_public_base_url(bind, None, &McpScope::User, None)
                 .expect("user URL builds"),
             "http://127.0.0.1:8080/mcp"
+        );
+        assert_eq!(
+            mcp_url_for_scope_with_public_base_url(
+                bind,
+                None,
+                &McpScope::Local,
+                Some("project 1"),
+            )
+            .expect("local project URL builds"),
+            "http://127.0.0.1:8080/mcp?project_id=project%201"
         );
         assert!(
             mcp_url_for_scope_with_public_base_url(bind, None, &McpScope::Project, None).is_err()
@@ -794,8 +1040,8 @@ command = "other"
         .expect("project config path resolves");
 
         assert_eq!(
-            config_path.path,
-            PathBuf::from("/Volumes/Data/codes/games/world/.claude/settings.json")
+            config_path.path(),
+            PathBuf::from("/Volumes/Data/codes/games/world/.mcp.json")
         );
     }
 
@@ -821,6 +1067,18 @@ command = "other"
     async fn install_project_scope_writes_bare_url() {
         let repo_dir = unique_temp_dir("forge-mcp-project");
         std::fs::create_dir_all(&repo_dir).expect("repo dir creates");
+        let claude_path = repo_dir.join(".mcp.json");
+        std::fs::write(
+            &claude_path,
+            serde_json::json!({
+                "foreign": true,
+                "mcpServers": {
+                    "other": { "type": "http", "url": "https://example.com/other" }
+                }
+            })
+            .to_string(),
+        )
+        .expect("existing project config writes");
         let (state, project_id) =
             test_state_with_project_repo(Some(repo_dir.to_string_lossy().into_owned())).await;
 
@@ -829,6 +1087,28 @@ command = "other"
 
         assert!(url.contains("/mcp?project_id=project-1"));
         assert!(!url.contains("token="));
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(&claude_path).expect("project config reads"),
+        )
+        .expect("project config parses");
+        assert_eq!(config["foreign"], true);
+        assert_eq!(
+            config["mcpServers"]["other"]["url"],
+            "https://example.com/other"
+        );
+        assert_eq!(config["mcpServers"]["forge"]["url"], url);
+
+        uninstall_config(&state, "claude", Some("project"), Some(&project_id)).await;
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(&claude_path).expect("project config reads after uninstall"),
+        )
+        .expect("project config parses after uninstall");
+        assert!(config["mcpServers"].get("forge").is_none());
+        assert_eq!(config["foreign"], true);
+        assert_eq!(
+            config["mcpServers"]["other"]["url"],
+            "https://example.com/other"
+        );
         let _ = std::fs::remove_dir_all(repo_dir);
     }
 
@@ -983,7 +1263,7 @@ command = "other"
         let outside_dir = unique_temp_dir("forge-mcp-symlink-outside");
         std::fs::create_dir_all(&repo_dir).expect("repo creates");
         std::fs::create_dir_all(&outside_dir).expect("outside creates");
-        std::os::unix::fs::symlink(&outside_dir, repo_dir.join(".claude"))
+        std::os::unix::fs::symlink(&outside_dir, repo_dir.join(".cursor"))
             .expect("config symlink creates");
         let (state, project_id) =
             test_state_with_project_repo(Some(repo_dir.to_string_lossy().into_owned())).await;
@@ -992,7 +1272,7 @@ command = "other"
             State(state),
             test_authenticated_user(),
             Json(McpConfigActionRequest {
-                agent: "claude".to_owned(),
+                agent: "cursor".to_owned(),
                 scope: Some("project".to_owned()),
                 project_id: Some(project_id),
                 public_base_url: None,
@@ -1003,7 +1283,7 @@ command = "other"
         .expect_err("symlinked config directory rejects");
 
         assert!(format!("{error:?}").contains("config_path_symlink"));
-        assert!(!outside_dir.join("settings.json").exists());
+        assert!(!outside_dir.join("mcp.json").exists());
         let _ = std::fs::remove_dir_all(repo_dir);
         let _ = std::fs::remove_dir_all(outside_dir);
     }
@@ -1013,11 +1293,11 @@ command = "other"
     async fn install_rejects_symlinked_config_file() {
         let repo_dir = unique_temp_dir("forge-mcp-symlink-file");
         let outside_dir = unique_temp_dir("forge-mcp-symlink-file-outside");
-        std::fs::create_dir_all(repo_dir.join(".claude")).expect("config dir creates");
+        std::fs::create_dir_all(&repo_dir).expect("repo creates");
         std::fs::create_dir_all(&outside_dir).expect("outside creates");
-        let outside_file = outside_dir.join("settings.json");
+        let outside_file = outside_dir.join("mcp.json");
         std::fs::write(&outside_file, "{\"keep\":true}\n").expect("outside file writes");
-        std::os::unix::fs::symlink(&outside_file, repo_dir.join(".claude/settings.json"))
+        std::os::unix::fs::symlink(&outside_file, repo_dir.join(".mcp.json"))
             .expect("config file symlink creates");
         let (state, project_id) =
             test_state_with_project_repo(Some(repo_dir.to_string_lossy().into_owned())).await;
@@ -1057,13 +1337,145 @@ command = "other"
 
         install_config(&state, "claude", Some("project"), Some(&project_id)).await;
 
-        let mode = std::fs::metadata(repo_dir.join(".claude/settings.json"))
+        let mode = std::fs::metadata(repo_dir.join(".mcp.json"))
             .expect("config metadata reads")
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
         let _ = std::fs::remove_dir_all(repo_dir);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_local_and_user_scopes_preserve_existing_configuration() {
+        let _guard = TEST_ENV_LOCK.lock().expect("test env lock");
+        let home_dir = unique_temp_dir("forge-mcp-claude-home");
+        let repo_a = unique_temp_dir("forge-mcp-claude-repo-a");
+        let repo_b = unique_temp_dir("forge-mcp-claude-repo-b");
+        for path in [&home_dir, &repo_a, &repo_b] {
+            std::fs::create_dir_all(path).expect("test directory creates");
+        }
+        let _home = EnvVarGuard::set("HOME", home_dir.as_os_str());
+        let canonical_a = std::fs::canonicalize(&repo_a).expect("repo A canonicalizes");
+        let canonical_b = std::fs::canonicalize(&repo_b).expect("repo B canonicalizes");
+        let state = test_state_with_user().await;
+        add_project_repo(&state, "project-a", "repo-a", &repo_a.to_string_lossy()).await;
+        add_project_repo(&state, "project-b", "repo-b", &repo_b.to_string_lossy()).await;
+
+        let key_a = canonical_a.to_string_lossy().into_owned();
+        let key_b = canonical_b.to_string_lossy().into_owned();
+        let claude_path = home_dir.join(".claude.json");
+        let mut initial = serde_json::json!({
+            "numStartups": 7,
+            "mcpServers": {
+                "user-other": { "type": "http", "url": "https://example.com/user" }
+            },
+            "projects": {
+                "/other/project": {
+                    "mcpServers": {
+                        "other": { "type": "http", "url": "https://example.com/other" }
+                    }
+                }
+            }
+        });
+        initial["projects"][&key_a] = serde_json::json!({
+            "allowedTools": ["Read"],
+            "mcpServers": {
+                "existing-a": { "type": "http", "url": "https://example.com/a" }
+            }
+        });
+        initial["projects"][&key_b] = serde_json::json!({
+            "mcpServers": {
+                "existing-b": { "type": "http", "url": "https://example.com/b" }
+            }
+        });
+        std::fs::write(
+            &claude_path,
+            serde_json::to_string_pretty(&initial).expect("initial config serializes"),
+        )
+        .expect("initial config writes");
+
+        let local_a = install_config(&state, "claude", Some("local"), Some("project-a")).await;
+        assert!(local_a.expected_url.contains("project_id=project-a"));
+        let local_b = install_config(&state, "claude", Some("local"), Some("project-b")).await;
+        assert!(local_b.expected_url.contains("project_id=project-b"));
+        let user = install_config(&state, "claude", Some("user"), None).await;
+        assert!(!user.expected_url.contains("project_id="));
+
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(&claude_path).expect("Claude config reads"),
+        )
+        .expect("Claude config parses");
+        assert_eq!(config["numStartups"], 7);
+        assert_eq!(
+            config["mcpServers"]["user-other"]["url"],
+            "https://example.com/user"
+        );
+        assert_eq!(config["mcpServers"]["forge"]["url"], user.expected_url);
+        assert_eq!(
+            config["projects"][key_a.as_str()]["mcpServers"]["forge"]["url"],
+            local_a.expected_url
+        );
+        assert_eq!(
+            config["projects"][key_b.as_str()]["mcpServers"]["forge"]["url"],
+            local_b.expected_url
+        );
+        assert_eq!(
+            config["projects"][key_a.as_str()]["allowedTools"][0],
+            "Read"
+        );
+        assert_eq!(
+            config["projects"][key_a.as_str()]["mcpServers"]["existing-a"]["url"],
+            "https://example.com/a"
+        );
+        assert_eq!(
+            config["projects"][key_b.as_str()]["mcpServers"]["existing-b"]["url"],
+            "https://example.com/b"
+        );
+        assert_eq!(
+            config["projects"]["/other/project"]["mcpServers"]["other"]["url"],
+            "https://example.com/other"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&claude_path)
+                .expect("Claude config metadata reads")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        uninstall_config(&state, "claude", Some("local"), Some("project-a")).await;
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(&claude_path).expect("Claude config reads after uninstall"),
+        )
+        .expect("Claude config parses after uninstall");
+        assert!(config["projects"][key_a.as_str()]["mcpServers"]
+            .get("forge")
+            .is_none());
+        assert_eq!(
+            config["projects"][key_b.as_str()]["mcpServers"]["forge"]["url"],
+            local_b.expected_url
+        );
+        assert_eq!(config["mcpServers"]["forge"]["url"], user.expected_url);
+        assert_eq!(
+            config["projects"][key_a.as_str()]["mcpServers"]["existing-a"]["url"],
+            "https://example.com/a"
+        );
+
+        let local_a_status = get_config(&state, "claude", Some("local"), Some("project-a")).await;
+        assert!(!local_a_status.installed);
+        let local_b_status = get_config(&state, "claude", Some("local"), Some("project-b")).await;
+        assert!(local_b_status.installed);
+        let user_status = get_config(&state, "claude", Some("user"), None).await;
+        assert!(user_status.installed);
+
+        let _ = std::fs::remove_dir_all(home_dir);
+        let _ = std::fs::remove_dir_all(repo_a);
+        let _ = std::fs::remove_dir_all(repo_b);
     }
 
     #[tokio::test]
@@ -1159,6 +1571,53 @@ command = "other"
         (state, project_id)
     }
 
+    async fn add_project_repo(state: &AppState, project_id: &str, repo_id: &str, local_path: &str) {
+        let now = db::now_rfc3339();
+        db::ProjectRepo::create(
+            &*state.db,
+            db::CreateProject {
+                id: project_id.to_owned(),
+                name: project_id.to_owned(),
+                settings: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: Some("test-user-id".to_owned()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project creates");
+        db::RepoRepo::create(
+            &*state.db,
+            db::CreateRepo {
+                id: repo_id.to_owned(),
+                project_id: project_id.to_owned(),
+                name: repo_id.to_owned(),
+                remote_url: "https://example.com/repo.git".to_owned(),
+                local_path: Some(local_path.to_owned()),
+                work_mode: db::WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("repo creates");
+        db::ProjectRepo::update(
+            &*state.db,
+            db::UpdateProject {
+                id: project_id.to_owned(),
+                name: None,
+                settings: None,
+                primary_repo_id: Some(Some(repo_id.to_owned())),
+                paused_at: None,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("project updates");
+    }
+
     async fn install_config(
         state: &AppState,
         agent: &str,
@@ -1191,6 +1650,28 @@ command = "other"
         .0
     }
 
+    async fn uninstall_config(
+        state: &AppState,
+        agent: &str,
+        scope: Option<&str>,
+        project_id: Option<&str>,
+    ) -> McpConfigResponse {
+        update_mcp_config(
+            State(state.clone()),
+            test_authenticated_user(),
+            Json(McpConfigActionRequest {
+                agent: agent.to_owned(),
+                scope: scope.map(str::to_owned),
+                project_id: project_id.map(str::to_owned),
+                public_base_url: None,
+                action: "uninstall".to_owned(),
+            }),
+        )
+        .await
+        .expect("uninstall succeeds")
+        .0
+    }
+
     async fn get_config(
         state: &AppState,
         agent: &str,
@@ -1213,9 +1694,9 @@ command = "other"
     }
 
     fn write_claude_config(repo_dir: &Path, url: &str) {
-        std::fs::create_dir_all(repo_dir.join(".claude")).expect("claude config dir creates");
+        std::fs::create_dir_all(repo_dir).expect("repo dir creates");
         std::fs::write(
-            repo_dir.join(".claude/settings.json"),
+            repo_dir.join(".mcp.json"),
             serde_json::json!({
                 "mcpServers": {
                     "forge": {
