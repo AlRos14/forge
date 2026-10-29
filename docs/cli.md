@@ -61,6 +61,11 @@ Provider entries store a credential reference and metadata; secret values are no
 
 `forge-ctl mcp install` writes the selected client's local configuration and points it at the Forge MCP endpoint. The supported client names are `claude`, `codex`, and `cursor`; scopes are `project`, `local`, and `user`. A token is required.
 
+For Claude Code, the command writes the locations Claude Code reads:
+- `project`: `<repo>/.mcp.json` with a top-level `mcpServers` entry.
+- `local`: `~/.claude.json` under `projects[<canonical project path>].mcpServers`.
+- `user`: `~/.claude.json` under top-level `mcpServers`.
+
 Project and local configurations must not contain a literal token because the file may be versioned. `forge-ctl mcp install` therefore writes a client-supported environment reference:
 - Claude: `Authorization: Bearer ${FORGE_TOKEN}`.
 - Cursor: `Authorization: Bearer ${env:FORGE_TOKEN}`.

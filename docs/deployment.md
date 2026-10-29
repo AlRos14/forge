@@ -102,6 +102,10 @@ exposure is controlled by the published port.
   project/local MCP configuration. It writes the client's environment-reference
   syntax and fails closed unless the referenced variable is set. `user`-scope
   files may contain a literal token and are written with `0600` permissions.
+- Claude Code project config is `<repo>/.mcp.json`; local and user configs share
+  `~/.claude.json` (project-keyed `projects[...].mcpServers` and top-level
+  `mcpServers` respectively). Existing unrelated keys and MCP entries are
+  preserved.
 - MCP configuration writes resolve through directory descriptors and reject
   symlinks in intermediate directories and the final file. A symlinked config
   path is a hard failure, not a redirect.

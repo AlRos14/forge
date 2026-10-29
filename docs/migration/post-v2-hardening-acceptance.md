@@ -116,3 +116,41 @@ timer still closes silent connections within five seconds, but input/resize no
 longer wait for it; MCP config writes are Unix-hardened with descriptor-relative
 traversal (non-Unix builds use canonical-root checks); `--token-env` requires
 the operator to export the variable in the client's environment.
+
+## H. Claude Code MCP location microfix
+
+An independent review found that Claude Code MCP configuration had been written
+to `.claude/settings*.json`, which Claude Code does not read for MCP. The fix
+uses the documented locations and preserves unrelated state:
+
+| Scope | Claude Code location | Structure |
+|---|---|---|
+| `project` | `<repo>/.mcp.json` | top-level `mcpServers.forge` |
+| `local` | `~/.claude.json` | `projects[<canonical project path>].mcpServers.forge` |
+| `user` | `~/.claude.json` | top-level `mcpServers.forge` |
+
+The API requires `project_id` for Claude local scope and canonicalizes the
+repository path before using it as the project key; it fails explicitly when the
+Project has no usable primary repository path. Install, status, and uninstall
+operate only on the `forge` entry in the selected section and preserve foreign
+keys, other projects, and other MCP servers. Project/local installs keep the
+environment reference; `user` keeps the private `0600` file.
+
+Focused evidence:
+
+- `forge-client` MCP tests: **14 passed**, including project `.mcp.json`,
+  local project-keyed entries, user/local coexistence, two Projects, uninstall,
+  foreign-key preservation, and `0600`.
+- API MCP unit tests: **24 passed**, including the same Claude local/user
+  coexistence and preservation matrix plus path/symlink checks.
+- API MCP HTTP tests: **3 passed**, including Claude local without `project_id`
+  returning `400 project_id_required`.
+- Native Claude Code 2.1.311 discovery was verified in isolated `HOME`
+  directories for all three scopes with `claude mcp get forge`:
+  - project: `Scope: Project config (shared via .mcp.json)`
+  - local: `Scope: Local config (private to you in this project)`
+  - user: `Scope: User config (available in all your projects)`
+
+The native check verified discovery only, using a fictitious token and no real
+credentials. It did not connect to a live MCP endpoint; Level C execution
+remains **NOT RUN**.
