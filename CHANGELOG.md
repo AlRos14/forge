@@ -10,8 +10,45 @@ PR14 audit on 2026-10-16.
 
 ### Added
 
+- Make new Tasks read-write by default and replace Task type selection in the
+  creation form with an advanced read-only option. MCP task creation also
+  drops type selection. Task type, TaskRole, and Execution Purpose no longer
+  select repository access. Existing read-only Task types are preserved by
+  migration V137; read-only parent Tasks pass the mode to new subtasks. REST
+  keeps its optional `task_type` field for existing clients.
+- Discover harness model options on the authorized online daemon that owns the
+  CLI configuration. Model catalogs are suggestions, not execution entitlements;
+  users can enter provider-specific model IDs supported by their harness.
+- Use installed harness and optional Claude Code Router executables for
+  execution and discovery. Forge does not download or pin their npm package
+  versions. Remove baked-in model catalogs from adapters; use each harness's
+  native catalog command, and report when it does not expose one. Claude Code
+  Router profiles can be selected explicitly for installed profile-based CLIs;
+  the legacy direct `ccr code` invocation remains available without a profile.
+- Discover OpenCode V2's installed model catalog and per-model variants. The
+  selected variant is passed through the installed CLI's native `--variant`
+  option; Forge does not supply a generic reasoning ladder.
+- Discover Claude Code's installed `--effort` choices from its CLI help and
+  expose the per-Agent Effort setting in creation and editing. The selected
+  value continues to use Claude Code's native `--effort` flag.
+- Render Task descriptions as sanitized Markdown and let users edit a Task's
+  concise title and Markdown brief from its detail page. Long pasted titles can
+  be moved into the description with one action.
 - Replace separate Task title and description inputs with one Markdown brief.
   Forge derives the title from an optional first-level heading or the first line.
+- Add a Task Artifact browser that renders inline Markdown, shows exact Artifact
+  IDs, and passes a selected Plan Artifact into the next Execution.
+- Explain that Forge WorkUnits scope Task Executions and are distinct from
+  domain work packets; clarify repository Workspace preparation and explicit
+  integration for planning-only Tasks.
+- Add Project worker defaults in Project settings. Owners and admins can set
+  default Task roles, coordination modes, and Human or Agent members. New
+  ordinary Tasks and subtasks copy these defaults transactionally; existing
+  Tasks remain independent. Human defaults require Project membership, and
+  Agent defaults require ownership by the canonical Project owner.
+- Add `GET` and `PUT /api/v1/projects/{id}/task-role-defaults` with optimistic
+  version checks. Issue integration's explicit `default_implementer` joins the
+  copied `implementer` role when present instead of creating a duplicate.
 
 ### Security
 
