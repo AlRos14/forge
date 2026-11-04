@@ -99,6 +99,9 @@ export function routeSsePayload(
   if (eventType.startsWith('project.')) {
     void queryClient.invalidateQueries({ queryKey: qk.project(payload.entity_id) })
     void queryClient.invalidateQueries({ queryKey: qk.projects })
+    void queryClient.invalidateQueries({
+      queryKey: qk.projectTaskRoleDefaults(payload.entity_id),
+    })
   }
 
   if (['artifact.created', 'message.created', 'handoff.created', 'handoff.status_changed', 'proposal.created', 'proposal.withdrawn', 'decision.recorded'].includes(eventType)) {

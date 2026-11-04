@@ -495,6 +495,15 @@ impl SqliteDb {
             .execute(&mut *transaction)
             .await?;
 
+        sqlx::query(
+            "INSERT INTO project_task_role_defaults (project_id, version, updated_at)
+             VALUES (?, 1, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+
         if let (Some(member_id), Some(owner_id)) = (owner_member_id, input.owner_id.as_deref()) {
             sqlx::query(
                 "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) \

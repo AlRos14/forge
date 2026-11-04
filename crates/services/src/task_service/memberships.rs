@@ -2,14 +2,109 @@ use super::*;
 use api_types::ActorRef;
 use db::{
     canonical_task_role_name, new_uuid_v4, now_rfc3339, ActorKind, CoordinationMode,
-    CreateRoleMembership, CreateTaskRole, ProjectRepo, RoleMembership, RoleMembershipRepo,
-    RoleMembershipStatus, TaskRole, TaskRoleRepo, UpdateRoleMembership, UpdateTaskRole, UserRepo,
+    CreateRoleMembership, CreateTaskRole, ProjectRepo, ProjectTaskRoleDefaultsRepo, RoleMembership,
+    RoleMembershipRepo, RoleMembershipStatus, TaskRole, TaskRoleRepo, UpdateRoleMembership,
+    UpdateTaskRole, UserRepo,
 };
+use sqlx::{Sqlite, Transaction};
 
 use crate::agent_service::{compute_effective_status, EffectiveStatus};
 use crate::project_actor_scope;
 
 impl TaskService {
+    pub(crate) async fn apply_project_task_role_defaults_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        project_id: &str,
+        task_id: &str,
+        created_at: &str,
+    ) -> Result<()> {
+        let project = ProjectRepo::get_by_id_in_tx(&*self.db, transaction, project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
+        let defaults = ProjectTaskRoleDefaultsRepo::get_task_role_defaults_in_tx(
+            &*self.db,
+            transaction,
+            project_id,
+        )
+        .await?;
+
+        for default in defaults.roles {
+            let role = canonical_task_role_name(&default.role).ok_or_else(|| {
+                ServiceError::invalid_operation("Project default role is not a TaskRole")
+            })?;
+            if role != default.role {
+                return Err(ServiceError::invalid_operation(
+                    "Project default role is not canonical",
+                ));
+            }
+            let task_role = TaskRoleRepo::create_in_tx(
+                &*self.db,
+                transaction,
+                CreateTaskRole {
+                    id: new_uuid_v4(),
+                    task_id: task_id.to_owned(),
+                    role,
+                    coordination_mode: Some(default.coordination_mode),
+                    policy_json: "{}".to_owned(),
+                    created_at: created_at.to_owned(),
+                    updated_at: created_at.to_owned(),
+                },
+            )
+            .await?;
+
+            for actor in default.members {
+                let actor_ref = match actor {
+                    db::ActorRef::Human(id) => ActorRef::Human(id),
+                    db::ActorRef::Agent(id) => ActorRef::Agent(id),
+                };
+                let valid = project_actor_scope::actor_is_valid_for_project_in_tx(
+                    transaction,
+                    project_id,
+                    project.owner_id.as_deref(),
+                    &actor_ref,
+                )
+                .await?;
+                let exact_agent_owner = match &actor_ref {
+                    ActorRef::Human(_) => true,
+                    ActorRef::Agent(agent_id) => {
+                        let owner_id: Option<String> =
+                            sqlx::query_scalar("SELECT owner_id FROM agent_current WHERE id = ?")
+                                .bind(agent_id)
+                                .fetch_optional(&mut **transaction)
+                                .await?
+                                .flatten();
+                        owner_id.is_some() && owner_id == project.owner_id
+                    }
+                };
+                if !valid || !exact_agent_owner {
+                    return Err(ServiceError::invalid_operation(
+                        "Project default Actor is no longer authorized for this Project",
+                    ));
+                }
+                let (actor_kind, actor_id) = match actor_ref {
+                    ActorRef::Human(id) => (ActorKind::Human, id),
+                    ActorRef::Agent(id) => (ActorKind::Agent, id),
+                };
+                RoleMembershipRepo::add_in_tx(
+                    &*self.db,
+                    transaction,
+                    CreateRoleMembership {
+                        id: new_uuid_v4(),
+                        task_role_id: task_role.id.clone(),
+                        actor_kind,
+                        actor_id,
+                        status: RoleMembershipStatus::Active,
+                        created_at: created_at.to_owned(),
+                        updated_at: created_at.to_owned(),
+                    },
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Load every TaskRole, including roles that currently have no members.
     /// `include_ended` controls whether ended historical membership records are
     /// returned; current eligibility is always limited to active/suspended

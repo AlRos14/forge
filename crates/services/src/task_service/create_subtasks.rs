@@ -64,6 +64,13 @@ impl TaskService {
                 },
             )
             .await?;
+            self.apply_project_task_role_defaults_in_tx(
+                &mut transaction,
+                &task.project_id,
+                &task.id,
+                &now,
+            )
+            .await?;
             TaskRepo::set_metadata_json_in_tx(
                 &*self.db,
                 &mut transaction,

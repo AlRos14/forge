@@ -1334,6 +1334,24 @@ pub trait ProjectRepo: Send + Sync {
 }
 
 #[async_trait]
+pub trait ProjectTaskRoleDefaultsRepo: Send + Sync {
+    async fn get_task_role_defaults(&self, project_id: &str) -> Result<ProjectTaskRoleDefaults>;
+    async fn get_task_role_defaults_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        project_id: &str,
+    ) -> Result<ProjectTaskRoleDefaults>;
+    async fn replace_task_role_defaults(
+        &self,
+        project_id: &str,
+        caller_user_id: &str,
+        expected_version: i64,
+        roles: Vec<ProjectTaskRoleDefault>,
+        updated_at: &str,
+    ) -> Result<ProjectTaskRoleDefaults>;
+}
+
+#[async_trait]
 pub trait ProjectHookRunRepo: Send + Sync {
     async fn try_claim(&self, input: CreateProjectHookRun) -> Result<Option<ProjectHookRun>>;
     async fn try_claim_or_skip_at_limit(
@@ -2168,6 +2186,11 @@ pub struct CreateTaskComment {
 #[async_trait]
 pub trait TaskRoleRepo: Send + Sync {
     async fn create(&self, input: CreateTaskRole) -> std::result::Result<TaskRole, crate::DbError>;
+    async fn create_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateTaskRole,
+    ) -> std::result::Result<TaskRole, crate::DbError>;
     async fn get_task_id(&self, id: &str) -> std::result::Result<Option<String>, crate::DbError>;
     async fn get_by_task_and_role(
         &self,
@@ -2186,6 +2209,11 @@ pub trait TaskRoleRepo: Send + Sync {
 pub trait RoleMembershipRepo: Send + Sync {
     async fn add(
         &self,
+        input: CreateRoleMembership,
+    ) -> std::result::Result<RoleMembership, crate::DbError>;
+    async fn add_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
         input: CreateRoleMembership,
     ) -> std::result::Result<RoleMembership, crate::DbError>;
     async fn get(&self, id: &str) -> std::result::Result<Option<RoleMembership>, crate::DbError>;

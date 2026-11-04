@@ -69,6 +69,7 @@ the maximum is 100.
 | `GET /projects` | List Projects visible to the authenticated user. |
 | `GET /projects/{id}` | Read a Project and its generic Project hook configuration. |
 | `PATCH /projects/{id}` | Update Project identity, pause state, and supported generic hooks. |
+| `GET /projects/{id}/task-role-defaults`, `PUT /projects/{id}/task-role-defaults` | Read or replace the role-to-worker template copied into new ordinary Tasks. Reads require Project visibility; updates require owner/admin membership and `expected_version`. Humans must be current Project members. Agents must be owned by the canonical Project owner; global visibility alone is not consent to run an Agent from another account. |
 | `DELETE /projects/{id}` | Delete a Project under the existing workspace cleanup contract. |
 | `POST /projects/{id}/pause`, `POST /projects/{id}/resume` | Pause or resume the Project. |
 | `GET /projects/{id}/repos`, `POST /projects/{id}/repos` | List or add repositories. |
@@ -77,7 +78,7 @@ the maximum is 100.
 | `GET /projects/{id}/media`, `POST /projects/{id}/media` | List or upload Project media. |
 | `GET /projects/{id}/media/{asset_id}` | Read an exact media asset. |
 | `POST /projects/{id}/media/{asset_id}/redact`, `.../purge` | Record the existing media redaction or purge action. |
-| `GET /projects/{id}/integration`, `POST /projects/{id}/integration`, `PATCH /projects/{id}/integration`, `POST /projects/{id}/integration/sync` | Manage the Project's external issue integration. Create accepts and GET/PATCH return `credential_env_var`, the environment variable name Forge reads during sync; the credential value is never returned or stored. Optional `default_implementer` is an exact `ActorRef`; imported issues create ordinary Tasks and, when configured, an `implementer` TaskRole with that Actor as a RoleMembership. Sync fails closed if the configured Actor is not valid for the Project. Lifecycle begins at the normal Task creation state; legacy `default_task_state` and singular assignment fields are rejected. |
+| `GET /projects/{id}/integration`, `POST /projects/{id}/integration`, `PATCH /projects/{id}/integration`, `POST /projects/{id}/integration/sync` | Manage the Project's external issue integration. Create accepts and GET/PATCH return `credential_env_var`, the environment variable name Forge reads during sync; the credential value is never returned or stored. Optional `default_implementer` is an exact `ActorRef`; imported issues create ordinary Tasks and add that Actor to the copied `implementer` TaskRole, creating the role only when the Project has no default for it. Sync fails closed if the configured Actor is not valid for the Project. Lifecycle begins at the normal Task creation state; legacy `default_task_state` and singular assignment fields are rejected. |
 | `GET /projects/{id}/members`, `POST /projects/{id}/members`, `PATCH /projects/{id}/members/{user_id}`, `DELETE /projects/{id}/members/{user_id}` | Manage Project membership. |
 
 Project reads require an exact `project_member` row for a Project with a
@@ -129,11 +130,14 @@ cursors and page metadata do not reveal other users' Agents. Provider runtime
 projections include only visible Agents and Daemons.
 
 Project media remains a Project resource. The retired Task comment/media
-attachment surface is not part of this API. Ordinary Task creation does not
-inherit role assignments from historical Project settings; create exact
-TaskRole and RoleMembership records through the Task role endpoints. Legacy
-state-driven lifecycle hook settings are preserved as history but are no
-longer dispatched. Generic Project hook rules are a separate target surface.
+attachment surface is not part of this API. Project task-role defaults are a
+template, not a replacement for Task-scoped authority: ordinary Task creation
+and subtask creation copy the configured roles, coordination modes, and active
+memberships in the Task creation transaction. Later Project default edits do
+not change existing Tasks, and Task role edits do not change the Project
+template. Automation Tasks do not inherit these defaults. Legacy state-driven
+lifecycle hook settings are preserved as history but are no longer dispatched.
+Generic Project hook rules are a separate target surface.
 
 External issue integration secrets are accepted only on create/update and are
 never returned. Legacy integration default-state and singular-assignee values
@@ -144,7 +148,7 @@ provenance and active defaults use an exact `default_implementer` ActorRef.
 
 | Method and path | Contract |
 | --- | --- |
-| `POST /projects/{project_id}/tasks` | Create an ordinary Task. Supported fields are `title`, `description`, `parent_task_id`, `task_type`, and `priority`. |
+| `POST /projects/{project_id}/tasks` | Create an ordinary Task. Supported fields are `title`, `description`, `parent_task_id`, `task_type`, and `priority`. Project task-role defaults are copied atomically. |
 | `GET /projects/{project_id}/tasks` | List Tasks. Filter with `lifecycle_state`, `task_type`, `priority`, and `q`; order with the supported Task sort fields. `status`, `include_cancelled`, and `include_archived` are rejected. |
 | `GET /tasks/{id}`, `PATCH /tasks/{id}`, `DELETE /tasks/{id}` | Read, update, or delete a Task. Updates require the Task `version`. |
 | `POST /tasks/{id}/subtasks/reorder` | Reorder exact child Task IDs. |

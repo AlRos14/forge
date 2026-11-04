@@ -29,6 +29,13 @@ Project
 
 An Actor is a Human or Agent. An Agent has a harness identity and selectable profile. A TaskRole defines responsibility for one Task; RoleMembership records which Actors may participate. Neither membership nor a legacy Task field assigns executable scope. A WorkUnit names the Role and, when allocated, the Actor for that scope.
 
+Projects can store default TaskRoles, coordination modes, and workers as a
+template. Ordinary Tasks and subtasks copy the template atomically into their
+own TaskRole and RoleMembership records. Existing Tasks remain independent when
+the Project template changes. Human defaults require current Project
+membership; Agent defaults require ownership by the canonical Project owner,
+so global discovery does not create cross-account execution authority.
+
 An Execution records one Actor, Role, Purpose, and Task, with an explicit WorkUnit, Workspace, and HarnessSession when applicable. Parent Execution records lineage; it does not grant authority or imply session reuse. Execution identity and configuration snapshots are historical.
 
 ## Authority and lifecycle

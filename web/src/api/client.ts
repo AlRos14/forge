@@ -7,7 +7,9 @@ import type {
   OperatorStatusResponse,
   PaginatedResponse,
   ProjectMemberResponse,
+  ProjectTaskRoleDefaultsResponse,
   UpdateProfileRequest,
+  UpdateProjectTaskRoleDefaultsRequest,
   UserResponse,
   UserSearchResult,
   ReorderSubtasksRequest,
@@ -272,6 +274,22 @@ export function searchUsers(q: string): Promise<UserSearchResult[]> {
 
 export function listMembers(projectId: string): Promise<ProjectMemberResponse[]> {
   return apiFetch<ProjectMemberResponse[]>(`/projects/${projectId}/members`)
+}
+
+export function getProjectTaskRoleDefaults(
+  projectId: string,
+): Promise<ProjectTaskRoleDefaultsResponse> {
+  return apiFetch<ProjectTaskRoleDefaultsResponse>(`/projects/${projectId}/task-role-defaults`)
+}
+
+export function updateProjectTaskRoleDefaults(
+  projectId: string,
+  body: UpdateProjectTaskRoleDefaultsRequest,
+): Promise<ProjectTaskRoleDefaultsResponse> {
+  return apiFetch<ProjectTaskRoleDefaultsResponse>(`/projects/${projectId}/task-role-defaults`, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  })
 }
 
 export function addMember(

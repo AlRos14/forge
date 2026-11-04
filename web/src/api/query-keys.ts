@@ -18,6 +18,8 @@ export const qk = {
     ['projects', projectId, 'releases', releaseId] as const,
   projectPages: (limit: number) => ['projects', 'pages', limit] as const,
   projectHookRuns: (projectId: string) => ['projects', projectId, 'project-hook-runs'] as const,
+  projectTaskRoleDefaults: (projectId: string) =>
+    ['projects', projectId, 'task-role-defaults'] as const,
   projectHookRunPages: (projectId: string, limit: number) =>
     ['projects', projectId, 'project-hook-runs', limit] as const,
   repos: (projectId: string) => ['projects', projectId, 'repos'] as const,

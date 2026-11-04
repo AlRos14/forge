@@ -2,13 +2,22 @@ import { useEffect, useMemo, useState } from 'react'
 import { ArrowsClockwise, Trash } from '@phosphor-icons/react'
 import { toast } from 'sonner'
 import {
+  useAgentsQuery,
   useCreateIntegration,
   useDeleteIntegration,
   useIntegrationQuery,
+  useMembersQuery,
+  useProjectQuery,
   useUpdateIntegration,
   useTriggerSync,
 } from '@/api/hooks'
-import type { CreateIntegrationRequest, PatchIntegrationRequest } from '@/types/generated'
+import type {
+  Agent,
+  CreateIntegrationRequest,
+  PatchIntegrationRequest,
+  ProjectMemberResponse,
+} from '@/types/generated'
+import type { ActorRef } from '@/types/generated/bindings/ActorRef'
 import { parseGitRemoteUrl } from '@/components/settings/integration-utils'
 import { SettingsSection } from '@/components/settings/SettingsSection'
 import { Button } from '@/components/ui/button'
@@ -38,6 +47,26 @@ const DEFAULT_BASE_URLS: Record<string, string> = {
   gitea: '',
 }
 
+function parseActorRef(value: string): ActorRef | null {
+  if (!value) return null
+  const [kind, ...parts] = value.split(':')
+  const id = parts.join(':')
+  if (!id || (kind !== 'agent' && kind !== 'human')) return null
+  return { kind, id }
+}
+
+function isAvailableActor(
+  value: string,
+  agents: Agent[],
+  members: ProjectMemberResponse[],
+): boolean {
+  const actor = parseActorRef(value)
+  if (!actor) return false
+  return actor.kind === 'agent'
+    ? agents.some((agent) => agent.id === actor.id)
+    : members.some((member) => member.user_id === actor.id)
+}
+
 interface IntegrationsTabProps {
   projectId: string
   repoRemoteUrl?: string | null
@@ -50,6 +79,9 @@ export function IntegrationsTab({
   embedded = false,
 }: IntegrationsTabProps) {
   const integrationQuery = useIntegrationQuery(projectId)
+  const projectQuery = useProjectQuery(projectId)
+  const agentsQuery = useAgentsQuery()
+  const membersQuery = useMembersQuery(projectId)
   const createIntegration = useCreateIntegration()
   const updateIntegration = useUpdateIntegration()
   const deleteIntegration = useDeleteIntegration()
@@ -58,6 +90,11 @@ export function IntegrationsTab({
   const is404 = isApiStatus(integrationQuery.error, 404)
   const hasIntegration = integrationQuery.isSuccess && integrationQuery.data != null
   const parsedRemote = useMemo(() => parseGitRemoteUrl(repoRemoteUrl), [repoRemoteUrl])
+  const projectOwnerId = projectQuery.data?.owner_id
+  const authorizedAgents = (agentsQuery.data?.items ?? []).filter((agent) =>
+    Boolean(projectOwnerId && agent.owner_id === projectOwnerId),
+  )
+  const projectMembers = membersQuery.data ?? []
 
   // Form state
   const [platform, setPlatform] = useState('github')
@@ -65,6 +102,7 @@ export function IntegrationsTab({
   const [owner, setOwner] = useState('')
   const [repo, setRepo] = useState('')
   const [credentialEnvVar, setCredentialEnvVar] = useState('')
+  const [defaultImplementer, setDefaultImplementer] = useState('')
   const [pollInterval, setPollInterval] = useState('300')
   const [enabled, setEnabled] = useState(true)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
@@ -75,6 +113,7 @@ export function IntegrationsTab({
     setOwner(parsedRemote?.owner ?? '')
     setRepo(parsedRemote?.repo ?? '')
     setCredentialEnvVar('')
+    setDefaultImplementer('')
     setPollInterval('300')
     setEnabled(true)
   }
@@ -88,6 +127,9 @@ export function IntegrationsTab({
     setOwner(d.owner)
     setRepo(d.repo)
     setCredentialEnvVar(d.credential_env_var)
+    setDefaultImplementer(
+      d.default_implementer ? `${d.default_implementer.kind}:${d.default_implementer.id}` : '',
+    )
     setPollInterval(String(d.poll_interval_secs))
     setEnabled(d.enabled)
   }, [integrationQuery.data])
@@ -113,6 +155,7 @@ export function IntegrationsTab({
     const trimmedRepo = repo.trim()
     const trimmedUrl = baseUrl.trim()
     const trimmedCredentialEnvVar = credentialEnvVar.trim()
+    const defaultActor = parseActorRef(defaultImplementer)
     const interval = Number(pollInterval)
 
     if (!trimmedUrl) {
@@ -143,6 +186,7 @@ export function IntegrationsTab({
         owner: trimmedOwner,
         repo: trimmedRepo,
         ...(trimmedCredentialEnvVar ? { credential_env_var: trimmedCredentialEnvVar } : {}),
+        default_implementer: defaultActor,
         poll_interval_secs: interval,
         enabled,
       }
@@ -161,6 +205,7 @@ export function IntegrationsTab({
         owner: trimmedOwner,
         repo: trimmedRepo,
         credential_env_var: trimmedCredentialEnvVar,
+        default_implementer: defaultActor,
         poll_interval_secs: interval,
         enabled,
       }
@@ -286,6 +331,36 @@ export function IntegrationsTab({
               placeholder="GITHUB_TOKEN"
               className="max-w-md"
             />
+          </SettingsSection>
+
+          <SettingsSection
+            title="Default implementer for imported issues"
+            description="When this integration imports an issue as a Task, Forge adds this exact Actor to its implementer TaskRole. This does not set a default for Tasks created elsewhere."
+          >
+            <select
+              aria-label="Default implementer for imported issues"
+              className="h-9 w-full max-w-md rounded-md border bg-background px-2 text-sm"
+              value={defaultImplementer}
+              onChange={(event) => setDefaultImplementer(event.target.value)}
+            >
+              <option value="">No default implementer</option>
+              {authorizedAgents.map((agent) => (
+                <option key={`agent:${agent.id}`} value={`agent:${agent.id}`}>
+                  Agent {agent.name}
+                </option>
+              ))}
+              {projectMembers.map((member) => (
+                <option key={`human:${member.user_id}`} value={`human:${member.user_id}`}>
+                  Human {member.display_name || member.email}
+                </option>
+              ))}
+              {defaultImplementer &&
+              !isAvailableActor(defaultImplementer, authorizedAgents, projectMembers) ? (
+                <option value={defaultImplementer}>
+                  Configured Actor unavailable · {defaultImplementer}
+                </option>
+              ) : null}
+            </select>
           </SettingsSection>
 
           <SettingsSection

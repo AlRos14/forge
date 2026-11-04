@@ -78,12 +78,14 @@ const projectSettingsTabs = new Set<ProjectSettingsTab>([
   'general',
   'repos',
   'members',
+  'workers',
   'mcp',
   'hooks',
   'danger',
 ])
 const taskDetailTabs = new Set<TaskDetailTab>([
   'overview',
+  'work',
   'executions',
   'review',
   'terminal',

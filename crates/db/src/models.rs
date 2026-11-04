@@ -19,6 +19,21 @@ pub struct Project {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectTaskRoleDefaults {
+    pub project_id: String,
+    pub version: i64,
+    pub roles: Vec<ProjectTaskRoleDefault>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectTaskRoleDefault {
+    pub role: String,
+    pub coordination_mode: CoordinationMode,
+    pub members: Vec<ActorRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectHookRunStatus {
     Queued,
     Running,

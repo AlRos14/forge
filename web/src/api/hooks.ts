@@ -15,6 +15,7 @@ import {
   deleteNotification,
   deletePat,
   getOperationsStatus,
+  getProjectTaskRoleDefaults,
   getSettings,
   getUnreadNotificationCount,
   listDependencies,
@@ -30,6 +31,7 @@ import {
   removeMember,
   updateMe,
   updateMemberRole,
+  updateProjectTaskRoleDefaults,
   updateSettings,
 } from '@/api/client'
 import { qk } from '@/api/query-keys'
@@ -78,6 +80,7 @@ import type {
   GateEvaluationResponse,
   UpdateAgentRequest,
   UpdateProjectRequest,
+  UpdateProjectTaskRoleDefaultsRequest,
   UpdateTaskRequest,
   TaskUsageSummary,
   SettingsResponse,
@@ -186,6 +189,30 @@ export function useProjectQuery(projectId: string) {
   return useQuery({
     queryKey: qk.project(projectId),
     queryFn: () => apiFetch<Project>(`/projects/${projectId}`),
+  })
+}
+
+export function useProjectTaskRoleDefaultsQuery(projectId: string) {
+  return useQuery({
+    queryKey: qk.projectTaskRoleDefaults(projectId),
+    queryFn: () => getProjectTaskRoleDefaults(projectId),
+    enabled: Boolean(projectId),
+  })
+}
+
+export function useUpdateProjectTaskRoleDefaults() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      projectId,
+      body,
+    }: {
+      projectId: string
+      body: UpdateProjectTaskRoleDefaultsRequest
+    }) => updateProjectTaskRoleDefaults(projectId, body),
+    onSuccess: (defaults) => {
+      queryClient.setQueryData(qk.projectTaskRoleDefaults(defaults.project_id), defaults)
+    },
   })
 }
 

@@ -132,6 +132,11 @@ pub fn api_router(state: AppState) -> Router {
                 .delete(routes::projects::delete_project),
         )
         .route(
+            "/api/v1/projects/{id}/task-role-defaults",
+            get(routes::projects::get_task_role_defaults)
+                .put(routes::projects::update_task_role_defaults),
+        )
+        .route(
             "/api/v1/projects/{id}/pause",
             post(routes::projects::pause_project),
         )

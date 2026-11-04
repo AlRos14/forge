@@ -34,6 +34,15 @@ WorkUnit and Execution: an implementer may remain a member while moving
 between WorkUnits, and changing that allocation never rewrites membership
 history.
 
+A Project may store a default set of TaskRoles, coordination modes, and
+workers. New ordinary Tasks and subtasks copy those values into their own
+TaskRole and active RoleMembership rows in the creation transaction. These
+Project defaults are templates: edits do not rewrite existing Tasks, and
+Task-specific membership edits do not flow back to the Project. Humans must be
+current Project members. An Agent default must be owned by the canonical
+Project owner; global Agent visibility does not grant cross-account execution
+consent. Project owner/admin membership is required to change the template.
+
 The same Actor can belong to several roles on one Task. Each Execution records
 the concrete Role, so an Actor acting as orchestrator and later reviewer has
 two distinguishable historical records.

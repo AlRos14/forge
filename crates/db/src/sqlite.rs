@@ -17,7 +17,8 @@ use crate::{
     NotificationRepo, Page, PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig,
     PrProviderConfigRepo, Project, ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus,
     ProjectIntegration, ProjectMediaTombstone, ProjectReleaseMediaPin, ProjectRepo,
-    ProviderStartClaim, RecordRemotePrOutcome, RecordWorkUnitIntegration, RecoverWorkUnitExecution,
+    ProjectTaskRoleDefaults, ProjectTaskRoleDefaultsRepo, ProviderStartClaim,
+    RecordRemotePrOutcome, RecordWorkUnitIntegration, RecoverWorkUnitExecution,
     RecoveryWorkUnitExecutionWrite, RemotePrAdmission, RemoveWorkUnitDependency, Repo, RepoRepo,
     Result, ReviewExecutionSubject, ReviewExecutionSubjectWrite, Runtime, RuntimeListQuery,
     RuntimeRepo, SelectAgentProfile, SharedMediaRepo, Skill, SkillRepo, SortBy, SortOrder, Task,
@@ -69,6 +70,7 @@ mod pr_provider_config;
 mod project;
 mod project_hook_run;
 mod project_member;
+mod project_task_role_defaults;
 mod provider_authorization;
 mod repo;
 mod role;

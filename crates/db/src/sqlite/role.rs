@@ -75,6 +75,37 @@ impl TaskRoleRepo for SqliteDb {
             .ok_or(DbError::NotFound)
     }
 
+    async fn create_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: CreateTaskRole,
+    ) -> crate::Result<TaskRole> {
+        sqlx::query(
+            "INSERT INTO task_role
+                (id, task_id, role, coordination_mode, policy_json, version, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(&input.role)
+        .bind(input.coordination_mode.map(|mode| mode.to_string()))
+        .bind(&input.policy_json)
+        .bind(&input.created_at)
+        .bind(&input.updated_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_role_sqlx_error)?;
+
+        let row = sqlx::query(&format!(
+            "SELECT {TASK_ROLE_COLUMNS} FROM task_role WHERE id = ?"
+        ))
+        .bind(&input.id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(map_role_sqlx_error)?;
+        map_task_role(&row)
+    }
+
     async fn get_task_id(&self, id: &str) -> crate::Result<Option<String>> {
         Ok(
             sqlx::query_scalar("SELECT task_id FROM task_role WHERE id = ?")
@@ -198,6 +229,40 @@ impl RoleMembershipRepo for SqliteDb {
         .await
         .map_err(map_role_sqlx_error)?;
         self.get(&input.id).await?.ok_or(DbError::NotFound)
+    }
+
+    async fn add_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: CreateRoleMembership,
+    ) -> crate::Result<RoleMembership> {
+        let ended_at =
+            (input.status == RoleMembershipStatus::Ended).then(|| input.updated_at.clone());
+        sqlx::query(
+            "INSERT INTO role_membership
+                (id, task_role_id, actor_kind, actor_id, status, version, created_at, updated_at, ended_at)
+             VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_role_id)
+        .bind(input.actor_kind.to_string())
+        .bind(&input.actor_id)
+        .bind(input.status.to_string())
+        .bind(&input.created_at)
+        .bind(&input.updated_at)
+        .bind(ended_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_role_sqlx_error)?;
+
+        let row = sqlx::query(&format!(
+            "SELECT {MEMBERSHIP_COLUMNS} FROM role_membership WHERE id = ?"
+        ))
+        .bind(&input.id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(map_role_sqlx_error)?;
+        map_membership(&row)
     }
 
     async fn get(&self, id: &str) -> crate::Result<Option<RoleMembership>> {

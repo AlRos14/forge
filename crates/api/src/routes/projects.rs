@@ -1,6 +1,8 @@
 use api_types::{
     parse_project_hooks_json, CreateProjectRequest, PaginatedResponse, ProjectHookRunResponse,
-    ProjectHookRunStatus, ProjectHookRunsResponse, ProjectResponse, UpdateProjectRequest,
+    ProjectHookRunStatus, ProjectHookRunsResponse, ProjectResponse,
+    ProjectTaskRoleDefault as ProjectTaskRoleDefaultResponse, ProjectTaskRoleDefaultsResponse,
+    UpdateProjectRequest, UpdateProjectTaskRoleDefaultsRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -10,7 +12,8 @@ use axum::{
 };
 use db::{
     new_uuid_v4, now_rfc3339, CreateProject, PageRequest, ProjectHookRun, ProjectHookRunRepo,
-    ProjectRepo, SortBy, SortOrder, UpdateProject,
+    ProjectRepo, ProjectTaskRoleDefault, ProjectTaskRoleDefaultsRepo, SortBy, SortOrder,
+    UpdateProject,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 
@@ -263,6 +266,99 @@ pub async fn update_project(
     });
 
     Ok(Json(project_response(project)?))
+}
+
+pub async fn get_task_role_defaults(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ProjectTaskRoleDefaultsResponse>> {
+    require_project_visible(&state, &id, &user.user_id).await?;
+    let defaults = ProjectTaskRoleDefaultsRepo::get_task_role_defaults(&*state.db, &id).await?;
+    Ok(Json(project_task_role_defaults_response(defaults)))
+}
+
+pub async fn update_task_role_defaults(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateProjectTaskRoleDefaultsRequest>,
+) -> ApiResult<Json<ProjectTaskRoleDefaultsResponse>> {
+    require_project_admin(&state, &id, &user.user_id).await?;
+    let roles = request
+        .roles
+        .into_iter()
+        .map(|role| {
+            let canonical = db::canonical_task_role_name(&role.role)
+                .ok_or_else(|| ApiError::bad_request("role is not a TaskRole"))?;
+            Ok(ProjectTaskRoleDefault {
+                role: canonical,
+                coordination_mode: match role.coordination_mode {
+                    api_types::CoordinationMode::Partitioned => db::CoordinationMode::Partitioned,
+                    api_types::CoordinationMode::Collaborative => {
+                        db::CoordinationMode::Collaborative
+                    }
+                    api_types::CoordinationMode::Independent => db::CoordinationMode::Independent,
+                },
+                members: role.members.into_iter().map(api_actor_ref_to_db).collect(),
+            })
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    let defaults = ProjectTaskRoleDefaultsRepo::replace_task_role_defaults(
+        &*state.db,
+        &id,
+        &user.user_id,
+        request.expected_version,
+        roles,
+        &now_rfc3339(),
+    )
+    .await?;
+    state.event_bus.publish(ForgeEvent {
+        event_type: "project.updated".to_owned(),
+        entity_id: id.clone(),
+        timestamp: event_timestamp(),
+        context: EventContext::ProjectUpdated {},
+    });
+    Ok(Json(project_task_role_defaults_response(defaults)))
+}
+
+fn api_actor_ref_to_db(actor: api_types::ActorRef) -> db::ActorRef {
+    match actor {
+        api_types::ActorRef::Human(id) => db::ActorRef::Human(id),
+        api_types::ActorRef::Agent(id) => db::ActorRef::Agent(id),
+    }
+}
+
+fn db_actor_ref_to_api(actor: db::ActorRef) -> api_types::ActorRef {
+    match actor {
+        db::ActorRef::Human(id) => api_types::ActorRef::Human(id),
+        db::ActorRef::Agent(id) => api_types::ActorRef::Agent(id),
+    }
+}
+
+fn project_task_role_defaults_response(
+    defaults: db::ProjectTaskRoleDefaults,
+) -> ProjectTaskRoleDefaultsResponse {
+    ProjectTaskRoleDefaultsResponse {
+        project_id: defaults.project_id,
+        version: defaults.version,
+        roles: defaults
+            .roles
+            .into_iter()
+            .map(|role| ProjectTaskRoleDefaultResponse {
+                role: role.role,
+                coordination_mode: match role.coordination_mode {
+                    db::CoordinationMode::Partitioned => api_types::CoordinationMode::Partitioned,
+                    db::CoordinationMode::Collaborative => {
+                        api_types::CoordinationMode::Collaborative
+                    }
+                    db::CoordinationMode::Independent => api_types::CoordinationMode::Independent,
+                },
+                members: role.members.into_iter().map(db_actor_ref_to_api).collect(),
+            })
+            .collect(),
+        updated_at: defaults.updated_at,
+    }
 }
 
 pub(super) async fn require_project_visible(

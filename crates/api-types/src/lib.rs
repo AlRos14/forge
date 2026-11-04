@@ -18,6 +18,7 @@ mod operations;
 mod project_hooks;
 mod project_media;
 mod project_release;
+mod project_task_role_defaults;
 mod provider_auth;
 mod public_events;
 mod repo_review;
@@ -46,6 +47,7 @@ pub use operations::*;
 pub use project_hooks::*;
 pub use project_media::*;
 pub use project_release::*;
+pub use project_task_role_defaults::*;
 pub use provider_auth::*;
 pub use public_events::*;
 pub use repo_review::*;
@@ -84,6 +86,10 @@ fn export_typescript() {
     CreateProjectRequest::export().expect("export CreateProjectRequest");
     UpdateProjectRequest::export().expect("export UpdateProjectRequest");
     ProjectResponse::export().expect("export ProjectResponse");
+    ProjectTaskRoleDefault::export().expect("export ProjectTaskRoleDefault");
+    ProjectTaskRoleDefaultsResponse::export().expect("export ProjectTaskRoleDefaultsResponse");
+    UpdateProjectTaskRoleDefaultsRequest::export()
+        .expect("export UpdateProjectTaskRoleDefaultsRequest");
     CreateTaskRequest::export().expect("export CreateTaskRequest");
     ReorderSubtasksRequest::export().expect("export ReorderSubtasksRequest");
     UpdateTaskRequest::export().expect("export UpdateTaskRequest");
