@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type FormEvent } from 'react'
 import { Link } from '@tanstack/react-router'
 import { toast } from 'sonner'
 import {
@@ -10,20 +10,33 @@ import {
   useTaskGatesQuery,
   useTaskLifecycleTransitionsQuery,
   useTaskQuery,
+  useUpdateTask,
   useTaskWorkUnitsQuery,
   useTransitionTaskLifecycle,
   useTriggerReview,
   useValidationsQuery,
 } from '@/api/hooks'
 import { apiFetch } from '@/api/client'
+import { TaskArtifactsPanel } from '@/components/task-detail/task-artifacts-panel'
 import { ErrorBanner } from '@/components/error-banner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { MarkdownEditor, MarkdownView } from '@/components/ui/markdown-editor'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { useAuthStore } from '@/stores/auth'
 import { TaskTerminalPanel } from '@/components/task-detail/task-terminal-panel'
+import { TaskWorkManagement } from '@/components/task-detail/task-work-management'
 import type {
   GateEvaluationResponse,
   MergeAfterGateResponse,
@@ -35,10 +48,10 @@ import type {
   TaskLifecycleState,
 } from '@/types/generated'
 
-export type TaskDetailTab = 'overview' | 'executions' | 'review' | 'terminal' | 'history'
+export type TaskDetailTab = 'overview' | 'work' | 'executions' | 'artifacts' | 'review' | 'terminal' | 'history'
 
 export function isTaskDetailTab(value: string | undefined): value is TaskDetailTab {
-  return value === 'overview' || value === 'executions' || value === 'review' || value === 'terminal' || value === 'history'
+  return value === 'overview' || value === 'work' || value === 'executions' || value === 'artifacts' || value === 'review' || value === 'terminal' || value === 'history'
 }
 
 const nextLifecycleStates: Partial<Record<TaskLifecycleState, TaskLifecycleState[]>> = {
@@ -52,7 +65,7 @@ const nextLifecycleStates: Partial<Record<TaskLifecycleState, TaskLifecycleState
   cancelled: [],
 }
 
-const tabs: TaskDetailTab[] = ['overview', 'executions', 'review', 'terminal', 'history']
+const tabs: TaskDetailTab[] = ['overview', 'work', 'executions', 'artifacts', 'review', 'terminal', 'history']
 
 export function TaskDetailPage({
   taskId,
@@ -70,6 +83,7 @@ export function TaskDetailPage({
   const gatesQuery = useTaskGatesQuery(taskId)
   const workUnitsQuery = useTaskWorkUnitsQuery(taskId)
   const transition = useTransitionTaskLifecycle()
+  const updateTask = useUpdateTask()
   const evaluateGate = useEvaluateGate()
   const startReview = useTriggerReview()
   const startExecution = useStartExecution()
@@ -78,6 +92,9 @@ export function TaskDetailPage({
   const [evaluations, setEvaluations] = useState<Record<string, GateEvaluationResponse>>({})
   const [reportForm, setReportForm] = useState<Record<string, SubmitReviewReportRequest>>({})
   const [reviewWorkspaceId, setReviewWorkspaceId] = useState('')
+  const [editTaskOpen, setEditTaskOpen] = useState(false)
+  const [editTitle, setEditTitle] = useState('')
+  const [editDescription, setEditDescription] = useState('')
   const [executionForm, setExecutionForm] = useState<{
     workUnitId: string
     purpose: ExecutionPurpose | ''
@@ -120,6 +137,32 @@ export function TaskDetailPage({
       })
     } catch (error) {
       toast.error(getApiErrorMessage(error, 'Task lifecycle transition failed'))
+    }
+  }
+
+  function openTaskEditor() {
+    if (!task) return
+    setEditTitle(task.title)
+    setEditDescription(task.description ?? '')
+    setEditTaskOpen(true)
+  }
+
+  async function saveTask(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!task || !editTitle.trim()) return
+    try {
+      await updateTask.mutateAsync({
+        taskId: task.id,
+        body: {
+          title: editTitle.trim(),
+          description: editDescription.trim() || null,
+          version: task.version,
+        },
+      })
+      toast.success('Task details saved')
+      setEditTaskOpen(false)
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Task details could not be saved'))
     }
   }
 
@@ -215,8 +258,13 @@ export function TaskDetailPage({
         <div className="flex flex-wrap items-start gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-2xl font-semibold">{task.title}</h1>
-            {task.description ? <p className="mt-2 whitespace-pre-wrap text-sm text-muted-foreground">{task.description}</p> : null}
+            {task.description ? (
+              <MarkdownView content={task.description} className="mt-2 text-sm text-muted-foreground" />
+            ) : null}
           </div>
+          <Button size="sm" variant="outline" onClick={openTaskEditor}>
+            Edit task
+          </Button>
           <Badge variant="outline">{task.lifecycle.state.replaceAll('_', ' ')}</Badge>
           <Badge variant="outline">{task.task_type}</Badge>
         </div>
@@ -247,6 +295,60 @@ export function TaskDetailPage({
         </nav>
       </header>
 
+      <Dialog open={editTaskOpen} onOpenChange={setEditTaskOpen}>
+        <DialogContent className="sm:max-w-2xl">
+          <form onSubmit={(event) => void saveTask(event)} className="space-y-4">
+            <DialogHeader>
+              <DialogTitle>Edit task</DialogTitle>
+              <DialogDescription>
+                Keep the title concise and put the full brief in the Markdown description.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-2">
+              <Label htmlFor="edit-task-title">Title</Label>
+              <Input
+                id="edit-task-title"
+                value={editTitle}
+                onChange={(event) => setEditTitle(event.target.value)}
+                required
+              />
+            </div>
+            {!task.description?.trim() && editTitle.length > 255 ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  const fullBrief = editTitle
+                  const heading = fullBrief.match(/^#\s+(.+)$/m)?.[1]?.trim()
+                  setEditDescription(fullBrief)
+                  if (heading) setEditTitle(heading)
+                }}
+              >
+                Move current title into Markdown description
+              </Button>
+            ) : null}
+            <div className="space-y-2">
+              <Label>Description (Markdown)</Label>
+              <MarkdownEditor
+                value={editDescription}
+                onChange={setEditDescription}
+                minHeight="240px"
+                placeholder="Add the task brief and acceptance criteria…"
+              />
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="ghost" onClick={() => setEditTaskOpen(false)}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={updateTask.isPending || !editTitle.trim()}>
+                {updateTask.isPending ? 'Saving…' : 'Save task'}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
       {activeTab === 'overview' ? (
         <div className="grid gap-4 lg:grid-cols-2">
           <section className="space-y-3 rounded-lg border p-4">
@@ -257,18 +359,9 @@ export function TaskDetailPage({
             <p className="text-xs text-muted-foreground">Lifecycle is aggregate progress. Actor cognition and execution history are recorded separately.</p>
           </section>
           <section className="space-y-3 rounded-lg border p-4">
-            <h2 className="font-semibold">TaskRole memberships</h2>
-            {(task.task_roles ?? []).length === 0 ? <p className="text-sm text-muted-foreground">No TaskRoles are defined.</p> : null}
-            {(task.task_roles ?? []).map((role) => (
-              <div key={role.id} className="space-y-1 rounded-md bg-muted/30 p-3">
-                <p className="font-medium">{role.role}</p>
-                {role.members.map((member) => (
-                  <p key={member.id} className="font-mono text-xs text-muted-foreground">
-                    {member.actor_ref.kind}:{member.actor_ref.id} · {member.status} · membership {member.id} v{String(member.version)}
-                  </p>
-                ))}
-              </div>
-            ))}
+            <h2 className="font-semibold">Work assignment</h2>
+            <p className="text-sm">{task.task_roles.length} TaskRoles · {workUnits.length} WorkUnits</p>
+            <Button size="sm" variant="outline" onClick={() => setActiveTab('work')}>Manage TaskRoles and WorkUnits</Button>
           </section>
           <section className="space-y-3 rounded-lg border p-4 lg:col-span-2">
             <div className="flex items-center justify-between gap-3">
@@ -313,6 +406,17 @@ export function TaskDetailPage({
             {!gatesQuery.isLoading && (gatesQuery.data?.length ?? 0) === 0 ? <p className="text-sm text-muted-foreground">No Gate with an active policy is recorded.</p> : null}
           </section>
         </div>
+      ) : null}
+
+      {activeTab === 'work' ? (
+        <TaskWorkManagement
+          task={task}
+          workUnits={workUnits}
+          executions={executions}
+          onChanged={async () => {
+            await Promise.all([taskQuery.refetch(), workUnitsQuery.refetch()])
+          }}
+        />
       ) : null}
 
       {activeTab === 'executions' ? (
@@ -402,6 +506,22 @@ export function TaskDetailPage({
           ))}
           {executions.length === 0 ? <p className="text-sm text-muted-foreground">No Execution records are available.</p> : null}
         </section>
+      ) : null}
+
+      {activeTab === 'artifacts' ? (
+        <TaskArtifactsPanel
+          taskId={task.id}
+          onUseInNextExecution={(artifactId) => {
+            setExecutionForm((current) => {
+              const ids = current.artifactIds.split('\n').map((value) => value.trim()).filter(Boolean)
+              return {
+                ...current,
+                artifactIds: ids.includes(artifactId) ? current.artifactIds : [...ids, artifactId].join('\n'),
+              }
+            })
+            setActiveTab('executions')
+          }}
+        />
       ) : null}
 
       {activeTab === 'review' ? (
