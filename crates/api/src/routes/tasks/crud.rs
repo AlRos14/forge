@@ -20,13 +20,14 @@ pub async fn create_task(
     });
     let task = state
         .task_service
-        .create_task(
+        .create_task_with_read_only(
             project_id,
             request.title,
             request.description,
             request.parent_task_id,
             request.priority,
             task_type,
+            request.read_only.unwrap_or(false),
             None,
             None,
         )

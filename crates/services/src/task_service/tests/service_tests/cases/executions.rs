@@ -587,28 +587,20 @@ async fn create_claimed_review_execution(
     let service = TaskService::new(Arc::new(db.clone()), event_bus)
         .with_workspace_root(workspace_root.to_path_buf())
         .with_workspace_exec_locks(Arc::new(crate::WorkspaceExecutionLockManager::new()));
-    let now = now_rfc3339();
-    let task = TaskRepo::create(
-        db,
-        db::CreateTask {
-            id: db::new_uuid_v4(),
-            project_id: project_id.to_owned(),
-            repo_id: Some(repo_id.to_owned()),
-            parent_task_id: None,
-            subtask_order: None,
-            title: "Read-only exact Review fixture".to_owned(),
-            description: Some("Review a dirty Workspace snapshot".to_owned()),
-            task_type: "review".to_owned(),
-            lifecycle_state: db::TaskLifecycleState::Active,
-            is_automation: false,
-            priority: 0,
-            merge_config: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("Review fixture Task creates");
+    let task = service
+        .create_task_with_read_only(
+            project_id.to_owned(),
+            "Read-only exact Review fixture",
+            Some("Review a dirty Workspace snapshot".to_owned()),
+            None,
+            Some(0),
+            Some("review".to_owned()),
+            true,
+            Some(db::TaskLifecycleState::Active),
+            None,
+        )
+        .await
+        .expect("explicitly read-only Review fixture Task creates");
     service
         .create_task_role(
             &task.id,

@@ -227,14 +227,9 @@ pub(super) async fn build_executor_config_snapshot(
     {
         snapshot[executors::ROUTING_SNAPSHOT_KEY] = routing;
     }
-    // Charter-backed discovery and planning Tasks may inspect a repository,
-    // but they are never allowed to receive a write-capable execution
-    // profile.  Persist the capability in the immutable execution snapshot
-    // so every executor backend sees the same server-derived restriction.
-    if matches!(
-        task.task_type.as_str(),
-        "planning" | "discovery" | "review" | "validation"
-    ) {
+    // Persist an explicit Task-level read-only restriction in the immutable
+    // execution snapshot so every executor backend sees the same policy.
+    if task.read_only {
         executors::mark_worktree_read_only(&mut snapshot);
     }
     serde_json::to_string(&snapshot)

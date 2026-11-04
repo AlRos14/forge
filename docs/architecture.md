@@ -38,6 +38,13 @@ so global discovery does not create cross-account execution authority.
 
 An Execution records one Actor, Role, Purpose, and Task, with an explicit WorkUnit, Workspace, and HarnessSession when applicable. Parent Execution records lineage; it does not grant authority or imply session reuse. Execution identity and configuration snapshots are historical.
 
+Repository access mode is an explicit Task `read_only` setting. New Tasks are
+read-write by default; a read-only Task gives its repository WorkUnit a
+read-only WorkspaceLease and causes repository changes to be discarded after
+each Execution. Task type, TaskRole, and Execution Purpose do not select
+repository access. New subtasks inherit a read-only parent setting, and the
+setting cannot be changed through the Task update API.
+
 ## Authority and lifecycle
 
 `TaskLifecycleService` owns the aggregate Task state and its versioned transition receipts. The current states are `backlog`, `ready`, `active`, `blocked`, `ready_to_merge`, `merging`, `done`, and `cancelled`. The `task.status` column was removed in V129; it is not an active projection or a second state authority.

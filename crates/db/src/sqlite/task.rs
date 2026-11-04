@@ -184,6 +184,27 @@ impl TaskRepo for SqliteDb {
             .transpose()
     }
 
+    async fn set_read_only_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        read_only: bool,
+    ) -> Result<Task> {
+        let result = sqlx::query("UPDATE task SET read_only = ? WHERE id = ?")
+            .bind(if read_only { 1_i64 } else { 0_i64 })
+            .bind(id)
+            .execute(&mut **transaction)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        let row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(id)
+            .fetch_one(&mut **transaction)
+            .await?;
+        map_task(row)
+    }
+
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>> {
         let offset = decode_offset(&query.page.cursor)?;
         let mut where_parts = vec!["project_id = ?"];

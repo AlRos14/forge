@@ -94,13 +94,14 @@ pub(super) async fn forge_create_task(
     }
     let task = state
         .task_service
-        .create_task(
+        .create_task_with_read_only(
             params.project_id,
             params.title,
             params.description,
             params.parent_task_id,
             params.priority,
-            params.task_type,
+            None,
+            params.read_only,
             None,
             None,
         )
@@ -230,30 +231,19 @@ fn validate_create_task_arguments(params: &Value) -> Result<(), McpToolError> {
             ));
         }
     }
-    if let Some(value) = object.get("type") {
-        let Some(task_type) = value.as_str() else {
+    if object.contains_key("type") || object.contains_key("task_type") {
+        return Err(invalid_field_error(
+            "type",
+            "Task type selection has been retired; new Tasks use role-based execution purposes",
+            None,
+        ));
+    }
+    if let Some(value) = object.get("read_only") {
+        if !value.is_boolean() {
             return Err(invalid_field_error(
-                "type",
-                "must be one of the accepted values",
-                Some(json!({
-                    "type": "string",
-                    "enum": ["implementation", "planning", "discovery", "review", "validation"]
-                })),
-            ));
-        };
-        if task_type != "implementation"
-            && task_type != "planning"
-            && task_type != "discovery"
-            && task_type != "review"
-            && task_type != "validation"
-        {
-            return Err(invalid_field_error(
-                "type",
-                format!("unsupported value `{task_type}`"),
-                Some(json!({
-                    "type": "string",
-                    "enum": ["implementation", "planning", "discovery", "review", "validation"]
-                })),
+                "read_only",
+                "must be a boolean",
+                Some(json!({"type": "boolean"})),
             ));
         }
     }
@@ -821,6 +811,7 @@ async fn task_public_value(state: &AppState, task: Task) -> Result<Value, McpToo
         "title": task.title,
         "description": task.description,
         "task_type": task.task_type,
+        "read_only": task.read_only,
         "lifecycle": {
             "task_id": lifecycle.task_id,
             "state": lifecycle.state.to_string(),

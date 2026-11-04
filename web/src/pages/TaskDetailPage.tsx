@@ -266,7 +266,7 @@ export function TaskDetailPage({
             Edit task
           </Button>
           <Badge variant="outline">{task.lifecycle.state.replaceAll('_', ' ')}</Badge>
-          <Badge variant="outline">{task.task_type}</Badge>
+          {task.read_only ? <Badge variant="outline">Read-only</Badge> : null}
         </div>
         <div className="flex flex-wrap gap-2">
           {(nextLifecycleStates[task.lifecycle.state] ?? []).map((state) => (

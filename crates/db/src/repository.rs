@@ -17,6 +17,12 @@ pub trait TaskRepo: Send + Sync {
         id: &str,
         include_deleted: bool,
     ) -> Result<Option<Task>>;
+    async fn set_read_only_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        read_only: bool,
+    ) -> Result<Task>;
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>>;
     async fn list_by_executing_agent(&self, query: AgentTaskListQuery) -> Result<Page<Task>>;
     async fn list_subtasks_ordered(&self, parent_task_id: &str) -> Result<Vec<Task>>;

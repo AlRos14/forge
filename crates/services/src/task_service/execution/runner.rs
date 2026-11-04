@@ -429,12 +429,7 @@ impl TaskService {
             })?;
         let mut agent_config = parse_json_value("executor config snapshot", snapshot)?;
         crate::task_service::config::validate_agent_routing_snapshot(&agent_config)?;
-        if execution.role == "reviewer"
-            || matches!(
-                task.task_type.as_str(),
-                "planning" | "discovery" | "review" | "validation"
-            )
-        {
+        if task.read_only {
             executors::mark_worktree_read_only(&mut agent_config);
         }
         // The immutable Execution snapshot selects the provider entry. Never
@@ -1443,12 +1438,7 @@ impl TaskService {
             })?;
         let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
         crate::task_service::config::validate_agent_routing_snapshot(&executor_config)?;
-        if execution.role == "reviewer"
-            || matches!(
-                task.task_type.as_str(),
-                "planning" | "discovery" | "review" | "validation"
-            )
-        {
+        if task.read_only {
             executors::mark_worktree_read_only(&mut executor_config);
         }
         let executor_type = executor_config

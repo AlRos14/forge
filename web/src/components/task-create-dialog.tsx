@@ -9,19 +9,10 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Label } from '@/components/ui/label'
-import { Select } from '@/components/ui/select'
 import { MarkdownEditor } from '@/components/ui/markdown-editor'
 import { toastApiError } from '@/lib/api-error'
 import { splitTaskContent } from '@/lib/task-content'
-import type { Task, TaskType } from '@/types/generated'
-
-const taskTypes: { value: TaskType; label: string }[] = [
-  { value: 'implementation', label: 'Implementation' },
-  { value: 'planning', label: 'Planning' },
-  { value: 'discovery', label: 'Discovery' },
-  { value: 'review', label: 'Review' },
-  { value: 'validation', label: 'Validation' },
-]
+import type { Task } from '@/types/generated'
 
 interface TaskCreateDialogProps {
   open: boolean
@@ -37,12 +28,12 @@ export function TaskCreateDialog({
   onCreated,
 }: TaskCreateDialogProps) {
   const [content, setContent] = useState('')
-  const [taskType, setTaskType] = useState<TaskType>('implementation')
+  const [readOnly, setReadOnly] = useState(false)
   const createTask = useCreateTask(projectId)
 
   const reset = () => {
     setContent('')
-    setTaskType('implementation')
+    setReadOnly(false)
   }
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -53,7 +44,7 @@ export function TaskCreateDialog({
     createTask.mutate(
       {
         ...taskContent,
-        task_type: taskType,
+        read_only: readOnly,
         priority: 0,
       },
       {
@@ -92,13 +83,18 @@ export function TaskCreateDialog({
           <details className="rounded-md border px-3 py-2">
             <summary className="cursor-pointer text-sm font-medium">More options</summary>
             <div className="mt-3 space-y-2">
-              <Label htmlFor="task-type">Task type</Label>
-              <Select
-                id="task-type"
-                value={taskType}
-                options={taskTypes.map((type) => ({ value: type.value, label: type.label }))}
-                onChange={(v) => setTaskType(v as TaskType)}
-              />
+              <label htmlFor="task-read-only" className="flex items-center gap-2 text-sm">
+                <input
+                  id="task-read-only"
+                  type="checkbox"
+                  checked={readOnly}
+                  onChange={(event) => setReadOnly(event.target.checked)}
+                />
+                Read-only Task
+              </label>
+              <p className="pl-6 text-xs text-muted-foreground">
+                Repository changes from its Executions are discarded when they finish.
+              </p>
             </div>
           </details>
           <DialogFooter>

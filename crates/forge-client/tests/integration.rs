@@ -116,6 +116,7 @@ async fn forge_client_runs_task_flow_and_deletes_task() {
                 description: None,
                 parent_task_id: None,
                 task_type: None,
+                read_only: Some(false),
                 priority: None,
             },
         )
@@ -472,6 +473,7 @@ fn task_response(
         title,
         description: None,
         task_type,
+        read_only: false,
         lifecycle: TaskLifecycleResponse {
             task_id,
             state: lifecycle_state,

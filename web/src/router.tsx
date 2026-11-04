@@ -198,7 +198,6 @@ const taskListSortByValues = new Set<TaskListSortBy>([
   'title',
   'lifecycle_state',
   'priority',
-  'task_type',
   'updated_at',
   'board_position',
 ])

@@ -196,6 +196,7 @@ async fn task_response_inner(db: &db::SqliteDb, task: Task) -> ApiResult<TaskRes
         title: task.title,
         description: task.description,
         task_type: parse_task_type(&task.task_type),
+        read_only: task.read_only,
         lifecycle,
         priority: task.priority,
         board_position: task.board_position,

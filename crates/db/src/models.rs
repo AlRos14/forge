@@ -917,6 +917,7 @@ pub struct Task {
     pub title: String,
     pub description: Option<String>,
     pub task_type: String,
+    pub read_only: bool,
     pub lifecycle_state: TaskLifecycleState,
     pub is_automation: bool,
     pub priority: i64,

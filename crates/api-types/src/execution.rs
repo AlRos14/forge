@@ -36,6 +36,7 @@ pub struct TaskResponse {
     pub title: String,
     pub description: Option<String>,
     pub task_type: TaskType,
+    pub read_only: bool,
     pub lifecycle: TaskLifecycleResponse,
     #[ts(type = "number")]
     pub priority: i64,

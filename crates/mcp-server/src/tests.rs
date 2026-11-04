@@ -1222,21 +1222,18 @@ fn scoped_mcp_injects_project_id_for_project_tools() {
 }
 
 #[test]
-fn forge_create_task_persists_validated_task_type() {
+fn forge_create_task_defaults_to_read_write_and_accepts_read_only() {
     run_async(async {
         let state = sqlite_state().await;
         let (project_id, _) = seed_project_repo(&state).await;
-        for (task_type, title) in [
-            ("discovery", "Discovery task"),
-            ("planning", "Planning task"),
-        ] {
+        for (read_only, title) in [(false, "Read-write task"), (true, "Read-only task")] {
             let result = call_tool(
                 &state,
                 "forge_create_task",
                 json!({
                     "project_id": project_id,
                     "title": title,
-                    "type": task_type
+                    "read_only": read_only
                 }),
             )
             .await;
@@ -1245,7 +1242,8 @@ fn forge_create_task_persists_validated_task_type() {
                 .await
                 .expect("task lookup succeeds")
                 .expect("task persists");
-            assert_eq!(task.task_type, task_type);
+            assert_eq!(task.read_only, read_only);
+            assert_eq!(task.task_type, "implementation");
         }
     });
 }
@@ -1274,7 +1272,7 @@ fn forge_create_task_rejects_invalid_priority_with_field_error() {
 }
 
 #[test]
-fn forge_create_task_rejects_invalid_type_with_field_error() {
+fn forge_create_task_rejects_retired_type_selection() {
     run_async(async {
         let state = sqlite_state().await;
         let (project_id, _) = seed_project_repo(&state).await;
@@ -1292,16 +1290,10 @@ fn forge_create_task_rejects_invalid_type_with_field_error() {
         assert_eq!(error.code, -32602);
         let data = error.data.expect("error data");
         assert_eq!(data["field"], "type");
-        assert_eq!(
-            data["accepted"]["enum"],
-            json!([
-                "implementation",
-                "planning",
-                "discovery",
-                "review",
-                "validation"
-            ])
-        );
+        assert!(data["details"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("retired"));
     });
 }
 

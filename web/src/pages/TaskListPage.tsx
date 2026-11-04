@@ -7,7 +7,7 @@ import { Input } from '@/components/ui/input'
 import { TaskCreateDialog } from '@/components/task-create-dialog'
 import type { TaskLifecycleState } from '@/types/generated'
 
-export type TaskListSortBy = 'title' | 'lifecycle_state' | 'priority' | 'task_type' | 'updated_at' | 'board_position'
+export type TaskListSortBy = 'title' | 'lifecycle_state' | 'priority' | 'updated_at' | 'board_position'
 export type TaskListSortOrder = 'asc' | 'desc'
 
 const lifecycleStates: Array<TaskLifecycleState | ''> = [
@@ -74,15 +74,14 @@ export function TaskListPage({
             <option value="title:asc">Title</option>
             <option value="priority:desc">Priority</option>
             <option value="lifecycle_state:asc">TaskLifecycle</option>
-            <option value="task_type:asc">Task type</option>
           </select>
         </label>
       </section>
 
       {tasksQuery.isError ? <ErrorBanner error={tasksQuery.error} fallback="Tasks failed to load" onRetry={() => void tasksQuery.refetch()} /> : null}
       <section className="overflow-hidden rounded-lg border">
-        <div className="grid grid-cols-[minmax(0,1fr)_140px_120px_90px] gap-3 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
-          <span>Task</span><span>TaskLifecycle</span><span>Type</span><span>Priority</span>
+        <div className="grid grid-cols-[minmax(0,1fr)_140px_90px] gap-3 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
+          <span>Task</span><span>TaskLifecycle</span><span>Priority</span>
         </div>
         {tasksQuery.isLoading ? <p className="p-4 text-sm text-muted-foreground">Loading tasks…</p> : null}
         {tasks.map((task) => (
@@ -90,11 +89,10 @@ export function TaskListPage({
             key={task.id}
             to="/tasks/$taskId"
             params={{ taskId: task.id }}
-            className="grid grid-cols-[minmax(0,1fr)_140px_120px_90px] items-center gap-3 border-b px-4 py-3 text-sm last:border-b-0 hover:bg-muted/30"
+            className="grid grid-cols-[minmax(0,1fr)_140px_90px] items-center gap-3 border-b px-4 py-3 text-sm last:border-b-0 hover:bg-muted/30"
           >
-            <span className="min-w-0"><strong className="block truncate">{task.title}</strong><span className="font-mono text-[11px] text-muted-foreground">{task.id}</span></span>
+            <span className="min-w-0"><strong className="block truncate">{task.title}</strong>{task.read_only ? <span className="mr-2 text-xs text-muted-foreground">Read-only ·</span> : null}<span className="font-mono text-[11px] text-muted-foreground">{task.id}</span></span>
             <span className="capitalize">{task.lifecycle.state.replaceAll('_', ' ')}</span>
-            <span>{task.task_type}</span>
             <span>{task.priority}</span>
           </Link>
         ))}

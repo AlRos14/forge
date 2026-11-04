@@ -20,6 +20,9 @@ pub struct CreateTaskRequest {
     pub parent_task_id: Option<String>,
     #[ts(optional = nullable)]
     pub task_type: Option<TaskType>,
+    #[serde(default)]
+    #[ts(optional, type = "boolean")]
+    pub read_only: Option<bool>,
     #[ts(type = "number | null")]
     #[ts(optional = nullable)]
     pub priority: Option<i64>,

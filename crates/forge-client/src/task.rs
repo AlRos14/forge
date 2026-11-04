@@ -202,6 +202,7 @@ impl TaskArgs {
                     description: description.clone(),
                     parent_task_id: None,
                     task_type: None,
+                    read_only: Some(false),
                     priority: *priority,
                 };
                 let task: TaskResponse = client
