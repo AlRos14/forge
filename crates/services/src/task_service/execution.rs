@@ -90,26 +90,6 @@ pub(crate) fn execution_purpose_for_role(role: &str) -> ExecutionPurpose {
     }
 }
 
-/// Resolve the purpose at a semantic task-dispatch boundary. The `interactive`
-/// label remains general regardless of Task type or workflow state; Task type
-/// independently selects its TaskRole and repository capability. For other
-/// role-driven paths, typed Tasks keep their stronger domain purpose so
-/// validation is not recorded as implementation merely because its workflow
-/// role is `worker`.
-pub(crate) fn execution_purpose_for_task_type(task_type: &str, role: &str) -> ExecutionPurpose {
-    if role.trim().eq_ignore_ascii_case("interactive") {
-        return ExecutionPurpose::General;
-    }
-
-    match task_type.trim().to_ascii_lowercase().as_str() {
-        "planning" => ExecutionPurpose::Plan,
-        "review" => ExecutionPurpose::Review,
-        "validation" => ExecutionPurpose::Validate,
-        "discovery" | "investigation" | "investigate" => ExecutionPurpose::Investigate,
-        _ => execution_purpose_for_role(role),
-    }
-}
-
 /// Resolve generic continuity only through the Execution's explicit
 /// HarnessSession reference. Legacy external session identifiers are retained
 /// as historical provenance and never authorize Resume.
@@ -525,36 +505,6 @@ mod purpose_tests {
             execution_purpose_for_role("interactive"),
             ExecutionPurpose::General
         );
-    }
-
-    #[test]
-    fn task_dispatch_mapping_keeps_domain_purpose_independent_from_role() {
-        assert_eq!(
-            execution_purpose_for_task_type("validation", "worker"),
-            ExecutionPurpose::Validate
-        );
-        assert_eq!(
-            execution_purpose_for_task_type("investigation", "implementer"),
-            ExecutionPurpose::Investigate
-        );
-        assert_eq!(
-            execution_purpose_for_task_type("implementation", "implementer"),
-            ExecutionPurpose::Implement
-        );
-
-        for task_type in [
-            "implementation",
-            "planning",
-            "review",
-            "validation",
-            "discovery",
-        ] {
-            assert_eq!(
-                execution_purpose_for_task_type(task_type, "interactive"),
-                ExecutionPurpose::General,
-                "interactive purpose for {task_type} Task"
-            );
-        }
     }
 }
 

@@ -78,7 +78,6 @@ async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_
             parent_task_id: None,
             title: "integration target".to_owned(),
             description: None,
-            task_type: "implementation".to_owned(),
             lifecycle_state: db::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,
@@ -940,7 +939,7 @@ async fn agent_identity_profile_membership_migration_preserves_operational_histo
 }
 
 #[tokio::test]
-async fn discovery_task_type_migration_preserves_rows_and_constraints() {
+async fn historical_task_modes_are_removed_without_losing_task_rows() {
     let migration_dir = unique_temp_path("discovery-task-migrations");
     fs::create_dir_all(&migration_dir).expect("temp migration dir creates");
     copy_migrations_up_to(72, &migration_dir);
@@ -1004,18 +1003,17 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
         .expect("legacy task loads")
         .expect("legacy task survives");
     assert_eq!(legacy.title, "Legacy task");
-    assert_eq!(legacy.task_type, "implementation");
     let legacy_plan = TaskRepo::get_by_id(&db, "legacy-plan", true)
         .await
         .expect("legacy plan loads")
         .expect("legacy plan survives");
-    assert_eq!(legacy_plan.task_type, "planning");
+    assert_eq!(legacy_plan.title, "Legacy plan");
     let legacy_child = TaskRepo::get_by_id(&db, "legacy-child", true)
         .await
         .expect("legacy child loads")
         .expect("legacy child survives");
-    assert_eq!(legacy_child.task_type, "implementation");
     assert_eq!(legacy_child.parent_task_id.as_deref(), Some("legacy-task"));
+    assert_eq!(legacy_child.title, "Legacy child");
 
     let discovery = TaskRepo::create(
         &db,
@@ -1026,7 +1024,6 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
             parent_task_id: None,
             title: "Discover product direction".to_owned(),
             description: Some("Genesis discovery".to_owned()),
-            task_type: "discovery".to_owned(),
             lifecycle_state: db::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,
@@ -1038,25 +1035,15 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
     )
     .await
     .expect("discovery task creates through repository");
-    assert_eq!(discovery.task_type, "discovery");
+    assert_eq!(discovery.title, "Discover product direction");
 
     let task_sql: String =
         sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task'")
             .fetch_one(&pool)
             .await
             .expect("task schema loads");
-    for task_type in [
-        "'implementation'",
-        "'planning'",
-        "'discovery'",
-        "'review'",
-        "'validation'",
-    ] {
-        assert!(
-            task_sql.contains(task_type),
-            "missing semantic type {task_type}"
-        );
-    }
+    assert!(!task_sql.contains("task_type"));
+    assert!(!task_sql.contains("read_only"));
     for object in [
         "idx_task_parent",
         "idx_task_repo",

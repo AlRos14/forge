@@ -91,7 +91,7 @@ export function TaskListPage({
             params={{ taskId: task.id }}
             className="grid grid-cols-[minmax(0,1fr)_140px_90px] items-center gap-3 border-b px-4 py-3 text-sm last:border-b-0 hover:bg-muted/30"
           >
-            <span className="min-w-0"><strong className="block truncate">{task.title}</strong>{task.read_only ? <span className="mr-2 text-xs text-muted-foreground">Read-only ·</span> : null}<span className="font-mono text-[11px] text-muted-foreground">{task.id}</span></span>
+            <span className="min-w-0"><strong className="block truncate">{task.title}</strong><span className="font-mono text-[11px] text-muted-foreground">{task.id}</span></span>
             <span className="capitalize">{task.lifecycle.state.replaceAll('_', ' ')}</span>
             <span>{task.priority}</span>
           </Link>

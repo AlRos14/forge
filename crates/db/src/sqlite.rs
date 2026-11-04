@@ -169,14 +169,12 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
         (SortBy::Agent, SortOrder::Desc) => {
             "(SELECT MIN(rm.actor_id) FROM task_role tr JOIN role_membership rm ON rm.task_role_id = tr.id WHERE tr.task_id = task.id AND tr.role = 'implementer' AND rm.actor_kind = 'agent' AND rm.status = 'active') DESC, id DESC"
         }
-        (SortBy::TaskType, SortOrder::Asc) => "task_type ASC, id ASC",
-        (SortBy::TaskType, SortOrder::Desc) => "task_type DESC, id DESC",
         (SortBy::Id, SortOrder::Asc) => "id ASC",
         (SortBy::Id, SortOrder::Desc) => "id DESC",
     }
 }
 
-const TASK_COLUMNS: &str = "task.id, task.project_id, task.repo_id, task.parent_task_id, task.title, task.description, task.task_type, task.read_only, (SELECT state FROM task_lifecycle WHERE task_id = task.id) AS lifecycle_state, task.is_automation, task.priority, task.board_position, task.subtask_order, task.merge_config, task.metadata_json, task.error_annotation, task.blocked_json, task.failed_json, task.deleted_at, task.version, task.created_at, task.updated_at";
+const TASK_COLUMNS: &str = "task.id, task.project_id, task.repo_id, task.parent_task_id, task.title, task.description, (SELECT state FROM task_lifecycle WHERE task_id = task.id) AS lifecycle_state, task.is_automation, task.priority, task.board_position, task.subtask_order, task.merge_config, task.metadata_json, task.error_annotation, task.blocked_json, task.failed_json, task.deleted_at, task.version, task.created_at, task.updated_at";
 const PROJECT_COLUMNS: &str = "id, name, settings, primary_repo_id, paused_at, owner_id, project_hooks_json, project_work_epoch, version, created_at, updated_at";
 
 fn limit(page: &PageRequest) -> i64 {
@@ -441,8 +439,6 @@ fn map_task(row: SqliteRow) -> Result<Task> {
         parent_task_id: row.try_get("parent_task_id")?,
         title: row.try_get("title")?,
         description: row.try_get("description")?,
-        task_type: row.try_get("task_type")?,
-        read_only: row.try_get::<i64, _>("read_only")? != 0,
         lifecycle_state: parse_enum(row.try_get::<String, _>("lifecycle_state")?)?,
         is_automation: row.try_get::<i64, _>("is_automation")? != 0,
         priority: row.try_get("priority")?,

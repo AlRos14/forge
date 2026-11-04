@@ -10,12 +10,13 @@ PR14 audit on 2026-10-16.
 
 ### Added
 
-- Make new Tasks read-write by default and replace Task type selection in the
-  creation form with an advanced read-only option. MCP task creation also
-  drops type selection. Task type, TaskRole, and Execution Purpose no longer
-  select repository access. Existing read-only Task types are preserved by
-  migration V137; read-only parent Tasks pass the mode to new subtasks. REST
-  keeps its optional `task_type` field for existing clients.
+- Remove Task classification and Task-level read-only settings from the UI,
+  persistence, REST, and MCP contracts. Eligible Agent Executions receive a
+  `repository_write` WorkspaceLease; Task type and read-only columns are
+  removed by additive migration V138 while the remaining Task data is kept.
+  REST task creation and listing no longer accept or expose Task modes, and
+  historical Project Release snapshots no longer expose their frozen task
+  classification.
 - Discover harness model options on the authorized online daemon that owns the
   CLI configuration. Model catalogs are suggestions, not execution entitlements;
   users can enter provider-specific model IDs supported by their harness.

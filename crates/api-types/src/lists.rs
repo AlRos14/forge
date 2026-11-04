@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::{TaskLifecycleState, TaskResponse, TaskType};
+use crate::{TaskLifecycleState, TaskResponse};
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -11,8 +11,6 @@ pub struct Task {
     pub title: String,
     pub description: Option<String>,
     pub lifecycle_state: TaskLifecycleState,
-    pub task_type: TaskType,
-    pub read_only: bool,
     pub priority: i32,
     pub board_position: f64,
     pub external_issue_number: Option<i64>,

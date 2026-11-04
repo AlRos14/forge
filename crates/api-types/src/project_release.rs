@@ -98,7 +98,6 @@ pub struct ReleaseTaskReference {
     pub task_id: String,
     #[ts(type = "number")]
     pub task_version: i64,
-    pub task_type: String,
     pub task_state: String,
     #[serde(default)]
     pub acceptance_check_ids: Vec<String>,

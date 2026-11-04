@@ -588,19 +588,17 @@ async fn create_claimed_review_execution(
         .with_workspace_root(workspace_root.to_path_buf())
         .with_workspace_exec_locks(Arc::new(crate::WorkspaceExecutionLockManager::new()));
     let task = service
-        .create_task_with_read_only(
+        .create_task(
             project_id.to_owned(),
-            "Read-only exact Review fixture",
+            "Exact Review fixture",
             Some("Review a dirty Workspace snapshot".to_owned()),
             None,
             Some(0),
-            Some("review".to_owned()),
-            true,
             Some(db::TaskLifecycleState::Active),
             None,
         )
         .await
-        .expect("explicitly read-only Review fixture Task creates");
+        .expect("Review fixture Task creates");
     service
         .create_task_role(
             &task.id,
@@ -913,7 +911,6 @@ impl TaskExecutor for ReviewOutputExecutor {
         &self,
         ctx: ExecutionContext,
     ) -> std::result::Result<executors::ExecutionResult, executors::ExecutorError> {
-        assert!(executors::is_worktree_read_only(&ctx.agent_config));
         let worktree = std::path::Path::new(&ctx.worktree_path);
         if self.mutate_worktree {
             std::fs::write(worktree.join("README.md"), "reviewer mutation\n")
@@ -2675,7 +2672,6 @@ async fn task_scoped_execution_entrypoints_fail_closed_without_storage() {
             project_id,
             "Task-scoped launch rejection",
             Some("unused".to_owned()),
-            None,
             None,
             None,
             None,
@@ -8819,7 +8815,6 @@ async fn work_unit_launch_records_execution_permission_policy_override_in_snapsh
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("task creates");
@@ -8871,7 +8866,6 @@ async fn work_unit_launch_records_codex_overrides_in_normalized_snapshot() {
             project_id,
             "Snapshot codex overrides",
             Some("unused".to_owned()),
-            None,
             None,
             None,
             None,

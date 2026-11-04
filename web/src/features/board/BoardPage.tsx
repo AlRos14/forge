@@ -97,7 +97,7 @@ export function BoardPage({ projectId }: { projectId: string }) {
                   <article key={task.id} className="space-y-3 rounded-md border bg-card p-3 shadow-sm">
                     <button type="button" className="block w-full text-left" onClick={() => void navigate({ to: '/tasks/$taskId', params: { taskId: task.id } })}>
                       <strong className="block text-sm">{task.title}</strong>
-                      <span className="mt-1 block text-xs text-muted-foreground">{task.read_only ? 'Read-only · ' : ''}priority {task.priority}</span>
+                      <span className="mt-1 block text-xs text-muted-foreground">priority {task.priority}</span>
                     </button>
                     <div className="flex flex-wrap gap-1">
                       {(nextStates[state] ?? []).map((next) => (

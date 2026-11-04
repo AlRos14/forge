@@ -429,9 +429,6 @@ impl TaskService {
             })?;
         let mut agent_config = parse_json_value("executor config snapshot", snapshot)?;
         crate::task_service::config::validate_agent_routing_snapshot(&agent_config)?;
-        if task.read_only {
-            executors::mark_worktree_read_only(&mut agent_config);
-        }
         // The immutable Execution snapshot selects the provider entry. Never
         // let the Agent's currently selected profile redirect this invocation.
         if snapshot_credential_ref(&agent_config)?.is_some() {
@@ -553,10 +550,7 @@ impl TaskService {
             && execution_before_launch.purpose == Some(ExecutionPurpose::Review);
         let mut review_worktree_snapshot = None;
         let mut review_snapshot_digest = None;
-        if is_review_execution
-            && execution_before_launch.workspace_id.is_some()
-            && executors::is_worktree_read_only(&agent_config)
-        {
+        if is_review_execution && execution_before_launch.workspace_id.is_some() {
             let worktree_path = std::path::Path::new(&worktree_path);
             let digest_before =
                 match crate::ValidationService::snapshot_digest(&worktree_path.to_string_lossy())
@@ -837,14 +831,6 @@ impl TaskService {
             }
         });
 
-        let read_only_head = if review_worktree_snapshot.is_none()
-            && execution.workspace_id.is_some()
-            && executors::is_worktree_read_only(&agent_config)
-        {
-            Some(git::get_current_sha(std::path::Path::new(&worktree_path)).await?)
-        } else {
-            None
-        };
         let existing_plan_output = if execution.purpose == Some(ExecutionPurpose::Plan) {
             db::CollaborationRepo::get_execution_artifact_output(
                 &*self.db,
@@ -964,15 +950,6 @@ impl TaskService {
                 }
             }
         }
-        let restore_result = if review_worktree_snapshot.is_some() {
-            Ok(())
-        } else if let Some(head) = read_only_head.as_deref() {
-            git::restore_worktree(std::path::Path::new(&worktree_path), head)
-                .await
-                .map_err(ServiceError::from)
-        } else {
-            Ok(())
-        };
         let mut result = if let Some(error) = review_restore_error {
             let snapshot = review_worktree_snapshot
                 .take()
@@ -983,7 +960,7 @@ impl TaskService {
                 workspace_path = %worktree_path,
                 snapshot_backup_path = %backup_path.display(),
                 %error,
-                "read-only Review workspace could not be restored to its exact subject"
+                "Review workspace could not be restored to its exact subject"
             );
             executors::ExecutionResult {
                 status: ExecutionOutcome::Failed,
@@ -998,11 +975,8 @@ impl TaskService {
             }
         } else {
             let mut result = execution_result?;
-            restore_result?;
             if let Some(subject) = review_subject.as_ref() {
                 result.after_sha = Some(subject.head_commit_sha.clone());
-            } else if let Some(head) = read_only_head {
-                result.after_sha = Some(head);
             }
             result
         };
@@ -1436,11 +1410,8 @@ impl TaskService {
             .ok_or_else(|| {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
-        let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
+        let executor_config = parse_json_value("executor config snapshot", snapshot)?;
         crate::task_service::config::validate_agent_routing_snapshot(&executor_config)?;
-        if task.read_only {
-            executors::mark_worktree_read_only(&mut executor_config);
-        }
         let executor_type = executor_config
             .get("executor_type")
             .and_then(Value::as_str)

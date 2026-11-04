@@ -25,16 +25,7 @@ async fn create_task_assigns_subtask_order_and_rejects_nested_subtask() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let root = service
-        .create_task(
-            project_id.clone(),
-            "Root",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_task(project_id.clone(), "Root", None, None, None, None, None)
         .await
         .expect("root task creates");
 
@@ -44,7 +35,6 @@ async fn create_task_assigns_subtask_order_and_rejects_nested_subtask() {
             "Child",
             None,
             Some(root.id.clone()),
-            None,
             None,
             None,
             None,
@@ -70,7 +60,6 @@ async fn create_task_assigns_subtask_order_and_rejects_nested_subtask() {
             None,
             None,
             None,
-            None,
         )
         .await;
     assert!(matches!(
@@ -93,16 +82,7 @@ async fn create_task_rejects_foreign_and_missing_parents_before_writing() {
     let (project_a, _repo_a, _) = seed_project_repo(&db).await;
     let (project_b, _repo_b, _) = seed_project_repo(&db).await;
     let parent = service
-        .create_task(
-            project_a,
-            "Foreign parent",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_task(project_a, "Foreign parent", None, None, None, None, None)
         .await
         .expect("parent creates");
     let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ?")
@@ -118,7 +98,6 @@ async fn create_task_rejects_foreign_and_missing_parents_before_writing() {
                 "Rejected child",
                 None,
                 Some(parent_id.to_owned()),
-                None,
                 None,
                 None,
                 None,
@@ -148,29 +127,11 @@ async fn update_task_parent_rejects_foreign_self_nested_and_cyclic_links_atomica
     let (project_id, _, _) = seed_project_repo(&db).await;
     let (other_project_id, _, _) = seed_project_repo(&db).await;
     let root_a = service
-        .create_task(
-            project_id.clone(),
-            "Root A",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_task(project_id.clone(), "Root A", None, None, None, None, None)
         .await
         .expect("Root A creates");
     let root_b = service
-        .create_task(
-            project_id.clone(),
-            "Root B",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_task(project_id.clone(), "Root B", None, None, None, None, None)
         .await
         .expect("Root B creates");
     let child_a = service
@@ -179,7 +140,6 @@ async fn update_task_parent_rejects_foreign_self_nested_and_cyclic_links_atomica
             "Child A",
             None,
             Some(root_a.id.clone()),
-            None,
             None,
             None,
             None,
@@ -193,23 +153,13 @@ async fn update_task_parent_rejects_foreign_self_nested_and_cyclic_links_atomica
     assert_eq!(child_a.parent_task_id.as_deref(), Some(root_a.id.as_str()));
     assert_eq!(child_a.subtask_order, Some(0));
     let root_c = service
-        .create_task(
-            project_id.clone(),
-            "Root C",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_task(project_id.clone(), "Root C", None, None, None, None, None)
         .await
         .expect("Root C creates");
     let foreign_parent = service
         .create_task(
             other_project_id,
             "Foreign root",
-            None,
             None,
             None,
             None,
@@ -402,7 +352,6 @@ async fn ordinary_task_update_does_not_rewrite_parent_structure() {
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("child creates");
@@ -430,7 +379,6 @@ async fn stale_and_direct_repository_parent_updates_are_rejected_atomically() {
             "Child",
             None,
             Some(parent_a.id.clone()),
-            None,
             None,
             None,
             None,
@@ -537,7 +485,6 @@ async fn create_child_serializes_with_parent_reparent() {
                 None,
                 None,
                 None,
-                None,
             )
             .await
     });
@@ -640,7 +587,6 @@ async fn create_root(service: &TaskService, project_id: &str, title: &str) -> Ta
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("root creates")
@@ -683,7 +629,6 @@ async fn soft_delete_rejects_parent_with_live_children_without_partial_writes() 
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("child creates");
@@ -721,7 +666,6 @@ async fn soft_delete_leaf_keeps_its_parent_live() {
             "Child",
             None,
             Some(parent.id.clone()),
-            None,
             None,
             None,
             None,
@@ -768,7 +712,6 @@ async fn create_child_serializes_with_parent_soft_delete() {
                 "C",
                 None,
                 Some(create_parent_id),
-                None,
                 None,
                 None,
                 None,
@@ -988,7 +931,6 @@ async fn reparent_requires_the_same_exact_repo() {
             subtask_order: None,
             title: "B in Repo B".to_owned(),
             description: None,
-            task_type: "implementation".to_owned(),
             lifecycle_state: db::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,
@@ -1045,7 +987,6 @@ async fn deleting_parent_after_detach_preserves_a_clean_root() {
             "Child",
             None,
             Some(parent.id.clone()),
-            None,
             None,
             None,
             None,

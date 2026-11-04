@@ -94,14 +94,12 @@ pub(super) async fn forge_create_task(
     }
     let task = state
         .task_service
-        .create_task_with_read_only(
+        .create_task(
             params.project_id,
             params.title,
             params.description,
             params.parent_task_id,
             params.priority,
-            None,
-            params.read_only,
             None,
             None,
         )
@@ -231,23 +229,6 @@ fn validate_create_task_arguments(params: &Value) -> Result<(), McpToolError> {
             ));
         }
     }
-    if object.contains_key("type") || object.contains_key("task_type") {
-        return Err(invalid_field_error(
-            "type",
-            "Task type selection has been retired; new Tasks use role-based execution purposes",
-            None,
-        ));
-    }
-    if let Some(value) = object.get("read_only") {
-        if !value.is_boolean() {
-            return Err(invalid_field_error(
-                "read_only",
-                "must be a boolean",
-                Some(json!({"type": "boolean"})),
-            ));
-        }
-    }
-
     Ok(())
 }
 
@@ -810,8 +791,6 @@ async fn task_public_value(state: &AppState, task: Task) -> Result<Value, McpToo
         "parent_task_id": task.parent_task_id,
         "title": task.title,
         "description": task.description,
-        "task_type": task.task_type,
-        "read_only": task.read_only,
         "lifecycle": {
             "task_id": lifecycle.task_id,
             "state": lifecycle.state.to_string(),

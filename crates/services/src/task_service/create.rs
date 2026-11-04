@@ -9,7 +9,6 @@ impl TaskService {
         description: Option<String>,
         parent_task_id: Option<String>,
         priority: Option<i64>,
-        task_type: Option<String>,
         initial_lifecycle_state: Option<db::TaskLifecycleState>,
         merge_config: Option<Value>,
     ) -> Result<Task> {
@@ -19,35 +18,6 @@ impl TaskService {
             description,
             parent_task_id,
             priority,
-            task_type,
-            false,
-            initial_lifecycle_state,
-            merge_config,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_task_with_read_only(
-        &self,
-        project_id: impl Into<String>,
-        title: impl Into<String>,
-        description: Option<String>,
-        parent_task_id: Option<String>,
-        priority: Option<i64>,
-        task_type: Option<String>,
-        read_only: bool,
-        initial_lifecycle_state: Option<db::TaskLifecycleState>,
-        merge_config: Option<Value>,
-    ) -> Result<Task> {
-        self.create_task_inner(
-            project_id,
-            title,
-            description,
-            parent_task_id,
-            priority,
-            task_type,
-            read_only,
             initial_lifecycle_state,
             merge_config,
         )
@@ -62,8 +32,6 @@ impl TaskService {
         description: Option<String>,
         parent_task_id: Option<String>,
         priority: Option<i64>,
-        task_type: Option<String>,
-        read_only: bool,
         initial_lifecycle_state: Option<db::TaskLifecycleState>,
         merge_config: Option<Value>,
     ) -> Result<Task> {
@@ -75,15 +43,6 @@ impl TaskService {
         let is_subtask = parent_task_id.is_some();
         if let Some(parent_id) = parent_task_id.as_deref() {
             validate_required("parent_task_id", parent_id)?;
-        }
-        let effective_task_type = task_type.unwrap_or_else(|| "implementation".to_owned());
-        if !matches!(
-            effective_task_type.as_str(),
-            "implementation" | "planning" | "discovery" | "review" | "validation"
-        ) {
-            return Err(ServiceError::invalid_operation(
-                "task_type must be implementation, planning, discovery, review, or validation",
-            ));
         }
         let now = now_rfc3339();
         let metadata_json = if is_subtask {
@@ -100,7 +59,6 @@ impl TaskService {
         let project = ProjectRepo::get_by_id_in_tx(&*self.db, &mut transaction, &project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
-        let mut effective_read_only = read_only;
         let (repo_id, subtask_order) = if let Some(parent_id) = parent_task_id.as_deref() {
             let parent = super::subtask::validate_parent_placement_in_tx(
                 &self.db,
@@ -110,7 +68,6 @@ impl TaskService {
                 parent_id,
             )
             .await?;
-            effective_read_only |= parent.read_only;
             let order =
                 TaskRepo::next_subtask_order_in_tx(&*self.db, &mut transaction, parent_id).await?;
             (parent.repo_id, Some(order))
@@ -134,7 +91,6 @@ impl TaskService {
             subtask_order,
             title,
             description,
-            task_type: effective_task_type,
             lifecycle_state,
             is_automation: false,
             priority: priority.unwrap_or(0),
@@ -143,10 +99,6 @@ impl TaskService {
             updated_at: now.clone(),
         };
         let mut task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
-        if effective_read_only {
-            task =
-                TaskRepo::set_read_only_in_tx(&*self.db, &mut transaction, &task.id, true).await?;
-        }
         self.apply_project_task_role_defaults_in_tx(
             &mut transaction,
             &task.project_id,
@@ -197,7 +149,6 @@ impl TaskService {
         project_id: impl Into<String>,
         title: impl Into<String>,
         description: Option<String>,
-        task_type: Option<String>,
         initial_lifecycle_state: Option<db::TaskLifecycleState>,
         merge_config: Option<Value>,
     ) -> Result<Task> {
@@ -217,7 +168,6 @@ impl TaskService {
         });
 
         let now = now_rfc3339();
-        let effective_task_type = task_type.unwrap_or_else(|| "implementation".to_owned());
         let create_task = CreateTask {
             id: new_uuid_v4(),
             project_id,
@@ -226,7 +176,6 @@ impl TaskService {
             subtask_order: None,
             title,
             description,
-            task_type: effective_task_type,
             lifecycle_state,
             is_automation: true,
             priority: 0,
@@ -256,14 +205,12 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("task", source_task_id.to_owned()))?;
         let task = self
-            .create_task_with_read_only(
+            .create_task(
                 source.project_id,
                 source.title,
                 source.description,
                 None,
                 Some(source.priority),
-                Some(source.task_type),
-                source.read_only,
                 None,
                 source
                     .merge_config

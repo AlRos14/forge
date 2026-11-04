@@ -12,8 +12,7 @@ use std::{
 use api_types::{
     CreateProjectRequest, CreateRepoRequest, CreateTaskRequest, PaginatedResponse, ProjectResponse,
     RepoResponse, TaskExecutionObservability, TaskLifecycleResponse, TaskLifecycleState,
-    TaskLifecycleTransitionResponse, TaskResponse, TaskType, TransitionTaskLifecycleRequest,
-    WorkMode,
+    TaskLifecycleTransitionResponse, TaskResponse, TransitionTaskLifecycleRequest, WorkMode,
 };
 use axum::{
     extract::{Path as AxumPath, State},
@@ -115,8 +114,6 @@ async fn forge_client_runs_task_flow_and_deletes_task() {
                 title: "Client task".to_owned(),
                 description: None,
                 parent_task_id: None,
-                task_type: None,
-                read_only: Some(false),
                 priority: None,
             },
         )
@@ -380,7 +377,6 @@ async fn create_task_route(
         data.next_id("task"),
         project_id,
         request.title,
-        request.task_type.unwrap_or(TaskType::Implementation),
         lifecycle_state,
     );
     data.tasks.insert(task.id.clone(), task.clone());
@@ -461,7 +457,6 @@ fn task_response(
     id: String,
     project_id: String,
     title: String,
-    task_type: TaskType,
     lifecycle_state: TaskLifecycleState,
 ) -> TaskResponse {
     let task_id = id.clone();
@@ -472,8 +467,6 @@ fn task_response(
         parent_task_id: None,
         title,
         description: None,
-        task_type,
-        read_only: false,
         lifecycle: TaskLifecycleResponse {
             task_id,
             state: lifecycle_state,

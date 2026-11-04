@@ -72,7 +72,6 @@ fn export_typescript() {
     // These are current target-domain wire contracts. Historical release
     // references are exported only through ProjectRelease's exact dependency
     // closure; storage and migration DTOs are not part of the public barrel.
-    TaskType::export().expect("export TaskType");
     WorkMode::export().expect("export WorkMode");
     AgentStatus::export().expect("export AgentStatus");
     ExecutionPurpose::export().expect("export ExecutionPurpose");

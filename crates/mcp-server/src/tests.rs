@@ -365,7 +365,6 @@ async fn seed_task_in_project(state: &AppState, project_id: String) -> Task {
             Some(1),
             None,
             None,
-            None,
         )
         .await
         .expect("task creates")
@@ -1222,29 +1221,26 @@ fn scoped_mcp_injects_project_id_for_project_tools() {
 }
 
 #[test]
-fn forge_create_task_defaults_to_read_write_and_accepts_read_only() {
+fn forge_create_task_accepts_a_task_brief_without_task_modes() {
     run_async(async {
         let state = sqlite_state().await;
         let (project_id, _) = seed_project_repo(&state).await;
-        for (read_only, title) in [(false, "Read-write task"), (true, "Read-only task")] {
-            let result = call_tool(
-                &state,
-                "forge_create_task",
-                json!({
-                    "project_id": project_id,
-                    "title": title,
-                    "read_only": read_only
-                }),
-            )
-            .await;
-            let task_id = result["id"].as_str().expect("task id");
-            let task = TaskRepo::get_by_id(&*state.db, task_id, false)
-                .await
-                .expect("task lookup succeeds")
-                .expect("task persists");
-            assert_eq!(task.read_only, read_only);
-            assert_eq!(task.task_type, "implementation");
-        }
+        let result = call_tool(
+            &state,
+            "forge_create_task",
+            json!({
+                "project_id": project_id,
+                "title": "Task brief",
+                "description": "A task created without execution modes."
+            }),
+        )
+        .await;
+        let task_id = result["id"].as_str().expect("task id");
+        let task = TaskRepo::get_by_id(&*state.db, task_id, false)
+            .await
+            .expect("task lookup succeeds")
+            .expect("task persists");
+        assert_eq!(task.title, "Task brief");
     });
 }
 
@@ -2199,7 +2195,6 @@ fn forge_update_task_rejects_cross_repo_parent_without_partial_write() {
                 subtask_order: None,
                 title: "Parent in other Repo".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
@@ -2595,7 +2590,6 @@ fn forge_create_sub_tasks_nested_rejected() {
                 parent_task_id: Some(root.id.clone()),
                 title: "Existing subtask".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,

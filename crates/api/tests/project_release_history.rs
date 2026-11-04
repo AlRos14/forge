@@ -509,7 +509,6 @@ async fn seed_authentic_v120_release_history(pool: &sqlx::SqlitePool) -> Vec<Pro
     let task_ref = ReleaseTaskReference {
         task_id: "historical-task-without-canonical-row".to_owned(),
         task_version: 7,
-        task_type: "implementation".to_owned(),
         task_state: "active".to_owned(),
         acceptance_check_ids: vec!["check-frozen-1".to_owned()],
     };

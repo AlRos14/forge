@@ -2,11 +2,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
+use crate::WorkMode;
 use crate::{
     project_hooks::{parse_project_hooks_json, ProjectHookRule},
     ExecutionPurpose,
 };
-use crate::{TaskType, WorkMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
@@ -18,11 +18,6 @@ pub struct CreateTaskRequest {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub parent_task_id: Option<String>,
-    #[ts(optional = nullable)]
-    pub task_type: Option<TaskType>,
-    #[serde(default)]
-    #[ts(optional, type = "boolean")]
-    pub read_only: Option<bool>,
     #[ts(type = "number | null")]
     #[ts(optional = nullable)]
     pub priority: Option<i64>,

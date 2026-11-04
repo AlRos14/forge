@@ -51,13 +51,10 @@ The same purpose can run under different permissions, and the same role can
 perform different purposes. The platform must not use a plan purpose as a
 permission mode.
 
-Repository read/write access is selected by the Task's explicit `read_only`
-setting, which defaults to `false`. WorkspaceLease admission derives its
-repository capability from that setting alone; Task type, TaskRole, and
-Execution Purpose do not make a Task read-only. A read-only Task receives a
-`repository_read` WorkspaceLease and the runtime discards repository changes
-after each Execution. The setting is fixed at Task creation, and subtasks
-inherit a read-only parent setting.
+Tasks do not have a repository access mode. Eligible Agent Executions receive
+the `repository_write` capability through WorkspaceLease admission after the
+current TaskRole, ownership, and workspace checks pass. Execution Purpose
+describes why the work exists and does not choose repository capability.
 
 Purpose `validate` is for Actor-driven validation cognition, such as
 investigation, reproduction, or interpretation. Deterministic commands and

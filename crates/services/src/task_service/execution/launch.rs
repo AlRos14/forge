@@ -193,9 +193,12 @@ impl TaskService {
             task_id: task.id.clone(),
             agent_id: Some(agent.id.clone()),
             actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
-            purpose: Some(parent_execution.purpose.clone().unwrap_or_else(|| {
-                execution_purpose_for_task_type(&task.task_type, &work_unit.role)
-            })),
+            purpose: Some(
+                parent_execution
+                    .purpose
+                    .clone()
+                    .unwrap_or_else(|| execution_purpose_for_role(&work_unit.role)),
+            ),
             harness_session_id: None,
             role: work_unit.role.clone(),
             status: ExecutionStatus::Running,
@@ -1148,9 +1151,12 @@ impl TaskService {
             task_id: task.id.clone(),
             agent_id: Some(agent.id.clone()),
             actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
-            purpose: Some(parent_execution.purpose.clone().unwrap_or_else(|| {
-                execution_purpose_for_task_type(&task.task_type, &work_unit.role)
-            })),
+            purpose: Some(
+                parent_execution
+                    .purpose
+                    .clone()
+                    .unwrap_or_else(|| execution_purpose_for_role(&work_unit.role)),
+            ),
             harness_session_id,
             role: work_unit.role.clone(),
             status: ExecutionStatus::Running,

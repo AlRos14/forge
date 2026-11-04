@@ -148,8 +148,8 @@ provenance and active defaults use an exact `default_implementer` ActorRef.
 
 | Method and path | Contract |
 | --- | --- |
-| `POST /projects/{project_id}/tasks` | Create an ordinary Task. Supported fields are `title`, `description`, `parent_task_id`, `task_type`, `read_only`, and `priority`. `read_only` defaults to `false`; repository capability comes only from this explicit Task setting, not Task type, TaskRole, or Execution Purpose. It selects a read-only WorkspaceLease and causes repository changes to be discarded after an Execution. The REST `task_type` field remains accepted for compatibility, but the web form no longer asks for it. Project task-role defaults are copied atomically. |
-| `GET /projects/{project_id}/tasks` | List Tasks. Filter with `lifecycle_state`, `task_type`, `priority`, and `q`; order with the supported Task sort fields. `status`, `include_cancelled`, and `include_archived` are rejected. |
+| `POST /projects/{project_id}/tasks` | Create a Task. Supported fields are `title`, `description`, `parent_task_id`, and `priority`; Task classification and access modes are not part of the contract. Project task-role defaults are copied atomically. |
+| `GET /projects/{project_id}/tasks` | List Tasks. Filter with `lifecycle_state`, `priority`, and `q`; order with the supported Task sort fields. Task classification is not a filter. `status`, `include_cancelled`, and `include_archived` are rejected. |
 | `GET /tasks/{id}`, `PATCH /tasks/{id}`, `DELETE /tasks/{id}` | Read, update, or delete a Task. Updates require the Task `version`. |
 | `POST /tasks/{id}/subtasks/reorder` | Reorder exact child Task IDs. |
 | `GET /tasks/{id}/dependencies`, `POST /tasks/{id}/dependencies`, `DELETE /tasks/{id}/dependencies/{dep_id}`, `GET /tasks/{id}/dependents` | Read and update Task dependencies. |
@@ -396,10 +396,10 @@ descriptor schemas are returned by MCP `tools/list` and are implemented in
 `crates/mcp-server/src/tools/descriptors.rs`. Retired tool names return MCP
 `-32601 method not found`; they are not forwarded to a different tool.
 
-`forge_create_task` accepts the task brief and an optional `read_only` boolean,
-which defaults to `false`. Task type selection has been retired from MCP; new
-Tasks use role-based Execution purposes. A read-only Task discards repository
-changes after each Execution.
+`forge_create_task` accepts a Task title and Markdown description, with
+optional parent Task and priority. Task classification and access modes are
+not part of the MCP contract. Repository WorkUnit Executions receive write
+capability when the Agent meets the current TaskRole and authority checks.
 
 `tools/list` is authoritative for the deployed descriptor set. Tools that
 start work require an exact Actor or explicit Agent identity and do not infer a

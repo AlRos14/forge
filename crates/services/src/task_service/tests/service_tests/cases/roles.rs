@@ -1026,7 +1026,6 @@ async fn invalid_actor_cannot_join_a_target_task_role() {
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("Task is independent of membership changes");
@@ -1079,7 +1078,6 @@ async fn task_creation_ignores_legacy_project_role_defaults() {
         .create_task(
             project_id.clone(),
             "ordinary Task ignores old defaults",
-            None,
             None,
             None,
             None,

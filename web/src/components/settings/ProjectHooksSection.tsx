@@ -48,7 +48,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
-import type { Project, TaskType } from '@/types/generated'
+import type { Project } from '@/types/generated'
 import type { ProjectHookAction } from '@/types/generated/bindings/ProjectHookAction'
 import type { ProjectHookRule } from '@/types/generated/bindings/ProjectHookRule'
 import type { ProjectHookRunResponse } from '@/types/generated/bindings/ProjectHookRunResponse'
@@ -71,7 +71,6 @@ type ProjectHookRuleFormState = {
   createTaskTitle: string
   createTaskDescription: string
   createTaskPriority: PriorityOption
-  createTaskType: TaskType | null
   addCommentTargetTaskId: string
   addCommentContent: string
   notifyTitle: string
@@ -88,7 +87,6 @@ type ProjectHookActionWire =
       type: 'create_task'
       title: string
       description: string | null
-      task_type: TaskType | null
       priority: number | null
     }
   | { type: 'add_comment'; target_task_id: string | null; content: string }
@@ -171,7 +169,6 @@ function emptyRuleForm(): ProjectHookRuleFormState {
     createTaskTitle: '',
     createTaskDescription: '',
     createTaskPriority: '',
-    createTaskType: null,
     addCommentTargetTaskId: '',
     addCommentContent: '',
     notifyTitle: '',
@@ -302,7 +299,6 @@ function ruleToWire(rule: ProjectHookRule): ProjectHookRuleWire {
           type: 'create_task',
           title: rule.action.title,
           description: rule.action.description,
-          task_type: rule.action.task_type,
           priority: numberOrNull(rule.action.priority),
         },
       }
@@ -356,7 +352,6 @@ function formFromRule(rule: ProjectHookRule): ProjectHookRuleFormState {
         createTaskTitle: rule.action.title,
         createTaskDescription: rule.action.description ?? '',
         createTaskPriority: priorityOptionFromValue(rule.action.priority),
-        createTaskType: rule.action.task_type,
       }
     case 'add_comment':
       return {
@@ -423,7 +418,6 @@ function buildRule(form: ProjectHookRuleFormState): ProjectHookRuleWire | string
         type: 'create_task',
         title,
         description: form.createTaskDescription.trim() || null,
-        task_type: form.createTaskType,
         priority: form.createTaskPriority ? PRIORITY_VALUES[form.createTaskPriority] : null,
       }
       break

@@ -117,14 +117,13 @@ impl TaskRepo for SqliteDb {
         transaction: &mut Transaction<'_, Sqlite>,
         input: CreateTask,
     ) -> Result<Task> {
-        sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, title, description, task_type, is_automation, priority, board_position, subtask_order, merge_config, metadata_json, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(board_position), 0.0) + 1.0, ?, ?, ?, ?, ? FROM task WHERE project_id = ?")
+        sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, title, description, is_automation, priority, board_position, subtask_order, merge_config, metadata_json, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(board_position), 0.0) + 1.0, ?, ?, ?, ?, ? FROM task WHERE project_id = ?")
             .bind(&input.id)
             .bind(&input.project_id)
             .bind(input.repo_id.as_deref())
             .bind(input.parent_task_id.as_deref())
             .bind(&input.title)
             .bind(input.description.as_deref())
-            .bind(&input.task_type)
             .bind(if input.is_automation { 1 } else { 0 })
             .bind(input.priority)
             .bind(input.subtask_order)
@@ -182,27 +181,6 @@ impl TaskRepo for SqliteDb {
             .await?
             .map(map_task)
             .transpose()
-    }
-
-    async fn set_read_only_in_tx(
-        &self,
-        transaction: &mut Transaction<'_, Sqlite>,
-        id: &str,
-        read_only: bool,
-    ) -> Result<Task> {
-        let result = sqlx::query("UPDATE task SET read_only = ? WHERE id = ?")
-            .bind(if read_only { 1_i64 } else { 0_i64 })
-            .bind(id)
-            .execute(&mut **transaction)
-            .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound);
-        }
-        let row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
-            .bind(id)
-            .fetch_one(&mut **transaction)
-            .await?;
-        map_task(row)
     }
 
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>> {

@@ -160,7 +160,7 @@ pub(super) fn executor_snapshot_with_sticky_candidate(
 
 pub(super) async fn build_executor_config_snapshot(
     db: &SqliteDb,
-    task: &Task,
+    _task: &Task,
     agent: &Agent,
     overrides: Option<ExecutionOverrides>,
     adapter_registry: Option<&executors::HarnessAdapterRegistry>,
@@ -226,11 +226,6 @@ pub(super) async fn build_executor_config_snapshot(
         routing_snapshot_value(kind, &snapshot["config"], &fallbacks, adapter_registry)?
     {
         snapshot[executors::ROUTING_SNAPSHOT_KEY] = routing;
-    }
-    // Persist an explicit Task-level read-only restriction in the immutable
-    // execution snapshot so every executor backend sees the same policy.
-    if task.read_only {
-        executors::mark_worktree_read_only(&mut snapshot);
     }
     serde_json::to_string(&snapshot)
         .map(Some)

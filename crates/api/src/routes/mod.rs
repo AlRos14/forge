@@ -3,7 +3,7 @@ use std::str::FromStr;
 use api_types::{
     parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
     ProjectResponse, RepoResponse, RoleMembershipResponse, RoleMembershipStatus, TaskResponse,
-    TaskRoleResponse, TaskType, WorkspaceResponse,
+    TaskRoleResponse, WorkspaceResponse,
 };
 use db::{
     ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, Page, PageRequest,
@@ -60,7 +60,6 @@ pub struct ListParams {
     pub lifecycle_state: Option<String>,
     pub include_archived: Option<bool>,
     pub include_cancelled: Option<bool>,
-    pub task_type: Option<String>,
     pub priority: Option<i64>,
     pub capabilities: Option<String>,
     pub executor_type: Option<String>,
@@ -195,8 +194,6 @@ async fn task_response_inner(db: &db::SqliteDb, task: Task) -> ApiResult<TaskRes
         parent_task_id: task.parent_task_id.clone(),
         title: task.title,
         description: task.description,
-        task_type: parse_task_type(&task.task_type),
-        read_only: task.read_only,
         lifecycle,
         priority: task.priority,
         board_position: task.board_position,
@@ -267,16 +264,6 @@ async fn task_execution_observability(
             + total_cache_write_tokens,
         total_cost_usd: row.try_get("total_cost_usd")?,
     })
-}
-
-fn parse_task_type(task_type: &str) -> TaskType {
-    match task_type {
-        "planning" => TaskType::Planning,
-        "discovery" => TaskType::Discovery,
-        "review" => TaskType::Review,
-        "validation" => TaskType::Validation,
-        _ => TaskType::Implementation,
-    }
 }
 
 pub async fn task_roles_response(
@@ -616,7 +603,6 @@ fn parse_task_sort_by(value: Option<&str>) -> ApiResult<SortBy> {
         "board_position" => Ok(SortBy::BoardPosition),
         "title" => Ok(SortBy::Title),
         "lifecycle_state" => Ok(SortBy::LifecycleState),
-        "task_type" => Ok(SortBy::TaskType),
         "id" => Ok(SortBy::Id),
         value => Err(ApiError::bad_request(format!("invalid sort_by: {value}"))),
     }

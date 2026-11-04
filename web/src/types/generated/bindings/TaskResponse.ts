@@ -2,7 +2,6 @@
 import type { TaskExecutionObservability } from "./TaskExecutionObservability";
 import type { TaskLifecycleResponse } from "./TaskLifecycleResponse";
 import type { TaskRoleResponse } from "./TaskRoleResponse";
-import type { TaskType } from "./TaskType";
 import type { WorkspaceResponse } from "./WorkspaceResponse";
 
-export type TaskResponse = { id: string, project_id: string, repo_id: string | null, parent_task_id: string | null, title: string, description: string | null, task_type: TaskType, read_only: boolean, lifecycle: TaskLifecycleResponse, priority: number, board_position: number, subtask_order: number | null, task_roles: Array<TaskRoleResponse>, execution_observability: TaskExecutionObservability, workspace: WorkspaceResponse | null, external_issue_number: number | null, external_issue_url: string | null, version: number, created_at: string, updated_at: string, };
+export type TaskResponse = { id: string, project_id: string, repo_id: string | null, parent_task_id: string | null, title: string, description: string | null, lifecycle: TaskLifecycleResponse, priority: number, board_position: number, subtask_order: number | null, task_roles: Array<TaskRoleResponse>, execution_observability: TaskExecutionObservability, workspace: WorkspaceResponse | null, external_issue_number: number | null, external_issue_url: string | null, version: number, created_at: string, updated_at: string, };

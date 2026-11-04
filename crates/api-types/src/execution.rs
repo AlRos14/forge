@@ -4,7 +4,7 @@ use ts_rs::TS;
 
 use crate::{
     ActorRef, AgentStatus, ExecutionPurpose, ExecutionRole, ExecutionStatus, ResumePolicy,
-    StopReason, TaskLifecycleResponse, TaskRoleResponse, TaskType, WorkspaceResponse,
+    StopReason, TaskLifecycleResponse, TaskRoleResponse, WorkspaceResponse,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -35,8 +35,6 @@ pub struct TaskResponse {
     pub parent_task_id: Option<String>,
     pub title: String,
     pub description: Option<String>,
-    pub task_type: TaskType,
-    pub read_only: bool,
     pub lifecycle: TaskLifecycleResponse,
     #[ts(type = "number")]
     pub priority: i64,

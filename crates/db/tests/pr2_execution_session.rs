@@ -237,7 +237,6 @@ async fn seed_task(db: &SqliteDb, suffix: &str) -> String {
             parent_task_id: None,
             title: "PR2 task".to_owned(),
             description: None,
-            task_type: "implementation".to_owned(),
             lifecycle_state: TaskLifecycleState::Active,
             is_automation: false,
             priority: 0,
@@ -268,8 +267,8 @@ async fn seed_legacy_task(db: &SqliteDb, suffix: &str) -> String {
     .await
     .expect("historical project creates");
     sqlx::query(
-        "INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at)
-         VALUES (?, ?, 'PR2 task', 'implementation', 'in_progress', ?, ?)",
+        "INSERT INTO task (id, project_id, title, created_at, updated_at)
+         VALUES (?, ?, 'PR2 task', ?, ?)",
     )
     .bind(&task_id)
     .bind(&project_id)

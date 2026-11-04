@@ -43,7 +43,7 @@ impl TaskService {
                 ..TaskMetadata::default()
             };
             let metadata_json = metadata.to_json();
-            let mut task = TaskRepo::create_in_tx(
+            let task = TaskRepo::create_in_tx(
                 &*self.db,
                 &mut transaction,
                 CreateTask {
@@ -53,7 +53,6 @@ impl TaskService {
                     parent_task_id: Some(parent_task_id.clone()),
                     title: item.title.clone(),
                     description: item.description.clone(),
-                    task_type: "implementation".to_owned(),
                     lifecycle_state: db::TaskLifecycleState::Ready,
                     is_automation: false,
                     priority: 0,
@@ -64,10 +63,6 @@ impl TaskService {
                 },
             )
             .await?;
-            if parent.read_only {
-                task = TaskRepo::set_read_only_in_tx(&*self.db, &mut transaction, &task.id, true)
-                    .await?;
-            }
             self.apply_project_task_role_defaults_in_tx(
                 &mut transaction,
                 &task.project_id,

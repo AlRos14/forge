@@ -28,12 +28,10 @@ export function TaskCreateDialog({
   onCreated,
 }: TaskCreateDialogProps) {
   const [content, setContent] = useState('')
-  const [readOnly, setReadOnly] = useState(false)
   const createTask = useCreateTask(projectId)
 
   const reset = () => {
     setContent('')
-    setReadOnly(false)
   }
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -44,7 +42,6 @@ export function TaskCreateDialog({
     createTask.mutate(
       {
         ...taskContent,
-        read_only: readOnly,
         priority: 0,
       },
       {
@@ -80,23 +77,6 @@ export function TaskCreateDialog({
               title. The remaining text is saved as the Markdown description.
             </p>
           </div>
-          <details className="rounded-md border px-3 py-2">
-            <summary className="cursor-pointer text-sm font-medium">More options</summary>
-            <div className="mt-3 space-y-2">
-              <label htmlFor="task-read-only" className="flex items-center gap-2 text-sm">
-                <input
-                  id="task-read-only"
-                  type="checkbox"
-                  checked={readOnly}
-                  onChange={(event) => setReadOnly(event.target.checked)}
-                />
-                Read-only Task
-              </label>
-              <p className="pl-6 text-xs text-muted-foreground">
-                Repository changes from its Executions are discarded when they finish.
-              </p>
-            </div>
-          </details>
           <DialogFooter>
             <Button
               disabled={createTask.isPending}

@@ -7,13 +7,9 @@ use sha2::{Digest, Sha256};
 const WORKSPACE_LEASE_SECONDS: i64 = 15 * 60;
 const CAPABILITY_PROFILE_REVISION: &str = "forge.capability-profile/v1";
 
-/// Resolve repository capability only from the Task's explicit access mode.
-fn workspace_lease_capability_class(read_only: bool) -> &'static str {
-    if read_only {
-        "repository_read"
-    } else {
-        "repository_write"
-    }
+/// Current Tasks grant repository write capability to their assigned Agents.
+fn workspace_lease_capability_class() -> &'static str {
+    "repository_write"
 }
 
 impl TaskService {
@@ -332,7 +328,7 @@ impl TaskService {
                     )
                 })?;
         }
-        let capability_class = workspace_lease_capability_class(task.read_only).to_owned();
+        let capability_class = workspace_lease_capability_class().to_owned();
         if !is_supported_capability_profile(&capability_class) {
             return Err(ServiceError::invalid_operation(format!(
                 "Task capability profile '{}' is not server-approved",
@@ -484,10 +480,7 @@ fn capability_profile_digest(capability_class: &str) -> String {
 }
 
 fn is_supported_capability_profile(capability_class: &str) -> bool {
-    matches!(
-        capability_class,
-        "repository_read" | "repository_write" | "read_only" | "discovery_read" | "planning_read"
-    )
+    matches!(capability_class, "repository_write")
 }
 
 #[cfg(test)]
@@ -508,123 +501,5 @@ mod tests {
             canonical_workspace_lease_role("orchestrator").expect("workflow worker role"),
             "worker"
         );
-    }
-
-    #[test]
-    fn only_the_explicit_task_access_mode_selects_repository_capability() {
-        struct Case {
-            execution_role: &'static str,
-            task_type: &'static str,
-            read_only: bool,
-            lease_role: &'static str,
-            purpose: &'static str,
-            capability: &'static str,
-        }
-        let cases = [
-            Case {
-                execution_role: "implementer",
-                task_type: "implementation",
-                read_only: false,
-                lease_role: "worker",
-                purpose: "implement",
-                capability: "repository_write",
-            },
-            Case {
-                execution_role: "planner",
-                task_type: "planning",
-                read_only: false,
-                lease_role: "worker",
-                purpose: "plan",
-                capability: "repository_write",
-            },
-            Case {
-                execution_role: "reviewer",
-                task_type: "review",
-                read_only: false,
-                lease_role: "reviewer",
-                purpose: "review",
-                capability: "repository_write",
-            },
-            Case {
-                execution_role: "validator",
-                task_type: "validation",
-                read_only: false,
-                lease_role: "worker",
-                purpose: "validate",
-                capability: "repository_write",
-            },
-            Case {
-                execution_role: "investigator",
-                task_type: "discovery",
-                read_only: false,
-                lease_role: "worker",
-                purpose: "investigate",
-                capability: "repository_write",
-            },
-            Case {
-                execution_role: "interactive",
-                task_type: "implementation",
-                read_only: false,
-                lease_role: "worker",
-                purpose: "general",
-                capability: "repository_write",
-            },
-            Case {
-                execution_role: "interactive",
-                task_type: "planning",
-                read_only: false,
-                lease_role: "worker",
-                purpose: "general",
-                capability: "repository_write",
-            },
-            Case {
-                execution_role: "interactive",
-                task_type: "review",
-                read_only: false,
-                lease_role: "worker",
-                purpose: "general",
-                capability: "repository_write",
-            },
-            Case {
-                execution_role: "interactive",
-                task_type: "validation",
-                read_only: false,
-                lease_role: "worker",
-                purpose: "general",
-                capability: "repository_write",
-            },
-            Case {
-                execution_role: "interactive",
-                task_type: "discovery",
-                read_only: false,
-                lease_role: "worker",
-                purpose: "general",
-                capability: "repository_write",
-            },
-            Case {
-                execution_role: "implementer",
-                task_type: "implementation",
-                read_only: true,
-                lease_role: "worker",
-                purpose: "implement",
-                capability: "repository_read",
-            },
-        ];
-
-        for case in cases {
-            let purpose = crate::task_service::execution::execution_purpose_for_task_type(
-                case.task_type,
-                case.execution_role,
-            );
-            assert_eq!(
-                canonical_workspace_lease_role(case.execution_role).expect("lease class"),
-                case.lease_role
-            );
-            assert_eq!(purpose.to_string(), case.purpose);
-            assert_eq!(
-                workspace_lease_capability_class(case.read_only),
-                case.capability
-            );
-        }
     }
 }

@@ -1,6 +1,5 @@
 // Public TypeScript surface generated from the explicit api-types export set.
 export * from './api'
-export type { TaskType } from './bindings/TaskType'
 export type { WorkMode } from './bindings/WorkMode'
 export type { AgentStatus } from './bindings/AgentStatus'
 export type { ExecutionPurpose } from './bindings/ExecutionPurpose'

@@ -127,7 +127,6 @@ async fn seed_running_execution(
             parent_task_id: None,
             title: "Owned execution".to_owned(),
             description: None,
-            task_type: "implementation".to_owned(),
             lifecycle_state: db::TaskLifecycleState::Active,
             is_automation: false,
             priority: 0,

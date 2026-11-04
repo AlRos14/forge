@@ -1516,7 +1516,6 @@ mod tests {
                 subtask_order: None,
                 title: "Reproduce WorkUnit create finish".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state: TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,

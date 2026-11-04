@@ -4,9 +4,7 @@ use serde_json::Value;
 
 use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
-    project_hooks::actions::{
-        task_type_to_string, ActionContext, ActionOutcome, HookActionHandler,
-    },
+    project_hooks::actions::{ActionContext, ActionOutcome, HookActionHandler},
     Result, ServiceError,
 };
 
@@ -59,7 +57,6 @@ impl HookActionHandler for DispatchAgentAction<'_> {
                 context.project.id.clone(),
                 format!("Automation: {}", context.rule_id),
                 Some(automation_task_description(context)),
-                Some(task_type_to_string(api_types::TaskType::Implementation)),
                 None,
                 None,
             )

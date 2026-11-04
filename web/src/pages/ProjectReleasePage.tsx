@@ -155,7 +155,7 @@ function TaskList({ tasks }: { tasks: ReleaseTaskReference[] }) {
                 <ArrowUpRight size={13} className="shrink-0" aria-hidden />
               </Link>
               <p className="mt-1 break-words text-micro text-muted-foreground">
-                {task.task_type} · {humanize(task.task_state)} · version {count(task.task_version)}
+                {humanize(task.task_state)} · version {count(task.task_version)}
               </p>
             </li>
           ))}

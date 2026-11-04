@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::TaskType;
-
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ProjectHookRule {
@@ -44,7 +42,6 @@ pub enum ProjectHookAction {
     CreateTask {
         title: String,
         description: Option<String>,
-        task_type: Option<TaskType>,
         #[ts(type = "number | null")]
         priority: Option<i64>,
     },

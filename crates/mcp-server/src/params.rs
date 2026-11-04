@@ -23,8 +23,6 @@ pub(crate) struct CreateTaskParams {
     pub(crate) description: Option<String>,
     #[serde(default)]
     pub(crate) parent_task_id: Option<String>,
-    #[serde(default)]
-    pub(crate) read_only: bool,
     pub(crate) priority: Option<i64>,
 }
 

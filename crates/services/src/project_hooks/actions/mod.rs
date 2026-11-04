@@ -1,4 +1,4 @@
-use api_types::{ProjectHookAction, TaskType};
+use api_types::ProjectHookAction;
 use async_trait::async_trait;
 use db::{Project, ProjectHookRun, ProjectHookRunStatus};
 
@@ -76,13 +76,11 @@ pub async fn execute_action(
         ProjectHookAction::CreateTask {
             title,
             description,
-            task_type,
             priority,
         } => {
             create_task::CreateTaskAction {
                 title,
                 description: description.as_deref(),
-                task_type: *task_type,
                 priority: *priority,
             }
             .execute(context)
@@ -113,15 +111,4 @@ pub async fn execute_action(
             .await
         }
     }
-}
-
-pub(crate) fn task_type_to_string(task_type: TaskType) -> String {
-    match task_type {
-        TaskType::Implementation => "implementation",
-        TaskType::Planning => "planning",
-        TaskType::Discovery => "discovery",
-        TaskType::Review => "review",
-        TaskType::Validation => "validation",
-    }
-    .to_owned()
 }
