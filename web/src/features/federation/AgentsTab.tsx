@@ -290,12 +290,15 @@ export function NewAgentDialog({
                   value={model || null}
                   isLoading={discovered.isLoading}
                   hasError={discovered.isError}
+                  warning={discovered.data?.warning}
                   onChange={(value) => setModel(value ?? '')}
                 />
               </div>
               {reasoningOptionsForModel.length > 0 ? (
                 <ReasoningSelector
                   id="agent-reasoning"
+                  label={runtime === 'claude_code' ? 'Effort' : 'Reasoning'}
+                  placeholder="Use harness default"
                   options={reasoningOptionsForModel}
                   value={reasoningEffort}
                   isLoading={discovered.isLoading}

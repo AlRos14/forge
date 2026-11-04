@@ -191,11 +191,14 @@ export function ChangeModelDialog({
                   value={model || null}
                   isLoading={discovered.isLoading}
                   hasError={discovered.isError}
+                  warning={discovered.data?.warning}
                   onChange={(value) => setModel(value ?? '')}
                 />
                 {reasoningOptions.length > 0 ? (
                   <ReasoningSelector
                     id="change-model-reasoning"
+                    label={agent?.executor_type === 'claude_code' ? 'Effort' : 'Reasoning'}
+                    placeholder="Use harness default"
                     options={reasoningOptions}
                     value={reasoningEffort || null}
                     isLoading={discovered.isLoading}

@@ -5,8 +5,8 @@ use axum::{
 };
 use db::DaemonRepo;
 use executors::{
-    ClaudeCodeConfig, CodexConfig, CursorConfig, DiscoverContext, ExecutorKind, GeminiConfig,
-    OpencodeConfig, ShellConfig, SmithConfig,
+    ClaudeCodeConfig, CodexConfig, CursorConfig, ExecutorKind, GeminiConfig, OpencodeConfig,
+    ShellConfig, SmithConfig,
 };
 use schemars::{schema_for, JsonSchema};
 use serde::Deserialize;
@@ -51,7 +51,7 @@ pub async fn executor_type_discovered_options(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(type_name): Path<String>,
-    Query(params): Query<DiscoveryParams>,
+    Query(_params): Query<DiscoveryParams>,
 ) -> ApiResult<Json<DiscoveredOptionsResponse>> {
     let kind = parse_executor_kind(&type_name)?;
     let adapter = state.adapter_registry.get(&kind).ok_or_else(|| {
@@ -59,17 +59,41 @@ pub async fn executor_type_discovered_options(
             "No adapter registered for executor type: {type_name}"
         ))
     })?;
+    let eligible_daemons =
+        DaemonRepo::list_available_for_executor(&*state.db, &type_name, &user.user_id).await?;
     let daemons = if user.is_admin {
-        DaemonRepo::list_available_for_executor(&*state.db, &type_name, &user.user_id).await?
+        eligible_daemons.clone()
     } else {
         Vec::new()
     };
-    let discovered = adapter
-        .discover_options(DiscoverContext {
-            project_path: params.project_id,
-        })
+    let (discovered, warning) = if let Some(daemon) = eligible_daemons.first() {
+        match services::daemon_transport::discover_harness_options(
+            &state.daemon_connections,
+            daemon,
+            adapter,
+            &type_name,
+        )
         .await
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        {
+            Ok(discovered) => {
+                let warning = discovered.warning.clone();
+                (discovered, warning)
+            }
+            Err(_) => (
+                Default::default(),
+                Some(
+                    "Model options could not be loaded from an authorized daemon. Enter a model ID supported by the harness.".to_owned(),
+                ),
+            ),
+        }
+    } else {
+        (
+            Default::default(),
+            Some(
+                "No authorized online daemon is available to load model options. Enter a model ID supported by the harness.".to_owned(),
+            ),
+        )
+    };
     let capability_config = adapter
         .normalize_config(
             &serde_json::json!({}),
@@ -90,7 +114,7 @@ pub async fn executor_type_discovered_options(
                 status: daemon.status.to_string(),
             })
             .collect(),
-        warning: None,
+        warning,
     }))
 }
 

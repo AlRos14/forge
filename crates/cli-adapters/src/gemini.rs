@@ -16,6 +16,7 @@ const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const PROMPT_SEND_TIMEOUT_SECONDS: u64 = 10;
 const FIRST_OUTPUT_TIMEOUT_SECONDS: u64 = 300;
 const MAX_SUMMARY_CHARS: usize = 500;
+const MODEL_DISCOVERY_TIMEOUT_SECONDS: u64 = 10;
 
 pub struct GeminiAdapter {
     processes: Arc<Mutex<HashMap<String, Arc<AsyncMutex<ProcessGroupChild>>>>>,
@@ -174,23 +175,15 @@ impl HarnessAdapter for GeminiAdapter {
         &self,
         _ctx: DiscoverContext,
     ) -> Result<DiscoveredOptions, ExecutorError> {
+        let (models, warning) = match discover_gemini_models().await {
+            Ok(models) => (models, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
         Ok(DiscoveredOptions {
-            models: vec![
-                "auto".into(),
-                "pro".into(),
-                "flash".into(),
-                "flash-lite".into(),
-                "gemini-3.5-flash".into(),
-                "gemini-3.1-pro-preview".into(),
-                "gemini-3.1-flash-lite".into(),
-                "gemini-3-pro-preview".into(),
-                "gemini-3-flash-preview".into(),
-                "gemini-2.5-pro".into(),
-                "gemini-2.5-flash".into(),
-                "gemini-2.5-flash-lite".into(),
-            ],
+            models,
             permission_policies: vec!["auto".into(), "supervised".into()],
             cli_specific: serde_json::json!({}),
+            warning,
         })
     }
 
@@ -543,6 +536,68 @@ fn executable_in_path(name: &str) -> bool {
     which::which(name).is_ok()
 }
 
+async fn discover_gemini_models() -> Result<Vec<String>, ExecutorError> {
+    if !executable_in_path("gemini") {
+        return Err(ExecutorError::Unavailable(
+            "Gemini CLI is not available on this daemon. Enter a model ID supported by the installed harness.".to_owned(),
+        ));
+    }
+
+    // Model listing is available in current Gemini CLI releases. Try both
+    // documented spellings so daemon discovery also works across CLI versions.
+    for args in [
+        vec!["models", "-o", "json"],
+        vec!["--list-models", "-o", "json"],
+    ] {
+        let mut command = tokio::process::Command::new("gemini");
+        command.args(args).env("NO_COLOR", "1");
+        let Some(output) = crate::command::output_with_timeout(
+            command,
+            Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECONDS),
+        )
+        .await
+        else {
+            continue;
+        };
+        if output.status.success()
+            && let Some(models) = parse_gemini_model_catalog(&output.stdout)
+            && !models.is_empty()
+        {
+            return Ok(models);
+        }
+    }
+
+    Err(ExecutorError::Unavailable(
+        "This Gemini CLI does not expose a usable model catalog. Enter a model ID supported by the installed harness.".to_owned(),
+    ))
+}
+
+fn parse_gemini_model_catalog(output: &[u8]) -> Option<Vec<String>> {
+    let value = serde_json::from_slice::<serde_json::Value>(output).ok()?;
+    let models = value
+        .as_array()
+        .or_else(|| value.get("models").and_then(serde_json::Value::as_array))?;
+
+    let mut discovered = Vec::new();
+    for model in models {
+        let Some(raw_id) = ["modelId", "id", "name"]
+            .into_iter()
+            .find_map(|key| model.get(key).and_then(serde_json::Value::as_str))
+        else {
+            continue;
+        };
+        let id = raw_id
+            .trim()
+            .strip_prefix("models/")
+            .unwrap_or(raw_id.trim());
+        if !id.is_empty() && !discovered.iter().any(|existing| existing == id) {
+            discovered.push(id.to_owned());
+        }
+    }
+
+    Some(discovered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,23 +616,6 @@ mod tests {
             config.command_overrides.additional_params,
             Some(vec!["--verbose".to_owned()])
         );
-    }
-
-    #[tokio::test]
-    async fn discovery_advertises_current_models_and_aliases() {
-        let discovered = GeminiAdapter::new()
-            .discover_options(DiscoverContext { project_path: None })
-            .await
-            .expect("discovery should succeed");
-
-        assert!(discovered.models.contains(&"auto".to_owned()));
-        assert!(discovered.models.contains(&"gemini-3.5-flash".to_owned()));
-        assert!(
-            discovered
-                .models
-                .contains(&"gemini-3.1-pro-preview".to_owned())
-        );
-        assert!(!discovered.models.contains(&"gemini-2.0-flash".to_owned()));
     }
 
     #[test]

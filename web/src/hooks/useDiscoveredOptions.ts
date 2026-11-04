@@ -18,12 +18,14 @@ export type DiscoveredExecutionOptions = {
   models: DiscoveredModelOption[]
   reasoningOptions: ReasoningOption[]
   permissionPolicies: string[]
+  warning?: string
 }
 
 type AgentDiscoveredOptionsResponse = {
   models?: Array<{ id: string; name?: string; reasoning_options?: string[] } | string>
   permission_policies?: string[]
   cli_specific?: unknown
+  warning?: string | null
 }
 
 function titleCase(value: string): string {
@@ -121,6 +123,7 @@ export function normalizeDiscoveredOptions(
     models,
     reasoningOptions: reasoningIds.map((id) => ({ id, label: titleCase(id) })),
     permissionPolicies: policies,
+    ...(response.warning ? { warning: response.warning } : {}),
   }
 }
 
@@ -153,6 +156,8 @@ export function useDiscoveredOptions(
       return normalizeDiscoveredOptions(response)
     },
     enabled: hasAgentId || hasExecutorType,
-    staleTime: 5 * 60 * 1000,
+    staleTime: 0,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: 'always',
   })
 }

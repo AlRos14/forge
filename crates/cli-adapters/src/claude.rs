@@ -14,15 +14,10 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CLAUDE_VERSION: &str = "2.1.226";
-// Router v3 replaced the `ccr code <claude args>` pass-through with
-// `ccr <profile> [-- <agent args>]`; adopting it needs an invocation rework,
-// so stay on the 2.x line until then.
-const DEFAULT_CLAUDE_ROUTER_VERSION: &str = "2.0.0";
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const PROMPT_SEND_TIMEOUT_SECONDS: u64 = 10;
 const FIRST_OUTPUT_TIMEOUT_SECONDS: u64 = 300;
@@ -256,19 +251,23 @@ impl ClaudeCodeAdapter {
             adapter_args.push(session_id.to_owned());
         }
 
-        let mut default_args = vec![
-            "-y".to_owned(),
-            if config.claude_code_router.unwrap_or(false) {
-                format!("@musistudio/claude-code-router@{DEFAULT_CLAUDE_ROUTER_VERSION}")
-            } else {
-                format!("@anthropic-ai/claude-code@{DEFAULT_CLAUDE_VERSION}")
-            },
-        ];
-        if config.claude_code_router.unwrap_or(false) {
-            default_args.push("code".to_owned());
-        }
+        let router_enabled = config.claude_code_router.unwrap_or(false);
+        let (program, default_args) = if router_enabled {
+            let args = match config
+                .claude_code_router_profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|profile| !profile.is_empty())
+            {
+                Some(profile) => vec![profile.to_owned(), "cli".to_owned(), "--".to_owned()],
+                None => vec!["code".to_owned()],
+            };
+            ("ccr", args)
+        } else {
+            ("claude", Vec::new())
+        };
 
-        let builder = crate::command::CommandBuilder::new("npx")
+        let builder = crate::command::CommandBuilder::new(program)
             .default_args(default_args)
             .adapter_args(adapter_args)
             .overrides(&config.command_overrides);
@@ -278,8 +277,13 @@ impl ClaudeCodeAdapter {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("NPM_CONFIG_LOGLEVEL", "error")
             .env("NO_COLOR", "1");
+        if let Some(effort) = &config.effort {
+            // Claude Code gives this environment variable precedence over
+            // --effort. Keep the explicit Agent selection effective even if
+            // the daemon inherited another default.
+            cmd.env("CLAUDE_CODE_EFFORT_LEVEL", effort);
+        }
         if config.disable_api_key.unwrap_or(false) {
             cmd.env_remove("ANTHROPIC_API_KEY");
         }
@@ -292,6 +296,14 @@ impl ClaudeCodeAdapter {
         cancel: CancellationToken,
     ) -> Result<ExecutionResult, ExecutorError> {
         let config = Self::resolve_config(&ctx);
+        if config.claude_code_router.unwrap_or(false)
+            && config.command_overrides.base_command_override.is_none()
+            && which::which("ccr").is_err()
+        {
+            return Err(ExecutorError::Unavailable(
+                "Claude Code Router is enabled, but its installed `ccr` executable is not available on this daemon.".to_owned(),
+            ));
+        }
         let resume_session_id = config.resume_session_id.clone();
         let worktree = Path::new(&ctx.worktree_path);
         let claude_home = dirs::home_dir();
@@ -491,6 +503,44 @@ impl Default for ClaudeCodeAdapter {
     }
 }
 
+fn effort_options_from_help(help: &str) -> Vec<String> {
+    let lines: Vec<_> = help.lines().collect();
+    let Some(start) = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("--effort "))
+    else {
+        return Vec::new();
+    };
+
+    let mut effort_help = lines[start].to_owned();
+    for line in lines.iter().skip(start + 1) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('-') {
+            break;
+        }
+        effort_help.push(' ');
+        effort_help.push_str(trimmed);
+    }
+
+    let Some((_, parenthesized)) = effort_help.split_once('(') else {
+        return Vec::new();
+    };
+    let Some((values, _)) = parenthesized.split_once(')') else {
+        return Vec::new();
+    };
+
+    let mut options = Vec::new();
+    for value in values.split(',').map(str::trim) {
+        if !value.is_empty()
+            && !value.chars().any(char::is_whitespace)
+            && !options.iter().any(|existing| existing == value)
+        {
+            options.push(value.to_owned());
+        }
+    }
+    options
+}
+
 #[async_trait]
 impl HarnessAdapter for ClaudeCodeAdapter {
     fn kind(&self) -> ExecutorKind {
@@ -572,24 +622,31 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         &self,
         _ctx: DiscoverContext,
     ) -> Result<DiscoveredOptions, ExecutorError> {
+        let mut command = Command::new("claude");
+        command.arg("--help");
+        let effort_options = crate::command::output_with_timeout(command, Duration::from_secs(5))
+            .await
+            .filter(|output| output.status.success())
+            .map(|output| {
+                let help = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                effort_options_from_help(&help)
+            })
+            .unwrap_or_default();
+
         Ok(DiscoveredOptions {
-            models: vec![
-                "claude-fable-5".into(),
-                "claude-opus-5".into(),
-                "claude-sonnet-5".into(),
-                "claude-haiku-4-5".into(),
-            ],
+            // Claude Code's supported non-interactive CLI has no model-list
+            // operation. Do not approximate its account- and provider-specific
+            // /model picker with a list maintained by Forge.
+            models: Vec::new(),
             permission_policies: vec!["auto".into(), "supervised".into(), "plan".into()],
-            cli_specific: serde_json::json!({
-                "reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultracode"],
-                "model_reasoning_efforts": {
-                    "claude-fable-5": ["low", "medium", "high", "xhigh", "max", "ultracode"],
-                    "claude-opus-5": ["low", "medium", "high", "xhigh", "max", "ultracode"],
-                    "claude-sonnet-5": ["low", "medium", "high", "xhigh", "max", "ultracode"],
-                    "claude-haiku-4-5": []
-                },
-                "claude_version": DEFAULT_CLAUDE_VERSION,
-            }),
+            cli_specific: serde_json::json!({"reasoning_efforts": effort_options}),
+            warning: Some(
+                "Claude Code does not expose a supported non-interactive model catalog. Enter an alias or model ID accepted by the installed CLI.".to_owned(),
+            ),
         })
     }
 
@@ -1335,7 +1392,7 @@ mod tests {
     }
 
     #[test]
-    fn command_builder_maps_model_effort_resume_and_pinned_package() {
+    fn command_builder_uses_installed_claude_and_maps_model_effort_resume() {
         let config = ClaudeCodeConfig {
             model: Some("claude-sonnet-4-6".to_owned()),
             effort: Some("high".to_owned()),
@@ -1345,7 +1402,7 @@ mod tests {
         };
 
         let cmd = ClaudeCodeAdapter::build_command(&config, Some("session-123"));
-        assert_eq!(cmd.as_std().get_program(), "npx");
+        assert_eq!(cmd.as_std().get_program(), "claude");
         let args: Vec<_> = cmd
             .as_std()
             .get_args()
@@ -1355,8 +1412,6 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-y",
-                "@anthropic-ai/claude-code@2.1.226",
                 "-p",
                 "--verbose",
                 "--output-format=stream-json",
@@ -1373,33 +1428,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_advertises_current_models_and_per_model_efforts() {
+    async fn discovery_does_not_fabricate_a_claude_model_catalog() {
         let discovered = ClaudeCodeAdapter::new()
             .discover_options(DiscoverContext { project_path: None })
             .await
             .expect("Claude Code options should be discoverable");
 
-        assert_eq!(
-            discovered.models,
-            vec![
-                "claude-fable-5",
-                "claude-opus-5",
-                "claude-sonnet-5",
-                "claude-haiku-4-5",
-            ]
-        );
-        assert_eq!(
-            discovered.cli_specific["model_reasoning_efforts"]["claude-fable-5"],
-            serde_json::json!(["low", "medium", "high", "xhigh", "max", "ultracode"])
-        );
-        assert_eq!(
-            discovered.cli_specific["model_reasoning_efforts"]["claude-haiku-4-5"],
-            serde_json::json!([])
-        );
+        assert!(discovered.models.is_empty());
+        assert!(discovered.warning.is_some());
     }
 
     #[test]
-    fn command_builder_uses_code_subcommand_only_for_router() {
+    fn command_builder_uses_installed_ccr_for_legacy_passthrough() {
         let config = ClaudeCodeConfig {
             claude_code_router: Some(true),
             command_overrides: CommandOverrides::default(),
@@ -1407,18 +1447,14 @@ mod tests {
         };
 
         let cmd = ClaudeCodeAdapter::build_command(&config, None);
+        assert_eq!(cmd.as_std().get_program(), "ccr");
         let args: Vec<_> = cmd
             .as_std()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
 
-        assert!(args.starts_with(&[
-            "-y".to_owned(),
-            "@musistudio/claude-code-router@2.0.0".to_owned(),
-            "code".to_owned(),
-            "-p".to_owned(),
-        ]));
+        assert!(args.starts_with(&["code".to_owned(), "-p".to_owned()]));
     }
 
     #[test]

@@ -260,6 +260,23 @@ ineligible to ordinary accounts. Agent availability and discovered options
 apply the same account and authenticated-capability checks as dispatch.
 Selecting a profile with a fixed daemon applies that check before the profile
 becomes active.
+Discovered model options run on the account's authorized online daemon, where
+the harness CLI and provider configuration live. A missing or older daemon can
+return a warning and an empty catalog; callers may enter a model ID directly.
+Catalog entries are suggestions, not proof that the account or provider grants
+access to a model. The harness validates access when it starts an Execution.
+Adapters use the installed harness's model-list command where one is available;
+Forge does not keep fallback lists of model IDs. Claude Code currently has no
+supported non-interactive model-list command, so its catalog is empty with a
+warning and callers can enter an alias or full model ID. Refreshing model
+options re-queries the daemon; the daemon must be running the updated CLI for
+the new version's catalog to appear.
+Claude Code's optional Router mode uses the system-installed `ccr` executable.
+`claude_code_router_profile` selects a profile in profile-based Router CLIs;
+omitting it uses the legacy `ccr code` pass-through.
+OpenCode v2 stores provider credentials in its SQLite data store; daemon
+detection checks for an active provider credential in read-only mode and never
+loads or returns the credential value.
 
 Credential and provider infrastructure remains usable after PR10. It does not
 restore Forge-owned cognition or native runtime dispatch.

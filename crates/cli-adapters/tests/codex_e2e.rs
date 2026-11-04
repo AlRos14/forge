@@ -5,7 +5,7 @@ use std::{
     error::Error,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     time::Duration,
 };
 
@@ -14,21 +14,13 @@ type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn codex_adapter_writes_file_in_live_repo() -> TestResult {
-    if which::which("codex")
-        .or_else(|_| which::which("npx"))
-        .is_err()
-    {
-        println!("skipping Codex E2E: codex/npx not installed");
+    if which::which("codex").is_err() {
+        println!("skipping Codex E2E: codex CLI not installed");
         return Ok(());
     }
 
     if !codex_auth_path().exists() {
         println!("skipping Codex E2E: ~/.codex/auth.json missing");
-        return Ok(());
-    }
-
-    if !npx_package_available_offline(["--offline", "-y", "@openai/codex@0.133.0", "--version"]) {
-        println!("skipping Codex E2E: @openai/codex npx package not available offline");
         return Ok(());
     }
 
@@ -110,15 +102,6 @@ fn run_git<const N: usize>(path: &Path, args: [&str; N]) -> TestResult {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(std::io::Error::other(format!("git command failed: {stderr}")).into())
     }
-}
-
-fn npx_package_available_offline<const N: usize>(args: [&str; N]) -> bool {
-    Command::new("npx")
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 fn assert_hello_contains_banana(path: &Path) -> TestResult {

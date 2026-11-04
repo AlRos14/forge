@@ -142,6 +142,9 @@ pub struct ClaudeCodeConfig {
     pub resume_session_id: Option<String>,
     pub dangerously_skip_permissions: Option<bool>,
     pub claude_code_router: Option<bool>,
+    /// Installed Claude Code Router profile to launch. Empty uses the legacy
+    /// `ccr code` pass-through supported by older Router CLIs.
+    pub claude_code_router_profile: Option<String>,
     pub disable_api_key: Option<bool>,
     pub permission_policy: Option<PermissionPolicy>,
     pub prompt_template: Option<String>,

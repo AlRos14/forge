@@ -8,6 +8,7 @@ pub const METHOD_FS_BRANCHES: &str = "fs.branches";
 pub const METHOD_EXECUTION_START: &str = "execution.start";
 pub const METHOD_EXECUTION_CANCEL: &str = "execution.cancel";
 pub const METHOD_PROTOCOL_CAPABILITIES: &str = "daemon.protocol_capabilities";
+pub const METHOD_HARNESS_DISCOVER_OPTIONS: &str = "harness.discover_options";
 pub const DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1: &str =
     "generic_harness_invocation_v1";
 pub const DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1: &str = "execution_role_v1";

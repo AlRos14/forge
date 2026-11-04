@@ -178,11 +178,13 @@ export function ExecutionConfigBar({
               disabled={disabled}
               isLoading={config.discoveredOptions.isFetching}
               hasError={config.discoveredOptions.isError}
+              warning={discoveredOptions?.warning}
               onChange={config.setModelId}
             />
             {showReasoningSelector ? (
               <ReasoningSelector
                 id="execution-config-reasoning"
+                label={selectedAgent?.executor_type === 'claude_code' ? 'Effort' : 'Reasoning'}
                 options={reasoningOptionsForModel}
                 value={config.reasoningEffort}
                 disabled={disabled}

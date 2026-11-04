@@ -87,6 +87,8 @@ pub struct DiscoveredOptions {
     pub models: Vec<String>,
     pub permission_policies: Vec<String>,
     pub cli_specific: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// Generic policy posture after one adapter interprets its concrete config.

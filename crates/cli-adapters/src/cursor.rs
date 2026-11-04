@@ -467,12 +467,17 @@ impl HarnessAdapter for CursorAdapter {
         &self,
         _ctx: DiscoverContext,
     ) -> Result<DiscoveredOptions, ExecutorError> {
+        let (models, warning) = match discover_cursor_models().await {
+            Ok(models) => (models, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
         Ok(DiscoveredOptions {
-            models: discover_cursor_models().await,
+            models,
             permission_policies: vec!["auto".into(), "supervised".into(), "plan".into()],
             cli_specific: serde_json::json!({
                 "output_formats": ["text", "json", "stream-json"],
             }),
+            warning,
         })
     }
 
@@ -1226,21 +1231,6 @@ fn truncate_summary(content: &str) -> String {
     }
 }
 
-fn default_cursor_models() -> Vec<String> {
-    vec![
-        "auto".into(),
-        "composer-2.5".into(),
-        "composer-2.5-fast".into(),
-        "cursor-grok-4.6-medium-fast".into(),
-        "cursor-grok-4.6-high-fast".into(),
-        "cursor-grok-4.6-xhigh-fast".into(),
-        "claude-sonnet-5-thinking-high".into(),
-        "claude-opus-5-thinking-high".into(),
-        "gpt-5.6-sol-high".into(),
-        "gpt-5.3-codex".into(),
-    ]
-}
-
 fn parse_cursor_list_models(output: &str) -> Vec<String> {
     let mut models = Vec::new();
     for line in output.lines() {
@@ -1262,24 +1252,39 @@ fn parse_cursor_list_models(output: &str) -> Vec<String> {
     models
 }
 
-async fn discover_cursor_models() -> Vec<String> {
-    if executable_in_path("cursor-agent") {
-        let mut command = tokio::process::Command::new("cursor-agent");
-        command.arg("--list-models");
-        if let Some(output) = crate::command::output_with_timeout(
-            command,
-            Duration::from_secs(LIST_MODELS_TIMEOUT_SECONDS),
-        )
-        .await
-            && output.status.success()
-        {
-            let parsed = parse_cursor_list_models(&String::from_utf8_lossy(&output.stdout));
-            if !parsed.is_empty() {
-                return parsed;
-            }
-        }
+async fn discover_cursor_models() -> Result<Vec<String>, ExecutorError> {
+    if !executable_in_path("cursor-agent") {
+        return Err(ExecutorError::Unavailable(
+            "Cursor CLI is not available on this daemon. Enter a model ID supported by the installed harness.".to_owned(),
+        ));
     }
-    default_cursor_models()
+
+    let mut command = tokio::process::Command::new("cursor-agent");
+    command.arg("--list-models");
+    let output = crate::command::output_with_timeout(
+        command,
+        Duration::from_secs(LIST_MODELS_TIMEOUT_SECONDS),
+    )
+    .await
+    .ok_or_else(|| {
+        ExecutorError::Unavailable(
+            "Cursor model discovery timed out or could not start. Enter a model ID supported by the installed harness.".to_owned(),
+        )
+    })?;
+    if !output.status.success() {
+        return Err(ExecutorError::Unavailable(
+            "Cursor CLI could not list models for its current account. Enter a model ID supported by the harness.".to_owned(),
+        ));
+    }
+
+    let models = parse_cursor_list_models(&String::from_utf8_lossy(&output.stdout));
+    if models.is_empty() {
+        return Err(ExecutorError::Unavailable(
+            "Cursor CLI returned no model options. Enter a model ID supported by the harness."
+                .to_owned(),
+        ));
+    }
+    Ok(models)
 }
 
 fn detect_cursor_availability() -> AvailabilityInfo {
@@ -1833,11 +1838,6 @@ mod tests {
     }
 
     #[test]
-    fn default_cursor_models_are_non_empty() {
-        assert!(default_cursor_models().contains(&"auto".to_owned()));
-        assert!(default_cursor_models().contains(&"cursor-grok-4.6-medium-fast".to_owned()));
-    }
-
     #[test]
     fn captures_cursor_stream_fields() {
         let mut session_id = None;

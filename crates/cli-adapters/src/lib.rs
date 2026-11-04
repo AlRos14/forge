@@ -20,8 +20,18 @@ pub use opencode::OpencodeAdapter;
 pub use shell::ShellAdapter;
 pub use smith::SmithAdapter;
 
-use executors::HarnessAdapterRegistry;
 use executors::HarnessCapabilities as C;
+use executors::{AvailabilityInfo, ExecutorKind, HarnessAdapter, HarnessAdapterRegistry};
+
+/// Detect adapter availability, including authentication metadata that is
+/// stored by the external CLI in its own database.
+pub async fn detect_availability(adapter: &dyn HarnessAdapter) -> AvailabilityInfo {
+    if adapter.kind() == ExecutorKind::Opencode {
+        opencode::detect_availability().await
+    } else {
+        adapter.check_availability()
+    }
+}
 
 /// Refuse to report a successful Resume unless the integration's normalized
 /// result confirms the exact external session requested by Forge.

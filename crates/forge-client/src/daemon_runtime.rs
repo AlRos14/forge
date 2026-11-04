@@ -14,14 +14,16 @@ use api_types::{
     ExecutionTerminalNotification, FsBranchesParams, FsListParams, RemoteExecutionFailureClass,
     RemoteResolvedCandidate, RemoteRouteAttempt, RemoteTokenUsage,
     DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1,
-    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1, INVALID_FRAME, METHOD_EXECUTION_CANCEL,
-    METHOD_EXECUTION_LOG, METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES,
-    METHOD_FS_LIST, METHOD_PROTOCOL_CAPABILITIES, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE,
+    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1, INVALID_FRAME, INVALID_INPUT,
+    METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_LOG, METHOD_EXECUTION_START,
+    METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES, METHOD_FS_LIST, METHOD_HARNESS_DISCOVER_OPTIONS,
+    METHOD_PROTOCOL_CAPABILITIES, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE,
     METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
 };
 use executors::{
-    ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
-    FallbackExecutor, LogEntry, TaskExecutor,
+    DiscoverContext, DiscoveredOptions, ExecutionContext, ExecutionFailureClass, ExecutionOutcome,
+    ExecutionResult, ExecutorError, ExecutorKind, FallbackExecutor, HarnessAdapterRegistry,
+    LogEntry, TaskExecutor,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -128,6 +130,13 @@ impl Drop for ActiveExecutionGuard {
 
 type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
 
+#[derive(serde::Deserialize)]
+struct HarnessDiscoverOptionsParams {
+    executor_type: String,
+    #[serde(default)]
+    project_path: Option<String>,
+}
+
 pub async fn run_command_stream(
     client: Arc<DaemonClient>,
     workspace_root: PathBuf,
@@ -182,6 +191,7 @@ pub struct DaemonRuntime {
     workspace_root: PathBuf,
     outbound: mpsc::UnboundedSender<DaemonFrame>,
     executor: Arc<FallbackExecutor>,
+    adapter_registry: Arc<HarnessAdapterRegistry>,
     active_executions: ActiveExecutionTracker,
     generation: Mutex<ExecutionGeneration>,
 }
@@ -218,10 +228,12 @@ impl DaemonRuntime {
         registry: Arc<executors::HarnessAdapterRegistry>,
         active_executions: ActiveExecutionTracker,
     ) -> Arc<Self> {
+        let executor = Arc::new(FallbackExecutor::new(Arc::clone(&registry)));
         Arc::new(Self {
             workspace_root,
             outbound,
-            executor: Arc::new(FallbackExecutor::new(registry)),
+            executor,
+            adapter_registry: registry,
             active_executions,
             generation: Mutex::new(ExecutionGeneration::default()),
         })
@@ -254,6 +266,18 @@ impl DaemonRuntime {
                             ],
                         },
                     ),
+                    Err(frame) => frame,
+                }
+            }
+            METHOD_HARNESS_DISCOVER_OPTIONS => {
+                match decode_params::<HarnessDiscoverOptionsParams>(&id, params) {
+                    Ok(params) => match self.discover_options(params).await {
+                        Ok(result) => response_frame(id, result),
+                        Err(error) => DaemonFrame::Error {
+                            id: Some(id),
+                            error,
+                        },
+                    },
                     Err(frame) => frame,
                 }
             }
@@ -308,6 +332,34 @@ impl DaemonRuntime {
                 None,
             ),
         }
+    }
+
+    async fn discover_options(
+        &self,
+        params: HarnessDiscoverOptionsParams,
+    ) -> CommandResult<DiscoveredOptions> {
+        let kind = params
+            .executor_type
+            .parse::<ExecutorKind>()
+            .map_err(|message| DaemonErrorPayload {
+                code: INVALID_INPUT.to_owned(),
+                message,
+                details: None,
+            })?;
+        let adapter = self
+            .adapter_registry
+            .get(&kind)
+            .ok_or_else(|| DaemonErrorPayload {
+                code: UNSUPPORTED_METHOD.to_owned(),
+                message: format!("no adapter registered for executor type: {kind}"),
+                details: None,
+            })?;
+        adapter
+            .discover_options(DiscoverContext {
+                project_path: params.project_path,
+            })
+            .await
+            .map_err(|error| execution_error(error.to_string()))
     }
 
     pub async fn start(

@@ -4,6 +4,7 @@ use executors::{
     ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, LogKind,
     LogStream, LogWriter, OpencodeConfig, PermissionPolicy, ProcessGroupChild,
 };
+use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -11,11 +12,13 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
 
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_SUMMARY_CHARS: usize = 500;
+const MODEL_DISCOVERY_TIMEOUT_SECONDS: u64 = 10;
 
 pub struct OpencodeAdapter {
     executions: Arc<Mutex<HashMap<String, RunningExecution>>>,
@@ -130,7 +133,32 @@ impl HarnessAdapter for OpencodeAdapter {
         config: &serde_json::Value,
         overrides: &executors::ExecutionOverrides,
     ) -> Result<serde_json::Value, ExecutorError> {
-        executors::normalize_harness_config::<OpencodeConfig>(self.kind(), config, overrides)
+        let mut normalized =
+            executors::normalize_harness_config::<OpencodeConfig>(self.kind(), config, overrides)?;
+        let variant = overrides
+            .reasoning_effort
+            .as_deref()
+            .or_else(|| {
+                config
+                    .get("model_reasoning_effort")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| config.get("effort").and_then(serde_json::Value::as_str))
+            .or_else(|| {
+                config
+                    .get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str)
+            });
+        if let Some(variant) = variant {
+            let object = normalized.as_object_mut().ok_or_else(|| {
+                ExecutorError::Other("normalized OpenCode config is not an object".to_owned())
+            })?;
+            object.insert(
+                "variant".to_owned(),
+                serde_json::Value::String(variant.to_owned()),
+            );
+        }
+        Ok(normalized)
     }
 
     fn capabilities(&self, _config: &serde_json::Value) -> executors::HarnessCapabilities {
@@ -142,7 +170,7 @@ impl HarnessAdapter for OpencodeAdapter {
             usage_reporting: S::Unsupported,
             account_usage_observation: S::Unsupported,
             model_selection: S::Native,
-            reasoning_controls: S::Unsupported,
+            reasoning_controls: S::Native,
             approval_policy: S::Native,
             sandbox_controls: S::Unsupported,
             planning: S::Unsupported,
@@ -163,10 +191,15 @@ impl HarnessAdapter for OpencodeAdapter {
         &self,
         _ctx: DiscoverContext,
     ) -> Result<DiscoveredOptions, ExecutorError> {
+        let catalog = discover_opencode_model_catalog().await?;
         Ok(DiscoveredOptions {
-            models: vec![],
+            models: catalog.models,
             permission_policies: vec!["auto".into(), "supervised".into()],
-            cli_specific: serde_json::json!({}),
+            cli_specific: serde_json::json!({
+                "model_id_format": "provider/model",
+                "model_reasoning_efforts": catalog.variants_by_model,
+            }),
+            warning: catalog.warning,
         })
     }
 
@@ -398,6 +431,150 @@ impl HarnessAdapter for OpencodeAdapter {
 
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct OpenCodeModelCatalog {
+    models: Vec<String>,
+    variants_by_model: HashMap<String, Vec<String>>,
+    warning: Option<String>,
+}
+
+async fn discover_opencode_model_catalog() -> Result<OpenCodeModelCatalog, ExecutorError> {
+    if which::which("opencode").is_err() {
+        return Err(ExecutorError::Unavailable(
+            "OpenCode CLI is not available on this daemon".to_owned(),
+        ));
+    }
+
+    let mut api_command = tokio::process::Command::new("opencode");
+    api_command
+        .args(["--standalone", "api", "get", "/api/model"])
+        .env("NO_COLOR", "1")
+        .env("FORCE_COLOR", "0");
+    if let Some(output) = crate::command::output_with_timeout(
+        api_command,
+        Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECONDS),
+    )
+    .await
+        && output.status.success()
+        && let Some(catalog) =
+            parse_opencode_model_catalog(&String::from_utf8_lossy(&output.stdout))
+        && !catalog.models.is_empty()
+    {
+        return Ok(catalog);
+    }
+
+    let mut command = tokio::process::Command::new("opencode");
+    command
+        .arg("models")
+        .env("NO_COLOR", "1")
+        .env("FORCE_COLOR", "0");
+    let output = crate::command::output_with_timeout(
+        command,
+        Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECONDS),
+    )
+    .await
+    .ok_or_else(|| {
+        ExecutorError::Unavailable("OpenCode model discovery timed out or could not start".into())
+    })?;
+    if !output.status.success() {
+        return Err(ExecutorError::Unavailable(
+            "OpenCode could not list models from its configured providers".to_owned(),
+        ));
+    }
+
+    let models = parse_opencode_models(&String::from_utf8_lossy(&output.stdout));
+    if models.is_empty() {
+        return Err(ExecutorError::Unavailable(
+            "OpenCode could not list models from its configured providers".to_owned(),
+        ));
+    }
+
+    Ok(OpenCodeModelCatalog {
+        models,
+        variants_by_model: HashMap::new(),
+        warning: Some(
+            "The installed OpenCode CLI did not expose model variants; reasoning choices are unavailable for this model list.".to_owned(),
+        ),
+    })
+}
+
+fn parse_opencode_model_catalog(output: &str) -> Option<OpenCodeModelCatalog> {
+    let response = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    let entries = response.get("data")?.as_array()?;
+    let mut catalog = OpenCodeModelCatalog::default();
+
+    for entry in entries {
+        let Some(id) = entry
+            .get("id")
+            .or_else(|| entry.get("modelID"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let provider = entry.get("providerID").and_then(serde_json::Value::as_str);
+        let model_id = match provider {
+            Some(provider) if !id.starts_with(&format!("{provider}/")) => {
+                format!("{provider}/{id}")
+            }
+            _ => id.to_owned(),
+        };
+        if model_id.trim().is_empty() || catalog.models.contains(&model_id) {
+            continue;
+        }
+
+        let variants = entry
+            .get("variants")
+            .map(parse_opencode_variant_ids)
+            .unwrap_or_default();
+        if !variants.is_empty() {
+            catalog.variants_by_model.insert(model_id.clone(), variants);
+        }
+        catalog.models.push(model_id);
+    }
+
+    Some(catalog)
+}
+
+fn parse_opencode_variant_ids(value: &serde_json::Value) -> Vec<String> {
+    let variants = match value {
+        serde_json::Value::Array(entries) => entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect(),
+        serde_json::Value::Object(entries) => entries.keys().cloned().collect(),
+        _ => Vec::new(),
+    };
+    let mut unique = Vec::new();
+    for variant in variants {
+        if !variant.trim().is_empty() && !unique.contains(&variant) {
+            unique.push(variant);
+        }
+    }
+    unique
+}
+
+fn parse_opencode_models(output: &str) -> Vec<String> {
+    let mut models = Vec::new();
+    for line in output.lines() {
+        let Some(id) = line.split_whitespace().next() else {
+            continue;
+        };
+        let id = id.trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.' | '/' | ':')
+        });
+        if !id.contains('/') || id.split('/').any(str::is_empty) || models.iter().any(|m| m == id) {
+            continue;
+        }
+        models.push(id.to_owned());
+    }
+    models
 }
 
 struct RunStreamResult {
@@ -747,6 +924,63 @@ fn opencode_auth_path() -> Option<PathBuf> {
     opencode_data_dir().map(|dir| dir.join("auth.json"))
 }
 
+fn opencode_database_candidates() -> Vec<PathBuf> {
+    if let Some(path) = env_path("OPENCODE_DB") {
+        return vec![path];
+    }
+
+    opencode_data_dir()
+        .map(|data_dir| vec![data_dir.join("opencode.db")])
+        .unwrap_or_default()
+}
+
+async fn opencode_v2_database_has_active_provider_credential(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .busy_timeout(Duration::from_millis(250));
+    let Ok(mut connection) = SqliteConnection::connect_with(&options).await else {
+        return false;
+    };
+
+    // Query only credential metadata. Never load or log the stored value.
+    let result = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(
+             SELECT 1 FROM credential
+             WHERE active = 1 AND connector_id IS NULL
+         )",
+    )
+    .fetch_one(&mut connection)
+    .await;
+    let _ = connection.close().await;
+    result.is_ok_and(|has_credential| has_credential != 0)
+}
+
+pub async fn detect_availability() -> AvailabilityInfo {
+    let mut availability = detect_opencode_availability();
+    if !matches!(availability.status, AvailabilityStatus::Installed)
+        || which::which("opencode").is_err()
+    {
+        return availability;
+    }
+
+    for path in opencode_database_candidates() {
+        if opencode_v2_database_has_active_provider_credential(&path).await {
+            availability.status = AvailabilityStatus::Authenticated;
+            availability.authenticated_at = path_modified_epoch_secs(&path);
+            availability.config_path = Some(path.to_string_lossy().into_owned());
+            break;
+        }
+    }
+
+    availability
+}
+
 fn path_modified_epoch_secs(path: &Path) -> Option<String> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     modified
@@ -959,6 +1193,73 @@ mod tests {
             | AvailabilityStatus::Installed
             | AvailabilityStatus::NotFound => {}
         }
+    }
+
+    #[tokio::test]
+    async fn v2_active_provider_credential_is_detected_read_only() {
+        let dir = tempfile::tempdir().expect("temp directory creates");
+        let path = dir.path().join("opencode.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("test database opens");
+        sqlx::query(
+            "CREATE TABLE credential (
+                 id TEXT PRIMARY KEY,
+                 value TEXT NOT NULL,
+                 active INTEGER NOT NULL,
+                 connector_id TEXT
+             )",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("credential table creates");
+        sqlx::query(
+            "INSERT INTO credential (id, value, active, connector_id)
+             VALUES ('provider-key', 'test-secret-never-read', 1, NULL)",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("provider credential inserts");
+        connection.close().await.expect("test database closes");
+
+        assert!(opencode_v2_database_has_active_provider_credential(&path).await);
+    }
+
+    #[tokio::test]
+    async fn v2_inactive_or_connector_credentials_do_not_authenticate_provider() {
+        let dir = tempfile::tempdir().expect("temp directory creates");
+        let path = dir.path().join("opencode.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("test database opens");
+        sqlx::query(
+            "CREATE TABLE credential (
+                 id TEXT PRIMARY KEY,
+                 value TEXT NOT NULL,
+                 active INTEGER NOT NULL,
+                 connector_id TEXT
+             )",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("credential table creates");
+        sqlx::query(
+            "INSERT INTO credential (id, value, active, connector_id) VALUES
+                 ('inactive', 'test-secret-never-read', 0, NULL),
+                 ('connector', 'test-secret-never-read', 1, 'mcp-connector')",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("non-provider credentials insert");
+        connection.close().await.expect("test database closes");
+
+        assert!(!opencode_v2_database_has_active_provider_credential(&path).await);
     }
 
     #[test]
