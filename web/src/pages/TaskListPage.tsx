@@ -1,12 +1,10 @@
 import { useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { toast } from 'sonner'
-import { useCreateTask, useTasksQuery } from '@/api/hooks'
+import { useTasksQuery } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
-import { getApiErrorMessage } from '@/lib/api-error'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Textarea } from '@/components/ui/textarea'
+import { TaskCreateDialog } from '@/components/task-create-dialog'
 import type { TaskLifecycleState } from '@/types/generated'
 
 export type TaskListSortBy = 'title' | 'lifecycle_state' | 'priority' | 'task_type' | 'updated_at' | 'board_position'
@@ -33,9 +31,6 @@ export function TaskListPage({
 }) {
   const [queryText, setQueryText] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
-  const [title, setTitle] = useState('')
-  const [description, setDescription] = useState('')
-  const createTask = useCreateTask(projectId)
   const tasksQuery = useTasksQuery(projectId, {
     q: queryText.trim() || undefined,
     lifecycle_state: lifecycleState,
@@ -44,24 +39,6 @@ export function TaskListPage({
     limit: 100,
   })
   const tasks = tasksQuery.data?.pages.flatMap((page) => page.items) ?? []
-
-  async function create() {
-    const nextTitle = title.trim()
-    if (!nextTitle) return
-    try {
-      await createTask.mutateAsync({
-        title: nextTitle,
-        description: description.trim() || undefined,
-        task_type: 'implementation',
-        priority: 0,
-      })
-      setTitle('')
-      setDescription('')
-      setCreateOpen(false)
-    } catch (error) {
-      toast.error(getApiErrorMessage(error, 'Task creation failed'))
-    }
-  }
 
   return (
     <main className="mx-auto w-full max-w-6xl space-y-5 p-4 sm:p-6">
@@ -73,16 +50,11 @@ export function TaskListPage({
         <Button onClick={() => setCreateOpen((open) => !open)}>New task</Button>
       </header>
 
-      {createOpen ? (
-        <section className="grid gap-3 rounded-lg border p-4 sm:grid-cols-2">
-          <Input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Task title" aria-label="Task title" />
-          <Textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Description (optional)" aria-label="Task description" />
-          <div className="flex gap-2 sm:col-span-2">
-            <Button disabled={!title.trim() || createTask.isPending} onClick={() => void create()}>{createTask.isPending ? 'Creating…' : 'Create task'}</Button>
-            <Button variant="outline" onClick={() => setCreateOpen(false)}>Cancel</Button>
-          </div>
-        </section>
-      ) : null}
+      <TaskCreateDialog
+        open={createOpen}
+        projectId={projectId}
+        onOpenChange={setCreateOpen}
+      />
 
       <section className="flex flex-wrap gap-3 rounded-lg border p-3">
         <Input className="max-w-xs" value={queryText} onChange={(event) => setQueryText(event.target.value)} placeholder="Search tasks" aria-label="Search tasks" />

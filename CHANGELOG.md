@@ -8,6 +8,11 @@ PR14 audit on 2026-10-16.
 
 ## [Unreleased]
 
+### Added
+
+- Replace separate Task title and description inputs with one Markdown brief.
+  Forge derives the title from an optional first-level heading or the first line.
+
 ### Security
 
 - Redact credential-like query parameters from MCP configuration responses, reject foreign-origin and tokenized installed URLs as unusable, reject symlinked configuration files, require Project admin for Project MCP config reads/writes, and require a server administrator for `user`/`local` MCP config scopes.
