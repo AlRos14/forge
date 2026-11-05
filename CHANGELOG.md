@@ -101,6 +101,11 @@ PR14 audit on 2026-10-16.
 
 ### Fixed
 
+- Run OpenCode Project Copilot turns against a private `--standalone` server
+  so the per-run agent and MCP policy is loaded. OpenCode v2's background
+  server ignored the inline policy and rejected the Copilot agent. Failed
+  turns now remain visible next to the composer alongside the sending,
+  running, and terminal state.
 - Serialize Project owner additions, removals, and role changes inside
   `BEGIN IMMEDIATE` transactions. Caller, target, last-owner, and canonical
   owner state are re-read after the writer lock, so concurrent owner removal

@@ -139,6 +139,7 @@
     "stopTurnHint": "Stopping a turn does not undo WorkUnit changes already made.",
     "cancelTurnFailed": "The Copilot turn could not be stopped.",
     "retryCancel": "Retry stop",
+    "sending": "Sending instruction…",
     "runEnded": "Copilot {{status}}.",
     "messagesFailed": "The conversation could not be loaded.",
     "loadingMessages": "Loading conversation…",

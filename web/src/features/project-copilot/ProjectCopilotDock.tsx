@@ -38,6 +38,7 @@ import {
   useUpdateProjectCopilotMutation,
 } from '@/features/project-copilot/hooks'
 import type {
+  ProjectCopilotRunDetailResponse,
   ProjectCopilotRunStatus,
   SendProjectCopilotMessageRequest,
 } from '@/features/project-copilot/types'
@@ -206,7 +207,13 @@ function ProjectCopilotSession({
   const [agentSelection, setAgentSelection] = useState<string | null>(null)
   const [editingAgent, setEditingAgent] = useState(false)
   const [trackedRunId, setTrackedRunId] = useState<string | null>(null)
+  const [terminalRun, setTerminalRun] = useState<ProjectCopilotRunDetailResponse | null>(null)
   const [retryPayload, setRetryPayload] = useState<SendProjectCopilotMessageRequest | null>(null)
+
+  useEffect(() => {
+    setTrackedRunId(null)
+    setTerminalRun(null)
+  }, [projectId])
   const [sendError, setSendError] = useState<unknown>(null)
   const [configError, setConfigError] = useState<unknown>(null)
   const messageListRef = useRef<HTMLDivElement>(null)
@@ -293,6 +300,7 @@ function ProjectCopilotSession({
     if (!detail || !isProjectCopilotRunTerminal(detail.run.status)) return
     if (processedTerminalRunRef.current === detail.run.id) return
     processedTerminalRunRef.current = detail.run.id
+    setTerminalRun(detail)
     setTrackedRunId(null)
     void messagesQuery.refetch()
     void activityQuery.refetch()
@@ -310,6 +318,7 @@ function ProjectCopilotSession({
     setSendError(null)
     sendMessage.mutate(payload, {
       onSuccess: (response) => {
+        setTerminalRun(null)
         setTrackedRunId(response.run.id)
         setRetryPayload(null)
         setSendError(null)
@@ -393,8 +402,9 @@ function ProjectCopilotSession({
   const showDraftContextNotice = Boolean(
     draft.trim() && (draftTaskContext || currentTaskContextId) && !draftContextMatchesCurrent,
   )
+  const terminalRunDetail = runQuery.data ?? terminalRun
   const runFailureMessage =
-    runQuery.data?.run.failure_message ?? runQuery.data?.run.failure_code ?? ''
+    terminalRunDetail?.run.failure_message ?? terminalRunDetail?.run.failure_code ?? ''
   const activityItems = activityQuery.data?.pages.flatMap((page) => page.items) ?? []
 
   const activityLabel = (item: ProjectCopilotActivity) => {
@@ -696,21 +706,6 @@ function ProjectCopilotSession({
               </div>
             ) : null}
 
-            {runQuery.data &&
-            ['failed', 'interrupted', 'cancelled'].includes(runQuery.data.run.status) ? (
-              <div
-                role="alert"
-                className="mb-4 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive"
-              >
-                <p className="font-medium">
-                  {t('projectCopilot.runEnded', {
-                    status: runStatusLabel(t, runQuery.data.run.status),
-                  })}
-                </p>
-                {runFailureMessage ? <p className="mt-1">{runFailureMessage}</p> : null}
-              </div>
-            ) : null}
-
             {messagesQuery.isError && !messagesQuery.data ? (
               <div
                 role="alert"
@@ -931,6 +926,31 @@ function ProjectCopilotSession({
               <p className="mb-2 text-xs text-muted-foreground">
                 {t('projectCopilot.assignAgentToChat')}
               </p>
+            ) : null}
+
+            {sendMessage.isPending || (activeRunId && !run) ? (
+              <div
+                role="status"
+                className="mb-2 flex items-center gap-2 text-xs text-muted-foreground"
+              >
+                <CircleNotch size={14} className="animate-spin" aria-hidden="true" />
+                <span>{t('projectCopilot.sending')}</span>
+              </div>
+            ) : null}
+
+            {terminalRunDetail &&
+            ['failed', 'interrupted', 'cancelled'].includes(terminalRunDetail.run.status) ? (
+              <div
+                role="alert"
+                className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive"
+              >
+                <span>
+                  {t('projectCopilot.runEnded', {
+                    status: runStatusLabel(t, terminalRunDetail.run.status),
+                  })}
+                  {runFailureMessage ? ` ${runFailureMessage}` : null}
+                </span>
+              </div>
             ) : null}
 
             {sendError ? (

@@ -573,7 +573,12 @@ impl ProjectCopilotService {
         let execution = tokio::time::timeout(RUN_TIMEOUT, self.executor.execute(context)).await;
         let result = match execution {
             Ok(Ok(result)) => result,
-            Ok(Err(_error)) => {
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    error = %error,
+                    "Project Copilot harness dispatch failed"
+                );
                 self.finish_failed(run_id, safe_failure("harness_failed"))
                     .await;
                 return Ok(());

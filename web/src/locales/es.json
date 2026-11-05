@@ -69,6 +69,7 @@
     "stopTurnHint": "Detener el turno no revierte los cambios de WorkUnits que ya se hayan realizado.",
     "cancelTurnFailed": "No se pudo detener el turno del copiloto.",
     "retryCancel": "Reintentar detención",
+    "sending": "Enviando instrucción…",
     "runEnded": "El copiloto {{status}}.",
     "messagesFailed": "No se pudo cargar la conversación.",
     "loadingMessages": "Cargando conversación…",

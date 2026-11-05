@@ -58,6 +58,9 @@ let activityPaginationEnabled = false
 let projectMembershipRole = 'member'
 let copilotAgentId: string | null = 'agent-1'
 let supportedCopilotExecutors = ['claude_code', 'codex', 'opencode']
+let runStatus = 'queued'
+let runFailureCode: string | null = null
+let runFailureMessage: string | null = null
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -66,7 +69,12 @@ function jsonResponse(body: unknown, status = 200) {
   })
 }
 
-function runFor(projectId: string, status = 'queued') {
+function runFor(
+  projectId: string,
+  status = 'queued',
+  failureCode: string | null = null,
+  failureMessage: string | null = null,
+) {
   return {
     id: 'run-1',
     project_id: projectId,
@@ -74,8 +82,8 @@ function runFor(projectId: string, status = 'queued') {
     binding_version: 1,
     context_task_id: 'task-b',
     status,
-    failure_code: null,
-    failure_message: null,
+    failure_code: failureCode,
+    failure_message: failureMessage,
     created_at: '2026-11-04T10:00:00Z',
     started_at: null,
     completed_at: null,
@@ -323,7 +331,7 @@ function installFetchMock() {
     if (path.endsWith('/copilot/runs/run-1') && method === 'GET') {
       const projectId = path.split('/')[2]!
       return jsonResponse({
-        run: runFor(projectId),
+        run: runFor(projectId, runStatus, runFailureCode, runFailureMessage),
         user_message: userMessage,
         assistant_message: null,
       })
@@ -361,6 +369,9 @@ beforeEach(() => {
   projectMembershipRole = 'member'
   copilotAgentId = 'agent-1'
   supportedCopilotExecutors = ['claude_code', 'codex', 'opencode']
+  runStatus = 'queued'
+  runFailureCode = null
+  runFailureMessage = null
   installFetchMock()
   useAuthStore.setState({
     user: {
@@ -432,6 +443,30 @@ describe('ProjectCopilotDock', () => {
     await waitFor(() =>
       expect(requestedPaths).toContain('DELETE /projects/project-b/copilot/runs/run-1'),
     )
+  })
+
+  it('keeps a failed run visible after the terminal refresh', async () => {
+    runStatus = 'failed'
+    runFailureCode = 'harness_failed'
+    runFailureMessage = 'The local harness failed to complete this Project Copilot turn.'
+    renderDock({ taskId: 'task-b' })
+
+    await waitFor(() => {
+      expect(
+        (screen.getByRole('button', { name: 'Open Project Copilot' }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false)
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Open Project Copilot' }))
+    const composer = await screen.findByRole('textbox', { name: 'Message to Project Copilot' })
+    fireEvent.change(composer, { target: { value: 'Create the work units for this task.' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+
+    expect(
+      await screen.findByText(
+        /Copilot Failed\. The local harness failed to complete this Project Copilot turn\./,
+      ),
+    ).toBeTruthy()
   })
 
   it('keeps transcript and draft state isolated when the Project changes', async () => {

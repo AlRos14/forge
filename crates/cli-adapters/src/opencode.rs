@@ -52,15 +52,25 @@ impl OpencodeAdapter {
     }
 
     fn build_command(config: &OpencodeConfig, prompt: &str) -> tokio::process::Command {
+        Self::build_command_with_prefix(config, prompt, &[])
+    }
+
+    fn build_command_with_prefix(
+        config: &OpencodeConfig,
+        prompt: &str,
+        global_args: &[&str],
+    ) -> tokio::process::Command {
         let overrides = &config.command_overrides;
 
         let merged_overrides = overrides.clone();
 
-        let mut adapter_args = vec![
+        let mut adapter_args: Vec<String> =
+            global_args.iter().map(|arg| (*arg).to_owned()).collect();
+        adapter_args.extend([
             "run".to_string(),
             "--format".to_string(),
             "json".to_string(),
-        ];
+        ]);
         if let Some(ref model) = config.model {
             adapter_args.push("--model".into());
             adapter_args.push(normalize_opencode_model_id(model));
@@ -111,7 +121,10 @@ impl OpencodeAdapter {
             safe_config.model = Some(format!("{}#{variant}", normalize_opencode_model_id(&model)));
             safe_config.variant = None;
         }
-        let mut command = Self::build_command(&safe_config, prompt);
+        // OpenCode v2 keeps a background server whose configuration is not
+        // reloaded per invocation. The Project Copilot agent and MCP policy
+        // must run against a private server so the inline policy applies.
+        let mut command = Self::build_command_with_prefix(&safe_config, prompt, &["--standalone"]);
         command
             .env("OPENCODE_CONFIG_DIR", config_dir)
             .env("OPENCODE_CONFIG_CONTENT", policy);
@@ -904,16 +917,22 @@ async fn ensure_opencode_project_copilot_cli_supported() -> Result<(), ExecutorE
         Ok(())
     } else {
         Err(ExecutorError::Unavailable(
-            "Project Copilot requires OpenCode CLI support for run --agent, --format, --model, and --session"
+            "Project Copilot requires OpenCode CLI support for --standalone and run --agent, --format, --model, and --session"
                 .to_owned(),
         ))
     }
 }
 
 fn opencode_project_copilot_cli_supports_policy(help: &str) -> bool {
-    ["--agent", "--format", "--model", "--session"]
-        .iter()
-        .all(|option| help.contains(option))
+    [
+        "--standalone",
+        "--agent",
+        "--format",
+        "--model",
+        "--session",
+    ]
+    .iter()
+    .all(|option| help.contains(option))
 }
 
 fn should_skip_permissions(config: &OpencodeConfig) -> bool {
@@ -1557,6 +1576,44 @@ mod tests {
             })
             .collect();
         assert_eq!(envs.get("OPENCODE_PERMISSION"), None);
+    }
+
+    #[test]
+    fn project_copilot_command_uses_an_isolated_standalone_server() {
+        let config = OpencodeConfig::default();
+        let cmd = OpencodeAdapter::build_project_copilot_command(
+            &config,
+            "hello",
+            r#"{"agents":{}}"#,
+            Path::new("/tmp/forge-opencode-copilot-test"),
+        );
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.first().map(String::as_str), Some("--standalone"));
+        assert!(args.iter().any(|arg| arg == "run"));
+        let envs: HashMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|value| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            envs.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+            Some(r#"{"agents":{}}"#)
+        );
+        assert_eq!(
+            envs.get("OPENCODE_CONFIG_DIR").map(String::as_str),
+            Some("/tmp/forge-opencode-copilot-test")
+        );
     }
 
     #[test]
