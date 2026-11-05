@@ -374,7 +374,11 @@ accepted only
 by MCP and never as a REST credential. Each use rechecks the binding,
 current requesting Human, current Agent ownership and expiry. Project scope is
 fixed by the authenticated delegation rather than client arguments. The
-Copilot's `tools/list` exposes context reads and WorkUnit create/update/allocate
+`GET /api/v1/projects/{id}/copilot/runs/{run_id}/logs` returns the exact run's
+redacted harness JSONL trace with opaque sequence paging (`tail`, `limit`) for
+Project viewers. It includes reasoning, tool, session, stdout/stderr, output,
+and error events and does not expose runtime secrets.
+The Copilot's `tools/list` exposes context reads and WorkUnit create/update/allocate
 and dependency management only; execution start, WorkUnit completion, lifecycle,
 Gates, global administration and membership changes are outside its tool set.
 An attached Task also removes Project-wide Task listing and fences Task reads

@@ -47,7 +47,10 @@ membership, a WorkUnit assignment, an Execution, or a WorkspaceLease.
 
 Messages and management runs are durable Project records. Each run identifies
 the exact Agent, requesting Human, Project binding version, optional context
-Task, and terminal outcome. Only one turn runs at a time in a Project.
+Task, and terminal outcome. Only one turn runs at a time in a Project. The
+**Harness trace** section shows that run's redacted JSONL events, including
+reasoning, tool calls and results, session metadata, output, and errors. It
+refreshes while the turn is active and remains available after completion.
 Idempotency keys distinguish retrying the same send from sending a new
 instruction. An interrupted run is recorded as interrupted rather than
 automatically replayed: it may already have performed management actions.

@@ -108,7 +108,7 @@ impl OpencodeAdapter {
         prompt: &str,
         policy: &str,
         config_dir: &Path,
-    ) -> tokio::process::Command {
+    ) -> Result<tokio::process::Command, ExecutorError> {
         let mut safe_config = config.clone();
         safe_config.agent = Some(OPENCODE_COPILOT_AGENT.to_owned());
         safe_config.auto_approve = Some(false);
@@ -123,12 +123,17 @@ impl OpencodeAdapter {
         }
         // OpenCode v2 keeps a background server whose configuration is not
         // reloaded per invocation. The Project Copilot agent and MCP policy
-        // must run against a private server so the inline policy applies.
+        // must run against a private server with a real config file so
+        // `{env:...}` substitutions are resolved for the MCP authorization.
+        let policy_path = config_dir.join("opencode.json");
+        std::fs::write(&policy_path, policy).map_err(|error| {
+            ExecutorError::Other(format!(
+                "failed to write OpenCode Project Copilot policy: {error}"
+            ))
+        })?;
         let mut command = Self::build_command_with_prefix(&safe_config, prompt, &["--standalone"]);
-        command
-            .env("OPENCODE_CONFIG_DIR", config_dir)
-            .env("OPENCODE_CONFIG_CONTENT", policy);
-        command
+        command.env("OPENCODE_CONFIG_DIR", config_dir);
+        Ok(command)
     }
 
     fn insert_execution(
@@ -278,7 +283,7 @@ impl HarnessAdapter for OpencodeAdapter {
             (project_copilot_mcp.as_ref(), copilot_runtime_dir.as_ref())
         {
             let policy = opencode_project_copilot_policy(mcp)?;
-            Self::build_project_copilot_command(&config, &prompt, &policy, runtime_dir.path())
+            Self::build_project_copilot_command(&config, &prompt, &policy, runtime_dir.path())?
         } else {
             Self::build_command(&config, &prompt)
         };
@@ -1581,12 +1586,11 @@ mod tests {
     #[test]
     fn project_copilot_command_uses_an_isolated_standalone_server() {
         let config = OpencodeConfig::default();
-        let cmd = OpencodeAdapter::build_project_copilot_command(
-            &config,
-            "hello",
-            r#"{"agents":{}}"#,
-            Path::new("/tmp/forge-opencode-copilot-test"),
-        );
+        let dir = tempfile::tempdir().expect("temp directory creates");
+        let policy = r#"{"agents":{}}"#;
+        let cmd =
+            OpencodeAdapter::build_project_copilot_command(&config, "hello", policy, dir.path())
+                .expect("command builds");
         let args: Vec<_> = cmd
             .as_std()
             .get_args()
@@ -1594,6 +1598,10 @@ mod tests {
             .collect();
         assert_eq!(args.first().map(String::as_str), Some("--standalone"));
         assert!(args.iter().any(|arg| arg == "run"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("opencode.json")).expect("policy file reads"),
+            policy
+        );
         let envs: HashMap<_, _> = cmd
             .as_std()
             .get_envs()
@@ -1607,12 +1615,8 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            envs.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
-            Some(r#"{"agents":{}}"#)
-        );
-        assert_eq!(
-            envs.get("OPENCODE_CONFIG_DIR").map(String::as_str),
-            Some("/tmp/forge-opencode-copilot-test")
+            envs.get("OPENCODE_CONFIG_DIR"),
+            Some(&dir.path().to_string_lossy().into_owned())
         );
     }
 

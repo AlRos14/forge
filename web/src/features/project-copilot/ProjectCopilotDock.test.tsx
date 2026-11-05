@@ -61,6 +61,7 @@ let supportedCopilotExecutors = ['claude_code', 'codex', 'opencode']
 let runStatus = 'queued'
 let runFailureCode: string | null = null
 let runFailureMessage: string | null = null
+let activeCopilotRun: ReturnType<typeof runFor> | null = null
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -112,7 +113,7 @@ function projectConfigFor(projectId: string) {
     agent_id: copilotAgentId,
     agent_name: copilotAgentId ? `Agent for ${projectId}` : null,
     version: 1,
-    active_run: null,
+    active_run: activeCopilotRun,
     supported_executor_types: supportedCopilotExecutors,
     supported_daemon_id: 'embedded-host',
   }
@@ -336,6 +337,24 @@ function installFetchMock() {
         assistant_message: null,
       })
     }
+    if (path.endsWith('/copilot/runs/run-1/logs') && method === 'GET') {
+      return jsonResponse({
+        items: [
+          {
+            schema_version: 1,
+            sequence: 1,
+            timestamp: '2026-11-04T10:00:01Z',
+            execution_id: 'run-1',
+            kind: 'stdout',
+            stream: 'main',
+            payload: { type: 'reasoning', text: 'Planning the WorkUnit breakdown.' },
+            truncated: false,
+          },
+        ],
+        has_more: false,
+        next_sequence: 2,
+      })
+    }
     return jsonResponse({ message: `Unhandled test request: ${method} ${path}` }, 404)
   })
   vi.stubGlobal('fetch', fetchMock)
@@ -372,6 +391,7 @@ beforeEach(() => {
   runStatus = 'queued'
   runFailureCode = null
   runFailureMessage = null
+  activeCopilotRun = null
   installFetchMock()
   useAuthStore.setState({
     user: {
@@ -467,6 +487,15 @@ describe('ProjectCopilotDock', () => {
         /Copilot Failed\. The local harness failed to complete this Project Copilot turn\./,
       ),
     ).toBeTruthy()
+  })
+
+  it('shows the harness trace for the active run', async () => {
+    activeCopilotRun = runFor('project-1')
+    renderDock({ projectId: 'project-1' })
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Project Copilot' }))
+    fireEvent.click(await screen.findByText('Harness trace'))
+
+    expect(await screen.findByText('Planning the WorkUnit breakdown.')).toBeTruthy()
   })
 
   it('keeps transcript and draft state isolated when the Project changes', async () => {

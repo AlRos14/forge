@@ -192,7 +192,7 @@ pub async fn get_logs(
     }))
 }
 
-fn execution_log_response(entry: executors::LogEntry) -> api_types::ExecutionLogEntry {
+pub(crate) fn execution_log_response(entry: executors::LogEntry) -> api_types::ExecutionLogEntry {
     use api_types::{ExecutionLogKind as PublicKind, ExecutionLogStream as PublicStream};
     let kind = match entry.kind {
         executors::LogKind::Stdout => PublicKind::Stdout,

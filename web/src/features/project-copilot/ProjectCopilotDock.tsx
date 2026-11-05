@@ -22,6 +22,7 @@ import { MarkdownView } from '@/components/ui/markdown-editor'
 import { Textarea } from '@/components/ui/textarea'
 import { getApiErrorMessage } from '@/lib/api-error'
 import type {
+  ExecutionLogEntry,
   Project,
   ProjectCopilotActivity,
   ProjectMemberResponse,
@@ -32,6 +33,7 @@ import {
   useProjectCopilotMessagesQuery,
   useProjectCopilotActivityQuery,
   useProjectCopilotQuery,
+  useProjectCopilotRunLogsQuery,
   useProjectCopilotRunQuery,
   useCancelProjectCopilotRunMutation,
   useSendProjectCopilotMessageMutation,
@@ -88,6 +90,32 @@ function useCompactViewport() {
 
 function runStatusLabel(t: (key: string) => string, status: ProjectCopilotRunStatus) {
   return t(`projectCopilot.runStatus.${status}`)
+}
+
+function traceEntryLabel(entry: ExecutionLogEntry) {
+  const payload = (entry.payload ?? {}) as Record<string, unknown>
+  const eventType = typeof payload.type === 'string' ? payload.type : null
+  return eventType ?? entry.kind
+}
+
+function traceEntryText(entry: ExecutionLogEntry) {
+  const payload = (entry.payload ?? {}) as Record<string, unknown>
+  const part =
+    payload.part && typeof payload.part === 'object'
+      ? (payload.part as Record<string, unknown>)
+      : undefined
+  const text = part?.text ?? payload.text ?? payload.line ?? payload.message
+  if (typeof text === 'string' && text.trim()) return text
+  const tool = part?.tool ?? payload.tool ?? payload.name
+  if (typeof tool === 'string' && tool.trim()) {
+    const input = part?.state ?? payload.input ?? payload.arguments
+    return input ? `${tool} ${JSON.stringify(input)}` : tool
+  }
+  try {
+    return JSON.stringify(payload)
+  } catch {
+    return ''
+  }
 }
 
 function CopilotTrigger({
@@ -208,6 +236,7 @@ function ProjectCopilotSession({
   const [editingAgent, setEditingAgent] = useState(false)
   const [trackedRunId, setTrackedRunId] = useState<string | null>(null)
   const [terminalRun, setTerminalRun] = useState<ProjectCopilotRunDetailResponse | null>(null)
+  const [traceOpen, setTraceOpen] = useState(false)
   const [retryPayload, setRetryPayload] = useState<SendProjectCopilotMessageRequest | null>(null)
 
   useEffect(() => {
@@ -405,6 +434,14 @@ function ProjectCopilotSession({
   const terminalRunDetail = runQuery.data ?? terminalRun
   const runFailureMessage =
     terminalRunDetail?.run.failure_message ?? terminalRunDetail?.run.failure_code ?? ''
+  const traceRunId = activeRunId ?? terminalRun?.run.id ?? null
+  const traceQuery = useProjectCopilotRunLogsQuery(
+    projectId,
+    traceRunId,
+    open && active && traceOpen,
+    Boolean(runIsPending),
+  )
+  const traceItems = traceQuery.data?.items ?? []
   const activityItems = activityQuery.data?.pages.flatMap((page) => page.items) ?? []
 
   const activityLabel = (item: ProjectCopilotActivity) => {
@@ -894,6 +931,59 @@ function ProjectCopilotSession({
                       : t('projectCopilot.activity.loadOlder')}
                   </Button>
                 ) : null}
+              </div>
+            </details>
+
+            <details
+              className="mt-3 border-t pt-3"
+              onToggle={(event) => setTraceOpen(event.currentTarget.open)}
+            >
+              <summary className="cursor-pointer select-none text-xs font-semibold text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                {t('projectCopilot.trace.title')}
+                {traceItems.length ? ` · ${traceItems.length}` : ''}
+              </summary>
+              <p className="mt-2 text-[11px] text-muted-foreground">
+                {t('projectCopilot.trace.hint')}
+              </p>
+              {traceQuery.isPending ? (
+                <p className="mt-2 text-xs text-muted-foreground" role="status">
+                  {t('projectCopilot.trace.loading')}
+                </p>
+              ) : null}
+              {traceQuery.isError ? (
+                <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-destructive">
+                  <span>{t('projectCopilot.trace.failed')}</span>
+                  <Button size="sm" variant="outline" onClick={() => void traceQuery.refetch()}>
+                    {t('common.retry')}
+                  </Button>
+                </div>
+              ) : null}
+              {!traceQuery.isPending && !traceQuery.isError && traceItems.length === 0 ? (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  {t('projectCopilot.trace.empty')}
+                </p>
+              ) : null}
+              <div className="mt-2 max-h-72 space-y-1 overflow-y-auto">
+                {traceItems.map((entry) => (
+                  <div
+                    key={`${entry.sequence}-${entry.kind}`}
+                    className="rounded-md bg-muted/40 px-2 py-1 text-[11px]"
+                  >
+                    <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
+                      <span className="font-mono uppercase">{traceEntryLabel(entry)}</span>
+                      <time dateTime={entry.timestamp}>
+                        {new Date(entry.timestamp).toLocaleTimeString([], {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          second: '2-digit',
+                        })}
+                      </time>
+                    </div>
+                    <p className="whitespace-pre-wrap break-words">
+                      {traceEntryText(entry)}
+                    </p>
+                  </div>
+                ))}
               </div>
             </details>
           </div>

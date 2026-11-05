@@ -2,6 +2,7 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tansta
 import {
   getProjectCopilot,
   getProjectCopilotRun,
+  getProjectCopilotRunLogs,
   cancelProjectCopilotRun,
   listProjectCopilotActivity,
   listProjectCopilotMessages,
@@ -67,6 +68,20 @@ export function useSendProjectCopilotMessageMutation(projectId: string) {
   return useMutation({
     mutationFn: (body: SendProjectCopilotMessageRequest) =>
       sendProjectCopilotMessage(projectId, body),
+  })
+}
+
+export function useProjectCopilotRunLogsQuery(
+  projectId: string,
+  runId: string | null,
+  enabled: boolean,
+  poll: boolean,
+) {
+  return useQuery({
+    queryKey: [...projectCopilotQueryKeys.run(projectId, runId ?? 'none'), 'logs'],
+    queryFn: () => getProjectCopilotRunLogs(projectId, runId!),
+    enabled: Boolean(projectId && runId) && enabled,
+    refetchInterval: poll ? 1_500 : false,
   })
 }
 

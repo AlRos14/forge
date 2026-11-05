@@ -36,6 +36,9 @@ pub fn with_runtime_environment(
     let env = object
         .entry("env")
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if env.is_null() {
+        *env = Value::Object(serde_json::Map::new());
+    }
     let env = env.as_object_mut().ok_or_else(|| {
         ExecutorError::Other("normalized harness env must be an object".to_owned())
     })?;
@@ -726,6 +729,25 @@ mod tests {
         assert_eq!(resolved["auto_commit"], false);
         assert!(resolved.get("unknown_field").is_none());
         assert_eq!(resolved["additional_params"][0], "--verbose");
+    }
+
+    #[test]
+    fn runtime_environment_replaces_a_null_env() {
+        let resolved = resolve_config_value(
+            ExecutorKind::Opencode,
+            &serde_json::json!({"model": "opencode-go/deepseek-v4.1-flash"}),
+            &ExecutionOverrides::default(),
+        )
+        .expect("config resolves");
+        assert!(resolved["env"].is_null());
+
+        let merged = with_runtime_environment(
+            &resolved,
+            &serde_json::json!({"runtime_env": {"TOKEN": "secret"}}),
+        )
+        .expect("runtime env merges");
+
+        assert_eq!(merged["env"]["TOKEN"], "secret");
     }
 
     #[test]

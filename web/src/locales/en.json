@@ -159,6 +159,13 @@
     "copilotActor": "Copilot",
     "otherHuman": "Project member {{id}}",
     "actorId": "Actor ID: {{id}}",
+    "trace": {
+      "title": "Harness trace",
+      "hint": "Harness events for this run. Credentials are redacted.",
+      "loading": "Loading harness trace…",
+      "failed": "The harness trace could not be loaded.",
+      "empty": "No harness events have been recorded for this run yet."
+    },
     "activity": {
       "title": "Project activity",
       "loading": "Loading activity…",

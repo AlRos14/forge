@@ -203,6 +203,42 @@ impl ProjectCopilotService {
         })
     }
 
+    /// Reads the redacted harness JSONL trace for one exact Project run.
+    pub async fn run_logs(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        tail: Option<usize>,
+        from_sequence: u64,
+        limit: usize,
+    ) -> Result<executors::LogReadResult> {
+        let run = ProjectCopilotRepo::get_copilot_run_by_id(&*self.db, run_id)
+            .await?
+            .filter(|run| run.project_id == project_id)
+            .ok_or_else(|| ServiceError::not_found("project_copilot_run", run_id.to_owned()))?;
+        let path = self
+            .run_context_dir(&run)
+            .join("logs")
+            .join("copilot.jsonl");
+        let result = match tail {
+            Some(n) => executors::LogReader::tail(&path, n.clamp(1, 1_000)).await,
+            None => executors::LogReader::read(&path, from_sequence, limit.clamp(1, 1_000)).await,
+        };
+        match result {
+            Ok(result) => Ok(result),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(executors::LogReadResult {
+                    entries: Vec::new(),
+                    has_more: false,
+                    next_sequence: None,
+                })
+            }
+            Err(error) => Err(ServiceError::invalid_operation(format!(
+                "Project Copilot harness logs could not be read: {error}"
+            ))),
+        }
+    }
+
     pub async fn get_run(
         &self,
         project_id: &str,

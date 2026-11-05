@@ -23,6 +23,10 @@ PR14 audit on 2026-10-16.
   Agent. Forward migration V139 preserves existing Tasks and historical Agent
   data.
 
+- Add `GET /api/v1/projects/{id}/copilot/runs/{run_id}/logs` and a Harness
+  trace section in the Copilot panel. It exposes the run's redacted JSONL
+  harness events, including reasoning, tool, session, output, and error events,
+  and refreshes while the turn is active.
 - Remove Task classification and Task-level read-only settings from the UI,
   persistence, REST, and MCP contracts. Eligible Agent Executions receive a
   `repository_write` WorkspaceLease; Task type and read-only columns are
@@ -103,8 +107,10 @@ PR14 audit on 2026-10-16.
 
 - Run OpenCode Project Copilot turns against a private `--standalone` server
   so the per-run agent and MCP policy is loaded. OpenCode v2's background
-  server ignored the inline policy and rejected the Copilot agent. Failed
-  turns now remain visible next to the composer alongside the sending,
+  server ignored the inline policy and rejected the Copilot agent. The policy
+  is written as a real config file so MCP `{env:...}` authorization is
+  resolved, and runtime environment merging accepts a normalized null `env`.
+  Failed turns now remain visible next to the composer alongside the sending,
   running, and terminal state.
 - Serialize Project owner additions, removals, and role changes inside
   `BEGIN IMMEDIATE` transactions. Caller, target, last-owner, and canonical

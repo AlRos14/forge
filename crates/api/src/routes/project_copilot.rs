@@ -23,6 +23,13 @@ pub struct MessagesQuery {
     pub limit: Option<i64>,
 }
 
+#[derive(Deserialize)]
+pub struct LogsQuery {
+    pub tail: Option<usize>,
+    pub from_sequence: Option<u64>,
+    pub limit: Option<usize>,
+}
+
 pub async fn get(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -131,6 +138,34 @@ pub async fn run(
             .get_run(&project_id, &run_id)
             .await?,
     ))
+}
+
+pub async fn logs(
+    State(state): State<AppState>,
+    Path((project_id, run_id)): Path<(String, String)>,
+    user: AuthenticatedUser,
+    Query(query): Query<LogsQuery>,
+) -> ApiResult<Json<api_types::ExecutionLogsResponse>> {
+    super::projects::require_project_visible(&state, &project_id, &user.user_id).await?;
+    let result = state
+        .project_copilot_service
+        .run_logs(
+            &project_id,
+            &run_id,
+            query.tail,
+            query.from_sequence.unwrap_or(0),
+            query.limit.unwrap_or(200).clamp(1, 1_000),
+        )
+        .await?;
+    Ok(Json(api_types::ExecutionLogsResponse {
+        items: result
+            .entries
+            .into_iter()
+            .map(super::executions::execution_log_response)
+            .collect(),
+        has_more: result.has_more,
+        next_sequence: result.next_sequence,
+    }))
 }
 
 pub async fn cancel(

@@ -123,11 +123,12 @@ different host still fails closed. Agent creation no longer asks for a host.
 | DB Copilot authority, including an unpinned Agent with a resolved host | PASS — 4 tests |
 | Copilot service, including the unpinned success path | PASS — 7 tests |
 | API Copilot delegation/authority | PASS — 1 test |
-| Web unit suite | PASS — 26 files, 138 tests |
+| Web unit suite | PASS — 26 files, 139 tests |
 | Web typecheck and lint | PASS |
 | Rust formatting and Clippy for `services`, `db`, and `cli-adapters` | PASS |
 
 OpenCode v2 keeps a background server whose configuration is not reloaded per
 invocation. Project Copilot now passes `--standalone` so each turn runs with
 the per-run agent and MCP policy, and terminal failures remain visible next to
-the composer.
+the composer. A **Harness trace** section reads the run's redacted JSONL events
+through the scoped run-log endpoint while the turn runs and after it ends.

@@ -1,4 +1,5 @@
 import { apiFetch } from '@/api/client'
+import type { ExecutionLogsResponse } from '@/types/generated'
 import type {
   ProjectCopilotActivityResponse,
   ProjectCopilotMessagesResponse,
@@ -58,6 +59,17 @@ export function sendProjectCopilotMessage(
 export function getProjectCopilotRun(projectId: string, runId: string) {
   return apiFetch<ProjectCopilotRunDetailResponse>(
     `${projectCopilotPath(projectId)}/runs/${encodeURIComponent(runId)}`,
+  )
+}
+
+export function getProjectCopilotRunLogs(
+  projectId: string,
+  runId: string,
+  tail = 200,
+) {
+  return apiFetch<ExecutionLogsResponse>(
+    `${projectCopilotPath(projectId)}/runs/${encodeURIComponent(runId)}/logs`,
+    { search: { tail } },
   )
 }
 

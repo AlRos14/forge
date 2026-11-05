@@ -153,6 +153,10 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::project_copilot::run).delete(routes::project_copilot::cancel),
         )
         .route(
+            "/api/v1/projects/{id}/copilot/runs/{run_id}/logs",
+            get(routes::project_copilot::logs),
+        )
+        .route(
             "/api/v1/projects/{id}/pause",
             post(routes::projects::pause_project),
         )

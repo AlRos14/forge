@@ -89,6 +89,13 @@
     "copilotActor": "Copiloto",
     "otherHuman": "Miembro del proyecto {{id}}",
     "actorId": "ID del actor: {{id}}",
+    "trace": {
+      "title": "Traza del harness",
+      "hint": "Eventos del harness para este turno. Las credenciales están redactadas.",
+      "loading": "Cargando la traza del harness…",
+      "failed": "No se pudo cargar la traza del harness.",
+      "empty": "Todavía no hay eventos del harness para este turno."
+    },
     "activity": {
       "title": "Actividad del proyecto",
       "loading": "Cargando actividad…",
