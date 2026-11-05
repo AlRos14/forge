@@ -9,7 +9,7 @@ use db::{
     CollaborationRepo, CreateProject, ExecutionPurpose, ExecutionRepo, GateRepo, GateScopeKind,
     PageRequest, ProjectRepo, RoleMembershipRepo, SortBy, SortOrder, Task, TaskDependencyRepo,
     TaskLifecycleRepo, TaskListQuery, TaskRepo, TaskRoleRepo, UpdateProject, UpdateTask,
-    ValidationRunRepo,
+    ValidationRunRepo, WorkUnitDependency,
 };
 use executors::ExecutionOverrides;
 use serde_json::{json, Map, Value};
@@ -23,15 +23,16 @@ use crate::{
     error::McpToolError,
     params::{
         page_request, parse_params, task_page_request, AddTaskDependencyParams,
-        AddTaskRoleMemberParams, CollaborationListParams, CreateProjectParams,
-        CreateSubTasksParams, CreateTaskParams, CreateTaskRoleParams, EvidenceParams,
-        GateEvaluationParams, GateIdParams, GateTaskParams, GetProjectParams, GetTaskParams,
-        ListAgentProfilesParams, ListAgentsParams, ListExecutionsParams, ListProjectsParams,
-        ListTaskDependenciesParams, ListTasksParams, RegisterAgentParams,
-        RemoveTaskDependencyParams, ReviewExecutionParams, ReviewTaskParams,
-        ReviseGatePolicyParams, StartExecutionParams, TransitionTaskLifecycleParams,
-        UpdateProjectHooksParams, UpdateProjectParams, UpdateTaskParams, ValidationRunParams,
-        ValidationTaskParams,
+        AddTaskRoleMemberParams, AllocateWorkUnitParams, CollaborationListParams,
+        CreateProjectParams, CreateSubTasksParams, CreateTaskParams, CreateTaskRoleParams,
+        CreateWorkUnitParams, EvidenceParams, GateEvaluationParams, GateIdParams, GateTaskParams,
+        GetProjectParams, GetTaskParams, ListAgentProfilesParams, ListAgentsParams,
+        ListExecutionsParams, ListProjectsParams, ListTaskDependenciesParams, ListTasksParams,
+        ListWorkUnitsParams, RegisterAgentParams, RemoveTaskDependencyParams,
+        ReviewExecutionParams, ReviewTaskParams, ReviseGatePolicyParams, StartExecutionParams,
+        TransitionTaskLifecycleParams, UpdateProjectHooksParams, UpdateProjectParams,
+        UpdateTaskParams, UpdateWorkUnitParams, ValidationRunParams, ValidationTaskParams,
+        WorkUnitDependencyParams, WorkUnitIdParams, WorkUnitTransitionParams,
     },
     protocol::McpContext,
     state::AppState,
@@ -388,6 +389,294 @@ pub(super) async fn forge_update_task(
         })
         .await?;
     task_public_value(state, task).await
+}
+
+pub(super) async fn forge_create_work_unit(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: CreateWorkUnitParams = parse_params(params)?;
+    let source = work_unit_source(context)?;
+    let provenance = params.provenance.map(|provenance| match provenance {
+        api_types::CreateWorkUnitProvenance::Actor { actor } => {
+            db::WorkUnitProvenance::Actor(work_unit_actor_to_db(actor))
+        }
+        api_types::CreateWorkUnitProvenance::WorkUnit { id } => {
+            db::WorkUnitProvenance::WorkUnit(id)
+        }
+        api_types::CreateWorkUnitProvenance::Artifact { id } => {
+            db::WorkUnitProvenance::Artifact(id)
+        }
+        api_types::CreateWorkUnitProvenance::External { id } => {
+            db::WorkUnitProvenance::External(id)
+        }
+    });
+    let unit = state
+        .work_unit_service
+        .create_idempotent(
+            source.clone(),
+            services::CreateWorkUnitInput {
+                task_id: params.task_id,
+                title: params.title,
+                scope: params.scope,
+                role: params.role,
+                parent_work_unit_id: params.parent_work_unit_id,
+                assigned_actor: params.assigned_actor.map(work_unit_actor_to_db),
+                requires_integration: params.requires_integration,
+                provenance,
+            },
+            &params.idempotency_key,
+        )
+        .await?;
+    work_unit_value_for(state, source, unit).await
+}
+
+pub(super) async fn forge_list_work_units(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: ListWorkUnitsParams = parse_params(params)?;
+    let source = work_unit_source(context)?;
+    let units = state
+        .work_unit_service
+        .list(source.clone(), &params.task_id)
+        .await?;
+    let mut items = Vec::with_capacity(units.len());
+    for unit in units {
+        items.push(work_unit_value_for(state, source.clone(), unit).await?);
+    }
+    let total_count = items.len();
+    Ok(json!({"items": items, "total_count": total_count}))
+}
+
+pub(super) async fn forge_get_work_unit(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: WorkUnitIdParams = parse_params(params)?;
+    let source = work_unit_source(context)?;
+    let unit = state
+        .work_unit_service
+        .get(source.clone(), &params.work_unit_id)
+        .await?;
+    work_unit_value_for(state, source, unit).await
+}
+
+pub(super) async fn forge_update_work_unit(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: UpdateWorkUnitParams = parse_params(params)?;
+    let source = work_unit_source(context)?;
+    let unit = state
+        .work_unit_service
+        .update(
+            source.clone(),
+            &params.work_unit_id,
+            params.expected_version,
+            params.title,
+            params.scope,
+            params.requires_integration,
+        )
+        .await?;
+    work_unit_value_for(state, source, unit).await
+}
+
+pub(super) async fn forge_allocate_work_unit(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: AllocateWorkUnitParams = parse_params(params)?;
+    let source = work_unit_source(context)?;
+    let unit = state
+        .work_unit_service
+        .allocate(
+            source.clone(),
+            &params.work_unit_id,
+            params.expected_version,
+            params.role,
+            params.assigned_actor.map(work_unit_actor_to_db),
+        )
+        .await?;
+    work_unit_value_for(state, source, unit).await
+}
+
+pub(super) async fn forge_list_work_unit_dependencies(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: WorkUnitIdParams = parse_params(params)?;
+    let dependencies = state
+        .work_unit_service
+        .dependencies(work_unit_source(context)?, &params.work_unit_id)
+        .await?;
+    Ok(json!({
+        "items": dependencies.iter().map(work_unit_dependency_value).collect::<Vec<_>>(),
+        "total_count": dependencies.len(),
+    }))
+}
+
+pub(super) async fn forge_add_work_unit_dependency(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: WorkUnitDependencyParams = parse_params(params)?;
+    let dependency = state
+        .work_unit_service
+        .add_dependency(
+            work_unit_source(context)?,
+            &params.work_unit_id,
+            &params.depends_on_work_unit_id,
+            params.expected_version,
+        )
+        .await?;
+    Ok(work_unit_dependency_value(&dependency))
+}
+
+pub(super) async fn forge_remove_work_unit_dependency(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: WorkUnitDependencyParams = parse_params(params)?;
+    let source = work_unit_source(context)?;
+    let unit = state
+        .work_unit_service
+        .remove_dependency(
+            source.clone(),
+            &params.work_unit_id,
+            &params.depends_on_work_unit_id,
+            params.expected_version,
+        )
+        .await?;
+    work_unit_value_for(state, source, unit).await
+}
+
+pub(super) async fn forge_transition_work_unit(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: WorkUnitTransitionParams = parse_params(params)?;
+    let status = match params.status {
+        api_types::WorkUnitStatus::Completed => db::WorkUnitStatus::Completed,
+        api_types::WorkUnitStatus::Cancelled => db::WorkUnitStatus::Cancelled,
+        api_types::WorkUnitStatus::Open => {
+            return Err(McpToolError::new(
+                -32602,
+                "WorkUnit cannot transition back to open",
+            ));
+        }
+    };
+    let source = work_unit_source(context)?;
+    let unit = state
+        .work_unit_service
+        .transition(
+            source.clone(),
+            &params.work_unit_id,
+            params.expected_version,
+            status,
+        )
+        .await?;
+    work_unit_value_for(state, source, unit).await
+}
+
+fn work_unit_source(context: &McpContext) -> Result<CollaborationActorSource, McpToolError> {
+    if let Some(run_id) = context.copilot_run_id.as_ref() {
+        return Ok(CollaborationActorSource::ProjectCopilot(run_id.clone()));
+    }
+    let user_id = context
+        .user_id
+        .as_ref()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| McpToolError::new(-32003, "authenticated server identity is required"))?;
+    Ok(CollaborationActorSource::Human(user_id.clone()))
+}
+
+fn work_unit_actor_to_db(actor: api_types::ActorRef) -> db::ActorRef {
+    match actor {
+        api_types::ActorRef::Human(id) => db::ActorRef::Human(id),
+        api_types::ActorRef::Agent(id) => db::ActorRef::Agent(id),
+    }
+}
+
+fn work_unit_actor_value(actor: &db::ActorRef) -> Value {
+    match actor {
+        db::ActorRef::Human(id) => json!(api_types::ActorRef::Human(id.clone())),
+        db::ActorRef::Agent(id) => json!(api_types::ActorRef::Agent(id.clone())),
+    }
+}
+
+fn work_unit_provenance_value(provenance: &db::WorkUnitProvenance) -> Value {
+    match provenance {
+        db::WorkUnitProvenance::Actor(actor) => {
+            json!(api_types::WorkUnitProvenance::Actor {
+                actor: match actor {
+                    db::ActorRef::Human(id) => api_types::ActorRef::Human(id.clone()),
+                    db::ActorRef::Agent(id) => api_types::ActorRef::Agent(id.clone()),
+                }
+            })
+        }
+        db::WorkUnitProvenance::WorkUnit(id) => {
+            json!(api_types::WorkUnitProvenance::WorkUnit { id: id.clone() })
+        }
+        db::WorkUnitProvenance::Artifact(id) => {
+            json!(api_types::WorkUnitProvenance::Artifact { id: id.clone() })
+        }
+        db::WorkUnitProvenance::External(id) => {
+            json!(api_types::WorkUnitProvenance::External { id: id.clone() })
+        }
+        db::WorkUnitProvenance::LegacyActor(id) => {
+            json!(api_types::WorkUnitProvenance::LegacyActor { id: id.clone() })
+        }
+    }
+}
+
+fn work_unit_dependency_value(dependency: &WorkUnitDependency) -> Value {
+    json!({
+        "work_unit_id": dependency.work_unit_id,
+        "depends_on_work_unit_id": dependency.depends_on_work_unit_id,
+        "satisfied": dependency.satisfied,
+        "created_at": dependency.created_at,
+    })
+}
+
+async fn work_unit_value_for(
+    state: &AppState,
+    source: CollaborationActorSource,
+    unit: db::WorkUnit,
+) -> Result<Value, McpToolError> {
+    let readiness = state.work_unit_service.readiness(source, &unit.id).await?;
+    Ok(json!({
+        "id": unit.id,
+        "task_id": unit.task_id,
+        "parent_work_unit_id": unit.parent_work_unit_id,
+        "title": unit.title,
+        "scope": unit.scope,
+        "status": unit.status.to_string(),
+        "role": unit.role,
+        "assigned_actor": unit.assigned_actor.as_ref().map(work_unit_actor_value),
+        "requires_integration": unit.requires_integration,
+        "provenance": unit.provenance.as_ref().map(work_unit_provenance_value),
+        "created_by": work_unit_actor_value(&unit.created_by),
+        "version": unit.version,
+        "created_at": unit.created_at,
+        "updated_at": unit.updated_at,
+        "readiness": {
+            "runnable": readiness.runnable,
+            "ready_for_allocation": readiness.ready_for_allocation,
+            "active_execution_ids": readiness.active_execution_ids,
+            "unsatisfied_dependency_ids": readiness.unsatisfied_dependency_ids,
+            "awaiting_integration": readiness.awaiting_integration,
+        }
+    }))
 }
 
 pub(super) async fn forge_register_agent(

@@ -68,6 +68,7 @@ mod personal_access_token;
 mod pr_metadata;
 mod pr_provider_config;
 mod project;
+mod project_copilot;
 mod project_hook_run;
 mod project_member;
 mod project_task_role_defaults;

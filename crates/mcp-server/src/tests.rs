@@ -136,6 +136,8 @@ fn user_mcp_context(user_id: &str) -> McpContext {
         project_id: None,
         user_id: Some(user_id.to_owned()),
         is_admin: false,
+        copilot_run_id: None,
+        copilot_task_id: None,
     }
 }
 
@@ -659,6 +661,8 @@ fn admin_mcp_context() -> McpContext {
         project_id: None,
         user_id: Some("test-admin".to_owned()),
         is_admin: true,
+        copilot_run_id: None,
+        copilot_task_id: None,
     }
 }
 
@@ -720,6 +724,8 @@ async fn call_tool_scoped(
             project_id: Some(project_id.to_owned()),
             user_id: Some("test-user".to_owned()),
             is_admin: false,
+            copilot_run_id: None,
+            copilot_task_id: None,
         },
         "tools/call",
         json!({
@@ -783,11 +789,14 @@ fn tools_list_returns_descriptors() {
         let expected = [
             "forge_add_task_dependency",
             "forge_add_task_role_member",
+            "forge_add_work_unit_dependency",
+            "forge_allocate_work_unit",
             "forge_create_project",
             "forge_create_task_role",
             "forge_create_sub_tasks",
             "forge_create_task",
             "forge_follow_up_execution",
+            "forge_create_work_unit",
             "forge_get_evidence",
             "forge_get_gate",
             "forge_get_gate_evaluation",
@@ -797,6 +806,7 @@ fn tools_list_returns_descriptors() {
             "forge_get_task_diff",
             "forge_get_task_lifecycle",
             "forge_get_validation_run",
+            "forge_get_work_unit",
             "forge_list_agent_profiles",
             "forge_list_agents",
             "forge_list_executions",
@@ -812,16 +822,21 @@ fn tools_list_returns_descriptors() {
             "forge_list_task_roles",
             "forge_list_tasks",
             "forge_list_validation_runs",
+            "forge_list_work_unit_dependencies",
+            "forge_list_work_units",
             "forge_register_agent",
             "forge_remove_task_dependency",
+            "forge_remove_work_unit_dependency",
             "forge_revise_gate_policy",
             "forge_create_task_gate",
             "forge_evaluate_gate",
             "forge_transition_task_lifecycle",
+            "forge_transition_work_unit",
             "forge_start_execution",
             "forge_update_project",
             "forge_update_project_hooks",
             "forge_update_task",
+            "forge_update_work_unit",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -870,6 +885,8 @@ fn task_role_membership_tools_require_identity_and_keep_exact_actor_ref() {
             project_id: None,
             user_id: Some("test-user".to_owned()),
             is_admin: false,
+            copilot_run_id: None,
+            copilot_task_id: None,
         };
         let created = dispatch_with_context(
             &state,
@@ -1077,6 +1094,8 @@ fn scoped_tools_list_marks_project_id_optional() {
                 project_id: Some("project-1".to_owned()),
                 user_id: Some("test-user".to_owned()),
                 is_admin: false,
+                copilot_run_id: None,
+                copilot_task_id: None,
             },
             "tools/list",
             json!({}),
@@ -1272,6 +1291,10 @@ fn forge_create_task_rejects_retired_type_selection() {
     run_async(async {
         let state = sqlite_state().await;
         let (project_id, _) = seed_project_repo(&state).await;
+        let task_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task")
+            .fetch_one(state.db.pool())
+            .await
+            .expect("task count before unknown-field rejection");
         let error = call_tool_error(
             &state,
             "forge_create_task",
@@ -1285,11 +1308,13 @@ fn forge_create_task_rejects_retired_type_selection() {
 
         assert_eq!(error.code, -32602);
         let data = error.data.expect("error data");
-        assert_eq!(data["field"], "type");
-        assert!(data["details"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("retired"));
+        let details = data["details"].as_str().unwrap_or_default();
+        assert!(details.contains("unknown field") && details.contains("type"));
+        let task_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task")
+            .fetch_one(state.db.pool())
+            .await
+            .expect("task count after unknown-field rejection");
+        assert_eq!(task_count_after, task_count_before);
     });
 }
 
@@ -1369,6 +1394,8 @@ fn scoped_mcp_rejects_mismatched_project_id() {
                 project_id: Some(project_id),
                 user_id: Some("test-user".to_owned()),
                 is_admin: false,
+                copilot_run_id: None,
+                copilot_task_id: None,
             },
             "tools/call",
             json!({
@@ -1418,6 +1445,8 @@ fn scoped_mcp_rejects_task_id_tool_for_other_project() {
                 project_id: Some(scoped_project_id),
                 user_id: Some("test-user".to_owned()),
                 is_admin: false,
+                copilot_run_id: None,
+                copilot_task_id: None,
             },
             "tools/call",
             json!({
@@ -1447,6 +1476,8 @@ fn scoped_mcp_rejects_parent_task_id_tool_for_other_project() {
                 project_id: Some(scoped_project_id),
                 user_id: Some("test-user".to_owned()),
                 is_admin: false,
+                copilot_run_id: None,
+                copilot_task_id: None,
             },
             "tools/call",
             json!({
@@ -1481,6 +1512,8 @@ fn scoped_mcp_rejects_execution_id_tool_for_other_project() {
                 project_id: Some(scoped_project_id),
                 user_id: Some("test-user".to_owned()),
                 is_admin: false,
+                copilot_run_id: None,
+                copilot_task_id: None,
             },
             "tools/call",
             json!({
@@ -2657,4 +2690,476 @@ fn uncertain_execution_start_maps_to_a_structured_no_retry_error() {
             .and_then(Value::as_str),
         Some("execution-uncertain")
     );
+}
+
+#[test]
+fn mcp_project_copilot_lists_only_delegated_management_tools() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (copilot_project_id, _) =
+            seed_private_project_repo(&state, "test-user", "Copilot Project").await;
+        let (_other_project_id, _) =
+            seed_private_project_repo(&state, "test-user", "Private Agent Project").await;
+        let private_agent_id = seed_private_agent(&state, "test-user").await;
+        let private_profiles = db::AgentProfileRepo::list_profiles(&*state.db, &private_agent_id)
+            .await
+            .expect("the same human owner can read the private Agent profile");
+        assert!(!private_profiles.is_empty());
+        let human_profile = call_tool_as(
+            &state,
+            &user_mcp_context("test-user"),
+            "forge_list_agent_profiles",
+            json!({"identity_id": private_agent_id.clone()}),
+        )
+        .await;
+        assert!(!human_profile["items"].as_array().unwrap().is_empty());
+
+        let copilot = McpContext {
+            project_id: Some(copilot_project_id),
+            user_id: Some("test-user".to_owned()),
+            is_admin: false,
+            copilot_run_id: Some("copilot-run-1".to_owned()),
+            copilot_task_id: None,
+        };
+        let listed = dispatch_with_context(&state, &copilot, "tools/list", json!({}))
+            .await
+            .expect("Copilot tool list is available");
+        let names = listed["tools"]
+            .as_array()
+            .expect("tools is an array")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"forge_list_tasks"));
+        for name in [
+            "forge_get_task",
+            "forge_list_task_roles",
+            "forge_list_work_units",
+            "forge_get_work_unit",
+            "forge_create_work_unit",
+            "forge_update_work_unit",
+            "forge_allocate_work_unit",
+            "forge_list_work_unit_dependencies",
+            "forge_add_work_unit_dependency",
+            "forge_remove_work_unit_dependency",
+        ] {
+            assert!(names.contains(&name), "Copilot list includes {name}");
+        }
+        for name in [
+            "forge_start_execution",
+            "forge_list_agents",
+            "forge_list_agent_profiles",
+            "forge_transition_work_unit",
+            "forge_transition_task_lifecycle",
+            "forge_create_task_role",
+            "forge_add_task_role_member",
+            "forge_create_project",
+            "forge_update_project",
+            "forge_register_agent",
+        ] {
+            assert!(!names.contains(&name), "Copilot list excludes {name}");
+        }
+
+        let task_scoped = McpContext {
+            copilot_task_id: Some("task-context".to_owned()),
+            ..copilot.clone()
+        };
+        let listed = dispatch_with_context(&state, &task_scoped, "tools/list", json!({}))
+            .await
+            .expect("Task-scoped Copilot tool list is available");
+        let names = listed["tools"]
+            .as_array()
+            .expect("tools is an array")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"forge_list_tasks"));
+
+        let error = dispatch_with_context(
+            &state,
+            &task_scoped,
+            "tools/call",
+            json!({
+                "name": "forge_list_tasks",
+                "arguments": {}
+            }),
+        )
+        .await
+        .expect_err("Task-scoped Copilot cannot enumerate other Project Tasks");
+        assert_eq!(error.code, -32003);
+
+        let before = (
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project")
+                .fetch_one(state.db.pool())
+                .await
+                .expect("project count before forbidden calls"),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task")
+                .fetch_one(state.db.pool())
+                .await
+                .expect("task count before forbidden calls"),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM work_unit")
+                .fetch_one(state.db.pool())
+                .await
+                .expect("WorkUnit count before forbidden calls"),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution")
+                .fetch_one(state.db.pool())
+                .await
+                .expect("execution count before forbidden calls"),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM domain_event")
+                .fetch_one(state.db.pool())
+                .await
+                .expect("domain-event count before forbidden calls"),
+        );
+
+        for (name, arguments) in [
+            ("forge_start_execution", json!({"work_unit_id":"wu-1"})),
+            ("forge_list_agents", json!({"limit":10})),
+            (
+                "forge_list_agent_profiles",
+                json!({"identity_id":private_agent_id}),
+            ),
+            ("forge_create_task_role", json!({"task_id":"task-1"})),
+            ("forge_create_project", json!({"name":"unauthorized"})),
+            ("forge_transition_work_unit", json!({"work_unit_id":"wu-1"})),
+        ] {
+            let error = call_tool_error_as(&state, &copilot, name, arguments).await;
+            assert_eq!(error.code, -32003, "Copilot call rejects {name}");
+        }
+
+        let after = (
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project")
+                .fetch_one(state.db.pool())
+                .await
+                .expect("project count after forbidden calls"),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task")
+                .fetch_one(state.db.pool())
+                .await
+                .expect("task count after forbidden calls"),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM work_unit")
+                .fetch_one(state.db.pool())
+                .await
+                .expect("WorkUnit count after forbidden calls"),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution")
+                .fetch_one(state.db.pool())
+                .await
+                .expect("execution count after forbidden calls"),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM domain_event")
+                .fetch_one(state.db.pool())
+                .await
+                .expect("domain-event count after forbidden calls"),
+        );
+        assert_eq!(
+            after, before,
+            "forbidden Copilot tools have no durable effects"
+        );
+    });
+}
+
+#[test]
+fn mcp_work_unit_tools_create_allocate_manage_dependencies_and_fence_versions() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+        let role = TaskRoleRepo::create(
+            &*state.db,
+            CreateTaskRole {
+                id: new_uuid_v4(),
+                task_id: task.id.clone(),
+                role: "implementer".to_owned(),
+                coordination_mode: None,
+                policy_json: "{}".to_owned(),
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("TaskRole creates");
+        RoleMembershipRepo::add(
+            &*state.db,
+            CreateRoleMembership {
+                id: new_uuid_v4(),
+                task_role_id: role.id,
+                actor_kind: db::ActorKind::Human,
+                actor_id: "test-user".to_owned(),
+                status: RoleMembershipStatus::Active,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("current Human membership creates");
+
+        let first_args = json!({
+            "idempotency_key":"create-first-wu",
+            "task_id":task.id,
+            "title":"First WorkUnit",
+            "scope":"Bounded first scope",
+            "role":"implementer",
+            "requires_integration":false
+        });
+        let first = call_tool(&state, "forge_create_work_unit", first_args.clone()).await;
+        assert_eq!(first["version"], 1);
+        assert_eq!(first["created_by"]["kind"], "human");
+        assert_eq!(first["created_by"]["id"], "test-user");
+        let updated = call_tool(
+            &state,
+            "forge_update_work_unit",
+            json!({
+                "work_unit_id": first["id"],
+                "expected_version": 1,
+                "title": "First WorkUnit after edit"
+            }),
+        )
+        .await;
+        assert_eq!(updated["version"], 2);
+        let replay = call_tool(&state, "forge_create_work_unit", first_args.clone()).await;
+        assert_eq!(replay["id"], first["id"]);
+        assert_eq!(
+            replay["version"], 2,
+            "replay returns current WorkUnit state"
+        );
+        let first_id = first["id"].as_str().expect("first WorkUnit has ID");
+        let mut conflicting_replay = first_args;
+        conflicting_replay["title"] = json!("Changed request content");
+        let error = call_tool_error_as(
+            &state,
+            &user_mcp_context("test-user"),
+            "forge_create_work_unit",
+            conflicting_replay,
+        )
+        .await;
+        assert_eq!(error.code, -32602, "same key rejects different intent");
+
+        let second = call_tool(
+            &state,
+            "forge_create_work_unit",
+            json!({
+                "idempotency_key":"create-second-wu",
+                "task_id":task.id,
+                "title":"Second WorkUnit",
+                "scope":"Bounded second scope",
+                "role":"implementer",
+                "requires_integration":false
+            }),
+        )
+        .await;
+        let second_id = second["id"].as_str().expect("second WorkUnit has ID");
+        let listed = call_tool(&state, "forge_list_work_units", json!({"task_id":task.id})).await;
+        assert_eq!(listed["total_count"], 2);
+        assert_eq!(listed["items"].as_array().unwrap().len(), 2);
+        let fetched = call_tool(
+            &state,
+            "forge_get_work_unit",
+            json!({"work_unit_id":first_id}),
+        )
+        .await;
+        assert_eq!(fetched["id"], first_id);
+
+        let allocated = call_tool(
+            &state,
+            "forge_allocate_work_unit",
+            json!({
+                "work_unit_id":first_id,
+                "expected_version":2,
+                "role":"implementer",
+                "assigned_actor":{"kind":"human","id":"test-user"}
+            }),
+        )
+        .await;
+        assert_eq!(allocated["version"], 3);
+        assert_eq!(allocated["assigned_actor"]["id"], "test-user");
+
+        let dependency = call_tool(
+            &state,
+            "forge_add_work_unit_dependency",
+            json!({
+                "work_unit_id":second_id,
+                "depends_on_work_unit_id":first_id,
+                "expected_version":1
+            }),
+        )
+        .await;
+        assert_eq!(dependency["work_unit_id"], second_id);
+        assert_eq!(dependency["depends_on_work_unit_id"], first_id);
+        assert_eq!(dependency["satisfied"], false);
+        let dependencies = call_tool(
+            &state,
+            "forge_list_work_unit_dependencies",
+            json!({"work_unit_id":second_id}),
+        )
+        .await;
+        assert_eq!(dependencies["total_count"], 1);
+        assert_eq!(
+            dependencies["items"][0]["depends_on_work_unit_id"],
+            first_id
+        );
+
+        let removed = call_tool(
+            &state,
+            "forge_remove_work_unit_dependency",
+            json!({
+                "work_unit_id":second_id,
+                "depends_on_work_unit_id":first_id,
+                "expected_version":2
+            }),
+        )
+        .await;
+        assert_eq!(removed["version"], 3);
+        let dependencies = call_tool(
+            &state,
+            "forge_list_work_unit_dependencies",
+            json!({"work_unit_id":second_id}),
+        )
+        .await;
+        assert_eq!(dependencies["total_count"], 0);
+
+        let updated = call_tool(
+            &state,
+            "forge_update_work_unit",
+            json!({
+                "work_unit_id":second_id,
+                "expected_version":3,
+                "title":"Updated second WorkUnit"
+            }),
+        )
+        .await;
+        assert_eq!(updated["version"], 4);
+        assert_eq!(updated["title"], "Updated second WorkUnit");
+        let stale_update = call_tool_error_as(
+            &state,
+            &user_mcp_context("test-user"),
+            "forge_update_work_unit",
+            json!({
+                "work_unit_id":second_id,
+                "expected_version":3,
+                "title":"Stale update"
+            }),
+        )
+        .await;
+        assert_eq!(
+            stale_update.code, -32009,
+            "stale WorkUnit version conflicts"
+        );
+    });
+}
+
+#[test]
+fn scoped_mcp_work_unit_tools_reject_cross_project_task_and_dependency_ids() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_a, _) = seed_project_repo(&state).await;
+        let task_a = seed_task_in_project(&state, project_a.clone()).await;
+        let task_b = seed_task(&state).await;
+        for task_id in [&task_a.id, &task_b.id] {
+            TaskRoleRepo::create(
+                &*state.db,
+                CreateTaskRole {
+                    id: new_uuid_v4(),
+                    task_id: task_id.clone(),
+                    role: "implementer".to_owned(),
+                    coordination_mode: None,
+                    policy_json: "{}".to_owned(),
+                    created_at: now_rfc3339(),
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await
+            .expect("WorkUnit role creates");
+        }
+        let first = call_tool(
+            &state,
+            "forge_create_work_unit",
+            json!({
+                "idempotency_key":"scope-a",
+                "task_id":task_a.id,
+                "title":"A scope",
+                "scope":"Project A",
+                "role":"implementer",
+                "requires_integration":false
+            }),
+        )
+        .await;
+        let second = call_tool(
+            &state,
+            "forge_create_work_unit",
+            json!({
+                "idempotency_key":"scope-b",
+                "task_id":task_b.id,
+                "title":"B scope",
+                "scope":"Project B",
+                "role":"implementer",
+                "requires_integration":false
+            }),
+        )
+        .await;
+        let scoped = McpContext {
+            project_id: Some(project_a),
+            ..user_mcp_context("test-user")
+        };
+
+        for (tool, arguments) in [
+            (
+                "forge_create_work_unit",
+                json!({
+                    "idempotency_key":"cross-project-create",
+                    "task_id":task_b.id,
+                    "title":"Should fail",
+                    "scope":"Project B",
+                    "role":"implementer",
+                    "requires_integration":false
+                }),
+            ),
+            ("forge_list_work_units", json!({"task_id":task_b.id})),
+            ("forge_get_work_unit", json!({"work_unit_id":second["id"]})),
+            (
+                "forge_add_work_unit_dependency",
+                json!({
+                    "work_unit_id":first["id"],
+                    "depends_on_work_unit_id":second["id"],
+                    "expected_version":1
+                }),
+            ),
+        ] {
+            let error = call_tool_error_as(&state, &scoped, tool, arguments).await;
+            assert_eq!(error.code, -32602, "{tool} cannot cross Project scope");
+        }
+    });
+}
+
+#[test]
+fn viewer_can_read_a_task_but_cannot_mutate_its_work_units() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, _) =
+            seed_private_project_repo(&state, "test-admin", "Viewer project").await;
+        ProjectMemberRepo::add_member(
+            &*state.db,
+            CreateProjectMember {
+                id: new_uuid_v4(),
+                project_id: project_id.clone(),
+                user_id: "test-user".to_owned(),
+                role: "viewer".to_owned(),
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("viewer membership adds");
+        let task = seed_task_in_project(&state, project_id).await;
+        let error = call_tool_error_as(
+            &state,
+            &user_mcp_context("test-user"),
+            "forge_create_work_unit",
+            json!({
+                "idempotency_key":"viewer-create",
+                "task_id":task.id,
+                "title":"Viewer cannot create",
+                "scope":"Denied",
+                "role":"implementer",
+                "requires_integration":false
+            }),
+        )
+        .await;
+        assert_eq!(error.code, -32003, "viewer WorkUnit mutation is denied");
+    });
 }

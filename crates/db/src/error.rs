@@ -25,6 +25,9 @@ pub enum DbError {
     #[error("project owner or administrator membership is required")]
     ProjectAdminRequired,
 
+    #[error("Project owner, admin, or member membership is required")]
+    ProjectWriteRequired,
+
     #[error("version conflict")]
     VersionConflict,
 
@@ -63,6 +66,12 @@ pub enum DbError {
 
     #[error("WorkUnit Workspace is not available for Execution admission")]
     WorkUnitWorkspaceUnavailable,
+
+    #[error("Project Copilot already has an active run")]
+    ProjectCopilotActiveRun,
+
+    #[error("Project Copilot run authority is stale")]
+    ProjectCopilotRunAuthority,
 
     #[error("WorkUnit already has a Running Execution")]
     WorkUnitExecutionAlreadyRunning,

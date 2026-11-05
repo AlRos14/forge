@@ -137,6 +137,22 @@ pub fn api_router(state: AppState) -> Router {
                 .put(routes::projects::update_task_role_defaults),
         )
         .route(
+            "/api/v1/projects/{id}/copilot",
+            get(routes::project_copilot::get).put(routes::project_copilot::update),
+        )
+        .route(
+            "/api/v1/projects/{id}/copilot/messages",
+            get(routes::project_copilot::messages).post(routes::project_copilot::send),
+        )
+        .route(
+            "/api/v1/projects/{id}/copilot/activity",
+            get(routes::project_copilot::activity),
+        )
+        .route(
+            "/api/v1/projects/{id}/copilot/runs/{run_id}",
+            get(routes::project_copilot::run).delete(routes::project_copilot::cancel),
+        )
+        .route(
             "/api/v1/projects/{id}/pause",
             post(routes::projects::pause_project),
         )

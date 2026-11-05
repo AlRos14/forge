@@ -414,6 +414,14 @@ a WorkUnit, HarnessSession, Workspace, parent Execution, configuration and
 capability snapshots, usage, outputs, and timestamps. Identity-bearing fields
 are immutable after start.
 
+Project Copilot adds a separate Project management boundary: its durable run
+records the exact Project, Agent, requesting Human and configuration revision
+without claiming to be a Task Execution. Management conversations and WorkUnit
+decomposition proposals are Project activity. Formal Task deliverables and
+their Artifact producers continue to require real Task Executions. The
+[Project Copilot contract](../concepts/project-copilot.md) describes its bounded
+MCP delegation and transactional authority checks.
+
 ### INV-009 — Execution Purpose is not permission
 
 Purpose answers why an Execution exists. Permission and sandbox policy answer

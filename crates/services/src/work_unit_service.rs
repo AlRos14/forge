@@ -10,6 +10,8 @@ use db::{
     WorkUnitWorkspaceRepo, Workspace, WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
 };
 use events::EventBus;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 use workspace::{RepoCacheLockManager, WorkspaceManager};
 
 use crate::{
@@ -84,12 +86,86 @@ impl WorkUnitService {
         self.create_with_id(source, input, new_uuid_v4()).await
     }
 
+    /// Create or replay a WorkUnit by a caller-scoped idempotency key.
+    ///
+    /// The deterministic UUID is derived from the authenticated source, Task,
+    /// and key. `create_with_id` then compares the complete requested intent
+    /// against an existing row and returns a conflict if the key was reused
+    /// with different content.
+    pub async fn create_idempotent(
+        &self,
+        source: CollaborationActorSource,
+        input: CreateWorkUnitInput,
+        idempotency_key: &str,
+    ) -> Result<WorkUnit> {
+        if idempotency_key.trim().is_empty() {
+            return Err(invalid("WorkUnit idempotency key must not be empty"));
+        }
+        let source_identity = match &source {
+            CollaborationActorSource::Human(id) => format!("human:{id}"),
+            CollaborationActorSource::Execution(id) => format!("execution:{id}"),
+            CollaborationActorSource::ProjectCopilot(run_id) => {
+                format!("project_copilot:{run_id}")
+            }
+        };
+        let mut hasher = Sha256::new();
+        for component in [
+            "forge.work-unit.create.v1".as_bytes(),
+            source_identity.as_bytes(),
+            input.task_id.as_bytes(),
+            idempotency_key.as_bytes(),
+        ] {
+            hasher.update((component.len() as u64).to_be_bytes());
+            hasher.update(component);
+        }
+        let digest = hasher.finalize();
+        let mut id_bytes = [0_u8; 16];
+        id_bytes.copy_from_slice(&digest[..16]);
+        // UUIDv8 reserves the version and variant bits for this stable,
+        // domain-separated SHA-256 identifier.
+        id_bytes[6] = (id_bytes[6] & 0x0f) | 0x80;
+        id_bytes[8] = (id_bytes[8] & 0x3f) | 0x80;
+        let intent = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "source": source_identity,
+            "task_id": input.task_id,
+            "title": input.title,
+            "scope": input.scope,
+            "role": input.role,
+            "parent_work_unit_id": input.parent_work_unit_id,
+            "assigned_actor": input.assigned_actor,
+            "requires_integration": input.requires_integration,
+            "provenance": work_unit_provenance_intent(input.provenance.as_ref()),
+        }))
+        .map_err(|_| invalid("WorkUnit request could not be encoded"))?;
+        let request_digest = hex::encode(Sha256::digest(intent));
+        self.create_with_request_digest(
+            source,
+            input,
+            Uuid::from_bytes(id_bytes).to_string(),
+            Some(request_digest),
+        )
+        .await
+    }
+
     pub(crate) async fn create_with_id(
         &self,
         source: CollaborationActorSource,
         input: CreateWorkUnitInput,
         id: String,
     ) -> Result<WorkUnit> {
+        self.create_with_request_digest(source, input, id, None)
+            .await
+    }
+
+    async fn create_with_request_digest(
+        &self,
+        source: CollaborationActorSource,
+        input: CreateWorkUnitInput,
+        id: String,
+        request_digest: Option<String>,
+    ) -> Result<WorkUnit> {
+        let requested_input = input.clone();
         let CreateWorkUnitInput {
             task_id,
             title,
@@ -104,22 +180,11 @@ impl WorkUnitService {
             .collaboration
             .authorize_mutation_source(&task_id, &source)
             .await?;
-        if let Some(existing) = WorkUnitRepo::get_by_id(&*self.db, &id).await? {
-            if existing.task_id == task_id
-                && existing.title == title
-                && existing.scope == scope
-                && existing.role == role
-                && existing.parent_work_unit_id == parent_work_unit_id
-                && existing.assigned_actor == assigned_actor
-                && existing.requires_integration == requires_integration
-                && existing.provenance == provenance
-                && existing.created_by == actor
-            {
-                return Ok(existing);
-            }
-            return Err(ServiceError::conflict(
-                "WorkUnit idempotency key conflicts with an existing record",
-            ));
+        if let Some(existing) = self
+            .existing_work_unit_for_create(&id, &actor, &requested_input, request_digest.as_deref())
+            .await?
+        {
+            return Ok(existing);
         }
         if requires_integration && task.repo_id.is_none() {
             return Err(invalid(
@@ -139,6 +204,20 @@ impl WorkUnitService {
             )
             .await?;
         let result = async {
+        // A second caller can pass the initial lookup before the first caller
+        // commits. Recheck after acquiring the Task's serialized operation so
+        // the same idempotency key replays instead of hitting the unique ID.
+        if let Some(existing) = self
+            .existing_work_unit_for_create(
+                &id,
+                &actor,
+                &requested_input,
+                request_digest.as_deref(),
+            )
+            .await?
+        {
+            return Ok(existing);
+        }
         let legacy_authority_active: i64 = sqlx::query_scalar(
             "SELECT EXISTS(
                  SELECT 1 FROM execution e
@@ -219,14 +298,24 @@ impl WorkUnitService {
             }
         }
         let now = now_rfc3339();
+        let mut event_payload = serde_json::json!({
+            "task_id": task.id,
+            "work_unit_id": id,
+            "version": 1,
+            "status": "open"
+        });
+        if let Some(request_digest) = request_digest.as_deref() {
+            event_payload["idempotency_request_digest"] = serde_json::json!(request_digest);
+        }
         let mut event = self.event(
             "work_unit.created",
             "work_unit",
             &id,
             &task,
             &actor,
-            serde_json::json!({"task_id": task.id, "work_unit_id": id, "version": 1, "status": "open"}),
+            event_payload,
             &now,
+            &source,
         );
         if let CollaborationActorSource::Execution(execution_id) = &source {
             let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
@@ -294,6 +383,52 @@ impl WorkUnitService {
             (Ok(unit), Ok(_)) => Ok(unit),
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
+        }
+    }
+
+    async fn existing_work_unit_for_create(
+        &self,
+        id: &str,
+        actor: &ActorRef,
+        input: &CreateWorkUnitInput,
+        request_digest: Option<&str>,
+    ) -> Result<Option<WorkUnit>> {
+        let Some(existing) = WorkUnitRepo::get_by_id(&*self.db, id).await? else {
+            return Ok(None);
+        };
+        let matches_intent = if let Some(request_digest) = request_digest {
+            if existing.task_id != input.task_id || &existing.created_by != actor {
+                false
+            } else {
+                let stored_digest: Option<Option<String>> = sqlx::query_scalar(
+                    "SELECT json_extract(payload_json, '$.idempotency_request_digest')
+                     FROM domain_event
+                     WHERE event_type = 'work_unit.created'
+                       AND entity_type = 'work_unit' AND entity_id = ?
+                     ORDER BY sequence DESC LIMIT 1",
+                )
+                .bind(id)
+                .fetch_optional(self.db.pool())
+                .await?;
+                stored_digest.flatten().as_deref() == Some(request_digest)
+            }
+        } else {
+            existing.task_id == input.task_id
+                && existing.title == input.title
+                && existing.scope == input.scope
+                && existing.role == input.role
+                && existing.parent_work_unit_id == input.parent_work_unit_id
+                && existing.assigned_actor == input.assigned_actor
+                && existing.requires_integration == input.requires_integration
+                && existing.provenance == input.provenance
+                && &existing.created_by == actor
+        };
+        if matches_intent {
+            Ok(Some(existing))
+        } else {
+            Err(ServiceError::conflict(
+                "WorkUnit idempotency key conflicts with an existing record",
+            ))
         }
     }
 
@@ -367,6 +502,7 @@ impl WorkUnitService {
             &actor,
             serde_json::json!({"task_id": task.id, "work_unit_id": id, "version": next_version}),
             &now,
+            &source,
         );
         let write = WorkUnitRepo::update(
             &*self.db,
@@ -399,6 +535,7 @@ impl WorkUnitService {
         let event = self.event(
             "work_unit.allocation_changed", "work_unit", id, &task, &actor,
             serde_json::json!({"task_id": task.id, "work_unit_id": id, "version": expected_version + 1}), &now,
+            &source,
         );
         let write = WorkUnitRepo::allocate(
             &*self.db,
@@ -476,6 +613,7 @@ impl WorkUnitService {
         let event = self.event(
             event_name, "work_unit", id, &task, &actor,
             serde_json::json!({"task_id": task.id, "work_unit_id": id, "version": expected_version + 1, "status": status.to_string()}), &now,
+            &source,
         );
         let write = WorkUnitRepo::transition(
             &*self.db,
@@ -506,6 +644,7 @@ impl WorkUnitService {
         let event = self.event(
             "work_unit.dependency_added", "work_unit", id, &task, &actor,
             serde_json::json!({"task_id": task.id, "work_unit_id": id, "depends_on_work_unit_id": depends_on_id, "version": expected_version + 1}), &now,
+            &source,
         );
         let write = WorkUnitRepo::add_dependency(
             &*self.db,
@@ -537,6 +676,7 @@ impl WorkUnitService {
         let event = self.event(
             "work_unit.dependency_removed", "work_unit", id, &task, &actor,
             serde_json::json!({"task_id": task.id, "work_unit_id": id, "depends_on_work_unit_id": depends_on_id, "version": expected_version + 1}), &now,
+            &source,
         );
         let write = WorkUnitRepo::remove_dependency(
             &*self.db,
@@ -706,6 +846,7 @@ impl WorkUnitService {
         let event = self.event(
             "execution.started", "execution", &execution.id, &task, &actor,
             serde_json::json!({"task_id": task.id, "work_unit_id": id, "execution_id": execution.id, "work_unit_version": expected_version}), &now,
+            &source,
         );
         let write = WorkUnitExecutionRepo::create_for_work_unit(
             &*self.db,
@@ -1053,6 +1194,7 @@ impl WorkUnitService {
                         "integration_id": operation_owner
                     }),
                     &now,
+                    &source,
                 );
                 let write = WorkUnitRepo::begin_integration(
                     &*self.db,
@@ -1085,6 +1227,7 @@ impl WorkUnitService {
                         &record,
                         &task,
                         &actor,
+                        &source,
                         work_unit_id,
                         WorkUnitIntegrationOutcome::Success,
                         Some(after_sha),
@@ -1097,6 +1240,7 @@ impl WorkUnitService {
                         &record,
                         &task,
                         &actor,
+                        &source,
                         work_unit_id,
                         WorkUnitIntegrationOutcome::Failed,
                         None,
@@ -1111,6 +1255,7 @@ impl WorkUnitService {
                                 &record,
                                 &task,
                                 &actor,
+                                &source,
                                 work_unit_id,
                                 WorkUnitIntegrationOutcome::Failed,
                                 None,
@@ -1126,6 +1271,7 @@ impl WorkUnitService {
                                     &record,
                                     &task,
                                     &actor,
+                                    &source,
                                     work_unit_id,
                                     WorkUnitIntegrationOutcome::Success,
                                     Some(after_sha),
@@ -1137,6 +1283,7 @@ impl WorkUnitService {
                                     &record,
                                     &task,
                                     &actor,
+                                    &source,
                                     work_unit_id,
                                     WorkUnitIntegrationOutcome::Failed,
                                     None,
@@ -1154,6 +1301,7 @@ impl WorkUnitService {
                                 &record,
                                 &task,
                                 &actor,
+                                &source,
                                 work_unit_id,
                                 WorkUnitIntegrationOutcome::Conflict,
                                 None,
@@ -1173,6 +1321,7 @@ impl WorkUnitService {
                                     &record,
                                     &task,
                                     &actor,
+                                    &source,
                                     work_unit_id,
                                     WorkUnitIntegrationOutcome::Failed,
                                     None,
@@ -1184,6 +1333,7 @@ impl WorkUnitService {
                                     &record,
                                     &task,
                                     &actor,
+                                    &source,
                                     work_unit_id,
                                     WorkUnitIntegrationOutcome::Failed,
                                     None,
@@ -1221,6 +1371,7 @@ impl WorkUnitService {
         record: &WorkUnitIntegration,
         task: &Task,
         actor: &ActorRef,
+        source: &CollaborationActorSource,
         work_unit_id: &str,
         outcome: WorkUnitIntegrationOutcome,
         target_after_sha: Option<String>,
@@ -1245,6 +1396,7 @@ impl WorkUnitService {
                 "outcome": outcome.to_string()
             }),
             &now,
+            source,
         );
         let write = WorkUnitRepo::record_integration(
             &*self.db,
@@ -1315,6 +1467,7 @@ impl WorkUnitService {
         actor: &ActorRef,
         payload: serde_json::Value,
         now: &str,
+        source: &CollaborationActorSource,
     ) -> CreateDomainEvent {
         CreateDomainEvent {
             id: new_uuid_v4(),
@@ -1325,12 +1478,38 @@ impl WorkUnitService {
             actor_id: Some(actor.id().to_owned()),
             scope_type: "task".to_owned(),
             scope_id: task.id.clone(),
-            correlation_id: new_uuid_v4(),
+            correlation_id: match source {
+                CollaborationActorSource::ProjectCopilot(run_id) => run_id.clone(),
+                CollaborationActorSource::Human(_) | CollaborationActorSource::Execution(_) => {
+                    new_uuid_v4()
+                }
+            },
             causation_id: None,
             causation_depth: 0,
             dedupe_key: None,
             payload_json: payload.to_string(),
             created_at: now.to_owned(),
+        }
+    }
+}
+
+fn work_unit_provenance_intent(provenance: Option<&WorkUnitProvenance>) -> serde_json::Value {
+    match provenance {
+        None => serde_json::Value::Null,
+        Some(WorkUnitProvenance::Actor(actor)) => {
+            serde_json::json!({"kind":"actor","actor":actor})
+        }
+        Some(WorkUnitProvenance::WorkUnit(id)) => {
+            serde_json::json!({"kind":"work_unit","id":id})
+        }
+        Some(WorkUnitProvenance::Artifact(id)) => {
+            serde_json::json!({"kind":"artifact","id":id})
+        }
+        Some(WorkUnitProvenance::External(id)) => {
+            serde_json::json!({"kind":"external","id":id})
+        }
+        Some(WorkUnitProvenance::LegacyActor(id)) => {
+            serde_json::json!({"kind":"legacy_actor","id":id})
         }
     }
 }

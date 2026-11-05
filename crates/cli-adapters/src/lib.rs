@@ -206,7 +206,7 @@ mod capability_tests {
                 usage_reporting: S::Unsupported,
                 account_usage_observation: S::Unsupported,
                 model_selection: S::Native,
-                reasoning_controls: S::Unsupported,
+                reasoning_controls: S::Native,
                 approval_policy: S::Native,
                 sandbox_controls: S::Unsupported,
                 planning: S::Unsupported,

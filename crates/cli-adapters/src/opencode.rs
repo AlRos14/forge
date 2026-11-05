@@ -273,7 +273,8 @@ impl HarnessAdapter for OpencodeAdapter {
             &ctx.logs_path,
             ctx.execution_id.clone(),
             DEFAULT_MAX_OUTPUT_BYTES,
-        );
+        )
+        .with_runtime_secret_redactions(&ctx.agent_config);
         if let Some(sender) = ctx.log_sender.clone() {
             writer.set_log_sender(sender);
         }
@@ -386,27 +387,36 @@ impl HarnessAdapter for OpencodeAdapter {
             stream.agent_session_id.as_deref(),
         )?;
 
-        let after_sha = if let Ok(false) =
-            git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
-        {
+        let after_sha = if ctx.role == "project_copilot" {
+            None
+        } else if let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
-            crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
-                .await
-                .unwrap_or(None)
+            crate::commit::commit_worktree_changes_for_role(
+                &ctx.role,
+                Path::new(&ctx.worktree_path),
+                &subject,
+            )
+            .await
+            .unwrap_or(None)
         } else {
             None
         };
-        let after_sha = match after_sha {
-            Some(sha) => Some(sha),
-            None => git::get_current_sha(Path::new(&ctx.worktree_path))
-                .await
-                .ok(),
+        let after_sha = if ctx.role == "project_copilot" {
+            None
+        } else {
+            match after_sha {
+                Some(sha) => Some(sha),
+                None => git::get_current_sha(Path::new(&ctx.worktree_path))
+                    .await
+                    .ok(),
+            }
         };
 
         Ok(ExecutionResult {
             status: ExecutionOutcome::Completed,
             after_sha,
             agent_session_id: stream.agent_session_id,
+            assistant_output: stream.assistant_output,
             summary: stream.summary,
             error: None,
             usage: None,
@@ -579,6 +589,7 @@ fn parse_opencode_models(output: &str) -> Vec<String> {
 
 struct RunStreamResult {
     agent_session_id: Option<String>,
+    assistant_output: Option<String>,
     summary: Option<String>,
     error: Option<String>,
     stderr_tail: String,
@@ -594,6 +605,7 @@ async fn stream_run_output(
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut agent_session_id = None;
+    let mut assistant_output = None;
     let mut summary = None;
     let mut error = None;
     let mut stderr_tail = String::new();
@@ -605,12 +617,18 @@ async fn stream_run_output(
                     Some(line) => {
                         let cleaned = strip_ansi_codes(&line);
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&cleaned) {
-                            capture_run_event(&event, &mut agent_session_id, &mut summary, &mut error);
+                            capture_run_event(
+                                &event,
+                                &mut agent_session_id,
+                                &mut assistant_output,
+                                &mut summary,
+                                &mut error,
+                            );
                             writer.write(classify_run_event(&event), LogStream::Main, event).await?;
                         } else {
-                            if !cleaned.trim().is_empty() {
-                                summary = Some(truncate_summary(&cleaned));
-                            }
+                            // stdout outside the documented JSON text events can
+                            // contain diagnostics or tool output. Keep it in the
+                            // execution log, but never present it as assistant text.
                             writer
                                 .write(
                                     LogKind::Stdout,
@@ -644,6 +662,7 @@ async fn stream_run_output(
 
     Ok(RunStreamResult {
         agent_session_id,
+        assistant_output,
         summary,
         error,
         stderr_tail,
@@ -695,7 +714,11 @@ fn classify_run_event(event: &serde_json::Value) -> LogKind {
         LogKind::ToolCall
     } else if lower.contains("session") {
         LogKind::SessionInfo
-    } else if lower.contains("delta") || lower.contains("part") || lower.contains("message") {
+    } else if lower == "text"
+        || lower.contains("delta")
+        || lower.contains("part")
+        || lower.contains("message")
+    {
         LogKind::AssistantDelta
     } else {
         LogKind::Stdout
@@ -705,6 +728,7 @@ fn classify_run_event(event: &serde_json::Value) -> LogKind {
 fn capture_run_event(
     event: &serde_json::Value,
     agent_session_id: &mut Option<String>,
+    assistant_output: &mut Option<String>,
     summary: &mut Option<String>,
     error: &mut Option<String>,
 ) {
@@ -720,10 +744,157 @@ fn capture_run_event(
         return;
     }
 
-    if let Some(text) = extract_text(event)
+    if let Some(text) = extract_assistant_text(event)
         && !text.trim().is_empty()
     {
         *summary = Some(truncate_summary(&text));
+        append_assistant_text(assistant_output, &text);
+    }
+}
+
+/// Extract only user-visible assistant text from OpenCode's run JSON events.
+/// Tool results, reasoning parts, user messages, and generic diagnostics never
+/// become the Project Copilot response.
+fn extract_assistant_text(event: &serde_json::Value) -> Option<String> {
+    if has_non_assistant_role(event) {
+        return None;
+    }
+    let kind = event_type(event).to_ascii_lowercase();
+    if kind == "error"
+        || kind.contains("tool")
+        || kind.contains("reason")
+        || kind.contains("think")
+        || kind.contains("user")
+    {
+        return None;
+    }
+
+    match kind.as_str() {
+        "text" => {
+            if event.get("part").is_some_and(|part| {
+                part.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|part_type| part_type != "text")
+            }) {
+                return None;
+            }
+            event
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_owned)
+                .or_else(|| event.get("part").and_then(extract_visible_text_part))
+        }
+        "message" | "assistant" => {
+            let message = event.get("message").unwrap_or(event);
+            if has_non_assistant_role(message) {
+                return None;
+            }
+            extract_legacy_assistant_message(message)
+        }
+        _ => {
+            if kind.contains("tool")
+                || kind.contains("reason")
+                || kind.contains("think")
+                || kind.contains("user")
+            {
+                return None;
+            }
+            event
+                .get("part")
+                .and_then(extract_visible_text_part)
+                .or_else(|| event.get("parts").and_then(extract_visible_text_part))
+                .or_else(|| {
+                    event
+                        .get("data")
+                        .and_then(|data| data.get("part"))
+                        .and_then(extract_visible_text_part)
+                })
+        }
+    }
+}
+
+fn has_non_assistant_role(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    ["role", "speaker"]
+        .into_iter()
+        .filter_map(|key| object.get(key).and_then(serde_json::Value::as_str))
+        .any(|role| !role.eq_ignore_ascii_case("assistant"))
+}
+
+fn extract_legacy_assistant_message(value: &serde_json::Value) -> Option<String> {
+    for key in ["text", "content"] {
+        if let Some(text) = value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+        {
+            return Some(text.to_owned());
+        }
+    }
+    value
+        .get("parts")
+        .and_then(extract_visible_text_part)
+        .or_else(|| value.get("content").and_then(extract_visible_text_part))
+}
+
+fn extract_visible_text_part(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if has_non_assistant_role(value) {
+                return None;
+            }
+            if let Some(kind) = object.get("type").and_then(serde_json::Value::as_str) {
+                if kind != "text" {
+                    return None;
+                }
+                return object
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .map(str::to_owned);
+            }
+            for key in ["text"] {
+                if let Some(text) = object
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    return Some(text.to_owned());
+                }
+            }
+            ["part", "parts", "content"]
+                .into_iter()
+                .filter_map(|key| object.get(key))
+                .filter_map(extract_visible_text_part)
+                .reduce(|mut output, text| {
+                    output.push_str(&text);
+                    output
+                })
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(extract_visible_text_part)
+            .reduce(|mut output, text| {
+                output.push_str(&text);
+                output
+            }),
+        serde_json::Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn append_assistant_text(current: &mut Option<String>, text: &str) {
+    let Some(existing) = current.as_mut() else {
+        *current = Some(text.to_owned());
+        return;
+    };
+    if text.starts_with(existing.as_str()) {
+        *existing = text.to_owned();
+    } else if !existing.ends_with(text) {
+        existing.push_str(text);
     }
 }
 
@@ -780,50 +951,6 @@ fn extract_session_id(value: &serde_json::Value) -> Option<String> {
             None
         }
         serde_json::Value::Array(values) => values.iter().find_map(extract_session_id),
-        _ => None,
-    }
-}
-
-fn extract_text(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::Object(map) => {
-            for key in ["text", "content", "summary"] {
-                if let Some(text) = map.get(key).and_then(|v| v.as_str())
-                    && !text.trim().is_empty()
-                {
-                    return Some(text.to_owned());
-                }
-            }
-            for key in ["message", "part", "properties", "data"] {
-                if let Some(text) = map.get(key).and_then(extract_text) {
-                    return Some(text);
-                }
-            }
-            if let Some(parts) = map.get("parts").and_then(|v| v.as_array()) {
-                let text = parts
-                    .iter()
-                    .filter_map(extract_text)
-                    .collect::<Vec<_>>()
-                    .join("");
-                if !text.trim().is_empty() {
-                    return Some(text);
-                }
-            }
-            None
-        }
-        serde_json::Value::Array(values) => {
-            let text = values
-                .iter()
-                .filter_map(extract_text)
-                .collect::<Vec<_>>()
-                .join("");
-            if text.trim().is_empty() {
-                None
-            } else {
-                Some(text)
-            }
-        }
-        serde_json::Value::String(text) if !text.trim().is_empty() => Some(text.to_owned()),
         _ => None,
     }
 }
@@ -1273,15 +1400,32 @@ mod tests {
     }
 
     #[test]
-    fn extract_text_reads_nested_parts() {
-        let event = serde_json::json!({
-            "type": "message",
-            "parts": [
-                { "type": "text", "text": "hello" },
-                { "type": "text", "text": " world" }
-            ]
-        });
-        assert_eq!(extract_text(&event), Some("hello world".to_owned()));
+    fn assistant_output_excludes_reasoning_tools_and_user_messages() {
+        let events = [
+            serde_json::json!({"type":"reasoning","text":"private chain of thought"}),
+            serde_json::json!({"type":"tool_result","text":"internal tool output"}),
+            serde_json::json!({"type":"message","role":"user","text":"echoed input"}),
+            serde_json::json!({
+                "type":"message",
+                "message":{"role":"assistant","parts":[
+                    {"type":"text","text":"Visible answer"},
+                    {"type":"reasoning","text":"hidden reasoning"},
+                    {"type":"tool","text":"tool result"}
+                ]}
+            }),
+        ];
+        let mut output = None;
+        let mut summary = None;
+        let mut session = None;
+        let mut error = None;
+
+        for event in &events {
+            capture_run_event(event, &mut session, &mut output, &mut summary, &mut error);
+        }
+
+        assert_eq!(output.as_deref(), Some("Visible answer"));
+        assert_eq!(summary.as_deref(), Some("Visible answer"));
+        assert_eq!(error, None);
     }
 
     #[test]
@@ -1328,6 +1472,9 @@ if [ "${OPENCODE_PERMISSION+x}" = "x" ]; then
   exit 42
 fi
 printf '%s\n' '{"type":"step_start","sessionID":"ses_test","part":{"type":"step-start","sessionID":"ses_test"}}'
+printf '%s\n' 'provider diagnostic should not be returned as assistant text'
+printf '%s\n' '{"type":"reasoning","text":"private reasoning"}'
+printf '%s\n' '{"type":"tool_result","text":"internal tool output"}'
 printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"type":"text","text":"forge fake ok"}}'
 printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","sessionID":"ses_test"}}'
 "#,
@@ -1348,7 +1495,7 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
                 invocation: executors::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
-                role: "coder".to_owned(),
+                role: "project_copilot".to_owned(),
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),
                 agent_config: serde_json::json!({
@@ -1366,6 +1513,8 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
         assert_eq!(result.status, ExecutionOutcome::Completed);
         assert_eq!(result.agent_session_id, Some("ses_test".to_owned()));
         assert_eq!(result.summary, Some("forge fake ok".to_owned()));
+        assert_eq!(result.assistant_output.as_deref(), Some("forge fake ok"));
+        assert_eq!(result.after_sha, None);
     }
 
     #[cfg(target_os = "linux")]

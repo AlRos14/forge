@@ -18,6 +18,7 @@ pub struct LogWriter {
     segment_bytes: u64,
     initialization_error: Option<io::Error>,
     log_sender: Option<mpsc::UnboundedSender<LogEntry>>,
+    redactions: Vec<String>,
 }
 
 impl LogWriter {
@@ -35,11 +36,18 @@ impl LogWriter {
             segment_bytes: segment_bytes.max(1),
             initialization_error,
             log_sender: None,
+            redactions: Vec::new(),
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Redact runtime credentials before either persistence or live delivery.
+    pub fn with_runtime_secret_redactions(mut self, config: &serde_json::Value) -> Self {
+        self.redactions = runtime_secret_values(config);
+        self
     }
     pub fn set_log_sender(&mut self, sender: mpsc::UnboundedSender<LogEntry>) {
         self.log_sender = Some(sender);
@@ -81,6 +89,8 @@ impl LogWriter {
         if let Some(error) = &self.initialization_error {
             return Err(io::Error::new(error.kind(), error.to_string()));
         }
+        let mut payload = payload;
+        redact_value(&mut payload, &self.redactions);
         let entry = LogEntry {
             schema_version: 1,
             sequence: self.sequence,
@@ -138,11 +148,92 @@ impl LogWriter {
     }
 }
 
+fn runtime_secret_values(config: &serde_json::Value) -> Vec<String> {
+    ["runtime_env", "env"]
+        .into_iter()
+        .filter_map(|name| config.get(name)?.as_object())
+        .flat_map(|env| env.iter())
+        .filter_map(|(name, value)| {
+            let name = name.to_ascii_lowercase();
+            (name.contains("token") || name.contains("api_key") || name.contains("secret"))
+                .then(|| value.as_str())
+                .flatten()
+                .filter(|secret| !secret.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+pub fn redact_runtime_secrets(text: &str, config: &serde_json::Value) -> String {
+    runtime_secret_values(config)
+        .into_iter()
+        .fold(text.to_owned(), |text, secret| {
+            text.replace(&secret, "[REDACTED]")
+        })
+}
+
+fn redact_value(value: &mut serde_json::Value, secrets: &[String]) {
+    match value {
+        serde_json::Value::String(text) => {
+            for secret in secrets {
+                *text = text.replace(secret, "[REDACTED]");
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_value(item, secrets);
+            }
+        }
+        serde_json::Value::Object(items) => {
+            let original = std::mem::take(items);
+            for (mut key, mut item) in original {
+                for secret in secrets {
+                    key = key.replace(secret, "[REDACTED]");
+                }
+                redact_value(&mut item, secrets);
+                items.insert(key, item);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::LogReader;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn runtime_credentials_are_redacted_before_disk_and_live_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redacted.jsonl");
+        let config = json!({"runtime_env":{"FORGE_COPILOT_MCP_TOKEN":"fgc_never-log-me"},"env":{"PROVIDER_API_KEY":"provider-secret-value"}});
+        let mut writer = LogWriter::new(&path, "run".to_owned(), DEFAULT_MAX_OUTPUT_BYTES)
+            .with_runtime_secret_redactions(&config);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        writer.set_log_sender(sender);
+        writer
+            .write(
+                LogKind::System,
+                LogStream::Main,
+                json!({"nested":[{"output":"fgc_never-log-me provider-secret-value"}]}),
+            )
+            .await
+            .unwrap();
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(
+            event.payload["nested"][0]["output"],
+            "[REDACTED] [REDACTED]"
+        );
+        let disk = std::fs::read_to_string(path).unwrap();
+        assert!(!disk.contains("fgc_never-log-me"));
+        assert!(!disk.contains("provider-secret-value"));
+        assert_eq!(
+            redact_runtime_secrets("fgc_never-log-me", &config),
+            "[REDACTED]"
+        );
+    }
 
     #[tokio::test]
     async fn rotation_compression_restart_and_live_activity_are_lossless() {

@@ -20,6 +20,8 @@ pub(crate) struct McpContext {
     pub(crate) project_id: Option<String>,
     pub(crate) user_id: Option<String>,
     pub(crate) is_admin: bool,
+    pub(crate) copilot_run_id: Option<String>,
+    pub(crate) copilot_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,6 +71,7 @@ pub async fn mcp_handler(
     Query(query): Query<McpQuery>,
     headers: HeaderMap,
     mcp_user: Option<axum::Extension<McpUser>>,
+    copilot_grant: Option<axum::Extension<db::ProjectCopilotRunGrant>>,
     request: Result<Json<McpRequest>, JsonRejection>,
 ) -> Response {
     let request = match request {
@@ -98,10 +101,35 @@ pub async fn mcp_handler(
     let notification = is_notification(&request);
     let id = request.id.unwrap_or(Value::Null);
     let mcp_user = mcp_user.map(|user| user.0);
+    let requested_project = scoped_project_id(query.project_id, &headers);
+    let grant = copilot_grant.map(|grant| grant.0);
+    if grant.as_ref().is_some_and(|grant| {
+        requested_project
+            .as_ref()
+            .is_some_and(|id| id != &grant.project_id)
+    }) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(error_response(
+                id,
+                -32003,
+                "Copilot delegation belongs to another Project",
+                None,
+            )),
+        )
+            .into_response();
+    }
     let context = McpContext {
-        project_id: scoped_project_id(query.project_id, &headers),
+        project_id: grant
+            .as_ref()
+            .map(|grant| grant.project_id.clone())
+            .or(requested_project),
         user_id: mcp_user.as_ref().map(|user| user.user_id.clone()),
         is_admin: mcp_user.is_some_and(|user| user.is_admin),
+        copilot_task_id: grant
+            .as_ref()
+            .and_then(|grant| grant.context_task_id.clone()),
+        copilot_run_id: grant.map(|grant| grant.run_id),
     };
     let result = dispatch_with_context(&state, &context, &request.method, request.params).await;
 

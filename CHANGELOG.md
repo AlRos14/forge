@@ -10,6 +10,14 @@ PR14 audit on 2026-10-16.
 
 ### Added
 
+- Add a Project Copilot available throughout the Project UI, with an explicitly
+  assigned harness-bound Agent, durable conversation and Project management
+  runs. The local runner uses Claude Code with native tools disabled and a
+  revocable run-scoped Forge MCP connection. Other harnesses are rejected until
+  they can enforce the same management boundary. WorkUnit management tools reuse
+  domain services, preserve TaskRole eligibility and record the acting Agent.
+  Forward migration V139 preserves existing Tasks and historical Agent data.
+
 - Remove Task classification and Task-level read-only settings from the UI,
   persistence, REST, and MCP contracts. Eligible Agent Executions receive a
   `repository_write` WorkspaceLease; Task type and read-only columns are

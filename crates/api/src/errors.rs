@@ -441,6 +441,16 @@ impl From<ServiceError> for ApiError {
 impl From<DbError> for ApiError {
     fn from(error: DbError) -> Self {
         match error {
+            DbError::Sqlx(error)
+                if error.as_database_error().is_some_and(|error| {
+                    error.message() == "project copilot run authority is stale"
+                }) =>
+            {
+                Self::forbidden_with_code(
+                    "copilot_authority_lost",
+                    "The Project Copilot delegation is no longer valid",
+                )
+            }
             DbError::NotFound => Self {
                 status: StatusCode::NOT_FOUND,
                 code: "not_found",
@@ -470,6 +480,18 @@ impl From<DbError> for ApiError {
             DbError::ProjectAdminRequired => Self::forbidden_with_code(
                 "project_admin_required",
                 "Project owner or admin role is required",
+            ),
+            DbError::ProjectWriteRequired => Self::forbidden_with_code(
+                "project_write_required",
+                "Current Project write membership is required",
+            ),
+            DbError::ProjectCopilotActiveRun => Self::conflict_with_code(
+                "copilot_run_active",
+                "The Project Copilot already has an active turn",
+            ),
+            DbError::ProjectCopilotRunAuthority => Self::forbidden_with_code(
+                "copilot_authority_lost",
+                "The Project Copilot delegation is no longer valid",
             ),
             DbError::VersionConflict => Self {
                 status: StatusCode::CONFLICT,

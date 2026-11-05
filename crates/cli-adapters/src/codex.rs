@@ -480,11 +480,14 @@ impl HarnessAdapter for CodexAdapter {
             return Err(registration_error);
         }
 
-        let writer = Arc::new(AsyncMutex::new(LogWriter::new(
-            &ctx.logs_path,
-            ctx.execution_id.clone(),
-            DEFAULT_MAX_OUTPUT_BYTES,
-        )));
+        let writer = Arc::new(AsyncMutex::new(
+            LogWriter::new(
+                &ctx.logs_path,
+                ctx.execution_id.clone(),
+                DEFAULT_MAX_OUTPUT_BYTES,
+            )
+            .with_runtime_secret_redactions(&ctx.agent_config),
+        ));
         {
             let mut w = writer.lock().await;
             if let Some(sender) = ctx.log_sender.clone() {
@@ -655,7 +658,7 @@ impl CodexAdapter {
             let _ = client.cancel_turn(thread_id.clone(), turn_id).await;
         }
 
-        let auto_commit = config.auto_commit.unwrap_or(true);
+        let auto_commit = config.auto_commit.unwrap_or(true) && ctx.role != "project_copilot";
         // Commit reminder: if completed but worktree is dirty, nudge Codex once
         if auto_commit
             && outcome == ExecutionOutcome::Completed
@@ -718,10 +721,15 @@ impl CodexAdapter {
         if !auto_commit {
             return Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,
-                after_sha: git::get_current_sha(Path::new(&ctx.worktree_path))
-                    .await
-                    .ok(),
+                after_sha: if ctx.role == "project_copilot" {
+                    None
+                } else {
+                    git::get_current_sha(Path::new(&ctx.worktree_path))
+                        .await
+                        .ok()
+                },
                 agent_session_id,
+                assistant_output: summary.clone(),
                 summary,
                 error: None,
                 usage: usage.map(|usage| usage_with_model(usage, &config)),
@@ -756,6 +764,7 @@ impl CodexAdapter {
             status: ExecutionOutcome::Completed,
             after_sha,
             agent_session_id,
+            assistant_output: summary.clone(),
             summary,
             error: None,
             usage: usage.map(|usage| usage_with_model(usage, &config)),
@@ -1134,7 +1143,6 @@ mod tests {
         assert_eq!(discovered.reasoning_efforts, vec!["low", "ultra", "max"]);
     }
 
-    #[test]
     #[test]
     fn thread_start_params_maps_policy() {
         let config = CodexConfig {

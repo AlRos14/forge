@@ -20,6 +20,9 @@ use crate::{domain_event_service::DomainEventService, Result, ServiceError};
 pub enum CollaborationActorSource {
     Human(String),
     Execution(String),
+    /// A server-authenticated, live Project Copilot management run.
+    /// Identity is resolved from durable authority, never from request DTOs.
+    ProjectCopilot(String),
 }
 
 #[derive(Debug, Clone)]
@@ -1090,6 +1093,11 @@ impl CollaborationService {
         self.validate_artifact_links(&task.id, &input.artifact_ids)
             .await?;
         let (source_role_id, parent_execution_id) = match &source {
+            CollaborationActorSource::ProjectCopilot(_) => {
+                return Err(invalid(
+                    "Project Copilot management cannot author Execution Handoffs",
+                ));
+            }
             CollaborationActorSource::Human(user_id) => {
                 if let Some(role_id) = input.source_role_id.as_deref() {
                     self.require_membership(
@@ -1593,6 +1601,18 @@ impl CollaborationService {
             .await?
             .ok_or_else(|| not_found("task", task_id.to_owned()))?;
         let actor = match source {
+            CollaborationActorSource::ProjectCopilot(run_id) => {
+                let grant = db::ProjectCopilotRepo::authorize_run(&*self.db, run_id).await?;
+                if grant.project_id != task.project_id
+                    || grant
+                        .context_task_id
+                        .as_deref()
+                        .is_some_and(|id| id != task_id)
+                {
+                    return Err(not_found("task", task_id.to_owned()));
+                }
+                ActorRef::Agent(grant.agent_id)
+            }
             CollaborationActorSource::Human(user_id) => {
                 self.authorize_human_project(&project, user_id)
                     .await
@@ -1911,6 +1931,9 @@ impl CollaborationService {
         let mut correlation_id = new_uuid_v4();
         let mut causation_id = None;
         let mut causation_depth = 0;
+        if let CollaborationActorSource::ProjectCopilot(run_id) = source {
+            correlation_id = run_id.clone();
+        }
         if let CollaborationActorSource::Execution(execution_id) = source {
             let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
                 .await?

@@ -21,6 +21,12 @@ The workspace source version is 0.8.0. This repository has no verified published
 
 PR0–PR15 are merged. The current implementation uses the Actor and harness orchestration model, TaskLifecycle, TaskRole/RoleMembership, WorkUnits, explicit Executions and HarnessSessions, deterministic Gates, and generic collaboration. Main Agent, Project Agent, Agent Chat, Product Genesis, Project OS operations, legacy Attention, and the old WorkflowEngine are retired from current runtime/public authority. Their migration provenance and historical snapshots remain historical evidence.
 
+Project Copilot is a separate, explicit Project-to-Agent assignment with durable
+Project management runs and conversation. It uses the selected installed
+harness and a live Project-scoped MCP delegation. It creates no placeholder
+Task or WorkUnit and grants no worker Execution, TaskRole or WorkspaceLease
+authority. See [Project Copilot](docs/concepts/project-copilot.md).
+
 Authentication and authorization use current durable authority. Reusable JWT, PAT, OAuth, and daemon credentials are accepted only in `Authorization: Bearer`; `?token=` is rejected on REST, MCP, and daemon WebSockets. The browser SSE transport uses a 30-second single-use ticket from `POST /api/v1/events/ticket`. JWT verification and OAuth MCP verification load the current user row; token claims never supply current admin authority. `Project.owner_id` is canonical and must have an exact role-`owner` membership; V135 repairs historical representation without claiming ownerless Projects.
 
 The product name remains Forge until its owner provides a new name. Do not rename public or persisted identifiers, crates, commands, packages, variables, paths, or database records without that exact decision and a reviewed preservation plan.

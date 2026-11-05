@@ -38,7 +38,8 @@ use async_trait::async_trait;
 pub struct ExecutionContext {
     pub task_id: String,
     pub execution_id: String,
-    /// Generic TaskRole name for bounded adapter compatibility behavior.
+    /// Adapter routing label. `project_copilot` is a management run label and
+    /// does not represent a persisted TaskRole or Task Execution.
     pub role: String,
     pub worktree_path: String,
     pub description: String,
@@ -134,6 +135,15 @@ pub enum ExecutionOutcome {
 
 #[async_trait]
 pub trait TaskExecutor: Send + Sync {
+    /// Reserve cancellation state before an admitted execution can be cancelled.
+    /// Executors without shared process state may keep the default no-op.
+    fn prepare_execution(&self, _execution_id: &str) {}
+
+    /// Release cancellation state after the caller has persisted the terminal
+    /// outcome. This lets callers keep cancellation effective through result
+    /// persistence, even if the harness future has already returned.
+    fn finish_execution(&self, _execution_id: &str) {}
+
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError>;
     async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError>;
 

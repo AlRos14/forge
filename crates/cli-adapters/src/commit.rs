@@ -35,6 +35,19 @@ pub async fn commit_worktree_changes(
     Ok(Some(sha.trim().to_owned()))
 }
 
+/// Task adapters may commit into their exact Task Workspace. Project Copilot
+/// runs have a private management context and must not perform Git operations.
+pub async fn commit_worktree_changes_for_role(
+    role: &str,
+    worktree: &Path,
+    message_subject: &str,
+) -> Result<Option<String>, ExecutorError> {
+    if role == "project_copilot" {
+        return Ok(None);
+    }
+    commit_worktree_changes(worktree, message_subject).await
+}
+
 pub fn build_commit_subject(task_description: Option<&str>, fallback_title: &str) -> String {
     let subject_text = task_description
         .and_then(first_non_empty_line)
@@ -109,6 +122,18 @@ mod tests {
         let sha = commit_worktree_changes(tempdir.path(), "agent: noop")
             .await
             .expect("clean check succeeds");
+
+        assert_eq!(sha, None);
+    }
+
+    #[tokio::test]
+    async fn project_copilot_context_skips_git_operations_in_empty_directory() {
+        let tempdir = tempfile::tempdir().expect("tempdir creates");
+
+        let sha =
+            commit_worktree_changes_for_role("project_copilot", tempdir.path(), "copilot turn")
+                .await
+                .expect("management context does not invoke git");
 
         assert_eq!(sha, None);
     }

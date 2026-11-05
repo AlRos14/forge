@@ -1838,7 +1838,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn captures_cursor_stream_fields() {
         let mut session_id = None;
         let mut summary = None;

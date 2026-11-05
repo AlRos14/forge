@@ -200,7 +200,7 @@ impl ClaudeCodeAdapter {
         config: &ClaudeCodeConfig,
         resume_session_id: Option<&str>,
     ) -> tokio::process::Command {
-        Self::build_command_for_cwd(config, resume_session_id, None)
+        Self::build_command_for_cwd(config, resume_session_id, None, false)
     }
 
     /// Build a command for the exact requested session. Claude reports a
@@ -208,14 +208,17 @@ impl ClaudeCodeAdapter {
     fn build_command_for_cwd(
         config: &ClaudeCodeConfig,
         resume_session_id: Option<&str>,
-        _cwd: Option<&Path>,
+        cwd: Option<&Path>,
+        project_copilot: bool,
     ) -> tokio::process::Command {
-        Self::build_command_inner(config, resume_session_id)
+        Self::build_command_inner(config, resume_session_id, cwd, project_copilot)
     }
 
     fn build_command_inner(
         config: &ClaudeCodeConfig,
         resume_session_id: Option<&str>,
+        cwd: Option<&Path>,
+        project_copilot: bool,
     ) -> tokio::process::Command {
         let mut adapter_args = vec![
             "-p".to_owned(),
@@ -224,7 +227,30 @@ impl ClaudeCodeAdapter {
             "--include-partial-messages".to_owned(),
         ];
 
-        if config.dangerously_skip_permissions.unwrap_or(false) {
+        if project_copilot {
+            // Claude Code 2.1.317 (the locally verified CLI) supports an
+            // explicit empty built-in tool set. Strict MCP loading admits only
+            // the per-run config created by ProjectCopilotService.
+            adapter_args.extend([
+                "--setting-sources".to_owned(),
+                String::new(),
+                "--settings".to_owned(),
+                r#"{"disableAllHooks":true}"#.to_owned(),
+                "--disable-slash-commands".to_owned(),
+                "--tools".to_owned(),
+                String::new(),
+                "--strict-mcp-config".to_owned(),
+                "--mcp-config".to_owned(),
+                cwd.unwrap_or_else(|| Path::new("."))
+                    .join(".mcp.json")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--permission-mode".to_owned(),
+                "dontAsk".to_owned(),
+                "--allowedTools".to_owned(),
+                "mcp__forge_project__*".to_owned(),
+            ]);
+        } else if config.dangerously_skip_permissions.unwrap_or(false) {
             adapter_args.push("--dangerously-skip-permissions".to_owned());
         } else if let Some(permission_mode) = claude_permission_mode(config) {
             adapter_args.push("--permission-mode".to_owned());
@@ -251,7 +277,7 @@ impl ClaudeCodeAdapter {
             adapter_args.push(session_id.to_owned());
         }
 
-        let router_enabled = config.claude_code_router.unwrap_or(false);
+        let router_enabled = !project_copilot && config.claude_code_router.unwrap_or(false);
         let (program, default_args) = if router_enabled {
             let args = match config
                 .claude_code_router_profile
@@ -273,6 +299,22 @@ impl ClaudeCodeAdapter {
             .overrides(&config.command_overrides);
 
         let mut cmd = builder.build();
+        if project_copilot {
+            cmd.env_clear();
+            for (key, value) in std::env::vars_os() {
+                if key
+                    .to_str()
+                    .is_some_and(|key| COPILOT_HOST_ENV_ALLOWLIST.contains(&key))
+                {
+                    cmd.env(key, value);
+                }
+            }
+            if let Some(runtime_env) = &config.command_overrides.env {
+                for (key, value) in runtime_env {
+                    cmd.env(key, value);
+                }
+            }
+        }
         cmd.kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -284,8 +326,14 @@ impl ClaudeCodeAdapter {
             // the daemon inherited another default.
             cmd.env("CLAUDE_CODE_EFFORT_LEVEL", effort);
         }
-        if config.disable_api_key.unwrap_or(false) {
+        if !project_copilot && config.disable_api_key.unwrap_or(false) {
             cmd.env_remove("ANTHROPIC_API_KEY");
+        }
+        if project_copilot {
+            // User-specific settings and command extensions are checked before
+            // this builder is called. Keep the dedicated runtime environment
+            // (provider credentials and the single-use Forge MCP token).
+            cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
         }
         cmd
     }
@@ -296,6 +344,16 @@ impl ClaudeCodeAdapter {
         cancel: CancellationToken,
     ) -> Result<ExecutionResult, ExecutorError> {
         let config = Self::resolve_config(&ctx);
+        let project_copilot = ctx.role == "project_copilot";
+        if project_copilot {
+            validate_project_copilot_config(&config)?;
+            if !Path::new(&ctx.worktree_path).join(".mcp.json").is_file() {
+                return Err(ExecutorError::Other(
+                    "Project Copilot MCP configuration is missing".to_owned(),
+                ));
+            }
+            ensure_project_copilot_cli_supported().await?;
+        }
         if config.claude_code_router.unwrap_or(false)
             && config.command_overrides.base_command_override.is_none()
             && which::which("ccr").is_err()
@@ -315,12 +373,20 @@ impl ClaudeCodeAdapter {
                 config.command_overrides.env.as_ref(),
             )?;
         }
-        let mut cmd =
-            Self::build_command_for_cwd(&config, resume_session_id.as_deref(), Some(worktree));
+        let mut cmd = Self::build_command_for_cwd(
+            &config,
+            resume_session_id.as_deref(),
+            Some(worktree),
+            project_copilot,
+        );
         cmd.current_dir(&ctx.worktree_path);
         let run_started_at = std::time::SystemTime::now();
 
-        let hook_path = install_stop_hook(Path::new(&ctx.worktree_path)).await?;
+        let hook_path = if ctx.role == "project_copilot" {
+            None
+        } else {
+            install_stop_hook(Path::new(&ctx.worktree_path)).await?
+        };
 
         let mut child = ProcessGroupChild::spawn(&mut cmd)?;
         let stdin = match child.inner().stdin.take() {
@@ -436,10 +502,16 @@ impl ClaudeCodeAdapter {
             resume_session_id.as_deref(),
             agent_session_id.as_deref(),
         )?;
-        let after_sha = if status == ExecutionOutcome::Completed {
+        let after_sha = if status == ExecutionOutcome::Completed && ctx.role == "project_copilot" {
+            None
+        } else if status == ExecutionOutcome::Completed {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
-            match crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
-                .await
+            match crate::commit::commit_worktree_changes_for_role(
+                &ctx.role,
+                Path::new(&ctx.worktree_path),
+                &subject,
+            )
+            .await
             {
                 Ok(Some(sha)) => Some(sha),
                 Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))
@@ -495,6 +567,151 @@ impl ClaudeCodeAdapter {
         processes.remove(execution_id);
         Ok(())
     }
+}
+
+const COPILOT_HOST_ENV_ALLOWLIST: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PATH",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "SYSTEMROOT",
+    "WINDIR",
+    "PATHEXT",
+    "TMP",
+    "TEMP",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_API_KEY_HELPER",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "ANTHROPIC_VERTEX_REGION",
+    "CLOUD_ML_REGION",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+];
+
+fn validate_project_copilot_config(config: &ClaudeCodeConfig) -> Result<(), ExecutorError> {
+    if config.command_overrides.base_command_override.is_some()
+        || config
+            .command_overrides
+            .additional_params
+            .as_ref()
+            .is_some_and(|args| !args.is_empty())
+        || config.claude_code_router == Some(true)
+        || config.dangerously_skip_permissions == Some(true)
+        || config.plan == Some(true)
+        || config.permission_policy != Some(PermissionPolicy::Supervised)
+    {
+        return Err(ExecutorError::Other(
+            "Project Copilot Agent config does not satisfy MCP-only harness policy".to_owned(),
+        ));
+    }
+
+    let env =
+        config.command_overrides.env.as_ref().ok_or_else(|| {
+            ExecutorError::Other("Project Copilot MCP token is missing".to_owned())
+        })?;
+    const RUNTIME_ENV_ALLOWLIST: &[&str] = &[
+        "FORGE_COPILOT_MCP_TOKEN",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "XAI_API_KEY",
+        "OPENROUTER_API_KEY",
+    ];
+    if !env
+        .get("FORGE_COPILOT_MCP_TOKEN")
+        .is_some_and(|token| !token.is_empty())
+        || env
+            .keys()
+            .any(|key| !RUNTIME_ENV_ALLOWLIST.contains(&key.as_str()))
+    {
+        return Err(ExecutorError::Other(
+            "Project Copilot runtime environment contains unsupported values".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_project_copilot_cli_supported() -> Result<(), ExecutorError> {
+    let output = crate::command::output_with_timeout(
+        {
+            let mut command = Command::new("claude");
+            command.arg("--help");
+            command
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .filter(|output| output.status.success())
+    .ok_or_else(|| {
+        ExecutorError::Unavailable(
+            "Project Copilot could not verify Claude Code's MCP-only CLI options".to_owned(),
+        )
+    })?;
+    let help = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if project_copilot_cli_supports_mcp_only(&help) {
+        Ok(())
+    } else {
+        Err(ExecutorError::Unavailable(
+            "Project Copilot requires Claude Code CLI support for MCP-only tool isolation"
+                .to_owned(),
+        ))
+    }
+}
+
+fn project_copilot_cli_supports_mcp_only(help: &str) -> bool {
+    let normalized_help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    let required = [
+        "--setting-sources <sources>",
+        "--settings <file-or-json>",
+        "--disable-slash-commands",
+        "--strict-mcp-config",
+        "--tools <tools...>",
+        "Use \"\" to disable all tools",
+        "--allowedTools",
+        "dontAsk",
+    ];
+    required
+        .iter()
+        .all(|option| normalized_help.contains(option))
 }
 
 impl Default for ClaudeCodeAdapter {
@@ -684,7 +901,8 @@ async fn stream_child_output(
         &ctx.logs_path,
         ctx.execution_id.clone(),
         DEFAULT_MAX_OUTPUT_BYTES,
-    );
+    )
+    .with_runtime_secret_redactions(&ctx.agent_config);
     if let Some(sender) = ctx.log_sender.clone() {
         writer.set_log_sender(sender);
     }
@@ -1354,7 +1572,7 @@ mod tests {
             command_overrides: CommandOverrides::default(),
             ..ClaudeCodeConfig::default()
         };
-        let cmd = ClaudeCodeAdapter::build_command_inner(&config, Some(session_id));
+        let cmd = ClaudeCodeAdapter::build_command_inner(&config, Some(session_id), None, false);
         let args: Vec<_> = cmd
             .as_std()
             .get_args()
@@ -1425,6 +1643,111 @@ mod tests {
                 "session-123"
             ]
         );
+    }
+
+    #[test]
+    fn project_copilot_command_disables_native_tools_and_restricts_mcp() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = ClaudeCodeConfig {
+            model: Some("claude-sonnet-4-6".to_owned()),
+            effort: Some("high".to_owned()),
+            permission_policy: Some(PermissionPolicy::Supervised),
+            dangerously_skip_permissions: Some(true),
+            plan: Some(true),
+            command_overrides: CommandOverrides::default(),
+            ..ClaudeCodeConfig::default()
+        };
+        let cmd = ClaudeCodeAdapter::build_command_for_cwd(&config, None, Some(cwd.path()), true);
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let has_pair = |flag: &str, value: &str| {
+            args.windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value)
+        };
+
+        assert!(has_pair("--tools", ""));
+        assert!(has_pair("--setting-sources", ""));
+        assert!(has_pair("--settings", r#"{"disableAllHooks":true}"#));
+        assert!(has_pair("--permission-mode", "dontAsk"));
+        assert!(has_pair("--allowedTools", "mcp__forge_project__*"));
+        assert!(has_pair(
+            "--mcp-config",
+            cwd.path().join(".mcp.json").to_str().unwrap()
+        ));
+        assert!(args.contains(&"--strict-mcp-config".to_owned()));
+        assert!(args.contains(&"--disable-slash-commands".to_owned()));
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_owned()));
+        assert!(!args.contains(&"--bare".to_owned()));
+        assert!(args.contains(&"claude-sonnet-4-6".to_owned()));
+        assert!(args.contains(&"high".to_owned()));
+    }
+
+    #[test]
+    fn project_copilot_config_accepts_only_runtime_credentials_and_safe_policy() {
+        let safe = ClaudeCodeConfig {
+            permission_policy: Some(PermissionPolicy::Supervised),
+            command_overrides: CommandOverrides {
+                env: Some(HashMap::from([
+                    (
+                        "FORGE_COPILOT_MCP_TOKEN".to_owned(),
+                        "single-use".to_owned(),
+                    ),
+                    ("OPENAI_API_KEY".to_owned(), "provider-key".to_owned()),
+                ])),
+                ..CommandOverrides::default()
+            },
+            ..ClaudeCodeConfig::default()
+        };
+        validate_project_copilot_config(&safe).expect("trusted runtime environment is allowed");
+
+        let unsafe_env = ClaudeCodeConfig {
+            permission_policy: Some(PermissionPolicy::Supervised),
+            command_overrides: CommandOverrides {
+                env: Some(HashMap::from([
+                    (
+                        "FORGE_COPILOT_MCP_TOKEN".to_owned(),
+                        "single-use".to_owned(),
+                    ),
+                    ("PATH".to_owned(), "/tmp/agent-bin".to_owned()),
+                ])),
+                ..CommandOverrides::default()
+            },
+            ..ClaudeCodeConfig::default()
+        };
+        assert!(validate_project_copilot_config(&unsafe_env).is_err());
+
+        let unsafe_args = ClaudeCodeConfig {
+            permission_policy: Some(PermissionPolicy::Supervised),
+            command_overrides: CommandOverrides {
+                additional_params: Some(vec!["--tools".to_owned(), "default".to_owned()]),
+                env: safe.command_overrides.env.clone(),
+                ..CommandOverrides::default()
+            },
+            ..ClaudeCodeConfig::default()
+        };
+        assert!(validate_project_copilot_config(&unsafe_args).is_err());
+    }
+
+    #[test]
+    fn project_copilot_cli_help_must_advertise_mcp_only_controls() {
+        let help = [
+            "--setting-sources <sources>",
+            "--settings <file-or-json>",
+            "--disable-slash-commands",
+            "--strict-mcp-config",
+            "--tools <tools...>",
+            "Use \"\" to disable all tools",
+            "--allowedTools",
+            "dontAsk",
+        ]
+        .join("\n");
+        assert!(project_copilot_cli_supports_mcp_only(&help));
+        assert!(!project_copilot_cli_supports_mcp_only(
+            "--tools <tools...> --strict-mcp-config"
+        ));
     }
 
     #[tokio::test]

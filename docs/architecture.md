@@ -56,6 +56,14 @@ Automatic Orchestrator execution requires the Agent owner and Task Project owner
 
 ## Harnesses and Executions
 
+The [Project Copilot](concepts/project-copilot.md) is an explicitly configured
+harness-bound Agent helping Humans organize a Project. Its persistent
+conversation and Project management runs are separate from Task Executions;
+they create no synthetic Task, TaskRole, WorkUnit or WorkspaceLease. A live,
+Project-scoped MCP delegation permits bounded WorkUnit management with exact
+Agent attribution and current ownership checks. Task execution and lifecycle
+authority continue to use the contracts below.
+
 `HarnessAdapter` is the boundary for supported harness detection, profile/configuration translation, capability evidence, Start/Resume, cancellation, normalized results, and usage observations. Forge fails closed when a required capability is unknown or unsupported. It does not read a harness's private credential store.
 
 A Human Execution has no HarnessSession. An Agent Execution references a HarnessSession explicitly when continuity is used. Resume never selects a session by Task, Role, Agent model label, or latest Execution.

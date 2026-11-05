@@ -1,6 +1,8 @@
 use std::str::FromStr;
 
-use api_types::{ExecutionPurpose, ProjectHookRule};
+use api_types::{
+    ActorRef, CreateWorkUnitProvenance, ExecutionPurpose, ProjectHookRule, WorkUnitStatus,
+};
 use db::{AgentStatus, PageRequest, SortBy, SortOrder, TaskLifecycleState};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
@@ -96,6 +98,67 @@ pub(crate) struct StartExecutionParams {
     pub(crate) prompt: String,
     #[serde(default)]
     pub(crate) input_artifact_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateWorkUnitParams {
+    pub(crate) idempotency_key: String,
+    pub(crate) task_id: String,
+    pub(crate) title: String,
+    pub(crate) scope: String,
+    pub(crate) role: String,
+    pub(crate) parent_work_unit_id: Option<String>,
+    pub(crate) assigned_actor: Option<ActorRef>,
+    pub(crate) requires_integration: bool,
+    pub(crate) provenance: Option<CreateWorkUnitProvenance>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListWorkUnitsParams {
+    pub(crate) task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkUnitIdParams {
+    pub(crate) work_unit_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateWorkUnitParams {
+    pub(crate) work_unit_id: String,
+    pub(crate) expected_version: i64,
+    pub(crate) title: Option<String>,
+    pub(crate) scope: Option<String>,
+    pub(crate) requires_integration: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AllocateWorkUnitParams {
+    pub(crate) work_unit_id: String,
+    pub(crate) expected_version: i64,
+    pub(crate) role: String,
+    pub(crate) assigned_actor: Option<ActorRef>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkUnitDependencyParams {
+    pub(crate) work_unit_id: String,
+    pub(crate) depends_on_work_unit_id: String,
+    pub(crate) expected_version: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkUnitTransitionParams {
+    pub(crate) work_unit_id: String,
+    pub(crate) expected_version: i64,
+    pub(crate) status: WorkUnitStatus,
 }
 
 #[derive(Debug, Deserialize)]

@@ -166,7 +166,7 @@ pub(crate) fn seal(path: &Path) -> io::Result<()> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "execution log is not a file",
-            ))
+            ));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err(error),

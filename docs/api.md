@@ -47,7 +47,8 @@ If a provider Start may have taken effect but its response is uncertain,
 `execution_start_uncertain`; its message identifies the exact Execution. Read
 that Execution and do not submit the Start again automatically.
 
-WorkUnit creation currently has no idempotency key. Validation of PR14's
+REST WorkUnit creation currently has no idempotency key. The MCP creation tool
+uses an explicit caller-scoped key. Validation of PR14's
 original head observed `POST /tasks/{task_id}/work-units` return
 `500 internal_error` with SQLite code 517 (`database is locked`) after the
 WorkUnit row had committed. A deterministic two-connection reproduction
@@ -70,6 +71,10 @@ the maximum is 100.
 | `GET /projects/{id}` | Read a Project and its generic Project hook configuration. |
 | `PATCH /projects/{id}` | Update Project identity, pause state, and supported generic hooks. |
 | `GET /projects/{id}/task-role-defaults`, `PUT /projects/{id}/task-role-defaults` | Read or replace the role-to-worker template copied into new ordinary Tasks. Reads require Project visibility; updates require owner/admin membership and `expected_version`. Humans must be current Project members. Agents must be owned by the canonical Project owner; global visibility alone is not consent to run an Agent from another account. |
+| `GET /projects/{id}/copilot`, `PUT /projects/{id}/copilot` | Read or assign the Project Copilot. Assignment accepts `expected_version` and nullable `agent_id`, requires current Project owner/admin authority and same-account Agent ownership. |
+| `GET /projects/{id}/copilot/messages`, `POST /projects/{id}/copilot/messages` | Read the durable Project conversation using an opaque cursor, or send `{content, idempotency_key, task_id?}`. Sending requires Project write authority and enabled MCP, returns HTTP 202 with the durable run and user message. An optional Task must belong to the same Project. |
+| `GET /projects/{id}/copilot/runs/{run_id}`, `DELETE /projects/{id}/copilot/runs/{run_id}` | Poll the exact run and its response, or cancel it. Cancellation revokes delegation; an uncertain or interrupted turn is not automatically replayed. |
+| `GET /projects/{id}/copilot/activity` | Read the Project's Copilot tool outcomes and domain mutations, newest first, with `limit` and an opaque keyset `cursor`. Includes the run, exact entity and optional Task reference; excludes tool argument bodies and credentials. |
 | `DELETE /projects/{id}` | Delete a Project under the existing workspace cleanup contract. |
 | `POST /projects/{id}/pause`, `POST /projects/{id}/resume` | Pause or resume the Project. |
 | `GET /projects/{id}/repos`, `POST /projects/{id}/repos` | List or add repositories. |
@@ -357,6 +362,22 @@ limited to administrators; resync hints carry no Project data.
 
 ## MCP
 
+Project Copilot harnesses receive a separate short-lived `fgc_` Bearer
+credential tied to an exact active Project management run. It is accepted
+only by MCP and never as a REST credential. Each use rechecks the binding,
+current requesting Human, current Agent ownership and expiry. Project scope is
+fixed by the authenticated delegation rather than client arguments. The
+Copilot's `tools/list` exposes context reads and WorkUnit create/update/allocate
+and dependency management only; execution start, WorkUnit completion, lifecycle,
+Gates, global administration and membership changes are outside its tool set.
+An attached Task also removes Project-wide Task listing and fences Task reads
+and mutations to that exact Task. The initial management runner supports local
+Claude Code with native tools disabled and strict per-run MCP configuration;
+Codex, OpenCode and remote hosts are rejected for management turns.
+WorkUnit mutations are attributed to the Agent, and durable activity events
+correlate them with the run and requesting Human. See
+[Project Copilot](concepts/project-copilot.md).
+
 MCP accepts the same current-authority Bearer credentials as REST: a PAT, an
 access JWT, or a valid OAuth MCP token. Query-string credentials are not
 accepted. OAuth access tokens are checked against their issuer, audience, and
@@ -378,6 +399,15 @@ The MCP server advertises only registered tools. The current tool names are:
 - Executions and roles: `forge_list_executions`, `forge_start_execution`,
   `forge_follow_up_execution`, `forge_list_task_roles`,
   `forge_create_task_role`, `forge_add_task_role_member`.
+- WorkUnits: `forge_create_work_unit`, `forge_list_work_units`,
+  `forge_get_work_unit`, `forge_update_work_unit`, `forge_allocate_work_unit`,
+  `forge_transition_work_unit`, `forge_list_work_unit_dependencies`,
+  `forge_add_work_unit_dependency`, `forge_remove_work_unit_dependency`.
+  Creation requires a caller-scoped `idempotency_key`; an exact retry returns
+  the current WorkUnit from its immutable creation intent, even after later
+  updates. Reusing the key with changed request content conflicts. Mutations
+  require exact expected versions where applicable and use the same domain
+  services as REST.
 - Gates and evidence: `forge_create_task_gate`, `forge_get_gate`,
   `forge_revise_gate_policy`, `forge_evaluate_gate`,
   `forge_get_gate_evaluation`, `forge_list_task_review_executions`,

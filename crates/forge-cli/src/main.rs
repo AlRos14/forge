@@ -172,6 +172,16 @@ async fn main() {
         Ok(_) => {}
         Err(error) => warn!(%error, "crash recovery failed"),
     }
+    // A management turn may already have applied MCP mutations before a crash.
+    // Preserve its history and revoke its credential; never replay that turn.
+    match db::ProjectCopilotRepo::recover_active_copilot_runs(&*db, &db::now_rfc3339()).await {
+        Ok(count) if count > 0 => info!(
+            recovered_count = count,
+            "interrupted Project Copilot turns recovered"
+        ),
+        Ok(_) => {}
+        Err(error) => panic!("Project Copilot crash recovery failed: {error}"),
+    }
 
     // 4. Start daemon monitor
     let daemon_monitor = Arc::new(services::DaemonMonitor::new(

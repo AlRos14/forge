@@ -1352,6 +1352,88 @@ pub trait ProjectTaskRoleDefaultsRepo: Send + Sync {
 }
 
 #[async_trait]
+pub trait ProjectCopilotRepo: Send + Sync {
+    async fn get_copilot_binding(&self, project_id: &str) -> Result<ProjectCopilotBinding>;
+    async fn update_copilot_binding(
+        &self,
+        project_id: &str,
+        caller_user_id: &str,
+        expected_version: i64,
+        agent_id: Option<&str>,
+        updated_at: &str,
+    ) -> Result<ProjectCopilotBinding>;
+    async fn create_copilot_run(
+        &self,
+        run: CreateProjectCopilotRun,
+        user_message: CreateProjectCopilotMessage,
+    ) -> Result<ProjectCopilotRunAdmission>;
+    async fn get_copilot_run_by_idempotency(
+        &self,
+        project_id: &str,
+        user_id: &str,
+        idempotency_key: &str,
+        request_digest: &str,
+    ) -> Result<Option<ProjectCopilotRunAdmission>>;
+    async fn get_copilot_run(
+        &self,
+        project_id: &str,
+        run_id: &str,
+    ) -> Result<Option<ProjectCopilotRun>>;
+    async fn get_copilot_run_by_id(&self, run_id: &str) -> Result<Option<ProjectCopilotRun>>;
+    async fn get_active_copilot_run(&self, project_id: &str) -> Result<Option<ProjectCopilotRun>>;
+    async fn get_copilot_message(
+        &self,
+        run_id: &str,
+        role: &str,
+    ) -> Result<Option<ProjectCopilotMessage>>;
+    async fn list_copilot_messages(
+        &self,
+        project_id: &str,
+        query: CopilotMessagePageQuery,
+    ) -> Result<Page<ProjectCopilotMessage>>;
+    async fn list_copilot_prompt_messages(
+        &self,
+        project_id: &str,
+        max_messages: i64,
+    ) -> Result<Vec<ProjectCopilotMessage>>;
+    async fn claim_copilot_run(
+        &self,
+        run_id: &str,
+        token_hash: &str,
+        token_expires_at: &str,
+        now: &str,
+    ) -> Result<Option<ProjectCopilotRun>>;
+    async fn finish_copilot_run(
+        &self,
+        run_id: &str,
+        status: ProjectCopilotRunStatus,
+        assistant_message: Option<CreateProjectCopilotMessage>,
+        failure_code: Option<&str>,
+        failure_message: Option<&str>,
+        now: &str,
+    ) -> Result<Option<ProjectCopilotRun>>;
+    async fn cancel_copilot_run(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        caller_user_id: &str,
+        now: &str,
+    ) -> Result<Option<ProjectCopilotRun>>;
+    async fn recover_active_copilot_runs(&self, now: &str) -> Result<i64>;
+    async fn get_copilot_run_id_by_token_hash(&self, token_hash: &str) -> Result<Option<String>>;
+    async fn authorize_run(&self, run_id: &str) -> Result<ProjectCopilotRunGrant>;
+    async fn authorize_run_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        grant: &ProjectCopilotRunGrant,
+        scope_type: &str,
+        scope_id: &str,
+        actor_type: &str,
+        actor_id: &str,
+    ) -> Result<()>;
+}
+
+#[async_trait]
 pub trait ProjectHookRunRepo: Send + Sync {
     async fn try_claim(&self, input: CreateProjectHookRun) -> Result<Option<ProjectHookRun>>;
     async fn try_claim_or_skip_at_limit(

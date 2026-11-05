@@ -32,6 +32,11 @@ WorkUnits can run concurrently when their dependencies, Actor capacity, and work
 
 The local server provides REST, MCP, the `forge-ctl` client, and the web UI. It starts an embedded daemon by default and can also connect to compatible external daemon hosts. Daemon, provider, credential, and WorkUnit constraints apply to each execution path.
 
+The [Project Copilot](docs/concepts/project-copilot.md) stays available across
+Project and Task screens to help prepare WorkUnits through the assigned Agent's
+native harness, with a persistent conversation and attributable activity. Its
+initial management runner supports local Claude Code.
+
 ## Build this repository
 
 At the PR14 documentation audit on 2026-10-16, this repository had no published GitHub release and no npm or Homebrew distribution of this fork was verified. Build from source to use this version. The build requires stable Rust, Git, Node.js 24, and pnpm 10; building the `forge` binary also builds the web UI.

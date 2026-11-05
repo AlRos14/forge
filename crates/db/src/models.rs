@@ -27,6 +27,139 @@ pub struct ProjectTaskRoleDefaults {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCopilotBinding {
+    pub project_id: String,
+    pub agent_id: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectCopilotRunStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl fmt::Display for ProjectCopilotRunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        })
+    }
+}
+
+impl FromStr for ProjectCopilotRunStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
+            _ => Err(format!("unknown Project Copilot run status: {value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCopilotRun {
+    pub id: String,
+    pub project_id: String,
+    pub agent_id: String,
+    pub user_id: String,
+    pub binding_version: i64,
+    pub agent_version: i64,
+    pub agent_snapshot_json: String,
+    pub context_task_id: Option<String>,
+    pub status: ProjectCopilotRunStatus,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub mcp_token_hash: Option<String>,
+    pub mcp_token_expires_at: Option<String>,
+    pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCopilotMessage {
+    pub id: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub role: String,
+    pub actor_type: String,
+    pub actor_id: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCopilotRunGrant {
+    pub run_id: String,
+    pub project_id: String,
+    pub agent_id: String,
+    pub user_id: String,
+    pub binding_version: i64,
+    pub context_task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectCopilotRun {
+    pub id: String,
+    pub project_id: String,
+    pub agent_id: String,
+    pub user_id: String,
+    pub binding_version: i64,
+    pub agent_version: i64,
+    pub agent_snapshot_json: String,
+    pub context_task_id: Option<String>,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectCopilotMessage {
+    pub id: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub role: String,
+    pub actor_type: String,
+    pub actor_id: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCopilotRunAdmission {
+    pub run: ProjectCopilotRun,
+    pub user_message: ProjectCopilotMessage,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopilotMessagePageQuery {
+    pub cursor: Option<String>,
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectTaskRoleDefault {
     pub role: String,
     pub coordination_mode: CoordinationMode,
