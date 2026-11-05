@@ -670,6 +670,17 @@ async fn project_copilot_run_accepts_an_unpinned_agent_with_its_resolved_host() 
         .await
         .expect("unpinned Agent run remains authorized on the resolved host");
     assert_eq!(grant.agent_id, fixture.agent_id);
+
+    let mut tx = fixture
+        .db
+        .pool()
+        .begin()
+        .await
+        .expect("event transaction starts");
+    insert_correlated_event(&mut tx, &fixture, "work-unit-unpinned")
+        .await
+        .expect("unpinned run domain event satisfies the updated guard");
+    tx.commit().await.expect("event transaction commits");
 }
 
 #[tokio::test]

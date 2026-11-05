@@ -125,10 +125,23 @@ different host still fails closed. Agent creation no longer asks for a host.
 | API Copilot delegation/authority | PASS — 1 test |
 | Web unit suite | PASS — 26 files, 139 tests |
 | Web typecheck and lint | PASS |
-| Rust formatting and Clippy for `services`, `db`, and `cli-adapters` | PASS |
+| Rust formatting and Clippy for `executors`, `cli-adapters`, `services`, `db`, `mcp-server`, and `api` | PASS |
+| OpenCode private-server invocation | PASS — adapter command test |
+| MCP `tools/call` with `_meta` metadata | PASS — 1 MCP test |
+| Copilot DB authority and V140 unpinned event insert | PASS — 4 DB tests |
+| MCP Copilot delegated-tool projection | PASS — 1 MCP test |
+
+Live acceptance on 2026-11-05: the Project Copilot created and allocated seven
+WorkUnits for Task `3ed1af02-c979-4eb0-9e6f-65976055a5f6`, with the dependency
+graph verified through the scoped tools.
 
 OpenCode v2 keeps a background server whose configuration is not reloaded per
-invocation. Project Copilot now passes `--standalone` so each turn runs with
-the per-run agent and MCP policy, and terminal failures remain visible next to
-the composer. A **Harness trace** section reads the run's redacted JSONL events
-through the scoped run-log endpoint while the turn runs and after it ends.
+invocation. Project Copilot now starts a private OpenCode server with a
+preflight session so the per-run agent and MCP catalog are loaded before the
+real turn. The policy is written as a real config file so MCP `{env:...}`
+authorization resolves, and `tools/call` accepts the MCP `_meta` field. V140
+recreates the Copilot domain-event guard against the frozen resolved host so
+unpinned Agents can complete management mutations. Terminal failures remain
+visible next to the composer. A **Harness trace** section reads the run's
+redacted JSONL events through the scoped run-log endpoint while the turn runs
+and after it ends.

@@ -1085,6 +1085,30 @@ fn revised_public_surface_does_not_advertise_retired_collaboration_tools() {
 }
 
 #[test]
+fn tool_call_accepts_mcp_meta() {
+    run_async(async {
+        let state = sqlite_state().await;
+        seed_project_repo(&state).await;
+        let result = dispatch_with_context(
+            &state,
+            &user_mcp_context("test-user"),
+            "tools/call",
+            json!({
+                "name": "forge_list_projects",
+                "arguments": {},
+                "_meta": { "progressToken": 1 }
+            }),
+        )
+        .await
+        .expect("MCP metadata does not invalidate tool arguments");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool result contains JSON text");
+        assert!(text.contains("\"items\""));
+    });
+}
+
+#[test]
 fn scoped_tools_list_marks_project_id_optional() {
     run_async(async {
         let state = sqlite_state().await;

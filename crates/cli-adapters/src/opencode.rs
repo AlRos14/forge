@@ -32,6 +32,18 @@ struct RunningExecution {
     cancelled: Arc<AtomicBool>,
 }
 
+struct ProjectCopilotServer {
+    child: tokio::process::Child,
+    url: String,
+    password: String,
+}
+
+impl Drop for ProjectCopilotServer {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
 impl OpencodeAdapter {
     pub fn new() -> Self {
         Self {
@@ -103,11 +115,132 @@ impl OpencodeAdapter {
         cmd
     }
 
+    async fn start_project_copilot_server(
+        config: &OpencodeConfig,
+        config_dir: &Path,
+    ) -> Result<ProjectCopilotServer, ExecutorError> {
+        let mut command = tokio::process::Command::new("opencode");
+        command
+            .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
+            .current_dir(config_dir)
+            .env("OPENCODE_CONFIG_DIR", config_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(env) = &config.command_overrides.env {
+            command.envs(env);
+        }
+        let mut child = command.spawn().map_err(|error| {
+            ExecutorError::Other(format!(
+                "failed to start OpenCode Project Copilot server: {error}"
+            ))
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ExecutorError::Other("failed to capture OpenCode server stdout".to_owned())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ExecutorError::Other("failed to capture OpenCode server stderr".to_owned())
+        })?;
+        let mut lines = BufReader::new(stdout).lines();
+        let mut url = None;
+        let mut password = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while url.is_none() || password.is_none() {
+            let line = tokio::time::timeout_at(deadline, lines.next_line())
+                .await
+                .map_err(|_| {
+                    ExecutorError::Other(
+                        "OpenCode Project Copilot server did not become ready".to_owned(),
+                    )
+                })?
+                .map_err(|error| {
+                    ExecutorError::Other(format!(
+                        "failed to read OpenCode server startup output: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    ExecutorError::Other(
+                        "OpenCode Project Copilot server exited before becoming ready".to_owned(),
+                    )
+                })?;
+            if let Some(value) = line.strip_prefix("server listening on ") {
+                url = Some(value.trim().to_owned());
+            } else if let Some(value) = line.strip_prefix("server password ") {
+                password = Some(value.trim().to_owned());
+            }
+        }
+        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(_)) = lines.next_line().await {}
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        Ok(ProjectCopilotServer {
+            child,
+            url: url.expect("server URL is set"),
+            password: password.expect("server password is set"),
+        })
+    }
+
+    async fn warm_up_project_copilot_server(
+        config: &OpencodeConfig,
+        config_dir: &Path,
+        server: &ProjectCopilotServer,
+    ) -> Result<(), ExecutorError> {
+        let mut last_failure = String::new();
+        for attempt in 0..3 {
+            let mut command = Self::build_project_copilot_command(
+                config,
+                "Reply with OK.",
+                config_dir,
+                server.url.as_str(),
+            )?;
+            command
+                .env("OPENCODE_CONFIG_DIR", config_dir)
+                .env("OPENCODE_SERVER_PASSWORD", &server.password);
+            let output = tokio::time::timeout(Duration::from_secs(60), command.output())
+                .await
+                .map_err(|_| {
+                    ExecutorError::Other("OpenCode Project Copilot warm-up timed out".to_owned())
+                })?
+                .map_err(|error| {
+                    ExecutorError::Other(format!(
+                        "OpenCode Project Copilot warm-up failed: {error}"
+                    ))
+                })?;
+            if output.status.success() {
+                return Ok(());
+            }
+            last_failure = format!(
+                "status {}: stderr={} stdout={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim(),
+                String::from_utf8_lossy(&output.stdout).trim()
+            );
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+        Err(ExecutorError::Other(format!(
+            "OpenCode Project Copilot warm-up failed against {}: {}",
+            server.url, last_failure
+        )))
+    }
+
+    fn write_project_copilot_policy(config_dir: &Path, policy: &str) -> Result<(), ExecutorError> {
+        let policy_path = config_dir.join("opencode.json");
+        std::fs::write(&policy_path, policy).map_err(|error| {
+            ExecutorError::Other(format!(
+                "failed to write OpenCode Project Copilot policy: {error}"
+            ))
+        })
+    }
+
     fn build_project_copilot_command(
         config: &OpencodeConfig,
         prompt: &str,
-        policy: &str,
         config_dir: &Path,
+        server_url: &str,
     ) -> Result<tokio::process::Command, ExecutorError> {
         let mut safe_config = config.clone();
         safe_config.agent = Some(OPENCODE_COPILOT_AGENT.to_owned());
@@ -123,15 +256,10 @@ impl OpencodeAdapter {
         }
         // OpenCode v2 keeps a background server whose configuration is not
         // reloaded per invocation. The Project Copilot agent and MCP policy
-        // must run against a private server with a real config file so
+        // run against a private server with a real config file so
         // `{env:...}` substitutions are resolved for the MCP authorization.
-        let policy_path = config_dir.join("opencode.json");
-        std::fs::write(&policy_path, policy).map_err(|error| {
-            ExecutorError::Other(format!(
-                "failed to write OpenCode Project Copilot policy: {error}"
-            ))
-        })?;
-        let mut command = Self::build_command_with_prefix(&safe_config, prompt, &["--standalone"]);
+        let mut command =
+            Self::build_command_with_prefix(&safe_config, prompt, &["--server", server_url]);
         command.env("OPENCODE_CONFIG_DIR", config_dir);
         Ok(command)
     }
@@ -279,11 +407,29 @@ impl HarnessAdapter for OpencodeAdapter {
             } else {
                 None
             };
-        let mut cmd = if let (Some(mcp), Some(runtime_dir)) =
+        if let (Some(mcp), Some(runtime_dir)) =
             (project_copilot_mcp.as_ref(), copilot_runtime_dir.as_ref())
         {
             let policy = opencode_project_copilot_policy(mcp)?;
-            Self::build_project_copilot_command(&config, &prompt, &policy, runtime_dir.path())?
+            Self::write_project_copilot_policy(runtime_dir.path(), &policy)?;
+        }
+        let copilot_server = if let Some(runtime_dir) = copilot_runtime_dir.as_ref() {
+            Some(Self::start_project_copilot_server(&config, runtime_dir.path()).await?)
+        } else {
+            None
+        };
+        let mut cmd = if let (Some(runtime_dir), Some(server)) =
+            (copilot_runtime_dir.as_ref(), copilot_server.as_ref())
+        {
+            Self::warm_up_project_copilot_server(&config, runtime_dir.path(), server).await?;
+            let mut command = Self::build_project_copilot_command(
+                &config,
+                &prompt,
+                runtime_dir.path(),
+                &server.url,
+            )?;
+            command.env("OPENCODE_SERVER_PASSWORD", &server.password);
+            command
         } else {
             Self::build_command(&config, &prompt)
         };
@@ -922,22 +1068,16 @@ async fn ensure_opencode_project_copilot_cli_supported() -> Result<(), ExecutorE
         Ok(())
     } else {
         Err(ExecutorError::Unavailable(
-            "Project Copilot requires OpenCode CLI support for --standalone and run --agent, --format, --model, and --session"
+            "Project Copilot requires OpenCode CLI support for serve and run --server, --agent, --format, --model, and --session"
                 .to_owned(),
         ))
     }
 }
 
 fn opencode_project_copilot_cli_supports_policy(help: &str) -> bool {
-    [
-        "--standalone",
-        "--agent",
-        "--format",
-        "--model",
-        "--session",
-    ]
-    .iter()
-    .all(|option| help.contains(option))
+    ["--server", "--agent", "--format", "--model", "--session"]
+        .iter()
+        .all(|option| help.contains(option))
 }
 
 fn should_skip_permissions(config: &OpencodeConfig) -> bool {
@@ -1584,19 +1724,31 @@ mod tests {
     }
 
     #[test]
-    fn project_copilot_command_uses_an_isolated_standalone_server() {
+    fn project_copilot_command_uses_a_private_server() {
         let config = OpencodeConfig::default();
         let dir = tempfile::tempdir().expect("temp directory creates");
         let policy = r#"{"agents":{}}"#;
-        let cmd =
-            OpencodeAdapter::build_project_copilot_command(&config, "hello", policy, dir.path())
-                .expect("command builds");
+        OpencodeAdapter::write_project_copilot_policy(dir.path(), policy).expect("policy writes");
+        let cmd = OpencodeAdapter::build_project_copilot_command(
+            &config,
+            "hello",
+            dir.path(),
+            "http://127.0.0.1:34567",
+        )
+        .expect("command builds");
         let args: Vec<_> = cmd
             .as_std()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args.first().map(String::as_str), Some("--standalone"));
+        assert_eq!(
+            &args[..3],
+            &[
+                "--server".to_owned(),
+                "http://127.0.0.1:34567".to_owned(),
+                "run".to_owned()
+            ]
+        );
         assert!(args.iter().any(|arg| arg == "run"));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("opencode.json")).expect("policy file reads"),

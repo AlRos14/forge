@@ -105,13 +105,15 @@ PR14 audit on 2026-10-16.
 
 ### Fixed
 
-- Run OpenCode Project Copilot turns against a private `--standalone` server
-  so the per-run agent and MCP policy is loaded. OpenCode v2's background
-  server ignored the inline policy and rejected the Copilot agent. The policy
-  is written as a real config file so MCP `{env:...}` authorization is
-  resolved, and runtime environment merging accepts a normalized null `env`.
-  Failed turns now remain visible next to the composer alongside the sending,
-  running, and terminal state.
+- Run OpenCode Project Copilot turns against a private OpenCode server with a
+  preflight session, so the per-run agent and MCP catalog are loaded before the
+  real turn. The policy is written as a real config file so MCP `{env:...}`
+  authorization is resolved, and runtime environment merging accepts a
+  normalized null `env`. Accept the MCP `_meta` request field on `tools/call`.
+  V140 recreates the Copilot domain-event guard against the frozen resolved
+  host, so unpinned Agents can complete management mutations. Failed turns now
+  remain visible next to the composer alongside the sending, running, and
+  terminal state.
 - Serialize Project owner additions, removals, and role changes inside
   `BEGIN IMMEDIATE` transactions. Caller, target, last-owner, and canonical
   owner state are re-read after the writer lock, so concurrent owner removal

@@ -15,6 +15,10 @@ pub(crate) struct ToolCallParams {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) arguments: Value,
+    /// MCP metadata supplied by some clients. It is transport context, not a
+    /// tool argument, and must not make an otherwise valid call fail validation.
+    #[serde(default, rename = "_meta")]
+    pub(crate) _meta: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
