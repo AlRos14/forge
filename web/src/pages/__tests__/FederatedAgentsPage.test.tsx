@@ -507,27 +507,26 @@ describe('FederatedAgentsPage', () => {
     expect(registerHarnessAgent.mock.calls[0]?.[0]).not.toHaveProperty('daemon_id')
   })
 
-  it('lets an administrator pin a new Agent to an authorized compatible host', async () => {
+  it('creates an administrator Agent with automatic host resolution', async () => {
     mockAuth.user = { id: 'user-1', is_admin: true }
     renderPage()
     fireEvent.click(screen.getAllByRole('button', { name: /new agent/i })[0])
     const wizard = within(screen.getByRole('dialog'))
     fireEvent.click(wizard.getByRole('button', { name: /Openai · Work key/i }))
     fireEvent.click(wizard.getByRole('button', { name: /Codex CLI harness/i }))
-    fireEvent.change(wizard.getByLabelText('Agent name'), { target: { value: 'Pinned worker' } })
-    fireEvent.click(wizard.getByLabelText('Execution host'))
-    fireEvent.click(screen.getByRole('option', { name: /forge-host · online/i }))
+    expect(wizard.queryByLabelText('Execution host')).toBeNull()
+    fireEvent.change(wizard.getByLabelText('Agent name'), { target: { value: 'Automatic worker' } })
     fireEvent.click(wizard.getByRole('button', { name: /create agent/i }))
 
     await vi.waitFor(() =>
       expect(registerHarnessAgent).toHaveBeenCalledWith(
         expect.objectContaining({
-          name: 'Pinned worker',
+          name: 'Automatic worker',
           executor_type: 'codex',
-          daemon_id: 'daemon-1',
         }),
       ),
     )
+    expect(registerHarnessAgent.mock.calls[0]?.[0]).not.toHaveProperty('daemon_id')
   })
 
   it('changes only the host for an Agent without a model', async () => {

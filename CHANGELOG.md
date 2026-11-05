@@ -14,11 +14,14 @@ PR14 audit on 2026-10-16.
   assigned harness-bound Agent, durable conversation and Project management
   runs. The local runner advertises only harness adapters with per-run native
   tool restrictions and a revocable, run-scoped Forge MCP connection. The UI
-  selects Agents owned by the Project owner and pinned to the authorized local
-  host; Agent settings now let administrators bind an Agent to an available
-  host. WorkUnit management tools reuse domain services, preserve TaskRole
-  eligibility and record the acting Agent. Forward migration V139 preserves
-  existing Tasks and historical Agent data.
+  selects Agents owned by the Project owner; an Agent without a host pin
+  resolves the authorized local embedded host at admission and the run
+  snapshot freezes it. Agent creation now defaults to automatic host
+  resolution, while administrators can still pin an existing Agent to an
+  available host through editing, REST, or the CLI. WorkUnit management tools
+  reuse domain services, preserve TaskRole eligibility and record the acting
+  Agent. Forward migration V139 preserves existing Tasks and historical Agent
+  data.
 
 - Remove Task classification and Task-level read-only settings from the UI,
   persistence, REST, and MCP contracts. Eligible Agent Executions receive a

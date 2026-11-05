@@ -17,7 +17,6 @@ import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { cn } from '@/lib/cn'
 import { getReasoningOptionsForModel, useDiscoveredOptions } from '@/hooks/useDiscoveredOptions'
-import { useAuthStore } from '@/stores/auth'
 import {
   useAgentProviderCapabilitiesQuery,
   useRegisterHarnessAgentMutation,
@@ -48,11 +47,9 @@ export function NewAgentDialog({
 }) {
   const capabilities = useAgentProviderCapabilitiesQuery()
   const registerHarness = useRegisterHarnessAgentMutation()
-  const isAdmin = useAuthStore((state) => Boolean(state.user?.is_admin))
   const [entryId, setEntryId] = useState<string | null>(preselectedEntryId)
   const [cliKind, setCliKind] = useState<string | null>(null)
   const [runtime, setRuntime] = useState<string | null>(null)
-  const [daemonId, setDaemonId] = useState('')
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [model, setModel] = useState('')
@@ -66,7 +63,6 @@ export function NewAgentDialog({
     setEntryId(preselectedEntryId)
     setCliKind(null)
     setRuntime(null)
-    setDaemonId('')
     setName('')
     setDescription('')
     setModel('')
@@ -87,7 +83,6 @@ export function NewAgentDialog({
     : undefined
   const step: 1 | 2 | 3 = !selectedEntry && !cliKind ? 1 : !runtime ? 2 : 3
   const discovered = useDiscoveredOptions(null, runtime)
-  const availableDaemons = discovered.data?.availableDaemons ?? []
   const reasoningOptionsForModel = useMemo(
     () => getReasoningOptionsForModel(discovered.data, model),
     [discovered.data, model],
@@ -113,14 +108,6 @@ export function NewAgentDialog({
       setError('A name is required.')
       return
     }
-    if (isAdmin && !availableDaemons.some((daemon) => daemon.id === daemonId)) {
-      setError(
-        availableDaemons.length > 0
-          ? 'Choose an online host that supports this runtime.'
-          : 'No authorized online host reports this runtime as authenticated.',
-      )
-      return
-    }
     inFlight.current = true
     setError(undefined)
     try {
@@ -132,7 +119,6 @@ export function NewAgentDialog({
         reasoning_effort: reasoningEffort,
         permission_policy: permissionPolicy,
         credential_id: selectedEntry?.id ?? null,
-        ...(isAdmin ? { daemon_id: daemonId } : {}),
       })
       onClose()
     } catch (cause) {
@@ -243,10 +229,7 @@ export function NewAgentDialog({
                   type="button"
                   disabled={unavailable}
                   className={`flex w-full items-center justify-between gap-3 rounded-md border px-3 py-2 text-left ${unavailable ? 'cursor-not-allowed border-border-subtle bg-muted/40 opacity-70' : 'border-border-subtle bg-card hover:border-ember-border'}`}
-                  onClick={() => {
-                    setRuntime(option.runtime)
-                    setDaemonId('')
-                  }}
+                  onClick={() => setRuntime(option.runtime)}
                 >
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
@@ -311,34 +294,6 @@ export function NewAgentDialog({
                   onChange={(value) => setModel(value ?? '')}
                 />
               </div>
-              {isAdmin ? (
-                <div className="space-y-2 sm:col-span-2">
-                  <Label htmlFor="agent-host">Execution host</Label>
-                  {discovered.isLoading ? (
-                    <p className="text-xs text-muted-foreground">Loading authorized hosts…</p>
-                  ) : availableDaemons.length === 0 ? (
-                    <p role="status" className="text-xs text-muted-foreground">
-                      No online host reports this runtime as authenticated. Connect a compatible host
-                      before creating this Agent.
-                    </p>
-                  ) : (
-                    <Select
-                      id="agent-host"
-                      value={daemonId}
-                      placeholder="Select an online host"
-                      onChange={setDaemonId}
-                      options={availableDaemons.map((daemon) => ({
-                        value: daemon.id,
-                        label: `${daemon.name} · ${humanize(daemon.status)}`,
-                      }))}
-                    />
-                  )}
-                  <p className="text-xs text-muted-foreground">
-                    Only hosts authorized for your account with this runtime authenticated are
-                    listed.
-                  </p>
-                </div>
-              ) : null}
               {reasoningOptionsForModel.length > 0 ? (
                 <ReasoningSelector
                   id="agent-reasoning"
@@ -378,20 +333,11 @@ export function NewAgentDialog({
               <Button
                 type="button"
                 variant="ghost"
-                onClick={() => {
-                  setRuntime(null)
-                  setDaemonId('')
-                }}
+                onClick={() => setRuntime(null)}
               >
                 Back
               </Button>
-              <Button
-                type="submit"
-                disabled={
-                  registerHarness.isPending ||
-                  (isAdmin && (discovered.isLoading || availableDaemons.length === 0))
-                }
-              >
+              <Button type="submit" disabled={registerHarness.isPending}>
                 <ShieldCheck size={15} aria-hidden />
                 {registerHarness.isPending ? 'Creating…' : 'Create agent'}
               </Button>

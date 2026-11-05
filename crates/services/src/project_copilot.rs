@@ -122,6 +122,45 @@ impl ProjectCopilotService {
         }
     }
 
+    /// Resolves the exact embedded host for one Agent without requiring an
+    /// Agent-level pin. A pin remains authoritative when it names a different
+    /// host; an unpinned Agent uses the authorized local embedded host.
+    async fn resolve_copilot_daemon_for_agent(
+        &self,
+        project: &db::Project,
+        agent: &db::Agent,
+    ) -> std::result::Result<db::Daemon, SafeFailure> {
+        let owner_id = project
+            .owner_id
+            .as_deref()
+            .ok_or_else(|| safe_failure("authorization_revoked"))?;
+        let owner = UserRepo::get_user_by_id(&*self.db, owner_id)
+            .await
+            .map_err(|_| safe_failure("project_owner_unavailable"))?
+            .ok_or_else(|| safe_failure("project_owner_unavailable"))?;
+        let daemon = DaemonRepo::get_by_machine_id(
+            &*self.db,
+            &crate::embedded_daemon::embedded_machine_id(),
+        )
+        .await
+        .map_err(|_| safe_failure("unsupported_agent_host"))?
+        .ok_or_else(|| safe_failure("unsupported_agent_host"))?;
+        if let Some(pinned_daemon_id) = agent.daemon_id.as_deref() {
+            if pinned_daemon_id != daemon.id.as_str() {
+                return Err(safe_failure("unsupported_remote_harness"));
+            }
+        }
+        if !db::daemon_execution_authorized(
+            &daemon,
+            Some(owner_id),
+            owner.is_admin,
+            &agent.executor_type,
+        ) {
+            return Err(safe_failure("agent_host_authority_changed"));
+        }
+        Ok(daemon)
+    }
+
     /// Assigns or removes the Project Copilot Agent using an optimistic version
     /// fence. DB authority is rechecked in the same immediate transaction.
     pub async fn update_binding(
@@ -270,14 +309,15 @@ impl ProjectCopilotService {
             insert_config_string(object, "prompt_template", agent.prompt_template.as_deref());
         }
 
-        let daemon_authority = if let Some(daemon_id) = agent.daemon_id.as_deref() {
-            DaemonRepo::get_by_id(&*self.db, daemon_id)
-                .await?
-                .map(|daemon| db::daemon_authority_snapshot(&agent, &daemon))
-                .unwrap_or(Value::Null)
-        } else {
-            Value::Null
-        };
+        let resolved_daemon = self
+            .resolve_copilot_daemon_for_agent(&project, &agent)
+            .await
+            .ok();
+        let resolved_daemon_id = resolved_daemon.as_ref().map(|daemon| daemon.id.clone());
+        let daemon_authority = resolved_daemon
+            .as_ref()
+            .map(|daemon| db::daemon_authority_snapshot(&agent, daemon))
+            .unwrap_or(Value::Null);
         let snapshot = json!({
             "agent_id": agent.id,
             "agent_version": agent.version,
@@ -293,6 +333,7 @@ impl ProjectCopilotService {
             "config": config,
             "config_valid": config_valid,
             "agent_daemon_id": agent.daemon_id,
+            "resolved_daemon_id": resolved_daemon_id,
             "daemon_authority": daemon_authority,
             "context_task": task_context,
             "snapshotted_at": db::now_rfc3339(),
@@ -587,10 +628,14 @@ impl ProjectCopilotService {
                 return Err(safe_failure("task_context_changed"));
             }
         }
-        let daemon_id = agent
-            .daemon_id
-            .as_deref()
-            .ok_or_else(|| safe_failure("unsupported_agent_host"))?;
+        let daemon_id = if snapshot.get("resolved_daemon_id").is_some() {
+            snapshot.get("resolved_daemon_id").and_then(Value::as_str)
+        } else if snapshot.get("agent_daemon_id").is_some() {
+            snapshot.get("agent_daemon_id").and_then(Value::as_str)
+        } else {
+            agent.daemon_id.as_deref()
+        }
+        .ok_or_else(|| safe_failure("unsupported_agent_host"))?;
         let daemon = DaemonRepo::get_by_id(&*self.db, daemon_id)
             .await
             .map_err(|_| safe_failure("agent_host_unavailable"))?
@@ -1073,6 +1118,23 @@ mod tests {
         executor_type: &str,
         config_json: &str,
     ) -> Fixture {
+        fixture_with_agent_config_and_binding(
+            behavior,
+            bind_local_daemon,
+            true,
+            executor_type,
+            config_json,
+        )
+        .await
+    }
+
+    async fn fixture_with_agent_config_and_binding(
+        behavior: StubBehavior,
+        bind_local_daemon: bool,
+        pin_agent_to_daemon: bool,
+        executor_type: &str,
+        config_json: &str,
+    ) -> Fixture {
         let pool = create_sqlite_pool("sqlite::memory:")
             .await
             .expect("SQLite pool creates");
@@ -1158,7 +1220,11 @@ mod tests {
                 capabilities_json: "[]".to_owned(),
                 config_json: config_json.to_owned(),
                 credential_ref: None,
-                daemon_id: daemon_binding,
+                daemon_id: if pin_agent_to_daemon {
+                    daemon_binding
+                } else {
+                    None
+                },
                 max_concurrent_tasks: 1,
                 heartbeat_interval_seconds: 30,
                 max_missed_heartbeats: 3,
@@ -1435,6 +1501,44 @@ mod tests {
         );
         assert_eq!(fixture.executor.call_count(), 0);
         assert!(detail.assistant_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn unbound_agent_uses_authorized_local_embedded_host() {
+        let fixture = fixture_with_agent_config_and_binding(
+            StubBehavior::EchoScopedToken,
+            true,
+            false,
+            "claude_code",
+            r#"{"permission_policy":"auto","dangerously_skip_permissions":true,"plan":true,"sandbox":"danger-full-access"}"#,
+        )
+        .await;
+        let admitted = fixture
+            .service
+            .send_message(
+                &fixture.project_id,
+                &fixture.member_id,
+                "Organize the current Task into WorkUnits.",
+                "turn-unbound-local-host-1",
+                None,
+                "http://127.0.0.1:8080/mcp",
+            )
+            .await
+            .expect("request is durably admitted");
+        let detail =
+            wait_for_terminal(&fixture.service, &fixture.project_id, &admitted.run.id).await;
+        assert_eq!(detail.run.status, ApiCopilotRunStatus::Succeeded);
+        assert_eq!(fixture.executor.call_count(), 1);
+
+        let snapshot_json: String =
+            sqlx::query_scalar("SELECT agent_snapshot_json FROM project_copilot_run WHERE id = ?")
+                .bind(&admitted.run.id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("run snapshot loads");
+        let snapshot: Value = serde_json::from_str(&snapshot_json).expect("snapshot is JSON");
+        assert!(snapshot["agent_daemon_id"].is_null());
+        assert!(snapshot["resolved_daemon_id"].as_str().is_some());
     }
 
     #[tokio::test]

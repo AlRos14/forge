@@ -75,10 +75,13 @@ delegation. Use only disposable `./test` data for local server acceptance.
 ## Harness and UI expansion — 2026-11-05
 
 The Project Copilot panel now takes its available executor types and exact
-authorized embedded daemon ID from `GET /projects/{id}/copilot`. Agent
-assignment requires the canonical Project owner's Agent to be pinned to that
-host. Agent Settings lets server administrators pin an Agent during creation
-or editing. Remote daemons remain unsupported for Project Copilot.
+authorized embedded daemon ID from `GET /projects/{id}/copilot`. Assignment
+accepts Agents owned by the canonical Project owner that have no host pin or
+name that host; an unpinned Agent's run freezes the resolved embedded host in
+its immutable snapshot. Agent creation now defaults to automatic host
+resolution, while administrators can still pin an existing Agent through
+editing, REST, or the CLI. Remote daemons remain unsupported for Project
+Copilot.
 
 Claude Code, Cursor Agent, OpenCode and Gemini CLI adapters advertise scoped
 management support only when the embedded daemon reports the harness as
@@ -108,3 +111,18 @@ exact Project/Task scope and tool set.
 | Test suites | NOT RUN in this change |
 | Gemini CLI preflight on this host | NOT RUN — Gemini is not installed |
 | Live model-provider round trip | NOT RUN |
+
+## Automatic host resolution — 2026-11-05
+
+Project Copilot accepts an Agent owned by the Project owner without a host pin.
+The turn snapshots the resolved embedded host, and a pinned Agent that names a
+different host still fails closed. Agent creation no longer asks for a host.
+
+| Check | Result |
+| --- | --- |
+| DB Copilot authority, including an unpinned Agent with a resolved host | PASS — 4 tests |
+| Copilot service, including the unpinned success path | PASS — 7 tests |
+| API Copilot delegation/authority | PASS — 1 test |
+| Web unit suite | PASS — 26 files, 137 tests |
+| Web typecheck and lint | PASS |
+| Rust formatting and Clippy for `services` and `db` | PASS |

@@ -615,6 +615,64 @@ async fn project_copilot_domain_event_guard_allows_current_authority_and_recheck
 }
 
 #[tokio::test]
+async fn project_copilot_run_accepts_an_unpinned_agent_with_its_resolved_host() {
+    let fixture = seed_running_run().await;
+    let agent = AgentRepo::get_by_id(&fixture.db, &fixture.agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    let agent = AgentRepo::update(
+        &fixture.db,
+        UpdateAgent {
+            id: agent.id,
+            expected_version: agent.version,
+            name: None,
+            description: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: None,
+            config_json: None,
+            daemon_id: Some(None),
+            max_concurrent_tasks: None,
+            heartbeat_interval_seconds: None,
+            max_missed_heartbeats: None,
+            status: None,
+            last_heartbeat_at: None,
+            is_default: None,
+            paused: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("Agent host pin clears");
+    assert!(agent.daemon_id.is_none());
+    let daemon = DaemonRepo::get_by_id(&fixture.db, &fixture.daemon_id)
+        .await
+        .expect("daemon loads")
+        .expect("daemon exists");
+    let snapshot = serde_json::json!({
+        "daemon_authority": db::daemon_authority_snapshot(&agent, &daemon),
+        "resolved_daemon_id": daemon.id,
+    });
+    sqlx::query(
+        "UPDATE project_copilot_run SET agent_version = ?, agent_snapshot_json = ? WHERE id = ?",
+    )
+    .bind(agent.version)
+    .bind(snapshot.to_string())
+    .bind(&fixture.run_id)
+    .execute(fixture.db.pool())
+    .await
+    .expect("run snapshot updates");
+
+    let grant = ProjectCopilotRepo::authorize_run(&fixture.db, &fixture.run_id)
+        .await
+        .expect("unpinned Agent run remains authorized on the resolved host");
+    assert_eq!(grant.agent_id, fixture.agent_id);
+}
+
+#[tokio::test]
 async fn project_copilot_domain_event_guard_rejects_changed_authority_edges() {
     for change in [
         AuthorityChange::OwnerTransferred,

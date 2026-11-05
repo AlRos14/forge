@@ -277,7 +277,18 @@ async fn copilot_daemon_authority_valid(
     else {
         return Ok(false);
     };
-    let Some(daemon_id) = agent.daemon_id.as_deref() else {
+    let daemon_id = if snapshot.get("resolved_daemon_id").is_some() {
+        snapshot
+            .get("resolved_daemon_id")
+            .and_then(|value| value.as_str())
+    } else if snapshot.get("agent_daemon_id").is_some() {
+        snapshot
+            .get("agent_daemon_id")
+            .and_then(|value| value.as_str())
+    } else {
+        agent.daemon_id.as_deref()
+    };
+    let Some(daemon_id) = daemon_id else {
         return Ok(false);
     };
     let Some(daemon) = sqlx::query("SELECT * FROM daemon WHERE id=?")

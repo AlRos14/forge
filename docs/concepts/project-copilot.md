@@ -6,21 +6,22 @@ navigating the Project, including a Task detail page. The manual Task and
 WorkUnit controls remain available alongside it.
 
 Owners and Project admins assign or replace the Copilot. The Agent must belong
-to the canonical Project owner's account and be pinned to the supported local
-embedded host. Global Agent discovery grants no cross-account execution
-consent. Project members may send instructions; viewers may inspect the
-conversation without starting a turn.
+to the canonical Project owner's account. An Agent without a host pin resolves
+to the supported local embedded host when the turn is admitted; an explicit pin
+to a different host remains unsupported. Global Agent discovery grants no
+cross-account execution consent. Project members may send instructions; viewers
+may inspect the conversation without starting a turn.
 
 ## Using the panel
 
 Open a Project or Task and select **Copilot** in the bottom-right corner. An
 owner or Project admin can select an eligible Agent in the panel. The list
 includes harnesses reported by the server as supported on the online embedded
-host, and only Agents owned by the Project owner and pinned to that host. If
-there is no eligible Agent, open **Agent settings** from the panel; a server
-administrator can bind the owner's Agent to an available host there. Project
-Copilot currently runs only on Forge's local embedded host, not remote daemons.
-The panel stays beside the page on desktop and opens as a modal on mobile.
+host, and Agents owned by the Project owner. Agents pinned to another host are
+excluded. If there is no eligible Agent, open **Agent settings** from the panel
+to create or configure one. Project Copilot currently runs only on Forge's
+local embedded host, not remote daemons. The panel stays beside the page on
+desktop and opens as a modal on mobile.
 
 From a Task, ask for a proposed breakdown or delegate creation explicitly, for
 example: "Create WorkUnits for this Task with dependencies and eligible
@@ -61,8 +62,10 @@ from a role or the most recent Execution.
 
 The API derives `supported_executor_types` from the registered adapters and
 the embedded daemon's current authenticated CLI report. It also returns the
-exact `supported_daemon_id`. The panel offers only Agents owned by the Project
-owner and pinned to that daemon. Each advertised adapter must install a
+exact `supported_daemon_id`. The panel offers Agents owned by the Project owner
+that either have no host pin or name that daemon. The run snapshot freezes the
+resolved embedded host, so later Agent or daemon changes fail closed rather
+than silently moving the run. Each advertised adapter must install a
 server-owned per-run MCP connection and prove that only the scoped Project
 Copilot tools are callable; adapters without that policy are not advertised
 and fail closed before a model request. Remote daemons are unsupported.

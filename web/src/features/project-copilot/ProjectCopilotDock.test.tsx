@@ -56,6 +56,8 @@ let requestedPaths: string[] = []
 let requestedActivityCursors: Array<string | null> = []
 let activityPaginationEnabled = false
 let projectMembershipRole = 'member'
+let copilotAgentId: string | null = 'agent-1'
+let supportedCopilotExecutors = ['claude_code', 'codex', 'opencode']
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -99,11 +101,11 @@ function projectFor(projectId: string) {
 function projectConfigFor(projectId: string) {
   return {
     project_id: projectId,
-    agent_id: 'agent-1',
-    agent_name: `Agent for ${projectId}`,
+    agent_id: copilotAgentId,
+    agent_name: copilotAgentId ? `Agent for ${projectId}` : null,
     version: 1,
     active_run: null,
-    supported_executor_types: ['claude_code', 'codex', 'opencode'],
+    supported_executor_types: supportedCopilotExecutors,
     supported_daemon_id: 'embedded-host',
   }
 }
@@ -133,6 +135,15 @@ function installFetchMock() {
             daemon_id: 'embedded-host',
             executor_type: 'claude_code',
             name: 'Claude Agent',
+            model: 'sonnet',
+            effective_status: 'active',
+          },
+          {
+            id: 'agent-auto',
+            owner_id: 'owner-1',
+            daemon_id: null,
+            executor_type: 'claude_code',
+            name: 'Automatic Claude Agent',
             model: 'sonnet',
             effective_status: 'active',
           },
@@ -348,6 +359,8 @@ beforeEach(() => {
   requestedActivityCursors = []
   activityPaginationEnabled = false
   projectMembershipRole = 'member'
+  copilotAgentId = 'agent-1'
+  supportedCopilotExecutors = ['claude_code', 'codex', 'opencode']
   installFetchMock()
   useAuthStore.setState({
     user: {
@@ -549,18 +562,33 @@ describe('ProjectCopilotDock', () => {
 
     expect(
       await screen.findByText(
-        "Choose an Agent owned by this Project's owner, bound to the supported local host, whose harness can be restricted to Copilot tools.",
+        "Choose an Agent owned by this Project's owner whose harness can be restricted to Copilot tools. Agents without a host pin use the supported local host automatically.",
       ),
     ).toBeTruthy()
     const agentSelector = screen.getByRole('button', { name: 'Agent' })
     await waitFor(() => expect((agentSelector as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(agentSelector)
 
-    expect(await screen.findByRole('option', { name: /Claude Agent/ })).toBeTruthy()
+    expect(await screen.findByRole('option', { name: /^Claude Agent/ })).toBeTruthy()
+    expect(await screen.findByRole('option', { name: /^Automatic Claude Agent/ })).toBeTruthy()
     expect(await screen.findByRole('option', { name: /Codex Agent/ })).toBeTruthy()
     expect(await screen.findByRole('option', { name: /OpenCode Agent/ })).toBeTruthy()
     expect(screen.queryByRole('option', { name: /Shell Agent/ })).toBeNull()
     expect(screen.queryByRole('option', { name: /Remote Codex Agent/ })).toBeNull()
+  })
+
+  it('preselects the only eligible Agent when there is no current assignment', async () => {
+    projectMembershipRole = 'admin'
+    copilotAgentId = null
+    supportedCopilotExecutors = ['opencode']
+    renderDock({ projectId: 'project-1' })
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Project Copilot' }))
+
+    const save = await screen.findByRole('button', { name: 'Save' })
+    await waitFor(() => expect((save as HTMLButtonElement).disabled).toBe(false))
+    expect(screen.getByRole('button', { name: 'Agent' }).textContent).toContain(
+      'OpenCode Agent',
+    )
   })
 
   it('uses a modal drawer on mobile and keeps the exact Task attached', async () => {

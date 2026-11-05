@@ -1094,7 +1094,7 @@ function AgentAssignmentEditor({
       ownerId !== null &&
       agent.owner_id === ownerId &&
       supportedDaemonId !== null &&
-      agent.daemon_id === supportedDaemonId &&
+      (agent.daemon_id === null || agent.daemon_id === supportedDaemonId) &&
       supportedExecutorTypes.includes(agent.executor_type),
   )
   const selectedIsEligible = value === null || eligibleAgents.some((agent) => agent.id === value)
@@ -1102,6 +1102,12 @@ function AgentAssignmentEditor({
     currentAgentId === null || eligibleAgents.some((agent) => agent.id === currentAgentId)
   const displayValue = eligibleAgents.some((agent) => agent.id === value) ? value : null
   const isLoading = agentsQuery.isPending || agentsQuery.isFetchingNextPage
+
+  useEffect(() => {
+    if (!canManage || agentsQuery.isPending || value !== null || eligibleAgents.length !== 1) return
+    const onlyAgent = eligibleAgents[0]
+    if (onlyAgent) onChange(onlyAgent.id)
+  }, [agentsQuery.isPending, canManage, eligibleAgents, onChange, value])
 
   return (
     <div className="mt-3 space-y-2 rounded-md bg-muted/40 p-3">

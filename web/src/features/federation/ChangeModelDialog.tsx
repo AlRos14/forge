@@ -208,9 +208,9 @@ export function ChangeModelDialog({
                   options={hostOptions}
                 />
                 <p className="text-xs text-muted-foreground">
-                  Host choices are limited to online daemons authorized for your account with this
-                  runtime authenticated. Automatic routing resolves an authorized host when an Execution
-                  starts.
+                  Optional advanced placement. Leave automatic unless this Agent must run on a
+                  specific authorized host. Automatic routing resolves an authorized host when an
+                  Execution starts.
                 </p>
               </div>
             ) : null}

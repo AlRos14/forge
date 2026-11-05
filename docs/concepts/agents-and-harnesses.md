@@ -180,13 +180,13 @@ created by server startup; its public registration identity is reserved for an
 explicit administrator operation. An ordinary user cannot obtain the embedded
 shell by registering or leaving its Agent unpinned.
 
-In Agent Settings, administrators can pin a new Agent or an Agent they own to an
-online host authorized for their account that reports the selected runtime as
-authenticated. The host choices come from the server's account-scoped
-availability check. Non-admins do not see host choices and cannot pin an Agent;
-their unpinned Executions use the existing account-authorized host resolver.
-Host edits use the Agent's current version, so a concurrent change remains a
-version conflict.
+Agent creation defaults to automatic host resolution. Administrators can still
+pin an Agent they own to an online host authorized for their account that
+reports the selected runtime as authenticated, through Agent edit, REST, or the
+CLI. The host choices come from the server's account-scoped availability check.
+Non-admins do not see host choices and cannot pin an Agent; unpinned Executions
+use the existing account-authorized host resolver. Host edits use the Agent's
+current version, so a concurrent change remains a version conflict.
 
 The same current account, Agent profile/binding, daemon owner/visibility/host,
 online state, and authenticated capability are checked at admission and again
