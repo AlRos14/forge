@@ -71,3 +71,40 @@ delegation. Use only disposable `./test` data for local server acceptance.
 | Rust formatting and whitespace checks | PASS |
 | Broad workspace test run | NOT RUN to completion — all targets compiled and 57 API unit tests passed; stopped before completing the unrelated integration suites to prioritize the affected contracts |
 | Live model-provider round trip | NOT RUN |
+
+## Harness and UI expansion — 2026-11-05
+
+The Project Copilot panel now takes its available executor types and exact
+authorized embedded daemon ID from `GET /projects/{id}/copilot`. Agent
+assignment requires the canonical Project owner's Agent to be pinned to that
+host. Agent Settings lets server administrators pin an Agent during creation
+or editing. Remote daemons remain unsupported for Project Copilot.
+
+Claude Code, Cursor Agent, OpenCode and Gemini CLI adapters advertise scoped
+management support only when the embedded daemon reports the harness as
+authenticated. Cursor and OpenCode were checked against locally installed CLI
+versions 2026.09.26 and 2.2.5; each run also checks required CLI flags. Gemini
+was not installed on this host, so its adapter checks the required CLI flags
+before starting any model turn. Smith remains unsupported because the CLI
+syntax documented by its upstream does not match the Forge adapter's current
+invocation. Codex CLI 0.166.0 remains unsupported because its app-server
+protocol does not expose a proven native-tool allowlist, ignores the attempted
+`include_apply_patch_tool` session setting, and merges run MCP configuration
+with existing MCP servers.
+
+For enabled adapters, MCP settings are assembled per run (Cursor, OpenCode and
+Gemini use temporary harness configuration; Claude Code uses its isolated
+run-context MCP file). The short-lived Bearer value is passed only through the
+process environment. The MCP endpoint and dispatch layer still enforce the
+exact Project/Task scope and tool set.
+
+| Check | Result |
+| --- | --- |
+| Rust workspace `cargo check` | PASS |
+| Workspace Clippy, all targets, warnings denied | PASS |
+| Web typecheck and lint | PASS |
+| Web production build | PASS |
+| Rust format and `git diff --check` | PASS |
+| Test suites | NOT RUN in this change |
+| Gemini CLI preflight on this host | NOT RUN — Gemini is not installed |
+| Live model-provider round trip | NOT RUN |

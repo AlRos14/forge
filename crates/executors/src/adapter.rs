@@ -113,6 +113,13 @@ pub struct ExecutionOverrides {
 pub trait HarnessAdapter: Send + Sync {
     fn kind(&self) -> ExecutorKind;
 
+    /// This integration can bind the delegated management MCP and restrict
+    /// model-callable tools for a Project Copilot run. Availability and the
+    /// current Agent/host authority are checked separately at invocation.
+    fn supports_project_copilot(&self) -> bool {
+        false
+    }
+
     /// Legacy family-level detector used by adapters whose availability does
     /// not depend on one candidate's normalized configuration.
     fn check_availability(&self) -> AvailabilityInfo {
@@ -289,6 +296,18 @@ fn require_planning_capability(
 
 #[async_trait]
 impl TaskExecutor for AdapterExecutor {
+    fn project_copilot_harnesses(&self) -> Vec<ExecutorKind> {
+        self.registry
+            .kinds()
+            .into_iter()
+            .filter(|kind| {
+                self.registry
+                    .get(kind)
+                    .is_some_and(HarnessAdapter::supports_project_copilot)
+            })
+            .collect()
+    }
+
     async fn execute(&self, mut ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
         let (kind, raw_config) = executor_config_pair(&ctx.agent_config)?;
         let adapter = self.registry.get(&kind).ok_or_else(|| {
@@ -633,6 +652,18 @@ impl FallbackExecutor {
 
 #[async_trait]
 impl TaskExecutor for FallbackExecutor {
+    fn project_copilot_harnesses(&self) -> Vec<ExecutorKind> {
+        self.registry
+            .kinds()
+            .into_iter()
+            .filter(|kind| {
+                self.registry
+                    .get(kind)
+                    .is_some_and(HarnessAdapter::supports_project_copilot)
+            })
+            .collect()
+    }
+
     fn prepare_execution(&self, execution_id: &str) {
         FallbackExecutor::prepare_execution(self, execution_id);
     }

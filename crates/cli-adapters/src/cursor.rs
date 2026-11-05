@@ -3,6 +3,7 @@ use executors::{
     AvailabilityInfo, AvailabilityStatus, CursorConfig, DiscoverContext, DiscoveredOptions,
     ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind,
     HarnessAdapter, LogKind, LogStream, LogWriter, PermissionPolicy, ProcessGroupChild,
+    ProjectCopilotMcp,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -28,6 +29,8 @@ const MAX_DIRECT_PROMPT_BYTES: usize = 32 * 1024;
 const CONTROL_DIR_PREFIX: &str = "forge-cursor-control-";
 const STALE_CONTROL_DIR_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const USAGE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const CURSOR_COPILOT_MCP_SERVER: &str = "forge_project";
+const PROJECT_COPILOT_TOKEN_ENV: &str = "FORGE_COPILOT_MCP_TOKEN";
 
 pub struct CursorAdapter {
     processes: Arc<Mutex<HashMap<String, RunningProcess>>>,
@@ -87,6 +90,17 @@ struct CachedAccountUsage {
 struct RuntimePromptFile {
     file: NamedTempFile,
     root: TempDir,
+}
+
+struct CursorProjectCopilotRuntime {
+    root: TempDir,
+    global_config_dir: std::path::PathBuf,
+}
+
+impl CursorProjectCopilotRuntime {
+    fn root(&self) -> &Path {
+        self.root.path()
+    }
 }
 
 impl RuntimePromptFile {
@@ -248,6 +262,15 @@ impl CursorAdapter {
         cmd
     }
 
+    fn build_project_copilot_command(config: &CursorConfig) -> tokio::process::Command {
+        let mut safe_config = config.clone();
+        // The per-run allowlist enables only the exact MCP tools. Never inherit
+        // `force` (Cursor's unrestricted approval mode) into management runs.
+        safe_config.force = Some(false);
+        safe_config.permission_policy = Some(PermissionPolicy::Supervised);
+        Self::build_command(&safe_config, None)
+    }
+
     fn insert_process(
         &self,
         execution_id: String,
@@ -352,6 +375,9 @@ impl Default for CursorAdapter {
 
 #[async_trait]
 impl HarnessAdapter for CursorAdapter {
+    fn supports_project_copilot(&self) -> bool {
+        true
+    }
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Cursor
     }
@@ -483,13 +509,27 @@ impl HarnessAdapter for CursorAdapter {
 
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
         let config = Self::resolve_config(&ctx);
+        let project_copilot = ctx.role == "project_copilot";
+        let copilot_mcp = if project_copilot {
+            Some(validate_project_copilot_config(&config)?.clone())
+        } else {
+            None
+        };
         let prompt = if let Some(template) = &config.prompt_template {
             format!("{template}\n\n{}", ctx.description)
         } else {
             ctx.description.clone()
         };
 
-        let runtime_prompt = if prompt.len() > MAX_DIRECT_PROMPT_BYTES {
+        let copilot_runtime = if let Some(mcp) = copilot_mcp.as_ref() {
+            Some(create_cursor_project_copilot_runtime(mcp)?)
+        } else {
+            None
+        };
+        if project_copilot {
+            ensure_cursor_project_copilot_cli_supported().await?;
+        }
+        let runtime_prompt = if !project_copilot && prompt.len() > MAX_DIRECT_PROMPT_BYTES {
             Some(Self::write_runtime_prompt(
                 &ctx.worktree_path,
                 &ctx.execution_id,
@@ -498,19 +538,29 @@ impl HarnessAdapter for CursorAdapter {
         } else {
             None
         };
-        let mut command = Self::build_command(
-            &config,
-            runtime_prompt
-                .as_ref()
-                .map(RuntimePromptFile::workspace_root),
-        );
+        let mut command = if project_copilot {
+            Self::build_project_copilot_command(&config)
+        } else {
+            Self::build_command(
+                &config,
+                runtime_prompt
+                    .as_ref()
+                    .map(RuntimePromptFile::workspace_root),
+            )
+        };
         command.arg(
             runtime_prompt
                 .as_ref()
                 .map(RuntimePromptFile::instruction)
                 .unwrap_or_else(|| prompt.clone()),
         );
-        command.current_dir(&ctx.worktree_path);
+        if let Some(runtime) = &copilot_runtime {
+            command
+                .current_dir(runtime.root())
+                .env("CURSOR_CONFIG_DIR", &runtime.global_config_dir);
+        } else {
+            command.current_dir(&ctx.worktree_path);
+        }
         let mut child = ProcessGroupChild::spawn(&mut command)?;
 
         let stdout = match child.inner().stdout.take() {
@@ -1152,6 +1202,293 @@ fn should_force(config: &CursorConfig) -> bool {
             Some(PermissionPolicy::Plan)
         )
     })
+}
+
+fn validate_project_copilot_config(
+    config: &CursorConfig,
+) -> Result<&ProjectCopilotMcp, ExecutorError> {
+    if config.command_overrides.base_command_override.is_some()
+        || config
+            .command_overrides
+            .additional_params
+            .as_ref()
+            .is_some_and(|args| !args.is_empty())
+    {
+        return Err(ExecutorError::Other(
+            "Project Copilot Agent config does not satisfy MCP-only harness policy".to_owned(),
+        ));
+    }
+    validate_cursor_project_copilot_environment(&config.command_overrides.env)?;
+    let mcp = config.forge_project_copilot.as_ref().ok_or_else(|| {
+        ExecutorError::Other("Project Copilot MCP descriptor is missing".to_owned())
+    })?;
+    let token = config
+        .command_overrides
+        .env
+        .as_ref()
+        .and_then(|env| env.get(PROJECT_COPILOT_TOKEN_ENV))
+        .ok_or_else(|| ExecutorError::Other("Project Copilot MCP token is missing".to_owned()))?;
+    if mcp.mcp_url.contains(token) {
+        return Err(ExecutorError::Other(
+            "Project Copilot MCP token must not appear in its URL".to_owned(),
+        ));
+    }
+    validate_project_copilot_descriptor(mcp)?;
+    Ok(mcp)
+}
+
+fn validate_cursor_project_copilot_environment(
+    env: &Option<HashMap<String, String>>,
+) -> Result<(), ExecutorError> {
+    const RUNTIME_ENV_ALLOWLIST: &[&str] = &[
+        PROJECT_COPILOT_TOKEN_ENV,
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "XAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "CURSOR_API_KEY",
+    ];
+    let Some(env) = env else {
+        return Err(ExecutorError::Other(
+            "Project Copilot MCP token is missing".to_owned(),
+        ));
+    };
+    if !env
+        .get(PROJECT_COPILOT_TOKEN_ENV)
+        .is_some_and(|token| !token.is_empty())
+        || env
+            .keys()
+            .any(|key| !RUNTIME_ENV_ALLOWLIST.contains(&key.as_str()))
+    {
+        return Err(ExecutorError::Other(
+            "Project Copilot runtime environment contains unsupported values".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_project_copilot_descriptor(mcp: &ProjectCopilotMcp) -> Result<(), ExecutorError> {
+    if !valid_project_copilot_mcp_url(&mcp.mcp_url)
+        || mcp.enabled_tools.iter().any(|tool| {
+            tool.is_empty()
+                || !tool
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        })
+    {
+        return Err(ExecutorError::Other(
+            "Project Copilot MCP descriptor is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_project_copilot_mcp_url(url: &str) -> bool {
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "http" | "https")
+        || remainder.is_empty()
+        || remainder.contains('?')
+        || remainder.contains('#')
+        || remainder.chars().any(char::is_whitespace)
+    {
+        return false;
+    }
+    let authority = remainder.split('/').next().unwrap_or_default();
+    !authority.is_empty() && !authority.contains('@')
+}
+
+fn create_cursor_project_copilot_runtime(
+    mcp: &ProjectCopilotMcp,
+) -> Result<CursorProjectCopilotRuntime, ExecutorError> {
+    validate_project_copilot_descriptor(mcp)?;
+    let external_servers = cursor_global_mcp_server_names()?;
+    let root = TempfileBuilder::new()
+        .prefix("forge-cursor-copilot-")
+        .tempdir()
+        .map_err(|error| {
+            ExecutorError::Other(format!(
+                "failed to create Cursor Project Copilot runtime directory: {error}"
+            ))
+        })?;
+    let project_cursor_dir = root.path().join(".cursor");
+    let global_config_dir = root.path().join("cursor-config");
+    fs::create_dir(&project_cursor_dir)
+        .and_then(|_| fs::create_dir(&global_config_dir))
+        .map_err(|error| {
+            ExecutorError::Other(format!(
+                "failed to create Cursor Project Copilot configuration directories: {error}"
+            ))
+        })?;
+
+    let policy = cursor_project_copilot_permissions(mcp, &external_servers);
+    let global_config = serde_json::json!({
+        "version": 1,
+        "editor": {"vimMode": false},
+        "approvalMode": "allowlist",
+        "permissions": policy.clone()
+    });
+    let project_config = serde_json::json!({
+        "version": 1,
+        "editor": {"vimMode": false},
+        "permissions": policy
+    });
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            (CURSOR_COPILOT_MCP_SERVER): {
+                "url": &mcp.mcp_url,
+                "headers": {
+                    "Authorization": format!("Bearer ${{env:{PROJECT_COPILOT_TOKEN_ENV}}}")
+                }
+            }
+        }
+    });
+    write_private_cursor_config(&global_config_dir.join("cli-config.json"), &global_config)?;
+    write_private_cursor_config(&project_cursor_dir.join("cli.json"), &project_config)?;
+    write_private_cursor_config(&project_cursor_dir.join("mcp.json"), &mcp_config)?;
+    Ok(CursorProjectCopilotRuntime {
+        root,
+        global_config_dir,
+    })
+}
+
+fn cursor_project_copilot_permissions(
+    mcp: &ProjectCopilotMcp,
+    other_servers: &[String],
+) -> serde_json::Value {
+    let mut allow = mcp
+        .enabled_tools
+        .iter()
+        .map(|tool| format!("Mcp({CURSOR_COPILOT_MCP_SERVER}:{tool})"))
+        .collect::<Vec<_>>();
+    allow.sort();
+    allow.dedup();
+
+    let mut deny = vec![
+        "Read(*)".to_owned(),
+        "Write(*)".to_owned(),
+        "Shell(*)".to_owned(),
+        "WebFetch(*)".to_owned(),
+    ];
+    deny.extend(
+        other_servers
+            .iter()
+            .filter(|server| server.as_str() != CURSOR_COPILOT_MCP_SERVER)
+            .map(|server| format!("Mcp({server}:*)")),
+    );
+    deny.sort();
+    deny.dedup();
+    serde_json::json!({"allow": allow, "deny": deny})
+}
+
+fn cursor_global_mcp_server_names() -> Result<Vec<String>, ExecutorError> {
+    let Some(path) = dirs::home_dir().map(|home| home.join(".cursor/mcp.json")) else {
+        return Ok(Vec::new());
+    };
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(ExecutorError::Other(format!(
+                "failed to read Cursor MCP server names for Project Copilot: {error}"
+            )));
+        }
+    };
+    let document: Value = serde_json::from_str(&contents).map_err(|_| {
+        ExecutorError::Other(
+            "Cursor global MCP config is invalid; refusing Project Copilot without a complete server denylist"
+                .to_owned(),
+        )
+    })?;
+    let Some(servers) = document.get("mcpServers") else {
+        return Ok(Vec::new());
+    };
+    let servers = servers.as_object().ok_or_else(|| {
+        ExecutorError::Other(
+            "Cursor global MCP server list is invalid; refusing Project Copilot".to_owned(),
+        )
+    })?;
+    let mut names = Vec::with_capacity(servers.len());
+    for name in servers.keys() {
+        if name != CURSOR_COPILOT_MCP_SERVER && !valid_cursor_mcp_server_name(name) {
+            return Err(ExecutorError::Other(
+                "Cursor global MCP server name cannot be safely denied; refusing Project Copilot"
+                    .to_owned(),
+            ));
+        }
+        names.push(name.clone());
+    }
+    Ok(names)
+}
+
+fn valid_cursor_mcp_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn write_private_cursor_config(path: &Path, value: &Value) -> Result<(), ExecutorError> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        ExecutorError::Other(format!(
+            "failed to encode Cursor Project Copilot config: {error}"
+        ))
+    })?;
+    fs::write(path, bytes).map_err(|error| {
+        ExecutorError::Other(format!(
+            "failed to write Cursor Project Copilot config: {error}"
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+            ExecutorError::Other(format!(
+                "failed to protect Cursor Project Copilot config: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+async fn ensure_cursor_project_copilot_cli_supported() -> Result<(), ExecutorError> {
+    let output = crate::command::output_with_timeout(
+        {
+            let mut command = tokio::process::Command::new("cursor-agent");
+            command.arg("--help");
+            command
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .filter(|output| output.status.success())
+    .ok_or_else(|| {
+        ExecutorError::Unavailable(
+            "Project Copilot could not verify Cursor Agent's print and stream-json options"
+                .to_owned(),
+        )
+    })?;
+    let help = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if cursor_project_copilot_cli_supports_policy(&help) {
+        Ok(())
+    } else {
+        Err(ExecutorError::Unavailable(
+            "Project Copilot requires Cursor Agent CLI support for -p and --output-format"
+                .to_owned(),
+        ))
+    }
+}
+
+fn cursor_project_copilot_cli_supports_policy(help: &str) -> bool {
+    let normalized = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.contains("-p") && normalized.contains("--output-format")
 }
 
 fn cursor_run_error(status: ExitStatus, stderr_tail: &str) -> String {

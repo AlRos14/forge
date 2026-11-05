@@ -47,7 +47,6 @@ import {
 } from '@/features/project-copilot/types'
 import { cn } from '@/lib/cn'
 
-const SUPPORTED_EXECUTORS = new Set(['claude_code'])
 const RUNNING_STATUSES = new Set<ProjectCopilotRunStatus>(['queued', 'running'])
 const ACTIVITY_TOOL_LABEL_KEYS: Record<string, string> = {
   forge_get_project: 'projectCopilot.activity.tools.readProject',
@@ -516,6 +515,8 @@ function ProjectCopilotSession({
               <AgentAssignmentEditor
                 projectId={projectId}
                 ownerId={project?.owner_id ?? null}
+                supportedExecutorTypes={config.supported_executor_types}
+                supportedDaemonId={config.supported_daemon_id}
                 value={agentSelection}
                 currentAgentId={config.agent_id}
                 canManage={canManage}
@@ -1060,6 +1061,8 @@ function ProjectCopilotSession({
 function AgentAssignmentEditor({
   projectId,
   ownerId,
+  supportedExecutorTypes,
+  supportedDaemonId,
   value,
   currentAgentId,
   canManage,
@@ -1070,6 +1073,8 @@ function AgentAssignmentEditor({
 }: {
   projectId: string
   ownerId: string | null
+  supportedExecutorTypes: string[]
+  supportedDaemonId: string | null
   value: string | null
   currentAgentId: string | null
   canManage: boolean
@@ -1088,7 +1093,9 @@ function AgentAssignmentEditor({
     (agent) =>
       ownerId !== null &&
       agent.owner_id === ownerId &&
-      SUPPORTED_EXECUTORS.has(agent.executor_type),
+      supportedDaemonId !== null &&
+      agent.daemon_id === supportedDaemonId &&
+      supportedExecutorTypes.includes(agent.executor_type),
   )
   const selectedIsEligible = value === null || eligibleAgents.some((agent) => agent.id === value)
   const currentIsEligible =
@@ -1125,7 +1132,17 @@ function AgentAssignmentEditor({
         </div>
       ) : null}
       {!agentsQuery.isPending && eligibleAgents.length === 0 && !agentsQuery.hasNextPage ? (
-        <p className="text-[11px] text-muted-foreground">{t('projectCopilot.noEligibleAgents')}</p>
+        <div className="space-y-1">
+          <p className="text-[11px] text-muted-foreground">
+            {t('projectCopilot.noEligibleAgents')}
+          </p>
+          <Link
+            to="/agents"
+            className="inline-flex text-[11px] font-medium text-primary underline-offset-4 hover:underline"
+          >
+            {t('projectCopilot.openAgentSettings')}
+          </Link>
+        </div>
       ) : null}
       {agentsQuery.hasNextPage ? (
         <Button

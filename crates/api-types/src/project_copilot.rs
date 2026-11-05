@@ -1,6 +1,27 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+/// The sole management tool set shared by MCP dispatch and native harness
+/// configuration. Task-bound runs omit Project-wide Task listing.
+pub const PROJECT_COPILOT_MCP_TOOLS: &[&str] = &[
+    "forge_get_project",
+    "forge_list_tasks",
+    "forge_get_task",
+    "forge_list_task_roles",
+    "forge_list_task_artifacts",
+    "forge_list_executions",
+    "forge_get_task_lifecycle",
+    "forge_list_task_dependencies",
+    "forge_list_work_units",
+    "forge_get_work_unit",
+    "forge_create_work_unit",
+    "forge_update_work_unit",
+    "forge_allocate_work_unit",
+    "forge_list_work_unit_dependencies",
+    "forge_add_work_unit_dependency",
+    "forge_remove_work_unit_dependency",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -61,6 +82,10 @@ pub struct ProjectCopilotResponse {
     #[ts(type = "number")]
     pub version: i64,
     pub active_run: Option<ProjectCopilotRun>,
+    /// Registered harness integrations with scoped Project management support.
+    pub supported_executor_types: Vec<String>,
+    /// The exact online embedded daemon authorized to run those integrations.
+    pub supported_daemon_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

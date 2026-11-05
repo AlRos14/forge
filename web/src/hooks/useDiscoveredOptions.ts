@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '@/api/client'
 import { qk } from '@/api/query-keys'
+import type { DiscoveredDaemonResponse } from '@/types/generated'
 
 export type DiscoveredModelOption = {
   id: string
@@ -18,6 +19,7 @@ export type DiscoveredExecutionOptions = {
   models: DiscoveredModelOption[]
   reasoningOptions: ReasoningOption[]
   permissionPolicies: string[]
+  availableDaemons: DiscoveredDaemonResponse[]
   warning?: string
 }
 
@@ -25,6 +27,7 @@ type AgentDiscoveredOptionsResponse = {
   models?: Array<{ id: string; name?: string; reasoning_options?: string[] } | string>
   permission_policies?: string[]
   cli_specific?: unknown
+  available_daemons?: DiscoveredDaemonResponse[]
   warning?: string | null
 }
 
@@ -123,6 +126,7 @@ export function normalizeDiscoveredOptions(
     models,
     reasoningOptions: reasoningIds.map((id) => ({ id, label: titleCase(id) })),
     permissionPolicies: policies,
+    availableDaemons: response.available_daemons ?? [],
     ...(response.warning ? { warning: response.warning } : {}),
   }
 }

@@ -103,6 +103,8 @@ function projectConfigFor(projectId: string) {
     agent_name: `Agent for ${projectId}`,
     version: 1,
     active_run: null,
+    supported_executor_types: ['claude_code', 'codex', 'opencode'],
+    supported_daemon_id: 'embedded-host',
   }
 }
 
@@ -128,6 +130,7 @@ function installFetchMock() {
           {
             id: 'agent-1',
             owner_id: 'owner-1',
+            daemon_id: 'embedded-host',
             executor_type: 'claude_code',
             name: 'Claude Agent',
             model: 'sonnet',
@@ -136,6 +139,7 @@ function installFetchMock() {
           {
             id: 'agent-codex',
             owner_id: 'owner-1',
+            daemon_id: 'embedded-host',
             executor_type: 'codex',
             name: 'Codex Agent',
             model: null,
@@ -144,8 +148,27 @@ function installFetchMock() {
           {
             id: 'agent-opencode',
             owner_id: 'owner-1',
+            daemon_id: 'embedded-host',
             executor_type: 'opencode',
             name: 'OpenCode Agent',
+            model: null,
+            effective_status: 'active',
+          },
+          {
+            id: 'agent-unsupported',
+            owner_id: 'owner-1',
+            daemon_id: 'embedded-host',
+            executor_type: 'shell',
+            name: 'Shell Agent',
+            model: null,
+            effective_status: 'active',
+          },
+          {
+            id: 'agent-remote',
+            owner_id: 'owner-1',
+            daemon_id: 'remote-host',
+            executor_type: 'codex',
+            name: 'Remote Codex Agent',
             model: null,
             effective_status: 'active',
           },
@@ -518,22 +541,26 @@ describe('ProjectCopilotDock', () => {
     expect(requestedActivityCursors).toContain('older-activity')
   })
 
-  it('offers only Claude Code Agents for the Project Copilot assignment', async () => {
+  it('offers every server-supported harness on the authorized local host', async () => {
     projectMembershipRole = 'admin'
     renderDock({ projectId: 'project-1' })
     fireEvent.click(await screen.findByRole('button', { name: 'Open Project Copilot' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Change' }))
 
     expect(
-      await screen.findByText("Choose an Agent owned by this Project's owner and using Claude Code."),
+      await screen.findByText(
+        "Choose an Agent owned by this Project's owner, bound to the supported local host, whose harness can be restricted to Copilot tools.",
+      ),
     ).toBeTruthy()
     const agentSelector = screen.getByRole('button', { name: 'Agent' })
     await waitFor(() => expect((agentSelector as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(agentSelector)
 
     expect(await screen.findByRole('option', { name: /Claude Agent/ })).toBeTruthy()
-    expect(screen.queryByRole('option', { name: /Codex Agent/ })).toBeNull()
-    expect(screen.queryByRole('option', { name: /OpenCode Agent/ })).toBeNull()
+    expect(await screen.findByRole('option', { name: /Codex Agent/ })).toBeTruthy()
+    expect(await screen.findByRole('option', { name: /OpenCode Agent/ })).toBeTruthy()
+    expect(screen.queryByRole('option', { name: /Shell Agent/ })).toBeNull()
+    expect(screen.queryByRole('option', { name: /Remote Codex Agent/ })).toBeNull()
   })
 
   it('uses a modal drawer on mobile and keeps the exact Task attached', async () => {

@@ -529,25 +529,7 @@ fn copilot_tool_allowed(name: &str, task_scoped: bool) -> bool {
     if task_scoped && name == "forge_list_tasks" {
         return false;
     }
-    matches!(
-        name,
-        "forge_get_project"
-            | "forge_list_tasks"
-            | "forge_get_task"
-            | "forge_list_task_roles"
-            | "forge_list_task_artifacts"
-            | "forge_list_executions"
-            | "forge_get_task_lifecycle"
-            | "forge_list_task_dependencies"
-            | "forge_list_work_units"
-            | "forge_get_work_unit"
-            | "forge_create_work_unit"
-            | "forge_update_work_unit"
-            | "forge_allocate_work_unit"
-            | "forge_list_work_unit_dependencies"
-            | "forge_add_work_unit_dependency"
-            | "forge_remove_work_unit_dependency"
-    )
+    api_types::PROJECT_COPILOT_MCP_TOOLS.contains(&name)
 }
 
 fn tool_call_result(result: Value) -> Value {

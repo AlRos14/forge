@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use executors::{
     AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
     ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, HarnessAdapter, LogKind,
-    LogStream, LogWriter, OpencodeConfig, PermissionPolicy, ProcessGroupChild,
+    LogStream, LogWriter, OpencodeConfig, PermissionPolicy, ProcessGroupChild, ProjectCopilotMcp,
 };
 use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 use std::collections::HashMap;
@@ -19,6 +19,8 @@ use tokio::sync::Mutex as AsyncMutex;
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_SUMMARY_CHARS: usize = 500;
 const MODEL_DISCOVERY_TIMEOUT_SECONDS: u64 = 10;
+const OPENCODE_COPILOT_AGENT: &str = "forge-project-copilot";
+const PROJECT_COPILOT_TOKEN_ENV: &str = "FORGE_COPILOT_MCP_TOKEN";
 
 pub struct OpencodeAdapter {
     executions: Arc<Mutex<HashMap<String, RunningExecution>>>,
@@ -91,6 +93,31 @@ impl OpencodeAdapter {
         cmd
     }
 
+    fn build_project_copilot_command(
+        config: &OpencodeConfig,
+        prompt: &str,
+        policy: &str,
+        config_dir: &Path,
+    ) -> tokio::process::Command {
+        let mut safe_config = config.clone();
+        safe_config.agent = Some(OPENCODE_COPILOT_AGENT.to_owned());
+        safe_config.auto_approve = Some(false);
+        safe_config.permission_policy = Some(PermissionPolicy::Supervised);
+        // OpenCode v2 selects a variant with model#variant; its current CLI no
+        // longer advertises the v1 --variant option.
+        if let (Some(model), Some(variant)) =
+            (safe_config.model.clone(), safe_config.variant.clone())
+        {
+            safe_config.model = Some(format!("{}#{variant}", normalize_opencode_model_id(&model)));
+            safe_config.variant = None;
+        }
+        let mut command = Self::build_command(&safe_config, prompt);
+        command
+            .env("OPENCODE_CONFIG_DIR", config_dir)
+            .env("OPENCODE_CONFIG_CONTENT", policy);
+        command
+    }
+
     fn insert_execution(
         &self,
         execution_id: String,
@@ -120,6 +147,10 @@ impl Default for OpencodeAdapter {
 
 #[async_trait]
 impl HarnessAdapter for OpencodeAdapter {
+    fn supports_project_copilot(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Opencode
     }
@@ -205,14 +236,48 @@ impl HarnessAdapter for OpencodeAdapter {
 
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
         let config = Self::resolve_config(&ctx);
+        let project_copilot = ctx.role == "project_copilot";
+        let project_copilot_mcp = if project_copilot {
+            Some(validate_project_copilot_config(&config)?.clone())
+        } else {
+            None
+        };
         let prompt = if let Some(template) = &config.prompt_template {
             format!("{template}\n\n{}", ctx.description)
         } else {
             ctx.description.clone()
         };
 
-        let mut cmd = Self::build_command(&config, &prompt);
-        cmd.current_dir(&ctx.worktree_path);
+        let copilot_runtime_dir =
+            if project_copilot {
+                Some(tempfile::Builder::new()
+                .prefix("forge-opencode-copilot-")
+                .tempdir()
+                .map_err(|error| {
+                    ExecutorError::Other(format!(
+                        "failed to create OpenCode Project Copilot runtime directory: {error}"
+                    ))
+                })?)
+            } else {
+                None
+            };
+        let mut cmd = if let (Some(mcp), Some(runtime_dir)) =
+            (project_copilot_mcp.as_ref(), copilot_runtime_dir.as_ref())
+        {
+            let policy = opencode_project_copilot_policy(mcp)?;
+            Self::build_project_copilot_command(&config, &prompt, &policy, runtime_dir.path())
+        } else {
+            Self::build_command(&config, &prompt)
+        };
+        if let Some(runtime_dir) = &copilot_runtime_dir {
+            cmd.current_dir(runtime_dir.path());
+        } else {
+            cmd.current_dir(&ctx.worktree_path);
+        }
+
+        if project_copilot {
+            ensure_opencode_project_copilot_cli_supported().await?;
+        }
 
         let mut child = ProcessGroupChild::spawn(&mut cmd)?;
 
@@ -667,6 +732,188 @@ async fn stream_run_output(
         error,
         stderr_tail,
     })
+}
+
+fn validate_project_copilot_config(
+    config: &OpencodeConfig,
+) -> Result<&ProjectCopilotMcp, ExecutorError> {
+    if config.command_overrides.base_command_override.is_some()
+        || config
+            .command_overrides
+            .additional_params
+            .as_ref()
+            .is_some_and(|args| !args.is_empty())
+    {
+        return Err(ExecutorError::Other(
+            "Project Copilot Agent config does not satisfy MCP-only harness policy".to_owned(),
+        ));
+    }
+    validate_project_copilot_environment(&config.command_overrides.env)?;
+    let mcp = config.forge_project_copilot.as_ref().ok_or_else(|| {
+        ExecutorError::Other("Project Copilot MCP descriptor is missing".to_owned())
+    })?;
+    let token = config
+        .command_overrides
+        .env
+        .as_ref()
+        .and_then(|env| env.get(PROJECT_COPILOT_TOKEN_ENV))
+        .ok_or_else(|| ExecutorError::Other("Project Copilot MCP token is missing".to_owned()))?;
+    if mcp.mcp_url.contains(token) {
+        return Err(ExecutorError::Other(
+            "Project Copilot MCP token must not appear in its URL".to_owned(),
+        ));
+    }
+    validate_project_copilot_descriptor(mcp)?;
+    Ok(mcp)
+}
+
+fn validate_project_copilot_environment(
+    env: &Option<HashMap<String, String>>,
+) -> Result<(), ExecutorError> {
+    const RUNTIME_ENV_ALLOWLIST: &[&str] = &[
+        PROJECT_COPILOT_TOKEN_ENV,
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "XAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OLLAMA_HOST",
+    ];
+    let Some(env) = env else {
+        return Err(ExecutorError::Other(
+            "Project Copilot MCP token is missing".to_owned(),
+        ));
+    };
+    if !env
+        .get(PROJECT_COPILOT_TOKEN_ENV)
+        .is_some_and(|token| !token.is_empty())
+        || env
+            .keys()
+            .any(|key| !RUNTIME_ENV_ALLOWLIST.contains(&key.as_str()))
+    {
+        return Err(ExecutorError::Other(
+            "Project Copilot runtime environment contains unsupported values".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_project_copilot_descriptor(mcp: &ProjectCopilotMcp) -> Result<(), ExecutorError> {
+    if !valid_project_copilot_mcp_url(&mcp.mcp_url)
+        || mcp.enabled_tools.iter().any(|tool| {
+            tool.is_empty()
+                || !tool
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        })
+    {
+        return Err(ExecutorError::Other(
+            "Project Copilot MCP descriptor is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_project_copilot_mcp_url(url: &str) -> bool {
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "http" | "https")
+        || remainder.is_empty()
+        || remainder.contains('?')
+        || remainder.contains('#')
+        || remainder.chars().any(char::is_whitespace)
+    {
+        return false;
+    }
+    let authority = remainder.split('/').next().unwrap_or_default();
+    !authority.is_empty() && !authority.contains('@')
+}
+
+fn opencode_project_copilot_policy(mcp: &ProjectCopilotMcp) -> Result<String, ExecutorError> {
+    validate_project_copilot_descriptor(mcp)?;
+    let mut permissions = vec![serde_json::json!({
+        "action": "*",
+        "resource": "*",
+        "effect": "deny"
+    })];
+    for tool in &mcp.enabled_tools {
+        permissions.push(serde_json::json!({
+            "action": format!("forge_project_{tool}"),
+            "resource": "*",
+            "effect": "allow"
+        }));
+    }
+    let document = serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "default_agent": OPENCODE_COPILOT_AGENT,
+        "permissions": permissions.clone(),
+        "agents": {
+            (OPENCODE_COPILOT_AGENT): {
+                "description": "Project management assistant with delegated Forge MCP tools",
+                "mode": "primary",
+                "hidden": true,
+                "permissions": permissions
+            }
+        },
+        "mcp": {
+            "servers": {
+                "forge_project": {
+                    "type": "remote",
+                    "url": &mcp.mcp_url,
+                    "oauth": false,
+                    "headers": {
+                        "Authorization": format!("Bearer {{env:{PROJECT_COPILOT_TOKEN_ENV}}}")
+                    },
+                    "codemode": false
+                }
+            }
+        }
+    });
+    serde_json::to_string(&document).map_err(|error| {
+        ExecutorError::Other(format!(
+            "failed to generate OpenCode Project Copilot policy: {error}"
+        ))
+    })
+}
+
+async fn ensure_opencode_project_copilot_cli_supported() -> Result<(), ExecutorError> {
+    let output = crate::command::output_with_timeout(
+        {
+            let mut command = tokio::process::Command::new("opencode");
+            command.args(["run", "--help"]);
+            command
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .filter(|output| output.status.success())
+    .ok_or_else(|| {
+        ExecutorError::Unavailable(
+            "Project Copilot could not verify OpenCode's managed agent and JSON CLI options"
+                .to_owned(),
+        )
+    })?;
+    let help = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if opencode_project_copilot_cli_supports_policy(&help) {
+        Ok(())
+    } else {
+        Err(ExecutorError::Unavailable(
+            "Project Copilot requires OpenCode CLI support for run --agent, --format, --model, and --session"
+                .to_owned(),
+        ))
+    }
+}
+
+fn opencode_project_copilot_cli_supports_policy(help: &str) -> bool {
+    ["--agent", "--format", "--model", "--session"]
+        .iter()
+        .all(|option| help.contains(option))
 }
 
 fn should_skip_permissions(config: &OpencodeConfig) -> bool {

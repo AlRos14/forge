@@ -99,6 +99,13 @@ pub struct ShellConfig {
     pub command_overrides: CommandOverrides,
 }
 
+/// Ephemeral management connection injected after the Agent snapshot is stored.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectCopilotMcp {
+    pub mcp_url: String,
+    pub enabled_tools: Vec<String>,
+}
+
 /// Codex executor config. Field names compatible with Vibe Kanban.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CodexConfig {
@@ -155,6 +162,9 @@ pub struct ClaudeCodeConfig {
 /// Cursor Agent CLI executor config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CursorConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub forge_project_copilot: Option<ProjectCopilotMcp>,
     pub model: Option<String>,
     pub force: Option<bool>,
     pub resume_session_id: Option<String>,
@@ -167,6 +177,9 @@ pub struct CursorConfig {
 /// OpenCode executor config. Field names compatible with Vibe Kanban.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct OpencodeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub forge_project_copilot: Option<ProjectCopilotMcp>,
     pub model: Option<String>,
     pub variant: Option<String>,
     pub agent: Option<String>,
@@ -182,6 +195,9 @@ pub struct OpencodeConfig {
 /// Gemini CLI executor config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct GeminiConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub forge_project_copilot: Option<ProjectCopilotMcp>,
     pub model: Option<String>,
     pub sandbox: Option<String>,
     pub yolo: Option<bool>,

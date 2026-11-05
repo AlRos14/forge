@@ -17,6 +17,7 @@ pub async fn configure_copilot_mcp(
     context_dir: &Path,
     mcp_url: &str,
     token: &str,
+    task_scoped: bool,
 ) -> Result<CopilotMcpConfig> {
     let url = url::Url::parse(mcp_url)
         .map_err(|_| ServiceError::invalid_operation("Invalid Copilot MCP endpoint"))?;
@@ -28,11 +29,6 @@ pub async fn configure_copilot_mcp(
     {
         return Err(ServiceError::invalid_operation(
             "Invalid Copilot MCP endpoint",
-        ));
-    }
-    if kind != ExecutorKind::ClaudeCode {
-        return Err(ServiceError::invalid_operation(
-            "Project Copilot currently requires Claude Code's MCP-only tool controls",
         ));
     }
     let object = config.as_object_mut().ok_or_else(|| {
@@ -88,6 +84,33 @@ pub async fn configure_copilot_mcp(
     object.remove("sandbox_mode");
 
     let runtime_env = json!({"FORGE_COPILOT_MCP_TOKEN": token});
+    let enabled_tools: Vec<_> = api_types::PROJECT_COPILOT_MCP_TOOLS
+        .iter()
+        .filter(|name| !(task_scoped && **name == "forge_list_tasks"))
+        .map(|name| (*name).to_owned())
+        .collect();
+    match kind {
+        ExecutorKind::Cursor | ExecutorKind::Opencode | ExecutorKind::Gemini => {
+            // The native adapter translates this server-owned connection and
+            // exact tool set into its own invocation policy.
+            object.insert(
+                "forge_project_copilot".to_owned(),
+                json!({
+                    "mcp_url": mcp_url, "enabled_tools": enabled_tools,
+                }),
+            );
+            return Ok(CopilotMcpConfig {
+                config,
+                runtime_env,
+            });
+        }
+        ExecutorKind::ClaudeCode => {}
+        _ => {
+            return Err(ServiceError::invalid_operation(
+                "This harness has no native Project Copilot MCP configuration",
+            ))
+        }
+    }
     let path = context_dir.join(".mcp.json");
     tokio::fs::create_dir_all(context_dir)
         .await
@@ -127,6 +150,7 @@ mod tests {
             dir.path(),
             "http://127.0.0.1:8080/mcp",
             "never-persist-this-credential",
+            false,
         )
         .await
         .unwrap();
@@ -149,7 +173,8 @@ mod tests {
             .contains("never-persist-this-credential"));
         for unsupported in [
             ExecutorKind::Codex,
-            ExecutorKind::Opencode,
+            ExecutorKind::Smith,
+            ExecutorKind::Null,
             ExecutorKind::Shell,
         ] {
             assert!(configure_copilot_mcp(
@@ -157,7 +182,8 @@ mod tests {
                 json!({}),
                 dir.path(),
                 "http://127.0.0.1/mcp",
-                "secret"
+                "secret",
+                false,
             )
             .await
             .is_err());
@@ -167,7 +193,8 @@ mod tests {
             json!({}),
             dir.path(),
             "http://127.0.0.1/mcp?token=secret",
-            "secret"
+            "secret",
+            false,
         )
         .await
         .is_err());
@@ -188,10 +215,43 @@ mod tests {
                 config,
                 dir.path(),
                 "http://127.0.0.1/mcp",
-                "secret"
+                "secret",
+                false,
             )
             .await
             .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_management_descriptors_use_scoped_tools_without_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        for kind in [
+            ExecutorKind::Cursor,
+            ExecutorKind::Opencode,
+            ExecutorKind::Gemini,
+        ] {
+            let configured = configure_copilot_mcp(
+                kind,
+                json!({"model":"chosen-model"}),
+                dir.path(),
+                "http://127.0.0.1:33715/mcp",
+                "fgc_private-credential",
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(configured.config["model"], "chosen-model");
+            assert!(!configured
+                .config
+                .to_string()
+                .contains("fgc_private-credential"));
+            let tools = configured.config["forge_project_copilot"]["enabled_tools"]
+                .as_array()
+                .unwrap();
+            assert!(tools.contains(&json!("forge_create_work_unit")));
+            assert!(!tools.contains(&json!("forge_list_tasks")));
+            assert!(!tools.contains(&json!("forge_start_execution")));
         }
     }
 }

@@ -65,13 +65,61 @@ impl ProjectCopilotService {
         let active_run = ProjectCopilotRepo::get_active_copilot_run(&*self.db, project_id)
             .await?
             .map(api_run);
+        let (supported_executor_types, supported_daemon_id) =
+            self.copilot_capabilities(project_id).await?;
         Ok(ProjectCopilotResponse {
             project_id: binding.project_id,
             agent_id: binding.agent_id,
             agent_name,
             version: binding.version,
             active_run,
+            supported_executor_types,
+            supported_daemon_id,
         })
+    }
+
+    async fn copilot_capabilities(
+        &self,
+        project_id: &str,
+    ) -> Result<(Vec<String>, Option<String>)> {
+        let Some(project) = ProjectRepo::get_by_id(&*self.db, project_id).await? else {
+            return Err(ServiceError::not_found("project", project_id.to_owned()));
+        };
+        let Some(owner_id) = project.owner_id.as_deref() else {
+            return Ok((Vec::new(), None));
+        };
+        let Some(owner) = UserRepo::get_user_by_id(&*self.db, owner_id).await? else {
+            return Ok((Vec::new(), None));
+        };
+        let Some(daemon) = DaemonRepo::get_by_machine_id(
+            &*self.db,
+            &crate::embedded_daemon::embedded_machine_id(),
+        )
+        .await?
+        else {
+            return Ok((Vec::new(), None));
+        };
+
+        let mut supported: Vec<_> = self
+            .executor
+            .project_copilot_harnesses()
+            .into_iter()
+            .filter(|kind| {
+                db::daemon_execution_authorized(
+                    &daemon,
+                    Some(owner_id),
+                    owner.is_admin,
+                    &kind.to_string(),
+                )
+            })
+            .map(|kind| kind.to_string())
+            .collect();
+        supported.sort();
+        if supported.is_empty() {
+            Ok((supported, None))
+        } else {
+            Ok((supported, Some(daemon.id)))
+        }
     }
 
     /// Assigns or removes the Project Copilot Agent using an optimistic version
@@ -373,7 +421,11 @@ impl ProjectCopilotService {
             .executor_type
             .parse::<ExecutorKind>()
             .map_err(|_| safe_failure("unsupported_harness"))?;
-        if executor_kind != ExecutorKind::ClaudeCode {
+        if !self
+            .executor
+            .project_copilot_harnesses()
+            .contains(&executor_kind)
+        {
             return Err(safe_failure("unsupported_harness"));
         }
         let config = snapshot
@@ -412,6 +464,7 @@ impl ProjectCopilotService {
             &context_dir,
             mcp_url,
             &token,
+            run.context_task_id.is_some(),
         )
         .await
         .map_err(|_| safe_failure("unsupported_mcp_configuration"))?;
@@ -827,7 +880,7 @@ fn safe_failure(code: &'static str) -> SafeFailure {
         "invalid_agent_snapshot" => "The assigned Agent configuration could not be loaded.",
         "invalid_agent_config" => "The assigned Agent has an invalid harness configuration.",
         "unsupported_harness" => {
-            "Project Copilot currently supports Claude Code on the local embedded host."
+            "The selected harness integration does not provide scoped Project Copilot management."
         }
         "unsupported_fallback_routing" => {
             "Project Copilot requires one explicitly selected harness; fallback routes are not supported."
@@ -942,6 +995,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TaskExecutor for StubExecutor {
+        fn project_copilot_harnesses(&self) -> Vec<ExecutorKind> {
+            vec![ExecutorKind::ClaudeCode]
+        }
+
         async fn execute(
             &self,
             context: ExecutionContext,
@@ -1381,7 +1438,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_harnesses_fail_closed_before_executor_start() {
+    async fn executors_without_management_capability_fail_before_start() {
         for executor_type in ["codex", "opencode"] {
             let fixture =
                 fixture_with_executor(StubBehavior::EchoScopedToken, true, executor_type).await;
@@ -1407,7 +1464,7 @@ mod tests {
             );
             assert_eq!(
                 detail.run.failure_message.as_deref(),
-                Some("Project Copilot currently supports Claude Code on the local embedded host.")
+                Some("The selected harness integration does not provide scoped Project Copilot management.")
             );
             assert_eq!(fixture.executor.call_count(), 0);
         }

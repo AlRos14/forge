@@ -363,17 +363,22 @@ limited to administrators; resync hints carry no Project data.
 ## MCP
 
 Project Copilot harnesses receive a separate short-lived `fgc_` Bearer
-credential tied to an exact active Project management run. It is accepted
-only by MCP and never as a REST credential. Each use rechecks the binding,
+credential tied to an exact active Project management run. `GET /projects/{id}/copilot`
+reports `supported_executor_types` and the exact
+`supported_daemon_id`: harnesses are listed only when their adapter supports
+scoped Project management and the Project owner's current authority permits
+that harness on the online embedded host. Assignment UI filters to Agents owned
+by the Project owner and pinned to that daemon. The credential is accepted only
+by MCP and never as a REST credential. Each use rechecks the binding,
 current requesting Human, current Agent ownership and expiry. Project scope is
 fixed by the authenticated delegation rather than client arguments. The
 Copilot's `tools/list` exposes context reads and WorkUnit create/update/allocate
 and dependency management only; execution start, WorkUnit completion, lifecycle,
 Gates, global administration and membership changes are outside its tool set.
 An attached Task also removes Project-wide Task listing and fences Task reads
-and mutations to that exact Task. The initial management runner supports local
-Claude Code with native tools disabled and strict per-run MCP configuration;
-Codex, OpenCode and remote hosts are rejected for management turns.
+and mutations to that exact Task. The management runner uses only registered
+harness adapters that disable native tools and configure the exact Forge MCP
+tool allowlist for the run. Remote hosts are not accepted.
 WorkUnit mutations are attributed to the Agent, and durable activity events
 correlate them with the run and requesting Human. See
 [Project Copilot](concepts/project-copilot.md).

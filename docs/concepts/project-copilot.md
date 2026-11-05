@@ -6,16 +6,21 @@ navigating the Project, including a Task detail page. The manual Task and
 WorkUnit controls remain available alongside it.
 
 Owners and Project admins assign or replace the Copilot. The Agent must belong
-to the canonical Project owner's account. Global Agent discovery grants no
-cross-account execution consent. Project members may send instructions;
-viewers may inspect the conversation without starting a turn.
+to the canonical Project owner's account and be pinned to the supported local
+embedded host. Global Agent discovery grants no cross-account execution
+consent. Project members may send instructions; viewers may inspect the
+conversation without starting a turn.
 
 ## Using the panel
 
 Open a Project or Task and select **Copilot** in the bottom-right corner. An
-owner or Project admin can select an eligible local Claude Code Agent in the
-panel. The panel stays beside the page on desktop and opens as a modal on
-mobile.
+owner or Project admin can select an eligible Agent in the panel. The list
+includes harnesses reported by the server as supported on the online embedded
+host, and only Agents owned by the Project owner and pinned to that host. If
+there is no eligible Agent, open **Agent settings** from the panel; a server
+administrator can bind the owner's Agent to an available host there. Project
+Copilot currently runs only on Forge's local embedded host, not remote daemons.
+The panel stays beside the page on desktop and opens as a modal on mobile.
 
 From a Task, ask for a proposed breakdown or delegate creation explicitly, for
 example: "Create WorkUnits for this Task with dependencies and eligible
@@ -54,24 +59,23 @@ Task context. This Project management run is separate from a Task Execution;
 it creates no placeholder Task or WorkUnit. Native sessions are never inferred
 from a role or the most recent Execution.
 
-The initial runner supports locally installed Claude Code on the authorized
-embedded host. Its preflight checks that the installed CLI advertises the
-required MCP-only controls before sending the prompt; the local CLI verified
-for this contract is Claude Code 2.1.317. Codex, OpenCode, other harnesses and
-remote daemons are unsupported and fail closed before a model request is sent.
-They remain unsupported until their adapter can guarantee that only the
-Project Copilot MCP tools are callable.
+The API derives `supported_executor_types` from the registered adapters and
+the embedded daemon's current authenticated CLI report. It also returns the
+exact `supported_daemon_id`. The panel offers only Agents owned by the Project
+owner and pinned to that daemon. Each advertised adapter must install a
+server-owned per-run MCP connection and prove that only the scoped Project
+Copilot tools are callable; adapters without that policy are not advertised
+and fail closed before a model request. Remote daemons are unsupported.
 
 The selected Agent configuration supplies the model, reasoning effort and
-prompt template. Project Copilot replaces permission and planning settings and
-rejects custom executables, extra CLI arguments, Agent environment overrides,
-fallback routes and Claude Code Router. The runner disables Claude Code's
-built-in tools with `--tools ""`, allows only the `mcp__forge_project__*`
-namespace, and loads only the per-run MCP file with `--strict-mcp-config`.
-User, Project and local settings sources, hooks and slash commands are disabled
-for the run. The MCP bearer credential exists only in the child environment;
-it is not written to the MCP file or command arguments. Managed host policy
-continues to apply.
+prompt template. Project Copilot rejects custom executables, extra CLI
+arguments, Agent environment overrides, fallback routes and Claude Code Router.
+Each adapter applies its native per-run policy to disable unrelated native
+tools and allow only the run's Forge MCP tools. Claude Code disables built-in
+tools with `--tools ""`, allows only the `mcp__forge_project__*` namespace and
+loads a strict per-run MCP file. The MCP bearer credential exists only in the
+child environment; it is not written to configuration files or command
+arguments. Managed host policy continues to apply.
 
 Forge injects its MCP connection through native per-run harness configuration.
 A short-lived credential is limited to the live run and Project. Only its hash

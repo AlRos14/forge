@@ -760,6 +760,10 @@ fn effort_options_from_help(help: &str) -> Vec<String> {
 
 #[async_trait]
 impl HarnessAdapter for ClaudeCodeAdapter {
+    fn supports_project_copilot(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::ClaudeCode
     }

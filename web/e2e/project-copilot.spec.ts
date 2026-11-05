@@ -99,6 +99,8 @@ async function mockProjectCopilotApi(
         agent_name: 'Claude Project Agent',
         version: 1,
         active_run: null,
+        supported_executor_types: ['claude_code'],
+        supported_daemon_id: 'embedded-host',
       }
     } else if (path === `/projects/${projectId}/copilot/messages` && method === 'GET') {
       body = { items: [], next_cursor: null }

@@ -22,8 +22,9 @@ pub use config::{
     account_key, account_key_for_context, candidate_key, merge_overrides, normalize_harness_config,
     validate_ordered_fallback_routing, validate_same_agent_candidate, ClaudeCodeConfig,
     CodexConfig, CommandOverrides, CursorConfig, ExecutorCandidate, ExecutorRouting, GeminiConfig,
-    NullConfig, OpencodeConfig, PermissionPolicy, RouteAttempt, RouteAttemptOutcome, ShellConfig,
-    SmithConfig, FALLBACKS_CONFIG_KEY, ROUTING_POLICY_ORDERED_FALLBACK_V1, ROUTING_SNAPSHOT_KEY,
+    NullConfig, OpencodeConfig, PermissionPolicy, ProjectCopilotMcp, RouteAttempt,
+    RouteAttemptOutcome, ShellConfig, SmithConfig, FALLBACKS_CONFIG_KEY,
+    ROUTING_POLICY_ORDERED_FALLBACK_V1, ROUTING_SNAPSHOT_KEY,
 };
 pub use log_reader::{LogReadResult, LogReader};
 pub use log_schema::{LogEntry, LogKind, LogStream};
@@ -135,6 +136,12 @@ pub enum ExecutionOutcome {
 
 #[async_trait]
 pub trait TaskExecutor: Send + Sync {
+    /// Registered integrations which implement scoped Project management.
+    /// An executor without this capability never advertises it implicitly.
+    fn project_copilot_harnesses(&self) -> Vec<ExecutorKind> {
+        Vec::new()
+    }
+
     /// Reserve cancellation state before an admitted execution can be cancelled.
     /// Executors without shared process state may keep the default no-op.
     fn prepare_execution(&self, _execution_id: &str) {}

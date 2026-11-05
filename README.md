@@ -35,7 +35,8 @@ The local server provides REST, MCP, the `forge-ctl` client, and the web UI. It 
 The [Project Copilot](docs/concepts/project-copilot.md) stays available across
 Project and Task screens to help prepare WorkUnits through the assigned Agent's
 native harness, with a persistent conversation and attributable activity. Its
-initial management runner supports local Claude Code.
+management runner offers each harness only when its adapter can restrict the
+run to scoped Forge MCP management tools on the authorized local host.
 
 ## Build this repository
 
