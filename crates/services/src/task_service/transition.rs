@@ -33,7 +33,7 @@ impl TaskService {
         )
         .await?;
         Ok(executions.items.iter().any(|execution| {
-            execution.purpose == Some(ExecutionPurpose::Review)
+            execution.role == "reviewer"
                 && execution
                     .actor_ref()
                     .is_some_and(|actor| matches!(actor, db::ActorRef::Human(_)))

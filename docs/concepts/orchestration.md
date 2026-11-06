@@ -40,11 +40,15 @@ orchestrator WorkUnit. The stable role/Actor/WorkUnit dedupe key and the normal
 domain-event receipt/wake lease path make migration retry and concurrent
 consumers idempotent.
 
-An Agent wake creates a fresh `purpose=orchestrate` Execution and uses a
+An Agent wake creates a fresh Execution under the `orchestrator` Role and uses a
 read-only Harness Start. PR6 does not infer or resume a previous session. A
 Human wake stays durable as pending Human work and creates no HarnessSession.
 The current typed output set is Message, Handoff, bounded WorkUnit creation,
-and Proposal. WorkUnit creation goes through `WorkUnitService`, carries stable
+and Proposal. A `create_work_unit` action for Role `reviewer` supplies
+`review_subject: { "reviewed_work_unit_id": "..." }`. The service verifies the
+same-Task source and freezes its accepted result; the orchestrator does not
+choose a result version or grant review authority by describing it in text.
+WorkUnit creation goes through `WorkUnitService`, carries stable
 action identity and wake provenance, and does not allocate a workspace or
 start work. WorkUnit-scoped actions stay inside that exact WorkUnit. Steering,
 stopping, reassigning, merging, and other protected mutations are not
@@ -53,7 +57,7 @@ records remain intent and resolution records with no implicit side effect.
 Direct Harness steering has no typed PR6 operation; Message and Handoff record
 communication intent without claiming native, emulated, or queued steering.
 
-Execution lifecycle events from an `orchestrate` Execution are classified
+Execution lifecycle events from an `orchestrator` Execution are classified
 separately and never generically wake another orchestrator. Creating a
 WorkUnit is an orchestrator action, not a wake signal; completion, readiness,
 allocation changes, and explicitly addressed collaboration can wake eligible
@@ -129,7 +133,7 @@ review failure, merge conflict, quota issue, and Human input. Log-token
 streaming is not a wake event by default; implementations may debounce or
 coalesce related events.
 
-Each wake is a new orchestrate Execution. The target architecture permits
+Each wake is a new orchestrator Execution. The target architecture permits
 resuming a compatible task-scoped HarnessSession; PR6 always uses Start with a
 fresh, Execution-bound HarnessSession. The Execution remains independently
 auditable.

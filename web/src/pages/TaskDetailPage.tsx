@@ -2,18 +2,20 @@ import { useState, type FormEvent } from 'react'
 import { Link } from '@tanstack/react-router'
 import { toast } from 'sonner'
 import {
+  useCancelTask,
   useEvaluateGate,
   useExecutionsQuery,
+  useLaunchTask,
+  usePauseTask,
+  useResumeTask,
   useReviewsQuery,
-  useStartExecution,
-  useSubmitReviewReport,
+  useTaskDispatchQuery,
   useTaskGatesQuery,
   useTaskLifecycleTransitionsQuery,
   useTaskQuery,
   useUpdateTask,
   useTaskWorkUnitsQuery,
   useTransitionTaskLifecycle,
-  useTriggerReview,
   useValidationsQuery,
 } from '@/api/hooks'
 import { apiFetch } from '@/api/client'
@@ -23,7 +25,6 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Textarea } from '@/components/ui/textarea'
 import {
   Dialog,
   DialogContent,
@@ -37,14 +38,14 @@ import { getApiErrorMessage } from '@/lib/api-error'
 import { useAuthStore } from '@/stores/auth'
 import { TaskTerminalPanel } from '@/components/task-detail/task-terminal-panel'
 import { TaskWorkManagement } from '@/components/task-detail/task-work-management'
+import { TaskReworkPanel } from '@/components/task-detail/task-rework-panel'
+import { WorkUnitHumanReviewPanel } from '@/components/task-detail/work-unit-review-panel'
 import type {
   GateEvaluationResponse,
   MergeAfterGateResponse,
   ReviewExecutionResponse,
-  ExecutionPurpose,
-  StartExecutionRequest,
-  SubmitReviewReportRequest,
   Task,
+  TaskDispatchActionRequest,
   TaskLifecycleState,
 } from '@/types/generated'
 
@@ -82,49 +83,26 @@ export function TaskDetailPage({
   const validationsQuery = useValidationsQuery(taskId)
   const gatesQuery = useTaskGatesQuery(taskId)
   const workUnitsQuery = useTaskWorkUnitsQuery(taskId)
+  const dispatchQuery = useTaskDispatchQuery(taskId)
   const transition = useTransitionTaskLifecycle()
   const updateTask = useUpdateTask()
   const evaluateGate = useEvaluateGate()
-  const startReview = useTriggerReview()
-  const startExecution = useStartExecution()
-  const submitReport = useSubmitReviewReport()
+  const launchTask = useLaunchTask()
+  const pauseTask = usePauseTask()
+  const resumeTask = useResumeTask()
+  const cancelTask = useCancelTask()
   const userId = useAuthStore((state) => state.user?.id)
   const [evaluations, setEvaluations] = useState<Record<string, GateEvaluationResponse>>({})
-  const [reportForm, setReportForm] = useState<Record<string, SubmitReviewReportRequest>>({})
-  const [reviewWorkspaceId, setReviewWorkspaceId] = useState('')
   const [editTaskOpen, setEditTaskOpen] = useState(false)
   const [editTitle, setEditTitle] = useState('')
   const [editDescription, setEditDescription] = useState('')
-  const [executionForm, setExecutionForm] = useState<{
-    workUnitId: string
-    purpose: ExecutionPurpose | ''
-    prompt: string
-    artifactIds: string
-  }>({ workUnitId: '', purpose: '', prompt: '', artifactIds: '' })
 
   const task = taskQuery.data
   const reviews = reviewsQuery.data ?? []
   const validations = validationsQuery.data ?? []
   const executions = executionsQuery.data?.items ?? []
   const workUnits = workUnitsQuery.data ?? []
-  const selectedWorkUnit = workUnits.find((unit) => unit.id === executionForm.workUnitId)
-  const runnableWorkUnits = workUnits.filter(
-    (unit) =>
-      unit.status === 'open' &&
-      unit.readiness.runnable &&
-      unit.assigned_actor?.kind === 'agent',
-  )
-  const reviewerRole = task?.task_roles.find((role) => role.role === 'reviewer')
-  const canStartReview = Boolean(
-    task?.lifecycle.state === 'active' &&
-      userId &&
-      reviewerRole?.members.some(
-        (member) =>
-          member.status === 'active' &&
-          member.actor_ref.kind === 'human' &&
-          member.actor_ref.id === userId,
-      ),
-  )
+  const dispatch = dispatchQuery.data
 
   async function transitionTo(toState: TaskLifecycleState) {
     if (!task) return
@@ -188,52 +166,33 @@ export function TaskDetailPage({
     }
   }
 
-  async function beginReview() {
-    if (!task) return
-    try {
-      await startReview.mutateAsync({
-        taskId: task.id,
-        body: { workspace_id: reviewWorkspaceId || null },
-      })
-    } catch (error) {
-      toast.error(getApiErrorMessage(error, 'Review Execution could not start'))
-    }
-  }
-
-  async function beginExecution() {
-    if (!task || !selectedWorkUnit || !executionForm.purpose) return
-    const body: StartExecutionRequest = {
-      work_unit_id: selectedWorkUnit.id,
-      expected_work_unit_version: selectedWorkUnit.version,
-      purpose: executionForm.purpose,
-      prompt: executionForm.prompt,
-      input_artifact_ids: executionForm.artifactIds
-        .split('\n')
-        .map((value) => value.trim())
-        .filter(Boolean),
-      overrides: null,
+  async function dispatchAction(action: 'launch' | 'pause' | 'resume' | 'cancel') {
+    if (!task || !dispatch) return
+    const body: TaskDispatchActionRequest = {
+      expected_task_version: task.version,
+      expected_lifecycle_version: task.lifecycle.version,
+      idempotency_key: crypto.randomUUID(),
+      reason: action === 'cancel' || action === 'pause' ? 'requested from Task detail' : null,
     }
     try {
-      await startExecution.mutateAsync({ taskId: task.id, body })
-      setExecutionForm({ workUnitId: '', purpose: '', prompt: '', artifactIds: '' })
-      toast.success('Execution started for the exact WorkUnit assignment')
+      if (action === 'launch') {
+        const result = await launchTask.mutateAsync({ taskId: task.id, body })
+        toast.success(
+          `Task launch admitted. Executions admitted: ${result.admitted_execution_ids.length}; provider starts accepted: ${result.started_execution_ids.length}.`,
+        )
+      } else if (action === 'pause') {
+        await pauseTask.mutateAsync({ taskId: task.id, body })
+        toast.success('Task pause admitted; running Executions were not claimed as stopped.')
+      } else if (action === 'resume') {
+        await resumeTask.mutateAsync({ taskId: task.id, body })
+        toast.success('Task dispatch resumed.')
+      } else {
+        await cancelTask.mutateAsync({ taskId: task.id, body })
+        toast.success('Task cancellation requested.')
+      }
+      await Promise.all([taskQuery.refetch(), executionsQuery.refetch(), workUnitsQuery.refetch(), dispatchQuery.refetch()])
     } catch (error) {
-      toast.error(getApiErrorMessage(error, 'Execution could not start'))
-    }
-  }
-
-  async function sendReviewReport(executionId: string) {
-    const body = reportForm[executionId]
-    if (!body) return
-    try {
-      await submitReport.mutateAsync({ executionId, body })
-      setReportForm((current) => {
-        const next = { ...current }
-        delete next[executionId]
-        return next
-      })
-    } catch (error) {
-      toast.error(getApiErrorMessage(error, 'ReviewReport could not be submitted'))
+      toast.error(getApiErrorMessage(error, `Task ${action} failed`))
     }
   }
 
@@ -279,7 +238,41 @@ export function TaskDetailPage({
               Move to {state.replaceAll('_', ' ')}
             </Button>
           ))}
+          <span className="mx-1 h-8 w-px bg-border" aria-hidden="true" />
+          {dispatch?.can_launch ? (
+            <Button size="sm" disabled={launchTask.isPending} onClick={() => void dispatchAction('launch')}>
+              Launch Task
+            </Button>
+          ) : null}
+          {dispatch?.can_pause ? (
+            <Button size="sm" variant="outline" disabled={pauseTask.isPending} onClick={() => void dispatchAction('pause')}>
+              Pause dispatch
+            </Button>
+          ) : null}
+          {dispatch?.can_resume ? (
+            <Button size="sm" variant="outline" disabled={resumeTask.isPending} onClick={() => void dispatchAction('resume')}>
+              Resume dispatch
+            </Button>
+          ) : null}
+          {dispatch?.can_cancel ? (
+            <Button size="sm" variant="outline" disabled={cancelTask.isPending} onClick={() => void dispatchAction('cancel')}>
+              Cancel Task
+            </Button>
+          ) : null}
         </div>
+        {dispatch?.blockers.length ? (
+          <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">
+            <strong>Launch blockers</strong>
+            <ul className="mt-1 list-disc pl-5">
+              {dispatch.blockers.map((blocker) => (
+                <li key={`${blocker.code}:${blocker.work_unit_id ?? ''}`}>
+                  {blocker.message}
+                  {blocker.work_unit_id ? ` (${blocker.work_unit_id})` : ''}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
         <nav className="flex gap-2 border-b" aria-label="Task sections">
           {tabs.map((tab) => (
             <button
@@ -413,7 +406,11 @@ export function TaskDetailPage({
           workUnits={workUnits}
           executions={executions}
           onChanged={async () => {
-            await Promise.all([taskQuery.refetch(), workUnitsQuery.refetch()])
+            await Promise.all([
+              taskQuery.refetch(),
+              workUnitsQuery.refetch(),
+              dispatchQuery.refetch(),
+            ])
           }}
         />
       ) : null}
@@ -421,83 +418,21 @@ export function TaskDetailPage({
       {activeTab === 'executions' ? (
         <section className="space-y-3 rounded-lg border p-4">
           <h2 className="font-semibold">Executions</h2>
-          <p className="text-xs text-muted-foreground">Every start names the exact runnable WorkUnit revision, purpose, prompt, and Artifact inputs. The WorkUnit assignment supplies the Actor and role.</p>
-          <div className="grid gap-3 rounded-md border p-3 md:grid-cols-2">
-            <label className="space-y-1 text-sm">
-              <span>Runnable WorkUnit</span>
-              <select
-                className="h-9 w-full rounded-md border bg-background px-2"
-                value={executionForm.workUnitId}
-                onChange={(event) => setExecutionForm((current) => ({ ...current, workUnitId: event.target.value }))}
-              >
-                <option value="">Select an exact WorkUnit</option>
-                {runnableWorkUnits.map((unit) => (
-                  <option key={unit.id} value={unit.id}>
-                    {unit.title} · {unit.role} · Agent {unit.assigned_actor?.id}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {workUnitsQuery.isLoading ? <p className="text-sm text-muted-foreground">Loading WorkUnits…</p> : null}
-            {!workUnitsQuery.isLoading && runnableWorkUnits.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No runnable Agent-assigned WorkUnit is available. Create or allocate an exact WorkUnit first.</p>
-            ) : null}
-            {selectedWorkUnit ? (
-              <p className="text-xs text-muted-foreground md:col-span-2">
-                WorkUnit {selectedWorkUnit.id} v{String(selectedWorkUnit.version)} · {selectedWorkUnit.role} · Agent {selectedWorkUnit.assigned_actor?.id}
-              </p>
-            ) : null}
-            <label className="space-y-1 text-sm">
-              <span>Execution purpose</span>
-              <select
-                className="h-9 w-full rounded-md border bg-background px-2"
-                value={executionForm.purpose}
-                onChange={(event) => setExecutionForm((current) => ({ ...current, purpose: event.target.value as ExecutionPurpose | '' }))}
-              >
-                <option value="">Select a purpose</option>
-                <option value="plan">Plan</option>
-                <option value="implement">Implement</option>
-                <option value="review">Review</option>
-                <option value="validate">Validate</option>
-                <option value="investigate">Investigate</option>
-                <option value="orchestrate">Orchestrate</option>
-                <option value="general">General</option>
-              </select>
-            </label>
-            <label className="space-y-1 text-sm">
-              <span>Exact Artifact input IDs (one per line)</span>
-              <Textarea
-                aria-label="Exact Artifact input IDs"
-                value={executionForm.artifactIds}
-                onChange={(event) => setExecutionForm((current) => ({ ...current, artifactIds: event.target.value }))}
-                placeholder="Artifact IDs"
-              />
-            </label>
-            <label className="space-y-1 text-sm md:col-span-2">
-              <span>Execution prompt</span>
-              <Textarea
-                aria-label="Execution prompt"
-                value={executionForm.prompt}
-                onChange={(event) => setExecutionForm((current) => ({ ...current, prompt: event.target.value }))}
-                placeholder="Task-specific instructions for the selected Agent"
-              />
-            </label>
-            <div className="md:col-span-2">
-              <Button
-                size="sm"
-                disabled={startExecution.isPending || !selectedWorkUnit || !executionForm.purpose || !executionForm.prompt.trim()}
-                onClick={() => void beginExecution()}
-              >
-                Start exact Agent Execution
-              </Button>
-            </div>
-          </div>
+          <p className="text-xs text-muted-foreground">
+            Execution records are technical history for dispatched Agent WorkUnits and submitted Human review
+            WorkUnits. This view is historical Activity; it is not a launch form. Pause and cancel act on the
+            Task dispatch intent.
+          </p>
+          {dispatch ? (
+            <p className="text-sm">
+              Dispatch state: <strong>{dispatch.dispatch.state}</strong> · version {String(dispatch.dispatch.version)} · {dispatch.work_units.filter((unit) => unit.state === 'ready').length} ready WorkUnits
+            </p>
+          ) : null}
           {executions.map((execution) => (
             <article key={execution.id} className="space-y-1 rounded-md border p-3 text-sm">
               <div className="flex flex-wrap items-center gap-2">
                 <Badge variant="outline">{execution.status}</Badge>
                 <span>role: {execution.role}</span>
-                <span>purpose: {execution.purpose ?? 'general'}</span>
                 <code className="ml-auto text-xs">{execution.id}</code>
               </div>
               <p className="text-xs text-muted-foreground">Actor: {execution.actor_ref?.kind ?? 'unavailable'}:{execution.actor_ref?.id ?? 'unavailable'} · Harness session: {execution.harness_session_id ?? 'none'} · Workspace: {execution.workspace_id ?? 'none'}</p>
@@ -508,62 +443,59 @@ export function TaskDetailPage({
       ) : null}
 
       {activeTab === 'artifacts' ? (
-        <TaskArtifactsPanel
-          taskId={task.id}
-          onUseInNextExecution={(artifactId) => {
-            setExecutionForm((current) => {
-              const ids = current.artifactIds.split('\n').map((value) => value.trim()).filter(Boolean)
-              return {
-                ...current,
-                artifactIds: ids.includes(artifactId) ? current.artifactIds : [...ids, artifactId].join('\n'),
-              }
-            })
-            setActiveTab('executions')
-          }}
-        />
+        <TaskArtifactsPanel taskId={task.id} />
       ) : null}
 
       {activeTab === 'review' ? (
         <section className="space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-4">
-            <div>
-              <h2 className="font-semibold">Review Executions</h2>
-              <p className="text-xs text-muted-foreground">Formal Review requires Execution role reviewer and purpose review. Choose an exact Workspace from Execution history; an empty selection starts a Workspace-free Review.</p>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <select
-                aria-label="Exact Review Workspace"
-                className="h-9 max-w-sm rounded-md border bg-background px-2 text-sm"
-                value={reviewWorkspaceId}
-                onChange={(event) => setReviewWorkspaceId(event.target.value)}
-              >
-                <option value="">No Workspace</option>
-                {[...new Map(executions
-                  .filter((execution) => execution.workspace_id)
-                  .map((execution) => [execution.workspace_id!, execution])).values()]
-                  .map((execution) => (
-                    <option key={execution.workspace_id} value={execution.workspace_id!}>
-                      Workspace {execution.workspace_id} · Execution {execution.id}
-                    </option>
-                  ))}
-              </select>
-              <Button size="sm" disabled={!canStartReview || startReview.isPending} onClick={() => void beginReview()}>
-                Start Human Review Execution
-              </Button>
-            </div>
+          <div className="rounded-lg border p-4">
+            <h2 className="font-semibold">Review Executions</h2>
+            <p className="text-xs text-muted-foreground">Formal Review is prepared as a reviewer WorkUnit with an exact subject. Assigned Human reviewers submit their report from that WorkUnit; the Task dispatcher records Agent reviewer attempts.</p>
           </div>
+          {workUnits.some(
+            (unit) =>
+              unit.role === 'reviewer' &&
+              unit.status === 'open' &&
+              unit.assigned_actor?.kind === 'human' &&
+              unit.assigned_actor.id === userId,
+          ) ? (
+            <section className="space-y-3">
+              <h3 className="font-semibold">Human review WorkUnits assigned to you</h3>
+              {workUnits
+                .filter(
+                  (unit) =>
+                    unit.role === 'reviewer' &&
+                    unit.status === 'open' &&
+                    unit.assigned_actor?.kind === 'human' &&
+                    unit.assigned_actor.id === userId,
+                )
+                .map((unit) => (
+                  <WorkUnitHumanReviewPanel
+                    key={unit.id}
+                    task={task}
+                    unit={unit}
+                    currentUserId={userId}
+                  />
+                ))}
+            </section>
+          ) : null}
           {reviewsQuery.isLoading ? <p className="text-sm text-muted-foreground">Loading Review Executions…</p> : null}
           {reviews.map(({ execution, report }) => (
-            <ReviewExecutionCard
-              key={execution.id}
-              review={{ execution, report }}
-              currentUserId={userId}
-              validations={validations}
-              form={reportForm[execution.id]}
-              onFormChange={(form) => setReportForm((current) => ({ ...current, [execution.id]: form }))}
-              onSubmit={() => void sendReviewReport(execution.id)}
-              submitting={submitReport.isPending}
-            />
+            <div key={execution.id} className="space-y-2">
+              <ReviewExecutionCard review={{ execution, report }} />
+              <TaskReworkPanel
+                task={task}
+                review={{ execution, report }}
+                onChanged={async () => {
+                  await Promise.all([
+                    taskQuery.refetch(),
+                    workUnitsQuery.refetch(),
+                    dispatchQuery.refetch(),
+                    executionsQuery.refetch(),
+                  ])
+                }}
+              />
+            </div>
           ))}
           {!reviewsQuery.isLoading && reviews.length === 0 ? <p className="rounded-lg border p-4 text-sm text-muted-foreground">No Review Execution is recorded.</p> : null}
           <section className="space-y-2 rounded-lg border p-4">
@@ -603,44 +535,16 @@ export function TaskDetailPage({
 
 export function ReviewExecutionCard({
   review,
-  currentUserId,
-  validations,
-  form,
-  onFormChange,
-  onSubmit,
-  submitting,
 }: {
   review: ReviewExecutionResponse
-  currentUserId: string | undefined
-  validations: import('@/types/generated').ValidationRunResponse[]
-  form: SubmitReviewReportRequest | undefined
-  onFormChange: (form: SubmitReviewReportRequest) => void
-  onSubmit: () => void
-  submitting: boolean
 }) {
   const { execution, report } = review
-  const isFormalReview = execution.role === 'reviewer' && execution.purpose === 'review'
-  const ownsExecution =
-    execution.actor_ref?.kind === 'human' &&
-    currentUserId !== undefined &&
-    execution.actor_ref.id === currentUserId
-  const canSubmit = isFormalReview && ownsExecution && execution.status === 'running' && !report
-  const currentForm = form ?? {
-    verdict: 'pass',
-    summary: '',
-    criteria: [],
-    findings: [],
-    questions: [],
-    evidence_ids: [],
-    artifact_ids: [],
-  }
-  const selectedEvidence = new Set(currentForm.evidence_ids)
 
   return (
     <article className="space-y-3 rounded-lg border p-4">
       <div className="flex flex-wrap items-center gap-2">
         <Badge variant="outline">{execution.status}</Badge>
-        <Badge variant="outline">{execution.role} · {execution.purpose ?? 'general'}</Badge>
+        <Badge variant="outline">{execution.role}</Badge>
         <code className="ml-auto text-xs">Execution {execution.id}</code>
       </div>
       <p className="text-xs text-muted-foreground">Actor {execution.actor_ref?.kind ?? 'unknown'}:{execution.actor_ref?.id ?? 'unknown'} · Workspace {execution.workspace_id ?? 'none'} · base {execution.before_sha ?? 'none'} · head {execution.after_sha ?? 'none'}</p>
@@ -648,33 +552,6 @@ export function ReviewExecutionCard({
         <div className="space-y-2 rounded bg-muted/40 p-3">
           <div className="flex flex-wrap gap-2"><Badge>ReviewReport</Badge><code className="text-xs">Artifact {report.id}</code></div>
           <p className="text-sm">{report.content ?? 'Report content is not available.'}</p>
-        </div>
-      ) : null}
-      {canSubmit ? (
-        <div className="space-y-3 rounded bg-muted/30 p-3">
-          <label className="block space-y-1 text-sm">
-            <span>Verdict</span>
-            <select
-              className="h-9 w-full rounded-md border bg-background px-2"
-              value={currentForm.verdict}
-              onChange={(event) => onFormChange({ ...currentForm, verdict: event.target.value as SubmitReviewReportRequest['verdict'] })}
-            >
-              <option value="pass">Pass</option><option value="request_changes">Request changes</option><option value="questions">Questions</option>
-            </select>
-          </label>
-          <Textarea aria-label="Review summary" value={currentForm.summary} onChange={(event) => onFormChange({ ...currentForm, summary: event.target.value })} placeholder="Summary for this ReviewReport" />
-          <div className="space-y-1">
-            <p className="text-xs font-medium">Pin exact Validation Evidence</p>
-            {validations.flatMap((run) => run.evidence_ids.map((id) => (
-              <label key={id} className="flex items-center gap-2 font-mono text-xs">
-                <input type="checkbox" checked={selectedEvidence.has(id)} onChange={(event) => onFormChange({ ...currentForm, evidence_ids: event.target.checked ? [...currentForm.evidence_ids, id] : currentForm.evidence_ids.filter((value) => value !== id) })} />
-                {id} · ValidationRun {run.id}
-              </label>
-            )))}
-            {validations.every((run) => run.evidence_ids.length === 0) ? <p className="text-xs text-muted-foreground">No Evidence facts are available to pin.</p> : null}
-          </div>
-          <Input aria-label="Exact Artifact IDs" value={currentForm.artifact_ids.join('\n')} onChange={(event) => onFormChange({ ...currentForm, artifact_ids: event.target.value.split('\n').map((value) => value.trim()).filter(Boolean) })} placeholder="One exact Artifact ID per line" />
-          <Button size="sm" disabled={!currentForm.summary.trim() || submitting} onClick={onSubmit}>Submit ReviewReport for this Execution</Button>
         </div>
       ) : null}
     </article>

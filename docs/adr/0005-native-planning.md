@@ -1,6 +1,6 @@
 # ADR 0005: Harness-native planning
 
-Status: Accepted in Plan PR0
+Status: Accepted in Plan PR0; purpose wording superseded by ADR 0014.
 
 ## Context
 
@@ -9,9 +9,10 @@ read-only permission mode look like native planning.
 
 ## Decision
 
-Planning is an Execution with purpose plan. The adapter invokes native harness
-planning when available; a Human uses the same planning role through the
-control plane. The result is a generic plan Artifact.
+Planning is an ordinary Execution under its explicit Role and WorkUnit scope.
+The adapter invokes native harness planning when available; a Human uses the
+same planning responsibility through the control plane. The result is a
+generic plan Artifact. No execution-purpose classification is required.
 
 ## Consequences
 

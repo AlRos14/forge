@@ -42,6 +42,7 @@ pub mod task_dispatcher;
 pub mod task_failure_retry;
 mod task_integration_operation;
 pub mod task_lifecycle;
+pub mod task_rework;
 pub mod task_service;
 pub mod terminal_service;
 pub mod types;
@@ -91,7 +92,10 @@ pub use recovery::{CrashRecovery, HeartbeatMonitor};
 pub use release_history::HistoricalReleaseReader;
 pub use shared_media_cleanup::SharedMediaCleanupScheduler;
 pub use shutdown::GracefulShutdown;
-pub use task_dispatcher::TaskDispatcher;
+pub use task_dispatcher::{DispatchOutcome, TaskDispatcher};
+pub use task_rework::{
+    RequestReworkInput, RequestReworkResult, TaskReworkService, WorkUnitReviewSubject,
+};
 pub use task_service::{NewSubtaskInput, TaskService};
 pub use terminal_service::{TerminalActivityTracker, TerminalService};
 pub use types::Assignee;

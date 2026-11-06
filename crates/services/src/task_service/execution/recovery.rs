@@ -513,12 +513,6 @@ impl TaskService {
                     task_id: task.id.clone(),
                     agent_id: Some(agent_id.clone()),
                     actor_ref: Some(db::ActorRef::Agent(agent_id)),
-                    purpose: Some(
-                        blocked_execution
-                            .purpose
-                            .clone()
-                            .unwrap_or_else(|| execution_purpose_for_role(&blocked_execution.role)),
-                    ),
                     harness_session_id,
                     role: blocked_execution.role.clone(),
                     status: ExecutionStatus::Running,

@@ -100,6 +100,19 @@ pub trait TaskLifecycleRepo: Send + Sync {
         &self,
         input: TransitionTaskLifecycle,
     ) -> Result<TaskLifecycleTransitionWrite>;
+    async fn get_task_dispatch(&self, task_id: &str) -> Result<Option<TaskDispatch>>;
+    async fn get_task_dispatch_receipt(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<TaskDispatchReceipt>>;
+    async fn list_running_task_dispatches(&self) -> Result<Vec<TaskDispatch>>;
+    /// Apply one launch/pause/resume/cancel intent and its idempotency receipt
+    /// in one serialized write.
+    async fn transition_task_dispatch(
+        &self,
+        input: TransitionTaskDispatch,
+    ) -> Result<TaskDispatchWrite>;
 }
 
 #[async_trait]
@@ -601,6 +614,13 @@ pub trait WorkUnitRepo: Send + Sync {
         input: CreateWorkUnit,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<WorkUnit>>;
+    /// Atomically create a WorkUnit and its immutable reviewed-result identity.
+    async fn create_with_review_subject(
+        &self,
+        input: CreateWorkUnit,
+        subject: CreateWorkUnitReviewSubject,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnit>>;
     /// Scope-only lookup for the auth-before-load boundary.
     async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_by_id(&self, id: &str) -> Result<Option<WorkUnit>>;
@@ -831,6 +851,10 @@ pub trait ExecutionRepo: Send + Sync {
     /// an orderly shutdown or process crash. Task-scoped legacy Executions are
     /// intentionally excluded.
     async fn list_work_unit_auto_recovery_candidates(&self) -> Result<Vec<Execution>>;
+    /// Exact latest WorkUnit-bound interrupted attempts that must be resolved
+    /// before a fresh parentless attempt can be admitted. Includes both Auto
+    /// restart and Human-directed recovery candidates.
+    async fn list_work_unit_recovery_required_candidates(&self) -> Result<Vec<Execution>>;
     /// Newly admitted Agent WorkUnit Executions whose external provider start
     /// has not been claimed. Older admissions without this receipt are not
     /// inferred to be pending because their external outcome is unknowable.
@@ -910,6 +934,7 @@ pub enum ProviderStartClaim {
     Uncertain,
     AuthorityLost,
     TaskCancelled,
+    TaskPaused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1868,11 +1893,26 @@ pub struct CreateWorkUnit {
     pub parent_work_unit_id: Option<String>,
     pub title: String,
     pub scope: String,
+    pub execution_instructions: Option<String>,
     pub role: String,
     pub assigned_actor: Option<ActorRef>,
     pub requires_integration: bool,
     pub provenance: Option<WorkUnitProvenance>,
     pub created_by: ActorRef,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkUnitReviewSubject {
+    pub review_work_unit_id: String,
+    pub task_id: String,
+    pub reviewed_work_unit_id: String,
+    pub reviewed_work_unit_version: Option<i64>,
+    pub result_execution_id: Option<String>,
+    pub result_artifact_id: Option<String>,
+    pub result_commit_sha: Option<String>,
+    pub result_workspace_id: Option<String>,
+    pub workspace_snapshot_digest: Option<String>,
     pub created_at: String,
 }
 
@@ -1904,6 +1944,7 @@ pub struct UpdateWorkUnit {
     pub expected_version: i64,
     pub title: Option<String>,
     pub scope: Option<String>,
+    pub execution_instructions: Option<Option<String>>,
     pub parent_work_unit_id: Option<Option<String>>,
     pub requires_integration: Option<bool>,
     pub updated_at: String,
@@ -2206,9 +2247,6 @@ pub struct CreateExecution {
     /// valid new service-level principal.
     pub actor_ref: Option<ActorRef>,
     pub role: String,
-    /// New writers must state the semantic reason for the run. `None` is
-    /// retained for historical compatibility rows until PR13 cleanup.
-    pub purpose: Option<ExecutionPurpose>,
     pub status: ExecutionStatus,
     pub stop_reason: Option<StopReason>,
     pub stopped_by: Option<String>,

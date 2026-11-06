@@ -1,7 +1,8 @@
 use std::str::FromStr;
 
 use api_types::{
-    ActorRef, CreateWorkUnitProvenance, ExecutionPurpose, ProjectHookRule, WorkUnitStatus,
+    ActorRef, CreateWorkUnitProvenance, CreateWorkUnitReviewSubjectRequest, ProjectHookRule,
+    SubmitReviewReportRequest, WorkUnitStatus,
 };
 use db::{AgentStatus, PageRequest, SortBy, SortOrder, TaskLifecycleState};
 use serde::{Deserialize, Deserializer};
@@ -95,13 +96,31 @@ pub(crate) struct ListExecutionsParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct StartExecutionParams {
-    pub(crate) work_unit_id: String,
-    pub(crate) expected_work_unit_version: i64,
-    pub(crate) purpose: ExecutionPurpose,
-    pub(crate) prompt: String,
-    #[serde(default)]
-    pub(crate) input_artifact_ids: Vec<String>,
+pub(crate) struct TaskDispatchActionParams {
+    pub(crate) task_id: String,
+    pub(crate) expected_task_version: i64,
+    pub(crate) expected_lifecycle_version: i64,
+    pub(crate) idempotency_key: String,
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RequestReworkParams {
+    pub(crate) task_id: String,
+    pub(crate) expected_task_version: i64,
+    pub(crate) expected_lifecycle_version: i64,
+    pub(crate) review_report_artifact_id: String,
+    pub(crate) reviewed_work_unit_id: String,
+    pub(crate) reviewed_work_unit_version: i64,
+    pub(crate) correction_title: String,
+    pub(crate) correction_scope: String,
+    pub(crate) correction_role: String,
+    pub(crate) correction_actor: Option<ActorRef>,
+    pub(crate) review_title: String,
+    pub(crate) review_scope: String,
+    pub(crate) review_actor: Option<ActorRef>,
+    pub(crate) idempotency_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,11 +130,21 @@ pub(crate) struct CreateWorkUnitParams {
     pub(crate) task_id: String,
     pub(crate) title: String,
     pub(crate) scope: String,
+    pub(crate) execution_instructions: Option<String>,
     pub(crate) role: String,
     pub(crate) parent_work_unit_id: Option<String>,
     pub(crate) assigned_actor: Option<ActorRef>,
     pub(crate) requires_integration: bool,
     pub(crate) provenance: Option<CreateWorkUnitProvenance>,
+    pub(crate) review_subject: Option<CreateWorkUnitReviewSubjectRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SubmitWorkUnitReviewParams {
+    pub(crate) work_unit_id: String,
+    pub(crate) expected_version: i64,
+    pub(crate) report: SubmitReviewReportRequest,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +166,7 @@ pub(crate) struct UpdateWorkUnitParams {
     pub(crate) expected_version: i64,
     pub(crate) title: Option<String>,
     pub(crate) scope: Option<String>,
+    pub(crate) execution_instructions: Option<Option<String>>,
     pub(crate) requires_integration: Option<bool>,
 }
 

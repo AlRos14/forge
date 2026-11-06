@@ -692,6 +692,7 @@ pub struct WorkUnit {
     pub parent_work_unit_id: Option<String>,
     pub title: String,
     pub scope: String,
+    pub execution_instructions: Option<String>,
     pub status: WorkUnitStatus,
     pub role: String,
     pub assigned_actor: Option<ActorRef>,
@@ -1073,7 +1074,6 @@ pub struct Execution {
     pub actor_kind: Option<ActorKind>,
     pub actor_id: Option<String>,
     pub role: String,
-    pub purpose: Option<ExecutionPurpose>,
     pub status: ExecutionStatus,
     pub stop_reason: Option<StopReason>,
     pub stopped_by: Option<String>,
@@ -1189,17 +1189,6 @@ pub enum ExecutionStatus {
     Completed,
     Failed,
     Cancelled,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExecutionPurpose {
-    Plan,
-    Implement,
-    Review,
-    Validate,
-    Investigate,
-    Orchestrate,
-    General,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1719,16 +1708,6 @@ enum_strings!(ExecutionStatus {
     Completed => "completed",
     Failed => "failed",
     Cancelled => "cancelled",
-});
-
-enum_strings!(ExecutionPurpose {
-    Plan => "plan",
-    Implement => "implement",
-    Review => "review",
-    Validate => "validate",
-    Investigate => "investigate",
-    Orchestrate => "orchestrate",
-    General => "general",
 });
 
 enum_strings!(HarnessSessionStatus {
@@ -2554,6 +2533,83 @@ pub struct TaskLifecycle {
     pub reason_ref: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskDispatchState {
+    Idle,
+    Running,
+    Paused,
+    Cancelled,
+}
+
+enum_strings!(TaskDispatchState {
+    Idle => "idle",
+    Running => "running",
+    Paused => "paused",
+    Cancelled => "cancelled",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskDispatchOperation {
+    Launch,
+    Pause,
+    Resume,
+    Cancel,
+}
+
+enum_strings!(TaskDispatchOperation {
+    Launch => "launch",
+    Pause => "pause",
+    Resume => "resume",
+    Cancel => "cancel",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDispatch {
+    pub task_id: String,
+    pub state: TaskDispatchState,
+    pub version: i64,
+    pub requested_by_kind: String,
+    pub requested_by_id: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDispatchReceipt {
+    pub id: String,
+    pub task_id: String,
+    pub operation: TaskDispatchOperation,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub intent_version: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDispatchWrite {
+    pub dispatch: TaskDispatch,
+    pub receipt: TaskDispatchReceipt,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionTaskDispatch {
+    pub task_id: String,
+    pub operation: TaskDispatchOperation,
+    pub state: TaskDispatchState,
+    pub expected_intent_version: i64,
+    pub requested_by_kind: String,
+    pub requested_by_id: Option<String>,
+    pub reason: Option<String>,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub receipt_id: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -217,7 +217,6 @@ impl TaskService {
                 "task_id": task_id,
                 "project_id": task.project_id,
                 "role": "reviewer",
-                "purpose": "review",
                 "actor_kind": "human",
                 "actor_id": user_id,
                 "workspace_id": workspace_subject.as_ref().map(|subject| &subject.0),
@@ -234,7 +233,6 @@ impl TaskService {
             agent_id: None,
             actor_ref: Some(db::ActorRef::Human(user_id.to_owned())),
             role: "reviewer".to_owned(),
-            purpose: Some(ExecutionPurpose::Review),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -314,7 +312,6 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;
         if execution.role != "reviewer"
-            || execution.purpose != Some(ExecutionPurpose::Review)
             || execution.actor_ref() != Some(db::ActorRef::Human(user_id.to_owned()))
         {
             return Err(ServiceError::AuthorizationDenied {
@@ -404,6 +401,8 @@ impl TaskService {
                     &assistant_output,
                     request.evidence_ids,
                     request.artifact_ids,
+                    request.reviewed_work_unit_id,
+                    request.reviewed_work_unit_version,
                 )
                 .await?;
         let (updated, report) = self

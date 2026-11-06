@@ -107,8 +107,8 @@ async fn fixture() -> Fixture {
     sqlx::query(
         "INSERT INTO execution (
              id, task_id, agent_id, role, status, created_at, updated_at,
-             actor_kind, actor_id, purpose
-         ) VALUES (?, ?, NULL, 'interactive', 'completed', ?, ?, 'human', ?, 'general')",
+             actor_kind, actor_id
+         ) VALUES (?, ?, NULL, 'interactive', 'completed', ?, ?, 'human', ?)",
     )
     .bind(&execution_id)
     .bind(&task_id)
@@ -218,8 +218,8 @@ async fn create_foreign_project(f: &Fixture) -> ForeignProjectFixture {
     sqlx::query(
         "INSERT INTO execution (
              id, task_id, agent_id, role, status, created_at, updated_at,
-             actor_kind, actor_id, purpose
-         ) VALUES (?, ?, NULL, 'interactive', 'completed', ?, ?, 'human', ?, 'general')",
+             actor_kind, actor_id
+         ) VALUES (?, ?, NULL, 'interactive', 'completed', ?, ?, 'human', ?)",
     )
     .bind(&execution_id)
     .bind(&task_id)
@@ -353,8 +353,8 @@ async fn add_agent_execution(f: &Fixture) -> (String, String, String) {
     sqlx::query(
         "INSERT INTO execution (
              id, task_id, agent_id, role, status, created_at, updated_at,
-             actor_kind, actor_id, purpose
-         ) VALUES (?, ?, ?, 'coder', 'completed', ?, ?, 'agent', ?, 'implement')",
+             actor_kind, actor_id
+         ) VALUES (?, ?, ?, 'coder', 'completed', ?, ?, 'agent', ?)",
     )
     .bind(&execution_id)
     .bind(&f.task_id)
@@ -1699,8 +1699,8 @@ async fn artifact_requires_valid_storage_and_same_task_execution_producer() {
     sqlx::query(
         "INSERT INTO execution (
              id, task_id, agent_id, role, status, created_at, updated_at,
-             actor_kind, actor_id, purpose
-         ) VALUES ('pr4-other-execution', ?, NULL, 'interactive', 'completed', ?, ?, 'human', ?, 'general')",
+             actor_kind, actor_id
+         ) VALUES ('pr4-other-execution', ?, NULL, 'interactive', 'completed', ?, ?, 'human', ?)",
     )
     .bind(&f.second_task_id)
     .bind(&now)

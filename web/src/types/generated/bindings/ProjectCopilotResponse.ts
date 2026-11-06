@@ -5,4 +5,8 @@ export type ProjectCopilotResponse = { project_id: string, agent_id: string | nu
 /**
  * Registered harness integrations with scoped Project management support.
  */
-supported_executor_types: Array<string>, supported_daemon_id: string | null, };
+supported_executor_types: Array<string>,
+/**
+ * The exact online embedded daemon authorized to run those integrations.
+ */
+supported_daemon_id: string | null, };

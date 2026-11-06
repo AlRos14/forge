@@ -38,9 +38,11 @@ pub async fn list_reviews(
     )
     .await?;
     let mut reviews = Vec::new();
-    for execution in page.items.into_iter().filter(|execution| {
-        execution.role == "reviewer" && execution.purpose == Some(db::ExecutionPurpose::Review)
-    }) {
+    for execution in page
+        .items
+        .into_iter()
+        .filter(|execution| execution.role == "reviewer")
+    {
         let report = db::CollaborationRepo::get_execution_artifact_output(
             &*state.db,
             &execution.id,

@@ -8,8 +8,40 @@ PR14 audit on 2026-10-16.
 
 ## [Unreleased]
 
+### Breaking
+
+- Reviewer WorkUnits can name their initial `review_subject` during preparation;
+  Forge freezes the accepted result rather than a mutable preparation version.
+  Humans submit through `POST /work-units/{id}/review-report` without creating
+  a manual Execution. Review independence, exact result availability, Task pause,
+  recovery priority, and concurrency remain core-controlled boundaries.
+
+- Task launch now uses durable dispatch intent. `POST /tasks/{id}/executions`
+  is retired and returns `410 Gone` with code
+  `execution.manual_launch_retired`; use `POST /tasks/{id}/dispatch/launch`
+  after preparing and allocating WorkUnits. The CLI replaces `task execute`
+  with `task launch|pause|resume|cancel`, and MCP replaces
+  `forge_start_execution` with `forge_launch_task|pause_task|resume_task|cancel_task`
+  plus `forge_get_task_dispatch` and `forge_request_rework`.
+- Remove `ExecutionPurpose` from REST, MCP, CLI, DTOs, generated web types,
+  events, and active persistence. V142 preserves historical values in
+  `pr13_execution_purpose_history` and rewrites purpose-dependent triggers and
+  views over Role, WorkUnit, Artifact, subject, and Wake facts. Execution
+  responses now expose `work_unit_id` and `work_unit_version` instead of
+  `purpose`.
+- WorkUnit creation and update accept optional `execution_instructions`; when
+  present, the dispatcher passes them to the assigned harness instead of the
+  generic Task/WorkUnit prompt. An open WorkUnit with a completed result is
+  `awaiting_acceptance` and receives no automatic retry.
+
 ### Added
 
+- Add `GET/POST /tasks/{id}/dispatch*` Task launch, pause, resume, and cancel
+  operations, a read-only preflight with per-WorkUnit blockers, and
+  `POST /work-units/{id}/workspace` for explicit repository preparation.
+- Add `POST /tasks/{id}/rework` and `forge_request_rework` for one idempotent
+  correction plus new-review round from an exact request-changes ReviewReport.
+  V143 adds bounded rework receipts and exact result/review subject relations.
 - Add a Project Copilot available throughout the Project UI, with an explicitly
   assigned harness-bound Agent, durable conversation and Project management
   runs. The local runner advertises only harness adapters with per-run native

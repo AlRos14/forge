@@ -467,7 +467,6 @@ mod tests {
                 actor_ref: harness_session_id
                     .as_ref()
                     .map(|_| db::ActorRef::Agent(agent_id)),
-                purpose: Some(db::ExecutionPurpose::Implement),
                 harness_session_id,
                 role: "coder".to_owned(),
                 status: ExecutionStatus::Running,

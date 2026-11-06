@@ -19,7 +19,7 @@ When behavior or a public contract changes, update the affected documentation in
 
 The workspace source version is 0.8.0. This repository has no verified published GitHub release as of the PR14 documentation audit. Build from this repository to use the current implementation; do not present ForgeAILab npm, Homebrew, installer, or release artifacts as this fork's distribution.
 
-PR0–PR15 are merged. The current implementation uses the Actor and harness orchestration model, TaskLifecycle, TaskRole/RoleMembership, WorkUnits, explicit Executions and HarnessSessions, deterministic Gates, and generic collaboration. Main Agent, Project Agent, Agent Chat, Product Genesis, Project OS operations, legacy Attention, and the old WorkflowEngine are retired from current runtime/public authority. Their migration provenance and historical snapshots remain historical evidence.
+PR0–PR15 are merged. The current implementation uses the Actor and harness orchestration model, TaskLifecycle, TaskRole/RoleMembership, WorkUnits, explicit Executions and HarnessSessions, deterministic Gates, and generic collaboration. Task launch is a durable dispatch intent: prepared Agent WorkUnits are admitted by the dispatcher, Human-assigned WorkUnits remain pending human work, and manual Execution creation is retired. Execution purpose is retired from public and active persistence; historical values remain migration evidence. Main Agent, Project Agent, Agent Chat, Product Genesis, Project OS operations, legacy Attention, and the old WorkflowEngine are retired from current runtime/public authority. Their migration provenance and historical snapshots remain historical evidence.
 
 Project Copilot is a separate, explicit Project-to-Agent assignment with durable
 Project management runs and conversation. It uses the selected installed
@@ -106,12 +106,12 @@ forge-client → REST API
 web/ → REST API and authenticated SSE
 ```
 
-- Humans and harness-bound Agents are peer Actors. Executions record one Actor, Role, Purpose, and explicit context.
+- Humans and harness-bound Agents are peer Actors. Internal attempts record one Actor, Role, exact WorkUnit version, and explicit context; Execution purpose is retired.
 - Harnesses own cognition and native session semantics; Forge owns work, authority, collaboration, evidence, and lifecycle.
 - Concurrent repository WorkUnits use separate workspaces and explicit leases. Integration is a separate serialized operation.
 - SQLite and numbered migrations are current persistence.
 - TaskLifecycleService owns aggregate Task state. task.status was removed in V129.
-- Formal Review is a reviewer Execution with Purpose review and a ReviewReport Artifact. ValidationRun is deterministic evidence; Agent Purpose validate is cognitive work.
+- Formal Review uses a reviewer WorkUnit with an exact result subject and a ReviewReport Artifact. Its technical attempt records provenance. ValidationRun is deterministic evidence; Agent validation-related work remains ordinary cognitive work.
 - Gate evaluates exact immutable inputs; it does not run tests, review code, integrate, or merge.
 - The current Orchestrator is event-driven and has a bounded typed output set. Do not claim unsupported autonomous steering, assignment, or merge actions.
 

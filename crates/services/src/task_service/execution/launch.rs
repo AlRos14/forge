@@ -193,12 +193,6 @@ impl TaskService {
             task_id: task.id.clone(),
             agent_id: Some(agent.id.clone()),
             actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
-            purpose: Some(
-                parent_execution
-                    .purpose
-                    .clone()
-                    .unwrap_or_else(|| execution_purpose_for_role(&work_unit.role)),
-            ),
             harness_session_id: None,
             role: work_unit.role.clone(),
             status: ExecutionStatus::Running,
@@ -369,7 +363,6 @@ impl TaskService {
         &self,
         work_unit_id: &str,
         expected_work_unit_version: i64,
-        purpose: ExecutionPurpose,
         prompt: String,
         input_artifact_ids: Vec<String>,
         overrides: Option<ExecutionOverrides>,
@@ -487,7 +480,6 @@ impl TaskService {
                     task_id: task.id.clone(),
                     agent_id: Some(agent_id.clone()),
                     actor_ref: Some(actor_ref),
-                    purpose: Some(purpose),
                     harness_session_id: None,
                     role: work_unit.role.clone(),
                     status: ExecutionStatus::Running,
@@ -537,13 +529,10 @@ impl TaskService {
         task_id: &str,
         agent_id: &str,
         role: &str,
-        purpose: ExecutionPurpose,
         prompt: String,
     ) -> Result<Execution> {
-        self.dispatch_initial_role_execution_with_metadata(
-            task_id, agent_id, role, purpose, prompt, None,
-        )
-        .await
+        self.dispatch_initial_role_execution_with_metadata(task_id, agent_id, role, prompt, None)
+            .await
     }
 
     pub async fn dispatch_initial_role_execution_with_metadata(
@@ -551,7 +540,6 @@ impl TaskService {
         task_id: &str,
         agent_id: &str,
         role: &str,
-        purpose: ExecutionPurpose,
         prompt: String,
         dispatch_metadata: Option<Value>,
     ) -> Result<Execution> {
@@ -559,7 +547,6 @@ impl TaskService {
             task_id,
             agent_id,
             role,
-            purpose,
             prompt,
             Vec::new(),
             dispatch_metadata,
@@ -573,7 +560,6 @@ impl TaskService {
         _task_id: &str,
         _agent_id: &str,
         _role: &str,
-        _purpose: ExecutionPurpose,
         _prompt: String,
         _input_artifact_ids: Vec<String>,
         _dispatch_metadata: Option<Value>,
@@ -824,12 +810,6 @@ impl TaskService {
                     task_id: task.id.clone(),
                     agent_id: Some(resolved_agent_id.clone()),
                     actor_ref: Some(db::ActorRef::Agent(resolved_agent_id.clone())),
-                    purpose: Some(
-                        parent_execution
-                            .purpose
-                            .clone()
-                            .unwrap_or(ExecutionPurpose::General),
-                    ),
                     harness_session_id: reusable_session.as_ref().and_then(|session| {
                         reusable_external_session
                             .as_ref()
@@ -1151,12 +1131,6 @@ impl TaskService {
             task_id: task.id.clone(),
             agent_id: Some(agent.id.clone()),
             actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
-            purpose: Some(
-                parent_execution
-                    .purpose
-                    .clone()
-                    .unwrap_or_else(|| execution_purpose_for_role(&work_unit.role)),
-            ),
             harness_session_id,
             role: work_unit.role.clone(),
             status: ExecutionStatus::Running,

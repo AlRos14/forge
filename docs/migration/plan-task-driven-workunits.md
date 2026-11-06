@@ -2,6 +2,8 @@
 
 Estado: propuesta de implementación para revisión humana. Este documento no
 describe funcionalidad ya disponible ni autoriza un merge o un despliegue.
+El estado implementado en esta rama, sin merge, se registra en
+[task-driven-workunits-implementation.md](task-driven-workunits-implementation.md).
 
 Fecha: 2026-11-05. Baseline inspeccionado:
 `155ba434c11f601af7a7b61f782943439bb72526`, rama

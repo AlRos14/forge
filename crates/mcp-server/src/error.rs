@@ -277,6 +277,8 @@ impl From<DbError> for McpToolError {
             DbError::InvalidTransition => Self::new(-32010, "invalid transition"),
             DbError::InvalidSoftDelete => Self::new(-32010, "invalid soft delete"),
             DbError::AgentAtCapacity => Self::new(-32029, "agent at capacity"),
+            DbError::TaskAtCapacity => Self::new(-32030, "task at automatic capacity"),
+            DbError::TaskDispatchPaused => Self::new(-32031, "task dispatch is paused"),
             DbError::InvalidCursor => Self::new(-32602, "invalid cursor"),
             error => Self::new(-32603, "internal error").with_data(json!({
                 "details": error.to_string()

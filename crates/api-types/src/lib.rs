@@ -28,6 +28,7 @@ mod review_validation;
 mod roles;
 mod runtime;
 mod settings;
+mod task_dispatch;
 mod terminal;
 mod work_unit;
 
@@ -58,6 +59,7 @@ pub use review_validation::*;
 pub use roles::*;
 pub use runtime::*;
 pub use settings::*;
+pub use task_dispatch::*;
 pub use terminal::*;
 pub use work_unit::*;
 
@@ -76,7 +78,6 @@ fn export_typescript() {
     // closure; storage and migration DTOs are not part of the public barrel.
     WorkMode::export().expect("export WorkMode");
     AgentStatus::export().expect("export AgentStatus");
-    ExecutionPurpose::export().expect("export ExecutionPurpose");
     ExecutionStatus::export().expect("export ExecutionStatus");
     StopReason::export().expect("export StopReason");
     ResumePolicy::export().expect("export ResumePolicy");
@@ -145,7 +146,17 @@ fn export_typescript() {
     MergeAfterGateRequest::export().expect("export MergeAfterGateRequest");
     MergeAfterGateResponse::export().expect("export MergeAfterGateResponse");
 
-    StartExecutionRequest::export().expect("export StartExecutionRequest");
+    TaskDispatchState::export().expect("export TaskDispatchState");
+    TaskDispatchIntentResponse::export().expect("export TaskDispatchIntentResponse");
+    TaskLaunchBlockerResponse::export().expect("export TaskLaunchBlockerResponse");
+    WorkUnitDispatchResponse::export().expect("export WorkUnitDispatchResponse");
+    TaskLaunchPreflightResponse::export().expect("export TaskLaunchPreflightResponse");
+    TaskDispatchActionRequest::export().expect("export TaskDispatchActionRequest");
+    TaskDispatchActionResponse::export().expect("export TaskDispatchActionResponse");
+    TaskLaunchResponse::export().expect("export TaskLaunchResponse");
+    RequestReworkRequest::export().expect("export RequestReworkRequest");
+    RequestReworkResponse::export().expect("export RequestReworkResponse");
+    ReviewSubjectResponse::export().expect("export ReviewSubjectResponse");
     FollowUpRequest::export().expect("export FollowUpRequest");
     RecoverWorkUnitExecutionRequest::export().expect("export RecoverWorkUnitExecutionRequest");
     ClaimOverrides::export().expect("export ClaimOverrides");
@@ -158,6 +169,7 @@ fn export_typescript() {
     ExecutionLogsResponse::export().expect("export ExecutionLogsResponse");
     StartReviewExecutionRequest::export().expect("export StartReviewExecutionRequest");
     SubmitReviewReportRequest::export().expect("export SubmitReviewReportRequest");
+    SubmitWorkUnitReviewRequest::export().expect("export SubmitWorkUnitReviewRequest");
     ReviewReportVerdict::export().expect("export ReviewReportVerdict");
     ReviewExecutionResponse::export().expect("export ReviewExecutionResponse");
     SubmitReviewReportResponse::export().expect("export SubmitReviewReportResponse");
@@ -198,6 +210,8 @@ fn export_typescript() {
     CollaborationListQuery::export().expect("export CollaborationListQuery");
 
     CreateWorkUnitRequest::export().expect("export CreateWorkUnitRequest");
+    CreateWorkUnitReviewSubjectRequest::export()
+        .expect("export CreateWorkUnitReviewSubjectRequest");
     CreateWorkUnitProvenance::export().expect("export CreateWorkUnitProvenance");
     UpdateWorkUnitRequest::export().expect("export UpdateWorkUnitRequest");
     AllocateWorkUnitRequest::export().expect("export AllocateWorkUnitRequest");

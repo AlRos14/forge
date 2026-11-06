@@ -11,10 +11,7 @@ impl TaskService {
         &self,
         execution: &Execution,
     ) -> Result<Option<OrchestratorWake>> {
-        if execution.role != "orchestrator"
-            || execution.purpose != Some(ExecutionPurpose::Orchestrate)
-            || execution.workspace_id.is_some()
-        {
+        if execution.role != "orchestrator" || execution.workspace_id.is_some() {
             return Ok(None);
         }
         let Some((wake, attempt)) =
@@ -241,7 +238,6 @@ impl TaskService {
             agent_id: Some(agent.id.clone()),
             actor_ref: Some(ActorRef::Agent(agent.id.clone())),
             role: "orchestrator".to_owned(),
-            purpose: Some(ExecutionPurpose::Orchestrate),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -278,7 +274,6 @@ impl TaskService {
                 "execution_id": create.id,
                 "task_id": task.id,
                 "role": "orchestrator",
-                "purpose": "orchestrate",
                 "actor_kind": "agent",
                 "actor_id": agent.id,
                 "work_unit_id": wake.work_unit_id,

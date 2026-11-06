@@ -278,7 +278,6 @@ async fn seed_execution(db: &db::SqliteDb, logs_path: Option<PathBuf>) -> String
             task_id,
             agent_id: None,
             actor_ref: None,
-            purpose: None,
             harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Running,

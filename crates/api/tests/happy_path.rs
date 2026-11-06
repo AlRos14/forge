@@ -11,11 +11,10 @@ use api::{build_router, AppState};
 use api_types::{
     ActorRef, AgentResponse, CreateTerminalSessionResponse, DaemonRegisterResponse, DaemonResponse,
     ExecutionResponse, ExecutionStatus, GateEvaluationResponse, GateResponse,
-    MergeAfterGateResponse, PaginatedResponse, ProjectResponse, RepoResponse,
-    ReviewExecutionResponse, ReviewReportVerdict, StartReviewExecutionRequest,
-    SubmitReviewReportRequest, SubmitReviewReportResponse, TaskLifecycleResponse,
-    TaskLifecycleState, TaskResponse, TerminalAttachTokenResponse, TerminalServerFrame,
-    TerminalSessionResponse, TerminalSessionStatus, WorkUnitIntegrationResponse, WorkUnitResponse,
+    MergeAfterGateResponse, PaginatedResponse, ProjectResponse, RepoResponse, ReviewReportVerdict,
+    SubmitReviewReportResponse, TaskLifecycleResponse, TaskLifecycleState, TaskResponse,
+    TerminalAttachTokenResponse, TerminalServerFrame, TerminalSessionResponse,
+    TerminalSessionStatus, WorkUnitIntegrationResponse, WorkUnitResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -124,25 +123,14 @@ async fn forge_happy_path_end_to_end() {
     )
     .await;
 
-    let execution: ExecutionResponse = json_request(
+    let execution = common::launch_work_unit_execution(
         &harness.app,
-        Method::POST,
-        &format!("/api/v1/tasks/{task_id}/executions"),
-        json!({
-            "work_unit_id": work_unit.id,
-            "expected_work_unit_version": work_unit.version,
-            "purpose": "implement",
-            "prompt": "echo hello > greeting.txt && git add . && git commit -m 'hi'",
-            "input_artifact_ids": []
-        }),
-        StatusCode::OK,
+        &task_id,
+        &work_unit,
+        Some("echo hello > greeting.txt && git add . && git commit -m 'hi'"),
     )
     .await;
     assert_eq!(execution.role, "implementer");
-    assert_eq!(
-        execution.purpose,
-        Some(api_types::ExecutionPurpose::Implement)
-    );
     let execution_id = execution.id.clone();
 
     let source_workspace =
@@ -601,18 +589,11 @@ async fn request_changes_report_leaves_lifecycle_to_gate_and_orchestration() {
     )
     .await;
 
-    let execution: ExecutionResponse = json_request(
+    let execution = common::launch_work_unit_execution(
         &harness.app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/executions", task.id),
-        json!({
-            "work_unit_id": work_unit.id,
-            "expected_work_unit_version": work_unit.version,
-            "purpose": "implement",
-            "prompt": "printf 'requested changes\\n' > requested-changes.txt && git add requested-changes.txt && git commit -m requested-changes",
-            "input_artifact_ids": []
-        }),
-        StatusCode::OK,
+        &task.id,
+        &work_unit,
+        Some("printf 'requested changes\\n' > requested-changes.txt && git add requested-changes.txt && git commit -m requested-changes"),
     )
     .await;
     let first_execution = execution;
@@ -794,40 +775,44 @@ async fn submit_human_review(
     verdict: ReviewReportVerdict,
     summary: &str,
 ) -> SubmitReviewReportResponse {
-    let review: ReviewExecutionResponse = json_request(
+    let attempts: PaginatedResponse<ExecutionResponse> = empty_request(
         app,
-        Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review-executions"),
-        serde_json::to_value(StartReviewExecutionRequest {
-            workspace_id: Some(workspace_id.to_owned()),
-        })
-        .expect("review start request serializes"),
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}/executions"),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(
-        review.execution.actor_ref,
-        Some(ActorRef::Human("test-user-id".to_owned()))
-    );
-    assert_eq!(review.execution.role.to_string(), "reviewer");
-    assert_eq!(
-        review.execution.purpose,
-        Some(api_types::ExecutionPurpose::Review)
-    );
+    let source_id = attempts
+        .items
+        .iter()
+        .find(|attempt| {
+            attempt.workspace_id.as_deref() == Some(workspace_id)
+                && attempt.status == ExecutionStatus::Completed
+        })
+        .and_then(|attempt| attempt.work_unit_id.as_deref())
+        .expect("review names the exact delivered WorkUnit");
+    let review: WorkUnitResponse = json_request(
+        app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/work-units"),
+        json!({
+            "title":"Independent Human review", "scope":"Review the exact delivery and evidence",
+            "role":"reviewer", "assigned_actor":{"kind":"human","id":"test-user-id"},
+            "requires_integration":false, "review_subject":{"reviewed_work_unit_id":source_id}
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
     json_request(
         app,
         Method::POST,
-        &format!("/api/v1/review-executions/{}", review.execution.id),
-        serde_json::to_value(SubmitReviewReportRequest {
-            verdict,
-            summary: summary.to_owned(),
-            criteria: vec!["acceptance criteria".to_owned()],
-            findings: Vec::new(),
-            questions: Vec::new(),
-            evidence_ids: Vec::new(),
-            artifact_ids: Vec::new(),
-        })
-        .expect("ReviewReport request serializes"),
+        &format!("/api/v1/work-units/{}/review-report", review.id),
+        json!({
+            "expected_version":review.version,
+            "report": {"verdict":verdict, "summary":summary,
+                "criteria":["acceptance criteria"],"findings":[],"questions":[],
+                "evidence_ids":[],"artifact_ids":[]}
+        }),
         StatusCode::OK,
     )
     .await
@@ -892,7 +877,12 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
     let mut config = (*state.effective_config).clone();
     config.terminal.enabled = true;
     state = state.with_effective_config(config);
-    let state = Arc::new(state);
+    let dispatcher = Arc::new(services::TaskDispatcher::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+        Arc::clone(&state.task_service),
+    ));
+    let state = Arc::new(state.with_task_dispatcher(dispatcher));
 
     let web_dist_dir = TestDir::new("forge-happy-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");

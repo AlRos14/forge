@@ -1,11 +1,13 @@
+mod human_review;
+
 use std::{path::Path, path::PathBuf, sync::Arc};
 
 use db::{
     new_uuid_v4, now_rfc3339, ActorRef, AddWorkUnitDependency, AgentRepo, AllocateWorkUnit,
     CreateDomainEvent, CreateExecution, CreateWorkUnit, CreateWorkUnitExecution,
-    CreateWorkUnitIntegration, Execution, ExecutionRepo, ExecutionStatus,
-    RecordWorkUnitIntegration, RepoRepo, SqliteDb, Task, TransitionWorkUnit, UpdateWorkUnit,
-    WorkUnit, WorkUnitDependency, WorkUnitExecutionRepo, WorkUnitIntegration,
+    CreateWorkUnitIntegration, CreateWorkUnitReviewSubject, Execution, ExecutionRepo,
+    ExecutionStatus, RecordWorkUnitIntegration, RepoRepo, SqliteDb, Task, TransitionWorkUnit,
+    UpdateWorkUnit, WorkUnit, WorkUnitDependency, WorkUnitExecutionRepo, WorkUnitIntegration,
     WorkUnitIntegrationOutcome, WorkUnitProvenance, WorkUnitRepo, WorkUnitStatus,
     WorkUnitWorkspaceRepo, Workspace, WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
 };
@@ -30,6 +32,7 @@ pub struct WorkUnitReadiness {
     pub active_execution_ids: Vec<String>,
     pub unsatisfied_dependency_ids: Vec<String>,
     pub awaiting_integration: bool,
+    pub awaiting_acceptance: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -37,11 +40,15 @@ pub struct CreateWorkUnitInput {
     pub task_id: String,
     pub title: String,
     pub scope: String,
+    pub execution_instructions: Option<String>,
     pub role: String,
     pub parent_work_unit_id: Option<String>,
     pub assigned_actor: Option<ActorRef>,
     pub requires_integration: bool,
     pub provenance: Option<WorkUnitProvenance>,
+    /// Exact reviewed WorkUnit for a reviewer role. The result version is
+    /// derived from durable state and remains pending until acceptance.
+    pub review_subject: Option<String>,
 }
 
 #[derive(Clone)]
@@ -131,11 +138,13 @@ impl WorkUnitService {
             "task_id": input.task_id,
             "title": input.title,
             "scope": input.scope,
+            "execution_instructions": input.execution_instructions,
             "role": input.role,
             "parent_work_unit_id": input.parent_work_unit_id,
             "assigned_actor": input.assigned_actor,
             "requires_integration": input.requires_integration,
             "provenance": work_unit_provenance_intent(input.provenance.as_ref()),
+            "review_subject": input.review_subject,
         }))
         .map_err(|_| invalid("WorkUnit request could not be encoded"))?;
         let request_digest = hex::encode(Sha256::digest(intent));
@@ -170,11 +179,13 @@ impl WorkUnitService {
             task_id,
             title,
             scope,
+            execution_instructions,
             role,
             parent_work_unit_id,
             assigned_actor,
             requires_integration,
             provenance,
+            review_subject,
         } = input;
         let (task, actor) = self
             .collaboration
@@ -189,6 +200,16 @@ impl WorkUnitService {
         if requires_integration && task.repo_id.is_none() {
             return Err(invalid(
                 "repository WorkUnit requires a repository-bound Task",
+            ));
+        }
+        if review_subject.is_some() && role != "reviewer" {
+            return Err(invalid(
+                "only a reviewer WorkUnit can have a review subject",
+            ));
+        }
+        if role == "reviewer" && review_subject.is_none() {
+            return Err(invalid(
+                "reviewer WorkUnit requires an exact reviewed WorkUnit subject",
             ));
         }
         let _integration_guard = self
@@ -326,9 +347,7 @@ impl WorkUnitService {
                     message: "WorkUnit action source does not match its exact Task Actor".to_owned(),
                 });
             }
-            if execution.role == "orchestrator"
-                && execution.purpose == Some(db::ExecutionPurpose::Orchestrate)
-            {
+            if execution.role == "orchestrator" {
                 let start_event = db::DomainEventRepo::get_event_by_dedupe(
                     &*self.db,
                     &format!("execution.started:{}", execution.id),
@@ -350,24 +369,122 @@ impl WorkUnitService {
                 event.causation_depth = causation_depth;
             }
         }
-        let write = WorkUnitRepo::create(
-            &*self.db,
-            CreateWorkUnit {
+        let task_id = task.id.clone();
+        let work_unit_input = CreateWorkUnit {
                 id,
-                task_id: task.id,
+                task_id: task_id.clone(),
                 parent_work_unit_id,
                 title,
                 scope,
+                execution_instructions,
                 role,
                 assigned_actor,
                 requires_integration,
                 provenance,
                 created_by: actor,
-                created_at: now,
-            },
-            event,
-        )
-        .await?;
+                created_at: now.clone(),
+            };
+        let review_work_unit_id = work_unit_input.id.clone();
+        let write = if let Some(reviewed_work_unit_id) = review_subject {
+            let reviewed = WorkUnitRepo::get_by_id(&*self.db, &reviewed_work_unit_id)
+                .await?
+                .filter(|reviewed| reviewed.task_id == task.id)
+                .ok_or_else(|| not_found("work_unit", reviewed_work_unit_id.clone()))?;
+            if reviewed.id == work_unit_input.id || reviewed.status == WorkUnitStatus::Cancelled {
+                return Err(invalid("review subject must be a different non-cancelled WorkUnit"));
+            }
+            let (reviewed_work_unit_version, result_execution_id, result_artifact_id,
+                result_commit_sha, result_workspace_id, workspace_snapshot_digest) =
+                if reviewed.status == WorkUnitStatus::Completed {
+                    let result_version = reviewed.version.checked_sub(1).ok_or_else(|| {
+                        invalid("completed review subject has no prior admitted version")
+                    })?;
+                    let execution_id: Option<String> = sqlx::query_scalar(
+                        "SELECT id FROM execution WHERE task_id = ? AND work_unit_id = ?
+                           AND work_unit_version = ? AND status = 'completed'
+                         ORDER BY created_at DESC, id DESC LIMIT 1",
+                    )
+                    .bind(&task.id)
+                    .bind(&reviewed.id)
+                    .bind(result_version)
+                    .fetch_optional(self.db.pool())
+                    .await?;
+                    let execution_id = execution_id.ok_or_else(|| {
+                        invalid("completed review subject has no exact completed Execution")
+                    })?;
+                    let execution = ExecutionRepo::get_by_id(&*self.db, &execution_id)
+                        .await?
+                        .ok_or_else(|| not_found("execution", execution_id.clone()))?;
+                    let result_artifact_id: Option<String> = if execution.role == "reviewer" {
+                        sqlx::query_scalar(
+                            "SELECT p.artifact_id FROM artifact_execution_producer p
+                             JOIN artifact a ON a.id = p.artifact_id AND a.task_id = p.task_id
+                             WHERE p.execution_id = ? AND p.task_id = ? AND a.kind = 'review_report'
+                             ORDER BY p.artifact_id LIMIT 1",
+                        )
+                        .bind(&execution.id)
+                        .bind(&task.id)
+                        .fetch_optional(self.db.pool())
+                        .await?
+                    } else {
+                        None
+                    };
+                    let digest = if let Some(workspace_id) = execution.workspace_id.as_deref() {
+                        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                            .await?
+                            .ok_or_else(|| not_found("workspace", workspace_id))?;
+                        let workspace_scope = WorkUnitWorkspaceRepo::get_scope_by_id(
+                            &*self.db,
+                            workspace_id,
+                        )
+                        .await?
+                        .ok_or_else(|| not_found("workspace", workspace_id))?;
+                        if workspace.task_id != task.id
+                            || workspace.status != WorkspaceStatus::Ready
+                            || workspace_scope.task_id != task.id
+                            || workspace_scope.kind != WorkspaceScopeKind::WorkUnit
+                            || workspace_scope.work_unit_id.as_deref() != Some(reviewed.id.as_str())
+                        {
+                            return Err(invalid(
+                                "completed review subject Workspace is not the exact ready WorkUnit Workspace",
+                            ));
+                        }
+                        let live_head = git::get_current_sha(Path::new(&workspace.worktree_path)).await?;
+                        if execution.after_sha.as_deref() != Some(live_head.as_str()) {
+                            return Err(invalid(
+                                "completed review subject Workspace no longer matches its exact Execution commit",
+                            ));
+                        }
+                        Some(crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?)
+                    } else {
+                        None
+                    };
+                    (Some(result_version), Some(execution.id), result_artifact_id, execution.after_sha,
+                        execution.workspace_id, digest)
+                } else {
+                    (None, None, None, None, None, None)
+                };
+            WorkUnitRepo::create_with_review_subject(
+                &*self.db,
+                work_unit_input,
+                CreateWorkUnitReviewSubject {
+                    review_work_unit_id,
+                    task_id,
+                    reviewed_work_unit_id: reviewed.id,
+                    reviewed_work_unit_version,
+                    result_execution_id,
+                    result_artifact_id,
+                    result_commit_sha,
+                    result_workspace_id,
+                    workspace_snapshot_digest,
+                    created_at: now,
+                },
+                event,
+            )
+            .await?
+        } else {
+            WorkUnitRepo::create(&*self.db, work_unit_input, event).await?
+        };
         self.domain_events.publish_committed(&write.event);
         Ok(write.record)
         }
@@ -460,6 +577,7 @@ impl WorkUnitService {
         Ok(WorkUnitRepo::list_by_task(&*self.db, task_id).await?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update(
         &self,
         source: CollaborationActorSource,
@@ -467,6 +585,7 @@ impl WorkUnitService {
         expected_version: i64,
         title: Option<String>,
         scope: Option<String>,
+        execution_instructions: Option<Option<String>>,
         requires_integration: Option<bool>,
     ) -> Result<WorkUnit> {
         let (task, actor) = self.authorize_work_unit(&source, id).await?;
@@ -511,6 +630,7 @@ impl WorkUnitService {
                 expected_version,
                 title,
                 scope,
+                execution_instructions,
                 parent_work_unit_id: None,
                 requires_integration,
                 updated_at: now,
@@ -531,6 +651,36 @@ impl WorkUnitService {
         assigned_actor: Option<ActorRef>,
     ) -> Result<WorkUnit> {
         let (task, actor) = self.authorize_work_unit(&source, id).await?;
+        if let Some(assigned_actor) = assigned_actor.as_ref() {
+            let api_actor = match assigned_actor {
+                db::ActorRef::Human(id) => api_types::ActorRef::Human(id.clone()),
+                db::ActorRef::Agent(id) => api_types::ActorRef::Agent(id.clone()),
+            };
+            if !crate::task_rework::reviewer_is_independent(&self.db, id, &api_actor).await? {
+                return Err(invalid(
+                    "independent review cannot use the Actor assigned to or contributing to the reviewed result",
+                ));
+            }
+            let dependent_reviewer: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM work_unit_review_subject s
+                    JOIN work_unit review ON review.id = s.review_work_unit_id
+                    WHERE s.reviewed_work_unit_id = ?
+                      AND review.assigned_actor_kind = ?
+                      AND review.assigned_actor_id = ?
+                )",
+            )
+            .bind(id)
+            .bind(assigned_actor.kind().to_string())
+            .bind(assigned_actor.id())
+            .fetch_one(self.db.pool())
+            .await?;
+            if dependent_reviewer != 0 {
+                return Err(invalid(
+                    "correction Actor cannot also be assigned as the dependent independent reviewer",
+                ));
+            }
+        }
         let now = now_rfc3339();
         let event = self.event(
             "work_unit.allocation_changed", "work_unit", id, &task, &actor,
@@ -604,15 +754,108 @@ impl WorkUnitService {
                 }
             }
         }
+        let has_dependent_reviews: i64 = if status == WorkUnitStatus::Completed {
+            sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM work_unit_review_subject
+                    WHERE task_id = ? AND reviewed_work_unit_id = ?
+                )",
+            )
+            .bind(&task.id)
+            .bind(id)
+            .fetch_one(self.db.pool())
+            .await?
+        } else {
+            0
+        };
+        let reviewed_result = if has_dependent_reviews != 0 {
+            if unit.version != expected_version {
+                return Err(db::DbError::VersionConflict.into());
+            }
+            let execution = crate::task_rework::latest_completed_work_unit_execution(
+                &self.db,
+                &task.id,
+                id,
+                unit.version,
+            )
+            .await?
+            .ok_or_else(|| {
+                invalid("reviewed WorkUnit requires an exact completed Execution result")
+            })?;
+            let result_artifact_id: Option<String> = if execution.role == "reviewer" {
+                sqlx::query_scalar(
+                    "SELECT p.artifact_id FROM artifact_execution_producer p
+                     JOIN artifact a ON a.id = p.artifact_id AND a.task_id = p.task_id
+                     WHERE p.execution_id = ? AND p.task_id = ? AND a.kind = 'review_report'
+                     ORDER BY p.artifact_id LIMIT 1",
+                )
+                .bind(&execution.id)
+                .bind(&task.id)
+                .fetch_optional(self.db.pool())
+                .await?
+            } else {
+                None
+            };
+            let (result_workspace_id, workspace_snapshot_digest) = if let Some(workspace_id) =
+                execution.workspace_id.as_deref()
+            {
+                let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                    .await?
+                    .ok_or_else(|| not_found("workspace", workspace_id))?;
+                let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, workspace_id)
+                    .await?
+                    .ok_or_else(|| not_found("workspace", workspace_id))?;
+                if workspace.task_id != task.id
+                    || workspace.status != WorkspaceStatus::Ready
+                    || scope.task_id != task.id
+                    || scope.kind != WorkspaceScopeKind::WorkUnit
+                    || scope.work_unit_id.as_deref() != Some(id)
+                {
+                    return Err(invalid(
+                        "reviewed result Workspace is not the exact ready WorkUnit Workspace",
+                    ));
+                }
+                let live_head = git::get_current_sha(Path::new(&workspace.worktree_path)).await?;
+                if execution.after_sha.as_deref() != Some(live_head.as_str()) {
+                    return Err(invalid(
+                        "reviewed result Workspace no longer matches its exact Execution commit",
+                    ));
+                }
+                let digest =
+                    crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
+                (Some(workspace_id.to_owned()), Some(digest))
+            } else {
+                (None, None)
+            };
+            Some(serde_json::json!({
+                "work_unit_version": unit.version,
+                "execution_id": execution.id,
+                "artifact_id": result_artifact_id,
+                "commit_sha": execution.after_sha,
+                "workspace_id": result_workspace_id,
+                "workspace_snapshot_digest": workspace_snapshot_digest,
+            }))
+        } else {
+            None
+        };
         let now = now_rfc3339();
         let event_name = match status {
             WorkUnitStatus::Completed => "work_unit.completed",
             WorkUnitStatus::Cancelled => "work_unit.cancelled",
             WorkUnitStatus::Open => return Err(invalid("WorkUnit cannot transition back to open")),
         };
+        let mut event_payload = serde_json::json!({"task_id": task.id, "work_unit_id": id, "version": expected_version + 1, "status": status.to_string()});
+        if let Some(reviewed_result) = reviewed_result {
+            event_payload["reviewed_result"] = reviewed_result;
+        }
         let event = self.event(
-            event_name, "work_unit", id, &task, &actor,
-            serde_json::json!({"task_id": task.id, "work_unit_id": id, "version": expected_version + 1, "status": status.to_string()}), &now,
+            event_name,
+            "work_unit",
+            id,
+            &task,
+            &actor,
+            event_payload,
+            &now,
             &source,
         );
         let write = WorkUnitRepo::transition(
@@ -736,9 +979,26 @@ impl WorkUnitService {
             .filter(|dependency| !dependency.satisfied)
             .map(|dependency| dependency.depends_on_work_unit_id)
             .collect::<Vec<_>>();
+        let latest_execution_status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM execution WHERE work_unit_id = ?
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let awaiting_acceptance = unit.status == WorkUnitStatus::Open
+            && active_execution_ids.is_empty()
+            && latest_execution_status.as_deref() == Some("completed");
+        let review_subject_ready = if unit.role == "reviewer" {
+            crate::task_rework::review_subject_ready(&self.db, id).await?
+        } else {
+            true
+        };
         let scope_ready = unit.status == WorkUnitStatus::Open
             && active_execution_ids.is_empty()
-            && unsatisfied_dependency_ids.is_empty();
+            && unsatisfied_dependency_ids.is_empty()
+            && !awaiting_acceptance
+            && review_subject_ready;
         let runnable = scope_ready && allocation_eligible;
         let ready_for_allocation =
             scope_ready && (unit.assigned_actor.is_none() || !allocation_eligible);
@@ -754,6 +1014,7 @@ impl WorkUnitService {
             active_execution_ids,
             unsatisfied_dependency_ids,
             awaiting_integration,
+            awaiting_acceptance,
         })
     }
 
@@ -773,8 +1034,8 @@ impl WorkUnitService {
                 "WorkUnit Execution Task and Actor must match the authorized source",
             ));
         }
-        if execution.purpose.is_none() {
-            return Err(invalid("WorkUnit Execution requires an explicit Purpose"));
+        if execution.actor_ref.is_none() {
+            return Err(invalid("WorkUnit Execution requires an explicit ActorRef"));
         }
         if let ActorRef::Agent(agent_id) = &actor {
             let agent = AgentRepo::get_by_id(&*self.db, agent_id)
@@ -911,6 +1172,22 @@ impl WorkUnitService {
             .await?
             .ok_or_else(|| not_found("repo", integration.repo_id.clone()))?;
         let repo_path = resolve_repo_source(&repo, &self.workspace_root).await?;
+        let required_base_sha: Option<String> = sqlx::query_scalar(
+            "SELECT result_commit_sha FROM work_unit_result_requirement
+             WHERE work_unit_id = ? AND result_commit_sha IS NOT NULL",
+        )
+        .bind(work_unit_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        if let Some(base_sha) = required_base_sha.as_deref() {
+            git::commit_parents(Path::new(&repo_path), base_sha)
+                .await
+                .map_err(|_| {
+                    invalid(
+                        "consumed WorkUnit result commit is not available in the repository",
+                    )
+                })?;
+        }
         let manager = WorkspaceManager::new(self.workspace_root.clone())
             .with_repo_cache_locks(Arc::clone(&self.repo_cache_locks));
         if let Some(existing) =
@@ -923,6 +1200,13 @@ impl WorkUnitService {
                 || scope.work_unit_id.as_deref() != Some(work_unit_id)
             {
                 return Err(invalid("Workspace scope does not match WorkUnit"));
+            }
+            if required_base_sha.as_deref().is_some_and(|required| {
+                existing.before_sha.as_deref() != Some(required)
+            }) {
+                return Err(invalid(
+                    "WorkUnit Workspace base does not match the consumed result commit",
+                ));
             }
             if existing.status == WorkspaceStatus::Cleaning {
                 return Err(invalid(
@@ -990,7 +1274,10 @@ impl WorkUnitService {
                 .ok_or_else(|| not_found("workspace", existing.id));
         }
         let workspace_id = new_uuid_v4();
-        let before_sha = git::get_current_sha(Path::new(&integration.worktree_path)).await?;
+        let before_sha = match required_base_sha {
+            Some(base_sha) => base_sha,
+            None => git::get_current_sha(Path::new(&integration.worktree_path)).await?,
+        };
         let branch = workspace::work_unit_branch_name(&task.id, work_unit_id, &workspace_id)
             .map_err(|error| invalid(error.to_string()))?;
         let path = manager
@@ -1696,7 +1983,6 @@ mod tests {
             agent_id: Some(agent_id.to_owned()),
             actor_ref: Some(ActorRef::Agent(agent_id.to_owned())),
             role: "implementer".to_owned(),
-            purpose: Some(db::ExecutionPurpose::Implement),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -1990,11 +2276,13 @@ mod tests {
                     task_id: task_id.clone(),
                     title: "Human repository allocation".to_owned(),
                     scope: "requires a repository execution".to_owned(),
+                    execution_instructions: None,
                     role: "implementer".to_owned(),
                     parent_work_unit_id: None,
                     assigned_actor: Some(ActorRef::Human(human_id.clone())),
                     requires_integration: true,
                     provenance: None,
+                    review_subject: None,
                 },
             )
             .await
@@ -2034,6 +2322,7 @@ mod tests {
                     parent_work_unit_id: None,
                     title: unit_title.to_owned(),
                     scope: "test scope".to_owned(),
+                    execution_instructions: None,
                     role: "implementer".to_owned(),
                     assigned_actor: Some(ActorRef::Agent(agent_id.to_owned())),
                     requires_integration: true,
@@ -2093,9 +2382,9 @@ mod tests {
             sqlx::query(
                 "INSERT INTO execution (
                      id, task_id, agent_id, role, status, workspace_id, before_sha,
-                     created_at, updated_at, actor_kind, actor_id, purpose,
+                     created_at, updated_at, actor_kind, actor_id,
                      work_unit_id, work_unit_version
-                 ) VALUES (?, ?, ?, 'implementer', 'running', ?, ?, ?, ?, 'agent', ?, 'implement', ?, 1)",
+                 ) VALUES (?, ?, ?, 'implementer', 'running', ?, ?, ?, ?, 'agent', ?, ?, 1)",
             )
             .bind(&execution_id)
             .bind(task_id)
@@ -2225,6 +2514,7 @@ mod tests {
                 parent_work_unit_id: None,
                 title: "dependent WorkUnit".to_owned(),
                 scope: "wait for integrated prerequisite".to_owned(),
+                execution_instructions: None,
                 role: "implementer".to_owned(),
                 assigned_actor: Some(ActorRef::Agent(agent_id.clone())),
                 requires_integration: false,
@@ -2851,11 +3141,13 @@ mod tests {
                     task_id: task_id.clone(),
                     title: "recover cleaned WorkUnit workspace".to_owned(),
                     scope: "preserve branch commits after failed attempt".to_owned(),
+                    execution_instructions: None,
                     role: "implementer".to_owned(),
                     parent_work_unit_id: None,
                     assigned_actor: Some(ActorRef::Agent(agent_id.clone())),
                     requires_integration: true,
                     provenance: None,
+                    review_subject: None,
                 },
             )
             .await
@@ -3199,11 +3491,13 @@ mod tests {
                     task_id: task_id.clone(),
                     title: "allocation readiness".to_owned(),
                     scope: "check active membership".to_owned(),
+                    execution_instructions: None,
                     role: "implementer".to_owned(),
                     parent_work_unit_id: None,
                     assigned_actor: Some(ActorRef::Agent(agent_id.clone())),
                     requires_integration: false,
                     provenance: None,
+                    review_subject: None,
                 },
             )
             .await

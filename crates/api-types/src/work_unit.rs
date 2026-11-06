@@ -50,11 +50,26 @@ pub enum CreateWorkUnitProvenance {
 pub struct CreateWorkUnitRequest {
     pub title: String,
     pub scope: String,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub execution_instructions: Option<String>,
     pub role: String,
     pub parent_work_unit_id: Option<String>,
     pub assigned_actor: Option<ActorRef>,
     pub requires_integration: bool,
     pub provenance: Option<CreateWorkUnitProvenance>,
+    /// Exact WorkUnit result this reviewer WorkUnit will inspect. The target
+    /// version is frozen when its first result Execution is admitted.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub review_subject: Option<CreateWorkUnitReviewSubjectRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct CreateWorkUnitReviewSubjectRequest {
+    pub reviewed_work_unit_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -65,6 +80,9 @@ pub struct UpdateWorkUnitRequest {
     pub expected_version: i64,
     pub title: Option<String>,
     pub scope: Option<String>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub execution_instructions: Option<Option<String>>,
     pub requires_integration: Option<bool>,
 }
 
@@ -114,6 +132,7 @@ pub struct WorkUnitReadinessResponse {
     pub active_execution_ids: Vec<String>,
     pub unsatisfied_dependency_ids: Vec<String>,
     pub awaiting_integration: bool,
+    pub awaiting_acceptance: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -125,6 +144,7 @@ pub struct WorkUnitResponse {
     pub parent_work_unit_id: Option<String>,
     pub title: String,
     pub scope: String,
+    pub execution_instructions: Option<String>,
     pub status: WorkUnitStatus,
     pub role: String,
     pub assigned_actor: Option<ActorRef>,
@@ -136,6 +156,7 @@ pub struct WorkUnitResponse {
     pub created_at: String,
     pub updated_at: String,
     pub readiness: WorkUnitReadinessResponse,
+    pub review_subject: Option<crate::ReviewSubjectResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

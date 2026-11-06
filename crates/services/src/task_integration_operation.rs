@@ -1903,7 +1903,6 @@ mod tests {
                         agent_id: None,
                         actor_ref: None,
                         role: "implementer".to_owned(),
-                        purpose: Some(db::ExecutionPurpose::Implement),
                         status: db::ExecutionStatus::Failed,
                         stop_reason: None,
                         stopped_by: None,

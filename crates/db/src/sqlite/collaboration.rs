@@ -682,7 +682,7 @@ impl CollaborationRepo for SqliteDb {
                 let producer = sqlx::query(
                     "SELECT actor_kind, actor_id, status FROM execution
                      WHERE id = ? AND task_id = ?
-                       AND role = 'reviewer' AND purpose = 'review'",
+                       AND role = 'reviewer'",
                 )
                 .bind(&input.producer_execution_id)
                 .bind(&input.task_id)
@@ -917,7 +917,7 @@ impl CollaborationRepo for SqliteDb {
             "SELECT e.actor_id
              FROM execution e
              WHERE e.id = ? AND e.task_id = ?
-               AND e.role = 'reviewer' AND e.purpose = 'review'
+               AND e.role = 'reviewer'
                AND e.actor_kind = 'human' AND e.actor_id IS NOT NULL
                AND EXISTS (SELECT 1 FROM user u WHERE u.id = e.actor_id)
                AND e.status = 'running'",

@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act, renderHook } from '@testing-library/react'
+import { createElement, type ReactNode } from 'react'
 
-import { getExecutionHookLogs, getExecutionLogs } from './hooks'
+import { getExecutionHookLogs, getExecutionLogs, useTransitionTaskLifecycle } from './hooks'
+import { qk } from './query-keys'
 import { useAuthStore } from '@/stores/auth'
 
 describe('execution log API helpers', () => {
@@ -47,5 +51,38 @@ describe('execution log API helpers', () => {
     const [url, init] = fetchMock.mock.calls[0]
     expect((url as URL).pathname).toBe('/api/v1/executions/exec-1/hook-logs')
     expect((init?.headers as Headers).get('authorization')).toBe('Bearer access-token')
+  })
+
+  it('invalidates Task dispatch preflight after a lifecycle transition', async () => {
+    const fetchMock = vi.spyOn(window, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          task_id: 'task-1',
+          lifecycle: {},
+          transition_id: 'transition-1',
+          gate_evaluation_id: null,
+          replayed: false,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    )
+    const queryClient = new QueryClient()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue()
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children)
+
+    const { result } = renderHook(() => useTransitionTaskLifecycle(), { wrapper })
+    await act(async () => {
+      await result.current.mutateAsync({
+        taskId: 'task-1',
+        toState: 'ready',
+        expectedLifecycleVersion: 4,
+        idempotencyKey: 'transition-key',
+      })
+    })
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.taskDispatch('task-1') })
+    queryClient.clear()
   })
 })

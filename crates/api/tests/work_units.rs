@@ -245,19 +245,11 @@ async fn non_repository_agent_work_unit_starts_through_task_executions_rest_rout
     )
     .await;
 
-    let execution: ExecutionResponse = json_request(
+    let execution: ExecutionResponse = common::launch_work_unit_execution(
         &harness.app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/executions", task.id),
-        json!({
-            "work_unit_id": work_unit.id,
-            "expected_work_unit_version": work_unit.version,
-            "purpose": "implement",
-            "prompt": "printf 'rest-ok\\n' > rest-result.txt",
-            "input_artifact_ids": [],
-            "overrides": null
-        }),
-        StatusCode::OK,
+        &task.id,
+        &work_unit,
+        Some("printf 'rest-ok\\n' > rest-result.txt"),
     )
     .await;
     assert_eq!(
@@ -538,11 +530,13 @@ async fn rest_and_mcp_cannot_route_an_account_to_another_accounts_embedded_shell
                 task_id: task.id.clone(),
                 title: "Try cross-account shell".to_owned(),
                 scope: "Attempt shell marker execution".to_owned(),
+                execution_instructions: None,
                 role: "implementer".to_owned(),
                 parent_work_unit_id: None,
                 assigned_actor: Some(db::ActorRef::Agent(agent.id.clone())),
                 requires_integration: false,
                 provenance: None,
+                review_subject: None,
             },
         )
         .await

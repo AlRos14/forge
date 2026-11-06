@@ -37,7 +37,7 @@ impl TaskService {
         &self,
         execution: Execution,
     ) -> Result<Execution> {
-        if execution.role != "reviewer" || execution.purpose != Some(ExecutionPurpose::Review) {
+        if execution.role != "reviewer" {
             return Ok(execution);
         }
         let Some(workspace_id) = execution.workspace_id.as_deref() else {
@@ -192,7 +192,6 @@ impl TaskService {
             });
         }
         if execution.role == "reviewer"
-            && execution.purpose == Some(ExecutionPurpose::Review)
             && self
                 .reconcile_existing_review_report(&execution, None, None)
                 .await?
@@ -234,7 +233,7 @@ impl TaskService {
             }
         }
         let prepared = async {
-            if execution.role == "reviewer" && execution.purpose == Some(ExecutionPurpose::Review) {
+            if execution.role == "reviewer" {
                 self.verify_execution_workspace_authority(&execution)
                     .await?;
             }
@@ -328,6 +327,12 @@ impl TaskService {
                     accepted: false,
                 });
             }
+            db::ProviderStartClaim::TaskPaused => {
+                return Ok(api_types::ExecutionStartResult {
+                    execution_id: execution.id,
+                    accepted: false,
+                });
+            }
             db::ProviderStartClaim::Claimed => {}
         }
 
@@ -401,7 +406,7 @@ impl TaskService {
                 "only running executions can be executed",
             ));
         }
-        if execution.role == "reviewer" && execution.purpose == Some(ExecutionPurpose::Review) {
+        if execution.role == "reviewer" {
             if let Some((completed, _report)) = self
                 .reconcile_existing_review_report(&execution, None, None)
                 .await?
@@ -546,8 +551,7 @@ impl TaskService {
             return Err(error);
         }
 
-        let is_review_execution = execution_before_launch.role == "reviewer"
-            && execution_before_launch.purpose == Some(ExecutionPurpose::Review);
+        let is_review_execution = execution_before_launch.role == "reviewer";
         let mut review_worktree_snapshot = None;
         let mut review_snapshot_digest = None;
         if is_review_execution && execution_before_launch.workspace_id.is_some() {
@@ -831,7 +835,7 @@ impl TaskService {
             }
         });
 
-        let existing_plan_output = if execution.purpose == Some(ExecutionPurpose::Plan) {
+        let existing_plan_output = if execution.role == "planner" {
             db::CollaborationRepo::get_execution_artifact_output(
                 &*self.db,
                 &execution.id,
@@ -1032,7 +1036,7 @@ impl TaskService {
             return Ok(current_execution);
         }
 
-        if current_execution.purpose == Some(ExecutionPurpose::Plan)
+        if current_execution.role == "planner"
             && result.status == ExecutionOutcome::Completed
             && existing_plan_output.is_none()
         {
@@ -1065,10 +1069,7 @@ impl TaskService {
             }
         }
 
-        if current_execution.role == "reviewer"
-            && current_execution.purpose == Some(ExecutionPurpose::Review)
-            && result.status == ExecutionOutcome::Completed
-        {
+        if current_execution.role == "reviewer" && result.status == ExecutionOutcome::Completed {
             let output = result
                 .assistant_output
                 .as_deref()

@@ -4,10 +4,10 @@ use db::{
     new_uuid_v4, now_rfc3339, ActorRef, AgentRepo, Artifact, ArtifactKind, ArtifactStorageKind,
     CollaborationRepo, CollaborationTarget, CreateArtifact, CreateDecision, CreateDomainEvent,
     CreateHandoff, CreateMessage, CreateProposal, Decision, DecisionOutcome, DomainEventRepo,
-    ExecutionPurpose, ExecutionRepo, Handoff, HandoffIntent, HandoffStatus, Page, PageRequest,
-    Project, ProjectMemberRepo, ProjectRepo, Proposal, ProposalStatus, ProposalTarget,
-    ProposalTargetKind, RoleMembershipRepo, RoleMembershipStatus, SqliteDb, Task, TaskRepo,
-    TaskRoleRepo, UserRepo, WorkspaceRepo,
+    ExecutionRepo, Handoff, HandoffIntent, HandoffStatus, Page, PageRequest, Project,
+    ProjectMemberRepo, ProjectRepo, Proposal, ProposalStatus, ProposalTarget, ProposalTargetKind,
+    RoleMembershipRepo, RoleMembershipStatus, SqliteDb, Task, TaskRepo, TaskRoleRepo, UserRepo,
+    WorkUnitRepo, WorkspaceRepo,
 };
 use events::EventBus;
 use sha2::{Digest, Sha256};
@@ -98,6 +98,8 @@ pub struct CollaborationService {
     domain_events: DomainEventService,
 }
 
+type ReviewReportInputs = (Vec<String>, Vec<String>, Option<String>, Option<i64>);
+
 impl CollaborationService {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
         Self {
@@ -112,9 +114,9 @@ impl CollaborationService {
         &self,
         execution: &db::Execution,
     ) -> Result<()> {
-        if execution.role != "reviewer" || execution.purpose != Some(ExecutionPurpose::Review) {
+        if execution.role != "reviewer" {
             return Err(invalid(
-                "Review subject check requires a reviewer Review Execution",
+                "Review subject check requires a reviewer Execution",
             ));
         }
         let Some(workspace_id) = execution.workspace_id.as_deref() else {
@@ -172,7 +174,7 @@ impl CollaborationService {
         &self,
         execution: &db::Execution,
     ) -> Result<Option<Artifact>> {
-        if execution.role != "reviewer" || execution.purpose != Some(ExecutionPurpose::Review) {
+        if execution.role != "reviewer" {
             return Err(invalid(
                 "ReviewReport reconciliation requires its exact reviewer Execution",
             ));
@@ -224,7 +226,34 @@ impl CollaborationService {
 
         let persisted_subject =
             ExecutionRepo::get_review_execution_subject(&*self.db, &execution.id).await?;
-        let expected_subject = match execution.workspace_id.as_deref() {
+        let value: serde_json::Value = serde_json::from_str(content)
+            .map_err(|error| invalid(format!("ReviewReport JSON is invalid: {error}")))?;
+        let relation_review_subject = match execution.work_unit_id.as_deref() {
+            Some(review_work_unit_id) => {
+                crate::task_rework::get_review_subject(&self.db, review_work_unit_id).await?
+            }
+            None => None,
+        };
+        let reviewed_work_unit_id = relation_review_subject
+            .as_ref()
+            .map(|subject| serde_json::json!(subject.reviewed_work_unit_id))
+            .unwrap_or_else(|| {
+                value
+                    .pointer("/subject/reviewed_work_unit_id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            });
+        let reviewed_work_unit_version = relation_review_subject
+            .as_ref()
+            .and_then(|subject| subject.reviewed_work_unit_version)
+            .map(|version| serde_json::json!(version))
+            .unwrap_or_else(|| {
+                value
+                    .pointer("/subject/reviewed_work_unit_version")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            });
+        let mut expected_subject = match execution.workspace_id.as_deref() {
             Some(workspace_id) => {
                 let subject = persisted_subject.ok_or_else(|| {
                     invalid("workspace-bound Review Execution has no frozen subject")
@@ -242,6 +271,8 @@ impl CollaborationService {
                 serde_json::json!({
                     "task_id": execution.task_id,
                     "review_execution_id": execution.id,
+                    "reviewed_work_unit_id": reviewed_work_unit_id,
+                    "reviewed_work_unit_version": reviewed_work_unit_version,
                     "workspace_id": subject.workspace_id,
                     "base_commit_sha": subject.base_commit_sha,
                     "head_commit_sha": subject.head_commit_sha,
@@ -257,6 +288,8 @@ impl CollaborationService {
                 serde_json::json!({
                     "task_id": execution.task_id,
                     "review_execution_id": execution.id,
+                    "reviewed_work_unit_id": reviewed_work_unit_id,
+                    "reviewed_work_unit_version": reviewed_work_unit_version,
                     "workspace_id": serde_json::Value::Null,
                     "base_commit_sha": execution.before_sha,
                     "head_commit_sha": execution.after_sha,
@@ -264,8 +297,19 @@ impl CollaborationService {
                 })
             }
         };
-        let value: serde_json::Value = serde_json::from_str(content)
-            .map_err(|error| invalid(format!("ReviewReport JSON is invalid: {error}")))?;
+        if let Some(subject) = relation_review_subject.as_ref().filter(|subject| {
+            subject.result_execution_id.is_some() && subject.reviewed_work_unit_version.is_some()
+        }) {
+            expected_subject["reviewed_result"] = serde_json::json!({
+                "execution_id": subject.result_execution_id,
+                "artifact_id": subject.result_artifact_id,
+                "commit_sha": subject.result_commit_sha,
+                "workspace_id": subject.result_workspace_id,
+                "workspace_snapshot_digest": subject.workspace_snapshot_digest,
+            });
+        } else if let Some(legacy_result) = value.pointer("/subject/reviewed_result") {
+            expected_subject["reviewed_result"] = legacy_result.clone();
+        }
         if value.get("kind").and_then(serde_json::Value::as_str) != Some("review_report")
             || value.get("subject") != Some(&expected_subject)
             || !matches!(
@@ -306,8 +350,7 @@ impl CollaborationService {
             return Err(not_found("execution", input.producer_execution_id));
         }
         if input.kind == ArtifactKind::Plan
-            && (execution.purpose != Some(ExecutionPurpose::Plan)
-                || input.storage_kind != ArtifactStorageKind::Inline
+            && (input.storage_kind != ArtifactStorageKind::Inline
                 || input
                     .content
                     .as_deref()
@@ -320,7 +363,7 @@ impl CollaborationService {
                 }))
         {
             return Err(invalid(
-                "Plan Artifact requires inline content, its exact digest, and a Plan Execution producer",
+                "Plan Artifact requires inline content, its exact digest, and an Execution producer",
             ));
         }
         if matches!(&source, CollaborationActorSource::Execution(id) if id != &execution.id) {
@@ -404,7 +447,6 @@ impl CollaborationService {
             agent_id: None,
             actor_ref: Some(ActorRef::Human(user_id.to_owned())),
             role: "planner".to_owned(),
-            purpose: Some(ExecutionPurpose::Plan),
             status: db::ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -446,7 +488,7 @@ impl CollaborationService {
         if execution.actor_ref() != Some(ActorRef::Human(user_id.to_owned()))
             || execution.harness_session_id.is_some()
             || execution.agent_id.is_some()
-            || execution.purpose != Some(ExecutionPurpose::Plan)
+            || execution.role != "planner"
         {
             return Err(ServiceError::AuthorizationDenied {
                 message: "Human plan completion must match its Human Plan Execution".to_owned(),
@@ -511,14 +553,12 @@ impl CollaborationService {
         let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
             .await?
             .ok_or_else(|| not_found("execution", execution_id.to_owned()))?;
-        if execution.purpose != Some(ExecutionPurpose::Plan)
-            || !matches!(
-                execution.status,
-                db::ExecutionStatus::Running | db::ExecutionStatus::Completed
-            )
-        {
+        if !matches!(
+            execution.status,
+            db::ExecutionStatus::Running | db::ExecutionStatus::Completed
+        ) {
             return Err(invalid(
-                "Plan Artifact producer must be a running or completed Plan Execution",
+                "Plan Artifact producer must be a running or completed Execution",
             ));
         }
         let actor = execution
@@ -602,11 +642,18 @@ impl CollaborationService {
         assistant_output: &str,
         evidence_input_ids: Vec<String>,
         artifact_input_ids: Vec<String>,
+        reviewed_work_unit_id: Option<String>,
+        reviewed_work_unit_version: Option<i64>,
     ) -> Result<Artifact> {
         self.create_review_report_from_execution_inner(
             execution_id,
             assistant_output,
-            Some((evidence_input_ids, artifact_input_ids)),
+            Some((
+                evidence_input_ids,
+                artifact_input_ids,
+                reviewed_work_unit_id,
+                reviewed_work_unit_version,
+            )),
         )
         .await
     }
@@ -615,13 +662,12 @@ impl CollaborationService {
         &self,
         execution_id: &str,
         assistant_output: &str,
-        requested_inputs: Option<(Vec<String>, Vec<String>)>,
+        requested_inputs: Option<ReviewReportInputs>,
     ) -> Result<Artifact> {
         let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
             .await?
             .ok_or_else(|| not_found("execution", execution_id.to_owned()))?;
         if execution.role != "reviewer"
-            || execution.purpose != Some(ExecutionPurpose::Review)
             || !matches!(
                 execution.status,
                 db::ExecutionStatus::Running | db::ExecutionStatus::Completed
@@ -651,7 +697,7 @@ impl CollaborationService {
             .ok_or_else(|| not_found("task", execution.task_id.clone()))?;
         let mut considered = Vec::new();
         let mut seen = HashSet::new();
-        if let Some((evidence_ids, artifact_ids)) = requested_inputs.as_ref() {
+        if let Some((evidence_ids, artifact_ids, _, _)) = requested_inputs.as_ref() {
             let mut declared_evidence = HashSet::new();
             let mut declared_artifacts = HashSet::new();
             for reference in &structured.evidence_considered {
@@ -827,6 +873,90 @@ impl CollaborationService {
         } else {
             None
         };
+        let (requested_work_unit_id, requested_work_unit_version) = requested_inputs
+            .as_ref()
+            .map(|(_, _, work_unit_id, work_unit_version)| {
+                (work_unit_id.clone(), *work_unit_version)
+            })
+            .unwrap_or((None, None));
+        if requested_work_unit_id.is_some() != requested_work_unit_version.is_some() {
+            return Err(invalid(
+                "ReviewReport subject requires both reviewed_work_unit_id and reviewed_work_unit_version",
+            ));
+        }
+        if let Some(work_unit_id) = requested_work_unit_id.as_deref() {
+            let work_unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
+                .await?
+                .filter(|work_unit| work_unit.task_id == execution.task_id)
+                .ok_or_else(|| invalid("ReviewReport subject WorkUnit is not in this Task"))?;
+            if Some(work_unit.version) != requested_work_unit_version
+                && !(work_unit.status == db::WorkUnitStatus::Completed
+                    && requested_work_unit_version
+                        .is_some_and(|version| work_unit.version == version + 1))
+            {
+                return Err(invalid(
+                    "ReviewReport subject WorkUnit version does not match",
+                ));
+            }
+        }
+        let relation_subject = match execution.work_unit_id.as_deref() {
+            Some(review_work_unit_id) => {
+                crate::task_rework::get_review_subject(&self.db, review_work_unit_id).await?
+            }
+            None => None,
+        };
+        let subject_work_unit_id = requested_work_unit_id.clone().or_else(|| {
+            relation_subject
+                .as_ref()
+                .map(|subject| subject.reviewed_work_unit_id.clone())
+        });
+        let subject_work_unit_version = requested_work_unit_version.or_else(|| {
+            relation_subject
+                .as_ref()
+                .and_then(|subject| subject.reviewed_work_unit_version)
+        });
+        if let (Some(requested_id), Some(relation)) =
+            (requested_work_unit_id.as_deref(), relation_subject.as_ref())
+        {
+            if relation.reviewed_work_unit_id != requested_id
+                || relation.reviewed_work_unit_version != subject_work_unit_version
+            {
+                return Err(invalid(
+                    "ReviewReport subject conflicts with its reviewer WorkUnit subject",
+                ));
+            }
+        }
+
+        if relation_subject.as_ref().is_some_and(|relation| {
+            relation.reviewed_work_unit_version.is_none()
+                || relation.result_execution_id.is_none()
+                || (relation.result_workspace_id.is_some()
+                    && relation.workspace_snapshot_digest.is_none())
+        }) {
+            return Err(invalid(
+                "ReviewReport requires its exact completed reviewed result",
+            ));
+        }
+
+        let mut report_subject = serde_json::json!({
+            "task_id": task.id,
+            "review_execution_id": execution.id,
+            "reviewed_work_unit_id": subject_work_unit_id,
+            "reviewed_work_unit_version": subject_work_unit_version,
+            "workspace_id": execution.workspace_id,
+            "base_commit_sha": subject.as_ref().map(|subject| subject.base_commit_sha.as_str()).or(execution.before_sha.as_deref()),
+            "head_commit_sha": subject.as_ref().map(|subject| subject.head_commit_sha.as_str()).or(execution.after_sha.as_deref()),
+            "workspace_snapshot_digest": subject.as_ref().map(|subject| subject.workspace_snapshot_digest.as_str()),
+        });
+        if let Some(reviewed_result) = relation_subject.as_ref() {
+            report_subject["reviewed_result"] = serde_json::json!({
+                "execution_id": reviewed_result.result_execution_id,
+                "artifact_id": reviewed_result.result_artifact_id,
+                "commit_sha": reviewed_result.result_commit_sha,
+                "workspace_id": reviewed_result.result_workspace_id,
+                "workspace_snapshot_digest": reviewed_result.workspace_snapshot_digest,
+            });
+        }
 
         let content = serde_json::json!({
             "kind": "review_report",
@@ -836,14 +966,7 @@ impl CollaborationService {
             "findings": structured.findings,
             "questions": structured.questions,
             "evidence_considered": considered,
-            "subject": {
-                "task_id": task.id,
-                "review_execution_id": execution.id,
-                "workspace_id": execution.workspace_id,
-                "base_commit_sha": subject.as_ref().map(|subject| subject.base_commit_sha.as_str()).or(execution.before_sha.as_deref()),
-                "head_commit_sha": subject.as_ref().map(|subject| subject.head_commit_sha.as_str()).or(execution.after_sha.as_deref()),
-                "workspace_snapshot_digest": subject.as_ref().map(|subject| subject.workspace_snapshot_digest.as_str()),
-            },
+            "subject": report_subject,
         })
         .to_string();
         let digest = hex::encode(Sha256::digest(content.as_bytes()));
@@ -888,7 +1011,13 @@ impl CollaborationService {
         if execution.status == db::ExecutionStatus::Running && existing_output.is_none() {
             self.ensure_review_subject_current(&execution).await?;
         }
-        let write = if let Some((evidence_input_ids, artifact_input_ids)) = requested_inputs {
+        let write = if let Some((
+            evidence_input_ids,
+            artifact_input_ids,
+            _reviewed_work_unit_id,
+            _reviewed_work_unit_version,
+        )) = requested_inputs
+        {
             CollaborationRepo::create_review_report_with_inputs(
                 &*self.db,
                 input,
@@ -1944,9 +2073,7 @@ impl CollaborationService {
                         .to_owned(),
                 });
             }
-            if execution.role == "orchestrator"
-                && execution.purpose == Some(ExecutionPurpose::Orchestrate)
-            {
+            if execution.role == "orchestrator" {
                 let start_event = DomainEventRepo::get_event_by_dedupe(
                     &*self.db,
                     &format!("execution.started:{}", execution.id),

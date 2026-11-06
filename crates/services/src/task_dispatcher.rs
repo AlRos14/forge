@@ -13,6 +13,9 @@ use tracing::Instrument;
 use crate::{Result, TaskService};
 
 mod active_recovery;
+mod dispatch;
+
+pub use dispatch::DispatchOutcome;
 
 pub struct TaskDispatcher {
     db: Arc<db::SqliteDb>,
@@ -115,7 +118,8 @@ impl TaskDispatcher {
     pub async fn check_once(&self) -> Result<u64> {
         let pending_starts = self.recover_pending_provider_starts().await?;
         let auto_recovered = self.recover_auto_cancelled_work_unit_executions().await?;
-        let dispatched = pending_starts + auto_recovered;
+        let dispatched_units = self.dispatch_eligible_work_units().await?;
+        let dispatched = pending_starts + dispatched_units + auto_recovered;
 
         tracing::info!(
             dispatched_tasks = dispatched,

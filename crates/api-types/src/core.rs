@@ -25,20 +25,6 @@ pub enum AgentStatus {
 
 pub type ExecutionRole = String;
 
-/// The explicit reason an Actor is performing work in an Execution.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum ExecutionPurpose {
-    Plan,
-    Implement,
-    Review,
-    Validate,
-    Investigate,
-    Orchestrate,
-    General,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]

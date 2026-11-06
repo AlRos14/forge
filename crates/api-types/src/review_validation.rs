@@ -36,6 +36,24 @@ pub struct SubmitReviewReportRequest {
     pub evidence_ids: Vec<String>,
     #[serde(default)]
     pub artifact_ids: Vec<String>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub reviewed_work_unit_id: Option<String>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    #[ts(type = "number | null")]
+    pub reviewed_work_unit_version: Option<i64>,
+}
+
+/// Submit the assigned Human's review of a prepared WorkUnit. Forge creates
+/// the technical attempt and binds its subject; no Execution selection is needed.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct SubmitWorkUnitReviewRequest {
+    #[ts(type = "number")]
+    pub expected_version: i64,
+    pub report: SubmitReviewReportRequest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    now_rfc3339, AgentExecutionStats, ExecutionPurpose, ExecutionStatus,
-    PendingProviderStartFailure, RunningExecutionFailure,
+    now_rfc3339, AgentExecutionStats, ExecutionStatus, PendingProviderStartFailure,
+    RunningExecutionFailure,
 };
 
 fn map_review_execution_subject(row: SqliteRow) -> Result<ReviewExecutionSubject> {
@@ -120,7 +120,6 @@ async fn create_human_review_execution(
     };
     if input.status != ExecutionStatus::Running
         || input.role != "reviewer"
-        || input.purpose != Some(ExecutionPurpose::Review)
         || human_actor_id.is_none()
         || !subject_matches
         || event.event_type != "execution.started"
@@ -266,7 +265,6 @@ impl ExecutionRepo for SqliteDb {
             .ok_or(DbError::NotFound)?;
         if execution.task_id != subject.task_id
             || execution.role != "reviewer"
-            || execution.purpose != Some(ExecutionPurpose::Review)
             || execution.status != ExecutionStatus::Running
             || execution.workspace_id.as_deref() != Some(subject.workspace_id.as_str())
         {
@@ -371,7 +369,7 @@ impl ExecutionRepo for SqliteDb {
     ) -> Result<Option<Execution>> {
         sqlx::query(
             "SELECT * FROM execution
-             WHERE task_id = ? AND role = 'reviewer' AND purpose = 'review'
+             WHERE task_id = ? AND role = 'reviewer'
                AND actor_kind = 'human' AND actor_id = ? AND status = 'running'
                AND workspace_id IS ?
              ORDER BY created_at DESC, id DESC LIMIT 1",
@@ -433,7 +431,6 @@ impl ExecutionRepo for SqliteDb {
             ));
         };
         if input.role != "orchestrator"
-            || input.purpose != Some(ExecutionPurpose::Orchestrate)
             || input.workspace_id.is_some()
             || event.event_type != "execution.started"
             || event.entity_type != "execution"
@@ -444,8 +441,7 @@ impl ExecutionRepo for SqliteDb {
             || event.actor_id.as_deref() != Some(agent_id.as_str())
         {
             return Err(DbError::Check(
-                "orchestrator Execution must be workspace-free with exact role and purpose"
-                    .to_owned(),
+                "orchestrator Execution must be workspace-free with its exact role".to_owned(),
             ));
         }
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -626,9 +622,57 @@ impl ExecutionRepo for SqliteDb {
         let rows = sqlx::query(
             "SELECT * FROM execution
              WHERE work_unit_id IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM work_unit w
+                   WHERE w.id = execution.work_unit_id AND w.task_id = execution.task_id
+                     AND w.status = 'open' AND w.version = execution.work_unit_version
+                     AND w.role = execution.role
+                     AND w.assigned_actor_kind = execution.actor_kind
+                     AND w.assigned_actor_id = execution.actor_id
+               )
                AND status = 'cancelled'
                AND resume_policy = 'auto'
                AND stop_reason IN ('crash_recovery', 'graceful_shutdown')
+               AND NOT EXISTS (
+                   SELECT 1 FROM execution newer
+                   WHERE newer.work_unit_id = execution.work_unit_id
+                     AND (newer.created_at > execution.created_at
+                          OR (newer.created_at = execution.created_at
+                              AND newer.id > execution.id))
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM execution child
+                   WHERE child.parent_execution_id = execution.id
+               )
+             ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(map_execution).collect()
+    }
+
+    async fn list_work_unit_recovery_required_candidates(&self) -> Result<Vec<Execution>> {
+        let rows = sqlx::query(
+            "SELECT * FROM execution
+             WHERE work_unit_id IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM work_unit w
+                   WHERE w.id = execution.work_unit_id AND w.task_id = execution.task_id
+                     AND w.status = 'open' AND w.version = execution.work_unit_version
+                     AND w.role = execution.role
+                     AND w.assigned_actor_kind = execution.actor_kind
+                     AND w.assigned_actor_id = execution.actor_id
+               )
+               AND status = 'cancelled'
+               AND resume_policy IN ('auto', 'manual')
+               AND stop_reason IN ('crash_recovery', 'agent_timeout', 'graceful_shutdown')
+               AND NOT EXISTS (
+                   SELECT 1 FROM execution newer
+                   WHERE newer.work_unit_id = execution.work_unit_id
+                     AND (newer.created_at > execution.created_at
+                          OR (newer.created_at = execution.created_at
+                              AND newer.id > execution.id))
+               )
                AND NOT EXISTS (
                    SELECT 1 FROM execution child
                    WHERE child.parent_execution_id = execution.id
@@ -898,8 +942,6 @@ impl ExecutionRepo for SqliteDb {
         if execution.status != ExecutionStatus::Running
             || !matches!(execution.actor_ref(), Some(ActorRef::Agent(_)))
             || execution.agent_id.as_deref() != execution.actor_ref().as_ref().map(ActorRef::id)
-            || (execution.role == "orchestrator")
-                != (execution.purpose == Some(ExecutionPurpose::Orchestrate))
             || !provider_start_event_matches_execution(
                 &attempt_event,
                 &execution,
@@ -996,9 +1038,17 @@ impl ExecutionRepo for SqliteDb {
             tx.commit().await?;
             return Ok(ProviderStartClaim::TaskCancelled);
         }
+        let task_dispatch_state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM task_dispatch WHERE task_id = ?")
+                .bind(&execution.task_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if matches!(task_dispatch_state.as_deref(), Some("paused" | "cancelled")) {
+            tx.commit().await?;
+            return Ok(ProviderStartClaim::TaskPaused);
+        }
 
-        let is_orchestrator = execution.role == "orchestrator"
-            && execution.purpose == Some(ExecutionPurpose::Orchestrate);
+        let is_orchestrator = execution.role == "orchestrator";
         if is_orchestrator {
             if execution.work_unit_id.is_some() || execution.workspace_id.is_some() {
                 tx.commit().await?;
@@ -1039,7 +1089,6 @@ impl ExecutionRepo for SqliteDb {
                     WHERE current_execution.id = ?
                       AND current_execution.task_id = wake.task_id
                       AND current_execution.role = 'orchestrator'
-                      AND current_execution.purpose = 'orchestrate'
                       AND current_execution.actor_kind = ?
                       AND current_execution.actor_id = ?
                       AND current_execution.agent_id = wake.actor_id

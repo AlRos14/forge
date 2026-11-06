@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use db::{CollaborationRepo, ExecutionPurpose, ExecutionRepo, ValidationRunRepo};
+use db::{CollaborationRepo, ExecutionRepo, ValidationRunRepo};
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -20,7 +20,7 @@ async fn exact_review_execution(state: &AppState, execution_id: &str) -> ApiResu
     let execution = ExecutionRepo::get_by_id(&*state.db, execution_id)
         .await?
         .ok_or_else(|| ApiError::not_found("review_execution", execution_id.to_owned()))?;
-    if execution.role != "reviewer" || execution.purpose != Some(ExecutionPurpose::Review) {
+    if execution.role != "reviewer" {
         return Err(ApiError::not_found(
             "review_execution",
             execution_id.to_owned(),

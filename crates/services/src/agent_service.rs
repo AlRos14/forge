@@ -707,7 +707,6 @@ mod tests {
                 task_id: task.id,
                 agent_id: Some(agent_id.to_owned()),
                 actor_ref: None,
-                purpose: None,
                 harness_session_id: None,
                 role: "coder".to_owned(),
                 status: ExecutionStatus::Running,

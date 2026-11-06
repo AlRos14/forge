@@ -10,11 +10,11 @@ use chrono::{DateTime, Duration, Utc};
 use db::{
     new_uuid_v4, now_rfc3339, ActorKind, ActorRef, AgentRepo, ClaimDomainEvents, CollaborationRepo,
     CollaborationTarget, CompleteDomainEvent, CoordinationMode, CreateOrchestratorWake,
-    DomainEvent, DomainEventRepo, ExecutionPurpose, ExecutionRepo, ExecutionStatus, GateRepo,
-    OrchestratorWake, OrchestratorWakeExecution, OrchestratorWakeRepo, OrchestratorWakeState,
-    PageRequest, ProposalTarget, ProposalTargetKind, RoleMembership, RoleMembershipRepo,
-    RoleMembershipStatus, SortBy, SortOrder, TaskRepo, TaskRole, TaskRoleRepo, WorkUnit,
-    WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo,
+    DomainEvent, DomainEventRepo, ExecutionRepo, ExecutionStatus, GateRepo, OrchestratorWake,
+    OrchestratorWakeExecution, OrchestratorWakeRepo, OrchestratorWakeState, PageRequest,
+    ProposalTarget, ProposalTargetKind, RoleMembership, RoleMembershipRepo, RoleMembershipStatus,
+    SortBy, SortOrder, TaskRepo, TaskRole, TaskRoleRepo, WorkUnit, WorkUnitRepo, WorkUnitStatus,
+    WorkUnitWorkspaceRepo, WorkspaceRepo,
 };
 use events::{EventBus, ForgeEvent};
 use serde_json::{json, Value};
@@ -106,6 +106,8 @@ enum OrchestratorAction {
         parent_work_unit_id: Option<String>,
         assigned_actor: Option<ActionActorRef>,
         requires_integration: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review_subject: Option<api_types::CreateWorkUnitReviewSubjectRequest>,
     },
     Proposal {
         target: ProposalTarget,
@@ -425,7 +427,7 @@ impl OrchestratorRuntime {
                     &event.event_type,
                     &event.scope_id,
                     &execution.task_id,
-                    execution.purpose,
+                    &execution.role,
                 ) {
                     return Ok(None);
                 }
@@ -1154,7 +1156,6 @@ impl OrchestratorRuntime {
             || execution.task_id != wake.task_id
             || execution.workspace_id.is_some()
             || execution.role != "orchestrator"
-            || execution.purpose != Some(ExecutionPurpose::Orchestrate)
             || execution.actor_ref() != Some(ActorRef::Agent(wake.actor_id.clone()))
         {
             self.make_uncertain(
@@ -1460,7 +1461,6 @@ impl OrchestratorRuntime {
                 "actor_kind": execution.actor_kind.map(|kind| kind.to_string()),
                 "actor_id": execution.actor_id,
                 "role": execution.role,
-                "purpose": execution.purpose.as_ref().map(|purpose| purpose.to_string()),
                 "status": execution.status.to_string(),
                 "work_unit_id": execution.work_unit_id,
                 "summary": execution.summary.as_deref().map(|value| truncate(value, 4096)),
@@ -1546,10 +1546,7 @@ impl OrchestratorRuntime {
         let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &event.entity_id).await? else {
             return Ok(false);
         };
-        if execution.purpose != Some(ExecutionPurpose::Orchestrate)
-            || execution.role != "orchestrator"
-            || execution.task_id != event.scope_id
-        {
+        if execution.role != "orchestrator" || execution.task_id != event.scope_id {
             return Ok(false);
         }
         let event_status_matches =
@@ -1955,6 +1952,7 @@ impl OrchestratorRuntime {
                     parent_work_unit_id,
                     assigned_actor,
                     requires_integration,
+                    review_subject,
                 } => {
                     if title.trim().is_empty()
                         || title.len() > 512
@@ -1962,6 +1960,10 @@ impl OrchestratorRuntime {
                         || scope.len() > 4096
                         || role.trim().is_empty()
                         || role.len() > 128
+                        || review_subject.as_ref().is_some_and(|subject| {
+                            subject.reviewed_work_unit_id.trim().is_empty()
+                                || subject.reviewed_work_unit_id.len() > 128
+                        })
                         || parent_work_unit_id
                             .as_ref()
                             .is_some_and(|id| id.trim().is_empty() || id.len() > 128)
@@ -1984,6 +1986,7 @@ impl OrchestratorRuntime {
                                 task_id: wake.task_id.clone(),
                                 title,
                                 scope,
+                                execution_instructions: None,
                                 role,
                                 parent_work_unit_id,
                                 assigned_actor: assigned_actor
@@ -1993,6 +1996,8 @@ impl OrchestratorRuntime {
                                 provenance: Some(db::WorkUnitProvenance::Actor(ActorRef::Agent(
                                     wake.actor_id.clone(),
                                 ))),
+                                review_subject: review_subject
+                                    .map(|subject| subject.reviewed_work_unit_id),
                             },
                             record.result_id.clone(),
                         )
@@ -2586,13 +2591,13 @@ fn execution_lifecycle_is_orchestrator_wake(
     event_type: &str,
     event_task_id: &str,
     execution_task_id: &str,
-    purpose: Option<ExecutionPurpose>,
+    role: &str,
 ) -> bool {
     matches!(
         event_type,
         "execution.started" | "execution.completed" | "execution.failed" | "execution.stalled"
     ) && event_task_id == execution_task_id
-        && purpose != Some(ExecutionPurpose::Orchestrate)
+        && role != "orchestrator"
 }
 
 fn event_is_authored_by_member(event: &DomainEvent, member: &RoleMembership) -> bool {
@@ -2720,6 +2725,30 @@ mod tests {
     async fn test_project(database: &Arc<db::SqliteDb>, owner_id: &str) -> String {
         let now = now_rfc3339();
         let id = new_uuid_v4();
+        let has_defaults: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'project_task_role_defaults')",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("Project defaults table lookup");
+        if !has_defaults {
+            sqlx::query(
+                "INSERT INTO project (
+                    id, name, settings, primary_repo_id, owner_id,
+                    project_hooks_json, project_work_epoch, version, created_at, updated_at
+                 ) VALUES (?, ?, '{}', NULL, ?, '[]', 0, 1, ?, ?)",
+            )
+            .bind(&id)
+            .bind("PR6 durable wake fixture")
+            .bind(owner_id)
+            .bind(&now)
+            .bind(&now)
+            .execute(database.pool())
+            .await
+            .expect("pre-cutover project creates");
+            return id;
+        }
         ProjectRepo::create(
             &**database,
             CreateProject {
@@ -3393,7 +3422,6 @@ mod tests {
                     .expect("admitted Execution loads")
                     .expect("admitted Execution exists");
                 assert_eq!(execution.role, "orchestrator");
-                assert_eq!(execution.purpose, Some(db::ExecutionPurpose::Orchestrate));
             }
             OrchestratorClaimMutation::ChangeTaskRolePolicy => {
                 let role = TaskRoleRepo::get_by_id(&*fixture.database, &fixture.role_id)
@@ -4343,8 +4371,7 @@ mod tests {
     #[tokio::test]
     async fn exact_failure_has_one_wake_after_retry_lifecycle_effect() {
         use db::{
-            CreateDomainEvent, CreateExecution, DomainEventRepo, ExecutionPurpose, ExecutionRepo,
-            ExecutionStatus,
+            CreateDomainEvent, CreateExecution, DomainEventRepo, ExecutionRepo, ExecutionStatus,
         };
 
         let pool = db::create_sqlite_pool("sqlite::memory:")
@@ -4377,7 +4404,6 @@ mod tests {
                 task_id: task_id.clone(),
                 agent_id: None,
                 actor_ref: Some(ActorRef::Human(human_id.clone())),
-                purpose: Some(ExecutionPurpose::Implement),
                 role: "implementer".to_owned(),
                 status: ExecutionStatus::Failed,
                 stop_reason: Some(db::StopReason::ExecutorFailed),
@@ -5098,7 +5124,6 @@ mod tests {
                 agent_id: Some(actor_id.clone()),
                 actor_ref: Some(ActorRef::Agent(actor_id.clone())),
                 role: "orchestrator".to_owned(),
-                purpose: Some(ExecutionPurpose::Orchestrate),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
                 stopped_by: None,
@@ -5624,6 +5649,7 @@ mod tests {
                 parent_work_unit_id: None,
                 title: "Exact orchestrator assignment".to_owned(),
                 scope: "One explicit orchestrator allocation".to_owned(),
+                execution_instructions: None,
                 role: "orchestrator".to_owned(),
                 assigned_actor: Some(ActorRef::Human(human_a.clone())),
                 requires_integration: false,
@@ -6033,7 +6059,6 @@ mod tests {
                 agent_id: Some(agent_id.clone()),
                 actor_ref: Some(ActorRef::Agent(agent_id.clone())),
                 role: "implementer".to_owned(),
-                purpose: Some(ExecutionPurpose::Implement),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
                 stopped_by: None,
@@ -6226,7 +6251,6 @@ mod tests {
         }
         let execution = orchestrator_execution.expect("fake Harness finishes the new Execution");
         assert_eq!(execution.role, "orchestrator");
-        assert_eq!(execution.purpose, Some(ExecutionPurpose::Orchestrate));
         assert_eq!(
             execution.actor_ref(),
             Some(ActorRef::Agent(agent_id.clone()))
@@ -6280,7 +6304,7 @@ mod tests {
             .expect("task exists");
         assert_eq!(task.lifecycle_state, db::TaskLifecycleState::Ready);
         let total_executions: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'orchestrator' AND purpose = 'orchestrate'",
+            "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'orchestrator'",
         )
         .bind(&task_id)
         .fetch_one(database.pool())
@@ -6402,6 +6426,7 @@ mod tests {
             parent_work_unit_id: None,
             title: "bounded".to_owned(),
             scope: "one scope".to_owned(),
+            execution_instructions: None,
             status: WorkUnitStatus::Open,
             role: "orchestrator".to_owned(),
             assigned_actor: Some(ActorRef::Agent("b".to_owned())),
@@ -6582,25 +6607,25 @@ mod tests {
             "execution.completed",
             "task-1",
             "task-1",
-            Some(ExecutionPurpose::Implement),
+            "implementer",
         ));
         assert!(!execution_lifecycle_is_orchestrator_wake(
             "execution.completed",
             "task-1",
             "task-1",
-            Some(ExecutionPurpose::Orchestrate),
+            "orchestrator",
         ));
         assert!(!execution_lifecycle_is_orchestrator_wake(
             "execution.log",
             "task-1",
             "task-1",
-            Some(ExecutionPurpose::Implement),
+            "implementer",
         ));
         assert!(!execution_lifecycle_is_orchestrator_wake(
             "execution.failed",
             "task-1",
             "task-2",
-            Some(ExecutionPurpose::Implement),
+            "implementer",
         ));
     }
 
@@ -6687,7 +6712,6 @@ mod tests {
             actor_kind: Some(ActorKind::Agent),
             actor_id: Some("agent-1".to_owned()),
             role: "implementer".to_owned(),
-            purpose: Some(ExecutionPurpose::Implement),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -6779,6 +6803,7 @@ mod tests {
             title: "follow-up".to_owned(),
             scope: "bounded scope".to_owned(),
             role: "implementer".to_owned(),
+            review_subject: None,
             parent_work_unit_id: None,
             assigned_actor: None,
             requires_integration: false,

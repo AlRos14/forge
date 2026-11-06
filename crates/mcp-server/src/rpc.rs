@@ -355,7 +355,11 @@ fn task_mutation_tool(tool_name: &str) -> bool {
         tool_name,
         "forge_create_sub_tasks"
             | "forge_update_task"
-            | "forge_start_execution"
+            | "forge_launch_task"
+            | "forge_pause_task"
+            | "forge_resume_task"
+            | "forge_cancel_task"
+            | "forge_request_rework"
             | "forge_add_task_dependency"
             | "forge_remove_task_dependency"
             | "forge_transition_task_lifecycle"
@@ -370,6 +374,7 @@ fn work_unit_mutation_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "forge_update_work_unit"
+            | "forge_submit_work_unit_review"
             | "forge_allocate_work_unit"
             | "forge_add_work_unit_dependency"
             | "forge_remove_work_unit_dependency"
@@ -396,7 +401,12 @@ fn task_scope_field(tool_name: &str) -> Option<&'static str> {
         | "forge_update_task"
         | "forge_get_task_diff"
         | "forge_list_executions"
-        | "forge_start_execution"
+        | "forge_get_task_dispatch"
+        | "forge_launch_task"
+        | "forge_pause_task"
+        | "forge_resume_task"
+        | "forge_cancel_task"
+        | "forge_request_rework"
         | "forge_add_task_dependency"
         | "forge_remove_task_dependency"
         | "forge_list_task_dependencies"
@@ -421,6 +431,7 @@ fn task_scope_field(tool_name: &str) -> Option<&'static str> {
 fn work_unit_scope_field(tool_name: &str) -> Option<&'static str> {
     match tool_name {
         "forge_get_work_unit"
+        | "forge_submit_work_unit_review"
         | "forge_update_work_unit"
         | "forge_allocate_work_unit"
         | "forge_list_work_unit_dependencies"

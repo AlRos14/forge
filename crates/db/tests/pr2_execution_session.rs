@@ -2,10 +2,10 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, run_migrations_from, ActorRef,
     AgentProfileRepo, AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile,
     CreateExecution, CreateHarnessSession, CreateProject, CreateRepo, CreateTask, CreateWorkspace,
-    DaemonRepo, DaemonStatus, DbError, ExecutionPurpose, ExecutionRepo, ExecutionStatus,
-    HarnessSessionRepo, HarnessSessionStatus, ProjectRepo, RepoRepo, SelectAgentProfile, SqliteDb,
-    TaskLifecycleState, TaskRepo, UpdateDaemonReport, UpdateExecution, UpdateHarnessSession,
-    UpsertDaemon, User, UserRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
+    DaemonRepo, DaemonStatus, DbError, ExecutionRepo, ExecutionStatus, HarnessSessionRepo,
+    HarnessSessionStatus, ProjectRepo, RepoRepo, SelectAgentProfile, SqliteDb, TaskLifecycleState,
+    TaskRepo, UpdateDaemonReport, UpdateExecution, UpdateHarnessSession, UpsertDaemon, User,
+    UserRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
 };
 use std::{
     fs,
@@ -444,7 +444,6 @@ fn execution_input(
     agent_id: &str,
     profile_id: &str,
     executor_type: &str,
-    purpose: ExecutionPurpose,
     workspace_id: Option<&str>,
     harness_session_id: Option<String>,
     _legacy_external_session_hint: Option<String>,
@@ -455,7 +454,6 @@ fn execution_input(
         agent_id: Some(agent_id.to_owned()),
         actor_ref: Some(ActorRef::Agent(agent_id.to_owned())),
         role: "coder".to_owned(),
-        purpose: Some(purpose),
         status: ExecutionStatus::Running,
         stop_reason: None,
         stopped_by: None,
@@ -527,7 +525,6 @@ async fn fresh_agent_execution_has_one_pending_session_and_atomic_result_project
             "pr2-agent-a",
             &profile_id,
             "codex",
-            ExecutionPurpose::Implement,
             None,
             None,
             None,
@@ -567,7 +564,6 @@ async fn fresh_agent_execution_has_one_pending_session_and_atomic_result_project
             "pr2-agent-a",
             &profile_id,
             "codex",
-            ExecutionPurpose::Implement,
             None,
             Some(session_id.clone()),
             None,
@@ -667,7 +663,6 @@ async fn profile_and_capability_changes_do_not_rewrite_an_active_session_snapsho
             "pr2-agent-capability-history",
             &profile_id,
             "codex",
-            ExecutionPurpose::Implement,
             None,
             None,
             None,
@@ -694,7 +689,6 @@ async fn profile_and_capability_changes_do_not_rewrite_an_active_session_snapsho
         "pr2-agent-capability-history",
         &profile_id,
         "codex",
-        ExecutionPurpose::Implement,
         None,
         Some(session_id.clone()),
         Some("capability-history-thread".to_owned()),
@@ -768,7 +762,6 @@ async fn non_session_executor_does_not_fabricate_pending_harness_session() {
             "pr2-agent-shell",
             &profile_id,
             "shell",
-            ExecutionPurpose::Implement,
             None,
             None,
             None,
@@ -797,7 +790,6 @@ async fn unresolved_ordered_fallback_does_not_create_speculative_session() {
         "pr2-agent-routed",
         &profile_id,
         "codex",
-        ExecutionPurpose::Implement,
         None,
         None,
         None,
@@ -850,7 +842,6 @@ async fn unresolved_route_result_cannot_bind_to_the_primary_candidate() {
         "pr2-agent-unresolved-result",
         &profile_id,
         "codex",
-        ExecutionPurpose::Implement,
         None,
         None,
         None,
@@ -906,7 +897,6 @@ async fn cross_harness_winner_cannot_materialize_under_a_different_agent_identit
         "pr2-agent-cross-route",
         &profile_id,
         "codex",
-        ExecutionPurpose::Implement,
         None,
         None,
         None,
@@ -985,7 +975,6 @@ async fn same_harness_fallback_snapshots_the_candidate_that_actually_ran() {
         "pr2-agent-same-route",
         &profile_id,
         "codex",
-        ExecutionPurpose::Implement,
         None,
         None,
         None,
@@ -1071,7 +1060,6 @@ async fn routed_sessionless_candidate_does_not_fabricate_continuity() {
         "pr2-agent-routed-shell",
         &profile_id,
         "shell",
-        ExecutionPurpose::Implement,
         None,
         None,
         None,
@@ -1161,7 +1149,6 @@ async fn human_execution_has_real_actor_and_no_agent_or_harness_session() {
             agent_id: None,
             actor_ref: Some(ActorRef::Human("pr2-human".to_owned())),
             role: "reviewer".to_owned(),
-            purpose: Some(ExecutionPurpose::Review),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -1208,7 +1195,6 @@ async fn human_execution_has_real_actor_and_no_agent_or_harness_session() {
                 agent_id: None,
                 actor_ref: Some(ActorRef::Human("human".to_owned())),
                 role: "reviewer".to_owned(),
-                purpose: Some(ExecutionPurpose::Review),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
                 stopped_by: None,
@@ -1248,7 +1234,6 @@ async fn purpose_is_independent_of_role_and_actor_change_cannot_reuse_session() 
             "pr2-agent-a",
             &profile_a,
             "codex",
-            ExecutionPurpose::Implement,
             None,
             None,
             None,
@@ -1264,7 +1249,6 @@ async fn purpose_is_independent_of_role_and_actor_change_cannot_reuse_session() 
             "pr2-agent-a",
             &profile_a,
             "codex",
-            ExecutionPurpose::Investigate,
             None,
             None,
             None,
@@ -1273,8 +1257,6 @@ async fn purpose_is_independent_of_role_and_actor_change_cannot_reuse_session() 
     .await
     .expect("second execution creates");
     assert_eq!(first.role, second.role);
-    assert_eq!(first.purpose, Some(ExecutionPurpose::Implement));
-    assert_eq!(second.purpose, Some(ExecutionPurpose::Investigate));
 
     let first = ExecutionRepo::record_harness_session_result(
         &db,
@@ -1302,7 +1284,6 @@ async fn purpose_is_independent_of_role_and_actor_change_cannot_reuse_session() 
             "pr2-agent-a",
             &profile_a,
             "codex",
-            ExecutionPurpose::General,
             None,
             Some(first_session.clone()),
             Some("shared-role-is-not-authority".to_owned()),
@@ -1323,7 +1304,6 @@ async fn purpose_is_independent_of_role_and_actor_change_cannot_reuse_session() 
             "pr2-agent-a",
             &profile_a,
             "codex",
-            ExecutionPurpose::General,
             None,
             None,
             Some("shared-role-is-not-authority".to_owned()),
@@ -1355,7 +1335,6 @@ async fn purpose_is_independent_of_role_and_actor_change_cannot_reuse_session() 
             "pr2-agent-b",
             &profile_b,
             "codex",
-            ExecutionPurpose::Implement,
             None,
             Some(first_session),
             None,
@@ -1371,7 +1350,7 @@ async fn execution_purpose_does_not_alias_permission_policy() {
     let db = database().await;
     let profile_id = seed_agent_with_policy(&db, "pr2-agent-permission", "codex", "auto").await;
     let task_id = seed_task(&db, "purpose-permission").await;
-    let execution = ExecutionRepo::create(
+    let _execution = ExecutionRepo::create(
         &db,
         execution_input(
             "pr2-execution-plan-purpose",
@@ -1379,7 +1358,6 @@ async fn execution_purpose_does_not_alias_permission_policy() {
             "pr2-agent-permission",
             &profile_id,
             "codex",
-            ExecutionPurpose::Plan,
             None,
             None,
             None,
@@ -1387,7 +1365,6 @@ async fn execution_purpose_does_not_alias_permission_policy() {
     )
     .await
     .expect("plan execution creates");
-    assert_eq!(execution.purpose, Some(ExecutionPurpose::Plan));
     let permission_policy: String =
         sqlx::query_scalar("SELECT permission_policy FROM agent_profile WHERE id = ?")
             .bind(&profile_id)
@@ -1411,7 +1388,6 @@ async fn workspace_scoped_session_is_not_reused_in_another_workspace() {
             "pr2-agent-workspace",
             &profile_id,
             "codex",
-            ExecutionPurpose::Implement,
             Some(&workspace_one),
             None,
             None,
@@ -1434,7 +1410,6 @@ async fn workspace_scoped_session_is_not_reused_in_another_workspace() {
         "pr2-agent-workspace",
         &profile_id,
         "codex",
-        ExecutionPurpose::Implement,
         Some(&workspace_two),
         Some(session_id),
         Some("workspace-thread".to_owned()),
@@ -1459,7 +1434,6 @@ async fn external_identity_is_scoped_by_agent_and_harness() {
             "pr2-agent-collision-a",
             &profile_a,
             "codex",
-            ExecutionPurpose::Implement,
             None,
             None,
             None,
@@ -1478,7 +1452,6 @@ async fn external_identity_is_scoped_by_agent_and_harness() {
             "pr2-agent-collision-b",
             &profile_b,
             "cursor",
-            ExecutionPurpose::Implement,
             None,
             None,
             None,
@@ -1499,7 +1472,6 @@ async fn external_identity_is_scoped_by_agent_and_harness() {
             "pr2-agent-collision-a",
             &profile_a,
             "cursor",
-            ExecutionPurpose::Implement,
             None,
             None,
             None,
@@ -1517,7 +1489,6 @@ async fn external_identity_is_scoped_by_agent_and_harness() {
             "pr2-agent-collision-a",
             &profile_a,
             "cursor",
-            ExecutionPurpose::Implement,
             None,
             a.harness_session_id.clone(),
             Some("abc".to_owned()),
@@ -1614,7 +1585,6 @@ async fn session_identity_and_execution_history_are_immutable_and_snapshotted() 
             "pr2-agent-immutable",
             &profile_id,
             "codex",
-            ExecutionPurpose::Implement,
             None,
             None,
             None,
@@ -1972,15 +1942,15 @@ async fn historical_session_migration_groups_only_coherent_identity() {
         .await
         .expect("second execution loads")
         .expect("second execution exists");
-    let planner = ExecutionRepo::get_by_id(&db, "pr2-history-planner")
+    let _planner = ExecutionRepo::get_by_id(&db, "pr2-history-planner")
         .await
         .expect("planner execution loads")
         .expect("planner execution exists");
-    let auditor = ExecutionRepo::get_by_id(&db, "pr2-history-auditor")
+    let _auditor = ExecutionRepo::get_by_id(&db, "pr2-history-auditor")
         .await
         .expect("auditor execution loads")
         .expect("auditor execution exists");
-    let unknown_role = ExecutionRepo::get_by_id(&db, "pr2-history-unknown-role")
+    let _unknown_role = ExecutionRepo::get_by_id(&db, "pr2-history-unknown-role")
         .await
         .expect("unknown-role execution loads")
         .expect("unknown-role execution exists");
@@ -2008,17 +1978,11 @@ async fn historical_session_migration_groups_only_coherent_identity() {
         first.actor_ref(),
         Some(ActorRef::Agent("pr2-history-a".to_owned()))
     );
-    assert_eq!(first.purpose, Some(ExecutionPurpose::Implement));
-    assert_eq!(second.purpose, Some(ExecutionPurpose::Review));
-    assert_eq!(planner.purpose, Some(ExecutionPurpose::Plan));
-    assert_eq!(auditor.purpose, Some(ExecutionPurpose::Review));
-    assert_eq!(unknown_role.purpose, Some(ExecutionPurpose::General));
     assert_eq!(first.harness_session_id, second.harness_session_id);
     assert_ne!(first.harness_session_id, other_agent.harness_session_id);
     assert_ne!(first.harness_session_id, other_harness.harness_session_id);
     assert_eq!(ambiguous.harness_session_id, None);
     assert_eq!(agentless.actor_ref(), None);
-    assert_eq!(agentless.purpose, Some(ExecutionPurpose::General));
     assert_eq!(sentinel.actor_ref(), None);
     assert_eq!(sentinel.harness_session_id, None);
     let issue_count: i64 = sqlx::query_scalar(

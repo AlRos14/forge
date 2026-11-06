@@ -296,7 +296,7 @@ impl OrchestratorWakeRepo for SqliteDb {
                 "SELECT EXISTS(
                     SELECT 1 FROM execution
                     WHERE id = ? AND role = 'orchestrator'
-                      AND purpose = 'orchestrate' AND status = 'running'
+                      AND role = 'orchestrator' AND status = 'running'
                 )",
             )
             .bind(&input.execution_id)

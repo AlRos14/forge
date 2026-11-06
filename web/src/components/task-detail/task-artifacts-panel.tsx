@@ -10,10 +10,8 @@ import type { ArtifactResponse, PaginatedResponse } from '@/types/generated'
 
 export function TaskArtifactsPanel({
   taskId,
-  onUseInNextExecution,
 }: {
   taskId: string
-  onUseInNextExecution: (artifactId: string) => void
 }) {
   const [expandedArtifactId, setExpandedArtifactId] = useState<string | null>(null)
   const artifactsQuery = useInfiniteQuery({
@@ -81,11 +79,6 @@ export function TaskArtifactsPanel({
                 >
                   {expandedArtifactId === artifact.id ? 'Hide content' : 'View content'}
                 </Button>
-                {artifact.kind === 'plan' ? (
-                  <Button size="sm" onClick={() => onUseInNextExecution(artifact.id)}>
-                    Use as Execution input
-                  </Button>
-                ) : null}
               </div>
             </div>
 

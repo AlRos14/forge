@@ -4,6 +4,7 @@ export const qk = {
   tasks: (projectId: string, filterKey: string) =>
     ['projects', projectId, 'tasks', filterKey] as const,
   task: (taskId: string) => ['tasks', taskId] as const,
+  taskDispatch: (taskId: string) => ['task-dispatch', taskId] as const,
   taskDiff: (taskId: string) => ['tasks', taskId, 'diff'] as const,
   taskDetail: (taskId: string) => ['tasks', taskId, 'detail'] as const,
   taskArtifacts: (taskId: string) => ['tasks', taskId, 'artifacts'] as const,

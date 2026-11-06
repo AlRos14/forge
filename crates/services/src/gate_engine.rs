@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use db::{
     new_uuid_v4, now_rfc3339, ActorKind, ActorRef, ArtifactKind, CollaborationRepo,
     CreateDomainEvent, CreateGate, CreateGatePolicyRevision, DecisionOutcome, DomainEvent,
-    ExecutionPurpose, ExecutionRepo, ExecutionStatus, Gate, GateEvaluation, GateEvaluationInput,
+    ExecutionRepo, ExecutionStatus, Gate, GateEvaluation, GateEvaluationInput,
     GateEvaluationOutcome, GateEvaluationWrite, GatePolicyRevision, GateRepo, GateScopeKind,
     ProposalStatus, RoleMembershipRepo, RoleMembershipStatus, SqliteDb,
     TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskLifecycleRepo,
@@ -114,6 +114,21 @@ pub struct ReviewSubjectExpectation {
     pub workspace_id: Option<String>,
     pub base_commit_sha: Option<String>,
     pub head_commit_sha: Option<String>,
+    pub workspace_snapshot_digest: Option<String>,
+    /// Exact delivered result; distinct from the reviewer's own Workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_result: Option<ReviewedResultExpectation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedResultExpectation {
+    pub work_unit_id: String,
+    pub work_unit_version: i64,
+    pub execution_id: String,
+    pub artifact_id: Option<String>,
+    pub commit_sha: Option<String>,
+    pub workspace_id: Option<String>,
     pub workspace_snapshot_digest: Option<String>,
 }
 
@@ -1057,6 +1072,66 @@ impl GateEngine {
                 .unwrap_or(Value::Null);
             let verdict = content.get("verdict").and_then(Value::as_str).unwrap_or("");
             let subject = content.get("subject").cloned().unwrap_or(Value::Null);
+            let delivered = match execution.work_unit_id.as_deref() {
+                Some(id) => crate::task_rework::get_review_subject(&self.db, id).await?,
+                None => None,
+            };
+            let delivered_attempt = match delivered
+                .as_ref()
+                .and_then(|s| s.result_execution_id.as_deref())
+            {
+                Some(id) => ExecutionRepo::get_by_id(&*self.db, id).await?,
+                None => None,
+            };
+            let delivered_is_exact = match delivered.as_ref() {
+                Some(result) => delivered_attempt.as_ref().is_some_and(|attempt| {
+                    attempt.task_id == gate.task_id
+                        && attempt.work_unit_id.as_deref()
+                            == Some(result.reviewed_work_unit_id.as_str())
+                        && attempt.work_unit_version == result.reviewed_work_unit_version
+                        && attempt.status == ExecutionStatus::Completed
+                        && attempt.after_sha == result.result_commit_sha
+                        && attempt.workspace_id == result.result_workspace_id
+                        && (attempt.workspace_id.is_none()
+                            || result.workspace_snapshot_digest.is_some())
+                        && subject.get("reviewed_work_unit_id").and_then(Value::as_str)
+                            == Some(result.reviewed_work_unit_id.as_str())
+                        && subject
+                            .get("reviewed_work_unit_version")
+                            .and_then(Value::as_i64)
+                            == result.reviewed_work_unit_version
+                        && subject.get("reviewed_result")
+                            == Some(&serde_json::json!({
+                                "execution_id": result.result_execution_id,
+                                "artifact_id": result.result_artifact_id,
+                                "commit_sha": result.result_commit_sha,
+                                "workspace_id": result.result_workspace_id,
+                                "workspace_snapshot_digest": result.workspace_snapshot_digest,
+                            }))
+                }),
+                None => {
+                    execution.work_unit_id.is_none() && subject.get("reviewed_result").is_none()
+                }
+            };
+            let delivered_pin_matches =
+                candidate
+                    .subject
+                    .reviewed_result
+                    .as_ref()
+                    .is_none_or(|expected| {
+                        delivered.as_ref().is_some_and(|actual| {
+                            actual.reviewed_work_unit_id == expected.work_unit_id
+                                && actual.reviewed_work_unit_version
+                                    == Some(expected.work_unit_version)
+                                && actual.result_execution_id.as_deref()
+                                    == Some(expected.execution_id.as_str())
+                                && actual.result_artifact_id == expected.artifact_id
+                                && actual.result_commit_sha == expected.commit_sha
+                                && actual.result_workspace_id == expected.workspace_id
+                                && actual.workspace_snapshot_digest
+                                    == expected.workspace_snapshot_digest
+                        })
+                    });
             let subject_matches = subject.get("task_id").and_then(Value::as_str)
                 == Some(gate.task_id.as_str())
                 && subject.get("review_execution_id").and_then(Value::as_str)
@@ -1070,7 +1145,9 @@ impl GateEngine {
                 && subject
                     .get("workspace_snapshot_digest")
                     .and_then(Value::as_str)
-                    == candidate.subject.workspace_snapshot_digest.as_deref();
+                    == candidate.subject.workspace_snapshot_digest.as_deref()
+                && delivered_is_exact
+                && delivered_pin_matches;
             let actor_ok = execution.actor_ref().as_ref() == Some(producer_actor)
                 && candidate
                     .expected_actor
@@ -1092,6 +1169,17 @@ impl GateEngine {
                     .iter()
                     .find(|unit| unit.work_unit_id == gate.scope_id)
                     .is_some_and(|unit| {
+                        if let Some(result) = delivered.as_ref() {
+                            return result.reviewed_work_unit_id == gate.scope_id
+                                && result
+                                    .reviewed_work_unit_version
+                                    .and_then(|version| version.checked_add(1))
+                                    == Some(unit.version)
+                                && result.result_execution_id.as_deref()
+                                    == Some(unit.execution_id.as_str())
+                                && result.result_commit_sha.as_deref()
+                                    == Some(unit.execution_result_sha.as_str());
+                        }
                         // The immutable Execution is admitted against the open
                         // WorkUnit version. Completing that WorkUnit advances
                         // its aggregate version once, so the exact producer
@@ -1113,7 +1201,6 @@ impl GateEngine {
                 });
             let producer_ok = execution.task_id == gate.task_id
                 && execution.role == "reviewer"
-                && execution.purpose == Some(ExecutionPurpose::Review)
                 && execution.status == ExecutionStatus::Completed
                 && actor_kind_ok
                 && actor_ok
@@ -2006,7 +2093,6 @@ mod tests {
                 agent_id: None,
                 actor_ref: Some(actor.clone()),
                 role: "reviewer".to_owned(),
-                purpose: Some(ExecutionPurpose::Review),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
                 stopped_by: None,
@@ -2530,6 +2616,7 @@ mod tests {
                 parent_work_unit_id: None,
                 title: "Implement exact unit".to_owned(),
                 scope: "One bounded change".to_owned(),
+                execution_instructions: None,
                 role: "implementer".to_owned(),
                 assigned_actor: Some(actor.clone()),
                 requires_integration: false,
@@ -2558,7 +2645,6 @@ mod tests {
                     agent_id: None,
                     actor_ref: Some(actor),
                     role: "implementer".to_owned(),
-                    purpose: Some(ExecutionPurpose::Implement),
                     status: ExecutionStatus::Running,
                     stop_reason: None,
                     stopped_by: None,
@@ -2928,6 +3014,7 @@ mod tests {
                 base_commit_sha: None,
                 head_commit_sha: None,
                 workspace_snapshot_digest: None,
+                reviewed_result: None,
             },
         }
     }

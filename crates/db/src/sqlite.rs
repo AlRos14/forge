@@ -235,6 +235,9 @@ pub(super) fn work_unit_execution_admission_error(error: &sqlx::Error) -> Option
     };
     match database_error.message() {
         "FORGE_WU_ADMISSION_AGENT_AT_CAPACITY" => Some(DbError::AgentAtCapacity),
+        "FORGE_WU_ADMISSION_TASK_AT_CAPACITY" => Some(DbError::TaskAtCapacity),
+        "FORGE_WU_ADMISSION_TASK_PAUSED" => Some(DbError::TaskDispatchPaused),
+        "FORGE_WU_ADMISSION_RECOVERY_PENDING" => Some(DbError::WorkUnitRecoveryPending),
         "FORGE_WU_ADMISSION_AGENT_MISSING" | "FORGE_WU_ADMISSION_WORK_UNIT_MISSING" => {
             Some(DbError::NotFound)
         }
@@ -468,10 +471,6 @@ fn map_execution(row: SqliteRow) -> Result<Execution> {
             .transpose()?,
         actor_id: row.try_get("actor_id")?,
         role: row.try_get::<String, _>("role")?,
-        purpose: row
-            .try_get::<Option<String>, _>("purpose")?
-            .map(parse_enum)
-            .transpose()?,
         status: parse_enum(row.try_get::<String, _>("status")?)?,
         stop_reason: row
             .try_get::<Option<String>, _>("stop_reason")?
@@ -657,11 +656,6 @@ impl SqliteDb {
                 ));
             }
         }
-        if input.actor_ref.is_some() && input.purpose.is_none() {
-            return Err(DbError::Check(
-                "new Execution writes require an explicit purpose".to_owned(),
-            ));
-        }
         if input.actor_ref.is_some() {
             let explicitly_supplied_harness_session = input.harness_session_id.is_some();
             if let Some(session_id) =
@@ -680,7 +674,7 @@ impl SqliteDb {
         let resume_policy = input.resume_policy.as_ref().map(ToString::to_string);
         let prompt = input.summary.as_deref();
         sqlx::query(
-            "INSERT INTO execution (id, task_id, agent_id, actor_kind, actor_id, role, purpose, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, harness_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, work_unit_id, work_unit_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO execution (id, task_id, agent_id, actor_kind, actor_id, role, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, harness_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, work_unit_id, work_unit_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.task_id)
@@ -688,7 +682,6 @@ impl SqliteDb {
         .bind(actor_kind.map(|value| value.to_string()))
         .bind(actor_id.as_deref())
         .bind(&input.role)
-        .bind(input.purpose.as_ref().map(ToString::to_string))
         .bind(input.status.to_string())
         .bind(stop_reason.as_deref())
         .bind(input.stopped_by.as_deref())

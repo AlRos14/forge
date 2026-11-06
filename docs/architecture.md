@@ -18,7 +18,8 @@ Project
     ├── WorkUnit*
     ├── Execution*
     │   ├── Actor
-    │   ├── Role and Purpose
+    │   ├── Role
+    │   ├── WorkUnit?
     │   ├── HarnessSession?
     │   └── Workspace?
     ├── ReviewReport / Artifact*
@@ -36,13 +37,12 @@ the Project template changes. Human defaults require current Project
 membership; Agent defaults require ownership by the canonical Project owner,
 so global discovery does not create cross-account execution authority.
 
-An Execution records one Actor, Role, Purpose, and Task, with an explicit WorkUnit, Workspace, and HarnessSession when applicable. Parent Execution records lineage; it does not grant authority or imply session reuse. Execution identity and configuration snapshots are historical.
+An Execution records one Actor, Role, and Task, with an explicit WorkUnit, Workspace, and HarnessSession when applicable. Execution purpose is retired; historical purpose values remain migration evidence only. Parent Execution records lineage; it does not grant authority or imply session reuse. Execution identity and configuration snapshots are historical.
 
 Tasks have no classification or Task-level repository access mode. An Agent
 that passes the current TaskRole, ownership, and WorkspaceLease checks receives
-the `repository_write` capability for its repository WorkUnit. Task purpose
-continues to describe the work being performed; it does not select repository
-capability.
+the `repository_write` capability for its repository WorkUnit. Task instructions
+describe the intended outcome; they do not select repository capability.
 
 ## Authority and lifecycle
 
@@ -76,13 +76,15 @@ A repository WorkUnit that requires integration receives its exact isolated Work
 
 A non-repository WorkUnit may have no Workspace and no WorkspaceLease. The current Agent path requires an online embedded host and a supported local CLI adapter. Unsupported remote daemon/provider combinations are rejected before the Execution enters `running`. This path is not a general remote no-Workspace execution feature.
 
-Dependencies form a same-Task directed acyclic graph. Readiness is derived from WorkUnit state, dependencies, Execution results, workspace state, and integration outcomes. A Task transition or completed Execution does not silently complete or integrate a WorkUnit.
+Dependencies form a same-Task directed acyclic graph. Readiness is derived from WorkUnit state, dependencies, Execution results, workspace state, and integration outcomes. A Task transition or completed Execution does not silently complete or integrate a WorkUnit. An open WorkUnit with a completed result is `awaiting_acceptance` and receives no automatic retry until that result is accepted or the unit is cancelled.
+
+Task dispatch is a durable intent owned by TaskLifecycle authority. An authenticated launch binds the exact Task and TaskLifecycle versions and an idempotency key. The TaskDispatcher admits exact assigned Agent WorkUnits while the intent is `running`; pause blocks new admissions and provider starts, and resume dispatches currently ready units. A Human-assigned WorkUnit is pending human work with no synthetic Execution. A bounded rework operation over an exact request-changes ReviewReport creates correction plus new review units and consumes one per-Task round atomically.
 
 ## Review, validation, and Gates
 
-Formal review is an Execution under Role `reviewer` and Purpose `review`. Its ReviewReport is an Artifact with exact Execution provenance. Review judgment remains distinct from deterministic checks.
+Formal review is an Execution under Role `reviewer`. Its ReviewReport is an Artifact with exact Execution provenance. Review judgment remains distinct from deterministic checks.
 
-A ValidationRun represents a deterministic command or check and its exact workspace, commit, status, output, and Evidence. In this implementation snapshot the public REST, MCP, CLI, and web surfaces expose ValidationRuns for reading; they do not expose a command to start one. An Agent Execution with Purpose `validate` is cognitive investigation, not deterministic validation evidence.
+A ValidationRun represents a deterministic command or check and its exact workspace, commit, status, output, and Evidence. In this implementation snapshot the public REST, MCP, CLI, and web surfaces expose ValidationRuns for reading; they do not expose a command to start one. Agent validation-related cognition is ordinary WorkUnit work, not deterministic validation evidence.
 
 A Gate is a deterministic policy over exact durable records. Its immutable GateEvaluation records the exact policy revision, inputs, and outcome. A Gate does not run a test, perform a review, integrate a WorkUnit, or merge a Repo. Lifecycle transitions and merge admission use the exact current evaluation where required.
 

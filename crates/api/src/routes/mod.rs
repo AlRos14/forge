@@ -44,8 +44,11 @@ pub mod providers;
 pub mod repos;
 pub mod reviews;
 pub mod settings;
+pub mod task_dispatch;
+pub mod task_rework;
 pub mod tasks;
 pub mod terminals;
+pub mod work_unit_reviews;
 pub mod work_units;
 pub mod workspaces;
 
@@ -402,7 +405,6 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
         task_id: execution.task_id,
         actor_ref,
         role: execution.role,
-        purpose: execution.purpose.map(execution_purpose_response),
         status: execution_status_response(execution.status),
         parent_execution_id: execution.parent_execution_id,
         harness_session_id: execution.harness_session_id,
@@ -420,22 +422,12 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
             .executor_config_snapshot_json
             .map(parse_json_value),
         workspace_id: execution.workspace_id,
+        work_unit_id: execution.work_unit_id,
+        work_unit_version: execution.work_unit_version,
         usage: None,
         account_usage: None,
         created_at: execution.created_at,
         updated_at: execution.updated_at,
-    }
-}
-
-fn execution_purpose_response(purpose: db::ExecutionPurpose) -> api_types::ExecutionPurpose {
-    match purpose {
-        db::ExecutionPurpose::Plan => api_types::ExecutionPurpose::Plan,
-        db::ExecutionPurpose::Implement => api_types::ExecutionPurpose::Implement,
-        db::ExecutionPurpose::Review => api_types::ExecutionPurpose::Review,
-        db::ExecutionPurpose::Validate => api_types::ExecutionPurpose::Validate,
-        db::ExecutionPurpose::Investigate => api_types::ExecutionPurpose::Investigate,
-        db::ExecutionPurpose::Orchestrate => api_types::ExecutionPurpose::Orchestrate,
-        db::ExecutionPurpose::General => api_types::ExecutionPurpose::General,
     }
 }
 

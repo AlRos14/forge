@@ -1,5 +1,7 @@
 use super::*;
+use crate::CreateWorkUnitReviewSubject;
 use crate::FollowUpExecutionReceipt;
+use sqlx::Column;
 
 fn validate_blocking_metadata_execution_identity(
     error_annotation: Option<&str>,
@@ -193,12 +195,22 @@ fn provenance_columns(
 }
 
 fn map_work_unit(row: SqliteRow) -> Result<WorkUnit> {
+    let execution_instructions = if row
+        .columns()
+        .iter()
+        .any(|column| column.name() == "execution_instructions")
+    {
+        row.try_get("execution_instructions")?
+    } else {
+        None
+    };
     Ok(WorkUnit {
         id: row.try_get("id")?,
         task_id: row.try_get("task_id")?,
         parent_work_unit_id: row.try_get("parent_work_unit_id")?,
         title: row.try_get("title")?,
         scope: row.try_get("scope")?,
+        execution_instructions,
         status: parse_enum(row.try_get::<String, _>("status")?)?,
         role: row.try_get("role")?,
         assigned_actor: actor_from_columns(
@@ -392,6 +404,105 @@ fn work_unit_write_error(error: sqlx::Error) -> DbError {
     check_error(error)
 }
 
+async fn create_work_unit_row(
+    db: &SqliteDb,
+    input: CreateWorkUnit,
+    subject: Option<CreateWorkUnitReviewSubject>,
+    event_input: CreateDomainEvent,
+) -> Result<CollaborationWrite<WorkUnit>> {
+    let (assigned_kind, assigned_id) = actor_columns(input.assigned_actor.as_ref());
+    let (provenance_kind, provenance_id, provenance_actor_kind) =
+        provenance_columns(input.provenance.as_ref());
+    let created_kind = input.created_by.kind().to_string();
+    let created_id = input.created_by.id().to_owned();
+    let now = input.created_at.clone();
+    let mut tx = db.pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO work_unit (
+                id, task_id, parent_work_unit_id, title, scope, status, role,
+                assigned_actor_kind, assigned_actor_id, requires_integration,
+                provenance_kind, provenance_id, provenance_actor_kind,
+                created_by_kind, created_by_id,
+                version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+    )
+    .bind(&input.id)
+    .bind(&input.task_id)
+    .bind(input.parent_work_unit_id.as_deref())
+    .bind(&input.title)
+    .bind(&input.scope)
+    .bind(&input.role)
+    .bind(assigned_kind.as_deref())
+    .bind(assigned_id.as_deref())
+    .bind(i64::from(input.requires_integration))
+    .bind(provenance_kind.as_deref())
+    .bind(provenance_id.as_deref())
+    .bind(provenance_actor_kind.as_deref())
+    .bind(&created_kind)
+    .bind(&created_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .map_err(work_unit_write_error)?;
+    if let Some(execution_instructions) = input.execution_instructions.as_deref() {
+        sqlx::query("UPDATE work_unit SET execution_instructions = ? WHERE id = ? AND task_id = ?")
+            .bind(execution_instructions)
+            .bind(&input.id)
+            .bind(&input.task_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(work_unit_write_error)?;
+    }
+    if let Some(subject) = subject {
+        if subject.review_work_unit_id != input.id || subject.task_id != input.task_id {
+            return Err(DbError::Check(
+                "review subject identity must match the new WorkUnit and Task".to_owned(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO work_unit_review_subject (
+                    review_work_unit_id, task_id, reviewed_work_unit_id,
+                    reviewed_work_unit_version, result_execution_id, result_artifact_id,
+                    result_commit_sha, result_workspace_id, workspace_snapshot_digest, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&subject.review_work_unit_id)
+        .bind(&subject.task_id)
+        .bind(&subject.reviewed_work_unit_id)
+        .bind(subject.reviewed_work_unit_version)
+        .bind(&subject.result_execution_id)
+        .bind(&subject.result_artifact_id)
+        .bind(&subject.result_commit_sha)
+        .bind(&subject.result_workspace_id)
+        .bind(&subject.workspace_snapshot_digest)
+        .bind(&subject.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(work_unit_write_error)?;
+    }
+    let event = append_event(db, &mut tx, &event_input).await?;
+    let record = WorkUnit {
+        id: input.id,
+        task_id: input.task_id,
+        parent_work_unit_id: input.parent_work_unit_id,
+        title: input.title,
+        scope: input.scope,
+        execution_instructions: input.execution_instructions,
+        status: WorkUnitStatus::Open,
+        role: input.role,
+        assigned_actor: input.assigned_actor,
+        requires_integration: input.requires_integration,
+        provenance: input.provenance,
+        created_by: input.created_by,
+        version: 1,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    tx.commit().await?;
+    Ok(CollaborationWrite { record, event })
+}
+
 #[async_trait]
 impl WorkUnitRepo for SqliteDb {
     async fn create(
@@ -399,49 +510,16 @@ impl WorkUnitRepo for SqliteDb {
         input: CreateWorkUnit,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<WorkUnit>> {
-        let (assigned_kind, assigned_id) = actor_columns(input.assigned_actor.as_ref());
-        let (provenance_kind, provenance_id, provenance_actor_kind) =
-            provenance_columns(input.provenance.as_ref());
-        let created_kind = input.created_by.kind().to_string();
-        let created_id = input.created_by.id().to_owned();
-        let now = input.created_at.clone();
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO work_unit (
-                id, task_id, parent_work_unit_id, title, scope, status, role,
-                assigned_actor_kind, assigned_actor_id, requires_integration,
-                provenance_kind, provenance_id, provenance_actor_kind,
-                created_by_kind, created_by_id,
-                version, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
-        )
-        .bind(&input.id)
-        .bind(&input.task_id)
-        .bind(input.parent_work_unit_id.as_deref())
-        .bind(&input.title)
-        .bind(&input.scope)
-        .bind(&input.role)
-        .bind(assigned_kind.as_deref())
-        .bind(assigned_id.as_deref())
-        .bind(i64::from(input.requires_integration))
-        .bind(provenance_kind.as_deref())
-        .bind(provenance_id.as_deref())
-        .bind(provenance_actor_kind.as_deref())
-        .bind(&created_kind)
-        .bind(&created_id)
-        .bind(&now)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await
-        .map_err(work_unit_write_error)?;
-        let event = append_event(self, &mut tx, &event).await?;
-        let row = sqlx::query("SELECT * FROM work_unit WHERE id = ?")
-            .bind(&input.id)
-            .fetch_one(&mut *tx)
-            .await?;
-        let record = map_work_unit(row)?;
-        tx.commit().await?;
-        Ok(CollaborationWrite { record, event })
+        create_work_unit_row(self, input, None, event).await
+    }
+
+    async fn create_with_review_subject(
+        &self,
+        input: CreateWorkUnit,
+        subject: CreateWorkUnitReviewSubject,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnit>> {
+        create_work_unit_row(self, input, Some(subject), event).await
     }
 
     async fn get_task_id(&self, id: &str) -> Result<Option<String>> {
@@ -492,6 +570,10 @@ impl WorkUnitRepo for SqliteDb {
         }
         let title = input.title.as_deref().unwrap_or(&current.title);
         let scope = input.scope.as_deref().unwrap_or(&current.scope);
+        let execution_instructions = input
+            .execution_instructions
+            .as_ref()
+            .unwrap_or(&current.execution_instructions);
         let parent_id = input
             .parent_work_unit_id
             .as_ref()
@@ -500,12 +582,14 @@ impl WorkUnitRepo for SqliteDb {
             .requires_integration
             .unwrap_or(current.requires_integration);
         let result = sqlx::query(
-            "UPDATE work_unit SET title = ?, scope = ?, parent_work_unit_id = ?,
-                 requires_integration = ?, version = version + 1, updated_at = ?
+            "UPDATE work_unit SET title = ?, scope = ?, execution_instructions = ?,
+                 parent_work_unit_id = ?, requires_integration = ?,
+                 version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND status = 'open'",
         )
         .bind(title)
         .bind(scope)
+        .bind(execution_instructions.as_deref())
         .bind(parent_id.as_deref())
         .bind(i64::from(requires_integration))
         .bind(&input.updated_at)
@@ -961,7 +1045,7 @@ impl WorkUnitExecutionRepo for SqliteDb {
             }
         }
         if admission.execution.status != ExecutionStatus::Running
-            || admission.execution.purpose.is_none()
+            || admission.execution.actor_ref.is_none()
             || execution_event_input.event_type != "execution.started"
             || execution_event_input.entity_type != "execution"
             || execution_event_input.entity_id != admission.execution.id

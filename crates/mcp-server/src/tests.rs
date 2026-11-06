@@ -4,10 +4,10 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, Agent, AgentRepo, AgentStatus,
     CreateAgent, CreateExecution, CreateProject, CreateProjectMember, CreateRepo,
     CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkspace, DaemonRepo, DaemonStatus,
-    ExecutionPurpose, ExecutionRepo, ExecutionStatus, ProjectMemberRepo, ProjectRepo, RepoRepo,
-    RoleMembershipRepo, RoleMembershipStatus, SqliteDb, Task, TaskRepo, TaskRoleRepo,
-    UpdateDaemonReport, UpdateProject, UpdateTask, UpsertDaemon, User, UserRepo, ValidationRunRepo,
-    WorkspaceRepo, WorkspaceStatus,
+    ExecutionRepo, ExecutionStatus, ProjectMemberRepo, ProjectRepo, RepoRepo, RoleMembershipRepo,
+    RoleMembershipStatus, SqliteDb, Task, TaskRepo, TaskRoleRepo, UpdateDaemonReport,
+    UpdateProject, UpdateTask, UpsertDaemon, User, UserRepo, ValidationRunRepo, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use events::EventBus;
 use serde_json::{json, Value};
@@ -382,7 +382,6 @@ async fn seed_execution(state: &AppState, task_id: String) -> String {
             task_id,
             agent_id: None,
             actor_ref: None,
-            purpose: None,
             harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Running,
@@ -421,7 +420,6 @@ async fn seed_task_with_legacy_resume_hint(state: &AppState, ambiguous_history: 
             task_id: task.id.clone(),
             agent_id: Some(agent.id.clone()),
             actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
-            purpose: Some(ExecutionPurpose::Implement),
             harness_session_id: None,
             role: "implementer".to_owned(),
             status: ExecutionStatus::Failed,
@@ -832,7 +830,12 @@ fn tools_list_returns_descriptors() {
             "forge_evaluate_gate",
             "forge_transition_task_lifecycle",
             "forge_transition_work_unit",
-            "forge_start_execution",
+            "forge_get_task_dispatch",
+            "forge_launch_task",
+            "forge_pause_task",
+            "forge_resume_task",
+            "forge_cancel_task",
+            "forge_request_rework",
             "forge_update_project",
             "forge_update_project_hooks",
             "forge_update_task",
@@ -958,7 +961,6 @@ fn mcp_execution_output_exposes_pr2_authority_fields() {
                 task_id: task.id.clone(),
                 agent_id: Some(agent.id.clone()),
                 actor_ref: Some(db::ActorRef::Agent(agent.id.clone())),
-                purpose: Some(ExecutionPurpose::Investigate),
                 harness_session_id: None,
                 role: "implementer".to_owned(),
                 status: ExecutionStatus::Running,
@@ -999,7 +1001,7 @@ fn mcp_execution_output_exposes_pr2_authority_fields() {
             execution["actor_ref"],
             json!({"kind": "agent", "id": agent.id})
         );
-        assert_eq!(execution["purpose"], "investigate");
+        assert!(execution["work_unit_id"].is_null());
         assert!(execution["harness_session_id"].is_null());
     });
 }
@@ -1797,17 +1799,16 @@ fn user_scoped_mcp_isolates_projects_and_derived_resources() {
         let error = call_tool_error_as(
             &state,
             &user_a,
-            "forge_start_execution",
+            "forge_launch_task",
             json!({
-                "work_unit_id": "foreign-work-unit",
-                "expected_work_unit_version": 1,
-                "agent_id": agent_b,
-                "purpose": "implement",
-                "prompt": "must not use another user's private Agent"
+                "task_id": task_b.id,
+                "expected_task_version": 1,
+                "expected_lifecycle_version": 1,
+                "idempotency_key": "foreign-task-launch"
             }),
         )
         .await;
-        assert_eq!(error.code, -32602);
+        assert_eq!(error.code, -32001);
         let execution_a = seed_execution(&state, task_a.id.clone()).await;
         let error = call_tool_error_as(
             &state,
@@ -2770,7 +2771,12 @@ fn mcp_project_copilot_lists_only_delegated_management_tools() {
             assert!(names.contains(&name), "Copilot list includes {name}");
         }
         for name in [
-            "forge_start_execution",
+            "forge_get_task_dispatch",
+            "forge_launch_task",
+            "forge_pause_task",
+            "forge_resume_task",
+            "forge_cancel_task",
+            "forge_request_rework",
             "forge_list_agents",
             "forge_list_agent_profiles",
             "forge_transition_work_unit",
@@ -2836,7 +2842,7 @@ fn mcp_project_copilot_lists_only_delegated_management_tools() {
         );
 
         for (name, arguments) in [
-            ("forge_start_execution", json!({"work_unit_id":"wu-1"})),
+            ("forge_launch_task", json!({"task_id":"task-1"})),
             ("forge_list_agents", json!({"limit":10})),
             (
                 "forge_list_agent_profiles",

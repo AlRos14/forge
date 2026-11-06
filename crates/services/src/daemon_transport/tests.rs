@@ -175,7 +175,6 @@ async fn seed_running_execution(
             task_id,
             agent_id: Some(agent_id.clone()),
             actor_ref: None,
-            purpose: None,
             harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Running,

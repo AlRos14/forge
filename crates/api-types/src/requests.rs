@@ -2,11 +2,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
+use crate::project_hooks::{parse_project_hooks_json, ProjectHookRule};
 use crate::WorkMode;
-use crate::{
-    project_hooks::{parse_project_hooks_json, ProjectHookRule},
-    ExecutionPurpose,
-};
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
@@ -59,22 +56,9 @@ pub struct ClaimTaskRequest {
     pub overrides: Option<ClaimOverrides>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(deny_unknown_fields)]
-#[ts(export)]
-pub struct StartExecutionRequest {
-    pub work_unit_id: String,
-    pub expected_work_unit_version: i64,
-    pub purpose: ExecutionPurpose,
-    pub prompt: String,
-    #[serde(default)]
-    pub input_artifact_ids: Vec<String>,
-    pub overrides: Option<ExecutionOverridesRequest>,
-}
-
 pub type ExecutionOverridesRequest = ClaimOverrides;
 
-#[derive(Debug, Clone, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 #[ts(export)]
 pub struct FollowUpRequest {

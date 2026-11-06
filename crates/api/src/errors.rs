@@ -535,6 +535,18 @@ impl From<DbError> for ApiError {
                 message: "agent is at capacity".to_owned(),
                 details: None,
             },
+            DbError::TaskAtCapacity => Self::conflict_with_code(
+                "task_at_capacity",
+                "Task has reached its automatic Execution capacity",
+            ),
+            DbError::TaskDispatchPaused => Self::conflict_with_code(
+                "task_dispatch_paused",
+                "Task dispatch is paused or cancelled",
+            ),
+            DbError::WorkUnitRecoveryPending => Self::conflict_with_code(
+                "work_unit_recovery_pending",
+                "WorkUnit must resolve its exact interrupted Execution before fresh admission",
+            ),
             DbError::AgentPaused { agent_id } => Self::conflict_with_code(
                 "agent_paused",
                 format!("agent {agent_id} is paused and cannot accept new work"),
@@ -642,6 +654,11 @@ mod tests {
                 DbError::WorkUnitExecutionAlreadyRunning,
                 StatusCode::CONFLICT,
                 "work_unit_execution_running",
+            ),
+            (
+                DbError::WorkUnitRecoveryPending,
+                StatusCode::CONFLICT,
+                "work_unit_recovery_pending",
             ),
         ];
         for (db_error, status, code) in cases {

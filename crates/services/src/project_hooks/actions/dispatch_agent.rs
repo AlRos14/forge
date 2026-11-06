@@ -1,5 +1,5 @@
 use api_types::ActorRef;
-use db::{AgentRepo, CoordinationMode, ExecutionPurpose, ProjectHookRunStatus};
+use db::{AgentRepo, CoordinationMode, ProjectHookRunStatus};
 use serde_json::Value;
 
 use crate::{
@@ -82,13 +82,7 @@ impl HookActionHandler for DispatchAgentAction<'_> {
         let launch = context
             .service
             .task_service
-            .dispatch_initial_role_execution(
-                &task.id,
-                &agent.id,
-                "implementer",
-                ExecutionPurpose::Implement,
-                prompt,
-            )
+            .dispatch_initial_role_execution(&task.id, &agent.id, "implementer", prompt)
             .await;
         let execution = match launch {
             Ok(execution) => execution,

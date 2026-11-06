@@ -407,20 +407,43 @@ async fn seed_project_repo_agent_with_owner(
         seed_daemon(db).await
     };
 
-    ProjectRepo::create(
-        db,
-        CreateProject {
-            id: project_id.clone(),
-            name: "Forge".to_owned(),
-            settings: "{}".to_owned(),
-            primary_repo_id: None,
-            owner_id: owner_id.clone(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
+    let has_role_defaults: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+         WHERE type = 'table' AND name = 'project_task_role_defaults')",
     )
+    .fetch_one(db.pool())
     .await
-    .expect("project creates");
+    .expect("Project role-defaults table lookup");
+    if has_role_defaults {
+        ProjectRepo::create(
+            db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "Forge".to_owned(),
+                settings: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: owner_id.clone(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project creates");
+    } else {
+        sqlx::query(
+            "INSERT INTO project (
+                id, name, settings, primary_repo_id, owner_id,
+                project_hooks_json, project_work_epoch, version, created_at, updated_at
+             ) VALUES (?, 'Forge', '{}', NULL, ?, '[]', 0, 1, ?, ?)",
+        )
+        .bind(&project_id)
+        .bind(owner_id.as_deref())
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("pre-cutover project creates");
+    }
     RepoRepo::create(
         db,
         CreateRepo {
@@ -830,7 +853,6 @@ fn pr8_human_review_start_inputs(
             task_id: task_id.to_owned(),
             agent_id: None,
             actor_ref: Some(crate::ActorRef::Human(user_id.to_owned())),
-            purpose: Some(crate::ExecutionPurpose::Review),
             harness_session_id: None,
             role: "reviewer".to_owned(),
             status: ExecutionStatus::Running,
@@ -1115,7 +1137,6 @@ async fn orchestrator_execution_admission_rechecks_project_account() {
             agent_id: Some(agent_id.clone()),
             actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
             role: "orchestrator".to_owned(),
-            purpose: Some(crate::ExecutionPurpose::Orchestrate),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -1392,7 +1413,6 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
             agent_id: Some(agent_id.clone()),
             actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
             role: "orchestrator".to_owned(),
-            purpose: Some(crate::ExecutionPurpose::Orchestrate),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -1713,7 +1733,6 @@ async fn pr6_wake_admission_is_deduplicated_and_lease_expiry_is_retryable() {
             agent_id: Some(agent_id.clone()),
             actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
             role: "orchestrator".to_owned(),
-            purpose: Some(crate::ExecutionPurpose::Orchestrate),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -2070,7 +2089,6 @@ async fn pr6_action_reservation_reuses_one_uuid_and_rejects_changed_replay() {
             task_id: task_id.clone(),
             agent_id: Some(agent_id.clone()),
             actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(crate::ExecutionPurpose::Orchestrate),
             role: "orchestrator".to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,
@@ -2233,7 +2251,6 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
             task_id: task_id.clone(),
             agent_id: Some(agent_id.clone()),
             actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(crate::ExecutionPurpose::General),
             harness_session_id: None,
             role: "implementer".to_owned(),
             status: ExecutionStatus::Running,
@@ -2425,7 +2442,6 @@ async fn interactive_workspace_lease_uses_task_role_for_insert_and_renewal() {
             task_id: task_id.clone(),
             agent_id: Some(role_agent_id.clone()),
             actor_ref: Some(crate::ActorRef::Agent(role_agent_id.clone())),
-            purpose: Some(crate::ExecutionPurpose::General),
             harness_session_id: None,
             role: "interactive".to_owned(),
             status: ExecutionStatus::Running,
@@ -3620,7 +3636,6 @@ async fn pr8_review_report_is_exact_human_execution_output_before_completion() {
             agent_id: None,
             actor_ref: Some(crate::ActorRef::Human(user_id.clone())),
             role: "reviewer".to_owned(),
-            purpose: Some(crate::ExecutionPurpose::Review),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -3755,7 +3770,6 @@ async fn pr8_review_report_is_exact_human_execution_output_before_completion() {
             agent_id: None,
             actor_ref: execution.actor_ref(),
             role: "reviewer".to_owned(),
-            purpose: Some(crate::ExecutionPurpose::Review),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -3851,7 +3865,6 @@ async fn pr8_review_subject_is_immutable_and_report_digest_must_match() {
             agent_id: None,
             actor_ref: Some(crate::ActorRef::Human(user_id.clone())),
             role: "reviewer".to_owned(),
-            purpose: Some(crate::ExecutionPurpose::Review),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -4493,35 +4506,27 @@ async fn pr8_legacy_review_backfill_requires_exact_attribution_and_ci_snapshot_i
         head_sha: Option<&str>,
     ) {
         let now = now_rfc3339();
-        ExecutionRepo::create(
-            db,
-            CreateExecution {
-                id: id.to_owned(),
-                task_id: task_id.to_owned(),
-                agent_id: None,
-                actor_ref: actor,
-                role: "reviewer".to_owned(),
-                purpose: Some(crate::ExecutionPurpose::Review),
-                status: ExecutionStatus::Completed,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: None,
-                harness_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: base_sha.map(str::to_owned),
-                after_sha: head_sha.map(str::to_owned),
-                error: None,
-                executor_config_snapshot_json: None,
-                workspace_id: workspace_id.map(str::to_owned),
-                created_at: now.clone(),
-                updated_at: now,
-            },
+        let (actor_kind, actor_id) = match actor.as_ref() {
+            Some(crate::ActorRef::Human(id)) => (Some("human"), Some(id.as_str())),
+            Some(crate::ActorRef::Agent(id)) => (Some("agent"), Some(id.as_str())),
+            None => (None, None),
+        };
+        sqlx::query(
+            "INSERT INTO execution (
+                id, task_id, agent_id, role, purpose, status, actor_kind, actor_id,
+                workspace_id, before_sha, after_sha, created_at, updated_at
+             ) VALUES (?, ?, NULL, 'reviewer', 'review', 'completed', ?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(id)
+        .bind(task_id)
+        .bind(actor_kind)
+        .bind(actor_id)
+        .bind(workspace_id)
+        .bind(base_sha)
+        .bind(head_sha)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
         .await
         .expect("historical Execution fixture creates");
     }
@@ -5125,7 +5130,6 @@ async fn delete_lifecycle_foreign_keys_match_repository_operations() {
             task_id: task_id.clone(),
             agent_id: Some(agent_id.clone()),
             actor_ref: None,
-            purpose: None,
             harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Running,
@@ -5350,7 +5354,6 @@ async fn sqlite_execution_role_auditor_round_trips() {
             task_id: task_id.clone(),
             agent_id: Some(agent_id),
             actor_ref: None,
-            purpose: None,
             harness_session_id: None,
             role: "auditor".to_string(),
             status: ExecutionStatus::Running,
@@ -5413,7 +5416,6 @@ async fn running_execution_admission_is_fenced_after_terminal_task_lifecycle() {
         task_id: task_id.clone(),
         agent_id: Some(agent_id.clone()),
         actor_ref: None,
-        purpose: None,
         harness_session_id: None,
         role: "executor".to_owned(),
         status,
@@ -5843,7 +5845,6 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             task_id: task_id.clone(),
             agent_id: Some(agent_id.clone()),
             actor_ref: None,
-            purpose: None,
             harness_session_id: None,
             role: "executor".to_string(),
             status: ExecutionStatus::Running,
@@ -6423,7 +6424,6 @@ async fn agent_active_execution_count_counts_only_exact_running_executions() {
             task_id,
             agent_id: Some(agent_id.clone()),
             actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(crate::ExecutionPurpose::Implement),
             harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Running,
@@ -6516,7 +6516,6 @@ async fn agent_task_list_uses_execution_history() {
             task_id: executed_task_id.clone(),
             agent_id: Some(agent_id.clone()),
             actor_ref: None,
-            purpose: None,
             harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Completed,
@@ -6741,7 +6740,6 @@ async fn pr7_migration_preserves_legacy_plan_history_and_maps_only_verifiable_au
             task_id: task_id.clone(),
             agent_id: Some(agent_id.clone()),
             actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(crate::ExecutionPurpose::Plan),
             harness_session_id: None,
             role: "planner".to_owned(),
             status: ExecutionStatus::Completed,
@@ -7758,4 +7756,504 @@ async fn domain_event_append_in_tx_rolls_back_with_the_mutation() {
         .await
         .expect("event lookup succeeds")
         .is_none());
+}
+
+#[tokio::test]
+async fn v141_v144_backfill_dispatch_and_preserve_execution_purpose_history() {
+    let migrations = tempfile::TempDir::new().expect("migration temp dir");
+    copy_migrations_through(140, migrations.path());
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool creates");
+    run_migrations_from(&pool, migrations.path())
+        .await
+        .expect("database migrates through V140");
+    let db = SqliteDb::new(pool);
+    let now = now_rfc3339();
+    let project_id = new_uuid_v4();
+    ProjectRepo::create(
+        &db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "Purpose retirement".to_owned(),
+            settings: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("project");
+    let task_id = new_uuid_v4();
+    TaskRepo::create(
+        &db,
+        CreateTask {
+            id: task_id.clone(),
+            project_id: project_id.clone(),
+            repo_id: None,
+            parent_task_id: None,
+            title: "Historical task".to_owned(),
+            description: None,
+            lifecycle_state: crate::TaskLifecycleState::Ready,
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("task");
+    let historical_execution = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO execution (
+             id, task_id, role, purpose, status, created_at, updated_at
+         ) VALUES (?, ?, 'executor', 'implement', 'completed', ?, ?)",
+    )
+    .bind(&historical_execution)
+    .bind(&task_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("historical purpose Execution");
+
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(source).expect("migration source") {
+        let path = entry.expect("migration entry").path();
+        let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((version, _)) = stem.split_once("__") else {
+            continue;
+        };
+        let version = version
+            .strip_prefix('V')
+            .expect("migration prefix")
+            .parse::<i64>()
+            .expect("migration version");
+        if (141..=144).contains(&version) {
+            fs::copy(
+                &path,
+                migrations.path().join(path.file_name().expect("filename")),
+            )
+            .expect("new migration copied");
+        }
+    }
+    run_migrations_from(db.pool(), migrations.path())
+        .await
+        .expect("database migrates through V144");
+
+    let (state, version): (String, i64) =
+        sqlx::query_as("SELECT state, version FROM task_dispatch WHERE task_id = ?")
+            .bind(&task_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("dispatch intent backfilled");
+    assert_eq!((state.as_str(), version), ("idle", 1));
+    let history_purpose: String = sqlx::query_scalar(
+        "SELECT purpose FROM pr13_execution_purpose_history WHERE execution_id = ?",
+    )
+    .bind(&historical_execution)
+    .fetch_one(db.pool())
+    .await
+    .expect("historical purpose preserved");
+    assert_eq!(history_purpose, "implement");
+    assert!(
+        !sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('execution') WHERE name = 'purpose'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("purpose column lookup")
+            != 0
+    );
+}
+
+#[tokio::test]
+async fn task_dispatch_concurrency_guard_rejects_a_fifth_parented_work_unit_execution() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Concurrency guard",
+    )
+    .await;
+    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 10 WHERE id = ?")
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .expect("agent capacity widened for fixture");
+    let now = now_rfc3339();
+    let mut work_unit_ids = Vec::new();
+    for index in 0..5 {
+        let work_unit_id = new_uuid_v4();
+        sqlx::query(
+            "INSERT INTO work_unit (
+                id, task_id, title, scope, status, role,
+                assigned_actor_kind, assigned_actor_id, requires_integration,
+                created_by_kind, created_by_id, version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'open', 'implementer', 'agent', ?, 0,
+                       'agent', ?, 1, ?, ?)",
+        )
+        .bind(&work_unit_id)
+        .bind(&task_id)
+        .bind(format!("Guard unit {index}"))
+        .bind(format!("scope {index}"))
+        .bind(&agent_id)
+        .bind(&agent_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("WorkUnit fixture");
+        work_unit_ids.push(work_unit_id);
+    }
+    let parent_execution_id = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO execution (
+            id, task_id, agent_id, role, status, actor_kind, actor_id,
+            work_unit_id, work_unit_version, created_at, updated_at
+         ) VALUES (?, ?, ?, 'implementer', 'running', 'agent', ?, ?, 1, ?, ?)",
+    )
+    .bind(&parent_execution_id)
+    .bind(&task_id)
+    .bind(&agent_id)
+    .bind(&agent_id)
+    .bind(&work_unit_ids[4])
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("parent Execution is admitted before reaching the cap");
+    sqlx::query(
+        "UPDATE execution
+         SET status = 'cancelled', stop_reason = 'agent_timeout',
+             stopped_by = 'system:recovery', resume_policy = 'manual',
+             stopped_at = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&parent_execution_id)
+    .execute(db.pool())
+    .await
+    .expect("parent is marked for exact Human-directed recovery");
+    assert!(
+        ExecutionRepo::list_work_unit_recovery_required_candidates(&db)
+            .await
+            .expect("recovery-required candidates list")
+            .iter()
+            .any(|candidate| candidate.id == parent_execution_id)
+    );
+
+    let preempting_attempt = sqlx::query(
+        "INSERT INTO execution (
+            id, task_id, agent_id, role, status, actor_kind, actor_id,
+            work_unit_id, work_unit_version, created_at, updated_at
+         ) VALUES (?, ?, ?, 'implementer', 'running', 'agent', ?, ?, 1, ?, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(&task_id)
+    .bind(&agent_id)
+    .bind(&agent_id)
+    .bind(&work_unit_ids[4])
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect_err("fresh parentless work cannot replace an exact interrupted candidate");
+    assert!(preempting_attempt
+        .to_string()
+        .contains("FORGE_WU_ADMISSION_RECOVERY_PENDING"));
+
+    for work_unit_id in work_unit_ids.iter().take(4) {
+        sqlx::query(
+            "INSERT INTO execution (
+                id, task_id, agent_id, role, status, actor_kind, actor_id,
+                work_unit_id, work_unit_version, created_at, updated_at
+             ) VALUES (?, ?, ?, 'implementer', 'running', 'agent', ?, ?, 1, ?, ?)",
+        )
+        .bind(new_uuid_v4())
+        .bind(&task_id)
+        .bind(&agent_id)
+        .bind(&agent_id)
+        .bind(work_unit_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("parentless WorkUnit admission below the ceiling");
+    }
+
+    let error = sqlx::query(
+        "INSERT INTO execution (
+            id, task_id, agent_id, role, status, actor_kind, actor_id,
+            work_unit_id, work_unit_version, parent_execution_id, created_at, updated_at
+         ) VALUES (?, ?, ?, 'implementer', 'running', 'agent', ?, ?, 1, ?, ?, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(&task_id)
+    .bind(&agent_id)
+    .bind(&agent_id)
+    .bind(&work_unit_ids[4])
+    .bind(&parent_execution_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect_err("a parent-bound recovery child also counts toward the Task cap");
+    assert!(error
+        .to_string()
+        .contains("FORGE_WU_ADMISSION_TASK_AT_CAPACITY"));
+}
+
+#[tokio::test]
+async fn task_dispatch_pause_guard_rejects_a_parented_work_unit_execution() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Paused parent-bound admission",
+    )
+    .await;
+    let now = now_rfc3339();
+    let work_unit_id = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO work_unit (
+            id, task_id, title, scope, status, role,
+            assigned_actor_kind, assigned_actor_id, requires_integration,
+            created_by_kind, created_by_id, version, created_at, updated_at
+         ) VALUES (?, ?, 'Paused unit', 'Parent-bound attempt', 'open',
+                   'implementer', 'agent', ?, 0, 'agent', ?, 1, ?, ?)",
+    )
+    .bind(&work_unit_id)
+    .bind(&task_id)
+    .bind(&agent_id)
+    .bind(&agent_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("WorkUnit fixture");
+
+    let parent_execution_id = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO execution (
+            id, task_id, agent_id, role, status, actor_kind, actor_id,
+            work_unit_id, work_unit_version, created_at, updated_at
+         ) VALUES (?, ?, ?, 'implementer', 'running', 'agent', ?, ?, 1, ?, ?)",
+    )
+    .bind(&parent_execution_id)
+    .bind(&task_id)
+    .bind(&agent_id)
+    .bind(&agent_id)
+    .bind(&work_unit_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("parent Execution is admitted");
+    sqlx::query(
+        "UPDATE execution
+         SET status = 'cancelled', stop_reason = 'crash_recovery',
+             stopped_by = 'system:recovery', resume_policy = 'auto',
+             stopped_at = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&parent_execution_id)
+    .execute(db.pool())
+    .await
+    .expect("parent becomes a recovery candidate");
+
+    TaskLifecycleRepo::transition_task_dispatch(
+        &db,
+        crate::TransitionTaskDispatch {
+            task_id: task_id.clone(),
+            operation: crate::TaskDispatchOperation::Pause,
+            state: crate::TaskDispatchState::Paused,
+            expected_intent_version: 1,
+            requested_by_kind: "system".to_owned(),
+            requested_by_id: None,
+            reason: Some("test pause".to_owned()),
+            idempotency_key: "pause-parent-bound".to_owned(),
+            request_digest: "a".repeat(64),
+            receipt_id: new_uuid_v4(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Task dispatch pauses");
+
+    let error = sqlx::query(
+        "INSERT INTO execution (
+            id, task_id, agent_id, role, status, actor_kind, actor_id,
+            work_unit_id, work_unit_version, parent_execution_id, created_at, updated_at
+         ) VALUES (?, ?, ?, 'implementer', 'running', 'agent', ?, ?, 1, ?, ?, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(&task_id)
+    .bind(&agent_id)
+    .bind(&agent_id)
+    .bind(&work_unit_id)
+    .bind(&parent_execution_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect_err("Task pause blocks every parent-bound WorkUnit admission");
+    assert!(error.to_string().contains("FORGE_WU_ADMISSION_TASK_PAUSED"));
+}
+
+#[tokio::test]
+async fn stale_interrupted_allocation_does_not_reserve_fresh_admission() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Concurrency guard",
+    )
+    .await;
+    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 10 WHERE id = ?")
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .expect("agent capacity widened for fixture");
+    let now = now_rfc3339();
+    let mut work_unit_ids = Vec::new();
+    for index in 0..5 {
+        let work_unit_id = new_uuid_v4();
+        sqlx::query(
+            "INSERT INTO work_unit (
+                id, task_id, title, scope, status, role,
+                assigned_actor_kind, assigned_actor_id, requires_integration,
+                created_by_kind, created_by_id, version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'open', 'implementer', 'agent', ?, 0,
+                       'agent', ?, 1, ?, ?)",
+        )
+        .bind(&work_unit_id)
+        .bind(&task_id)
+        .bind(format!("Guard unit {index}"))
+        .bind(format!("scope {index}"))
+        .bind(&agent_id)
+        .bind(&agent_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("WorkUnit fixture");
+        work_unit_ids.push(work_unit_id);
+    }
+    let parent_execution_id = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO execution (
+            id, task_id, agent_id, role, status, actor_kind, actor_id,
+            work_unit_id, work_unit_version, created_at, updated_at
+         ) VALUES (?, ?, ?, 'implementer', 'running', 'agent', ?, ?, 1, ?, ?)",
+    )
+    .bind(&parent_execution_id)
+    .bind(&task_id)
+    .bind(&agent_id)
+    .bind(&agent_id)
+    .bind(&work_unit_ids[4])
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("parent Execution is admitted before reaching the cap");
+    sqlx::query(
+        "UPDATE execution
+         SET status = 'cancelled', stop_reason = 'agent_timeout',
+             stopped_by = 'system:recovery', resume_policy = 'manual',
+             stopped_at = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&parent_execution_id)
+    .execute(db.pool())
+    .await
+    .expect("parent is marked for exact Human-directed recovery");
+    assert!(
+        ExecutionRepo::list_work_unit_recovery_required_candidates(&db)
+            .await
+            .expect("recovery-required candidates list")
+            .iter()
+            .any(|candidate| candidate.id == parent_execution_id)
+    );
+
+    let preempting_attempt = sqlx::query(
+        "INSERT INTO execution (
+            id, task_id, agent_id, role, status, actor_kind, actor_id,
+            work_unit_id, work_unit_version, created_at, updated_at
+         ) VALUES (?, ?, ?, 'implementer', 'running', 'agent', ?, ?, 1, ?, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(&task_id)
+    .bind(&agent_id)
+    .bind(&agent_id)
+    .bind(&work_unit_ids[4])
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect_err("fresh parentless work cannot replace an exact interrupted candidate");
+    assert!(preempting_attempt
+        .to_string()
+        .contains("FORGE_WU_ADMISSION_RECOVERY_PENDING"));
+
+    sqlx::query("UPDATE work_unit SET version = version + 1 WHERE id = ?")
+        .bind(&work_unit_ids[4])
+        .execute(db.pool())
+        .await
+        .expect("advance allocation revision");
+    assert!(
+        ExecutionRepo::list_work_unit_recovery_required_candidates(&db)
+            .await
+            .expect("current recovery candidates")
+            .is_empty()
+    );
+    sqlx::query(
+        "UPDATE execution SET resume_policy = 'auto', stop_reason = 'crash_recovery' WHERE id = ?",
+    )
+    .bind(&parent_execution_id)
+    .execute(db.pool())
+    .await
+    .expect("Auto recovery policy");
+    assert!(ExecutionRepo::list_work_unit_auto_recovery_candidates(&db)
+        .await
+        .expect("current Auto candidates")
+        .is_empty());
+    sqlx::query(
+        "INSERT INTO execution (
+            id, task_id, agent_id, role, status, actor_kind, actor_id,
+            work_unit_id, work_unit_version, created_at, updated_at
+         ) VALUES (?, ?, ?, 'implementer', 'running', 'agent', ?, ?, 2, ?, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(&task_id)
+    .bind(&agent_id)
+    .bind(&agent_id)
+    .bind(&work_unit_ids[4])
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("fresh exact allocation is no longer blocked by stale recovery");
 }

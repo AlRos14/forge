@@ -384,9 +384,7 @@ impl TaskService {
         &self,
         execution: &db::Execution,
     ) -> Result<Option<db::WorkspaceLease>> {
-        if execution.role == "orchestrator"
-            && execution.purpose == Some(db::ExecutionPurpose::Orchestrate)
-        {
+        if execution.role == "orchestrator" {
             if execution.workspace_id.is_some() {
                 return Err(ServiceError::invalid_operation(
                     "orchestrator Execution cannot receive a mutable WorkspaceLease",

@@ -1579,6 +1579,7 @@ mod tests {
                 parent_work_unit_id: None,
                 title: "Committed before operation finish".to_owned(),
                 scope: "Test the create/finish boundary".to_owned(),
+                execution_instructions: None,
                 role: "implementer".to_owned(),
                 assigned_actor: None,
                 requires_integration: false,

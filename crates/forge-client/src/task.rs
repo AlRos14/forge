@@ -1,9 +1,10 @@
 use anyhow::Result;
 use api_types::{
     ActorRef, AddRoleMembershipRequest, CoordinationMode, CreateTaskRequest, CreateTaskRoleRequest,
-    ExecutionPurpose, ExecutionResponse, PaginatedResponse, RoleMembershipResponse,
-    StartExecutionRequest, TaskLifecycleState, TaskLifecycleTransitionResponse, TaskResponse,
-    TaskRoleResponse, TransitionTaskLifecycleRequest,
+    PaginatedResponse, RoleMembershipResponse, TaskDispatchActionRequest,
+    TaskDispatchActionResponse, TaskLaunchResponse, TaskLifecycleState,
+    TaskLifecycleTransitionResponse, TaskResponse, TaskRoleResponse,
+    TransitionTaskLifecycleRequest,
 };
 use clap::{Subcommand, ValueEnum};
 
@@ -42,18 +43,45 @@ pub enum TaskCmd {
     Get {
         id: String,
     },
-    Execute {
+    Launch {
         id: String,
         #[arg(long)]
-        work_unit_id: String,
+        expected_task_version: i64,
         #[arg(long)]
-        expected_work_unit_version: i64,
-        #[arg(long, value_enum)]
-        purpose: PurposeArg,
+        expected_lifecycle_version: i64,
         #[arg(long)]
-        prompt: String,
-        #[arg(long = "input-artifact-id")]
-        input_artifact_ids: Vec<String>,
+        idempotency_key: String,
+    },
+    Pause {
+        id: String,
+        #[arg(long)]
+        expected_task_version: i64,
+        #[arg(long)]
+        expected_lifecycle_version: i64,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    Resume {
+        id: String,
+        #[arg(long)]
+        expected_task_version: i64,
+        #[arg(long)]
+        expected_lifecycle_version: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    Cancel {
+        id: String,
+        #[arg(long)]
+        expected_task_version: i64,
+        #[arg(long)]
+        expected_lifecycle_version: i64,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        reason: Option<String>,
     },
     Role {
         #[command(subcommand)]
@@ -133,31 +161,6 @@ pub enum LifecycleStateArg {
     Cancelled,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-pub enum PurposeArg {
-    Plan,
-    Implement,
-    Review,
-    Validate,
-    Investigate,
-    Orchestrate,
-    General,
-}
-
-impl From<PurposeArg> for ExecutionPurpose {
-    fn from(value: PurposeArg) -> Self {
-        match value {
-            PurposeArg::Plan => Self::Plan,
-            PurposeArg::Implement => Self::Implement,
-            PurposeArg::Review => Self::Review,
-            PurposeArg::Validate => Self::Validate,
-            PurposeArg::Investigate => Self::Investigate,
-            PurposeArg::Orchestrate => Self::Orchestrate,
-            PurposeArg::General => Self::General,
-        }
-    }
-}
-
 impl From<LifecycleStateArg> for TaskLifecycleState {
     fn from(value: LifecycleStateArg) -> Self {
         match value {
@@ -232,43 +235,89 @@ impl TaskArgs {
                 let task: TaskResponse = client.get(&format!("/api/v1/tasks/{id}")).await?;
                 print_task(output, &task)
             }
-            TaskCmd::Execute {
+            TaskCmd::Launch {
                 id,
-                work_unit_id,
-                expected_work_unit_version,
-                purpose,
-                prompt,
-                input_artifact_ids,
+                expected_task_version,
+                expected_lifecycle_version,
+                idempotency_key,
             } => {
-                let request = StartExecutionRequest {
-                    work_unit_id: work_unit_id.clone(),
-                    expected_work_unit_version: *expected_work_unit_version,
-                    purpose: (*purpose).into(),
-                    prompt: prompt.clone(),
-                    input_artifact_ids: input_artifact_ids.clone(),
-                    overrides: None,
+                let request = TaskDispatchActionRequest {
+                    expected_task_version: *expected_task_version,
+                    expected_lifecycle_version: *expected_lifecycle_version,
+                    idempotency_key: idempotency_key.clone(),
+                    reason: None,
                 };
-                let execution: ExecutionResponse = client
-                    .post(&format!("/api/v1/tasks/{id}/executions"), &request)
+                let response: TaskLaunchResponse = client
+                    .post(&format!("/api/v1/tasks/{id}/dispatch/launch"), &request)
                     .await?;
                 match output {
-                    OutputFormat::Json => print_json(&execution),
+                    OutputFormat::Json => print_json(&response),
                     OutputFormat::Table => {
-                        let actor = serde_json::to_value(&execution.actor_ref)?.to_string();
-                        let purpose = serde_json::to_value(execution.purpose)?;
                         println!(
-                            "Execution {} status={} actor={} role={} purpose={}",
-                            execution.id,
-                            serde_json::to_value(execution.status)?
-                                .as_str()
-                                .unwrap_or("unknown"),
-                            actor,
-                            execution.role,
-                            purpose.as_str().unwrap_or("unknown")
+                            "Task {} dispatch={:?} v{} admitted={} admitted_executions={} started_executions={}",
+                            id,
+                            response.dispatch.state,
+                            response.dispatch.version,
+                            response.admitted,
+                            response.admitted_execution_ids.len(),
+                            response.started_execution_ids.len()
                         );
                         Ok(())
                     }
                 }
+            }
+            TaskCmd::Pause {
+                id,
+                expected_task_version,
+                expected_lifecycle_version,
+                idempotency_key,
+                reason,
+            } => {
+                let request = TaskDispatchActionRequest {
+                    expected_task_version: *expected_task_version,
+                    expected_lifecycle_version: *expected_lifecycle_version,
+                    idempotency_key: idempotency_key.clone(),
+                    reason: reason.clone(),
+                };
+                let response: TaskDispatchActionResponse = client
+                    .post(&format!("/api/v1/tasks/{id}/dispatch/pause"), &request)
+                    .await?;
+                print_dispatch_action(output, id, &response)
+            }
+            TaskCmd::Resume {
+                id,
+                expected_task_version,
+                expected_lifecycle_version,
+                idempotency_key,
+            } => {
+                let request = TaskDispatchActionRequest {
+                    expected_task_version: *expected_task_version,
+                    expected_lifecycle_version: *expected_lifecycle_version,
+                    idempotency_key: idempotency_key.clone(),
+                    reason: None,
+                };
+                let response: TaskDispatchActionResponse = client
+                    .post(&format!("/api/v1/tasks/{id}/dispatch/resume"), &request)
+                    .await?;
+                print_dispatch_action(output, id, &response)
+            }
+            TaskCmd::Cancel {
+                id,
+                expected_task_version,
+                expected_lifecycle_version,
+                idempotency_key,
+                reason,
+            } => {
+                let request = TaskDispatchActionRequest {
+                    expected_task_version: *expected_task_version,
+                    expected_lifecycle_version: *expected_lifecycle_version,
+                    idempotency_key: idempotency_key.clone(),
+                    reason: reason.clone(),
+                };
+                let response: TaskDispatchActionResponse = client
+                    .post(&format!("/api/v1/tasks/{id}/dispatch/cancel"), &request)
+                    .await?;
+                print_dispatch_action(output, id, &response)
             }
             TaskCmd::Role { command } => match command {
                 TaskRoleCmd::List { id } => {
@@ -403,6 +452,28 @@ fn print_task(output: &OutputFormat, task: &TaskResponse) -> Result<()> {
         OutputFormat::Json => print_json(task),
         OutputFormat::Table => {
             print_table_tasks(std::slice::from_ref(task));
+            Ok(())
+        }
+    }
+}
+
+fn print_dispatch_action(
+    output: &OutputFormat,
+    task_id: &str,
+    response: &TaskDispatchActionResponse,
+) -> Result<()> {
+    match output {
+        OutputFormat::Json => print_json(response),
+        OutputFormat::Table => {
+            println!(
+                "Task {} lifecycle={} dispatch={:?} v{}",
+                task_id,
+                serde_json::to_value(response.task.lifecycle.state)?
+                    .as_str()
+                    .unwrap_or("unknown"),
+                response.dispatch.state,
+                response.dispatch.version
+            );
             Ok(())
         }
     }

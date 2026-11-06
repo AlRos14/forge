@@ -39,7 +39,7 @@ type Props = {
 }
 
 type RoleDraft = { coordinationMode: CoordinationMode; policy: string }
-type UnitDraft = { title: string; scope: string; requiresIntegration: boolean }
+type UnitDraft = { title: string; scope: string; executionInstructions: string; requiresIntegration: boolean }
 
 const COORDINATION_MODES: CoordinationMode[] = ['partitioned', 'collaborative', 'independent']
 const MEMBERSHIP_STATUSES: RoleMembershipStatus[] = ['active', 'suspended', 'ended']
@@ -121,9 +121,11 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
   const [creation, setCreation] = useState({
     title: '',
     scope: '',
+    executionInstructions: '',
     role: '',
     parentId: '',
     assignedActor: '',
+    reviewedWorkUnitId: '',
     requiresIntegration: false,
     provenanceKind: '',
     provenanceRef: '',
@@ -152,6 +154,7 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
           {
             title: unit.title,
             scope: unit.scope,
+            executionInstructions: unit.execution_instructions ?? '',
             requiresIntegration: unit.requires_integration,
           },
         ]),
@@ -263,6 +266,10 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
       toast.error('Title, scope, and an existing TaskRole are required')
       return
     }
+    if (role === 'reviewer' && !creation.reviewedWorkUnitId) {
+      toast.error('Choose the exact WorkUnit this reviewer will inspect')
+      return
+    }
     const provenanceActor = parseActorKey(creation.provenanceActor)
     const provenance =
       creation.provenanceKind === 'actor'
@@ -287,11 +294,15 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
     const body: CreateWorkUnitRequest = {
       title: creation.title.trim(),
       scope: creation.scope.trim(),
+      execution_instructions: creation.executionInstructions.trim() || null,
       role,
       parent_work_unit_id: creation.parentId || null,
       assigned_actor: parseActorKey(creation.assignedActor),
       requires_integration: creation.requiresIntegration,
       provenance,
+      ...(role === 'reviewer'
+        ? { review_subject: { reviewed_work_unit_id: creation.reviewedWorkUnitId } }
+        : {}),
     }
     try {
       await postOrPatch<WorkUnitResponse>(`/tasks/${task.id}/work-units`, 'POST', body)
@@ -299,9 +310,11 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
       setCreation({
         title: '',
         scope: '',
+        executionInstructions: '',
         role,
         parentId: '',
         assignedActor: '',
+        reviewedWorkUnitId: '',
         requiresIntegration: false,
         provenanceKind: '',
         provenanceRef: '',
@@ -320,6 +333,7 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
       expected_version: unit.version,
       title: draft.title.trim() || null,
       scope: draft.scope.trim() || null,
+      execution_instructions: draft.executionInstructions.trim() || null,
       requires_integration: draft.requiresIntegration,
     }
     try {
@@ -334,6 +348,15 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
   const allocateWorkUnit = async (unit: WorkUnitResponse) => {
     const allocation = allocations[unit.id]
     if (!allocation?.role) return
+    const reviewSubject = unit.review_subject
+    if (allocation.role === 'reviewer' && !reviewSubject) {
+      toast.error('Create a new reviewer WorkUnit with an exact subject instead')
+      return
+    }
+    if (reviewSubject && allocation.role !== 'reviewer') {
+      toast.error('The role cannot change after an exact reviewer subject is assigned')
+      return
+    }
     const body: AllocateWorkUnitRequest = {
       expected_version: unit.version,
       role: allocation.role,
@@ -387,8 +410,17 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
     }
   }
 
-  const integrateWorkUnit = async (unit: WorkUnitResponse, executionId: string) => {
-    if (!executionId) return
+  const prepareWorkspace = async (unit: WorkUnitResponse) => {
+    try {
+      await postOrPatch(`/work-units/${unit.id}/workspace`, 'POST', {})
+      toast.success('WorkUnit Workspace prepared')
+      await onChanged()
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Could not prepare WorkUnit Workspace'))
+    }
+  }
+
+  const integrateWorkUnit = async (unit: WorkUnitResponse, executionId: string) => {    if (!executionId) return
     const body: WorkUnitIntegrationRequest = {
       execution_id: executionId,
       idempotency_key: crypto.randomUUID(),
@@ -615,11 +647,11 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
       <div className="space-y-3 border-t pt-4">
         <h3 className="font-medium">Create a WorkUnit</h3>
         <p className="max-w-3xl text-xs leading-relaxed text-muted-foreground">
-          Forge WorkUnits are executable scopes for this Task; they are not the FirePOS work
-          packets you are planning. Enable a repository Workspace when the Agent needs to read
-          this Task&apos;s repository. Forge prepares an isolated Workspace at Execution start;
-          integrating its result into the Task branch is a separate explicit action. For this
-          planning task, use Purpose Plan and leave the Integrate action unused.
+          Forge WorkUnits are executable scopes for this Task. Enable a repository Workspace when the
+          Agent needs to read this Task&apos;s repository. Forge prepares an isolated Workspace when
+          the WorkUnit is prepared for launch; integrating its result into the Task branch is a
+          separate explicit action. Optional execution instructions are passed to the assigned
+          harness; they are not a second Task or Execution lifecycle.
         </p>
         <form
           onSubmit={(event) => void createWorkUnit(event)}
@@ -639,9 +671,11 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
             <select
               className="h-9 rounded-md border bg-background px-2 text-sm"
               value={creation.role || task.task_roles[0]?.role || ''}
-              onChange={(event) =>
-                setCreation((current) => ({ ...current, role: event.target.value }))
-              }
+              onChange={(event) => setCreation((current) => ({
+                ...current,
+                role: event.target.value,
+                reviewedWorkUnitId: '',
+              }))}
             >
               <option value="">Create a TaskRole first</option>
               {task.task_roles.map((role) => (
@@ -651,6 +685,34 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
               ))}
             </select>
           </label>
+          {(creation.role || task.task_roles[0]?.role) === 'reviewer' ? (
+            <label className="space-y-1 text-xs md:col-span-2">
+              <span>Exact WorkUnit to review</span>
+              <select
+                aria-label="Exact WorkUnit to review"
+                required
+                className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+                value={creation.reviewedWorkUnitId}
+                onChange={(event) => setCreation((current) => ({
+                  ...current,
+                  reviewedWorkUnitId: event.target.value,
+                }))}
+              >
+                <option value="">Choose the WorkUnit under review</option>
+                {workUnits
+                  .filter((unit) => unit.role !== 'reviewer' && unit.status !== 'cancelled')
+                  .map((unit) => (
+                    <option key={unit.id} value={unit.id}>
+                      {unit.title} · {unit.status}
+                      {unit.status === 'open' ? ' · waiting for its exact result' : ''}
+                    </option>
+                  ))}
+              </select>
+              <span className="block text-muted-foreground">
+                Forge freezes the subject to that WorkUnit&apos;s exact result before review can run.
+              </span>
+            </label>
+          ) : null}
           <label className="space-y-1 text-xs md:col-span-2">
             <span>Scope</span>
             <Textarea
@@ -658,6 +720,19 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
               onChange={(event) =>
                 setCreation((current) => ({ ...current, scope: event.target.value }))
               }
+            />
+          </label>
+          <label className="space-y-1 text-xs md:col-span-2">
+            <span>Harness execution instructions (optional)</span>
+            <Textarea
+              value={creation.executionInstructions}
+              onChange={(event) =>
+                setCreation((current) => ({
+                  ...current,
+                  executionInstructions: event.target.value,
+                }))
+              }
+              placeholder="Exact instructions passed to the assigned harness instead of the generic Task/WorkUnit prompt"
             />
           </label>
           <label className="space-y-1 text-xs">
@@ -797,6 +872,7 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
               unitDrafts[unit.id] ?? {
                 title: unit.title,
                 scope: unit.scope,
+                executionInstructions: unit.execution_instructions ?? '',
                 requiresIntegration: unit.requires_integration,
               }
             }
@@ -820,6 +896,7 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
             onAddDependency={() => void createDependency(unit)}
             onRemoveDependency={(id) => void removeDependency(unit, id)}
             onRefreshReadiness={() => void refreshReadiness(unit)}
+            onPrepareWorkspace={() => void prepareWorkspace(unit)}
             onIntegrate={(executionId) => void integrateWorkUnit(unit, executionId)}
           />
         ))}
@@ -848,11 +925,14 @@ type WorkUnitCardProps = {
   onAddDependency: () => void
   onRemoveDependency: (id: string) => void
   onRefreshReadiness: () => void
+  onPrepareWorkspace: () => void
   onIntegrate: (executionId: string) => void
 }
 
 function WorkUnitCard(props: WorkUnitCardProps) {
   const { unit, units, roles, agents, members, executions } = props
+  const reviewSubject = unit.review_subject
+  const reviewedUnit = units.find((item) => item.id === reviewSubject?.reviewed_work_unit_id)
   const dependenciesQuery = useQuery({
     queryKey: ['work-unit-dependencies', unit.id, unit.version],
     queryFn: () => apiFetch<WorkUnitDependencyResponse[]>(`/work-units/${unit.id}/dependencies`),
@@ -873,6 +953,33 @@ function WorkUnitCard(props: WorkUnitCardProps) {
         </span>
         <code className="ml-auto text-xs text-muted-foreground">{unit.id}</code>
       </div>
+      {unit.role === 'reviewer' ? (
+        <div className="rounded bg-amber-50/60 p-2 text-xs" aria-label="Reviewer subject">
+          {reviewSubject ? (
+            <>
+              <strong>Exact review subject:</strong>{' '}
+              {reviewedUnit?.title ?? reviewSubject.reviewed_work_unit_id}
+              {reviewSubject.reviewed_work_unit_version != null
+                ? ` · version ${String(reviewSubject.reviewed_work_unit_version)}`
+                : ' · waiting for the exact WorkUnit result'}
+              {reviewSubject.result_execution_id
+                ? ` · result Execution ${reviewSubject.result_execution_id}`
+                : ''}
+              {reviewSubject.result_artifact_id
+                ? ` · Artifact ${reviewSubject.result_artifact_id}`
+                : ''}
+              {reviewSubject.result_commit_sha
+                ? ` · commit ${reviewSubject.result_commit_sha}`
+                : ''}
+              <span className="mt-1 block text-muted-foreground">
+                This subject is fixed. Create a new reviewer WorkUnit to review another scope.
+              </span>
+            </>
+          ) : (
+            <span>No exact subject is attached. Create a new reviewer WorkUnit and select its subject.</span>
+          )}
+        </div>
+      ) : null}
       <div className="grid gap-2 md:grid-cols-2">
         <label className="space-y-1 text-xs">
           <span>Title</span>
@@ -902,6 +1009,16 @@ function WorkUnitCard(props: WorkUnitCardProps) {
             onChange={(event) => props.onDraftChange({ ...props.draft, scope: event.target.value })}
           />
         </label>
+        <label className="space-y-1 text-xs md:col-span-2">
+          <span>Harness execution instructions</span>
+          <Textarea
+            value={props.draft.executionInstructions}
+            onChange={(event) =>
+              props.onDraftChange({ ...props.draft, executionInstructions: event.target.value })
+            }
+            placeholder="Optional exact instructions for the assigned harness"
+          />
+        </label>
         <label className="flex items-center gap-2 text-sm">
           <input
             type="checkbox"
@@ -927,7 +1044,13 @@ function WorkUnitCard(props: WorkUnitCardProps) {
             onChange={(event) => props.onAllocationChange({ role: event.target.value, actor: '' })}
           >
             {roles.map((role) => (
-              <option key={role.id} value={role.role}>
+              <option
+                key={role.id}
+                value={role.role}
+                disabled={
+                  reviewSubject ? role.role !== 'reviewer' : role.role === 'reviewer'
+                }
+              >
                 {role.role}
               </option>
             ))}
@@ -959,14 +1082,22 @@ function WorkUnitCard(props: WorkUnitCardProps) {
       <div className="space-y-2 rounded bg-muted/20 p-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h4 className="text-sm font-medium">Dependencies</h4>
-          <Button size="sm" variant="ghost" onClick={props.onRefreshReadiness}>
-            Refresh readiness
-          </Button>
+          <div className="flex gap-2">
+            {unit.requires_integration ? (
+              <Button size="sm" variant="outline" onClick={props.onPrepareWorkspace}>
+                Prepare workspace
+              </Button>
+            ) : null}
+            <Button size="sm" variant="ghost" onClick={props.onRefreshReadiness}>
+              Refresh readiness
+            </Button>
+          </div>
         </div>
         <p className="text-xs text-muted-foreground">
           Runnable: {String(readiness.runnable)} · ready for allocation:{' '}
           {String(readiness.ready_for_allocation)} · awaiting integration:{' '}
-          {String(readiness.awaiting_integration)}
+          {String(readiness.awaiting_integration)} · awaiting acceptance:{' '}
+          {String(readiness.awaiting_acceptance)}
           {readiness.active_execution_ids.length
             ? ` · active Executions: ${readiness.active_execution_ids.join(', ')}`
             : ''}
@@ -1051,7 +1182,7 @@ function WorkUnitCard(props: WorkUnitCardProps) {
               <option value="">Select exact completed Execution</option>
               {completedExecutions.map((execution) => (
                 <option key={execution.id} value={execution.id}>
-                  {execution.purpose ?? 'general'} · {execution.actor_ref?.kind}:
+                  {execution.role} · {execution.actor_ref?.kind}:
                   {execution.actor_ref?.id} · {execution.id}
                 </option>
               ))}

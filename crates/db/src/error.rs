@@ -55,6 +55,15 @@ pub enum DbError {
     #[error("agent at capacity")]
     AgentAtCapacity,
 
+    #[error("Task is at its automatic Execution capacity")]
+    TaskAtCapacity,
+
+    #[error("Task dispatch is paused or cancelled")]
+    TaskDispatchPaused,
+
+    #[error("WorkUnit must resolve its exact interrupted Execution before fresh admission")]
+    WorkUnitRecoveryPending,
+
     #[error("agent is paused: {agent_id}")]
     AgentPaused { agent_id: String },
 

@@ -4,7 +4,7 @@ mod common;
 
 use std::{sync::Arc, time::Duration};
 
-use api_types::{AgentResponse, ExecutionResponse, TaskResponse, METHOD_EXECUTION_START};
+use api_types::{AgentResponse, TaskLaunchResponse, TaskResponse, METHOD_EXECUTION_START};
 use axum::http::{Method, StatusCode};
 use db::{
     ExecutionRepo, ExecutionStatus as DbExecutionStatus, StopReason, TaskLifecycleRepo,
@@ -179,23 +179,49 @@ async fn launch_execution_for_task(
         true,
     )
     .await;
+    let work_unit: api_types::WorkUnitResponse = json_request(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/work-units/{}", work_unit.id),
+        json!({
+            "expected_version": work_unit.version,
+            "title": null,
+            "scope": null,
+            "execution_instructions": prompt,
+            "requires_integration": null,
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let _: Value = json_request::<Value>(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/workspace", work_unit.id),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    let task: TaskResponse = json_request::<TaskResponse>(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}"),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
 
     let start_app = harness.app.clone();
     let start_task_id = task_id.to_owned();
-    let start_work_unit_id = work_unit.id;
-    let expected_work_unit_version = work_unit.version;
-    let prompt = prompt.to_owned();
     let start_handle = tokio::spawn(async move {
-        json_request::<ExecutionResponse>(
+        json_request::<TaskLaunchResponse>(
             &start_app,
             Method::POST,
-            &format!("/api/v1/tasks/{start_task_id}/executions"),
+            &format!("/api/v1/tasks/{start_task_id}/dispatch/launch"),
             json!({
-                "work_unit_id": start_work_unit_id,
-                "expected_work_unit_version": expected_work_unit_version,
-                "purpose": "implement",
-                "prompt": prompt,
-                "input_artifact_ids": []
+                "expected_task_version": task.version,
+                "expected_lifecycle_version": task.lifecycle.version,
+                "idempotency_key": uuid::Uuid::new_v4().to_string(),
+                "reason": null,
             }),
             StatusCode::OK,
         )
@@ -217,16 +243,10 @@ async fn launch_execution_for_task(
     )
     .await;
 
-    let execution = start_handle.await.expect("Execution start joins");
-    assert_eq!(execution.id, execution_id);
-    assert_eq!(execution.role, "implementer");
+    let launch = start_handle.await.expect("Execution start joins");
     assert_eq!(
-        execution.purpose,
-        Some(api_types::ExecutionPurpose::Implement)
-    );
-    assert_eq!(
-        execution.actor_ref,
-        Some(api_types::ActorRef::Agent(agent_id.to_owned()))
+        launch.admitted_execution_ids.first().map(String::as_str),
+        Some(execution_id.as_str())
     );
 
     (execution_id, start_params)

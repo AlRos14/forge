@@ -2,9 +2,10 @@ use super::*;
 use crate::{
     CollaborationWrite, CreateGate, CreateGatePolicyRevision, Gate, GateEvaluation,
     GateEvaluationInput, GateEvaluationWrite, GatePolicyRevision, GateRepo, Result,
-    StoreGateEvaluation, TaskLifecycle, TaskLifecycleMigrationAudit, TaskLifecycleRepo,
-    TaskLifecycleState, TaskLifecycleTransitionFact, TaskLifecycleTransitionWrite,
-    TransitionTaskLifecycle,
+    StoreGateEvaluation, TaskDispatch, TaskDispatchOperation, TaskDispatchReceipt,
+    TaskDispatchState, TaskDispatchWrite, TaskLifecycle, TaskLifecycleMigrationAudit,
+    TaskLifecycleRepo, TaskLifecycleState, TaskLifecycleTransitionFact,
+    TaskLifecycleTransitionWrite, TransitionTaskDispatch, TransitionTaskLifecycle,
 };
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -23,6 +24,31 @@ pub(super) fn map_task_lifecycle(row: &sqlx::sqlite::SqliteRow) -> Result<TaskLi
         reason_ref: row.try_get("reason_ref")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn map_task_dispatch(row: &sqlx::sqlite::SqliteRow) -> Result<TaskDispatch> {
+    Ok(TaskDispatch {
+        task_id: row.try_get("task_id")?,
+        state: parse_gate_enum(row.try_get("state")?)?,
+        version: row.try_get("version")?,
+        requested_by_kind: row.try_get("requested_by_kind")?,
+        requested_by_id: row.try_get("requested_by_id")?,
+        reason: row.try_get("reason")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn map_task_dispatch_receipt(row: &sqlx::sqlite::SqliteRow) -> Result<TaskDispatchReceipt> {
+    Ok(TaskDispatchReceipt {
+        id: row.try_get("id")?,
+        task_id: row.try_get("task_id")?,
+        operation: parse_gate_enum(row.try_get("operation")?)?,
+        idempotency_key: row.try_get("idempotency_key")?,
+        request_digest: row.try_get("request_digest")?,
+        intent_version: row.try_get("intent_version")?,
+        created_at: row.try_get("created_at")?,
     })
 }
 
@@ -534,6 +560,196 @@ impl TaskLifecycleRepo for SqliteDb {
             gate_evaluation_id: input.gate_evaluation_id,
             replayed: false,
             event: Some(event),
+        })
+    }
+
+    async fn get_task_dispatch(&self, task_id: &str) -> Result<Option<TaskDispatch>> {
+        sqlx::query(
+            "SELECT task_id, state, version, requested_by_kind, requested_by_id, reason,
+                    created_at, updated_at
+             FROM task_dispatch WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(map_task_dispatch)
+        .transpose()
+    }
+
+    async fn list_running_task_dispatches(&self) -> Result<Vec<TaskDispatch>> {
+        let rows = sqlx::query(
+            "SELECT task_id, state, version, requested_by_kind, requested_by_id, reason,
+                    created_at, updated_at
+             FROM task_dispatch WHERE state = 'running'
+             ORDER BY updated_at ASC, task_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(map_task_dispatch).collect()
+    }
+
+    async fn get_task_dispatch_receipt(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<TaskDispatchReceipt>> {
+        sqlx::query(
+            "SELECT id, task_id, operation, idempotency_key, request_digest, intent_version,
+                    created_at
+             FROM task_dispatch_receipt
+             WHERE task_id = ? AND idempotency_key = ?",
+        )
+        .bind(task_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(map_task_dispatch_receipt)
+        .transpose()
+    }
+
+    async fn transition_task_dispatch(
+        &self,
+        input: TransitionTaskDispatch,
+    ) -> Result<TaskDispatchWrite> {
+        if input.idempotency_key.trim().is_empty() || input.idempotency_key.len() > 256 {
+            return Err(DbError::Check(
+                "invalid Task dispatch idempotency key".to_owned(),
+            ));
+        }
+        if input.request_digest.len() != 64 {
+            return Err(DbError::Check(
+                "Task dispatch request digest must be 64 hex characters".to_owned(),
+            ));
+        }
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(row) = sqlx::query(
+            "SELECT id, task_id, operation, idempotency_key, request_digest, intent_version,
+                    created_at
+             FROM task_dispatch_receipt
+             WHERE task_id = ? AND idempotency_key = ?",
+        )
+        .bind(&input.task_id)
+        .bind(&input.idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            let operation: TaskDispatchOperation = parse_gate_enum(row.try_get("operation")?)?;
+            if operation != input.operation
+                || row.try_get::<String, _>("request_digest")? != input.request_digest
+            {
+                return Err(DbError::IdempotencyConflict);
+            }
+            let receipt = map_task_dispatch_receipt(&row)?;
+            let dispatch_row = sqlx::query(
+                "SELECT task_id, state, version, requested_by_kind, requested_by_id, reason,
+                        created_at, updated_at
+                 FROM task_dispatch WHERE task_id = ?",
+            )
+            .bind(&input.task_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            let dispatch = map_task_dispatch(&dispatch_row)?;
+            transaction.commit().await?;
+            return Ok(TaskDispatchWrite {
+                dispatch,
+                receipt,
+                replayed: true,
+            });
+        }
+
+        let current = sqlx::query(
+            "SELECT task_id, state, version, requested_by_kind, requested_by_id, reason,
+                    created_at, updated_at
+             FROM task_dispatch WHERE task_id = ?",
+        )
+        .bind(&input.task_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .as_ref()
+        .map(map_task_dispatch)
+        .transpose()?
+        .ok_or_else(|| DbError::Check("Task dispatch intent is missing".to_owned()))?;
+        if current.version != input.expected_intent_version {
+            return Err(DbError::VersionConflict);
+        }
+        if current.state == TaskDispatchState::Cancelled
+            && input.operation != TaskDispatchOperation::Cancel
+        {
+            return Err(DbError::Check(
+                "cancelled Task dispatch intent cannot be resumed".to_owned(),
+            ));
+        }
+        match (input.operation, input.state) {
+            (TaskDispatchOperation::Launch, TaskDispatchState::Running)
+            | (TaskDispatchOperation::Pause, TaskDispatchState::Paused)
+            | (TaskDispatchOperation::Resume, TaskDispatchState::Running)
+            | (TaskDispatchOperation::Cancel, TaskDispatchState::Cancelled) => {}
+            _ => {
+                return Err(DbError::Check(
+                    "Task dispatch operation and target state do not match".to_owned(),
+                ))
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO task_dispatch_receipt (
+                id, task_id, operation, idempotency_key, request_digest, intent_version, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&input.receipt_id)
+        .bind(&input.task_id)
+        .bind(input.operation.to_string())
+        .bind(&input.idempotency_key)
+        .bind(&input.request_digest)
+        .bind(input.expected_intent_version + 1)
+        .bind(&input.created_at)
+        .execute(&mut *transaction)
+        .await?;
+
+        let updated = sqlx::query(
+            "UPDATE task_dispatch
+             SET state = ?, version = version + 1, requested_by_kind = ?, requested_by_id = ?,
+                 reason = ?, updated_at = ?
+             WHERE task_id = ? AND version = ?",
+        )
+        .bind(input.state.to_string())
+        .bind(&input.requested_by_kind)
+        .bind(input.requested_by_id.as_deref())
+        .bind(input.reason.as_deref())
+        .bind(&input.created_at)
+        .bind(&input.task_id)
+        .bind(input.expected_intent_version)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        let dispatch_row = sqlx::query(
+            "SELECT task_id, state, version, requested_by_kind, requested_by_id, reason,
+                    created_at, updated_at
+             FROM task_dispatch WHERE task_id = ?",
+        )
+        .bind(&input.task_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let dispatch = map_task_dispatch(&dispatch_row)?;
+        let receipt = TaskDispatchReceipt {
+            id: input.receipt_id,
+            task_id: input.task_id,
+            operation: input.operation,
+            idempotency_key: input.idempotency_key,
+            request_digest: input.request_digest,
+            intent_version: dispatch.version,
+            created_at: input.created_at,
+        };
+        transaction.commit().await?;
+        Ok(TaskDispatchWrite {
+            dispatch,
+            receipt,
+            replayed: false,
         })
     }
 }
