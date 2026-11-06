@@ -2,11 +2,11 @@
 import type { TaskDispatchIntentResponse } from "./TaskDispatchIntentResponse";
 import type { TaskLaunchPreflightResponse } from "./TaskLaunchPreflightResponse";
 
-export type TaskLaunchResponse = { admitted: boolean, dispatch: TaskDispatchIntentResponse, preflight: TaskLaunchPreflightResponse, 
+export type TaskLaunchResponse = { admitted: boolean, dispatch: TaskDispatchIntentResponse, preflight: TaskLaunchPreflightResponse,
 /**
  * Executions admitted by the launch request or by its dispatcher tick.
  */
-admitted_execution_ids: Array<string>, 
+admitted_execution_ids: Array<string>,
 /**
  * Executions whose external provider start was accepted in this request.
  */
