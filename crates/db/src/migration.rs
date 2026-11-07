@@ -65,6 +65,7 @@ use std::{
 // records the compatibility access setting; V138 retires Task classification
 // and per-Task access settings while keeping Task data and repository authority
 // checks current.
+// V157 advances rework review lines by their exact result across parallel reports.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

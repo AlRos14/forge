@@ -5768,10 +5768,10 @@ async fn v148_facts_and_legacy_task_roles_survive_role_capability_migrations() {
     .await
     .expect("historical Gate input loads");
 
-    copy_migrations_through(156, migrations.path());
+    copy_migrations_through(157, migrations.path());
     run_migrations_from(&pool, migrations.path())
         .await
-        .expect("database migrates from V148 through V156");
+        .expect("database migrates from V148 through V157");
 
     let migrated_input: String = sqlx::query_scalar(
         "SELECT json_object(

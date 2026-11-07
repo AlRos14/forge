@@ -100,6 +100,11 @@ atomically. Replaying the same idempotency key consumes nothing and returns the
 same units. The dispatcher performs the external starts; the rework operation
 does not.
 
+Opening a correction advances the line by the exact reviewed result. Another
+reviewer's later report over that same result does not prevent a valid
+request-changes report from opening the round. The new pending result clears
+the line's previous approval while preserving every historical revision.
+
 The previous implementation and review units are not reopened or rewritten.
 A later review sees the correction result, not the earlier version. An
 independent reviewer cannot be an Actor that contributed to the reviewed

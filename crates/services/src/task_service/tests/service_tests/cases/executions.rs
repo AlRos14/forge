@@ -697,9 +697,15 @@ async fn create_claimed_review_execution(
         .expect("independent source WorkUnit");
     let source_execution_id = db::new_uuid_v4();
     let source_time = now_rfc3339();
-    sqlx::query("INSERT INTO execution (id,task_id,role,status,actor_kind,actor_id,work_unit_id,work_unit_version,created_at,updated_at) VALUES (?,?,'implementer','completed','human',?,?,?, ?,?)")
+    sqlx::query("INSERT INTO execution (id,task_id,role,status,actor_kind,actor_id,work_unit_id,work_unit_version,created_at,updated_at) VALUES (?,?,'implementer','running','human',?,?,?, ?,?)")
         .bind(&source_execution_id).bind(&task.id).bind(&human_id).bind(&source.id).bind(source.version)
-        .bind(&source_time).bind(&source_time).execute(db.pool()).await.expect("completed independent source attempt");
+        .bind(&source_time).bind(&source_time).execute(db.pool()).await.expect("admitted independent source attempt");
+    sqlx::query("UPDATE execution SET status = 'completed', updated_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&source_execution_id)
+        .execute(db.pool())
+        .await
+        .expect("independent source attempt completes after admission");
     work_unit_service
         .transition(
             crate::CollaborationActorSource::Human(human_id.clone()),
@@ -1389,6 +1395,21 @@ async fn pr8_agent_review_execution_materializes_one_exact_review_report() {
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
+    let task_service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    task_service
+        .create_task_role_with_configuration(
+            &task.id,
+            "reviewer",
+            CoordinationMode::Independent,
+            "{}".to_owned(),
+            r#"{"schema_version":1,"display_label":null,"capabilities":["formal_review"],"rework":null}"#.to_owned(),
+        )
+        .await
+        .expect("explicit formal review role");
+    task_service
+        .add_task_role_member(&task.id, "reviewer", ActorRef::Agent(agent_id.clone()))
+        .await
+        .expect("reviewer membership precedes admission");
     let executor_config_snapshot_json = authorized_execution_snapshot(&db, &task, &agent_id).await;
     let now = now_rfc3339();
     let execution = db::ExecutionRepo::create(

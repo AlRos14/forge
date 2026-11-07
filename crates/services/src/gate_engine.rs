@@ -2656,7 +2656,10 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .expect("TaskRole membership events");
-        assert_eq!(membership_events, 3);
+        assert_eq!(
+            membership_events, 4,
+            "includes explicit capability configuration"
+        );
     }
 
     #[tokio::test]

@@ -254,8 +254,8 @@ async fn human_reviews_an_exact_work_unit_without_creating_an_execution_manually
             }
         );
     }
-    // Rework starts unassigned: later allocation and instruction edits must not
-    // strand R2 on the preparation version of C1.
+    // Rework requires an explicit Actor. Later allocation and instruction edits
+    // must not strand R2 on the preparation version of C1.
     let task: TaskResponse = empty_request(
         &harness.app,
         Method::GET,
@@ -263,16 +263,53 @@ async fn human_reviews_an_exact_work_unit_without_creating_an_execution_manually
         StatusCode::OK,
     )
     .await;
-    let round: api_types::RequestReworkResponse = json_request(&harness.app, Method::POST,
-        &format!("/api/v1/tasks/{}/rework", task.id), json!({
-            "expected_task_version":task.version,"expected_lifecycle_version":task.lifecycle.version,
-            "review_report_artifact_id":submitted.report.id,
-            "reviewed_work_unit_id":implementation.id,"reviewed_work_unit_version":implementation.version,
-            "correction_title":"C1","correction_scope":"Add missing evidence","correction_role_id":implementer_role_id,
-            "correction_actor":null,"review_title":"R2","review_scope":"Review corrected evidence",
-            "review_actor":{"kind":"human","id":"test-user-id"},
-            "idempotency_key":"late-allocation-round"
-        }), StatusCode::OK).await;
+    let mut rework_request = json!({
+        "expected_task_version":task.version,"expected_lifecycle_version":task.lifecycle.version,
+        "review_report_artifact_id":submitted.report.id,
+        "reviewed_work_unit_id":implementation.id,"reviewed_work_unit_version":implementation.version,
+        "correction_title":"C1","correction_scope":"Add missing evidence","correction_role_id":implementer_role_id,
+        "correction_actor":null,"review_title":"R2","review_scope":"Review corrected evidence",
+        "review_actor":{"kind":"human","id":"test-user-id"},
+        "idempotency_key":"late-allocation-round"
+    });
+    let rework_url = format!("/api/v1/tasks/{}/rework", task.id);
+    let _: Value = json_request(
+        &harness.app,
+        Method::POST,
+        &rework_url,
+        rework_request.clone(),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    rework_request["correction_actor"] = json!({"kind":"agent","id":agent_id});
+    let round: api_types::RequestReworkResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &rework_url,
+        rework_request,
+        StatusCode::OK,
+    )
+    .await;
+    let lines: Vec<api_types::ReviewLineResponse> = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/review-lines", task.id),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    let line = lines
+        .iter()
+        .find(|line| line.root_work_unit_id == implementation.id)
+        .unwrap();
+    assert_eq!(line.current_work_unit_id, round.correction_work_unit.id);
+    assert!(line.current_result_execution_id.is_none());
+    assert!(line.latest_report_artifact_id.is_none());
+    assert!(line
+        .history
+        .iter()
+        .any(|revision| revision.review_report_artifact_id.as_deref()
+            == Some(submitted.report.id.as_str())));
     let correction: WorkUnitResponse = json_request(
         &harness.app,
         Method::POST,

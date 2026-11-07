@@ -150,6 +150,10 @@ PR14 audit on 2026-10-16.
 
 ### Fixed
 
+- V157 advances a correction's review line from the exact reviewed result even
+  when another reviewer has since reported on that same result. Existing
+  reports and review-line revisions remain immutable.
+
 - Daemon generation retirement lets the harness finish cancellation cleanup
   before joining its execution. A timed-out cleanup fails closed instead of
   reporting a retired generation while provider processes may still run.
