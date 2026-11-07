@@ -754,6 +754,16 @@ impl TaskCoordinationRepo for SqliteDb {
             return Err(DbError::IdempotencyConflict);
         }
         sqlx::query(
+            "INSERT INTO artifact_execution_producer (artifact_id, execution_id, task_id)
+             VALUES (?, ?, ?)",
+        )
+        .bind(&input.artifact_id)
+        .bind(&input.producer_execution_id)
+        .bind(&input.task_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(check_error)?;
+        sqlx::query(
             "INSERT INTO artifact (
                 id, task_id, kind, storage_kind, content, content_ref,
                 metadata_json, digest, created_at
@@ -765,16 +775,6 @@ impl TaskCoordinationRepo for SqliteDb {
         .bind(&input.artifact_metadata_json)
         .bind(&input.plan_digest)
         .bind(&input.created_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
-        sqlx::query(
-            "INSERT INTO artifact_execution_producer (artifact_id, execution_id, task_id)
-             VALUES (?, ?, ?)",
-        )
-        .bind(&input.artifact_id)
-        .bind(&input.producer_execution_id)
-        .bind(&input.task_id)
         .execute(&mut *tx)
         .await
         .map_err(check_error)?;
