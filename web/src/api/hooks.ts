@@ -47,6 +47,11 @@ import type {
   RepoSyncResponse,
   UpdateRepoRequest,
   CreateTaskRequest,
+  AuthorizeTaskCoordinationRequest,
+  CreateTaskCoordinationTurnRequest,
+  CreateTaskCoordinationTurnResponse,
+  CreateTaskInterventionRequest,
+  CreateTaskQualityRequest,
   Daemon,
   Execution,
   ExecutionLogsResponse,
@@ -79,6 +84,17 @@ import type {
   SubmitWorkUnitReviewRequest,
   ValidationRunResponse,
   Task,
+  TaskCoordinationOverviewResponse,
+  TaskCoordinationPlanResponse,
+  TaskCoordinationRequestResponse,
+  TaskInterventionResponse,
+  TaskInterventionsResponse,
+  TaskQualityRequestResponse,
+  TaskQualityRequestsResponse,
+  MaterializeTaskCoordinationPlanRequest,
+  MaterializeTaskCoordinationPlanResponse,
+  RevokeTaskCoordinationRequest,
+  ResolveTaskQualityRequest,
   TaskLifecycleState,
   TaskLifecycleTransitionFactResponse,
   TransitionTaskLifecycleRequest,
@@ -428,6 +444,175 @@ export function useTaskWorkUnitsQuery(taskId: string) {
     queryKey: qk.workUnits(taskId),
     queryFn: () => apiFetch<WorkUnitResponse[]>(`/tasks/${taskId}/work-units`),
     enabled: Boolean(taskId),
+  })
+}
+
+function invalidateTaskCoordinationQueries(
+  queryClient: ReturnType<typeof useQueryClient>,
+  taskId: string,
+) {
+  void queryClient.invalidateQueries({ queryKey: qk.taskCoordination(taskId) })
+  void queryClient.invalidateQueries({ queryKey: qk.taskQualityRequests(taskId) })
+  void queryClient.invalidateQueries({ queryKey: qk.taskInterventions(taskId) })
+  void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+  void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
+  void queryClient.invalidateQueries({ queryKey: qk.workUnits(taskId) })
+  void queryClient.invalidateQueries({ queryKey: qk.lifecycleTransitions(taskId) })
+}
+
+export function useTaskCoordinationQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskCoordination(taskId),
+    queryFn: () => apiFetch<TaskCoordinationOverviewResponse>(`/tasks/${taskId}/coordination`),
+    enabled: Boolean(taskId),
+    refetchInterval: (query) => {
+      const state = query.state.data?.latest_request?.state
+      return state === 'requested' || state === 'running' ? 2_000 : false
+    },
+  })
+}
+
+export function useTaskCoordinationRequestQuery(taskId: string, requestId: string | null) {
+  return useQuery({
+    queryKey: qk.taskCoordinationRequest(taskId, requestId ?? ''),
+    queryFn: () =>
+      apiFetch<TaskCoordinationRequestResponse>(
+        `/tasks/${taskId}/coordination/requests/${requestId}`,
+      ),
+    enabled: Boolean(taskId && requestId),
+    refetchInterval: (query) => {
+      const state = query.state.data?.state
+      return state === 'requested' || state === 'running' ? 2_000 : false
+    },
+  })
+}
+
+export function useTaskCoordinationPlanQuery(taskId: string, artifactId: string | null) {
+  return useQuery({
+    queryKey: qk.taskCoordinationPlan(taskId, artifactId ?? ''),
+    queryFn: () =>
+      apiFetch<TaskCoordinationPlanResponse>(`/tasks/${taskId}/coordination/plans/${artifactId}`),
+    enabled: Boolean(taskId && artifactId),
+  })
+}
+
+export function useAuthorizeTaskCoordination() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, body }: { taskId: string; body: AuthorizeTaskCoordinationRequest }) =>
+      apiFetch<TaskCoordinationOverviewResponse>(`/tasks/${taskId}/coordination/authorize`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: (result) => invalidateTaskCoordinationQueries(queryClient, result.task_id),
+  })
+}
+
+export function useRevokeTaskCoordination() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, body }: { taskId: string; body: RevokeTaskCoordinationRequest }) =>
+      apiFetch<TaskCoordinationOverviewResponse>(`/tasks/${taskId}/coordination/revoke`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: (result) => invalidateTaskCoordinationQueries(queryClient, result.task_id),
+  })
+}
+
+export function useRequestTaskCoordinationTurn() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, body }: { taskId: string; body: CreateTaskCoordinationTurnRequest }) =>
+      apiFetch<CreateTaskCoordinationTurnResponse>(`/tasks/${taskId}/coordination/requests`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: (result) => invalidateTaskCoordinationQueries(queryClient, result.request.task_id),
+  })
+}
+
+export function useMaterializeTaskCoordinationPlan() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      artifactId,
+      body,
+    }: {
+      taskId: string
+      artifactId: string
+      body: MaterializeTaskCoordinationPlanRequest
+    }) =>
+      apiFetch<MaterializeTaskCoordinationPlanResponse>(
+        `/tasks/${taskId}/coordination/plans/${artifactId}/materialize`,
+        { method: 'POST', body: JSON.stringify(body) },
+      ),
+    onSuccess: (result) => invalidateTaskCoordinationQueries(queryClient, result.plan.task_id),
+  })
+}
+
+export function useTaskQualityRequestsQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskQualityRequests(taskId),
+    queryFn: () =>
+      apiFetch<TaskQualityRequestsResponse>(`/tasks/${taskId}/coordination/quality-requests`),
+    enabled: Boolean(taskId),
+    refetchInterval: 5_000,
+  })
+}
+
+export function useCreateTaskQualityRequest() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, body }: { taskId: string; body: CreateTaskQualityRequest }) =>
+      apiFetch<TaskQualityRequestResponse>(`/tasks/${taskId}/coordination/quality-requests`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: (result) => invalidateTaskCoordinationQueries(queryClient, result.task_id),
+  })
+}
+
+export function useResolveTaskQualityRequest() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      requestId,
+      body,
+    }: {
+      taskId: string
+      requestId: string
+      body: ResolveTaskQualityRequest
+    }) =>
+      apiFetch<TaskQualityRequestResponse>(
+        `/tasks/${taskId}/coordination/quality-requests/${requestId}/resolve`,
+        { method: 'POST', body: JSON.stringify(body) },
+      ),
+    onSuccess: (result) => invalidateTaskCoordinationQueries(queryClient, result.task_id),
+  })
+}
+
+export function useTaskInterventionsQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskInterventions(taskId),
+    queryFn: () =>
+      apiFetch<TaskInterventionsResponse>(`/tasks/${taskId}/coordination/interventions`),
+    enabled: Boolean(taskId),
+    refetchInterval: 5_000,
+  })
+}
+
+export function useCreateTaskIntervention() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, body }: { taskId: string; body: CreateTaskInterventionRequest }) =>
+      apiFetch<TaskInterventionResponse>(`/tasks/${taskId}/coordination/interventions`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: (result) => invalidateTaskCoordinationQueries(queryClient, result.task_id),
   })
 }
 

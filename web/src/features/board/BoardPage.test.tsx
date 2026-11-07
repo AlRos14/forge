@@ -9,6 +9,26 @@ vi.mock('@/api/hooks', () => ({
   useCreateTask: vi.fn(),
   useTasksQuery: vi.fn(),
   useTransitionTaskLifecycle: vi.fn(),
+  useProjectQuery: () => ({ data: { owner_id: 'owner-1' }, isError: false, isLoading: false }),
+  useProjectTaskRoleDefaultsQuery: () => ({
+    data: { roles: [] },
+    isError: false,
+    isLoading: false,
+    refetch: vi.fn(),
+  }),
+  useMembersQuery: () => ({ data: [], isError: false, isLoading: false, refetch: vi.fn() }),
+  useAgentsInfiniteQuery: () => ({
+    data: { pages: [] },
+    isError: false,
+    isLoading: false,
+    refetch: vi.fn(),
+  }),
+  useDaemonsQuery: () => ({
+    data: { items: [] },
+    isError: false,
+    isLoading: false,
+    refetch: vi.fn(),
+  }),
 }))
 
 describe('BoardPage TaskLifecycle authority', () => {

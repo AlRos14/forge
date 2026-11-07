@@ -2,14 +2,12 @@ import { useEffect, useState, type FormEvent } from 'react'
 import { Link } from '@tanstack/react-router'
 import { toast } from 'sonner'
 import {
-  useCancelTask,
   useAgentsInfiniteQuery,
+  useCreateTaskIntervention,
   useDaemonsQuery,
   useEvaluateGate,
   useExecutionsQuery,
   useLaunchTask,
-  usePauseTask,
-  useResumeTask,
   useReviewsQuery,
   useTaskDispatchQuery,
   useTaskGatesQuery,
@@ -48,6 +46,7 @@ import { TaskReworkPanel } from '@/components/task-detail/task-rework-panel'
 import { WorkUnitHumanReviewPanel } from '@/components/task-detail/work-unit-review-panel'
 import { ActorIdentity } from '@/features/task-roles/ActorIdentity'
 import { CopyReferenceButton } from '@/components/ui/copy-reference-button'
+import { TaskCoordinationPanel } from '@/components/task-detail/task-coordination-panel'
 import type {
   GateEvaluationResponse,
   MergeAfterGateResponse,
@@ -156,9 +155,7 @@ export function TaskDetailPage({
   const updateTask = useUpdateTask()
   const evaluateGate = useEvaluateGate()
   const launchTask = useLaunchTask()
-  const pauseTask = usePauseTask()
-  const resumeTask = useResumeTask()
-  const cancelTask = useCancelTask()
+  const createIntervention = useCreateTaskIntervention()
   const userId = useAuthStore((state) => state.user?.id)
   const [evaluations, setEvaluations] = useState<Record<string, GateEvaluationResponse>>({})
   const [editTaskOpen, setEditTaskOpen] = useState(false)
@@ -278,15 +275,36 @@ export function TaskDetailPage({
         toast.success(
           `Task launch admitted. Executions admitted: ${result.admitted_execution_ids.length}; provider starts accepted: ${result.started_execution_ids.length}.`,
         )
-      } else if (action === 'pause') {
-        await pauseTask.mutateAsync({ taskId: task.id, body })
-        toast.success('Task dispatch paused; currently running work may continue.')
-      } else if (action === 'resume') {
-        await resumeTask.mutateAsync({ taskId: task.id, body })
-        toast.success('Task dispatch resumed.')
       } else {
-        await cancelTask.mutateAsync({ taskId: task.id, body })
-        toast.success('Task cancelled; Forge requested cancellation of running Executions.')
+        const kind = action as 'pause' | 'resume' | 'cancel'
+        const result = await createIntervention.mutateAsync({
+          taskId: task.id,
+          body: {
+            kind,
+            expected_task_version: task.version,
+            expected_coordination_version: null,
+            expected_lifecycle_version: task.lifecycle.version,
+            instruction: null,
+            plan_artifact_id: null,
+            decision: null,
+            rationale: null,
+            reason: action === 'cancel' || action === 'pause' ? 'requested from Task detail' : null,
+            brief: null,
+            idempotency_key: crypto.randomUUID(),
+          },
+        })
+        if (result.state === 'rejected') {
+          throw new Error(
+            result.failure_message ?? result.failure_code ?? `Task ${action} was rejected`,
+          )
+        }
+        toast.success(
+          action === 'pause'
+            ? 'New work is paused; work already running may continue.'
+            : action === 'resume'
+              ? 'Task dispatch resumed.'
+              : 'Task cancelled; Forge requested cancellation of running Executions.',
+        )
       }
       await Promise.all([
         taskQuery.refetch(),
@@ -361,7 +379,7 @@ export function TaskDetailPage({
             <Button
               size="sm"
               variant="outline"
-              disabled={pauseTask.isPending}
+              disabled={createIntervention.isPending}
               onClick={() => setDispatchConfirmAction('pause')}
             >
               Pause new work
@@ -371,7 +389,7 @@ export function TaskDetailPage({
             <Button
               size="sm"
               variant="outline"
-              disabled={resumeTask.isPending}
+              disabled={createIntervention.isPending}
               onClick={() => void dispatchAction('resume')}
             >
               Resume work
@@ -381,7 +399,7 @@ export function TaskDetailPage({
             <Button
               size="sm"
               variant="outline"
-              disabled={cancelTask.isPending}
+              disabled={createIntervention.isPending}
               onClick={() => setDispatchConfirmAction('cancel')}
             >
               Cancel Task…
@@ -471,7 +489,7 @@ export function TaskDetailPage({
       <Dialog
         open={dispatchConfirmAction !== null}
         onOpenChange={(open) => {
-          if (!open && !pauseTask.isPending && !cancelTask.isPending) setDispatchConfirmAction(null)
+          if (!open && !createIntervention.isPending) setDispatchConfirmAction(null)
         }}
       >
         <DialogContent>
@@ -489,7 +507,7 @@ export function TaskDetailPage({
             <Button
               type="button"
               variant="outline"
-              disabled={pauseTask.isPending || cancelTask.isPending}
+              disabled={createIntervention.isPending}
               onClick={() => setDispatchConfirmAction(null)}
             >
               Keep Task running
@@ -497,7 +515,7 @@ export function TaskDetailPage({
             <Button
               type="button"
               variant={dispatchConfirmAction === 'cancel' ? 'destructive' : 'default'}
-              disabled={pauseTask.isPending || cancelTask.isPending}
+              disabled={createIntervention.isPending}
               onClick={() => {
                 if (!dispatchConfirmAction) return
                 void dispatchAction(dispatchConfirmAction).then((succeeded) => {
@@ -505,7 +523,7 @@ export function TaskDetailPage({
                 })
               }}
             >
-              {pauseTask.isPending || cancelTask.isPending
+              {createIntervention.isPending
                 ? 'Saving…'
                 : dispatchConfirmAction === 'pause'
                   ? 'Pause new work'
@@ -571,6 +589,15 @@ export function TaskDetailPage({
 
       {activeTab === 'overview' ? (
         <div className="grid min-w-0 gap-4 lg:grid-cols-2">
+          <div className="min-w-0 lg:col-span-2">
+            <TaskCoordinationPanel
+              task={task}
+              agents={agents}
+              members={members}
+              daemons={daemons}
+              onOpenAdvancedWork={() => setActiveTab('work')}
+            />
+          </div>
           <section className="min-w-0 space-y-3 rounded-lg border p-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h2 className="font-semibold">Task status</h2>

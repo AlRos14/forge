@@ -5,6 +5,7 @@ import type { ReviewExecutionResponse } from '@/types/generated'
 
 const pageMocks = vi.hoisted(() => ({
   launch: vi.fn(),
+  intervention: vi.fn(),
 }))
 
 vi.mock('@/api/hooks', async () => {
@@ -31,7 +32,7 @@ vi.mock('@/api/hooks', async () => {
   }
   const staleDispatch = {
     can_launch: false,
-    can_pause: false,
+    can_pause: true,
     can_resume: false,
     can_cancel: false,
     blockers: [{ code: 'task_blocked', message: 'blocked', work_unit_id: null }],
@@ -78,11 +79,16 @@ vi.mock('@/api/hooks', async () => {
         started_execution_ids: [],
       }),
     }),
-    usePauseTask: () => noMutation,
-    useResumeTask: () => noMutation,
-    useCancelTask: () => noMutation,
+    useCreateTaskIntervention: () => ({
+      isPending: false,
+      mutateAsync: pageMocks.intervention.mockResolvedValue({ state: 'applied' }),
+    }),
   }
 })
+
+vi.mock('@/components/task-detail/task-coordination-panel', () => ({
+  TaskCoordinationPanel: () => <section>Task coordination</section>,
+}))
 
 vi.mock('@/components/task-detail/task-work-management', () => ({
   TaskWorkManagement: ({ onChanged }: { onChanged: () => Promise<unknown> }) => (
@@ -190,5 +196,31 @@ describe('Task WorkUnit preparation and launch', () => {
     fireEvent.click(launch)
 
     await waitFor(() => expect(pageMocks.launch).toHaveBeenCalledTimes(1))
+  })
+
+  it('records pause as a versioned Task intervention', async () => {
+    render(<TaskDetailPage taskId="task-1" />)
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Pause new work' })[0]!)
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Pause new work' })).at(-1)!)
+
+    await waitFor(() =>
+      expect(pageMocks.intervention).toHaveBeenCalledWith({
+        taskId: 'task-1',
+        body: {
+          kind: 'pause',
+          expected_task_version: 3,
+          expected_coordination_version: null,
+          expected_lifecycle_version: 2,
+          instruction: null,
+          plan_artifact_id: null,
+          decision: null,
+          rationale: null,
+          reason: 'requested from Task detail',
+          brief: null,
+          idempotency_key: expect.any(String),
+        },
+      }),
+    )
   })
 })
