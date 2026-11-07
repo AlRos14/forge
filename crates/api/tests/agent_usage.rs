@@ -51,7 +51,6 @@ async fn unpinned_remote_agent_usage_uses_the_actual_execution_observation() {
             task_id: task.id,
             agent_id: Some(agent.id.clone()),
             actor_ref: None,
-            purpose: None,
             harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Running,

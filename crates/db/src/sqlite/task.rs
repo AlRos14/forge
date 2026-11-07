@@ -117,14 +117,13 @@ impl TaskRepo for SqliteDb {
         transaction: &mut Transaction<'_, Sqlite>,
         input: CreateTask,
     ) -> Result<Task> {
-        sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, title, description, task_type, is_automation, priority, board_position, subtask_order, merge_config, metadata_json, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(board_position), 0.0) + 1.0, ?, ?, ?, ?, ? FROM task WHERE project_id = ?")
+        sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, title, description, is_automation, priority, board_position, subtask_order, merge_config, metadata_json, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(board_position), 0.0) + 1.0, ?, ?, ?, ?, ? FROM task WHERE project_id = ?")
             .bind(&input.id)
             .bind(&input.project_id)
             .bind(input.repo_id.as_deref())
             .bind(input.parent_task_id.as_deref())
             .bind(&input.title)
             .bind(input.description.as_deref())
-            .bind(&input.task_type)
             .bind(if input.is_automation { 1 } else { 0 })
             .bind(input.priority)
             .bind(input.subtask_order)

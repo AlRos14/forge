@@ -16,7 +16,6 @@ describe('BoardPage TaskLifecycle authority', () => {
   const task = {
     id: 'task-ready',
     title: 'Lifecycle ready task',
-    task_type: 'implementation',
     priority: 2,
     status: 'done',
     lifecycle: { state: 'ready', version: 7 },

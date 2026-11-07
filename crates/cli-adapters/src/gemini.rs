@@ -2,13 +2,15 @@ use async_trait::async_trait;
 use executors::{
     AvailabilityInfo, AvailabilityStatus, DiscoverContext, DiscoveredOptions, ExecutionContext,
     ExecutionOutcome, ExecutionResult, ExecutorError, ExecutorKind, GeminiConfig, HarnessAdapter,
-    LogKind, LogStream, LogWriter, PermissionPolicy, ProcessGroupChild,
+    LogKind, LogStream, LogWriter, PermissionPolicy, ProcessGroupChild, ProjectCopilotMcp,
 };
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -16,6 +18,14 @@ const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const PROMPT_SEND_TIMEOUT_SECONDS: u64 = 10;
 const FIRST_OUTPUT_TIMEOUT_SECONDS: u64 = 300;
 const MAX_SUMMARY_CHARS: usize = 500;
+const MODEL_DISCOVERY_TIMEOUT_SECONDS: u64 = 10;
+const GEMINI_COPILOT_MCP_SERVER: &str = "forge-project";
+const PROJECT_COPILOT_TOKEN_ENV: &str = "FORGE_COPILOT_MCP_TOKEN";
+
+struct GeminiProjectCopilotRuntime {
+    root: TempDir,
+    system_settings_path: PathBuf,
+}
 
 pub struct GeminiAdapter {
     processes: Arc<Mutex<HashMap<String, Arc<AsyncMutex<ProcessGroupChild>>>>>,
@@ -81,6 +91,22 @@ impl GeminiAdapter {
         cmd
     }
 
+    fn build_project_copilot_command(config: &GeminiConfig) -> tokio::process::Command {
+        let mut safe_config = config.clone();
+        safe_config.yolo = Some(false);
+        safe_config.permission_policy = Some(PermissionPolicy::Supervised);
+        safe_config.sandbox = None;
+        safe_config.check_every_n = None;
+        let mut command = Self::build_command(&safe_config);
+        command.args([
+            "--extensions",
+            "none",
+            "--allowed-mcp-server-names",
+            GEMINI_COPILOT_MCP_SERVER,
+        ]);
+        command
+    }
+
     fn insert_process(
         &self,
         execution_id: String,
@@ -108,8 +134,192 @@ impl Default for GeminiAdapter {
     }
 }
 
+fn validate_project_copilot_config(
+    config: &GeminiConfig,
+) -> Result<&ProjectCopilotMcp, ExecutorError> {
+    if config.command_overrides.base_command_override.is_some()
+        || config
+            .command_overrides
+            .additional_params
+            .as_ref()
+            .is_some_and(|args| !args.is_empty())
+    {
+        return Err(ExecutorError::Other(
+            "Project Copilot Agent config does not satisfy MCP-only harness policy".to_owned(),
+        ));
+    }
+    const RUNTIME_ENV_ALLOWLIST: &[&str] = &[
+        PROJECT_COPILOT_TOKEN_ENV,
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ];
+    let env =
+        config.command_overrides.env.as_ref().ok_or_else(|| {
+            ExecutorError::Other("Project Copilot MCP token is missing".to_owned())
+        })?;
+    if !env
+        .get(PROJECT_COPILOT_TOKEN_ENV)
+        .is_some_and(|token| !token.is_empty())
+        || env
+            .keys()
+            .any(|key| !RUNTIME_ENV_ALLOWLIST.contains(&key.as_str()))
+    {
+        return Err(ExecutorError::Other(
+            "Project Copilot runtime environment contains unsupported values".to_owned(),
+        ));
+    }
+    let mcp = config.forge_project_copilot.as_ref().ok_or_else(|| {
+        ExecutorError::Other("Project Copilot MCP descriptor is missing".to_owned())
+    })?;
+    let token = config
+        .command_overrides
+        .env
+        .as_ref()
+        .and_then(|env| env.get(PROJECT_COPILOT_TOKEN_ENV))
+        .ok_or_else(|| ExecutorError::Other("Project Copilot MCP token is missing".to_owned()))?;
+    if mcp.mcp_url.contains(token) {
+        return Err(ExecutorError::Other(
+            "Project Copilot MCP token must not appear in its URL".to_owned(),
+        ));
+    }
+    if !valid_project_copilot_mcp_url(&mcp.mcp_url)
+        || mcp.enabled_tools.iter().any(|tool| {
+            tool.is_empty()
+                || !tool
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        })
+    {
+        return Err(ExecutorError::Other(
+            "Project Copilot MCP descriptor is invalid".to_owned(),
+        ));
+    }
+    Ok(mcp)
+}
+
+fn valid_project_copilot_mcp_url(url: &str) -> bool {
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "http" | "https")
+        || remainder.is_empty()
+        || remainder.contains('?')
+        || remainder.contains('#')
+        || remainder.chars().any(char::is_whitespace)
+    {
+        return false;
+    }
+    let authority = remainder.split('/').next().unwrap_or_default();
+    !authority.is_empty() && !authority.contains('@')
+}
+
+fn create_gemini_project_copilot_runtime(
+    mcp: &ProjectCopilotMcp,
+) -> Result<GeminiProjectCopilotRuntime, ExecutorError> {
+    let root = tempfile::Builder::new()
+        .prefix("forge-gemini-copilot-")
+        .tempdir()
+        .map_err(|error| {
+            ExecutorError::Other(format!(
+                "failed to create Gemini Project Copilot runtime directory: {error}"
+            ))
+        })?;
+    let system_settings_path = root.path().join("system-settings.json");
+    let settings = serde_json::json!({
+        "tools": {"core": []},
+        "skills": {"enabled": false},
+        "hooksConfig": {"enabled": false},
+        "mcp": {"allowed": [GEMINI_COPILOT_MCP_SERVER]},
+        "admin": {
+            "secureModeEnabled": true,
+            "extensions": {"enabled": false},
+            "skills": {"enabled": false}
+        },
+        "mcpServers": {
+            (GEMINI_COPILOT_MCP_SERVER): {
+                "httpUrl": &mcp.mcp_url,
+                "headers": {
+                    "Authorization": format!("Bearer ${{{PROJECT_COPILOT_TOKEN_ENV}}}")
+                },
+                "includeTools": &mcp.enabled_tools,
+                "trust": true
+            }
+        }
+    });
+    let contents = serde_json::to_vec(&settings).map_err(|error| {
+        ExecutorError::Other(format!(
+            "failed to encode Gemini Project Copilot settings: {error}"
+        ))
+    })?;
+    fs::write(&system_settings_path, contents).map_err(|error| {
+        ExecutorError::Other(format!(
+            "failed to write Gemini Project Copilot settings: {error}"
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&system_settings_path, fs::Permissions::from_mode(0o600)).map_err(
+            |error| {
+                ExecutorError::Other(format!(
+                    "failed to protect Gemini Project Copilot settings: {error}"
+                ))
+            },
+        )?;
+    }
+    Ok(GeminiProjectCopilotRuntime {
+        root,
+        system_settings_path,
+    })
+}
+
+async fn ensure_gemini_project_copilot_cli_supported() -> Result<(), ExecutorError> {
+    let output = crate::command::output_with_timeout(
+        {
+            let mut command = tokio::process::Command::new("gemini");
+            command.arg("--help");
+            command
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .filter(|output| output.status.success())
+    .ok_or_else(|| {
+        ExecutorError::Unavailable(
+            "Project Copilot could not verify Gemini CLI MCP and extension options".to_owned(),
+        )
+    })?;
+    let help = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if gemini_project_copilot_cli_supports_policy(&help) {
+        Ok(())
+    } else {
+        Err(ExecutorError::Unavailable(
+            "Project Copilot requires Gemini CLI support for --extensions and --allowed-mcp-server-names"
+                .to_owned(),
+        ))
+    }
+}
+
+fn gemini_project_copilot_cli_supports_policy(help: &str) -> bool {
+    ["--extensions", "--allowed-mcp-server-names"]
+        .iter()
+        .all(|option| help.contains(option))
+}
+
 #[async_trait]
 impl HarnessAdapter for GeminiAdapter {
+    fn supports_project_copilot(&self) -> bool {
+        true
+    }
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Gemini
     }
@@ -174,30 +384,43 @@ impl HarnessAdapter for GeminiAdapter {
         &self,
         _ctx: DiscoverContext,
     ) -> Result<DiscoveredOptions, ExecutorError> {
+        let (models, warning) = match discover_gemini_models().await {
+            Ok(models) => (models, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
         Ok(DiscoveredOptions {
-            models: vec![
-                "auto".into(),
-                "pro".into(),
-                "flash".into(),
-                "flash-lite".into(),
-                "gemini-3.5-flash".into(),
-                "gemini-3.1-pro-preview".into(),
-                "gemini-3.1-flash-lite".into(),
-                "gemini-3-pro-preview".into(),
-                "gemini-3-flash-preview".into(),
-                "gemini-2.5-pro".into(),
-                "gemini-2.5-flash".into(),
-                "gemini-2.5-flash-lite".into(),
-            ],
+            models,
             permission_policies: vec!["auto".into(), "supervised".into()],
             cli_specific: serde_json::json!({}),
+            warning,
         })
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
         let config = Self::resolve_config(&ctx);
-        let mut cmd = Self::build_command(&config);
-        cmd.current_dir(&ctx.worktree_path);
+        let project_copilot = ctx.role == "project_copilot";
+        let copilot_runtime = if project_copilot {
+            let mcp = validate_project_copilot_config(&config)?;
+            Some(create_gemini_project_copilot_runtime(mcp)?)
+        } else {
+            None
+        };
+        if project_copilot {
+            ensure_gemini_project_copilot_cli_supported().await?;
+        }
+        let mut cmd = if project_copilot {
+            Self::build_project_copilot_command(&config)
+        } else {
+            Self::build_command(&config)
+        };
+        if let Some(runtime) = &copilot_runtime {
+            cmd.current_dir(runtime.root.path()).env(
+                "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
+                &runtime.system_settings_path,
+            );
+        } else {
+            cmd.current_dir(&ctx.worktree_path);
+        }
 
         let mut child = ProcessGroupChild::spawn(&mut cmd)?;
 
@@ -543,6 +766,68 @@ fn executable_in_path(name: &str) -> bool {
     which::which(name).is_ok()
 }
 
+async fn discover_gemini_models() -> Result<Vec<String>, ExecutorError> {
+    if !executable_in_path("gemini") {
+        return Err(ExecutorError::Unavailable(
+            "Gemini CLI is not available on this daemon. Enter a model ID supported by the installed harness.".to_owned(),
+        ));
+    }
+
+    // Model listing is available in current Gemini CLI releases. Try both
+    // documented spellings so daemon discovery also works across CLI versions.
+    for args in [
+        vec!["models", "-o", "json"],
+        vec!["--list-models", "-o", "json"],
+    ] {
+        let mut command = tokio::process::Command::new("gemini");
+        command.args(args).env("NO_COLOR", "1");
+        let Some(output) = crate::command::output_with_timeout(
+            command,
+            Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECONDS),
+        )
+        .await
+        else {
+            continue;
+        };
+        if output.status.success()
+            && let Some(models) = parse_gemini_model_catalog(&output.stdout)
+            && !models.is_empty()
+        {
+            return Ok(models);
+        }
+    }
+
+    Err(ExecutorError::Unavailable(
+        "This Gemini CLI does not expose a usable model catalog. Enter a model ID supported by the installed harness.".to_owned(),
+    ))
+}
+
+fn parse_gemini_model_catalog(output: &[u8]) -> Option<Vec<String>> {
+    let value = serde_json::from_slice::<serde_json::Value>(output).ok()?;
+    let models = value
+        .as_array()
+        .or_else(|| value.get("models").and_then(serde_json::Value::as_array))?;
+
+    let mut discovered = Vec::new();
+    for model in models {
+        let Some(raw_id) = ["modelId", "id", "name"]
+            .into_iter()
+            .find_map(|key| model.get(key).and_then(serde_json::Value::as_str))
+        else {
+            continue;
+        };
+        let id = raw_id
+            .trim()
+            .strip_prefix("models/")
+            .unwrap_or(raw_id.trim());
+        if !id.is_empty() && !discovered.iter().any(|existing| existing == id) {
+            discovered.push(id.to_owned());
+        }
+    }
+
+    Some(discovered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,23 +846,6 @@ mod tests {
             config.command_overrides.additional_params,
             Some(vec!["--verbose".to_owned()])
         );
-    }
-
-    #[tokio::test]
-    async fn discovery_advertises_current_models_and_aliases() {
-        let discovered = GeminiAdapter::new()
-            .discover_options(DiscoverContext { project_path: None })
-            .await
-            .expect("discovery should succeed");
-
-        assert!(discovered.models.contains(&"auto".to_owned()));
-        assert!(discovered.models.contains(&"gemini-3.5-flash".to_owned()));
-        assert!(
-            discovered
-                .models
-                .contains(&"gemini-3.1-pro-preview".to_owned())
-        );
-        assert!(!discovered.models.contains(&"gemini-2.0-flash".to_owned()));
     }
 
     #[test]

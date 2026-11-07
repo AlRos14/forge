@@ -8,7 +8,13 @@ interface TabsCtx {
 
 const Ctx = createContext<TabsCtx>({ value: '', onValueChange: () => {} })
 
-export function Tabs({ defaultValue, value: controlledValue, onValueChange, children, className }: {
+export function Tabs({
+  defaultValue,
+  value: controlledValue,
+  onValueChange,
+  children,
+  className,
+}: {
   defaultValue?: string
   value?: string
   onValueChange?: (v: string) => void
@@ -28,13 +34,26 @@ export function Tabs({ defaultValue, value: controlledValue, onValueChange, chil
 
 export function TabsList({ children, className }: { children: ReactNode; className?: string }) {
   return (
-    <div className={cn('inline-flex h-10 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground', className)}>
+    <div
+      className={cn(
+        'flex min-h-10 max-w-full flex-wrap items-center rounded-md bg-muted p-1 text-muted-foreground',
+        className,
+      )}
+    >
       {children}
     </div>
   )
 }
 
-export function TabsTrigger({ value, children, className }: { value: string; children: ReactNode; className?: string }) {
+export function TabsTrigger({
+  value,
+  children,
+  className,
+}: {
+  value: string
+  children: ReactNode
+  className?: string
+}) {
   const ctx = useContext(Ctx)
   return (
     <button
@@ -51,11 +70,24 @@ export function TabsTrigger({ value, children, className }: { value: string; chi
   )
 }
 
-export function TabsContent({ value, children, className }: { value: string; children: ReactNode; className?: string }) {
+export function TabsContent({
+  value,
+  children,
+  className,
+}: {
+  value: string
+  children: ReactNode
+  className?: string
+}) {
   const ctx = useContext(Ctx)
   if (ctx.value !== value) return null
   return (
-    <div className={cn('mt-2 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2', className)}>
+    <div
+      className={cn(
+        'mt-2 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
+        className,
+      )}
+    >
       {children}
     </div>
   )

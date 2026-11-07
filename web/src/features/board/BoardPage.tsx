@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { toast } from 'sonner'
-import { useCreateTask, useTasksQuery, useTransitionTaskLifecycle } from '@/api/hooks'
+import { useTasksQuery, useTransitionTaskLifecycle } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Textarea } from '@/components/ui/textarea'
+import { TaskCreateDialog } from '@/components/task-create-dialog'
 import { getApiErrorMessage } from '@/lib/api-error'
 import type { Task, TaskLifecycleState } from '@/types/generated'
 
@@ -25,8 +25,6 @@ export function BoardPage({ projectId }: { projectId: string }) {
   const [queryText, setQueryText] = useState('')
   const [includeCancelled, setIncludeCancelled] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
-  const [title, setTitle] = useState('')
-  const [description, setDescription] = useState('')
   const tasksQuery = useTasksQuery(projectId, {
     q: queryText.trim() || undefined,
     lifecycle_state: lanes.join(','),
@@ -34,7 +32,6 @@ export function BoardPage({ projectId }: { projectId: string }) {
     sort_order: 'asc',
     limit: 200,
   })
-  const createTask = useCreateTask(projectId)
   const transition = useTransitionTaskLifecycle()
   const allTasks = tasksQuery.data?.pages.flatMap((page) => page.items) ?? []
   const tasks = includeCancelled ? allTasks : allTasks.filter((task) => task.lifecycle.state !== 'cancelled')
@@ -49,25 +46,6 @@ export function BoardPage({ projectId }: { projectId: string }) {
       window.removeEventListener('forge:focus-board-search', focus)
     }
   }, [])
-
-  async function create() {
-    const nextTitle = title.trim()
-    if (!nextTitle) return
-    try {
-      const task = await createTask.mutateAsync({
-        title: nextTitle,
-        description: description.trim() || undefined,
-        task_type: 'implementation',
-        priority: 0,
-      })
-      setTitle('')
-      setDescription('')
-      setCreateOpen(false)
-      void navigate({ to: '/tasks/$taskId', params: { taskId: task.id } })
-    } catch (error) {
-      toast.error(getApiErrorMessage(error, 'Task creation failed'))
-    }
-  }
 
   async function move(task: Task, toState: TaskLifecycleState) {
     try {
@@ -94,16 +72,14 @@ export function BoardPage({ projectId }: { projectId: string }) {
         <Button onClick={() => setCreateOpen((open) => !open)}>New task</Button>
       </header>
 
-      {createOpen ? (
-        <section className="grid gap-3 rounded-lg border p-4 sm:grid-cols-2">
-          <Input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Task title" aria-label="Task title" />
-          <Textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Description (optional)" aria-label="Task description" />
-          <div className="flex gap-2 sm:col-span-2">
-            <Button disabled={!title.trim() || createTask.isPending} onClick={() => void create()}>{createTask.isPending ? 'Creating…' : 'Create task'}</Button>
-            <Button variant="outline" onClick={() => setCreateOpen(false)}>Cancel</Button>
-          </div>
-        </section>
-      ) : null}
+      <TaskCreateDialog
+        open={createOpen}
+        projectId={projectId}
+        onOpenChange={setCreateOpen}
+        onCreated={(task) => {
+          void navigate({ to: '/tasks/$taskId', params: { taskId: task.id } })
+        }}
+      />
 
       {tasksQuery.isError ? <ErrorBanner error={tasksQuery.error} fallback="Task board failed to load" onRetry={() => void tasksQuery.refetch()} /> : null}
       {tasksQuery.isLoading ? <p className="text-sm text-muted-foreground">Loading board…</p> : null}
@@ -121,7 +97,7 @@ export function BoardPage({ projectId }: { projectId: string }) {
                   <article key={task.id} className="space-y-3 rounded-md border bg-card p-3 shadow-sm">
                     <button type="button" className="block w-full text-left" onClick={() => void navigate({ to: '/tasks/$taskId', params: { taskId: task.id } })}>
                       <strong className="block text-sm">{task.title}</strong>
-                      <span className="mt-1 block text-xs text-muted-foreground">{task.task_type} · priority {task.priority}</span>
+                      <span className="mt-1 block text-xs text-muted-foreground">priority {task.priority}</span>
                     </button>
                     <div className="flex flex-wrap gap-1">
                       {(nextStates[state] ?? []).map((next) => (

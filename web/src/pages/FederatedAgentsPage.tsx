@@ -2,10 +2,7 @@ import { useEffect, useState } from 'react'
 import { useSearch } from '@tanstack/react-router'
 import { Plus } from '@phosphor-icons/react'
 import { Button } from '@/components/ui/button'
-import {
-  useFederatedAgentsQuery,
-  useProvidersQuery,
-} from '@/features/federation/hooks'
+import { useFederatedAgentsQuery, useProvidersQuery } from '@/features/federation/hooks'
 import type { FederatedAgent } from '@/features/federation/types'
 import type { CliRuntimeEntryResponse, ProviderEntryResponse } from '@/types/generated'
 import { PageHeader } from '@/features/federation/components'
@@ -64,7 +61,7 @@ export function FederatedAgentsPage() {
   }
 
   return (
-    <div className="min-h-full space-y-6 p-5 lg:p-8">
+    <div className="min-h-full min-w-0 space-y-6">
       <PageHeader
         eyebrow="Account-owned providers and agents"
         title="Agent Settings"

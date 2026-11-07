@@ -100,6 +100,19 @@ pub trait TaskLifecycleRepo: Send + Sync {
         &self,
         input: TransitionTaskLifecycle,
     ) -> Result<TaskLifecycleTransitionWrite>;
+    async fn get_task_dispatch(&self, task_id: &str) -> Result<Option<TaskDispatch>>;
+    async fn get_task_dispatch_receipt(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<TaskDispatchReceipt>>;
+    async fn list_running_task_dispatches(&self) -> Result<Vec<TaskDispatch>>;
+    /// Apply one launch/pause/resume/cancel intent and its idempotency receipt
+    /// in one serialized write.
+    async fn transition_task_dispatch(
+        &self,
+        input: TransitionTaskDispatch,
+    ) -> Result<TaskDispatchWrite>;
 }
 
 #[async_trait]
@@ -601,6 +614,13 @@ pub trait WorkUnitRepo: Send + Sync {
         input: CreateWorkUnit,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<WorkUnit>>;
+    /// Atomically create a WorkUnit and its immutable reviewed-result identity.
+    async fn create_with_review_subject(
+        &self,
+        input: CreateWorkUnit,
+        subject: CreateWorkUnitReviewSubject,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnit>>;
     /// Scope-only lookup for the auth-before-load boundary.
     async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_by_id(&self, id: &str) -> Result<Option<WorkUnit>>;
@@ -799,6 +819,7 @@ pub trait ExecutionRepo: Send + Sync {
     async fn find_running_human_review_execution(
         &self,
         task_id: &str,
+        task_role_id: &str,
         user_id: &str,
         workspace_id: Option<&str>,
     ) -> Result<Option<Execution>>;
@@ -831,6 +852,10 @@ pub trait ExecutionRepo: Send + Sync {
     /// an orderly shutdown or process crash. Task-scoped legacy Executions are
     /// intentionally excluded.
     async fn list_work_unit_auto_recovery_candidates(&self) -> Result<Vec<Execution>>;
+    /// Exact latest WorkUnit-bound interrupted attempts that must be resolved
+    /// before a fresh parentless attempt can be admitted. Includes both Auto
+    /// restart and Human-directed recovery candidates.
+    async fn list_work_unit_recovery_required_candidates(&self) -> Result<Vec<Execution>>;
     /// Newly admitted Agent WorkUnit Executions whose external provider start
     /// has not been claimed. Older admissions without this receipt are not
     /// inferred to be pending because their external outcome is unknowable.
@@ -910,6 +935,7 @@ pub enum ProviderStartClaim {
     Uncertain,
     AuthorityLost,
     TaskCancelled,
+    TaskPaused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1331,6 +1357,106 @@ pub trait ProjectRepo: Send + Sync {
     /// Deletes a Project. When `caller_user_id` is provided, the exact
     /// owner/admin membership is rechecked inside the deletion transaction.
     async fn delete(&self, id: &str, caller_user_id: Option<&str>) -> Result<()>;
+}
+
+#[async_trait]
+pub trait ProjectTaskRoleDefaultsRepo: Send + Sync {
+    async fn get_task_role_defaults(&self, project_id: &str) -> Result<ProjectTaskRoleDefaults>;
+    async fn get_task_role_defaults_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        project_id: &str,
+    ) -> Result<ProjectTaskRoleDefaults>;
+    async fn replace_task_role_defaults(
+        &self,
+        project_id: &str,
+        caller_user_id: &str,
+        expected_version: i64,
+        roles: Vec<ProjectTaskRoleDefault>,
+        updated_at: &str,
+    ) -> Result<ProjectTaskRoleDefaults>;
+}
+
+#[async_trait]
+pub trait ProjectCopilotRepo: Send + Sync {
+    async fn get_copilot_binding(&self, project_id: &str) -> Result<ProjectCopilotBinding>;
+    async fn update_copilot_binding(
+        &self,
+        project_id: &str,
+        caller_user_id: &str,
+        expected_version: i64,
+        agent_id: Option<&str>,
+        updated_at: &str,
+    ) -> Result<ProjectCopilotBinding>;
+    async fn create_copilot_run(
+        &self,
+        run: CreateProjectCopilotRun,
+        user_message: CreateProjectCopilotMessage,
+    ) -> Result<ProjectCopilotRunAdmission>;
+    async fn get_copilot_run_by_idempotency(
+        &self,
+        project_id: &str,
+        user_id: &str,
+        idempotency_key: &str,
+        request_digest: &str,
+    ) -> Result<Option<ProjectCopilotRunAdmission>>;
+    async fn get_copilot_run(
+        &self,
+        project_id: &str,
+        run_id: &str,
+    ) -> Result<Option<ProjectCopilotRun>>;
+    async fn get_copilot_run_by_id(&self, run_id: &str) -> Result<Option<ProjectCopilotRun>>;
+    async fn get_active_copilot_run(&self, project_id: &str) -> Result<Option<ProjectCopilotRun>>;
+    async fn get_copilot_message(
+        &self,
+        run_id: &str,
+        role: &str,
+    ) -> Result<Option<ProjectCopilotMessage>>;
+    async fn list_copilot_messages(
+        &self,
+        project_id: &str,
+        query: CopilotMessagePageQuery,
+    ) -> Result<Page<ProjectCopilotMessage>>;
+    async fn list_copilot_prompt_messages(
+        &self,
+        project_id: &str,
+        max_messages: i64,
+    ) -> Result<Vec<ProjectCopilotMessage>>;
+    async fn claim_copilot_run(
+        &self,
+        run_id: &str,
+        token_hash: &str,
+        token_expires_at: &str,
+        now: &str,
+    ) -> Result<Option<ProjectCopilotRun>>;
+    async fn finish_copilot_run(
+        &self,
+        run_id: &str,
+        status: ProjectCopilotRunStatus,
+        assistant_message: Option<CreateProjectCopilotMessage>,
+        failure_code: Option<&str>,
+        failure_message: Option<&str>,
+        now: &str,
+    ) -> Result<Option<ProjectCopilotRun>>;
+    async fn cancel_copilot_run(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        caller_user_id: &str,
+        now: &str,
+    ) -> Result<Option<ProjectCopilotRun>>;
+    async fn recover_active_copilot_runs(&self, now: &str) -> Result<i64>;
+    async fn get_copilot_run_id_by_token_hash(&self, token_hash: &str) -> Result<Option<String>>;
+    async fn authorize_run(&self, run_id: &str) -> Result<ProjectCopilotRunGrant>;
+    async fn authorize_run_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        grant: &ProjectCopilotRunGrant,
+        scope_type: &str,
+        scope_id: &str,
+        actor_type: &str,
+        actor_id: &str,
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -1768,11 +1894,31 @@ pub struct CreateWorkUnit {
     pub parent_work_unit_id: Option<String>,
     pub title: String,
     pub scope: String,
+    pub execution_instructions: Option<String>,
     pub role: String,
     pub assigned_actor: Option<ActorRef>,
     pub requires_integration: bool,
     pub provenance: Option<WorkUnitProvenance>,
+    pub artifact_input_ids: Vec<String>,
+    pub review_approval_gate_id: Option<String>,
+    pub review_approval_line_id: Option<String>,
     pub created_by: ActorRef,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkUnitReviewSubject {
+    pub review_work_unit_id: String,
+    pub task_id: String,
+    pub reviewed_work_unit_id: String,
+    pub reviewed_work_unit_version: Option<i64>,
+    pub result_execution_id: Option<String>,
+    pub result_artifact_id: Option<String>,
+    pub result_commit_sha: Option<String>,
+    pub result_workspace_id: Option<String>,
+    pub workspace_snapshot_digest: Option<String>,
+    pub manifest_json: Option<String>,
+    pub manifest_digest: Option<String>,
     pub created_at: String,
 }
 
@@ -1804,6 +1950,7 @@ pub struct UpdateWorkUnit {
     pub expected_version: i64,
     pub title: Option<String>,
     pub scope: Option<String>,
+    pub execution_instructions: Option<Option<String>>,
     pub parent_work_unit_id: Option<Option<String>>,
     pub requires_integration: Option<bool>,
     pub updated_at: String,
@@ -1824,6 +1971,23 @@ pub struct TransitionWorkUnit {
     pub expected_version: i64,
     pub status: WorkUnitStatus,
     pub updated_at: String,
+    /// Exact completed result to freeze into any review subjects prepared
+    /// before this WorkUnit completed. Kept in the same transaction as the
+    /// WorkUnit transition and its review-line projection.
+    pub reviewed_result: Option<CompleteReviewedWorkUnitResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteReviewedWorkUnitResult {
+    pub execution_id: String,
+    pub result_artifact_id: Option<String>,
+    pub result_artifact_digest: Option<String>,
+    pub result_commit_sha: Option<String>,
+    pub result_workspace_id: Option<String>,
+    pub workspace_snapshot_digest: Option<String>,
+    pub manifest_id: Option<String>,
+    pub manifest_json: Option<String>,
+    pub manifest_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2064,7 +2228,6 @@ pub struct CreateTask {
     pub parent_task_id: Option<String>,
     pub title: String,
     pub description: Option<String>,
-    pub task_type: String,
     pub lifecycle_state: TaskLifecycleState,
     pub is_automation: bool,
     pub priority: i64,
@@ -2107,9 +2270,6 @@ pub struct CreateExecution {
     /// valid new service-level principal.
     pub actor_ref: Option<ActorRef>,
     pub role: String,
-    /// New writers must state the semantic reason for the run. `None` is
-    /// retained for historical compatibility rows until PR13 cleanup.
-    pub purpose: Option<ExecutionPurpose>,
     pub status: ExecutionStatus,
     pub stop_reason: Option<StopReason>,
     pub stopped_by: Option<String>,
@@ -2168,6 +2328,22 @@ pub struct CreateTaskComment {
 #[async_trait]
 pub trait TaskRoleRepo: Send + Sync {
     async fn create(&self, input: CreateTaskRole) -> std::result::Result<TaskRole, crate::DbError>;
+    async fn create_with_configuration(
+        &self,
+        input: CreateTaskRole,
+        configuration_json: &str,
+    ) -> std::result::Result<TaskRole, crate::DbError>;
+    async fn create_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateTaskRole,
+    ) -> std::result::Result<TaskRole, crate::DbError>;
+    async fn create_with_configuration_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateTaskRole,
+        configuration_json: &str,
+    ) -> std::result::Result<TaskRole, crate::DbError>;
     async fn get_task_id(&self, id: &str) -> std::result::Result<Option<String>, crate::DbError>;
     async fn get_by_task_and_role(
         &self,
@@ -2180,12 +2356,37 @@ pub trait TaskRoleRepo: Send + Sync {
         task_id: &str,
     ) -> std::result::Result<Vec<TaskRole>, crate::DbError>;
     async fn update(&self, input: UpdateTaskRole) -> std::result::Result<TaskRole, crate::DbError>;
+    async fn update_with_configuration(
+        &self,
+        input: UpdateTaskRoleWithConfiguration,
+    ) -> std::result::Result<TaskRole, crate::DbError>;
+}
+
+#[async_trait]
+pub trait TaskRoleCapabilityConfigurationRepo: Send + Sync {
+    async fn get_by_task_role_id(
+        &self,
+        task_role_id: &str,
+    ) -> std::result::Result<Option<TaskRoleCapabilityConfiguration>, crate::DbError>;
+}
+
+#[async_trait]
+pub trait ExecutionTaskRoleAuthorityRepo: Send + Sync {
+    async fn get_by_execution_id(
+        &self,
+        execution_id: &str,
+    ) -> std::result::Result<Option<ExecutionTaskRoleAuthority>, crate::DbError>;
 }
 
 #[async_trait]
 pub trait RoleMembershipRepo: Send + Sync {
     async fn add(
         &self,
+        input: CreateRoleMembership,
+    ) -> std::result::Result<RoleMembership, crate::DbError>;
+    async fn add_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
         input: CreateRoleMembership,
     ) -> std::result::Result<RoleMembership, crate::DbError>;
     async fn get(&self, id: &str) -> std::result::Result<Option<RoleMembership>, crate::DbError>;

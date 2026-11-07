@@ -17,6 +17,7 @@ pub enum ReviewReportVerdict {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct StartReviewExecutionRequest {
+    pub task_role_id: String,
     pub workspace_id: Option<String>,
 }
 
@@ -36,6 +37,24 @@ pub struct SubmitReviewReportRequest {
     pub evidence_ids: Vec<String>,
     #[serde(default)]
     pub artifact_ids: Vec<String>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub reviewed_work_unit_id: Option<String>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    #[ts(type = "number | null")]
+    pub reviewed_work_unit_version: Option<i64>,
+}
+
+/// Submit the assigned Human's review of a prepared WorkUnit. Forge creates
+/// the technical attempt and binds its subject; no Execution selection is needed.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct SubmitWorkUnitReviewRequest {
+    #[ts(type = "number")]
+    pub expected_version: i64,
+    pub report: SubmitReviewReportRequest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -104,4 +123,83 @@ pub struct EvidenceResponse {
     pub producer_validation_run_id: String,
     pub evidence_key: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ReviewLineRevisionResponse {
+    pub line_id: String,
+    pub task_id: String,
+    #[ts(type = "number")]
+    pub revision: i64,
+    pub work_unit_id: String,
+    #[ts(type = "number")]
+    pub work_unit_version: i64,
+    pub result_execution_id: Option<String>,
+    pub result_artifact_id: Option<String>,
+    pub result_commit_sha: Option<String>,
+    pub result_workspace_id: Option<String>,
+    pub workspace_snapshot_digest: Option<String>,
+    pub manifest_id: Option<String>,
+    pub review_report_artifact_id: Option<String>,
+    pub verdict: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ReviewLineResponse {
+    pub id: String,
+    pub task_id: String,
+    pub root_work_unit_id: String,
+    pub current_work_unit_id: String,
+    #[ts(type = "number")]
+    pub current_work_unit_version: i64,
+    pub current_result_execution_id: Option<String>,
+    pub current_result_artifact_id: Option<String>,
+    pub current_commit_sha: Option<String>,
+    pub current_workspace_id: Option<String>,
+    pub current_snapshot_digest: Option<String>,
+    pub current_manifest_id: Option<String>,
+    pub latest_report_artifact_id: Option<String>,
+    pub latest_verdict: Option<String>,
+    #[ts(type = "number")]
+    pub revision: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub history: Vec<ReviewLineRevisionResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct WorkUnitArtifactInputResponse {
+    pub artifact_id: String,
+    pub digest: String,
+    pub producer_execution_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export)]
+pub struct WorkUnitArtifactManifestResponse {
+    pub id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    #[ts(type = "number")]
+    pub work_unit_version: i64,
+    pub result_execution_id: String,
+    pub delivery_artifact_id: String,
+    pub delivery_artifact_digest: String,
+    #[ts(type = "Record<string, unknown>")]
+    pub manifest: Value,
+    pub manifest_digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export)]
+pub struct WorkUnitArtifactPackageResponse {
+    pub work_unit_id: String,
+    pub inputs: Vec<WorkUnitArtifactInputResponse>,
+    pub manifests: Vec<WorkUnitArtifactManifestResponse>,
 }

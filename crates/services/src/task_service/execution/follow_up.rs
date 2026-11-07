@@ -9,7 +9,6 @@ impl TaskService {
         parent_execution_id: String,
         prompt: String,
         trigger: &str,
-        purpose: ExecutionPurpose,
         idempotency_key: String,
     ) -> Result<Execution> {
         self.dispatch_role_follow_up_exact(
@@ -19,7 +18,6 @@ impl TaskService {
             None,
             prompt,
             trigger,
-            purpose,
             idempotency_key,
         )
         .await
@@ -34,7 +32,6 @@ impl TaskService {
         agent_id: String,
         prompt: String,
         trigger: &str,
-        purpose: ExecutionPurpose,
         idempotency_key: String,
     ) -> Result<Execution> {
         self.dispatch_role_follow_up_exact(
@@ -44,7 +41,6 @@ impl TaskService {
             Some(agent_id),
             prompt,
             trigger,
-            purpose,
             idempotency_key,
         )
         .await
@@ -59,7 +55,6 @@ impl TaskService {
         agent_id: Option<String>,
         prompt: String,
         trigger: &str,
-        purpose: ExecutionPurpose,
         idempotency_key: String,
     ) -> Result<Execution> {
         validate_required("task_id", task_id)?;
@@ -68,16 +63,9 @@ impl TaskService {
         let parent = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", parent_execution_id.clone()))?;
-        if parent.task_id != task_id
-            || parent.role != role
-            || parent
-                .purpose
-                .as_ref()
-                .is_some_and(|parent_purpose| parent_purpose != &purpose)
-            || parent.work_unit_id.is_none()
-        {
+        if parent.task_id != task_id || parent.role != role || parent.work_unit_id.is_none() {
             return Err(ServiceError::invalid_operation(
-                "role follow-up requires the exact parent Execution, matching role and purpose, bound to a WorkUnit",
+                "role follow-up requires the exact parent Execution and role bound to a WorkUnit",
             ));
         }
         let result = self

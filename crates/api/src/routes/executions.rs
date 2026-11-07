@@ -1,4 +1,4 @@
-use api_types::{ExecutionResponse, FollowUpRequest, PaginatedResponse, StartExecutionRequest};
+use api_types::{ExecutionResponse, FollowUpRequest, PaginatedResponse};
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -32,64 +32,12 @@ pub async fn list_executions(
 pub async fn start_task_execution(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
-    user: crate::routes::auth::AuthenticatedUser,
-    Json(request): Json<StartExecutionRequest>,
+    user: AuthenticatedUser,
 ) -> ApiResult<Json<ExecutionResponse>> {
     crate::routes::tasks::require_task_mutable(&state, &task_id, &user).await?;
-    if request.prompt.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "prompt must be non-empty for an Execution",
-        ));
-    }
-    let work_unit = db::WorkUnitRepo::get_by_id(&*state.db, &request.work_unit_id)
-        .await?
-        .filter(|work_unit| work_unit.task_id == task_id)
-        .ok_or_else(|| ApiError::not_found("work_unit", request.work_unit_id.clone()))?;
-    if let Some(db::ActorRef::Agent(agent_id)) = work_unit.assigned_actor.as_ref() {
-        services::agent_service::require_agent_account(&state.db, agent_id, &user.user_id).await?;
-    }
-    if work_unit.requires_integration {
-        state
-            .work_unit_service
-            .prepare_workspace(
-                services::CollaborationActorSource::Human(user.user_id.clone()),
-                &work_unit.id,
-            )
-            .await
-            .map_err(ApiError::from)?;
-    }
-    let purpose = match request.purpose {
-        api_types::ExecutionPurpose::Plan => db::ExecutionPurpose::Plan,
-        api_types::ExecutionPurpose::Implement => db::ExecutionPurpose::Implement,
-        api_types::ExecutionPurpose::Review => db::ExecutionPurpose::Review,
-        api_types::ExecutionPurpose::Validate => db::ExecutionPurpose::Validate,
-        api_types::ExecutionPurpose::Investigate => db::ExecutionPurpose::Investigate,
-        api_types::ExecutionPurpose::Orchestrate => db::ExecutionPurpose::Orchestrate,
-        api_types::ExecutionPurpose::General => db::ExecutionPurpose::General,
-    };
-    let overrides = request.overrides.map(|overrides| ExecutionOverrides {
-        model_id: overrides.model_id,
-        reasoning_effort: overrides.reasoning_effort,
-        permission_policy: overrides.permission_policy,
-    });
-    let launched = state
-        .task_service
-        .launch_work_unit_execution(
-            &work_unit.id,
-            request.expected_work_unit_version,
-            purpose,
-            request.prompt,
-            request.input_artifact_ids,
-            overrides,
-        )
-        .await
-        .map_err(ApiError::from)?;
-    state
-        .task_service
-        .start_execution(launched.execution.id.clone())
-        .await?;
-    Ok(Json(
-        execution_response_with_usage(&state.db, launched.execution).await?,
+    Err(ApiError::gone_with_code(
+        "execution.manual_launch_retired",
+        "manual Execution creation is retired; use POST /api/v1/tasks/{id}/dispatch/launch with prepared WorkUnits",
     ))
 }
 
@@ -192,7 +140,7 @@ pub async fn get_logs(
     }))
 }
 
-fn execution_log_response(entry: executors::LogEntry) -> api_types::ExecutionLogEntry {
+pub(crate) fn execution_log_response(entry: executors::LogEntry) -> api_types::ExecutionLogEntry {
     use api_types::{ExecutionLogKind as PublicKind, ExecutionLogStream as PublicStream};
     let kind = match entry.kind {
         executors::LogKind::Stdout => PublicKind::Stdout,

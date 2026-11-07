@@ -103,6 +103,27 @@ events
 usage
 ~~~
 
+Adapters also expose advisory model and policy options for the owning daemon's
+configured CLI. Discovery runs on that daemon rather than the API host. Model
+options are suggestions, not entitlements; a caller may supply any model ID
+accepted by the harness, which validates the account's access at Execution
+start. Adapters use the installed harness's native model catalog interface
+when it provides one. OpenCode V2 discovery reads its current model metadata,
+including each model's own variants, and passes a selected variant through
+OpenCode's `--variant` option. Forge does not synthesize a generic reasoning
+ladder. If a harness has no supported non-interactive model catalog,
+discovery returns no model suggestions and the UI accepts a model alias or ID
+directly. Claude Code effort choices are discovered separately from the
+installed CLI's `--help` output and saved as the Agent's default; available
+effort levels still depend on the selected model and are enforced by Claude
+Code. Updating a CLI requires its owning daemon to run the updated executable
+before a new discovery request can reflect that version.
+
+When Claude Code Router is enabled, the adapter invokes the installed `ccr`
+executable. Configure `claude_code_router_profile` to launch a named profile
+with current profile-based CLIs; without it, Forge uses the legacy `ccr code`
+pass-through supported by older Router CLIs.
+
 When the harness supports them, the adapter may also expose fork, steer, and
 pause/resume. The core expresses platform intent; the adapter translates it
 into native harness behavior.
@@ -158,6 +179,14 @@ ownerless embedded records remain administrator-only. The local daemon is
 created by server startup; its public registration identity is reserved for an
 explicit administrator operation. An ordinary user cannot obtain the embedded
 shell by registering or leaving its Agent unpinned.
+
+Agent creation defaults to automatic host resolution. Administrators can still
+pin an Agent they own to an online host authorized for their account that
+reports the selected runtime as authenticated, through Agent edit, REST, or the
+CLI. The host choices come from the server's account-scoped availability check.
+Non-admins do not see host choices and cannot pin an Agent; unpinned Executions
+use the existing account-authorized host resolver. Host edits use the Agent's
+current version, so a concurrent change remains a version conflict.
 
 The same current account, Agent profile/binding, daemon owner/visibility/host,
 online state, and authenticated capability are checked at admission and again

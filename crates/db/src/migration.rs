@@ -61,7 +61,11 @@ use std::{
 // the WorkUnit Execution admission trigger with distinct failure markers so
 // late SQLite guard rejections retain their exact typed cause. V135 repairs the
 // canonical Project owner membership representation without inventing owners
-// for ownerless Projects.
+// for ownerless Projects. V136 adds Project TaskRole defaults; V137 temporarily
+// records the compatibility access setting; V138 retires Task classification
+// and per-Task access settings while keeping Task data and repository authority
+// checks current.
+// V157 advances rework review lines by their exact result across parallel reports.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

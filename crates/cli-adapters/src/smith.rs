@@ -222,6 +222,7 @@ impl HarnessAdapter for SmithAdapter {
                 "profiles": surface.profiles,
                 "providers": surface.providers,
             }),
+            warning: None,
         })
     }
 

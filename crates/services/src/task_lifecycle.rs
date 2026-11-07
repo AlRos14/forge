@@ -1,18 +1,95 @@
 //! Aggregate Task progress, persisted independently from actor activity.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use api_types::{Actor, SystemComponent};
 use db::{
-    new_uuid_v4, now_rfc3339, CreateDomainEvent, DomainEventRepo, ExecutionRepo,
-    GateEvaluationOutcome, GateRepo, SqliteDb, Task, TaskIntegrationOperationRepo, TaskLifecycle,
+    new_uuid_v4, now_rfc3339, AgentRepo, CreateDomainEvent, DomainEventRepo, ExecutionRepo,
+    GateEvaluationOutcome, GateRepo, SqliteDb, Task, TaskDispatch, TaskDispatchOperation,
+    TaskDispatchState, TaskDispatchWrite, TaskIntegrationOperationRepo, TaskLifecycle,
     TaskLifecycleRepo, TaskLifecycleState, TaskLifecycleTransitionWrite, TaskRepo,
-    ValidationRunRepo, WorkUnitRepo,
+    TransitionTaskDispatch, ValidationRunRepo, WorkUnitIntegrationOutcome, WorkUnitRepo,
+    WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceStatus,
 };
 use events::EventBus;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::{DomainEventService, Result, ServiceError};
+
+fn task_lifecycle_response(lifecycle: &TaskLifecycle) -> api_types::TaskLifecycleResponse {
+    api_types::TaskLifecycleResponse {
+        task_id: lifecycle.task_id.clone(),
+        state: match lifecycle.state {
+            TaskLifecycleState::Backlog => api_types::TaskLifecycleState::Backlog,
+            TaskLifecycleState::Ready => api_types::TaskLifecycleState::Ready,
+            TaskLifecycleState::Active => api_types::TaskLifecycleState::Active,
+            TaskLifecycleState::Blocked => api_types::TaskLifecycleState::Blocked,
+            TaskLifecycleState::ReadyToMerge => api_types::TaskLifecycleState::ReadyToMerge,
+            TaskLifecycleState::Merging => api_types::TaskLifecycleState::Merging,
+            TaskLifecycleState::Done => api_types::TaskLifecycleState::Done,
+            TaskLifecycleState::Cancelled => api_types::TaskLifecycleState::Cancelled,
+        },
+        version: lifecycle.version,
+        reason_kind: lifecycle.reason_kind.clone(),
+        reason_ref: lifecycle.reason_ref.clone(),
+        created_at: lifecycle.created_at.clone(),
+        updated_at: lifecycle.updated_at.clone(),
+    }
+}
+
+fn task_dispatch_response(dispatch: &TaskDispatch) -> api_types::TaskDispatchIntentResponse {
+    api_types::TaskDispatchIntentResponse {
+        task_id: dispatch.task_id.clone(),
+        state: match dispatch.state {
+            TaskDispatchState::Idle => api_types::TaskDispatchState::Idle,
+            TaskDispatchState::Running => api_types::TaskDispatchState::Running,
+            TaskDispatchState::Paused => api_types::TaskDispatchState::Paused,
+            TaskDispatchState::Cancelled => api_types::TaskDispatchState::Cancelled,
+        },
+        version: dispatch.version,
+        requested_by: match (
+            dispatch.requested_by_kind.as_str(),
+            dispatch.requested_by_id.as_deref(),
+        ) {
+            ("human", Some(id)) => Some(api_types::ActorRef::Human(id.to_owned())),
+            ("agent", Some(id)) => Some(api_types::ActorRef::Agent(id.to_owned())),
+            _ => None,
+        },
+        reason: dispatch.reason.clone(),
+        created_at: dispatch.created_at.clone(),
+        updated_at: dispatch.updated_at.clone(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn task_dispatch_request_digest(
+    task_id: &str,
+    operation: TaskDispatchOperation,
+    state: TaskDispatchState,
+    expected_task_version: i64,
+    expected_lifecycle_version: i64,
+    requested_by_kind: &str,
+    requested_by_id: &str,
+    reason: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for component in [
+        "forge.task-dispatch.v1".to_owned(),
+        task_id.to_owned(),
+        operation.to_string(),
+        state.to_string(),
+        expected_task_version.to_string(),
+        expected_lifecycle_version.to_string(),
+        requested_by_kind.to_owned(),
+        requested_by_id.to_owned(),
+        reason.to_owned(),
+    ] {
+        hasher.update((component.len() as u64).to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
 
 #[derive(Debug, Clone)]
 pub enum LifecycleCause {
@@ -57,6 +134,618 @@ impl TaskLifecycleService {
 
     pub async fn get(&self, task_id: &str) -> Result<Option<TaskLifecycle>> {
         Ok(TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id).await?)
+    }
+
+    pub async fn get_dispatch(&self, task_id: &str) -> Result<db::TaskDispatch> {
+        TaskLifecycleRepo::get_task_dispatch(&*self.db, task_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task dispatch", task_id.to_owned()))
+    }
+
+    /// Read-only launch readiness for one Task. It names every WorkUnit that
+    /// cannot progress instead of selecting an arbitrary Actor or silently
+    /// skipping unassigned scope.
+    pub async fn launch_preflight(
+        &self,
+        task_id: &str,
+    ) -> Result<api_types::TaskLaunchPreflightResponse> {
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        let dispatch = self.get_dispatch(&task.id).await?;
+        let work_units = WorkUnitRepo::list_by_task(&*self.db, &task.id).await?;
+        let recovery_required_work_units =
+            ExecutionRepo::list_work_unit_recovery_required_candidates(&*self.db)
+                .await?
+                .into_iter()
+                .filter_map(|execution| execution.work_unit_id)
+                .collect::<HashSet<_>>();
+        let mut blockers = Vec::new();
+        let mut units = Vec::with_capacity(work_units.len());
+        let mut fatal = false;
+        if work_units.is_empty() {
+            blockers.push(api_types::TaskLaunchBlockerResponse {
+                code: "no_work_units".to_owned(),
+                message: "Task has no prepared WorkUnit to dispatch".to_owned(),
+                work_unit_id: None,
+            });
+            fatal = true;
+        }
+        for unit in work_units {
+            let active_execution_ids =
+                WorkUnitRepo::list_active_execution_ids(&*self.db, &unit.id).await?;
+            let dependencies = WorkUnitRepo::list_dependencies(&*self.db, &unit.id).await?;
+            let unsatisfied_dependency_ids = dependencies
+                .iter()
+                .filter(|dependency| !dependency.satisfied)
+                .map(|dependency| dependency.depends_on_work_unit_id.clone())
+                .collect::<Vec<_>>();
+            let (allocation_eligible, agent_unavailable) = match unit.assigned_actor.as_ref() {
+                Some(db::ActorRef::Agent(agent_id)) => {
+                    let active: i64 = sqlx::query_scalar(
+                        "SELECT EXISTS(
+                                SELECT 1 FROM task_role tr
+                                JOIN role_membership rm ON rm.task_role_id = tr.id
+                                WHERE tr.task_id = ? AND tr.role = ?
+                                  AND rm.actor_kind = 'agent' AND rm.actor_id = ?
+                                  AND rm.status = 'active'
+                            )",
+                    )
+                    .bind(&unit.task_id)
+                    .bind(&unit.role)
+                    .bind(agent_id)
+                    .fetch_one(self.db.pool())
+                    .await?;
+                    let agent = AgentRepo::get_by_id(&*self.db, agent_id).await?;
+                    (
+                        active != 0,
+                        agent.is_none() || agent.as_ref().is_some_and(|agent| agent.paused),
+                    )
+                }
+                Some(db::ActorRef::Human(user_id)) => {
+                    let active: i64 = sqlx::query_scalar(
+                        "SELECT EXISTS(
+                                SELECT 1 FROM task_role tr
+                                JOIN role_membership rm ON rm.task_role_id = tr.id
+                                WHERE tr.task_id = ? AND tr.role = ?
+                                  AND rm.actor_kind = 'human' AND rm.actor_id = ?
+                                  AND rm.status = 'active'
+                            )",
+                    )
+                    .bind(&unit.task_id)
+                    .bind(&unit.role)
+                    .bind(user_id)
+                    .fetch_one(self.db.pool())
+                    .await?;
+                    (active != 0, false)
+                }
+                None => (false, false),
+            };
+            let workspace_ready = if unit.requires_integration {
+                WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, &unit.id)
+                    .await?
+                    .is_some_and(|workspace| workspace.status == WorkspaceStatus::Ready)
+            } else {
+                true
+            };
+            let integration_succeeded = if unit.requires_integration {
+                WorkUnitRepo::list_integrations(&*self.db, &unit.id)
+                    .await?
+                    .iter()
+                    .any(|integration| integration.outcome == WorkUnitIntegrationOutcome::Success)
+            } else {
+                true
+            };
+            let has_result_requirement: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM work_unit_result_requirement WHERE work_unit_id = ?)",
+            )
+            .bind(&unit.id)
+            .fetch_one(self.db.pool())
+            .await?;
+            let result_available = if has_result_requirement != 0 {
+                crate::task_rework::result_requirement_available(&self.db, &unit.id).await?
+            } else {
+                true
+            };
+            let latest_execution_status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM execution WHERE work_unit_id = ?
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+            )
+            .bind(&unit.id)
+            .fetch_optional(self.db.pool())
+            .await?;
+            let awaiting_acceptance = unit.status == WorkUnitStatus::Open
+                && active_execution_ids.is_empty()
+                && latest_execution_status.as_deref() == Some("completed");
+            let has_review_subject: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM work_unit_review_subject WHERE review_work_unit_id = ?)",
+            )
+            .bind(&unit.id)
+            .fetch_one(self.db.pool())
+            .await?;
+            let formal_review = crate::role_capabilities::task_role_name_has_capability(
+                &self.db,
+                &unit.task_id,
+                &unit.role,
+                api_types::TaskRoleCapability::FormalReview,
+            )
+            .await?;
+            let review_subject_ready = if has_review_subject || formal_review {
+                if !has_review_subject || !formal_review {
+                    false
+                } else {
+                    crate::task_rework::review_subject_ready(&self.db, &unit.id).await?
+                }
+            } else {
+                true
+            };
+            let awaiting_review_approval = if let (Some(gate_id), Some(line_id)) = (
+                unit.review_approval_gate_id.as_deref(),
+                unit.review_approval_line_id.as_deref(),
+            ) {
+                let current_approval: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM work_unit_review_line line
+                        JOIN gate gate ON gate.id = ? AND gate.task_id = line.task_id
+                        JOIN gate_evaluation evaluation
+                          ON evaluation.gate_id = gate.id AND evaluation.task_id = gate.task_id
+                         AND evaluation.outcome = 'satisfied'
+                         AND evaluation.policy_revision = gate.active_policy_revision
+                        JOIN gate_evaluation_input input
+                          ON input.evaluation_id = evaluation.id AND input.task_id = evaluation.task_id
+                         AND input.input_kind = 'review_line' AND input.input_id = line.id
+                         AND input.input_version = line.revision AND input.status = 'pass'
+                        WHERE line.id = ? AND line.latest_verdict = 'pass'
+                          AND line.current_result_execution_id IS NOT NULL
+                          AND evaluation.id = (
+                              SELECT latest.id FROM gate_evaluation latest
+                              WHERE latest.gate_id = gate.id
+                          ORDER BY latest.evaluated_at DESC, latest.id DESC LIMIT 1
+                          )
+                    )",
+                )
+                .bind(gate_id)
+                .bind(line_id)
+                .fetch_one(self.db.pool())
+                .await?;
+                !current_approval
+            } else {
+                false
+            };
+            let (state, reason, blocker) = match unit.status {
+                WorkUnitStatus::Cancelled => ("cancelled", Some("WorkUnit is cancelled"), None),
+                WorkUnitStatus::Completed => {
+                    if unit.requires_integration && !integration_succeeded {
+                        (
+                            "awaiting_integration",
+                            Some("completed result requires explicit integration"),
+                            None,
+                        )
+                    } else {
+                        ("completed", None, None)
+                    }
+                }
+                WorkUnitStatus::Open if !active_execution_ids.is_empty() => {
+                    ("running", Some("an Execution is active"), None)
+                }
+                WorkUnitStatus::Open if !review_subject_ready => (
+                    "waiting_dependency",
+                    Some("the exact reviewed WorkUnit result is not ready"),
+                    None,
+                ),
+                WorkUnitStatus::Open if awaiting_acceptance => (
+                    "awaiting_acceptance",
+                    Some("a completed Execution result awaits WorkUnit acceptance"),
+                    None,
+                ),
+                WorkUnitStatus::Open if awaiting_review_approval => (
+                    "awaiting_review_approval",
+                    Some("the latest exact review line does not have a current satisfied Gate evaluation"),
+                    None,
+                ),
+                WorkUnitStatus::Open if recovery_required_work_units.contains(&unit.id) => (
+                    "awaiting_recovery",
+                    Some("an exact interrupted attempt must be resumed or resolved before fresh work"),
+                    None,
+                ),
+                WorkUnitStatus::Open if unit.assigned_actor.is_none() => (
+                    "unassigned",
+                    Some("WorkUnit has no exact assigned Actor"),
+                    Some((
+                        "work_unit_unassigned",
+                        "WorkUnit has no exact assigned Actor; allocation is required",
+                    )),
+                ),
+                WorkUnitStatus::Open
+                    if matches!(unit.assigned_actor, Some(db::ActorRef::Human(_))) =>
+                {
+                    (
+                        "waiting_human",
+                        Some("assigned to a Human; no harness Execution will be created"),
+                        None,
+                    )
+                }
+                WorkUnitStatus::Open if agent_unavailable => (
+                    "blocked",
+                    Some("assigned Agent is missing or paused"),
+                    Some(("agent_unavailable", "assigned Agent is missing or paused")),
+                ),
+                WorkUnitStatus::Open if !allocation_eligible => (
+                    "blocked",
+                    Some("assigned Actor has no active TaskRole membership"),
+                    Some((
+                        "membership_inactive",
+                        "assigned Actor has no active TaskRole membership",
+                    )),
+                ),
+                WorkUnitStatus::Open if !unsatisfied_dependency_ids.is_empty() => (
+                    "waiting_dependency",
+                    Some("one or more prerequisites are unsatisfied"),
+                    None,
+                ),
+                WorkUnitStatus::Open if !result_available => (
+                    "blocked",
+                    Some("exact consumed result is not available"),
+                    Some((
+                        "result_unavailable",
+                        "WorkUnit requires an exact completed source result",
+                    )),
+                ),
+                WorkUnitStatus::Open if !workspace_ready => (
+                    "blocked",
+                    Some("repository Workspace is not prepared"),
+                    Some((
+                        "workspace_not_prepared",
+                        "repository WorkUnit Workspace must be prepared before launch",
+                    )),
+                ),
+                WorkUnitStatus::Open => ("ready", None, None),
+            };
+            if let Some((code, message)) = blocker {
+                fatal = true;
+                blockers.push(api_types::TaskLaunchBlockerResponse {
+                    code: code.to_owned(),
+                    message: message.to_owned(),
+                    work_unit_id: Some(unit.id.clone()),
+                });
+            }
+            units.push(api_types::WorkUnitDispatchResponse {
+                work_unit_id: unit.id.clone(),
+                title: unit.title,
+                status: match unit.status {
+                    WorkUnitStatus::Open => api_types::WorkUnitStatus::Open,
+                    WorkUnitStatus::Completed => api_types::WorkUnitStatus::Completed,
+                    WorkUnitStatus::Cancelled => api_types::WorkUnitStatus::Cancelled,
+                },
+                role: unit.role,
+                assigned_actor: unit.assigned_actor.map(|actor| match actor {
+                    db::ActorRef::Human(id) => api_types::ActorRef::Human(id),
+                    db::ActorRef::Agent(id) => api_types::ActorRef::Agent(id),
+                }),
+                readiness: api_types::WorkUnitReadinessResponse {
+                    runnable: state == "ready",
+                    ready_for_allocation: state == "unassigned"
+                        || state == "blocked" && !allocation_eligible,
+                    active_execution_ids,
+                    unsatisfied_dependency_ids,
+                    awaiting_integration: state == "awaiting_integration",
+                    awaiting_acceptance: state == "awaiting_acceptance",
+                    awaiting_review_approval,
+                },
+                state: state.to_owned(),
+                reason: reason.map(str::to_owned),
+            });
+        }
+
+        let terminal = matches!(
+            lifecycle.state,
+            TaskLifecycleState::Done | TaskLifecycleState::Cancelled
+        );
+        let task_blocked = lifecycle.state == TaskLifecycleState::Blocked;
+        if task_blocked {
+            fatal = true;
+            blockers.push(api_types::TaskLaunchBlockerResponse {
+                code: "task_blocked".to_owned(),
+                message: "TaskLifecycle is blocked; resolve the exact block before launch"
+                    .to_owned(),
+                work_unit_id: None,
+            });
+        }
+        if terminal {
+            blockers.push(api_types::TaskLaunchBlockerResponse {
+                code: "task_terminal".to_owned(),
+                message: "terminal Task cannot be launched".to_owned(),
+                work_unit_id: None,
+            });
+        }
+        let can_launch = !fatal
+            && !terminal
+            && matches!(
+                dispatch.state,
+                TaskDispatchState::Idle | TaskDispatchState::Running
+            )
+            && matches!(
+                lifecycle.state,
+                TaskLifecycleState::Backlog
+                    | TaskLifecycleState::Ready
+                    | TaskLifecycleState::Active
+                    | TaskLifecycleState::Blocked
+            );
+        Ok(api_types::TaskLaunchPreflightResponse {
+            task_id: task.id,
+            task_version: task.version,
+            lifecycle: task_lifecycle_response(&lifecycle),
+            dispatch: task_dispatch_response(&dispatch),
+            can_launch,
+            can_pause: dispatch.state == TaskDispatchState::Running,
+            can_resume: dispatch.state == TaskDispatchState::Paused && !terminal,
+            can_cancel: !matches!(
+                lifecycle.state,
+                TaskLifecycleState::Done
+                    | TaskLifecycleState::Cancelled
+                    | TaskLifecycleState::Merging
+            ),
+            blockers,
+            work_units: units,
+        })
+    }
+
+    /// Record the durable intent to dispatch this Task. Preflight is checked
+    /// before the write; an exact idempotent replay returns its original
+    /// receipt without re-evaluating newer execution facts.
+    pub async fn launch_task(
+        &self,
+        task_id: &str,
+        expected_task_version: i64,
+        expected_lifecycle_version: i64,
+        requested_by: &api_types::ActorRef,
+        idempotency_key: &str,
+    ) -> Result<TaskDispatchWrite> {
+        self.apply_dispatch_operation(
+            task_id,
+            TaskDispatchOperation::Launch,
+            TaskDispatchState::Running,
+            expected_task_version,
+            expected_lifecycle_version,
+            requested_by,
+            None,
+            idempotency_key,
+            |preflight| preflight.can_launch,
+            "Task launch is not available for the current WorkUnits",
+        )
+        .await
+    }
+
+    pub async fn pause_task(
+        &self,
+        task_id: &str,
+        expected_task_version: i64,
+        expected_lifecycle_version: i64,
+        requested_by: &api_types::ActorRef,
+        reason: Option<String>,
+        idempotency_key: &str,
+    ) -> Result<TaskDispatchWrite> {
+        self.apply_dispatch_operation(
+            task_id,
+            TaskDispatchOperation::Pause,
+            TaskDispatchState::Paused,
+            expected_task_version,
+            expected_lifecycle_version,
+            requested_by,
+            reason,
+            idempotency_key,
+            |preflight| preflight.can_pause,
+            "Task is not running; pause is not available",
+        )
+        .await
+    }
+
+    pub async fn resume_task(
+        &self,
+        task_id: &str,
+        expected_task_version: i64,
+        expected_lifecycle_version: i64,
+        requested_by: &api_types::ActorRef,
+        idempotency_key: &str,
+    ) -> Result<TaskDispatchWrite> {
+        self.apply_dispatch_operation(
+            task_id,
+            TaskDispatchOperation::Resume,
+            TaskDispatchState::Running,
+            expected_task_version,
+            expected_lifecycle_version,
+            requested_by,
+            None,
+            idempotency_key,
+            |preflight| preflight.can_resume,
+            "Task is not paused; resume is not available",
+        )
+        .await
+    }
+
+    pub async fn record_cancelled_dispatch(
+        &self,
+        task_id: &str,
+        expected_task_version: i64,
+        expected_lifecycle_version: i64,
+        requested_by: &api_types::ActorRef,
+        reason: Option<String>,
+        idempotency_key: &str,
+    ) -> Result<TaskDispatchWrite> {
+        self.apply_dispatch_operation(
+            task_id,
+            TaskDispatchOperation::Cancel,
+            TaskDispatchState::Cancelled,
+            expected_task_version,
+            expected_lifecycle_version,
+            requested_by,
+            reason,
+            idempotency_key,
+            |preflight| preflight.can_cancel,
+            "Task cannot be cancelled in its current lifecycle",
+        )
+        .await
+    }
+
+    /// Record the cancellation request after the lifecycle transition has
+    /// already made the Task terminal. This keeps the dispatch receipt while
+    /// allowing the caller's expected versions to bind the original request.
+    pub async fn record_cancelled_dispatch_after_cancel(
+        &self,
+        task_id: &str,
+        expected_task_version: i64,
+        expected_lifecycle_version: i64,
+        requested_by: &api_types::ActorRef,
+        reason: Option<String>,
+        idempotency_key: &str,
+    ) -> Result<TaskDispatchWrite> {
+        if idempotency_key.trim().is_empty() || idempotency_key.len() > 256 {
+            return Err(ServiceError::invalid_operation(
+                "Task dispatch idempotency_key must contain 1 to 256 characters",
+            ));
+        }
+        TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
+        if lifecycle.state != TaskLifecycleState::Cancelled {
+            return Err(ServiceError::invalid_operation(
+                "Task dispatch cancellation receipt requires a cancelled TaskLifecycle",
+            ));
+        }
+        let (kind, id) = match requested_by {
+            api_types::ActorRef::Human(id) => ("human", Some(id.clone())),
+            api_types::ActorRef::Agent(id) => ("agent", Some(id.clone())),
+        };
+        let request_digest = task_dispatch_request_digest(
+            task_id,
+            TaskDispatchOperation::Cancel,
+            TaskDispatchState::Cancelled,
+            expected_task_version,
+            expected_lifecycle_version,
+            kind,
+            id.as_deref().unwrap_or_default(),
+            reason.as_deref().unwrap_or_default(),
+        );
+        if let Some(receipt) =
+            TaskLifecycleRepo::get_task_dispatch_receipt(&*self.db, task_id, idempotency_key)
+                .await?
+        {
+            if receipt.operation != TaskDispatchOperation::Cancel
+                || receipt.request_digest != request_digest
+            {
+                return Err(db::DbError::IdempotencyConflict.into());
+            }
+            let dispatch = self.get_dispatch(task_id).await?;
+            return Ok(TaskDispatchWrite {
+                dispatch,
+                receipt,
+                replayed: true,
+            });
+        }
+        Ok(TaskLifecycleRepo::transition_task_dispatch(
+            &*self.db,
+            TransitionTaskDispatch {
+                task_id: task_id.to_owned(),
+                operation: TaskDispatchOperation::Cancel,
+                state: TaskDispatchState::Cancelled,
+                expected_intent_version: self.get_dispatch(task_id).await?.version,
+                requested_by_kind: kind.to_owned(),
+                requested_by_id: id,
+                reason,
+                idempotency_key: idempotency_key.to_owned(),
+                request_digest,
+                receipt_id: new_uuid_v4(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .await?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_dispatch_operation(
+        &self,
+        task_id: &str,
+        operation: TaskDispatchOperation,
+        state: TaskDispatchState,
+        expected_task_version: i64,
+        expected_lifecycle_version: i64,
+        requested_by: &api_types::ActorRef,
+        reason: Option<String>,
+        idempotency_key: &str,
+        allowed: impl Fn(&api_types::TaskLaunchPreflightResponse) -> bool,
+        unavailable: &str,
+    ) -> Result<TaskDispatchWrite> {
+        if idempotency_key.trim().is_empty() || idempotency_key.len() > 256 {
+            return Err(ServiceError::invalid_operation(
+                "Task dispatch idempotency_key must contain 1 to 256 characters",
+            ));
+        }
+        let (kind, id) = match requested_by {
+            api_types::ActorRef::Human(id) => ("human", Some(id.clone())),
+            api_types::ActorRef::Agent(id) => ("agent", Some(id.clone())),
+        };
+        let request_digest = task_dispatch_request_digest(
+            task_id,
+            operation,
+            state,
+            expected_task_version,
+            expected_lifecycle_version,
+            kind,
+            id.as_deref().unwrap_or_default(),
+            reason.as_deref().unwrap_or_default(),
+        );
+        if let Some(receipt) =
+            TaskLifecycleRepo::get_task_dispatch_receipt(&*self.db, task_id, idempotency_key)
+                .await?
+        {
+            if receipt.operation != operation || receipt.request_digest != request_digest {
+                return Err(db::DbError::IdempotencyConflict.into());
+            }
+        } else {
+            let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+            let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
+            if task.version != expected_task_version {
+                return Err(db::DbError::TaskVersionConflict {
+                    expected: expected_task_version,
+                    actual: task.version,
+                }
+                .into());
+            }
+            if lifecycle.version != expected_lifecycle_version {
+                return Err(db::DbError::VersionConflict.into());
+            }
+            let preflight = self.launch_preflight(task_id).await?;
+            if !allowed(&preflight) {
+                return Err(ServiceError::conflict(unavailable.to_owned()));
+            }
+        }
+        Ok(TaskLifecycleRepo::transition_task_dispatch(
+            &*self.db,
+            TransitionTaskDispatch {
+                task_id: task_id.to_owned(),
+                operation,
+                state,
+                expected_intent_version: self.get_dispatch(task_id).await?.version,
+                requested_by_kind: kind.to_owned(),
+                requested_by_id: id,
+                reason,
+                idempotency_key: idempotency_key.to_owned(),
+                request_digest,
+                receipt_id: new_uuid_v4(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .await?)
     }
 
     /// Build the exact PR9 lifecycle receipts required by a WorkUnit Execution
@@ -694,7 +1383,6 @@ mod tests {
                 parent_task_id: None,
                 title: "Lifecycle target".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state,
                 is_automation: false,
                 priority: 0,
@@ -1810,7 +2498,6 @@ mod tests {
                 agent_id: None,
                 actor_ref: None,
                 role: "implementer".to_owned(),
-                purpose: Some(db::ExecutionPurpose::Implement),
                 status: db::ExecutionStatus::Failed,
                 stop_reason: None,
                 stopped_by: None,

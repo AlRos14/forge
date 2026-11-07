@@ -3,16 +3,6 @@ use serde_json::Value;
 use ts_rs::TS;
 
 pub type TaskStatus = String;
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum TaskType {
-    Implementation,
-    Planning,
-    Discovery,
-    Review,
-    Validation,
-}
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -34,20 +24,6 @@ pub enum AgentStatus {
 }
 
 pub type ExecutionRole = String;
-
-/// The explicit reason an Actor is performing work in an Execution.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum ExecutionPurpose {
-    Plan,
-    Implement,
-    Review,
-    Validate,
-    Investigate,
-    Orchestrate,
-    General,
-}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

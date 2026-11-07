@@ -10,11 +10,11 @@ use chrono::{DateTime, Duration, Utc};
 use db::{
     new_uuid_v4, now_rfc3339, ActorKind, ActorRef, AgentRepo, ClaimDomainEvents, CollaborationRepo,
     CollaborationTarget, CompleteDomainEvent, CoordinationMode, CreateOrchestratorWake,
-    DomainEvent, DomainEventRepo, ExecutionPurpose, ExecutionRepo, ExecutionStatus, GateRepo,
-    OrchestratorWake, OrchestratorWakeExecution, OrchestratorWakeRepo, OrchestratorWakeState,
-    PageRequest, ProposalTarget, ProposalTargetKind, RoleMembership, RoleMembershipRepo,
-    RoleMembershipStatus, SortBy, SortOrder, TaskRepo, TaskRole, TaskRoleRepo, WorkUnit,
-    WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo,
+    DomainEvent, DomainEventRepo, ExecutionRepo, ExecutionStatus, GateRepo, OrchestratorWake,
+    OrchestratorWakeExecution, OrchestratorWakeRepo, OrchestratorWakeState, PageRequest,
+    ProposalTarget, ProposalTargetKind, RoleMembership, RoleMembershipRepo, RoleMembershipStatus,
+    SortBy, SortOrder, TaskRepo, TaskRole, TaskRoleRepo, WorkUnit, WorkUnitRepo, WorkUnitStatus,
+    WorkUnitWorkspaceRepo, WorkspaceRepo,
 };
 use events::{EventBus, ForgeEvent};
 use serde_json::{json, Value};
@@ -106,6 +106,8 @@ enum OrchestratorAction {
         parent_work_unit_id: Option<String>,
         assigned_actor: Option<ActionActorRef>,
         requires_integration: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review_subject: Option<api_types::CreateWorkUnitReviewSubjectRequest>,
     },
     Proposal {
         target: ProposalTarget,
@@ -304,6 +306,15 @@ impl OrchestratorRuntime {
     }
 
     pub async fn run_once(&self, limit: i64) -> Result<OrchestratorRun> {
+        // Pending automatic rework is durable and remains pending across a
+        // Task pause. The periodic run rechecks it after resume, even though
+        // Task dispatch transitions are not EventBus-delivered.
+        crate::task_rework::TaskReworkService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .process_pending_automatic_rework(100)
+        .await?;
         let now = now_rfc3339();
         let events = DomainEventRepo::claim_event_batch(
             &*self.db,
@@ -327,6 +338,12 @@ impl OrchestratorRuntime {
 
         for event in events {
             self.gate_engine.process_domain_event(&event).await?;
+            crate::task_rework::TaskReworkService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .process_domain_event(&event)
+            .await?;
             crate::task_failure_retry::TaskFailureRetryService::new(
                 Arc::clone(&self.db),
                 Arc::clone(&self.event_bus),
@@ -354,6 +371,16 @@ impl OrchestratorRuntime {
             .await?;
             run.processed_events += 1;
         }
+
+        // An artifact.created event may have added a pending intent above.
+        // Process it after the whole claimed batch has been classified so a
+        // crash/replay cannot make event ordering the source of authority.
+        crate::task_rework::TaskReworkService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .process_pending_automatic_rework(100)
+        .await?;
 
         for _ in 0..16 {
             match self.dispatch_one().await? {
@@ -425,7 +452,12 @@ impl OrchestratorRuntime {
                     &event.event_type,
                     &event.scope_id,
                     &execution.task_id,
-                    execution.purpose,
+                    crate::role_capabilities::execution_has_capability(
+                        &self.db,
+                        &execution.id,
+                        api_types::TaskRoleCapability::Orchestration,
+                    )
+                    .await?,
                 ) {
                     return Ok(None);
                 }
@@ -653,7 +685,14 @@ impl OrchestratorRuntime {
                 let Some(role) = TaskRoleRepo::get_by_id(&*self.db, &event.entity_id).await? else {
                     return Ok(None);
                 };
-                if role.task_id != task_id || role.role != "orchestrator" {
+                if role.task_id != task_id
+                    || !crate::role_capabilities::current_task_role_has_capability(
+                        &self.db,
+                        &role.id,
+                        api_types::TaskRoleCapability::Orchestration,
+                    )
+                    .await?
+                {
                     return Ok(None);
                 }
                 let payload = parse_payload(event);
@@ -688,7 +727,7 @@ impl OrchestratorRuntime {
                         return Ok(None);
                     };
                     if unit.task_id != task_id
-                        || unit.role != "orchestrator"
+                        || unit.role != role.role
                         || unit.assigned_actor.as_ref() != Some(actor)
                     {
                         return Ok(None);
@@ -720,7 +759,14 @@ impl OrchestratorRuntime {
                 else {
                     return Ok(None);
                 };
-                if role.task_id != task_id || role.role != "orchestrator" {
+                if role.task_id != task_id
+                    || !crate::role_capabilities::current_task_role_has_capability(
+                        &self.db,
+                        &role.id,
+                        api_types::TaskRoleCapability::Orchestration,
+                    )
+                    .await?
+                {
                     return Ok(None);
                 }
                 let target = if membership.status == RoleMembershipStatus::Active {
@@ -742,7 +788,12 @@ impl OrchestratorRuntime {
                 };
                 let payload = parse_payload(event);
                 if role.task_id != task_id
-                    || role.role != "orchestrator"
+                    || !crate::role_capabilities::current_task_role_has_capability(
+                        &self.db,
+                        &role.id,
+                        api_types::TaskRoleCapability::Orchestration,
+                    )
+                    .await?
                     || payload.get("task_role_id").and_then(Value::as_str) != Some(role.id.as_str())
                     || payload.get("bootstrap_version").and_then(Value::as_i64) != Some(1)
                 {
@@ -779,7 +830,7 @@ impl OrchestratorRuntime {
                         return Ok(None);
                     };
                     if unit.task_id != task_id
-                        || unit.role != "orchestrator"
+                        || unit.role != role.role
                         || unit.assigned_actor.as_ref() != Some(&actor)
                     {
                         return Ok(None);
@@ -799,16 +850,17 @@ impl OrchestratorRuntime {
 
     async fn admit_signal(&self, event: &DomainEvent, signal: WakeSignal) -> Result<usize> {
         let task_id = event.scope_id.as_str();
-        let Some(role) =
-            TaskRoleRepo::get_by_task_and_role(&*self.db, task_id, "orchestrator").await?
-        else {
-            return Ok(0);
+        let event_role_id = match event.event_type.as_str() {
+            "orchestrator.task_role_changed" | "orchestrator.bootstrap_reconciled" => {
+                Some(event.entity_id.as_str().to_owned())
+            }
+            "orchestrator.membership_changed" => {
+                RoleMembershipRepo::get(&*self.db, &event.entity_id)
+                    .await?
+                    .map(|membership| membership.task_role_id)
+            }
+            _ => None,
         };
-        let memberships = RoleMembershipRepo::list_by_role(&*self.db, &role.id, false).await?;
-        let active: Vec<_> = memberships
-            .into_iter()
-            .filter(|membership| membership.status == RoleMembershipStatus::Active)
-            .collect();
         let unit = match signal.work_unit_id.as_deref() {
             Some(id) => {
                 let Some(unit) = WorkUnitRepo::get_by_id(&*self.db, id).await? else {
@@ -821,57 +873,76 @@ impl OrchestratorRuntime {
             }
             None => None,
         };
-        let targets = select_orchestrator_targets(
-            role.coordination_mode,
-            &role.id,
-            &active,
-            unit.as_ref(),
-            &signal.target,
-        );
         let now = now_rfc3339();
         let policy_digest = current_policy_digest();
-        let role_policy = TaskRoleOrchestratorPolicy::parse(&role.policy_json).ok();
         let mut admitted = 0;
-        for membership in targets {
-            if event_is_authored_by_member(event, membership) {
-                continue;
-            }
-            if membership.actor_kind == ActorKind::Agent
-                && role_policy
-                    .as_ref()
-                    .is_some_and(|policy| !policy.permits_automatic_orchestration())
+        for role in TaskRoleRepo::list_by_task(&*self.db, task_id).await? {
+            if event_role_id
+                .as_deref()
+                .is_some_and(|event_role_id| event_role_id != role.id)
+                || !crate::role_capabilities::current_task_role_has_capability(
+                    &self.db,
+                    &role.id,
+                    api_types::TaskRoleCapability::Orchestration,
+                )
+                .await?
+                || unit.as_ref().is_some_and(|unit| unit.role != role.role)
             {
                 continue;
             }
-            let id = new_uuid_v4();
-            if OrchestratorWakeRepo::admit_orchestrator_wake(
-                &*self.db,
-                CreateOrchestratorWake {
-                    id,
-                    event_id: event.id.clone(),
-                    event_sequence: event.sequence,
-                    task_id: task_id.to_owned(),
-                    task_role_id: role.id.clone(),
-                    coordination_mode: role.coordination_mode,
-                    actor_kind: membership.actor_kind,
-                    actor_id: membership.actor_id.clone(),
-                    work_unit_id: signal.work_unit_id.clone(),
-                    correlation_id: event.correlation_id.clone(),
-                    causation_id: Some(event.id.clone()),
-                    causation_depth: event.causation_depth,
-                    policy_ref: POLICY_REF.to_owned(),
-                    policy_version: POLICY_VERSION,
-                    policy_digest: policy_digest.clone(),
-                    task_role_version: role.version,
-                    task_role_policy_json: role.policy_json.clone(),
-                    available_at: now.clone(),
-                    created_at: now.clone(),
-                    updated_at: now.clone(),
-                },
-            )
-            .await?
-            {
-                admitted += 1;
+            let memberships = RoleMembershipRepo::list_by_role(&*self.db, &role.id, false).await?;
+            let active: Vec<_> = memberships
+                .into_iter()
+                .filter(|membership| membership.status == RoleMembershipStatus::Active)
+                .collect();
+            let role_policy = TaskRoleOrchestratorPolicy::parse(&role.policy_json).ok();
+            let targets = select_orchestrator_targets(
+                role.coordination_mode,
+                &role.id,
+                &role.role,
+                &active,
+                unit.as_ref(),
+                &signal.target,
+            );
+            for membership in targets {
+                if event_is_authored_by_member(event, membership)
+                    || (membership.actor_kind == ActorKind::Agent
+                        && role_policy
+                            .as_ref()
+                            .is_some_and(|policy| !policy.permits_automatic_orchestration()))
+                {
+                    continue;
+                }
+                let id = new_uuid_v4();
+                if OrchestratorWakeRepo::admit_orchestrator_wake(
+                    &*self.db,
+                    CreateOrchestratorWake {
+                        id,
+                        event_id: event.id.clone(),
+                        event_sequence: event.sequence,
+                        task_id: task_id.to_owned(),
+                        task_role_id: role.id.clone(),
+                        coordination_mode: role.coordination_mode,
+                        actor_kind: membership.actor_kind,
+                        actor_id: membership.actor_id.clone(),
+                        work_unit_id: signal.work_unit_id.clone(),
+                        correlation_id: event.correlation_id.clone(),
+                        causation_id: Some(event.id.clone()),
+                        causation_depth: event.causation_depth,
+                        policy_ref: POLICY_REF.to_owned(),
+                        policy_version: POLICY_VERSION,
+                        policy_digest: policy_digest.clone(),
+                        task_role_version: role.version,
+                        task_role_policy_json: role.policy_json.clone(),
+                        available_at: now.clone(),
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    },
+                )
+                .await?
+                {
+                    admitted += 1;
+                }
             }
         }
         Ok(admitted)
@@ -900,13 +971,25 @@ impl OrchestratorRuntime {
             return Ok(DispatchOutcome::Retried);
         }
         let role = TaskRoleRepo::get_by_id(&*self.db, &wake.task_role_id).await?;
-        let Some(role) =
-            role.filter(|role| role.task_id == wake.task_id && role.role == "orchestrator")
-        else {
+        let Some(role) = role.filter(|role| role.task_id == wake.task_id) else {
             self.fail_wake(&wake, "canonical TaskRole was removed or changed")
                 .await?;
             return Ok(DispatchOutcome::Retried);
         };
+        if !crate::role_capabilities::current_task_role_has_capability(
+            &self.db,
+            &role.id,
+            api_types::TaskRoleCapability::Orchestration,
+        )
+        .await?
+        {
+            self.fail_wake(
+                &wake,
+                "orchestration capability was revoked after wake admission",
+            )
+            .await?;
+            return Ok(DispatchOutcome::Retried);
+        }
         if role.version != wake.task_role_version || role.policy_json != wake.task_role_policy_json
         {
             self.fail_wake(
@@ -979,6 +1062,7 @@ impl OrchestratorRuntime {
         let selected = select_orchestrator_targets(
             role.coordination_mode,
             &role.id,
+            &role.role,
             &memberships,
             unit.as_ref(),
             &signal.target,
@@ -1150,11 +1234,21 @@ impl OrchestratorRuntime {
                 }
             },
         };
+        let execution_has_orchestration = crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::Orchestration,
+        )
+        .await?;
+        let exact_execution_role =
+            db::ExecutionTaskRoleAuthorityRepo::get_by_execution_id(&*self.db, &execution.id)
+                .await?
+                .is_some_and(|authority| authority.task_role_id == wake.task_role_id);
         if execution.status != ExecutionStatus::Running
             || execution.task_id != wake.task_id
             || execution.workspace_id.is_some()
-            || execution.role != "orchestrator"
-            || execution.purpose != Some(ExecutionPurpose::Orchestrate)
+            || !execution_has_orchestration
+            || !exact_execution_role
             || execution.actor_ref() != Some(ActorRef::Agent(wake.actor_id.clone()))
         {
             self.make_uncertain(
@@ -1422,7 +1516,6 @@ impl OrchestratorRuntime {
                 "title": truncate(&task.title, 512),
                 "description": task.description.as_deref().map(|value| truncate(value, 16 * 1024)),
                 "lifecycle_state": task.lifecycle_state,
-                "task_type": task.task_type,
                 "version": task.version,
             },
             "task_role": {
@@ -1461,7 +1554,6 @@ impl OrchestratorRuntime {
                 "actor_kind": execution.actor_kind.map(|kind| kind.to_string()),
                 "actor_id": execution.actor_id,
                 "role": execution.role,
-                "purpose": execution.purpose.as_ref().map(|purpose| purpose.to_string()),
                 "status": execution.status.to_string(),
                 "work_unit_id": execution.work_unit_id,
                 "summary": execution.summary.as_deref().map(|value| truncate(value, 4096)),
@@ -1547,9 +1639,13 @@ impl OrchestratorRuntime {
         let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &event.entity_id).await? else {
             return Ok(false);
         };
-        if execution.purpose != Some(ExecutionPurpose::Orchestrate)
-            || execution.role != "orchestrator"
-            || execution.task_id != event.scope_id
+        if execution.task_id != event.scope_id
+            || !crate::role_capabilities::execution_has_capability(
+                &self.db,
+                &execution.id,
+                api_types::TaskRoleCapability::Orchestration,
+            )
+            .await?
         {
             return Ok(false);
         }
@@ -1956,6 +2052,7 @@ impl OrchestratorRuntime {
                     parent_work_unit_id,
                     assigned_actor,
                     requires_integration,
+                    review_subject,
                 } => {
                     if title.trim().is_empty()
                         || title.len() > 512
@@ -1963,6 +2060,10 @@ impl OrchestratorRuntime {
                         || scope.len() > 4096
                         || role.trim().is_empty()
                         || role.len() > 128
+                        || review_subject.as_ref().is_some_and(|subject| {
+                            subject.reviewed_work_unit_id.trim().is_empty()
+                                || subject.reviewed_work_unit_id.len() > 128
+                        })
                         || parent_work_unit_id
                             .as_ref()
                             .is_some_and(|id| id.trim().is_empty() || id.len() > 128)
@@ -1985,6 +2086,7 @@ impl OrchestratorRuntime {
                                 task_id: wake.task_id.clone(),
                                 title,
                                 scope,
+                                execution_instructions: None,
                                 role,
                                 parent_work_unit_id,
                                 assigned_actor: assigned_actor
@@ -1994,6 +2096,10 @@ impl OrchestratorRuntime {
                                 provenance: Some(db::WorkUnitProvenance::Actor(ActorRef::Agent(
                                     wake.actor_id.clone(),
                                 ))),
+                                review_subject: review_subject
+                                    .map(|subject| subject.reviewed_work_unit_id),
+                                artifact_inputs: Vec::new(),
+                                review_approval: None,
                             },
                             record.result_id.clone(),
                         )
@@ -2089,7 +2195,6 @@ impl OrchestratorRuntime {
             return Err(invalid_action("orchestrator TaskRole no longer exists"));
         };
         if role.task_id != wake.task_id
-            || role.role != "orchestrator"
             || role.coordination_mode != wake.coordination_mode
             || role.version != wake.task_role_version
             || role.policy_json != wake.task_role_policy_json
@@ -2097,6 +2202,15 @@ impl OrchestratorRuntime {
             return Err(invalid_action(
                 "TaskRole version, coordination, or policy changed after wake admission",
             ));
+        }
+        if !crate::role_capabilities::current_task_role_has_capability(
+            &self.db,
+            &role.id,
+            api_types::TaskRoleCapability::Orchestration,
+        )
+        .await?
+        {
+            return Err(invalid_action("TaskRole lost orchestration capability"));
         }
         let memberships = RoleMembershipRepo::list_by_role(&*self.db, &role.id, false).await?;
         if !memberships.iter().any(|membership| {
@@ -2503,6 +2617,7 @@ fn validate_action_policy(
 fn select_orchestrator_targets<'a>(
     mode: Option<CoordinationMode>,
     orchestrator_role_id: &str,
+    orchestrator_role_name: &str,
     members: &'a [RoleMembership],
     work_unit: Option<&WorkUnit>,
     target: &WakeTarget,
@@ -2522,7 +2637,7 @@ fn select_orchestrator_targets<'a>(
                 .filter(|member| member.status == RoleMembershipStatus::Active)
                 .collect(),
             Some(CoordinationMode::Partitioned) => {
-                if let Some(unit) = work_unit.filter(|unit| unit.role == "orchestrator") {
+                if let Some(unit) = work_unit.filter(|unit| unit.role == orchestrator_role_name) {
                     unit.assigned_actor
                         .as_ref()
                         .and_then(exact_actor)
@@ -2541,7 +2656,7 @@ fn select_orchestrator_targets<'a>(
                 .filter(|member| member.status == RoleMembershipStatus::Active)
                 .collect(),
             Some(CoordinationMode::Partitioned) => work_unit
-                .filter(|unit| unit.role == "orchestrator")
+                .filter(|unit| unit.role == orchestrator_role_name)
                 .and_then(|unit| unit.assigned_actor.as_ref())
                 .and_then(exact_actor)
                 .into_iter()
@@ -2587,13 +2702,13 @@ fn execution_lifecycle_is_orchestrator_wake(
     event_type: &str,
     event_task_id: &str,
     execution_task_id: &str,
-    purpose: Option<ExecutionPurpose>,
+    has_orchestration_capability: bool,
 ) -> bool {
     matches!(
         event_type,
         "execution.started" | "execution.completed" | "execution.failed" | "execution.stalled"
     ) && event_task_id == execution_task_id
-        && purpose != Some(ExecutionPurpose::Orchestrate)
+        && !has_orchestration_capability
 }
 
 fn event_is_authored_by_member(event: &DomainEvent, member: &RoleMembership) -> bool {
@@ -2667,7 +2782,7 @@ mod tests {
     use super::*;
     use db::{
         CreateProject, CreateRoleMembership, CreateTask, CreateTaskRole, ProjectRepo,
-        RoleMembershipRepo, TaskRepo, TaskRoleRepo, User, UserRepo, WorkUnitRepo,
+        RoleMembershipRepo, TaskRepo, TaskRoleRepo, User, UserRepo,
     };
     use sqlx::Row;
 
@@ -2721,6 +2836,30 @@ mod tests {
     async fn test_project(database: &Arc<db::SqliteDb>, owner_id: &str) -> String {
         let now = now_rfc3339();
         let id = new_uuid_v4();
+        let has_defaults: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'project_task_role_defaults')",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("Project defaults table lookup");
+        if !has_defaults {
+            sqlx::query(
+                "INSERT INTO project (
+                    id, name, settings, primary_repo_id, owner_id,
+                    project_hooks_json, project_work_epoch, version, created_at, updated_at
+                 ) VALUES (?, ?, '{}', NULL, ?, '[]', 0, 1, ?, ?)",
+            )
+            .bind(&id)
+            .bind("PR6 durable wake fixture")
+            .bind(owner_id)
+            .bind(&now)
+            .bind(&now)
+            .execute(database.pool())
+            .await
+            .expect("pre-cutover project creates");
+            return id;
+        }
         ProjectRepo::create(
             &**database,
             CreateProject {
@@ -2759,7 +2898,6 @@ mod tests {
                     parent_task_id: None,
                     title: title.to_owned(),
                     description: None,
-                    task_type: "implementation".to_owned(),
                     lifecycle_state: db::TaskLifecycleState::Ready,
                     is_automation: false,
                     priority: 0,
@@ -2788,6 +2926,18 @@ mod tests {
         id
     }
 
+    async fn grant_test_orchestration_capability(database: &Arc<db::SqliteDb>, role_id: &str) {
+        let migrated: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_role_capability_configuration')",
+        )
+        .fetch_one(database.pool()).await.expect("capability schema lookup");
+        if migrated {
+            sqlx::query("UPDATE task_role_capability_configuration SET configuration_json = ?, updated_at = ? WHERE task_role_id = ?")
+                .bind(r#"{"schema_version":1,"display_label":null,"capabilities":["orchestration"],"rework":null}"#)
+                .bind(now_rfc3339()).bind(role_id).execute(database.pool()).await.expect("fixture explicitly grants orchestration capability");
+        }
+    }
+
     async fn test_orchestrator_role(
         database: &Arc<db::SqliteDb>,
         task_id: &str,
@@ -2796,6 +2946,16 @@ mod tests {
     ) -> String {
         let now = now_rfc3339();
         let id = new_uuid_v4();
+        let capability_schema: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_role_capability_configuration')",
+        ).fetch_one(database.pool()).await.expect("fixture schema lookup");
+        if !capability_schema {
+            sqlx::query("INSERT INTO task_role (id, task_id, role, coordination_mode, policy_json, version, created_at, updated_at) VALUES (?, ?, 'orchestrator', ?, ?, 1, ?, ?)")
+                .bind(&id).bind(task_id).bind(mode.map(|mode| mode.to_string()))
+                .bind(policy_json).bind(&now).bind(&now)
+                .execute(database.pool()).await.expect("historical TaskRole fixture inserts before capability migration");
+            return id;
+        }
         TaskRoleRepo::create(
             &**database,
             CreateTaskRole {
@@ -2810,6 +2970,7 @@ mod tests {
         )
         .await
         .expect("canonical orchestrator TaskRole creates");
+        grant_test_orchestration_capability(database, &id).await;
         id
     }
 
@@ -3395,7 +3556,6 @@ mod tests {
                     .expect("admitted Execution loads")
                     .expect("admitted Execution exists");
                 assert_eq!(execution.role, "orchestrator");
-                assert_eq!(execution.purpose, Some(db::ExecutionPurpose::Orchestrate));
             }
             OrchestratorClaimMutation::ChangeTaskRolePolicy => {
                 let role = TaskRoleRepo::get_by_id(&*fixture.database, &fixture.role_id)
@@ -3647,22 +3807,11 @@ mod tests {
         let execution = ExecutionRepo::get_by_id(&*fixture.database, &execution_id)
             .await
             .expect("Execution lookup succeeds");
-        let resolved_daemon_id = execution
-            .as_ref()
-            .and_then(|execution| execution.executor_config_snapshot_json.as_deref())
-            .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
-            .and_then(|snapshot| {
-                snapshot
-                    .get("resolved_daemon_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            });
         assert!(
             matches!(&outcome, DispatchOutcome::Retried)
                 && provider_calls == 0
                 && execution.is_none(),
-            "cross-account global Agent must be denied before provider Start; got {outcome:?}, {provider_calls} provider calls, resolved daemon {resolved_daemon_id:?} (Agent-owned daemon {})",
-            fixture.daemon_id
+            "cross-account global Agent must be denied before provider Start"
         );
         assert_eq!(attempt_state, "reserved");
         let wake_state: String =
@@ -4227,7 +4376,6 @@ mod tests {
                 parent_task_id: None,
                 title: "Handle a durable orchestration wake".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
@@ -4254,6 +4402,7 @@ mod tests {
         )
         .await
         .expect("canonical TaskRole creates");
+        grant_test_orchestration_capability(&database, &task_role_id).await;
         RoleMembershipRepo::add(
             &*database,
             CreateRoleMembership {
@@ -4346,8 +4495,7 @@ mod tests {
     #[tokio::test]
     async fn exact_failure_has_one_wake_after_retry_lifecycle_effect() {
         use db::{
-            CreateDomainEvent, CreateExecution, DomainEventRepo, ExecutionPurpose, ExecutionRepo,
-            ExecutionStatus,
+            CreateDomainEvent, CreateExecution, DomainEventRepo, ExecutionRepo, ExecutionStatus,
         };
 
         let pool = db::create_sqlite_pool("sqlite::memory:")
@@ -4380,7 +4528,6 @@ mod tests {
                 task_id: task_id.clone(),
                 agent_id: None,
                 actor_ref: Some(ActorRef::Human(human_id.clone())),
-                purpose: Some(ExecutionPurpose::Implement),
                 role: "implementer".to_owned(),
                 status: ExecutionStatus::Failed,
                 stop_reason: Some(db::StopReason::ExecutorFailed),
@@ -4685,9 +4832,9 @@ mod tests {
             .run_once(10)
             .await
             .expect("new Task activation is found by the durable scan");
-        // Task creation, the Gate role-revision fact from membership insert,
-        // and bootstrap reconciliation are separate durable records.
-        assert_eq!(new_task.processed_events, 3);
+        // Task creation, explicit capability configuration, the membership
+        // Gate role-revision fact, and bootstrap are separate durable records.
+        assert_eq!(new_task.processed_events, 4);
         assert_eq!(new_task.admitted_wakes, 1);
         assert_eq!(new_task.dispatched_wakes, 1);
         let new_task_wake: String = sqlx::query_scalar(
@@ -5101,7 +5248,6 @@ mod tests {
                 agent_id: Some(actor_id.clone()),
                 actor_ref: Some(ActorRef::Agent(actor_id.clone())),
                 role: "orchestrator".to_owned(),
-                purpose: Some(ExecutionPurpose::Orchestrate),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
                 stopped_by: None,
@@ -5619,40 +5765,11 @@ mod tests {
         .await;
         let work_unit_id = new_uuid_v4();
         let work_unit_created_at = now_rfc3339();
-        WorkUnitRepo::create(
-            &*database,
-            db::CreateWorkUnit {
-                id: work_unit_id.clone(),
-                task_id: partitioned_task.clone(),
-                parent_work_unit_id: None,
-                title: "Exact orchestrator assignment".to_owned(),
-                scope: "One explicit orchestrator allocation".to_owned(),
-                role: "orchestrator".to_owned(),
-                assigned_actor: Some(ActorRef::Human(human_a.clone())),
-                requires_integration: false,
-                provenance: None,
-                created_by: ActorRef::Human(human_a.clone()),
-                created_at: work_unit_created_at.clone(),
-            },
-            db::CreateDomainEvent {
-                id: new_uuid_v4(),
-                event_type: "work_unit.created".to_owned(),
-                entity_type: "work_unit".to_owned(),
-                entity_id: work_unit_id,
-                actor_type: "human".to_owned(),
-                actor_id: Some(human_a.clone()),
-                scope_type: "task".to_owned(),
-                scope_id: partitioned_task,
-                correlation_id: new_uuid_v4(),
-                causation_id: None,
-                causation_depth: 0,
-                dedupe_key: None,
-                payload_json: r#"{"role":"orchestrator"}"#.to_owned(),
-                created_at: work_unit_created_at,
-            },
-        )
-        .await
-        .expect("partitioned exact WorkUnit allocation creates");
+        // Seed the historical V094 shape without invoking the current mapper.
+        sqlx::query("INSERT INTO work_unit (id, task_id, title, scope, status, role, assigned_actor_kind, assigned_actor_id, requires_integration, created_by_kind, created_by_id, version, created_at, updated_at) VALUES (?, ?, 'Exact orchestrator assignment', 'One explicit orchestrator allocation', 'open', 'orchestrator', 'human', ?, 0, 'human', ?, 1, ?, ?)")
+            .bind(&work_unit_id).bind(&partitioned_task).bind(&human_a).bind(&human_a)
+            .bind(&work_unit_created_at).bind(&work_unit_created_at)
+            .execute(database.pool()).await.expect("historical partitioned WorkUnit allocation creates");
 
         set_orchestrator_cursor_to_head(&database).await;
         let before_v095_head: i64 = sqlx::query_scalar(
@@ -5937,7 +6054,6 @@ mod tests {
                 parent_task_id: None,
                 title: "Create bounded work and request merge approval".to_owned(),
                 description: Some("Only a small task-scoped action set is authorized.".to_owned()),
-                task_type: "implementation".to_owned(),
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
@@ -5964,6 +6080,7 @@ mod tests {
         )
         .await
         .expect("orchestrator TaskRole creates");
+        grant_test_orchestration_capability(&database, &orchestrator_role_id).await;
         RoleMembershipRepo::add(
             &*database,
             CreateRoleMembership {
@@ -6037,7 +6154,6 @@ mod tests {
                 agent_id: Some(agent_id.clone()),
                 actor_ref: Some(ActorRef::Agent(agent_id.clone())),
                 role: "implementer".to_owned(),
-                purpose: Some(ExecutionPurpose::Implement),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
                 stopped_by: None,
@@ -6230,7 +6346,6 @@ mod tests {
         }
         let execution = orchestrator_execution.expect("fake Harness finishes the new Execution");
         assert_eq!(execution.role, "orchestrator");
-        assert_eq!(execution.purpose, Some(ExecutionPurpose::Orchestrate));
         assert_eq!(
             execution.actor_ref(),
             Some(ActorRef::Agent(agent_id.clone()))
@@ -6284,7 +6399,7 @@ mod tests {
             .expect("task exists");
         assert_eq!(task.lifecycle_state, db::TaskLifecycleState::Ready);
         let total_executions: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'orchestrator' AND purpose = 'orchestrate'",
+            "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'orchestrator'",
         )
         .bind(&task_id)
         .fetch_one(database.pool())
@@ -6388,6 +6503,7 @@ mod tests {
         let targets = select_orchestrator_targets(
             Some(CoordinationMode::Collaborative),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Task,
@@ -6406,11 +6522,14 @@ mod tests {
             parent_work_unit_id: None,
             title: "bounded".to_owned(),
             scope: "one scope".to_owned(),
+            execution_instructions: None,
             status: WorkUnitStatus::Open,
             role: "orchestrator".to_owned(),
             assigned_actor: Some(ActorRef::Agent("b".to_owned())),
             requires_integration: false,
             provenance: None,
+            review_approval_gate_id: None,
+            review_approval_line_id: None,
             created_by: ActorRef::Agent("a".to_owned()),
             version: 1,
             created_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -6419,6 +6538,7 @@ mod tests {
         let targets = select_orchestrator_targets(
             Some(CoordinationMode::Partitioned),
             "role-orchestrator",
+            "orchestrator",
             &members,
             Some(&unit),
             &WakeTarget::Task,
@@ -6428,6 +6548,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Partitioned),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Task,
@@ -6441,6 +6562,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Independent),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Task,
@@ -6449,6 +6571,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Independent),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Role("role-orchestrator".to_owned()),
@@ -6457,6 +6580,7 @@ mod tests {
         let exact = select_orchestrator_targets(
             Some(CoordinationMode::Independent),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Actor(ActorRef::Agent("b".to_owned())),
@@ -6471,6 +6595,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             None,
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Task
@@ -6479,6 +6604,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             None,
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Role("role-orchestrator".to_owned()),
@@ -6488,6 +6614,7 @@ mod tests {
             select_orchestrator_targets(
                 None,
                 "role-orchestrator",
+                "orchestrator",
                 &members,
                 None,
                 &WakeTarget::Actor(ActorRef::Agent("a".to_owned())),
@@ -6505,6 +6632,7 @@ mod tests {
             select_orchestrator_targets(
                 Some(CoordinationMode::Collaborative),
                 "role-orchestrator",
+                "orchestrator",
                 &members,
                 None,
                 &role,
@@ -6515,6 +6643,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Partitioned),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &role,
@@ -6523,6 +6652,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Independent),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &role,
@@ -6539,6 +6669,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Collaborative),
             "role-orchestrator",
+            "orchestrator",
             &[suspended.clone(), ended.clone()],
             None,
             &WakeTarget::Task,
@@ -6547,6 +6678,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Collaborative),
             "role-orchestrator",
+            "orchestrator",
             &[suspended.clone(), ended],
             None,
             &WakeTarget::Actor(ActorRef::Agent("a".to_owned())),
@@ -6586,25 +6718,25 @@ mod tests {
             "execution.completed",
             "task-1",
             "task-1",
-            Some(ExecutionPurpose::Implement),
+            false,
         ));
         assert!(!execution_lifecycle_is_orchestrator_wake(
             "execution.completed",
             "task-1",
             "task-1",
-            Some(ExecutionPurpose::Orchestrate),
+            true,
         ));
         assert!(!execution_lifecycle_is_orchestrator_wake(
             "execution.log",
             "task-1",
             "task-1",
-            Some(ExecutionPurpose::Implement),
+            false,
         ));
         assert!(!execution_lifecycle_is_orchestrator_wake(
             "execution.failed",
             "task-1",
             "task-2",
-            Some(ExecutionPurpose::Implement),
+            false,
         ));
     }
 
@@ -6691,7 +6823,6 @@ mod tests {
             actor_kind: Some(ActorKind::Agent),
             actor_id: Some("agent-1".to_owned()),
             role: "implementer".to_owned(),
-            purpose: Some(ExecutionPurpose::Implement),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -6783,6 +6914,7 @@ mod tests {
             title: "follow-up".to_owned(),
             scope: "bounded scope".to_owned(),
             role: "implementer".to_owned(),
+            review_subject: None,
             parent_work_unit_id: None,
             assigned_actor: None,
             requires_integration: false,

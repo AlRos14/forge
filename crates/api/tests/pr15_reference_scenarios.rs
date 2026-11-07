@@ -368,21 +368,13 @@ async fn s01_authenticated_http_shell_flow_persists_across_server_restart() {
     )
     .await;
 
-    let execution: ExecutionResponse = request_json(
+    let execution: ExecutionResponse = launch_work_unit_execution(
         &client,
-        Method::POST,
         &base,
-        &format!("/api/v1/tasks/{}/executions", task.id),
-        Some(&token),
-        Some(json!({
-            "work_unit_id": allocated.id,
-            "expected_work_unit_version": allocated.version,
-            "purpose": "implement",
-            "prompt": "printf 'pr15-http-result\\n' > pr15-result.txt && git add pr15-result.txt && git -c user.name='Forge Test' -c user.email='test@forge.invalid' commit -m 'PR15 HTTP result'",
-            "input_artifact_ids": [],
-            "overrides": null
-        })),
-        StatusCode::OK,
+        &token,
+        &task.id,
+        &allocated,
+        "printf 'pr15-http-result\\n' > pr15-result.txt && git add pr15-result.txt && git -c user.name='Forge Test' -c user.email='test@forge.invalid' commit -m 'PR15 HTTP result'",
     )
     .await;
     assert_eq!(execution.status, ExecutionStatus::Running);
@@ -662,7 +654,7 @@ async fn s04_ended_membership_rejects_new_execution_for_preallocated_work_unit()
         StatusCode::CREATED,
     )
     .await;
-    let allocated: WorkUnitResponse = common::json_request(
+    let _allocated: WorkUnitResponse = common::json_request(
         &harness.app,
         Method::POST,
         &format!("/api/v1/work-units/{}/allocation", work_unit.id),
@@ -689,25 +681,23 @@ async fn s04_ended_membership_rejects_new_execution_for_preallocated_work_unit()
     let rejected = common::raw_json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/executions", task.id),
+        &format!("/api/v1/tasks/{}/dispatch/launch", task.id),
         json!({
-            "work_unit_id": allocated.id,
-            "expected_work_unit_version": allocated.version,
-            "purpose": "implement",
-            "prompt": "This must not reach the shell provider.",
-            "input_artifact_ids": [],
-            "overrides": null
+            "expected_task_version": task.version,
+            "expected_lifecycle_version": task.lifecycle.version,
+            "idempotency_key": "ended-membership-launch",
+            "reason": null,
         }),
     )
     .await;
-    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
     let error_bytes = axum::body::to_bytes(rejected.into_body(), usize::MAX)
         .await
         .expect("rejected admission error body reads");
     let error: api_types::ErrorResponse =
         serde_json::from_slice(&error_bytes).expect("rejected admission error parses");
-    assert_eq!(error.code, "invalid_operation");
-    assert_eq!(error.message, "WorkUnit is not runnable");
+    assert_eq!(error.code, "conflict");
+    assert!(error.message.contains("launch is not available"));
     let execution_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
             .bind(&task.id)
@@ -816,25 +806,50 @@ async fn s02_three_shell_processes_write_concurrently_in_isolated_work_unit_work
     }
 
     let mut executions = Vec::with_capacity(labels.len());
+    // Prepare the exact harness instructions for every WorkUnit before the
+    // first launch, so one dispatcher tick can admit the parallel graph.
     for (index, label) in labels.iter().enumerate() {
-        let work_unit = &work_units[index];
-        let execution: ExecutionResponse = common::json_request(
+        let work_unit = work_units[index].clone();
+        let command = s02_shell_command(
+            label,
+            &release_path,
+            &barrier_dir.path().join(format!("ready-{label}")),
+        );
+        let updated: WorkUnitResponse = common::json_request(
             &harness.app,
-            Method::POST,
-            &format!("/api/v1/tasks/{}/executions", task.id),
+            Method::PATCH,
+            &format!("/api/v1/work-units/{}", work_unit.id),
             json!({
-                "work_unit_id": work_unit.id,
-                "expected_work_unit_version": work_unit.version,
-                "purpose": "implement",
-                "prompt": s02_shell_command(
-                    label,
-                    &release_path,
-                    &barrier_dir.path().join(format!("ready-{label}")),
-                ),
-                "input_artifact_ids": [],
-                "overrides": null
+                "expected_version": work_unit.version,
+                "title": null,
+                "scope": null,
+                "execution_instructions": command,
+                "requires_integration": null,
             }),
             StatusCode::OK,
+        )
+        .await;
+        work_units[index] = updated;
+        let _: Value = common::json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/work-units/{}/workspace", work_unit.id),
+            json!({}),
+            StatusCode::OK,
+        )
+        .await;
+    }
+    for (index, label) in labels.iter().enumerate() {
+        let work_unit = &work_units[index];
+        let execution: ExecutionResponse = common::launch_work_unit_execution(
+            &harness.app,
+            &task.id,
+            work_unit,
+            Some(&s02_shell_command(
+                label,
+                &release_path,
+                &barrier_dir.path().join(format!("ready-{label}")),
+            )),
         )
         .await;
         assert_eq!(execution.status, ExecutionStatus::Running);
@@ -856,7 +871,6 @@ async fn s02_three_shell_processes_write_concurrently_in_isolated_work_unit_work
         assert_eq!(row.agent_id.as_deref(), Some(agent_id.as_str()));
         assert_eq!(row.actor_ref(), Some(db::ActorRef::Agent(agent_id.clone())));
         assert_eq!(row.role, "implementer");
-        assert_eq!(row.purpose, Some(db::ExecutionPurpose::Implement));
         assert_eq!(row.work_unit_id.as_deref(), Some(work_unit.id.as_str()));
         assert_eq!(row.work_unit_version, Some(work_unit.version));
         let workspace_id = row
@@ -1152,6 +1166,114 @@ async fn s02_three_shell_processes_write_concurrently_in_isolated_work_unit_work
     assert_ne!(lifecycle.state, TaskLifecycleState::Done);
 }
 
+async fn launch_work_unit_execution(
+    client: &Client,
+    base: &str,
+    token: &str,
+    task_id: &str,
+    work_unit: &WorkUnitResponse,
+    prompt: &str,
+) -> ExecutionResponse {
+    let work_unit: WorkUnitResponse = request_json(
+        client,
+        Method::GET,
+        base,
+        &format!("/api/v1/work-units/{}", work_unit.id),
+        Some(token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    let work_unit: WorkUnitResponse = if work_unit.execution_instructions.as_deref() == Some(prompt)
+    {
+        work_unit
+    } else {
+        request_json(
+            client,
+            Method::PATCH,
+            base,
+            &format!("/api/v1/work-units/{}", work_unit.id),
+            Some(token),
+            Some(json!({
+                "expected_version": work_unit.version,
+                "title": null,
+                "scope": null,
+                "execution_instructions": prompt,
+                "requires_integration": null,
+            })),
+            StatusCode::OK,
+        )
+        .await
+    };
+    if work_unit.requires_integration && work_unit.readiness.runnable {
+        let _: Value = request_json(
+            client,
+            Method::POST,
+            base,
+            &format!("/api/v1/work-units/{}/workspace", work_unit.id),
+            Some(token),
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    }
+    let task: TaskResponse = request_json(
+        client,
+        Method::GET,
+        base,
+        &format!("/api/v1/tasks/{task_id}"),
+        Some(token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    let launch: api_types::TaskLaunchResponse = request_json(
+        client,
+        Method::POST,
+        base,
+        &format!("/api/v1/tasks/{task_id}/dispatch/launch"),
+        Some(token),
+        Some(json!({
+            "expected_task_version": task.version,
+            "expected_lifecycle_version": task.lifecycle.version,
+            "idempotency_key": uuid::Uuid::new_v4().to_string(),
+            "reason": null,
+        })),
+        StatusCode::OK,
+    )
+    .await;
+    let execution_id = if let Some(execution_id) = launch.admitted_execution_ids.first() {
+        execution_id.clone()
+    } else {
+        let executions: PaginatedResponse<ExecutionResponse> = request_json(
+            client,
+            Method::GET,
+            base,
+            &format!("/api/v1/tasks/{task_id}/executions"),
+            Some(token),
+            None,
+            StatusCode::OK,
+        )
+        .await;
+        executions
+            .items
+            .into_iter()
+            .find(|execution| execution.work_unit_id.as_deref() == Some(work_unit.id.as_str()))
+            .map(|execution| execution.id)
+            .expect("Task launch or its existing Execution targets the WorkUnit")
+    };
+    request_json(
+        client,
+        Method::GET,
+        base,
+        &format!("/api/v1/executions/{execution_id}"),
+        Some(token),
+        None,
+        StatusCode::OK,
+    )
+    .await
+}
+
 async fn new_unseeded_state(database_url: &str, workspace_root: &Path) -> AppState {
     let pool = db::create_sqlite_pool(database_url)
         .await
@@ -1175,7 +1297,7 @@ async fn new_unseeded_state(database_url: &str, workspace_root: &Path) -> AppSta
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
     ));
-    AppState::with_adapter_registry_services_and_shutdown(
+    let state = AppState::with_adapter_registry_services_and_shutdown(
         db,
         event_bus,
         true,
@@ -1186,7 +1308,13 @@ async fn new_unseeded_state(database_url: &str, workspace_root: &Path) -> AppSta
         api::state::test_workflows_dir(),
         api::state::test_jwt_secret(),
         api::state::test_bcrypt_cost(),
-    )
+    );
+    let dispatcher = Arc::new(services::TaskDispatcher::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+        Arc::clone(&state.task_service),
+    ));
+    state.with_task_dispatcher(dispatcher)
 }
 
 #[derive(Debug, Clone)]

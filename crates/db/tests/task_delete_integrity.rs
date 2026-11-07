@@ -173,7 +173,6 @@ async fn create_task(
             subtask_order,
             title: title.to_owned(),
             description: None,
-            task_type: "implementation".to_owned(),
             lifecycle_state: db::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,

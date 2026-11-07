@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    now_rfc3339, AgentExecutionStats, ExecutionPurpose, ExecutionStatus,
-    PendingProviderStartFailure, RunningExecutionFailure,
+    now_rfc3339, ActorKind, AgentExecutionStats, ExecutionStatus, ExecutionTaskRoleAuthority,
+    ExecutionTaskRoleAuthorityRepo, PendingProviderStartFailure, RunningExecutionFailure,
 };
 
 fn map_review_execution_subject(row: SqliteRow) -> Result<ReviewExecutionSubject> {
@@ -14,6 +14,38 @@ fn map_review_execution_subject(row: SqliteRow) -> Result<ReviewExecutionSubject
         workspace_snapshot_digest: row.try_get("workspace_snapshot_digest")?,
         created_at: row.try_get("created_at")?,
     })
+}
+
+fn map_execution_task_role_authority(row: &SqliteRow) -> Result<ExecutionTaskRoleAuthority> {
+    Ok(ExecutionTaskRoleAuthority {
+        execution_id: row.try_get("execution_id")?,
+        task_role_id: row.try_get("task_role_id")?,
+        task_role_version: row.try_get("task_role_version")?,
+        configuration_json: row.try_get("configuration_json")?,
+        capabilities_json: row.try_get("capabilities_json")?,
+        membership_id: row.try_get("membership_id")?,
+        actor_kind: ActorKind::from_str(&row.try_get::<String, _>("actor_kind")?)
+            .map_err(|_| DbError::InvalidTransition)?,
+        actor_id: row.try_get("actor_id")?,
+        source: row.try_get("source")?,
+        captured_at: row.try_get("captured_at")?,
+    })
+}
+
+#[async_trait]
+impl ExecutionTaskRoleAuthorityRepo for SqliteDb {
+    async fn get_by_execution_id(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<ExecutionTaskRoleAuthority>> {
+        let row = sqlx::query("SELECT * FROM execution_task_role_authority WHERE execution_id = ?")
+            .bind(execution_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref()
+            .map(map_execution_task_role_authority)
+            .transpose()
+    }
 }
 
 async fn insert_review_execution_subject_in_tx(
@@ -119,8 +151,6 @@ async fn create_human_review_execution(
         }
     };
     if input.status != ExecutionStatus::Running
-        || input.role != "reviewer"
-        || input.purpose != Some(ExecutionPurpose::Review)
         || human_actor_id.is_none()
         || !subject_matches
         || event.event_type != "execution.started"
@@ -138,10 +168,11 @@ async fn create_human_review_execution(
     }
 
     let mut tx = db.pool.begin().await?;
-    if !human_has_current_role_authority_in_tx(
+    if !human_has_current_role_capability_in_tx(
         &mut tx,
         &input.task_id,
-        "reviewer",
+        &input.role,
+        "formal_review",
         human_actor_id.expect("shape validation requires a Human Actor"),
     )
     .await?
@@ -164,10 +195,11 @@ async fn create_human_review_execution(
 /// Recheck current Human role authority inside the same SQLite transaction as
 /// an authoritative Review write. Only a current target TaskRole membership
 /// can authorize it.
-pub(super) async fn human_has_current_role_authority_in_tx(
+pub(super) async fn human_has_current_role_capability_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     task_id: &str,
     role: &str,
+    capability: &str,
     user_id: &str,
 ) -> Result<bool> {
     let Some(canonical_role) = crate::canonical_task_role_name(role) else {
@@ -177,9 +209,17 @@ pub(super) async fn human_has_current_role_authority_in_tx(
         "SELECT EXISTS (
             SELECT 1
             FROM task_role AS role
+            JOIN task_role_capability_configuration AS configuration
+              ON configuration.task_role_id = role.id
             JOIN role_membership AS membership
               ON membership.task_role_id = role.id
             WHERE role.task_id = ? AND role.role = ?
+              AND json_valid(configuration.configuration_json)
+              AND json_extract(configuration.configuration_json, '$.schema_version') = 1
+              AND EXISTS (
+                  SELECT 1 FROM json_each(configuration.configuration_json, '$.capabilities')
+                  WHERE type = 'text' AND value = ?
+              )
               AND membership.actor_kind = 'human'
               AND membership.actor_id = ?
               AND membership.status = 'active'
@@ -187,7 +227,28 @@ pub(super) async fn human_has_current_role_authority_in_tx(
     )
     .bind(task_id)
     .bind(&canonical_role)
+    .bind(capability)
     .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(authorized != 0)
+}
+
+pub(super) async fn execution_snapshot_has_capability_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    execution_id: &str,
+    capability: &str,
+) -> Result<bool> {
+    let authorized: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM execution_task_role_authority authority
+            JOIN json_each(authority.capabilities_json) capability
+            WHERE authority.execution_id = ?
+              AND capability.type = 'text' AND capability.value = ?
+         )",
+    )
+    .bind(execution_id)
+    .bind(capability)
     .fetch_one(&mut **tx)
     .await?;
     Ok(authorized != 0)
@@ -265,8 +326,8 @@ impl ExecutionRepo for SqliteDb {
             .transpose()?
             .ok_or(DbError::NotFound)?;
         if execution.task_id != subject.task_id
-            || execution.role != "reviewer"
-            || execution.purpose != Some(ExecutionPurpose::Review)
+            || !execution_snapshot_has_capability_in_tx(&mut tx, &execution.id, "formal_review")
+                .await?
             || execution.status != ExecutionStatus::Running
             || execution.workspace_id.as_deref() != Some(subject.workspace_id.as_str())
         {
@@ -366,17 +427,23 @@ impl ExecutionRepo for SqliteDb {
     async fn find_running_human_review_execution(
         &self,
         task_id: &str,
+        task_role_id: &str,
         user_id: &str,
         workspace_id: Option<&str>,
     ) -> Result<Option<Execution>> {
         sqlx::query(
-            "SELECT * FROM execution
-             WHERE task_id = ? AND role = 'reviewer' AND purpose = 'review'
-               AND actor_kind = 'human' AND actor_id = ? AND status = 'running'
-               AND workspace_id IS ?
-             ORDER BY created_at DESC, id DESC LIMIT 1",
+            "SELECT execution.* FROM execution
+             JOIN execution_task_role_authority authority
+               ON authority.execution_id = execution.id
+             JOIN json_each(authority.capabilities_json) capability
+             WHERE execution.task_id = ? AND authority.task_role_id = ?
+               AND capability.type = 'text' AND capability.value = 'formal_review'
+               AND execution.actor_kind = 'human' AND execution.actor_id = ?
+               AND execution.status = 'running' AND execution.workspace_id IS ?
+             ORDER BY execution.created_at DESC, execution.id DESC LIMIT 1",
         )
         .bind(task_id)
+        .bind(task_role_id)
         .bind(user_id)
         .bind(workspace_id)
         .fetch_optional(self.pool())
@@ -432,9 +499,7 @@ impl ExecutionRepo for SqliteDb {
                 "automatic orchestrator Execution requires an Agent ActorRef".to_owned(),
             ));
         };
-        if input.role != "orchestrator"
-            || input.purpose != Some(ExecutionPurpose::Orchestrate)
-            || input.workspace_id.is_some()
+        if input.workspace_id.is_some()
             || event.event_type != "execution.started"
             || event.entity_type != "execution"
             || event.entity_id != input.id
@@ -444,8 +509,7 @@ impl ExecutionRepo for SqliteDb {
             || event.actor_id.as_deref() != Some(agent_id.as_str())
         {
             return Err(DbError::Check(
-                "orchestrator Execution must be workspace-free with exact role and purpose"
-                    .to_owned(),
+                "orchestrator Execution must be workspace-free with its exact role".to_owned(),
             ));
         }
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -457,9 +521,18 @@ impl ExecutionRepo for SqliteDb {
                 JOIN project current_project ON current_project.id = current_task.project_id
                 JOIN agent_current current_agent ON current_agent.id = w.actor_id
                 WHERE w.id = ? AND w.task_id = ? AND w.actor_kind = 'agent'
-                  AND w.actor_id = ? AND w.task_role_id = (
-                      SELECT id FROM task_role WHERE task_id = w.task_id
-                        AND role = 'orchestrator'
+                  AND w.actor_id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM task_role role
+                      JOIN task_role_capability_configuration configuration
+                        ON configuration.task_role_id = role.id
+                      WHERE role.id = w.task_role_id AND role.task_id = w.task_id
+                        AND role.role = ? AND role.version = w.task_role_version
+                        AND role.policy_json = w.task_role_policy_json
+                        AND EXISTS (
+                            SELECT 1 FROM json_each(configuration.configuration_json, '$.capabilities')
+                            WHERE type = 'text' AND value = 'orchestration'
+                        )
                   )
                   AND current_project.owner_id IS NOT NULL
                   AND current_project.owner_id = current_agent.owner_id
@@ -483,6 +556,7 @@ impl ExecutionRepo for SqliteDb {
         .bind(wake_id)
         .bind(&input.task_id)
         .bind(agent_id)
+        .bind(&input.role)
         .bind(lease_owner)
         .bind(attempt_number)
         .bind(&input.id)
@@ -626,9 +700,57 @@ impl ExecutionRepo for SqliteDb {
         let rows = sqlx::query(
             "SELECT * FROM execution
              WHERE work_unit_id IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM work_unit w
+                   WHERE w.id = execution.work_unit_id AND w.task_id = execution.task_id
+                     AND w.status = 'open' AND w.version = execution.work_unit_version
+                     AND w.role = execution.role
+                     AND w.assigned_actor_kind = execution.actor_kind
+                     AND w.assigned_actor_id = execution.actor_id
+               )
                AND status = 'cancelled'
                AND resume_policy = 'auto'
                AND stop_reason IN ('crash_recovery', 'graceful_shutdown')
+               AND NOT EXISTS (
+                   SELECT 1 FROM execution newer
+                   WHERE newer.work_unit_id = execution.work_unit_id
+                     AND (newer.created_at > execution.created_at
+                          OR (newer.created_at = execution.created_at
+                              AND newer.id > execution.id))
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM execution child
+                   WHERE child.parent_execution_id = execution.id
+               )
+             ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(map_execution).collect()
+    }
+
+    async fn list_work_unit_recovery_required_candidates(&self) -> Result<Vec<Execution>> {
+        let rows = sqlx::query(
+            "SELECT * FROM execution
+             WHERE work_unit_id IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM work_unit w
+                   WHERE w.id = execution.work_unit_id AND w.task_id = execution.task_id
+                     AND w.status = 'open' AND w.version = execution.work_unit_version
+                     AND w.role = execution.role
+                     AND w.assigned_actor_kind = execution.actor_kind
+                     AND w.assigned_actor_id = execution.actor_id
+               )
+               AND status = 'cancelled'
+               AND resume_policy IN ('auto', 'manual')
+               AND stop_reason IN ('crash_recovery', 'agent_timeout', 'graceful_shutdown')
+               AND NOT EXISTS (
+                   SELECT 1 FROM execution newer
+                   WHERE newer.work_unit_id = execution.work_unit_id
+                     AND (newer.created_at > execution.created_at
+                          OR (newer.created_at = execution.created_at
+                              AND newer.id > execution.id))
+               )
                AND NOT EXISTS (
                    SELECT 1 FROM execution child
                    WHERE child.parent_execution_id = execution.id
@@ -898,8 +1020,6 @@ impl ExecutionRepo for SqliteDb {
         if execution.status != ExecutionStatus::Running
             || !matches!(execution.actor_ref(), Some(ActorRef::Agent(_)))
             || execution.agent_id.as_deref() != execution.actor_ref().as_ref().map(ActorRef::id)
-            || (execution.role == "orchestrator")
-                != (execution.purpose == Some(ExecutionPurpose::Orchestrate))
             || !provider_start_event_matches_execution(
                 &attempt_event,
                 &execution,
@@ -996,9 +1116,19 @@ impl ExecutionRepo for SqliteDb {
             tx.commit().await?;
             return Ok(ProviderStartClaim::TaskCancelled);
         }
+        let task_dispatch_state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM task_dispatch WHERE task_id = ?")
+                .bind(&execution.task_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if matches!(task_dispatch_state.as_deref(), Some("paused" | "cancelled")) {
+            tx.commit().await?;
+            return Ok(ProviderStartClaim::TaskPaused);
+        }
 
-        let is_orchestrator = execution.role == "orchestrator"
-            && execution.purpose == Some(ExecutionPurpose::Orchestrate);
+        let is_orchestrator =
+            execution_snapshot_has_capability_in_tx(&mut tx, &execution.id, "orchestration")
+                .await?;
         if is_orchestrator {
             if execution.work_unit_id.is_some() || execution.workspace_id.is_some() {
                 tx.commit().await?;
@@ -1031,6 +1161,10 @@ impl ExecutionRepo for SqliteDb {
                       ON current_agent.id = wake.actor_id
                     JOIN task_role AS role
                       ON role.id = wake.task_role_id
+                    JOIN task_role_capability_configuration AS configuration
+                      ON configuration.task_role_id = role.id
+                    JOIN execution_task_role_authority AS authority
+                      ON authority.execution_id = current_execution.id
                     JOIN role_membership AS member
                       ON member.task_role_id = wake.task_role_id
                      AND member.actor_kind = wake.actor_kind
@@ -1038,8 +1172,7 @@ impl ExecutionRepo for SqliteDb {
                      AND member.status = 'active'
                     WHERE current_execution.id = ?
                       AND current_execution.task_id = wake.task_id
-                      AND current_execution.role = 'orchestrator'
-                      AND current_execution.purpose = 'orchestrate'
+                      AND current_execution.role = role.role
                       AND current_execution.actor_kind = ?
                       AND current_execution.actor_id = ?
                       AND current_execution.agent_id = wake.actor_id
@@ -1065,8 +1198,14 @@ impl ExecutionRepo for SqliteDb {
                       AND wake.attempt_count >= attempt.attempt_number
                       AND attempt.state = 'start_requested'
                       AND role.task_id = wake.task_id
-                      AND role.role = 'orchestrator'
                       AND role.version = wake.task_role_version
+                      AND authority.task_role_id = role.id
+                      AND authority.task_role_version = role.version
+                      AND authority.configuration_json = configuration.configuration_json
+                      AND EXISTS (
+                          SELECT 1 FROM json_each(configuration.configuration_json, '$.capabilities')
+                          WHERE type = 'text' AND value = 'orchestration'
+                      )
                       AND role.policy_json = wake.task_role_policy_json
                       AND role.coordination_mode IS wake.coordination_mode
                       AND json_valid(role.policy_json)
@@ -1163,20 +1302,52 @@ impl ExecutionRepo for SqliteDb {
             let work_unit_authority_is_current: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
                     SELECT 1 FROM work_unit w
-                    JOIN task_role tr ON tr.task_id = w.task_id AND tr.role = w.role
-                    JOIN role_membership rm ON rm.task_role_id = tr.id
+                    JOIN execution_task_role_authority authority
+                      ON authority.execution_id = ?
+                    JOIN task_role tr ON tr.id = authority.task_role_id
+                      AND tr.task_id = w.task_id AND tr.role = w.role
+                    JOIN task_role_capability_configuration configuration
+                      ON configuration.task_role_id = tr.id
+                    JOIN role_membership rm ON rm.id = authority.membership_id
                     WHERE w.id = ? AND w.task_id = ?
                       AND w.status = 'open' AND w.version = ? AND w.role = ?
                       AND w.assigned_actor_kind = ? AND w.assigned_actor_id = ?
                       AND rm.actor_kind = ? AND rm.actor_id = ? AND rm.status = 'active'
+                      AND authority.actor_kind = ? AND authority.actor_id = ?
+                      AND authority.task_role_version = tr.version
+                      AND authority.configuration_json = configuration.configuration_json
+                      AND (w.review_approval_gate_id IS NULL OR EXISTS (
+                          SELECT 1 FROM work_unit_review_line line
+                          JOIN gate gate ON gate.id = w.review_approval_gate_id
+                            AND gate.task_id = w.task_id
+                          JOIN gate_evaluation evaluation
+                            ON evaluation.gate_id = gate.id AND evaluation.task_id = gate.task_id
+                           AND evaluation.outcome = 'satisfied'
+                           AND evaluation.policy_revision = gate.active_policy_revision
+                          JOIN gate_evaluation_input input
+                            ON input.evaluation_id = evaluation.id AND input.task_id = evaluation.task_id
+                           AND input.input_kind = 'review_line' AND input.input_id = line.id
+                           AND input.input_version = line.revision AND input.status = 'pass'
+                          WHERE line.id = w.review_approval_line_id
+                            AND line.task_id = w.task_id AND line.latest_verdict = 'pass'
+                            AND line.current_result_execution_id IS NOT NULL
+                            AND evaluation.id = (
+                                SELECT latest.id FROM gate_evaluation latest
+                                WHERE latest.gate_id = gate.id
+                                ORDER BY latest.evaluated_at DESC, latest.id DESC LIMIT 1
+                            )
+                      ))
                       AND ((w.requires_integration = 1 AND ? IS NOT NULL)
                            OR (w.requires_integration = 0 AND ? IS NULL))
                 )",
             )
+            .bind(&execution.id)
             .bind(work_unit_id)
             .bind(&execution.task_id)
             .bind(work_unit_version)
             .bind(&execution.role)
+            .bind(&actor_kind)
+            .bind(&actor_id)
             .bind(&actor_kind)
             .bind(&actor_id)
             .bind(&actor_kind)
@@ -1206,7 +1377,13 @@ impl ExecutionRepo for SqliteDb {
                     SELECT 1 FROM workspace_lease
                     WHERE task_id = ? AND work_unit_id = ? AND workspace_id = ?
                       AND execution_id = ? AND operation_idempotency_key = ?
-                      AND role = CASE WHEN trim(?) = 'reviewer' THEN 'reviewer' ELSE 'worker' END
+                      AND role = CASE WHEN EXISTS (
+                          SELECT 1 FROM execution_task_role_authority authority
+                          JOIN json_each(authority.capabilities_json) capability
+                          WHERE authority.execution_id = ?
+                            AND capability.type = 'text'
+                            AND capability.value = 'formal_review'
+                      ) THEN 'reviewer' ELSE 'worker' END
                       AND assigned_principal_type = 'agent' AND assigned_principal_id = ?
                       AND status = 'active' AND expires_at > ?
                 )",
@@ -1216,7 +1393,7 @@ impl ExecutionRepo for SqliteDb {
             .bind(workspace_id)
             .bind(&execution.id)
             .bind(&execution.id)
-            .bind(&execution.role)
+            .bind(&execution.id)
             .bind(&actor_id)
             .bind(crate::now_rfc3339())
             .fetch_one(&mut *tx)

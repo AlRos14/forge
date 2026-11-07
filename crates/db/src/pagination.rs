@@ -24,7 +24,6 @@ pub enum SortBy {
     LifecycleState,
     Status,
     Agent,
-    TaskType,
     Id,
 }
 

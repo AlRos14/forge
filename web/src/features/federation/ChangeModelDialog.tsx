@@ -19,6 +19,7 @@ import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { getReasoningOptionsForModel, useDiscoveredOptions } from '@/hooks/useDiscoveredOptions'
 import { SectionKicker } from '@/features/federation/components'
+import { useAuthStore } from '@/stores/auth'
 import {
   federationQueryKeys,
   isVersionConflict,
@@ -39,12 +40,15 @@ export function ChangeModelDialog({
   onClose: () => void
 }) {
   const queryClient = useQueryClient()
+  const isAdmin = useAuthStore((state) => Boolean(state.user?.is_admin))
+  const currentUserId = useAuthStore((state) => state.user?.id)
   const [mode, setMode] = useState<Mode>('update')
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [model, setModel] = useState('')
   const [reasoningEffort, setReasoningEffort] = useState('')
   const [permissionPolicy, setPermissionPolicy] = useState('')
+  const [daemonId, setDaemonId] = useState('')
   const [profileId, setProfileId] = useState('')
   const [error, setError] = useState<string>()
 
@@ -55,6 +59,8 @@ export function ChangeModelDialog({
   const updateAgent = useUpdateAgent()
   const discovered = useDiscoveredOptions(agent?.id ?? null, agent?.executor_type)
   const reasoningOptions = getReasoningOptionsForModel(discovered.data, model)
+  const availableDaemons = discovered.data?.availableDaemons ?? []
+  const canPinHost = isAdmin && agent?.owner_id === currentUserId
 
   useEffect(() => {
     if (!agent) return
@@ -64,6 +70,7 @@ export function ChangeModelDialog({
     setModel(agent.model ?? '')
     setReasoningEffort(agent.reasoning_effort ?? '')
     setPermissionPolicy(agent.permission_policy ?? '')
+    setDaemonId(agent.daemon_id ?? '')
     setProfileId('')
     setError(undefined)
   }, [agent?.id])
@@ -79,42 +86,60 @@ export function ChangeModelDialog({
       setError('Choose an exact profile to activate.')
       return
     }
-    if (mode === 'update' && !model.trim()) {
-      setError('A model is required.')
-      return
-    }
-
     setError(undefined)
     try {
+      const nextName = name.trim()
+      const nextDescription = description.trim() ? description.trim() : null
+      const nextDaemonId = daemonId || null
+      const hostChanged = canPinHost && nextDaemonId !== agent.daemon_id
       const metadataChanged =
-        name.trim() !== agent.name ||
-        (description.trim() ? description.trim() : null) !== agent.description
+        nextName !== agent.name || nextDescription !== agent.description || hostChanged
 
       if (mode === 'existing') {
         let version = agent.version
         if (metadataChanged) {
+          const body: {
+            version: number
+            name?: string
+            description?: string | null
+            daemon_id?: string | null
+          } = { version }
+          if (nextName !== agent.name) body.name = nextName
+          if (nextDescription !== agent.description) body.description = nextDescription
+          if (hostChanged) body.daemon_id = nextDaemonId
           const updated = await updateAgent.mutateAsync({
             agentId: agent.id,
-            body: {
-              name: name.trim(),
-              description: description.trim() ? description.trim() : null,
-              version,
-            },
+            body,
           })
           version = updated.version
         }
         await selectProfile.mutateAsync({ profileId, version })
       } else {
+        const nextModel = model.trim() ? model.trim() : null
+        const nextReasoningEffort = reasoningEffort.trim() || null
+        const nextPermissionPolicy = permissionPolicy.trim() || null
+        const body: {
+          version: number
+          name?: string
+          description?: string | null
+          model?: string | null
+          reasoning_effort?: string | null
+          permission_policy?: string | null
+          daemon_id?: string | null
+        } = { version: agent.version }
+        if (nextName !== agent.name) body.name = nextName
+        if (nextDescription !== agent.description) body.description = nextDescription
+        if (nextModel !== agent.model) body.model = nextModel
+        if (nextReasoningEffort !== agent.reasoning_effort) {
+          body.reasoning_effort = nextReasoningEffort
+        }
+        if (nextPermissionPolicy !== agent.permission_policy) {
+          body.permission_policy = nextPermissionPolicy
+        }
+        if (hostChanged) body.daemon_id = nextDaemonId
         await updateAgent.mutateAsync({
           agentId: agent.id,
-          body: {
-            name: name.trim(),
-            description: description.trim() ? description.trim() : null,
-            model: model.trim(),
-            reasoning_effort: reasoningEffort.trim() || null,
-            permission_policy: permissionPolicy.trim() || null,
-            version: agent.version,
-          },
+          body,
         })
       }
       void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
@@ -131,6 +156,16 @@ export function ChangeModelDialog({
   }
 
   const pending = selectProfile.isPending || updateAgent.isPending
+  const hostOptions = [
+    { value: '', label: 'Automatically resolve at Execution time' },
+    ...(agent?.daemon_id && !availableDaemons.some((daemon) => daemon.id === agent.daemon_id)
+      ? [{ value: agent.daemon_id, label: `Current host unavailable · ${agent.daemon_id}`, disabled: true }]
+      : []),
+    ...availableDaemons.map((daemon) => ({
+      value: daemon.id,
+      label: `${daemon.name} · ${humanize(daemon.status)}`,
+    })),
+  ]
 
   return (
     <Dialog open={Boolean(agent)} onOpenChange={(open) => !open && onClose()}>
@@ -162,6 +197,24 @@ export function ChangeModelDialog({
               <button type="button" role="tab" aria-selected={mode === 'existing'} onClick={() => setMode('existing')} className="flex-1 rounded px-3 py-1.5 text-xs font-medium">Select existing profile</button>
             </div>
 
+            {canPinHost ? (
+              <div className="space-y-2">
+                <Label htmlFor="edit-agent-host">Execution host</Label>
+                <Select
+                  id="edit-agent-host"
+                  value={daemonId}
+                  placeholder="Select an execution host"
+                  onChange={setDaemonId}
+                  options={hostOptions}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Optional advanced placement. Leave automatic unless this Agent must run on a
+                  specific authorized host. Automatic routing resolves an authorized host when an
+                  Execution starts.
+                </p>
+              </div>
+            ) : null}
+
             {mode === 'existing' ? (
               <div className="space-y-2">
                 <Label htmlFor="change-model-profile">Profile</Label>
@@ -191,11 +244,14 @@ export function ChangeModelDialog({
                   value={model || null}
                   isLoading={discovered.isLoading}
                   hasError={discovered.isError}
+                  warning={discovered.data?.warning}
                   onChange={(value) => setModel(value ?? '')}
                 />
                 {reasoningOptions.length > 0 ? (
                   <ReasoningSelector
                     id="change-model-reasoning"
+                    label={agent?.executor_type === 'claude_code' ? 'Effort' : 'Reasoning'}
+                    placeholder="Use harness default"
                     options={reasoningOptions}
                     value={reasoningEffort || null}
                     isLoading={discovered.isLoading}

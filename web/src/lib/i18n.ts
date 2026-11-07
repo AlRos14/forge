@@ -2,6 +2,7 @@ import i18n from 'i18next'
 import LanguageDetector from 'i18next-browser-languagedetector'
 import { initReactI18next } from 'react-i18next'
 import en from '@/locales/en.json'
+import es from '@/locales/es.json'
 
 const productTermKeys = {
   run: { singular: 'terms.run', plural: 'terms.runs' },
@@ -19,13 +20,17 @@ export function productTerm(term: ProductTerm, count = 1): string {
   return i18n.t(productTermKeys[term][count === 1 ? 'singular' : 'plural'])
 }
 
-void i18n.use(LanguageDetector).use(initReactI18next).init({
-  resources: {
-    en: { translation: en },
-  },
-  fallbackLng: 'en',
-  supportedLngs: ['en'],
-  interpolation: { escapeValue: false },
-})
+void i18n
+  .use(LanguageDetector)
+  .use(initReactI18next)
+  .init({
+    resources: {
+      en: { translation: en },
+      es: { translation: es },
+    },
+    fallbackLng: 'en',
+    supportedLngs: ['en', 'es'],
+    interpolation: { escapeValue: false },
+  })
 
 export default i18n

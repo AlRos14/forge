@@ -1,6 +1,9 @@
 use std::str::FromStr;
 
-use api_types::{ExecutionPurpose, ProjectHookRule};
+use api_types::{
+    ActorRef, CreateWorkUnitProvenance, CreateWorkUnitReviewSubjectRequest, ProjectHookRule,
+    SubmitReviewReportRequest, WorkUnitStatus,
+};
 use db::{AgentStatus, PageRequest, SortBy, SortOrder, TaskLifecycleState};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
@@ -13,6 +16,10 @@ pub(crate) struct ToolCallParams {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) arguments: Value,
+    /// MCP metadata supplied by some clients. It is transport context, not a
+    /// tool argument, and must not make an otherwise valid call fail validation.
+    #[serde(default, rename = "_meta")]
+    pub(crate) _meta: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,8 +30,6 @@ pub(crate) struct CreateTaskParams {
     pub(crate) description: Option<String>,
     #[serde(default)]
     pub(crate) parent_task_id: Option<String>,
-    #[serde(default, rename = "type")]
-    pub(crate) task_type: Option<String>,
     pub(crate) priority: Option<i64>,
 }
 
@@ -91,13 +96,107 @@ pub(crate) struct ListExecutionsParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct StartExecutionParams {
-    pub(crate) work_unit_id: String,
-    pub(crate) expected_work_unit_version: i64,
-    pub(crate) purpose: ExecutionPurpose,
-    pub(crate) prompt: String,
+pub(crate) struct TaskDispatchActionParams {
+    pub(crate) task_id: String,
+    pub(crate) expected_task_version: i64,
+    pub(crate) expected_lifecycle_version: i64,
+    pub(crate) idempotency_key: String,
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RequestReworkParams {
+    pub(crate) task_id: String,
+    pub(crate) expected_task_version: i64,
+    pub(crate) expected_lifecycle_version: i64,
+    pub(crate) review_report_artifact_id: String,
+    pub(crate) reviewed_work_unit_id: String,
+    pub(crate) reviewed_work_unit_version: i64,
+    pub(crate) correction_title: String,
+    pub(crate) correction_scope: String,
+    pub(crate) correction_role_id: String,
+    pub(crate) correction_actor: Option<ActorRef>,
+    pub(crate) review_title: String,
+    pub(crate) review_scope: String,
+    pub(crate) review_actor: Option<ActorRef>,
+    pub(crate) idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateWorkUnitParams {
+    pub(crate) idempotency_key: String,
+    pub(crate) task_id: String,
+    pub(crate) title: String,
+    pub(crate) scope: String,
+    pub(crate) execution_instructions: Option<String>,
+    pub(crate) role: String,
+    pub(crate) parent_work_unit_id: Option<String>,
+    pub(crate) assigned_actor: Option<ActorRef>,
+    pub(crate) requires_integration: bool,
+    pub(crate) provenance: Option<CreateWorkUnitProvenance>,
     #[serde(default)]
-    pub(crate) input_artifact_ids: Vec<String>,
+    pub(crate) artifact_inputs: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) review_approval: Option<api_types::WorkUnitReviewApprovalRequest>,
+    pub(crate) review_subject: Option<CreateWorkUnitReviewSubjectRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SubmitWorkUnitReviewParams {
+    pub(crate) work_unit_id: String,
+    pub(crate) expected_version: i64,
+    pub(crate) report: SubmitReviewReportRequest,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListWorkUnitsParams {
+    pub(crate) task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkUnitIdParams {
+    pub(crate) work_unit_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateWorkUnitParams {
+    pub(crate) work_unit_id: String,
+    pub(crate) expected_version: i64,
+    pub(crate) title: Option<String>,
+    pub(crate) scope: Option<String>,
+    pub(crate) execution_instructions: Option<Option<String>>,
+    pub(crate) requires_integration: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AllocateWorkUnitParams {
+    pub(crate) work_unit_id: String,
+    pub(crate) expected_version: i64,
+    pub(crate) role: String,
+    pub(crate) assigned_actor: Option<ActorRef>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkUnitDependencyParams {
+    pub(crate) work_unit_id: String,
+    pub(crate) depends_on_work_unit_id: String,
+    pub(crate) expected_version: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkUnitTransitionParams {
+    pub(crate) work_unit_id: String,
+    pub(crate) expected_version: i64,
+    pub(crate) status: WorkUnitStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +206,18 @@ pub(crate) struct CreateTaskRoleParams {
     pub(crate) role: String,
     pub(crate) coordination_mode: api_types::CoordinationMode,
     pub(crate) policy: Option<Value>,
+    pub(crate) configuration: Option<api_types::TaskRoleConfiguration>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateTaskRoleParams {
+    pub(crate) task_id: String,
+    pub(crate) role: String,
+    pub(crate) expected_version: i64,
+    pub(crate) coordination_mode: Option<api_types::CoordinationMode>,
+    pub(crate) policy: Option<Value>,
+    pub(crate) configuration: Option<api_types::TaskRoleConfiguration>,
 }
 
 #[derive(Debug, Deserialize)]

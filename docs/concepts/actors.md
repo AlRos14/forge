@@ -24,7 +24,7 @@ current policy before disclosing or mutating anything.
 A Human is a first-class Actor. Human work does not use a fake Agent,
 HarnessProfile, or HarnessSession. A Human planner, implementer, reviewer, and
 orchestrator is represented by an ordinary Execution under the corresponding
-Role and Purpose.
+Role.
 
 Human-specific UI ergonomics are allowed. Human-specific domain shortcuts that
 change authority or bypass the Execution, Artifact, Gate, workspace, or

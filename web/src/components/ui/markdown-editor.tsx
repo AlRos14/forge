@@ -37,6 +37,7 @@ interface MarkdownEditorProps {
   placeholder?: string
   minHeight?: string
   autoFocus?: boolean
+  ariaLabel?: string
   className?: string
 }
 
@@ -47,6 +48,7 @@ export function MarkdownEditor({
   placeholder,
   minHeight = '120px',
   autoFocus = false,
+  ariaLabel = 'Markdown editor',
   className,
 }: MarkdownEditorProps) {
   const theme = useLayoutStore((s) => s.theme)
@@ -67,7 +69,7 @@ export function MarkdownEditor({
         theme={theme === 'dark' ? oneDark : 'light'}
         minHeight={minHeight}
         onChange={onChange}
-        aria-label="Markdown editor"
+        aria-label={ariaLabel}
         basicSetup={{
           lineNumbers: false,
           foldGutter: false,

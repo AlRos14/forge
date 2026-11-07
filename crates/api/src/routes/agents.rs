@@ -9,7 +9,7 @@ use axum::{
 };
 use db::{now_rfc3339, Agent, AgentListQuery, AgentRepo, DaemonRepo, ExecutionRepo, UpdateAgent};
 use events::{event_timestamp, EventContext, ForgeEvent};
-use executors::{DiscoverContext, ExecutorKind};
+use executors::ExecutorKind;
 use serde_json::Value;
 use services::agent_service::{compute_effective_status, resolve_daemon_for_agent};
 use sqlx::Row;
@@ -467,7 +467,7 @@ pub async fn agent_discovered_options(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(id): Path<String>,
-    Query(params): Query<DiscoveryParams>,
+    Query(_params): Query<DiscoveryParams>,
 ) -> ApiResult<Json<DiscoveredOptionsResponse>> {
     let agent = AgentRepo::get_by_id(&*state.db, &id)
         .await?
@@ -487,15 +487,37 @@ pub async fn agent_discovered_options(
     } else {
         Vec::new()
     };
-    let discovered = if daemons.is_empty() {
-        Default::default()
-    } else {
-        adapter
-            .discover_options(DiscoverContext {
-                project_path: params.project_id,
-            })
+    let mut warning = None;
+    let discovered = if is_agent_owner {
+        match resolve_daemon_for_agent(&state.db, &agent).await {
+            Ok(daemon) => match services::daemon_transport::discover_harness_options(
+                &state.daemon_connections,
+                &daemon,
+                adapter,
+                &agent.executor_type,
+            )
             .await
-            .map_err(|error| ApiError::bad_request(error.to_string()))?
+            {
+                Ok(discovered) => {
+                    warning = discovered.warning.clone();
+                    discovered
+                }
+                Err(_) => {
+                    warning = Some(
+                        "Model options could not be loaded from the Agent's daemon. Enter a model ID supported by the harness.".to_owned(),
+                    );
+                    Default::default()
+                }
+            },
+            Err(_) => {
+                warning = Some(
+                    "No authorized online daemon is available to load model options. Enter a model ID supported by the harness.".to_owned(),
+                );
+                Default::default()
+            }
+        }
+    } else {
+        Default::default()
     };
     let raw_config = serde_json::from_str::<serde_json::Value>(&agent.config_json)
         .unwrap_or_else(|_| serde_json::json!({}));
@@ -515,7 +537,7 @@ pub async fn agent_discovered_options(
                 status: daemon.status.to_string(),
             })
             .collect(),
-        warning: None,
+        warning,
     }))
 }
 

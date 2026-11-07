@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -9,8 +11,8 @@ use std::{
 use api::{build_router, AppState};
 use api_types::{
     AgentResponse, CliProjectionItem, CliProjectionResponse, DaemonRegisterResponse,
-    DaemonResponse, ExecutionPurpose, ExecutionResponse, ExecutionStatus, PaginatedResponse,
-    ProjectResponse, RepoResponse, TaskLifecycleState, TaskResponse, WorkUnitResponse,
+    DaemonResponse, ExecutionResponse, ExecutionStatus, PaginatedResponse, ProjectResponse,
+    RepoResponse, TaskLifecycleState, TaskResponse, WorkUnitResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -196,19 +198,11 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
     )
     .await;
 
-    let running_execution: ExecutionResponse = json_request(
+    let running_execution: ExecutionResponse = common::launch_work_unit_execution(
         &app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/executions", task.id),
-        json!({
-            "work_unit_id": allocated_work_unit.id,
-            "expected_work_unit_version": allocated_work_unit.version,
-            "purpose": "implement",
-            "prompt": "echo forge-e2e-ok",
-            "input_artifact_ids": [],
-            "overrides": null
-        }),
-        StatusCode::OK,
+        &task.id,
+        &allocated_work_unit,
+        Some("echo forge-e2e-ok"),
     )
     .await;
     assert_eq!(running_execution.status, ExecutionStatus::Running);
@@ -217,7 +211,6 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
         Some(api_types::ActorRef::Agent(agent_id.clone()))
     );
     assert_eq!(running_execution.role, "implementer");
-    assert_eq!(running_execution.purpose, Some(ExecutionPurpose::Implement));
 
     let workspace = db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*state.db, &work_unit.id)
         .await
@@ -295,7 +288,7 @@ async fn test_app_with_state(workspace_root: &Path) -> (Router, Arc<AppState>) {
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
     ));
-    let state = Arc::new(AppState::with_adapter_registry_services_and_shutdown(
+    let state = AppState::with_adapter_registry_services_and_shutdown(
         db,
         event_bus,
         true,
@@ -306,7 +299,13 @@ async fn test_app_with_state(workspace_root: &Path) -> (Router, Arc<AppState>) {
         api::state::test_workflows_dir(),
         api::state::test_jwt_secret(),
         api::state::test_bcrypt_cost(),
+    );
+    let dispatcher = Arc::new(services::TaskDispatcher::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+        Arc::clone(&state.task_service),
     ));
+    let state = Arc::new(state.with_task_dispatcher(dispatcher));
 
     let web_dist_dir = workspace_root.join("web-dist");
     std::fs::create_dir_all(&web_dist_dir).expect("create web dist dir");

@@ -3,7 +3,7 @@ use std::str::FromStr;
 use api_types::{
     parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
     ProjectResponse, RepoResponse, RoleMembershipResponse, RoleMembershipStatus, TaskResponse,
-    TaskRoleResponse, TaskType, WorkspaceResponse,
+    TaskRoleResponse, WorkspaceResponse,
 };
 use db::{
     ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, Page, PageRequest,
@@ -35,6 +35,7 @@ pub mod members;
 pub mod notifications;
 pub mod oauth;
 pub mod operations;
+pub mod project_copilot;
 pub mod project_media;
 pub mod project_releases;
 pub mod projects;
@@ -43,8 +44,11 @@ pub mod providers;
 pub mod repos;
 pub mod reviews;
 pub mod settings;
+pub mod task_dispatch;
+pub mod task_rework;
 pub mod tasks;
 pub mod terminals;
+pub mod work_unit_reviews;
 pub mod work_units;
 pub mod workspaces;
 
@@ -60,7 +64,6 @@ pub struct ListParams {
     pub lifecycle_state: Option<String>,
     pub include_archived: Option<bool>,
     pub include_cancelled: Option<bool>,
-    pub task_type: Option<String>,
     pub priority: Option<i64>,
     pub capabilities: Option<String>,
     pub executor_type: Option<String>,
@@ -195,7 +198,6 @@ async fn task_response_inner(db: &db::SqliteDb, task: Task) -> ApiResult<TaskRes
         parent_task_id: task.parent_task_id.clone(),
         title: task.title,
         description: task.description,
-        task_type: parse_task_type(&task.task_type),
         lifecycle,
         priority: task.priority,
         board_position: task.board_position,
@@ -268,16 +270,6 @@ async fn task_execution_observability(
     })
 }
 
-fn parse_task_type(task_type: &str) -> TaskType {
-    match task_type {
-        "planning" => TaskType::Planning,
-        "discovery" => TaskType::Discovery,
-        "review" => TaskType::Review,
-        "validation" => TaskType::Validation,
-        _ => TaskType::Implementation,
-    }
-}
-
 pub async fn task_roles_response(
     db: &db::SqliteDb,
     task_id: &str,
@@ -287,9 +279,19 @@ pub async fn task_roles_response(
     let mut response = Vec::with_capacity(roles.len());
     for role in roles {
         let members = RoleMembershipRepo::list_by_role(db, &role.id, include_ended).await?;
-        let policy = serde_json::from_str(&role.policy_json).map_err(|error| {
+        let policy = serde_json::from_str::<Value>(&role.policy_json).map_err(|error| {
             ApiError::internal(format!("invalid persisted TaskRole policy: {error}"))
         })?;
+        let configuration_record =
+            db::TaskRoleCapabilityConfigurationRepo::get_by_task_role_id(db, &role.id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::internal("TaskRole capability configuration is missing")
+                })?;
+        let configuration = services::task_role_configuration::parse_task_role_configuration(
+            &configuration_record.configuration_json,
+        )
+        .map_err(ApiError::from)?;
         response.push(TaskRoleResponse {
             id: role.id,
             task_id: role.task_id,
@@ -300,6 +302,7 @@ pub async fn task_roles_response(
                 DbCoordinationMode::Independent => api_types::CoordinationMode::Independent,
             }),
             policy,
+            configuration,
             version: role.version,
             members: members.into_iter().map(role_membership_response).collect(),
             created_at: role.created_at,
@@ -413,7 +416,6 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
         task_id: execution.task_id,
         actor_ref,
         role: execution.role,
-        purpose: execution.purpose.map(execution_purpose_response),
         status: execution_status_response(execution.status),
         parent_execution_id: execution.parent_execution_id,
         harness_session_id: execution.harness_session_id,
@@ -431,22 +433,12 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
             .executor_config_snapshot_json
             .map(parse_json_value),
         workspace_id: execution.workspace_id,
+        work_unit_id: execution.work_unit_id,
+        work_unit_version: execution.work_unit_version,
         usage: None,
         account_usage: None,
         created_at: execution.created_at,
         updated_at: execution.updated_at,
-    }
-}
-
-fn execution_purpose_response(purpose: db::ExecutionPurpose) -> api_types::ExecutionPurpose {
-    match purpose {
-        db::ExecutionPurpose::Plan => api_types::ExecutionPurpose::Plan,
-        db::ExecutionPurpose::Implement => api_types::ExecutionPurpose::Implement,
-        db::ExecutionPurpose::Review => api_types::ExecutionPurpose::Review,
-        db::ExecutionPurpose::Validate => api_types::ExecutionPurpose::Validate,
-        db::ExecutionPurpose::Investigate => api_types::ExecutionPurpose::Investigate,
-        db::ExecutionPurpose::Orchestrate => api_types::ExecutionPurpose::Orchestrate,
-        db::ExecutionPurpose::General => api_types::ExecutionPurpose::General,
     }
 }
 
@@ -615,7 +607,6 @@ fn parse_task_sort_by(value: Option<&str>) -> ApiResult<SortBy> {
         "board_position" => Ok(SortBy::BoardPosition),
         "title" => Ok(SortBy::Title),
         "lifecycle_state" => Ok(SortBy::LifecycleState),
-        "task_type" => Ok(SortBy::TaskType),
         "id" => Ok(SortBy::Id),
         value => Err(ApiError::bad_request(format!("invalid sort_by: {value}"))),
     }

@@ -101,9 +101,9 @@ export function DaemonsPage({ selectedDaemonId }: { selectedDaemonId?: string })
   }, [agents])
 
   return (
-    <div className="flex h-[calc(100vh-7rem)] gap-0 overflow-hidden rounded-xl border border-border-subtle bg-card shadow-card">
+    <div className="flex min-w-0 flex-col gap-0 lg:flex-row rounded-xl border border-border-subtle bg-card shadow-card">
       {/* Left panel */}
-      <div className="flex w-60 shrink-0 flex-col border-r border-border-subtle bg-background">
+      <div className="flex w-full min-w-0 shrink-0 flex-col border-b border-border-subtle lg:w-60 lg:border-b-0 lg:border-r bg-background">
         <header className="flex shrink-0 items-center justify-between border-b px-4 py-3">
           <div>
             <p className="font-mono text-micro font-semibold uppercase tracking-[1px] text-muted-foreground">
@@ -209,7 +209,7 @@ export function DaemonsPage({ selectedDaemonId }: { selectedDaemonId?: string })
       </div>
 
       {/* Right panel */}
-      <div className="flex flex-1 flex-col overflow-hidden">
+      <div className="flex min-w-0 flex-1 flex-col">
         {selectedDaemon ? (
           <DaemonDetail
             daemon={selectedDaemon}

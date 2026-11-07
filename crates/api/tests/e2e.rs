@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -7,9 +9,9 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentAvailabilityResponse, AgentResponse, ErrorResponse, ExecutionResponse, PaginatedResponse,
-    ProjectResponse, RepoResponse, TaskDependency, TaskLifecycleState,
-    TaskLifecycleTransitionResponse, TaskResponse, TasksResponse, WorkUnitResponse,
+    AgentAvailabilityResponse, AgentResponse, PaginatedResponse, ProjectResponse, RepoResponse,
+    TaskDependency, TaskLifecycleState, TaskLifecycleTransitionResponse, TaskResponse,
+    TasksResponse, WorkUnitResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -380,6 +382,18 @@ async fn execution_start_blocked_by_work_unit_dependency_returns_conflict() {
         StatusCode::CREATED,
     )
     .await;
+    let _: WorkUnitResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/work-units/{}/allocation", prerequisite.id),
+        json!({
+            "expected_version": prerequisite.version,
+            "role": "implementer",
+            "assigned_actor": { "kind": "agent", "id": agent.id }
+        }),
+        StatusCode::OK,
+    )
+    .await;
     let work_unit: WorkUnitResponse = json_request(
         &app,
         Method::POST,
@@ -414,7 +428,7 @@ async fn execution_start_blocked_by_work_unit_dependency_returns_conflict() {
         StatusCode::OK,
     )
     .await;
-    let work_unit: WorkUnitResponse = json_request(
+    let _work_unit: WorkUnitResponse = json_request(
         &app,
         Method::POST,
         &format!("/api/v1/work-units/{}/allocation", work_unit.id),
@@ -427,21 +441,25 @@ async fn execution_start_blocked_by_work_unit_dependency_returns_conflict() {
     )
     .await;
 
-    let response: ErrorResponse = json_request(
+    let launch: api_types::TaskLaunchResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/executions", task.id),
+        &format!("/api/v1/tasks/{}/dispatch/launch", task.id),
         json!({
-            "work_unit_id": work_unit.id,
-            "expected_work_unit_version": work_unit.version,
-            "purpose": "implement",
-            "prompt": "echo blocked by dependency",
-            "input_artifact_ids": []
+            "expected_task_version": task.version,
+            "expected_lifecycle_version": task.lifecycle.version,
+            "idempotency_key": "dependency-gate-launch",
+            "reason": null,
         }),
-        StatusCode::CONFLICT,
+        StatusCode::OK,
     )
     .await;
-    assert_eq!(response.code, "dependency_gate");
+    assert!(!launch.admitted_execution_ids.is_empty());
+    assert!(launch
+        .preflight
+        .work_units
+        .iter()
+        .any(|unit| unit.state == "waiting_dependency"));
 }
 
 #[tokio::test]
@@ -485,18 +503,11 @@ async fn agent_execution_records_exact_actor_role_and_purpose() {
 
     let work_unit = create_and_allocate_work_unit(&app, &task.id, &agent.id).await;
 
-    let execution: ExecutionResponse = json_request(
+    let execution = common::launch_work_unit_execution(
         &app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/executions", task.id),
-        json!({
-            "work_unit_id": work_unit.id,
-            "expected_work_unit_version": work_unit.version,
-            "purpose": "implement",
-            "prompt": "echo agent execution",
-            "input_artifact_ids": []
-        }),
-        StatusCode::OK,
+        &task.id,
+        &work_unit,
+        Some("echo agent execution"),
     )
     .await;
     assert_eq!(execution.task_id, task.id);
@@ -505,10 +516,6 @@ async fn agent_execution_records_exact_actor_role_and_purpose() {
         Some(api_types::ActorRef::Agent(agent.id))
     );
     assert_eq!(execution.role, "implementer");
-    assert_eq!(
-        execution.purpose,
-        Some(api_types::ExecutionPurpose::Implement)
-    );
 }
 
 #[tokio::test]
@@ -665,6 +672,12 @@ async fn test_app() -> Router {
         true,
         Arc::new(cli_adapters::default_registry()),
     );
+    let dispatcher = Arc::new(services::TaskDispatcher::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+        Arc::clone(&state.task_service),
+    ));
+    let state = state.with_task_dispatcher(dispatcher);
 
     let web_dist_dir = std::env::temp_dir().join(format!("forge-api-e2e-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&web_dist_dir).expect("create web dist dir");

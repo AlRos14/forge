@@ -37,7 +37,13 @@ impl TaskService {
         &self,
         execution: Execution,
     ) -> Result<Execution> {
-        if execution.role != "reviewer" || execution.purpose != Some(ExecutionPurpose::Review) {
+        if !crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
+        {
             return Ok(execution);
         }
         let Some(workspace_id) = execution.workspace_id.as_deref() else {
@@ -191,8 +197,12 @@ impl TaskService {
                 accepted: false,
             });
         }
-        if execution.role == "reviewer"
-            && execution.purpose == Some(ExecutionPurpose::Review)
+        if crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
             && self
                 .reconcile_existing_review_report(&execution, None, None)
                 .await?
@@ -234,7 +244,13 @@ impl TaskService {
             }
         }
         let prepared = async {
-            if execution.role == "reviewer" && execution.purpose == Some(ExecutionPurpose::Review) {
+            if crate::role_capabilities::execution_has_capability(
+                &self.db,
+                &execution.id,
+                api_types::TaskRoleCapability::FormalReview,
+            )
+            .await?
+            {
                 self.verify_execution_workspace_authority(&execution)
                     .await?;
             }
@@ -328,6 +344,12 @@ impl TaskService {
                     accepted: false,
                 });
             }
+            db::ProviderStartClaim::TaskPaused => {
+                return Ok(api_types::ExecutionStartResult {
+                    execution_id: execution.id,
+                    accepted: false,
+                });
+            }
             db::ProviderStartClaim::Claimed => {}
         }
 
@@ -401,7 +423,13 @@ impl TaskService {
                 "only running executions can be executed",
             ));
         }
-        if execution.role == "reviewer" && execution.purpose == Some(ExecutionPurpose::Review) {
+        if crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
+        {
             if let Some((completed, _report)) = self
                 .reconcile_existing_review_report(&execution, None, None)
                 .await?
@@ -429,14 +457,6 @@ impl TaskService {
             })?;
         let mut agent_config = parse_json_value("executor config snapshot", snapshot)?;
         crate::task_service::config::validate_agent_routing_snapshot(&agent_config)?;
-        if execution.role == "reviewer"
-            || matches!(
-                task.task_type.as_str(),
-                "planning" | "discovery" | "review" | "validation"
-            )
-        {
-            executors::mark_worktree_read_only(&mut agent_config);
-        }
         // The immutable Execution snapshot selects the provider entry. Never
         // let the Agent's currently selected profile redirect this invocation.
         if snapshot_credential_ref(&agent_config)?.is_some() {
@@ -554,14 +574,15 @@ impl TaskService {
             return Err(error);
         }
 
-        let is_review_execution = execution_before_launch.role == "reviewer"
-            && execution_before_launch.purpose == Some(ExecutionPurpose::Review);
+        let is_review_execution = crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution_before_launch.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?;
         let mut review_worktree_snapshot = None;
         let mut review_snapshot_digest = None;
-        if is_review_execution
-            && execution_before_launch.workspace_id.is_some()
-            && executors::is_worktree_read_only(&agent_config)
-        {
+        if is_review_execution && execution_before_launch.workspace_id.is_some() {
             let worktree_path = std::path::Path::new(&worktree_path);
             let digest_before =
                 match crate::ValidationService::snapshot_digest(&worktree_path.to_string_lossy())
@@ -842,15 +863,7 @@ impl TaskService {
             }
         });
 
-        let read_only_head = if review_worktree_snapshot.is_none()
-            && execution.workspace_id.is_some()
-            && executors::is_worktree_read_only(&agent_config)
-        {
-            Some(git::get_current_sha(std::path::Path::new(&worktree_path)).await?)
-        } else {
-            None
-        };
-        let existing_plan_output = if execution.purpose == Some(ExecutionPurpose::Plan) {
+        let existing_plan_output = if execution.role == "planner" {
             db::CollaborationRepo::get_execution_artifact_output(
                 &*self.db,
                 &execution.id,
@@ -919,6 +932,11 @@ impl TaskService {
                     task_id: task.id.clone(),
                     execution_id: execution_id.clone(),
                     role: execution.role.clone(),
+                    task_role_capabilities: crate::role_capabilities::execution_capabilities(
+                        &self.db,
+                        &execution.id,
+                    )
+                    .await?,
                     worktree_path: worktree_path.clone(),
                     description,
                     agent_config,
@@ -969,15 +987,6 @@ impl TaskService {
                 }
             }
         }
-        let restore_result = if review_worktree_snapshot.is_some() {
-            Ok(())
-        } else if let Some(head) = read_only_head.as_deref() {
-            git::restore_worktree(std::path::Path::new(&worktree_path), head)
-                .await
-                .map_err(ServiceError::from)
-        } else {
-            Ok(())
-        };
         let mut result = if let Some(error) = review_restore_error {
             let snapshot = review_worktree_snapshot
                 .take()
@@ -988,7 +997,7 @@ impl TaskService {
                 workspace_path = %worktree_path,
                 snapshot_backup_path = %backup_path.display(),
                 %error,
-                "read-only Review workspace could not be restored to its exact subject"
+                "Review workspace could not be restored to its exact subject"
             );
             executors::ExecutionResult {
                 status: ExecutionOutcome::Failed,
@@ -1003,11 +1012,8 @@ impl TaskService {
             }
         } else {
             let mut result = execution_result?;
-            restore_result?;
             if let Some(subject) = review_subject.as_ref() {
                 result.after_sha = Some(subject.head_commit_sha.clone());
-            } else if let Some(head) = read_only_head {
-                result.after_sha = Some(head);
             }
             result
         };
@@ -1063,7 +1069,7 @@ impl TaskService {
             return Ok(current_execution);
         }
 
-        if current_execution.purpose == Some(ExecutionPurpose::Plan)
+        if current_execution.role == "planner"
             && result.status == ExecutionOutcome::Completed
             && existing_plan_output.is_none()
         {
@@ -1096,8 +1102,12 @@ impl TaskService {
             }
         }
 
-        if current_execution.role == "reviewer"
-            && current_execution.purpose == Some(ExecutionPurpose::Review)
+        if crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &current_execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
             && result.status == ExecutionOutcome::Completed
         {
             let output = result
@@ -1441,16 +1451,8 @@ impl TaskService {
             .ok_or_else(|| {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
-        let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
+        let executor_config = parse_json_value("executor config snapshot", snapshot)?;
         crate::task_service::config::validate_agent_routing_snapshot(&executor_config)?;
-        if execution.role == "reviewer"
-            || matches!(
-                task.task_type.as_str(),
-                "planning" | "discovery" | "review" | "validation"
-            )
-        {
-            executors::mark_worktree_read_only(&mut executor_config);
-        }
         let executor_type = executor_config
             .get("executor_type")
             .and_then(Value::as_str)
@@ -1471,6 +1473,11 @@ impl TaskService {
             task_id: task.id.clone(),
             execution_id: execution.id.clone(),
             role: execution.role.clone(),
+            task_role_capabilities: crate::role_capabilities::execution_capabilities(
+                &self.db,
+                &execution.id,
+            )
+            .await?,
             workspace_path,
             executor_type,
             executor_config,

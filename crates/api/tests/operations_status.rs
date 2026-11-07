@@ -131,7 +131,6 @@ async fn seed_blocked_task(harness: &common::Harness, title: &str) -> String {
             parent_task_id: None,
             title: title.to_owned(),
             description: None,
-            task_type: "implementation".to_owned(),
             lifecycle_state: db::TaskLifecycleState::Blocked,
             is_automation: false,
             priority: 0,

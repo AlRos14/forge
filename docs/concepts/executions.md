@@ -8,7 +8,6 @@ Execution
   task_id
   actor_ref
   role
-  purpose
   work_unit_id?
   harness_session_id?
   workspace_id?
@@ -22,17 +21,16 @@ Execution
   finished_at?
 ~~~
 
-It represents exactly one Actor acting under exactly one Role for one Purpose.
-The role is historical context, not an Actor subtype.
+It represents exactly one Actor acting under exactly one Role. The role is
+historical context, not an Actor subtype. Execution purpose is retired; the
+WorkUnit scope, Role, WorkspaceLease, and exact outputs describe the work.
 
 ## Plan PR2 persistence
 
 The current persistence stores `actor_kind` and `actor_id` as the physical
-form of `actor_ref`, plus one of these exact purposes:
-`plan`, `implement`, `review`, `validate`, `investigate`, `orchestrate`, or
-`general`. Purpose is supplied by the semantic creation path; it is not a
-permanent alias for a Role or for the transitional executor
-`permission_policy: plan` value.
+form of `actor_ref`. Historical purpose values are preserved only in
+`pr13_execution_purpose_history`; they are not read by current runtime
+authority. New Executions do not carry a purpose classification.
 
 `actor_kind` and `actor_id` are the canonical ActorRef. `execution.agent_id`
 remains an Agent-only lookup projection for Agent execution statistics;
@@ -40,25 +38,31 @@ remains an Agent-only lookup projection for Agent execution statistics;
 A new Human Execution stores the real user id, has no Agent projection, and
 has no HarnessSession.
 
-## Purpose and permission
+## Role and permission
 
-Initial purposes are plan, implement, review, validate, investigate,
-orchestrate, and general. Purpose describes why work exists. Permission,
-sandbox, credentials, and workspace lease describe what it may do. They are
-independent fields and policies.
+Permission, sandbox, credentials, and workspace lease describe what an
+Execution may do. Role and WorkUnit allocation describe the responsibility.
+They are independent records and policies.
 
-The same purpose can run under different permissions, and the same role can
-perform different purposes. The platform must not use a plan purpose as a
-permission mode.
+Tasks do not have a repository access mode. Eligible Agent Executions receive
+the `repository_write` capability through WorkspaceLease admission after the
+current TaskRole, ownership, and workspace checks pass. The WorkUnit
+`requires_integration` mode and the exact Role do not grant a broader
+capability.
 
-Purpose `validate` is for Actor-driven validation cognition, such as
-investigation, reproduction, or interpretation. Deterministic commands and
-trusted checks use a core-controlled ValidationRun instead; they do not need a
-Human, Agent, HarnessSession, or fake System Actor.
+Actor-driven validation cognition, such as investigation, reproduction, or
+interpretation, is ordinary WorkUnit work. Deterministic commands and trusted
+checks use a core-controlled ValidationRun instead; they do not need a Human,
+Agent, HarnessSession, or fake System Actor.
 
 ## Immutability and lineage
 
-Actor, Role, Purpose, Agent, HarnessProfileRevision, capabilities, and Workspace
+Daemon connection generations own cancellation and joining of their running
+executions. The harness receives cancellation without its cleanup future being
+dropped by the fallback executor. Retirement waits for cleanup; a timeout aborts
+the task and fails closed rather than proving that provider processes stopped.
+
+Actor, Role, Agent, HarnessProfileRevision, capabilities, and Workspace
 references become immutable after the Execution starts. An attached
 HarnessSession reference cannot be replaced. An unresolved ordered fallback
 starts without a speculative session; its exact winner snapshot and external
@@ -151,3 +155,9 @@ so it cannot overwrite a provider attempt claimed concurrently. It never
 renews or revives an expired lease. Explicit Task cancellation still resolves
 pending Executions locally and does not send a provider cancellation for work
 that was never started.
+
+An interrupted WorkUnit attempt reserves recovery priority only while the open
+WorkUnit still has its exact admitted version, role, and assigned Actor.
+Editing or reallocating that scope retires the old attempt as a recovery
+candidate; its historical record remains intact. Fresh dispatch still requires
+current allocation, readiness, membership, lease, and provider-start checks.

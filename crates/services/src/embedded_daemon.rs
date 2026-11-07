@@ -193,7 +193,7 @@ impl EmbeddedDaemon {
             let Some(adapter) = self.adapter_registry.get(&kind) else {
                 continue;
             };
-            let availability = adapter.check_availability();
+            let availability = cli_adapters::detect_availability(adapter).await;
             let (path, version) = cli_path_and_version(&kind, adapter).await;
             detected.push(DetectedCliInput {
                 kind: kind.to_string(),

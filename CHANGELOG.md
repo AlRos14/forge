@@ -8,6 +8,111 @@ PR14 audit on 2026-10-16.
 
 ## [Unreleased]
 
+### Breaking
+
+- TaskRole names no longer define formal review, orchestration, or rework
+  authority. Use typed `configuration` with the capability catalog and exact
+  TaskRole version. `GET /api/v1/task-role-capabilities` returns the closed
+  catalog and editable templates. A role named `reviewer` without
+  `formal_review` cannot review; a custom role can when an owner/admin grants
+  it. Executions preserve an immutable admission snapshot; Provider Start
+  rejects revoked or changed configuration.
+- Approval requirements follow an exact review line and latest result. A
+  `request_changes` report and ordinary WorkUnit completion do not unlock the
+  final consumer. Rework routes are manual by default; enabling automatic
+  rework is an owner/admin configuration change. Project role defaults resolve
+  role names to local TaskRole IDs when a new Task is created.
+
+- Reviewer WorkUnits can name their initial `review_subject` during preparation;
+  Forge freezes the accepted result rather than a mutable preparation version.
+  Humans submit through `POST /work-units/{id}/review-report` without creating
+  a manual Execution. Review independence, exact result availability, Task pause,
+  recovery priority, and concurrency remain core-controlled boundaries.
+
+- Task launch now uses durable dispatch intent. `POST /tasks/{id}/executions`
+  is retired and returns `410 Gone` with code
+  `execution.manual_launch_retired`; use `POST /tasks/{id}/dispatch/launch`
+  after preparing and allocating WorkUnits. The CLI replaces `task execute`
+  with `task launch|pause|resume|cancel`, and MCP replaces
+  `forge_start_execution` with `forge_launch_task|pause_task|resume_task|cancel_task`
+  plus `forge_get_task_dispatch` and `forge_request_rework`.
+- Remove `ExecutionPurpose` from REST, MCP, CLI, DTOs, generated web types,
+  events, and active persistence. V142 preserves historical values in
+  `pr13_execution_purpose_history` and rewrites purpose-dependent triggers and
+  views over Role, WorkUnit, Artifact, subject, and Wake facts. Execution
+  responses now expose `work_unit_id` and `work_unit_version` instead of
+  `purpose`.
+- WorkUnit creation and update accept optional `execution_instructions`; when
+  present, the dispatcher passes them to the assigned harness instead of the
+  generic Task/WorkUnit prompt. An open WorkUnit with a completed result is
+  `awaiting_acceptance` and receives no automatic retry.
+
+### Added
+
+- Add `GET/POST /tasks/{id}/dispatch*` Task launch, pause, resume, and cancel
+  operations, a read-only preflight with per-WorkUnit blockers, and
+  `POST /work-units/{id}/workspace` for explicit repository preparation.
+- Add `POST /tasks/{id}/rework` and `forge_request_rework` for one idempotent
+  correction plus new-review round from an exact request-changes ReviewReport.
+  V143 adds bounded rework receipts and exact result/review subject relations.
+- Add a Project Copilot available throughout the Project UI, with an explicitly
+  assigned harness-bound Agent, durable conversation and Project management
+  runs. The local runner advertises only harness adapters with per-run native
+  tool restrictions and a revocable, run-scoped Forge MCP connection. The UI
+  selects Agents owned by the Project owner; an Agent without a host pin
+  resolves the authorized local embedded host at admission and the run
+  snapshot freezes it. Agent creation now defaults to automatic host
+  resolution, while administrators can still pin an existing Agent to an
+  available host through editing, REST, or the CLI. WorkUnit management tools
+  reuse domain services, preserve TaskRole eligibility and record the acting
+  Agent. Forward migration V139 preserves existing Tasks and historical Agent
+  data.
+
+- Add `GET /api/v1/projects/{id}/copilot/runs/{run_id}/logs` and a Harness
+  trace section in the Copilot panel. It exposes the run's redacted JSONL
+  harness events, including reasoning, tool, session, output, and error events,
+  and refreshes while the turn is active.
+- Remove Task classification and Task-level read-only settings from the UI,
+  persistence, REST, and MCP contracts. Eligible Agent Executions receive a
+  `repository_write` WorkspaceLease; Task type and read-only columns are
+  removed by additive migration V138 while the remaining Task data is kept.
+  REST task creation and listing no longer accept or expose Task modes, and
+  historical Project Release snapshots no longer expose their frozen task
+  classification.
+- Discover harness model options on the authorized online daemon that owns the
+  CLI configuration. Model catalogs are suggestions, not execution entitlements;
+  users can enter provider-specific model IDs supported by their harness.
+- Use installed harness and optional Claude Code Router executables for
+  execution and discovery. Forge does not download or pin their npm package
+  versions. Remove baked-in model catalogs from adapters; use each harness's
+  native catalog command, and report when it does not expose one. Claude Code
+  Router profiles can be selected explicitly for installed profile-based CLIs;
+  the legacy direct `ccr code` invocation remains available without a profile.
+- Discover OpenCode V2's installed model catalog and per-model variants. The
+  selected variant is passed through the installed CLI's native `--variant`
+  option; Forge does not supply a generic reasoning ladder.
+- Discover Claude Code's installed `--effort` choices from its CLI help and
+  expose the per-Agent Effort setting in creation and editing. The selected
+  value continues to use Claude Code's native `--effort` flag.
+- Render Task descriptions as sanitized Markdown and let users edit a Task's
+  concise title and Markdown brief from its detail page. Long pasted titles can
+  be moved into the description with one action.
+- Replace separate Task title and description inputs with one Markdown brief.
+  Forge derives the title from an optional first-level heading or the first line.
+- Add a Task Artifact browser that renders inline Markdown, shows exact Artifact
+  IDs, and passes a selected Plan Artifact into the next Execution.
+- Explain that Forge WorkUnits scope Task Executions and are distinct from
+  domain work packets; clarify repository Workspace preparation and explicit
+  integration for planning-only Tasks.
+- Add Project worker defaults in Project settings. Owners and admins can set
+  default Task roles, coordination modes, and Human or Agent members. New
+  ordinary Tasks and subtasks copy these defaults transactionally; existing
+  Tasks remain independent. Human defaults require Project membership, and
+  Agent defaults require ownership by the canonical Project owner.
+- Add `GET` and `PUT /api/v1/projects/{id}/task-role-defaults` with optimistic
+  version checks. Issue integration's explicit `default_implementer` joins the
+  copied `implementer` role when present instead of creating a duplicate.
+
 ### Security
 
 - Redact credential-like query parameters from MCP configuration responses, reject foreign-origin and tokenized installed URLs as unusable, reject symlinked configuration files, require Project admin for Project MCP config reads/writes, and require a server administrator for `user`/`local` MCP config scopes.
@@ -45,6 +150,30 @@ PR14 audit on 2026-10-16.
 
 ### Fixed
 
+- V157 advances a correction's review line from the exact reviewed result even
+  when another reviewer has since reported on that same result. Existing
+  reports and review-line revisions remain immutable.
+
+- Daemon generation retirement lets the harness finish cancellation cleanup
+  before joining its execution. A timed-out cleanup fails closed instead of
+  reporting a retired generation while provider processes may still run.
+- Combined dependency/review cycles return the typed cycle conflict when
+  rejected by the database guard.
+
+- Automatic rework intents now link to the exact manual receipt when a human
+  completes the same ReviewReport first. A concurrent Task pause leaves the
+  intent pending for resume, while cancellation records a distinct terminal
+  outcome. Escape from a portalled Select closes the Select without closing its
+  surrounding Dialog.
+- Run OpenCode Project Copilot turns against a private OpenCode server with a
+  preflight session, so the per-run agent and MCP catalog are loaded before the
+  real turn. The policy is written as a real config file so MCP `{env:...}`
+  authorization is resolved, and runtime environment merging accepts a
+  normalized null `env`. Accept the MCP `_meta` request field on `tools/call`.
+  V140 recreates the Copilot domain-event guard against the frozen resolved
+  host, so unpinned Agents can complete management mutations. Failed turns now
+  remain visible next to the composer alongside the sending, running, and
+  terminal state.
 - Serialize Project owner additions, removals, and role changes inside
   `BEGIN IMMEDIATE` transactions. Caller, target, last-owner, and canonical
   owner state are re-read after the writer lock, so concurrent owner removal

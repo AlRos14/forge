@@ -45,6 +45,7 @@ pub struct TaskRoleResponse {
     pub coordination_mode: Option<CoordinationMode>,
     #[ts(type = "Record<string, unknown>")]
     pub policy: serde_json::Value,
+    pub configuration: crate::TaskRoleConfiguration,
     #[ts(type = "number")]
     pub version: i64,
     pub members: Vec<RoleMembershipResponse>,
@@ -59,6 +60,8 @@ pub struct CreateTaskRoleRequest {
     pub role: String,
     pub coordination_mode: CoordinationMode,
     #[serde(default)]
+    pub configuration: crate::TaskRoleConfiguration,
+    #[serde(default)]
     #[ts(type = "Record<string, unknown> | null")]
     pub policy: Option<serde_json::Value>,
 }
@@ -70,6 +73,8 @@ pub struct UpdateTaskRoleRequest {
     #[ts(type = "number")]
     pub expected_version: i64,
     pub coordination_mode: Option<CoordinationMode>,
+    #[serde(default)]
+    pub configuration: Option<crate::TaskRoleConfiguration>,
     #[serde(default)]
     #[ts(type = "Record<string, unknown> | null")]
     pub policy: Option<serde_json::Value>,

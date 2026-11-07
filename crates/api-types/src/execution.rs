@@ -3,8 +3,8 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::{
-    ActorRef, AgentStatus, ExecutionPurpose, ExecutionRole, ExecutionStatus, ResumePolicy,
-    StopReason, TaskLifecycleResponse, TaskRoleResponse, TaskType, WorkspaceResponse,
+    ActorRef, AgentStatus, ExecutionRole, ExecutionStatus, ResumePolicy, StopReason,
+    TaskLifecycleResponse, TaskRoleResponse, WorkspaceResponse,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -35,7 +35,6 @@ pub struct TaskResponse {
     pub parent_task_id: Option<String>,
     pub title: String,
     pub description: Option<String>,
-    pub task_type: TaskType,
     pub lifecycle: TaskLifecycleResponse,
     #[ts(type = "number")]
     pub priority: i64,
@@ -298,7 +297,6 @@ pub struct ExecutionResponse {
     pub task_id: String,
     pub actor_ref: Option<ActorRef>,
     pub role: ExecutionRole,
-    pub purpose: Option<ExecutionPurpose>,
     pub status: ExecutionStatus,
     pub parent_execution_id: Option<String>,
     pub harness_session_id: Option<String>,
@@ -315,6 +313,9 @@ pub struct ExecutionResponse {
     #[ts(type = "Record<string, unknown> | null")]
     pub executor_config_snapshot: Option<Value>,
     pub workspace_id: Option<String>,
+    pub work_unit_id: Option<String>,
+    #[ts(type = "number | null")]
+    pub work_unit_version: Option<i64>,
     pub usage: Option<Vec<ExecutionUsageResponse>>,
     #[serde(default)]
     #[ts(type = "Record<string, unknown> | null")]

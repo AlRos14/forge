@@ -770,7 +770,6 @@ mod tests {
                 parent_task_id: None,
                 title: format!("Task {task_id}"),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state,
                 is_automation: false,
                 priority: 0,

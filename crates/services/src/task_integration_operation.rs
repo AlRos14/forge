@@ -473,10 +473,10 @@ mod tests {
 
     use super::*;
     use db::{
-        create_sqlite_pool, run_migrations, CreatePrProviderConfig, CreateProject, CreateRepo,
-        CreateTask, CreateTerminalSession, CreateWorkspace, PrMetadataRepo, PrProviderConfigRepo,
-        ProjectRepo, RepoRepo, TaskIntegrationOperationKind, TaskRepo, TerminalSessionRepo,
-        UserRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
+        create_sqlite_pool, run_migrations, CreatePrProviderConfig, CreateRepo, CreateTask,
+        CreateTerminalSession, CreateWorkspace, PrMetadataRepo, PrProviderConfigRepo, ProjectRepo,
+        RepoRepo, TaskIntegrationOperationKind, TaskRepo, TerminalSessionRepo, UserRepo, WorkMode,
+        WorkspaceRepo, WorkspaceStatus,
     };
     use events::EventBus;
     use std::{
@@ -701,20 +701,14 @@ mod tests {
         )
         .await
         .expect("user");
-        ProjectRepo::create(
-            &*db,
-            CreateProject {
-                id: project_id.clone(),
-                name: "Task integration operation recovery".to_owned(),
-                settings: "{}".to_owned(),
-                primary_repo_id: None,
-                owner_id: Some(user_id.clone()),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("project");
+        // Seed the historical schema directly; current repositories also
+        // write defaults tables that did not exist at this migration boundary.
+        sqlx::query("INSERT INTO project (id, name, settings, primary_repo_id, owner_id, created_at, updated_at) VALUES (?, 'Migration fixture project', '{}', NULL, ?, ?, ?)")
+            .bind(&project_id).bind(&user_id).bind(&now).bind(&now)
+            .execute(db.pool()).await.expect("historical Project fixture");
+        sqlx::query("INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) VALUES (?, ?, ?, 'owner', ?, ?)")
+            .bind(new_uuid_v4()).bind(&project_id).bind(&user_id).bind(&now).bind(&now)
+            .execute(db.pool()).await.expect("historical Project owner membership");
         RepoRepo::create(
             &*db,
             CreateRepo {
@@ -769,7 +763,6 @@ mod tests {
                     subtask_order: None,
                     title: "Operation recovery".to_owned(),
                     description: None,
-                    task_type: "implementation".to_owned(),
                     lifecycle_state: db::TaskLifecycleState::Ready,
                     is_automation: false,
                     priority: 0,
@@ -1892,104 +1885,134 @@ mod tests {
             .expect("old retry transition is applied")
             .transition_id
             .clone();
-        let (later_retry_receipt_id, later_retry_event_id) =
-            if scenario.later_retry_without_transition {
-                let execution_id = new_uuid_v4();
-                let failed_at = now_rfc3339();
-                let (_execution, failure_event) = db::ExecutionRepo::create_with_event(
-                    &*fixture.db,
-                    db::CreateExecution {
-                        id: execution_id.clone(),
-                        task_id: fixture.task_id.clone(),
-                        agent_id: None,
-                        actor_ref: None,
-                        role: "implementer".to_owned(),
-                        purpose: Some(db::ExecutionPurpose::Implement),
-                        status: db::ExecutionStatus::Failed,
-                        stop_reason: None,
-                        stopped_by: None,
-                        resume_policy: None,
-                        stopped_at: None,
-                        parent_execution_id: None,
-                        harness_session_id: None,
-                        agent_message_id: None,
-                        last_activity_at: None,
-                        summary: None,
-                        logs_path: None,
-                        before_sha: None,
-                        after_sha: None,
-                        error: Some("unrelated later execution failure".to_owned()),
-                        executor_config_snapshot_json: None,
-                        workspace_id: None,
-                        created_at: failed_at.clone(),
-                        updated_at: failed_at.clone(),
-                    },
-                    db::CreateDomainEvent {
-                        id: new_uuid_v4(),
-                        event_type: "execution.failed".to_owned(),
-                        entity_type: "execution".to_owned(),
-                        entity_id: execution_id.clone(),
-                        actor_type: "system".to_owned(),
-                        actor_id: None,
-                        scope_type: "task".to_owned(),
-                        scope_id: fixture.task_id.clone(),
-                        correlation_id: format!("unrelated-execution-failure:{execution_id}"),
-                        causation_id: None,
-                        causation_depth: 0,
-                        dedupe_key: Some(format!("unrelated-execution-failure:{execution_id}")),
-                        payload_json: serde_json::json!({
-                            "task_id": fixture.task_id,
-                            "execution_id": execution_id,
-                            "failure": "unrelated later failure",
-                        })
-                        .to_string(),
-                        created_at: failed_at,
-                    },
+        let (later_retry_receipt_id, later_retry_event_id) = if scenario
+            .later_retry_without_transition
+        {
+            let execution_id = new_uuid_v4();
+            let failed_at = now_rfc3339();
+            // V113 predates current Execution admission/snapshot tables.
+            // Reproduce its persisted failure using that historical shape.
+            sqlx::query(
+                    "INSERT INTO execution (id, task_id, role, purpose, status, error, created_at, updated_at)
+                     VALUES (?, ?, 'implementer', 'implement', 'failed', 'unrelated later execution failure', ?, ?)",
                 )
-                .await
-                .expect("later unrelated failed Execution");
-                let retry_service = crate::task_failure_retry::TaskFailureRetryService::new(
-                    Arc::clone(&fixture.db),
-                    Arc::clone(&event_bus),
-                );
-                assert_eq!(
-                    retry_service
-                        .process_domain_event(&failure_event)
-                        .await
-                        .expect("active Task records retry request without transition"),
-                    1
-                );
-                let event = db::DomainEventRepo::get_event_by_dedupe(
-                    &*fixture.db,
-                    &format!(
-                        "task-failure-retry:{}:execution_failed:{}",
-                        fixture.task_id, execution_id
-                    ),
-                )
-                .await
-                .expect("later retry event lookup")
-                .expect("later retry event remains durable");
-                let receipt_id: String = sqlx::query_scalar(
-                    "SELECT id FROM task_failure_retry_receipt WHERE receipt_event_id = ?",
-                )
-                .bind(&event.id)
-                .fetch_one(fixture.db.pool())
-                .await
-                .expect("later retry receipt remains durable");
-                let transition_count: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM task_lifecycle_transition
-                     WHERE task_id = ? AND cause_kind = 'domain_event' AND cause_ref = ?",
-                )
+                .bind(&execution_id)
                 .bind(&fixture.task_id)
-                .bind(&event.id)
-                .fetch_one(fixture.db.pool())
+                .bind(&failed_at)
+                .bind(&failed_at)
+                .execute(fixture.db.pool())
                 .await
-                .expect("later retry lifecycle transition count");
-                assert_eq!(transition_count, 0);
-                (Some(receipt_id), Some(event.id))
-            } else {
-                (None, None)
-            };
+                .expect("historical failed Execution");
+            let failure_event = db::DomainEventRepo::append_event(
+                &*fixture.db,
+                db::CreateDomainEvent {
+                    id: new_uuid_v4(),
+                    event_type: "execution.failed".to_owned(),
+                    entity_type: "execution".to_owned(),
+                    entity_id: execution_id.clone(),
+                    actor_type: "system".to_owned(),
+                    actor_id: None,
+                    scope_type: "task".to_owned(),
+                    scope_id: fixture.task_id.clone(),
+                    correlation_id: format!("unrelated-execution-failure:{execution_id}"),
+                    causation_id: None,
+                    causation_depth: 0,
+                    dedupe_key: Some(format!("unrelated-execution-failure:{execution_id}")),
+                    payload_json: serde_json::json!({
+                        "task_id": fixture.task_id,
+                        "execution_id": execution_id,
+                        "failure": "unrelated later failure",
+                    })
+                    .to_string(),
+                    created_at: failed_at,
+                },
+            )
+            .await
+            .expect("later unrelated failed Execution");
+            // Preserve V113's historical retry facts without running today's
+            // consumer, which requires newer immutable authority snapshots.
+            let later_receipt_id = new_uuid_v4();
+            let later_retry_key = format!(
+                "task-failure-retry:{}:execution_failed:{}",
+                fixture.task_id, execution_id
+            );
+            let later_retry_event = db::DomainEventRepo::append_event(
+                &*fixture.db,
+                db::CreateDomainEvent {
+                    id: new_uuid_v4(),
+                    event_type: "task.rework_requested".to_owned(),
+                    entity_type: "task".to_owned(),
+                    entity_id: fixture.task_id.clone(),
+                    actor_type: "system".to_owned(),
+                    actor_id: None,
+                    scope_type: "task".to_owned(),
+                    scope_id: fixture.task_id.clone(),
+                    correlation_id: later_retry_key.clone(),
+                    causation_id: Some(failure_event.id.clone()),
+                    causation_depth: 2,
+                    dedupe_key: Some(later_retry_key),
+                    payload_json: serde_json::json!({
+                        "task_id":fixture.task_id, "failure_kind":"execution_failed",
+                        "failure_ref":execution_id, "source_event_id":failure_event.id,
+                        "attempt_number":1, "retry_budget":3, "retry_epoch":0,
+                        "disposition":"rework", "policy_ref":"forge.task_failure_retry",
+                        "policy_version":3, "policy_digest":policy_digest
+                    })
+                    .to_string(),
+                    created_at: now_rfc3339(),
+                },
+            )
+            .await
+            .expect("historical retry event without lifecycle transition");
+            sqlx::query(
+                "INSERT INTO task_failure_retry_receipt (
+                    id, task_id, failure_kind, failure_ref, source_event_id,
+                    attempt_number, retry_budget, disposition, policy_ref,
+                    policy_version, policy_digest, receipt_event_id, created_at, retry_epoch
+                 ) VALUES (?, ?, 'execution_failed', ?, ?, 1, 3, 'rework',
+                           'forge.task_failure_retry', 3, ?, ?, ?, 0)",
+            )
+            .bind(&later_receipt_id)
+            .bind(&fixture.task_id)
+            .bind(&execution_id)
+            .bind(&failure_event.id)
+            .bind(&policy_digest)
+            .bind(&later_retry_event.id)
+            .bind(&later_retry_event.created_at)
+            .execute(fixture.db.pool())
+            .await
+            .expect("historical retry receipt without lifecycle transition");
+            let event = db::DomainEventRepo::get_event_by_dedupe(
+                &*fixture.db,
+                &format!(
+                    "task-failure-retry:{}:execution_failed:{}",
+                    fixture.task_id, execution_id
+                ),
+            )
+            .await
+            .expect("later retry event lookup")
+            .expect("later retry event remains durable");
+            let receipt_id: String = sqlx::query_scalar(
+                "SELECT id FROM task_failure_retry_receipt WHERE receipt_event_id = ?",
+            )
+            .bind(&event.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("later retry receipt remains durable");
+            let transition_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_lifecycle_transition
+                     WHERE task_id = ? AND cause_kind = 'domain_event' AND cause_ref = ?",
+            )
+            .bind(&fixture.task_id)
+            .bind(&event.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("later retry lifecycle transition count");
+            assert_eq!(transition_count, 0);
+            (Some(receipt_id), Some(event.id))
+        } else {
+            (None, None)
+        };
         if scenario.later_authority {
             crate::task_lifecycle::TaskLifecycleService::new(
                 Arc::clone(&fixture.db),

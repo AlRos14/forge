@@ -15,7 +15,19 @@ moment, not the current repository.
 | `pr-0a.md`, `pr-1.md` … `pr-3.md` | Historical exit ledgers | Record earlier workstream exits. |
 | [plan-pr15-acceptance-report.md](plan-pr15-acceptance-report.md) | Historical acceptance evidence | S01–S13 evidence at its pinned SHA. |
 | [post-v2-hardening-acceptance.md](post-v2-hardening-acceptance.md) | Current post-V2 hardening ledger | F-02–F-05 repairs, new findings, and A/B/C evidence boundaries. |
+| [plan-task-driven-workunits.md](plan-task-driven-workunits.md) | Implementation plan and product contract | Task launch, automatic dispatch, exact review subjects, rework, and purpose retirement. |
+| [task-driven-workunits-implementation.md](task-driven-workunits-implementation.md) | Current implementation ledger | V141–V144, service/API/MCP/CLI/UI changes, and validation performed. |
 
 For current behavior use [architecture.md](../architecture.md),
 [concepts](../concepts/), [api.md](../api.md), [cli.md](../cli.md), and
 [getting-started.md](../getting-started.md).
+
+## Proposed independent follow-up plans
+
+These are implementation proposals, not current runtime contracts:
+
+- [Plan A: roles, capabilities, and correction routing](../plans/roles-capabilities-and-rework.md).
+- [Plan B: UI consistency and layout](../plans/ui-consistency-and-layout.md).
+
+Each plan includes a separate agent brief, file ownership, acceptance criteria,
+and a final integration boundary. Neither authorizes changing live Tasks.

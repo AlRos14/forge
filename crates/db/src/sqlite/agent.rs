@@ -51,12 +51,8 @@ async fn list_agents(
         (SortBy::LifecycleState, SortOrder::Desc) => "agent.created_at DESC, agent.id DESC",
         (SortBy::Status, SortOrder::Asc) => "agent.status ASC, agent.id ASC",
         (SortBy::Status, SortOrder::Desc) => "agent.status DESC, agent.id DESC",
-        (SortBy::Agent, SortOrder::Asc) | (SortBy::TaskType, SortOrder::Asc) => {
-            "agent.created_at ASC, agent.id ASC"
-        }
-        (SortBy::Agent, SortOrder::Desc) | (SortBy::TaskType, SortOrder::Desc) => {
-            "agent.created_at DESC, agent.id DESC"
-        }
+        (SortBy::Agent, SortOrder::Asc) => "agent.created_at ASC, agent.id ASC",
+        (SortBy::Agent, SortOrder::Desc) => "agent.created_at DESC, agent.id DESC",
     };
     let sql = format!(
         "SELECT agent.* FROM agent_current AS agent{} ORDER BY {} LIMIT ? OFFSET ?",

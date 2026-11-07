@@ -1,10 +1,52 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::Serialize;
 
 use crate::daemon_transport::providers::{ExecutionProvider, FilesystemProvider};
 use crate::daemon_transport::DaemonConnectionRegistry;
 use crate::{Result, ServiceError};
+
+#[derive(Serialize)]
+struct HarnessDiscoverOptionsParams<'a> {
+    executor_type: &'a str,
+    project_path: Option<String>,
+}
+
+pub async fn discover_harness_options(
+    registry: &DaemonConnectionRegistry,
+    daemon: &db::Daemon,
+    adapter: &dyn executors::HarnessAdapter,
+    executor_type: &str,
+) -> Result<executors::DiscoveredOptions> {
+    // Match execution provider selection: the embedded host has no command
+    // WebSocket, so use its in-process adapter unless a live remote connection
+    // has explicitly taken over this daemon identity.
+    if !registry.is_connected(&daemon.id)
+        && crate::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id)
+    {
+        return adapter
+            .discover_options(executors::DiscoverContext { project_path: None })
+            .await
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "embedded harness option discovery failed: {error}"
+                ))
+            });
+    }
+
+    registry
+        .send_request(
+            &daemon.id,
+            api_types::METHOD_HARNESS_DISCOVER_OPTIONS,
+            HarnessDiscoverOptionsParams {
+                executor_type,
+                project_path: None,
+            },
+            api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,
+        )
+        .await
+}
 
 #[derive(Clone)]
 pub struct RemoteFilesystemProvider {
@@ -84,8 +126,14 @@ impl ExecutionProvider for RemoteExecutionProvider {
         // reconnected, older daemon after capability negotiation completes.
         let mut required_features =
             vec![api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1];
-        if params.role == "reviewer" {
+        if params
+            .task_role_capabilities
+            .contains(&api_types::TaskRoleCapability::FormalReview)
+        {
             required_features.push(api_types::DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1);
+        }
+        if !params.task_role_capabilities.is_empty() {
+            required_features.push(api_types::DAEMON_PROTOCOL_FEATURE_TASK_ROLE_CAPABILITIES_V1);
         }
         {
             let capabilities: api_types::DaemonProtocolCapabilities = self

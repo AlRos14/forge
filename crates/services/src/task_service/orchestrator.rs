@@ -11,8 +11,12 @@ impl TaskService {
         &self,
         execution: &Execution,
     ) -> Result<Option<OrchestratorWake>> {
-        if execution.role != "orchestrator"
-            || execution.purpose != Some(ExecutionPurpose::Orchestrate)
+        if !crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::Orchestration,
+        )
+        .await?
             || execution.workspace_id.is_some()
         {
             return Ok(None);
@@ -56,7 +60,12 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::invalid_operation("orchestrator TaskRole is missing"))?;
         if role.task_id != execution.task_id
-            || role.role != "orchestrator"
+            || !crate::role_capabilities::current_task_role_has_capability(
+                &self.db,
+                &role.id,
+                api_types::TaskRoleCapability::Orchestration,
+            )
+            .await?
             || role.coordination_mode != wake.coordination_mode
             || role.version != wake.task_role_version
             || role.policy_json != wake.task_role_policy_json
@@ -112,7 +121,12 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::invalid_operation("orchestrator TaskRole is missing"))?;
         if task_role.task_id != task.id
-            || task_role.role != "orchestrator"
+            || !crate::role_capabilities::current_task_role_has_capability(
+                &self.db,
+                &task_role.id,
+                api_types::TaskRoleCapability::Orchestration,
+            )
+            .await?
             || task_role.coordination_mode != wake.coordination_mode
             || task_role.version != wake.task_role_version
             || task_role.policy_json != wake.task_role_policy_json
@@ -240,8 +254,7 @@ impl TaskService {
             task_id: task.id.clone(),
             agent_id: Some(agent.id.clone()),
             actor_ref: Some(ActorRef::Agent(agent.id.clone())),
-            role: "orchestrator".to_owned(),
-            purpose: Some(ExecutionPurpose::Orchestrate),
+            role: task_role.role.clone(),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -277,8 +290,7 @@ impl TaskService {
             payload_json: serde_json::json!({
                 "execution_id": create.id,
                 "task_id": task.id,
-                "role": "orchestrator",
-                "purpose": "orchestrate",
+                "role": task_role.role,
                 "actor_kind": "agent",
                 "actor_id": agent.id,
                 "work_unit_id": wake.work_unit_id,

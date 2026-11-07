@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use db::{
     new_uuid_v4, now_rfc3339, ActorKind, ActorRef, ArtifactKind, CollaborationRepo,
     CreateDomainEvent, CreateGate, CreateGatePolicyRevision, DecisionOutcome, DomainEvent,
-    ExecutionPurpose, ExecutionRepo, ExecutionStatus, Gate, GateEvaluation, GateEvaluationInput,
+    ExecutionRepo, ExecutionStatus, Gate, GateEvaluation, GateEvaluationInput,
     GateEvaluationOutcome, GateEvaluationWrite, GatePolicyRevision, GateRepo, GateScopeKind,
     ProposalStatus, RoleMembershipRepo, RoleMembershipStatus, SqliteDb,
     TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskLifecycleRepo,
@@ -13,6 +13,7 @@ use db::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 
 use crate::{
     task_lifecycle::{LifecycleCause, TaskLifecycleService, TransitionLifecycleInput},
@@ -81,6 +82,9 @@ pub struct ReviewSetPolicy {
     pub allowed_actor_refs: Vec<ActorRef>,
     #[serde(default)]
     pub task_role_snapshot: Option<TaskRoleReviewerSnapshot>,
+    #[serde(default)]
+    pub review_line_id: Option<String>,
+    #[serde(default)]
     pub candidates: Vec<ReviewReportRequirement>,
 }
 
@@ -114,6 +118,21 @@ pub struct ReviewSubjectExpectation {
     pub workspace_id: Option<String>,
     pub base_commit_sha: Option<String>,
     pub head_commit_sha: Option<String>,
+    pub workspace_snapshot_digest: Option<String>,
+    /// Exact delivered result; distinct from the reviewer's own Workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_result: Option<ReviewedResultExpectation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedResultExpectation {
+    pub work_unit_id: String,
+    pub work_unit_version: i64,
+    pub execution_id: String,
+    pub artifact_id: Option<String>,
+    pub commit_sha: Option<String>,
+    pub workspace_id: Option<String>,
     pub workspace_snapshot_digest: Option<String>,
 }
 
@@ -997,7 +1016,117 @@ impl GateEngine {
         // never satisfy a multi-reviewer policy by themselves.
         let mut passing_reviewers = PassingReviewers::default();
         let mut required_failed = false;
-        for candidate in &requirement.candidates {
+        let mut candidates = requirement.candidates.clone();
+        if let Some(line_id) = requirement.review_line_id.as_deref() {
+            candidates.clear();
+            let line = sqlx::query(
+                "SELECT id, task_id, current_work_unit_id, current_work_unit_version,
+                        current_result_execution_id, current_result_artifact_id,
+                        current_commit_sha, current_workspace_id, current_snapshot_digest,
+                        current_manifest_id, latest_report_artifact_id, latest_verdict, revision
+                 FROM work_unit_review_line WHERE id = ? AND task_id = ?",
+            )
+            .bind(line_id)
+            .bind(&gate.task_id)
+            .fetch_optional(self.db.pool())
+            .await?;
+            let Some(line) = line else {
+                missing.push(format!("review_line:{line_id}"));
+                issues.push("review_line_missing_or_wrong_task".to_owned());
+                return Ok(());
+            };
+            let line_revision: i64 = line.try_get("revision")?;
+            let latest_report_artifact_id: Option<String> =
+                line.try_get("latest_report_artifact_id")?;
+            let latest_verdict: Option<String> = line.try_get("latest_verdict")?;
+            let line_identity = json!({
+                "line_id": line_id,
+                "revision": line_revision,
+                "current_work_unit_id": line.try_get::<String, _>("current_work_unit_id")?,
+                "current_work_unit_version": line.try_get::<i64, _>("current_work_unit_version")?,
+                "current_result_execution_id": line.try_get::<Option<String>, _>("current_result_execution_id")?,
+                "current_result_artifact_id": line.try_get::<Option<String>, _>("current_result_artifact_id")?,
+                "current_commit_sha": line.try_get::<Option<String>, _>("current_commit_sha")?,
+                "current_workspace_id": line.try_get::<Option<String>, _>("current_workspace_id")?,
+                "current_snapshot_digest": line.try_get::<Option<String>, _>("current_snapshot_digest")?,
+                "current_manifest_id": line.try_get::<Option<String>, _>("current_manifest_id")?,
+                "latest_report_artifact_id": latest_report_artifact_id,
+                "latest_verdict": latest_verdict,
+            });
+            let line_digest = sha256(line_identity.to_string().as_bytes());
+            let mut line_subject = line_identity;
+            line_subject["line_digest"] = json!(line_digest);
+            let subject_json = line_subject.to_string();
+            inputs.push(InputDraft {
+                input_kind: "review_line".to_owned(),
+                input_id: line_id.to_owned(),
+                input_version: line_revision,
+                input_digest: line_digest,
+                producer_ref: latest_report_artifact_id.clone(),
+                subject_json,
+                status: latest_verdict
+                    .clone()
+                    .unwrap_or_else(|| "pending".to_owned()),
+            });
+
+            let current_result_execution_id: Option<String> =
+                line.try_get("current_result_execution_id")?;
+            if let (Some(report_id), Some(result_execution_id)) = (
+                latest_report_artifact_id.as_deref(),
+                current_result_execution_id.as_deref(),
+            ) {
+                if latest_verdict.as_deref() == Some("pass") {
+                    if let Some(report) =
+                        CollaborationRepo::get_artifact(&*self.db, report_id).await?
+                    {
+                        let report_content: Value = report
+                            .content
+                            .as_deref()
+                            .and_then(|content| serde_json::from_str(content).ok())
+                            .unwrap_or(Value::Null);
+                        let report_subject = report_content
+                            .get("subject")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let exact_result = ReviewedResultExpectation {
+                            work_unit_id: line.try_get("current_work_unit_id")?,
+                            work_unit_version: line.try_get("current_work_unit_version")?,
+                            execution_id: result_execution_id.to_owned(),
+                            artifact_id: line.try_get("current_result_artifact_id")?,
+                            commit_sha: line.try_get("current_commit_sha")?,
+                            workspace_id: line.try_get("current_workspace_id")?,
+                            workspace_snapshot_digest: line.try_get("current_snapshot_digest")?,
+                        };
+                        candidates.push(ReviewReportRequirement {
+                            artifact_id: report.id.clone(),
+                            digest: report.digest.clone().unwrap_or_default(),
+                            expected_actor: None,
+                            required: true,
+                            subject: ReviewSubjectExpectation {
+                                workspace_id: report_subject
+                                    .get("workspace_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                base_commit_sha: report_subject
+                                    .get("base_commit_sha")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                head_commit_sha: report_subject
+                                    .get("head_commit_sha")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                workspace_snapshot_digest: report_subject
+                                    .get("workspace_snapshot_digest")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                reviewed_result: Some(exact_result),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        for candidate in &candidates {
             let Some(artifact) =
                 CollaborationRepo::get_artifact(&*self.db, &candidate.artifact_id).await?
             else {
@@ -1057,6 +1186,66 @@ impl GateEngine {
                 .unwrap_or(Value::Null);
             let verdict = content.get("verdict").and_then(Value::as_str).unwrap_or("");
             let subject = content.get("subject").cloned().unwrap_or(Value::Null);
+            let delivered = match execution.work_unit_id.as_deref() {
+                Some(id) => crate::task_rework::get_review_subject(&self.db, id).await?,
+                None => None,
+            };
+            let delivered_attempt = match delivered
+                .as_ref()
+                .and_then(|s| s.result_execution_id.as_deref())
+            {
+                Some(id) => ExecutionRepo::get_by_id(&*self.db, id).await?,
+                None => None,
+            };
+            let delivered_is_exact = match delivered.as_ref() {
+                Some(result) => delivered_attempt.as_ref().is_some_and(|attempt| {
+                    attempt.task_id == gate.task_id
+                        && attempt.work_unit_id.as_deref()
+                            == Some(result.reviewed_work_unit_id.as_str())
+                        && attempt.work_unit_version == result.reviewed_work_unit_version
+                        && attempt.status == ExecutionStatus::Completed
+                        && attempt.after_sha == result.result_commit_sha
+                        && attempt.workspace_id == result.result_workspace_id
+                        && (attempt.workspace_id.is_none()
+                            || result.workspace_snapshot_digest.is_some())
+                        && subject.get("reviewed_work_unit_id").and_then(Value::as_str)
+                            == Some(result.reviewed_work_unit_id.as_str())
+                        && subject
+                            .get("reviewed_work_unit_version")
+                            .and_then(Value::as_i64)
+                            == result.reviewed_work_unit_version
+                        && subject.get("reviewed_result")
+                            == Some(&serde_json::json!({
+                                "execution_id": result.result_execution_id,
+                                "artifact_id": result.result_artifact_id,
+                                "commit_sha": result.result_commit_sha,
+                                "workspace_id": result.result_workspace_id,
+                                "workspace_snapshot_digest": result.workspace_snapshot_digest,
+                            }))
+                }),
+                None => {
+                    execution.work_unit_id.is_none() && subject.get("reviewed_result").is_none()
+                }
+            };
+            let delivered_pin_matches =
+                candidate
+                    .subject
+                    .reviewed_result
+                    .as_ref()
+                    .is_none_or(|expected| {
+                        delivered.as_ref().is_some_and(|actual| {
+                            actual.reviewed_work_unit_id == expected.work_unit_id
+                                && actual.reviewed_work_unit_version
+                                    == Some(expected.work_unit_version)
+                                && actual.result_execution_id.as_deref()
+                                    == Some(expected.execution_id.as_str())
+                                && actual.result_artifact_id == expected.artifact_id
+                                && actual.result_commit_sha == expected.commit_sha
+                                && actual.result_workspace_id == expected.workspace_id
+                                && actual.workspace_snapshot_digest
+                                    == expected.workspace_snapshot_digest
+                        })
+                    });
             let subject_matches = subject.get("task_id").and_then(Value::as_str)
                 == Some(gate.task_id.as_str())
                 && subject.get("review_execution_id").and_then(Value::as_str)
@@ -1070,7 +1259,9 @@ impl GateEngine {
                 && subject
                     .get("workspace_snapshot_digest")
                     .and_then(Value::as_str)
-                    == candidate.subject.workspace_snapshot_digest.as_deref();
+                    == candidate.subject.workspace_snapshot_digest.as_deref()
+                && delivered_is_exact
+                && delivered_pin_matches;
             let actor_ok = execution.actor_ref().as_ref() == Some(producer_actor)
                 && candidate
                     .expected_actor
@@ -1092,6 +1283,17 @@ impl GateEngine {
                     .iter()
                     .find(|unit| unit.work_unit_id == gate.scope_id)
                     .is_some_and(|unit| {
+                        if let Some(result) = delivered.as_ref() {
+                            return result.reviewed_work_unit_id == gate.scope_id
+                                && result
+                                    .reviewed_work_unit_version
+                                    .and_then(|version| version.checked_add(1))
+                                    == Some(unit.version)
+                                && result.result_execution_id.as_deref()
+                                    == Some(unit.execution_id.as_str())
+                                && result.result_commit_sha.as_deref()
+                                    == Some(unit.execution_result_sha.as_str());
+                        }
                         // The immutable Execution is admitted against the open
                         // WorkUnit version. Completing that WorkUnit advances
                         // its aggregate version once, so the exact producer
@@ -1111,9 +1313,14 @@ impl GateEngine {
                 .is_none_or(|snapshot| {
                     task_role_current == Some(true) && snapshot.actor_refs.contains(producer_actor)
                 });
+            let formal_review_admitted = crate::role_capabilities::execution_has_capability(
+                &self.db,
+                &execution.id,
+                api_types::TaskRoleCapability::FormalReview,
+            )
+            .await?;
             let producer_ok = execution.task_id == gate.task_id
-                && execution.role == "reviewer"
-                && execution.purpose == Some(ExecutionPurpose::Review)
+                && formal_review_admitted
                 && execution.status == ExecutionStatus::Completed
                 && actor_kind_ok
                 && actor_ok
@@ -1153,10 +1360,14 @@ impl GateEngine {
                 });
             }
         }
-        let threshold = match requirement.mode {
-            ReviewSelectionMode::OneAcceptable => 1,
-            ReviewSelectionMode::AllRequired => requirement.candidates.len() as u32,
-            ReviewSelectionMode::AtLeast => requirement.required_count,
+        let threshold = if requirement.review_line_id.is_some() {
+            1
+        } else {
+            match requirement.mode {
+                ReviewSelectionMode::OneAcceptable => 1,
+                ReviewSelectionMode::AllRequired => requirement.candidates.len() as u32,
+                ReviewSelectionMode::AtLeast => requirement.required_count,
+            }
         };
         if passing_reviewers.count() < threshold as usize {
             issues.push("review_quorum_not_satisfied".to_owned());
@@ -1555,37 +1766,54 @@ fn normalize_policy(policy: &mut GatePolicyDocument) -> Result<()> {
         ));
     }
     if let Some(review) = &mut policy.review {
-        if review.candidates.is_empty() || (!review.allow_humans && !review.allow_agents) {
+        let line_bound = review.review_line_id.is_some();
+        if (!line_bound && review.candidates.is_empty())
+            || (!review.allow_humans && !review.allow_agents)
+        {
             return Err(invalid(
-                "review Gate needs candidates and an acceptable Actor kind",
+                "review Gate needs a review line or candidates and an acceptable Actor kind",
+            ));
+        }
+        if line_bound && !review.candidates.is_empty() {
+            return Err(invalid(
+                "review-line Gate policy cannot also contain static review candidates",
+            ));
+        }
+        if line_bound
+            && (review.mode != ReviewSelectionMode::OneAcceptable || review.required_count != 1)
+        {
+            return Err(invalid(
+                "review-line Gate policy requires one_acceptable with required_count=1",
             ));
         }
         match review.mode {
-            ReviewSelectionMode::OneAcceptable if review.required_count != 1 => {
+            ReviewSelectionMode::OneAcceptable if !line_bound && review.required_count != 1 => {
                 return Err(invalid(
                     "one_acceptable reviewer policy requires required_count=1",
                 ));
             }
             ReviewSelectionMode::AllRequired
-                if review.required_count as usize != review.candidates.len() =>
+                if !line_bound && review.required_count as usize != review.candidates.len() =>
             {
                 return Err(invalid(
                     "all_required reviewer policy must require every candidate",
                 ));
             }
             ReviewSelectionMode::AllRequired
-                if review
-                    .candidates
-                    .iter()
-                    .any(|candidate| !candidate.required) =>
+                if !line_bound
+                    && review
+                        .candidates
+                        .iter()
+                        .any(|candidate| !candidate.required) =>
             {
                 return Err(invalid(
                     "all_required reviewer policy cannot contain optional candidates",
                 ));
             }
             ReviewSelectionMode::AtLeast
-                if review.required_count == 0
-                    || review.required_count as usize > review.candidates.len() =>
+                if !line_bound
+                    && (review.required_count == 0
+                        || review.required_count as usize > review.candidates.len()) =>
             {
                 return Err(invalid(
                     "N-of-M reviewer count is outside the candidate set",
@@ -1918,7 +2146,6 @@ mod tests {
                 parent_task_id: None,
                 title: "TaskRole snapshot".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
@@ -1998,6 +2225,9 @@ mod tests {
             membership_digest: actor_set_digest(std::slice::from_ref(&actor)),
             actor_refs: vec![actor.clone()],
         };
+        sqlx::query("UPDATE task_role_capability_configuration SET configuration_json = ? WHERE task_role_id IN (SELECT id FROM task_role WHERE task_id = ? AND role = 'reviewer')")
+            .bind(r#"{"schema_version":1,"display_label":null,"capabilities":["formal_review"],"rework":null}"#)
+            .bind(&task_id).execute(db.pool()).await.expect("explicit formal_review fixture capability");
         let execution_id = new_uuid_v4();
         db::ExecutionRepo::create(
             &*db,
@@ -2007,7 +2237,6 @@ mod tests {
                 agent_id: None,
                 actor_ref: Some(actor.clone()),
                 role: "reviewer".to_owned(),
-                purpose: Some(ExecutionPurpose::Review),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
                 stopped_by: None,
@@ -2092,6 +2321,7 @@ mod tests {
                 allow_agents: false,
                 allowed_actor_refs: Vec::new(),
                 task_role_snapshot: Some(snapshot),
+                review_line_id: None,
                 candidates: vec![candidate("optional-not-yet-produced"), passing_report],
             }),
             validations: Vec::new(),
@@ -2199,6 +2429,7 @@ mod tests {
                     allow_agents: false,
                     allowed_actor_refs: Vec::new(),
                     task_role_snapshot: Some(exact_role_snapshot.clone()),
+                    review_line_id: None,
                     candidates: vec![exact_candidate, missing_candidate],
                 }),
                 validations: Vec::new(),
@@ -2425,7 +2656,10 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .expect("TaskRole membership events");
-        assert_eq!(membership_events, 3);
+        assert_eq!(
+            membership_events, 4,
+            "includes explicit capability configuration"
+        );
     }
 
     #[tokio::test]
@@ -2482,7 +2716,6 @@ mod tests {
                 parent_task_id: None,
                 title: "Exact WorkUnit Gate".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
@@ -2532,10 +2765,14 @@ mod tests {
                 parent_work_unit_id: None,
                 title: "Implement exact unit".to_owned(),
                 scope: "One bounded change".to_owned(),
+                execution_instructions: None,
                 role: "implementer".to_owned(),
                 assigned_actor: Some(actor.clone()),
                 requires_integration: false,
                 provenance: None,
+                artifact_input_ids: Vec::new(),
+                review_approval_gate_id: None,
+                review_approval_line_id: None,
                 created_by: actor.clone(),
                 created_at: now.clone(),
             },
@@ -2560,7 +2797,6 @@ mod tests {
                     agent_id: None,
                     actor_ref: Some(actor),
                     role: "implementer".to_owned(),
-                    purpose: Some(ExecutionPurpose::Implement),
                     status: ExecutionStatus::Running,
                     stop_reason: None,
                     stopped_by: None,
@@ -2626,6 +2862,7 @@ mod tests {
                 expected_version: 1,
                 status: WorkUnitStatus::Completed,
                 updated_at: now.clone(),
+                reviewed_result: None,
             },
             gate_event(
                 "work_unit.completed",
@@ -2782,7 +3019,6 @@ mod tests {
                 parent_task_id: None,
                 title: "Exact Decision Gate".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
@@ -2931,6 +3167,7 @@ mod tests {
                 base_commit_sha: None,
                 head_commit_sha: None,
                 workspace_snapshot_digest: None,
+                reviewed_result: None,
             },
         }
     }
@@ -2947,6 +3184,7 @@ mod tests {
                 allow_agents: true,
                 allowed_actor_refs: Vec::new(),
                 task_role_snapshot: None,
+                review_line_id: None,
                 candidates: vec![
                     candidate("review-c"),
                     candidate("review-a"),

@@ -432,7 +432,6 @@ async fn task_and_execution_routes_enforce_project_visibility() {
             agent_id: None,
             actor_ref: Some(db::ActorRef::Human("test-user-id".to_owned())),
             role: "reviewer".to_owned(),
-            purpose: Some(db::ExecutionPurpose::Review),
             status: db::ExecutionStatus::Completed,
             stop_reason: None,
             stopped_by: None,
@@ -2173,27 +2172,16 @@ async fn execution_start_requires_an_exact_active_agent_membership_and_purpose()
     )
     .await;
 
-    let execution: ExecutionResponse = common::json_request_with_bearer(
+    let execution: ExecutionResponse = common::launch_work_unit_execution_with_bearer(
         &harness.app,
-        Method::POST,
-        &format!("/api/v1/tasks/{}/executions", task.id),
+        &task.id,
+        &allocated_work_unit,
         &token,
-        json!({
-            "work_unit_id": allocated_work_unit.id,
-            "expected_work_unit_version": allocated_work_unit.version,
-            "purpose": "implement",
-            "prompt": "Implement the exact requested change.",
-            "input_artifact_ids": []
-        }),
-        StatusCode::OK,
+        Some("Implement the exact requested change."),
     )
     .await;
     assert_eq!(execution.task_id, task.id);
     assert_eq!(execution.role, "implementer");
-    assert_eq!(
-        execution.purpose,
-        Some(api_types::ExecutionPurpose::Implement)
-    );
     assert_eq!(
         execution.actor_ref,
         Some(api_types::ActorRef::Agent(agent_id.clone()))

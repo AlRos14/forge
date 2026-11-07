@@ -88,7 +88,6 @@ fn parse_project_hooks_json_rejects_empty_required_action_fields() {
                 "type": "create_task",
                 "title": " ",
                 "description": null,
-                "task_type": null,
                 "priority": null
             },
             "cooldown_seconds": null,
@@ -383,7 +382,6 @@ async fn all_work_completed_ignores_running_automation_task_and_automation_does_
             project.id.clone(),
             "Automation: completion",
             Some("hook-run automation task".to_owned()),
-            Some("implementation".to_owned()),
             None,
             None,
         )
@@ -699,7 +697,6 @@ async fn seed_task(
             subtask_order: None,
             title: format!("{lifecycle_state:?} task"),
             description: None,
-            task_type: "implementation".to_owned(),
             lifecycle_state,
             is_automation,
             priority: 0,
@@ -727,7 +724,6 @@ fn create_task_rule(
         action: ProjectHookAction::CreateTask {
             title: title.to_owned(),
             description: Some("created by project hook".to_owned()),
-            task_type: None,
             priority: None,
         },
         cooldown_seconds,

@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn default_command_no_overrides() {
         let builder = CommandBuilder::new("codex")
-            .default_args(vec!["-y".into(), "@openai/codex@0.1".into()])
+            .default_args(vec!["--profile".into(), "work".into()])
             .adapter_args(vec!["app-server".into()]);
 
         let cmd = builder.build();
@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(prog, "codex");
 
         let args: Vec<_> = cmd.as_std().get_args().collect();
-        assert_eq!(args, vec!["-y", "@openai/codex@0.1", "app-server"]);
+        assert_eq!(args, vec!["--profile", "work", "app-server"]);
     }
 
     #[test]
@@ -218,8 +218,8 @@ mod tests {
             additional_params: Some(vec!["--verbose".into()]),
             env: None,
         };
-        let builder = CommandBuilder::new("npx")
-            .default_args(vec!["-y".into(), "@openai/codex@0.1".into()])
+        let builder = CommandBuilder::new("codex")
+            .default_args(vec!["--profile".into(), "work".into()])
             .adapter_args(vec!["app-server".into()])
             .overrides(&overrides);
 

@@ -132,6 +132,31 @@ pub fn api_router(state: AppState) -> Router {
                 .delete(routes::projects::delete_project),
         )
         .route(
+            "/api/v1/projects/{id}/task-role-defaults",
+            get(routes::projects::get_task_role_defaults)
+                .put(routes::projects::update_task_role_defaults),
+        )
+        .route(
+            "/api/v1/projects/{id}/copilot",
+            get(routes::project_copilot::get).put(routes::project_copilot::update),
+        )
+        .route(
+            "/api/v1/projects/{id}/copilot/messages",
+            get(routes::project_copilot::messages).post(routes::project_copilot::send),
+        )
+        .route(
+            "/api/v1/projects/{id}/copilot/activity",
+            get(routes::project_copilot::activity),
+        )
+        .route(
+            "/api/v1/projects/{id}/copilot/runs/{run_id}",
+            get(routes::project_copilot::run).delete(routes::project_copilot::cancel),
+        )
+        .route(
+            "/api/v1/projects/{id}/copilot/runs/{run_id}/logs",
+            get(routes::project_copilot::logs),
+        )
+        .route(
             "/api/v1/projects/{id}/pause",
             post(routes::projects::pause_project),
         )
@@ -209,8 +234,16 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::work_units::create_work_unit).get(routes::work_units::list_work_units),
         )
         .route(
+            "/api/v1/tasks/{task_id}/review-lines",
+            get(routes::task_rework::list_review_lines),
+        )
+        .route(
             "/api/v1/work-units/{id}",
             get(routes::work_units::get_work_unit).patch(routes::work_units::update_work_unit),
+        )
+        .route(
+            "/api/v1/work-units/{id}/artifact-package",
+            get(routes::work_units::get_artifact_package),
         )
         .route(
             "/api/v1/work-units/{id}/allocation",
@@ -219,6 +252,10 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/work-units/{id}/status",
             post(routes::work_units::transition_work_unit),
+        )
+        .route(
+            "/api/v1/work-units/{id}/review-report",
+            post(routes::work_unit_reviews::submit),
         )
         .route(
             "/api/v1/work-units/{id}/dependencies",
@@ -235,6 +272,10 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/work-units/{id}/integrations",
             post(routes::work_units::integrate),
+        )
+        .route(
+            "/api/v1/work-units/{id}/workspace",
+            post(routes::work_units::prepare_workspace),
         )
         .route(
             "/api/v1/tasks/{task_id}/artifacts",
@@ -339,6 +380,10 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/tasks/{id}/lifecycle/transitions",
             get(routes::tasks::list_task_lifecycle_transitions),
+        )
+        .route(
+            "/api/v1/task-role-capabilities",
+            get(routes::tasks::task_role_capability_catalog),
         )
         .route(
             "/api/v1/tasks/{id}/task-roles",
@@ -540,6 +585,34 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/tasks/{id}/executions",
             get(routes::executions::list_executions).post(routes::executions::start_task_execution),
+        )
+        .route(
+            "/api/v1/tasks/{id}/dispatch",
+            get(routes::task_dispatch::get_launch_preflight),
+        )
+        .route(
+            "/api/v1/tasks/{id}/dispatch/launch",
+            post(routes::task_dispatch::launch_task),
+        )
+        .route(
+            "/api/v1/tasks/{id}/dispatch/pause",
+            post(routes::task_dispatch::pause_task),
+        )
+        .route(
+            "/api/v1/tasks/{id}/dispatch/resume",
+            post(routes::task_dispatch::resume_task),
+        )
+        .route(
+            "/api/v1/tasks/{id}/dispatch/cancel",
+            post(routes::task_dispatch::cancel_task),
+        )
+        .route(
+            "/api/v1/tasks/{id}/rework",
+            post(routes::task_rework::request_rework),
+        )
+        .route(
+            "/api/v1/tasks/{id}/rework/automation",
+            get(routes::task_rework::list_automatic_rework_intents),
         )
         .route(
             "/api/v1/tasks/{task_id}/executions/{execution_id}/recovery",

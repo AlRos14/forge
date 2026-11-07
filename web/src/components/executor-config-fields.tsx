@@ -120,6 +120,19 @@ export function ClaudeCodeFields({ cfg, onChange }: ExecFieldProps) {
           Skip permissions
         </label>
       </div>
+      {getBool(cfg, 'claude_code_router') && (
+        <ConfigField
+          label="Router profile"
+          className="col-span-2"
+          hint="Uses the installed ccr profile command. Leave empty only for older CLIs that support ccr code."
+        >
+          <Input
+            value={getStr(cfg, 'claude_code_router_profile')}
+            onChange={(e) => onChange('claude_code_router_profile', e.target.value || undefined)}
+            placeholder="Installed CCR profile name"
+          />
+        </ConfigField>
+      )}
     </div>
   )
 }

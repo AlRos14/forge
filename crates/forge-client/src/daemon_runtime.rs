@@ -14,14 +14,17 @@ use api_types::{
     ExecutionTerminalNotification, FsBranchesParams, FsListParams, RemoteExecutionFailureClass,
     RemoteResolvedCandidate, RemoteRouteAttempt, RemoteTokenUsage,
     DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1,
-    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1, INVALID_FRAME, METHOD_EXECUTION_CANCEL,
-    METHOD_EXECUTION_LOG, METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES,
-    METHOD_FS_LIST, METHOD_PROTOCOL_CAPABILITIES, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE,
+    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1,
+    DAEMON_PROTOCOL_FEATURE_TASK_ROLE_CAPABILITIES_V1, INVALID_FRAME, INVALID_INPUT,
+    METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_LOG, METHOD_EXECUTION_START,
+    METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES, METHOD_FS_LIST, METHOD_HARNESS_DISCOVER_OPTIONS,
+    METHOD_PROTOCOL_CAPABILITIES, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE,
     METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
 };
 use executors::{
-    ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
-    FallbackExecutor, LogEntry, TaskExecutor,
+    DiscoverContext, DiscoveredOptions, ExecutionContext, ExecutionFailureClass, ExecutionOutcome,
+    ExecutionResult, ExecutorKind, FallbackExecutor, HarnessAdapterRegistry, LogEntry,
+    TaskExecutor,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -128,6 +131,13 @@ impl Drop for ActiveExecutionGuard {
 
 type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
 
+#[derive(serde::Deserialize)]
+struct HarnessDiscoverOptionsParams {
+    executor_type: String,
+    #[serde(default)]
+    project_path: Option<String>,
+}
+
 pub async fn run_command_stream(
     client: Arc<DaemonClient>,
     workspace_root: PathBuf,
@@ -182,6 +192,7 @@ pub struct DaemonRuntime {
     workspace_root: PathBuf,
     outbound: mpsc::UnboundedSender<DaemonFrame>,
     executor: Arc<FallbackExecutor>,
+    adapter_registry: Arc<HarnessAdapterRegistry>,
     active_executions: ActiveExecutionTracker,
     generation: Mutex<ExecutionGeneration>,
 }
@@ -218,10 +229,14 @@ impl DaemonRuntime {
         registry: Arc<executors::HarnessAdapterRegistry>,
         active_executions: ActiveExecutionTracker,
     ) -> Arc<Self> {
+        let executor = Arc::new(
+            FallbackExecutor::new(Arc::clone(&registry)).with_adapter_owned_cancellation(),
+        );
         Arc::new(Self {
             workspace_root,
             outbound,
-            executor: Arc::new(FallbackExecutor::new(registry)),
+            executor,
+            adapter_registry: registry,
             active_executions,
             generation: Mutex::new(ExecutionGeneration::default()),
         })
@@ -251,9 +266,22 @@ impl DaemonRuntime {
                             features: vec![
                                 DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1.to_owned(),
                                 DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1.to_owned(),
+                                DAEMON_PROTOCOL_FEATURE_TASK_ROLE_CAPABILITIES_V1.to_owned(),
                             ],
                         },
                     ),
+                    Err(frame) => frame,
+                }
+            }
+            METHOD_HARNESS_DISCOVER_OPTIONS => {
+                match decode_params::<HarnessDiscoverOptionsParams>(&id, params) {
+                    Ok(params) => match self.discover_options(params).await {
+                        Ok(result) => response_frame(id, result),
+                        Err(error) => DaemonFrame::Error {
+                            id: Some(id),
+                            error,
+                        },
+                    },
                     Err(frame) => frame,
                 }
             }
@@ -310,6 +338,34 @@ impl DaemonRuntime {
         }
     }
 
+    async fn discover_options(
+        &self,
+        params: HarnessDiscoverOptionsParams,
+    ) -> CommandResult<DiscoveredOptions> {
+        let kind = params
+            .executor_type
+            .parse::<ExecutorKind>()
+            .map_err(|message| DaemonErrorPayload {
+                code: INVALID_INPUT.to_owned(),
+                message,
+                details: None,
+            })?;
+        let adapter = self
+            .adapter_registry
+            .get(&kind)
+            .ok_or_else(|| DaemonErrorPayload {
+                code: UNSUPPORTED_METHOD.to_owned(),
+                message: format!("no adapter registered for executor type: {kind}"),
+                details: None,
+            })?;
+        adapter
+            .discover_options(DiscoverContext {
+                project_path: params.project_path,
+            })
+            .await
+            .map_err(|error| execution_error(error.to_string()))
+    }
+
     pub async fn start(
         self: &Arc<Self>,
         params: ExecutionStartParams,
@@ -325,6 +381,7 @@ impl DaemonRuntime {
             task_id: params.task_id.clone(),
             execution_id: params.execution_id.clone(),
             role: params.role.clone(),
+            task_role_capabilities: params.task_role_capabilities.clone(),
             worktree_path: worktree_path.to_string_lossy().into_owned(),
             description,
             agent_config: params.executor_config,
@@ -585,46 +642,11 @@ async fn run_execution_task(
     );
 
     let execution_id = ctx.execution_id.clone();
-    let read_only_path = executors::is_worktree_read_only(&ctx.agent_config)
-        .then(|| PathBuf::from(&ctx.worktree_path));
-    let read_only_head = match read_only_path.as_deref() {
-        Some(path) => git::get_current_sha(path).await.map(Some).map_err(|error| {
-            ExecutorError::Other(format!(
-                "failed to capture read-only worktree state: {error}"
-            ))
-        }),
-        None => Ok(None),
-    };
-    let result = match read_only_head {
-        Ok(read_only_head) => {
-            let logs_path = PathBuf::from(&ctx.logs_path);
-            let execution_result = executor.execute(ctx).await;
-            if let Err(error) = executors::LogWriter::compact(&logs_path).await {
-                tracing::warn!(%error, "failed to compress daemon execution log; plain log retained");
-            }
-            let restore_result = match (read_only_path.as_deref(), read_only_head.as_deref()) {
-                (Some(path), Some(head)) => {
-                    git::restore_worktree(path, head).await.map_err(|error| {
-                        ExecutorError::Other(format!(
-                            "failed to restore read-only worktree state: {error}"
-                        ))
-                    })
-                }
-                _ => Ok(()),
-            };
-            match (execution_result, restore_result) {
-                (_, Err(error)) => Err(error),
-                (Ok(mut result), Ok(())) => {
-                    if let Some(head) = read_only_head {
-                        result.after_sha = Some(head);
-                    }
-                    Ok(result)
-                }
-                (Err(error), Ok(())) => Err(error),
-            }
-        }
-        Err(error) => Err(error),
-    };
+    let logs_path = PathBuf::from(&ctx.logs_path);
+    let result = executor.execute(ctx).await;
+    if let Err(error) = executors::LogWriter::compact(&logs_path).await {
+        tracing::warn!(%error, "failed to compress daemon execution log; plain log retained");
+    }
     // The executor owns the only log sender in ctx, so completion should close the
     // channel and let the forwarder drain. If an executor holds a sender clone or
     // emits a very large trailing burst, the timeout favors terminal notification
@@ -1211,6 +1233,7 @@ mod tests {
             task_id: "task-generation".to_owned(),
             execution_id: execution_id.to_owned(),
             role: "coder".to_owned(),
+            task_role_capabilities: vec![],
             workspace_path: workspace_root.to_string_lossy().into_owned(),
             executor_type: "codex".to_owned(),
             executor_config: serde_json::json!({
@@ -1352,6 +1375,7 @@ mod tests {
                 task_id: "task-1".to_owned(),
                 execution_id: execution_id.clone(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "shell".to_owned(),
                 executor_config: serde_json::json!({
@@ -1398,6 +1422,7 @@ mod tests {
                 task_id: "task-remote-resume".to_owned(),
                 execution_id: "exec-remote-resume".to_owned(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "codex".to_owned(),
                 executor_config: serde_json::json!({
@@ -1453,6 +1478,7 @@ mod tests {
                 task_id: "task-cursor-usage".to_owned(),
                 execution_id: "exec-cursor-usage".to_owned(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "cursor".to_owned(),
                 executor_config: serde_json::json!({
@@ -1494,6 +1520,7 @@ mod tests {
                 task_id: "task-1".to_owned(),
                 execution_id: execution_id.clone(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "shell".to_owned(),
                 executor_config: serde_json::json!({

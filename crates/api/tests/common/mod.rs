@@ -11,8 +11,8 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentProfileResponse, AgentResponse, DaemonRegisterResponse, DaemonResponse, ProjectResponse,
-    RepoResponse, TaskResponse, WorkUnitResponse,
+    AgentProfileResponse, AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionResponse,
+    ProjectResponse, RepoResponse, TaskLaunchResponse, TaskResponse, WorkUnitResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -90,7 +90,7 @@ pub async fn test_app_with_pool(
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
     ));
-    let state = Arc::new(AppState::with_adapter_registry_services_and_shutdown(
+    let state = AppState::with_adapter_registry_services_and_shutdown(
         db,
         event_bus,
         true,
@@ -101,7 +101,13 @@ pub async fn test_app_with_pool(
         api::state::test_workflows_dir(),
         api::state::test_jwt_secret(),
         api::state::test_bcrypt_cost(),
+    );
+    let task_dispatcher = Arc::new(services::TaskDispatcher::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+        Arc::clone(&state.task_service),
     ));
+    let state = Arc::new(state.with_task_dispatcher(task_dispatcher));
 
     let web_dist_dir = TestDir::new(&format!("{prefix}-web"));
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
@@ -152,6 +158,192 @@ pub async fn create_allocated_work_unit(
         StatusCode::OK,
     )
     .await
+}
+
+pub async fn launch_work_unit_execution(
+    app: &Router,
+    task_id: &str,
+    work_unit: &WorkUnitResponse,
+    prompt: Option<&str>,
+) -> ExecutionResponse {
+    let work_unit: WorkUnitResponse = empty_request(
+        app,
+        Method::GET,
+        &format!("/api/v1/work-units/{}", work_unit.id),
+        StatusCode::OK,
+    )
+    .await;
+    let mut work_unit = work_unit;
+    if let Some(prompt) =
+        prompt.filter(|prompt| work_unit.execution_instructions.as_deref() != Some(*prompt))
+    {
+        work_unit = json_request(
+            app,
+            Method::PATCH,
+            &format!("/api/v1/work-units/{}", work_unit.id),
+            json!({
+                "expected_version": work_unit.version,
+                "title": null,
+                "scope": null,
+                "execution_instructions": prompt,
+                "requires_integration": null,
+            }),
+            StatusCode::OK,
+        )
+        .await;
+    }
+    if work_unit.requires_integration && work_unit.readiness.runnable {
+        let _: Value = empty_request(
+            app,
+            Method::POST,
+            &format!("/api/v1/work-units/{}/workspace", work_unit.id),
+            StatusCode::OK,
+        )
+        .await;
+    }
+    let task: TaskResponse = empty_request(
+        app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    let launch: TaskLaunchResponse = json_request(
+        app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/dispatch/launch"),
+        json!({
+            "expected_task_version": task.version,
+            "expected_lifecycle_version": task.lifecycle.version,
+            "idempotency_key": uuid::Uuid::new_v4().to_string(),
+            "reason": null,
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    if let Some(execution_id) = launch.admitted_execution_ids.first() {
+        return empty_request(
+            app,
+            Method::GET,
+            &format!("/api/v1/executions/{execution_id}"),
+            StatusCode::OK,
+        )
+        .await;
+    }
+    let executions: api_types::PaginatedResponse<ExecutionResponse> = empty_request(
+        app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}/executions"),
+        StatusCode::OK,
+    )
+    .await;
+    executions
+        .items
+        .into_iter()
+        .find(|execution| execution.work_unit_id.as_deref() == Some(work_unit.id.as_str()))
+        .unwrap_or_else(|| {
+            panic!(
+                "Task launch admitted no Execution and no historical Execution targets the WorkUnit: {:?}",
+                launch.preflight
+            )
+        })
+}
+
+pub async fn launch_work_unit_execution_with_bearer(
+    app: &Router,
+    task_id: &str,
+    work_unit: &WorkUnitResponse,
+    bearer: &str,
+    prompt: Option<&str>,
+) -> ExecutionResponse {
+    let work_unit: WorkUnitResponse = empty_request_with_bearer(
+        app,
+        Method::GET,
+        &format!("/api/v1/work-units/{}", work_unit.id),
+        bearer,
+        StatusCode::OK,
+    )
+    .await;
+    let mut work_unit = work_unit;
+    if let Some(prompt) =
+        prompt.filter(|prompt| work_unit.execution_instructions.as_deref() != Some(*prompt))
+    {
+        work_unit = json_request_with_bearer(
+            app,
+            Method::PATCH,
+            &format!("/api/v1/work-units/{}", work_unit.id),
+            bearer,
+            json!({
+                "expected_version": work_unit.version,
+                "title": null,
+                "scope": null,
+                "execution_instructions": prompt,
+                "requires_integration": null,
+            }),
+            StatusCode::OK,
+        )
+        .await;
+    }
+    if work_unit.requires_integration && work_unit.readiness.runnable {
+        let _: Value = empty_request_with_bearer(
+            app,
+            Method::POST,
+            &format!("/api/v1/work-units/{}/workspace", work_unit.id),
+            bearer,
+            StatusCode::OK,
+        )
+        .await;
+    }
+    let task: TaskResponse = empty_request_with_bearer(
+        app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}"),
+        bearer,
+        StatusCode::OK,
+    )
+    .await;
+    let launch: TaskLaunchResponse = json_request_with_bearer(
+        app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/dispatch/launch"),
+        bearer,
+        json!({
+            "expected_task_version": task.version,
+            "expected_lifecycle_version": task.lifecycle.version,
+            "idempotency_key": uuid::Uuid::new_v4().to_string(),
+            "reason": null,
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    if let Some(execution_id) = launch.admitted_execution_ids.first() {
+        return empty_request_with_bearer(
+            app,
+            Method::GET,
+            &format!("/api/v1/executions/{execution_id}"),
+            bearer,
+            StatusCode::OK,
+        )
+        .await;
+    }
+    let executions: api_types::PaginatedResponse<ExecutionResponse> = empty_request_with_bearer(
+        app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}/executions"),
+        bearer,
+        StatusCode::OK,
+    )
+    .await;
+    executions
+        .items
+        .into_iter()
+        .find(|execution| execution.work_unit_id.as_deref() == Some(work_unit.id.as_str()))
+        .unwrap_or_else(|| {
+            panic!(
+                "Task launch admitted no Execution and no historical Execution targets the WorkUnit: {:?}",
+                launch.preflight
+            )
+        })
 }
 
 pub fn setup_git_repo(root: &Path) -> PathBuf {

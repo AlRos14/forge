@@ -73,43 +73,6 @@ pub(crate) async fn has_exact_work_unit_target(
     }
 }
 
-/// Runtime writers choose purpose from the semantic operation. This helper is
-/// intentionally only a small compatibility mapping for existing role-driven
-/// dispatch paths; callers with a stronger semantic signal pass the purpose
-/// directly.
-pub(crate) fn execution_purpose_for_role(role: &str) -> ExecutionPurpose {
-    match role.trim().to_ascii_lowercase().as_str() {
-        "planner" => ExecutionPurpose::Plan,
-        "reviewer" | "auditor" => ExecutionPurpose::Review,
-        "coder" | "worker" | "implementer" | "executor" | "merge_fixer" => {
-            ExecutionPurpose::Implement
-        }
-        "orchestrator" => ExecutionPurpose::Orchestrate,
-        "interactive" | "system" => ExecutionPurpose::General,
-        _ => ExecutionPurpose::General,
-    }
-}
-
-/// Resolve the purpose at a semantic task-dispatch boundary. The `interactive`
-/// label remains general regardless of Task type or workflow state; Task type
-/// independently selects its TaskRole and repository capability. For other
-/// role-driven paths, typed Tasks keep their stronger domain purpose so
-/// validation is not recorded as implementation merely because its workflow
-/// role is `worker`.
-pub(crate) fn execution_purpose_for_task_type(task_type: &str, role: &str) -> ExecutionPurpose {
-    if role.trim().eq_ignore_ascii_case("interactive") {
-        return ExecutionPurpose::General;
-    }
-
-    match task_type.trim().to_ascii_lowercase().as_str() {
-        "planning" => ExecutionPurpose::Plan,
-        "review" => ExecutionPurpose::Review,
-        "validation" => ExecutionPurpose::Validate,
-        "discovery" | "investigation" | "investigate" => ExecutionPurpose::Investigate,
-        _ => execution_purpose_for_role(role),
-    }
-}
-
 /// Resolve generic continuity only through the Execution's explicit
 /// HarnessSession reference. Legacy external session identifiers are retained
 /// as historical provenance and never authorize Resume.
@@ -291,15 +254,8 @@ pub async fn harness_invocation_for_execution(
     execution: &Execution,
     workspace_id: Option<&str>,
 ) -> Result<api_types::HarnessInvocation> {
-    let is_planning = execution.purpose == Some(ExecutionPurpose::Plan);
     let Some(harness_session_id) = execution.harness_session_id.as_deref() else {
-        return Ok(if is_planning {
-            api_types::HarnessInvocation::Planning {
-                external_session_id: None,
-            }
-        } else {
-            api_types::HarnessInvocation::Start
-        });
+        return Ok(api_types::HarnessInvocation::Start);
     };
     let Some(session) = db::HarnessSessionRepo::get_by_id(db, harness_session_id).await? else {
         return Err(ServiceError::invalid_operation(
@@ -311,13 +267,7 @@ pub async fn harness_invocation_for_execution(
         // New Agent Executions receive a pending session row before dispatch.
         // That row is the destination for the session created by Start, not a
         // request to Resume an external session that does not exist yet.
-        return Ok(if is_planning {
-            api_types::HarnessInvocation::Planning {
-                external_session_id: None,
-            }
-        } else {
-            api_types::HarnessInvocation::Start
-        });
+        return Ok(api_types::HarnessInvocation::Start);
     }
     let external_session_id =
         resumable_external_session(db, execution, execution.agent_id.as_deref(), workspace_id)
@@ -327,14 +277,8 @@ pub async fn harness_invocation_for_execution(
             "explicit HarnessSession is not resumable under its historical capability evidence",
         )
             })?;
-    Ok(if is_planning {
-        api_types::HarnessInvocation::Planning {
-            external_session_id: Some(external_session_id),
-        }
-    } else {
-        api_types::HarnessInvocation::Resume {
-            external_session_id,
-        }
+    Ok(api_types::HarnessInvocation::Resume {
+        external_session_id,
     })
 }
 
@@ -442,7 +386,7 @@ fn is_known_pr2_resume_harness(harness_kind: &str) -> bool {
 }
 
 #[cfg(test)]
-mod purpose_tests {
+mod harness_identity_tests {
     use super::*;
 
     #[test]
@@ -497,64 +441,6 @@ mod purpose_tests {
             "codex",
             "{malformed",
         ));
-    }
-
-    #[test]
-    fn role_mapping_is_only_a_compatibility_default() {
-        assert_eq!(
-            execution_purpose_for_role("planner"),
-            ExecutionPurpose::Plan
-        );
-        assert_eq!(
-            execution_purpose_for_role("reviewer"),
-            ExecutionPurpose::Review
-        );
-        assert_eq!(
-            execution_purpose_for_role("implementer"),
-            ExecutionPurpose::Implement
-        );
-        assert_eq!(
-            execution_purpose_for_role("orchestrator"),
-            ExecutionPurpose::Orchestrate
-        );
-        assert_eq!(
-            execution_purpose_for_role("custom"),
-            ExecutionPurpose::General
-        );
-        assert_eq!(
-            execution_purpose_for_role("interactive"),
-            ExecutionPurpose::General
-        );
-    }
-
-    #[test]
-    fn task_dispatch_mapping_keeps_domain_purpose_independent_from_role() {
-        assert_eq!(
-            execution_purpose_for_task_type("validation", "worker"),
-            ExecutionPurpose::Validate
-        );
-        assert_eq!(
-            execution_purpose_for_task_type("investigation", "implementer"),
-            ExecutionPurpose::Investigate
-        );
-        assert_eq!(
-            execution_purpose_for_task_type("implementation", "implementer"),
-            ExecutionPurpose::Implement
-        );
-
-        for task_type in [
-            "implementation",
-            "planning",
-            "review",
-            "validation",
-            "discovery",
-        ] {
-            assert_eq!(
-                execution_purpose_for_task_type(task_type, "interactive"),
-                ExecutionPurpose::General,
-                "interactive purpose for {task_type} Task"
-            );
-        }
     }
 }
 

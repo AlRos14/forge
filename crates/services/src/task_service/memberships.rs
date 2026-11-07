@@ -2,14 +2,129 @@ use super::*;
 use api_types::ActorRef;
 use db::{
     canonical_task_role_name, new_uuid_v4, now_rfc3339, ActorKind, CoordinationMode,
-    CreateRoleMembership, CreateTaskRole, ProjectRepo, RoleMembership, RoleMembershipRepo,
-    RoleMembershipStatus, TaskRole, TaskRoleRepo, UpdateRoleMembership, UpdateTaskRole, UserRepo,
+    CreateRoleMembership, CreateTaskRole, ProjectRepo, ProjectTaskRoleDefaultsRepo, RoleMembership,
+    RoleMembershipRepo, RoleMembershipStatus, TaskRole, TaskRoleRepo, UpdateRoleMembership,
+    UpdateTaskRole, UpdateTaskRoleWithConfiguration, UserRepo,
 };
+use sqlx::{Sqlite, Transaction};
+use std::collections::HashMap;
 
 use crate::agent_service::{compute_effective_status, EffectiveStatus};
 use crate::project_actor_scope;
 
 impl TaskService {
+    pub(crate) async fn apply_project_task_role_defaults_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        project_id: &str,
+        task_id: &str,
+        created_at: &str,
+    ) -> Result<()> {
+        let project = ProjectRepo::get_by_id_in_tx(&*self.db, transaction, project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
+        let defaults = ProjectTaskRoleDefaultsRepo::get_task_role_defaults_in_tx(
+            &*self.db,
+            transaction,
+            project_id,
+        )
+        .await?;
+
+        let task_role_ids = defaults
+            .roles
+            .iter()
+            .map(|default| (default.role.clone(), new_uuid_v4()))
+            .collect::<HashMap<_, _>>();
+
+        for default in defaults.roles {
+            let role = canonical_task_role_name(&default.role).ok_or_else(|| {
+                ServiceError::invalid_operation("Project default role is not a TaskRole")
+            })?;
+            if role != default.role {
+                return Err(ServiceError::invalid_operation(
+                    "Project default role is not canonical",
+                ));
+            }
+            let project_configuration: api_types::ProjectTaskRoleConfiguration =
+                serde_json::from_str(&default.configuration_json).map_err(|error| {
+                    ServiceError::invalid_operation(format!(
+                        "Project TaskRole configuration is invalid: {error}"
+                    ))
+                })?;
+            let configuration = crate::task_role_configuration::project_configuration_to_task_role(
+                &project_configuration,
+                &task_role_ids,
+            )?;
+            let configuration_json =
+                crate::task_role_configuration::store_task_role_configuration(&configuration)?;
+            let task_role = TaskRoleRepo::create_with_configuration_in_tx(
+                &*self.db,
+                transaction,
+                CreateTaskRole {
+                    id: task_role_ids[&role].clone(),
+                    task_id: task_id.to_owned(),
+                    role,
+                    coordination_mode: Some(default.coordination_mode),
+                    policy_json: "{}".to_owned(),
+                    created_at: created_at.to_owned(),
+                    updated_at: created_at.to_owned(),
+                },
+                &configuration_json,
+            )
+            .await?;
+
+            for actor in default.members {
+                let actor_ref = match actor {
+                    db::ActorRef::Human(id) => ActorRef::Human(id),
+                    db::ActorRef::Agent(id) => ActorRef::Agent(id),
+                };
+                let valid = project_actor_scope::actor_is_valid_for_project_in_tx(
+                    transaction,
+                    project_id,
+                    project.owner_id.as_deref(),
+                    &actor_ref,
+                )
+                .await?;
+                let exact_agent_owner = match &actor_ref {
+                    ActorRef::Human(_) => true,
+                    ActorRef::Agent(agent_id) => {
+                        let owner_id: Option<String> =
+                            sqlx::query_scalar("SELECT owner_id FROM agent_current WHERE id = ?")
+                                .bind(agent_id)
+                                .fetch_optional(&mut **transaction)
+                                .await?
+                                .flatten();
+                        owner_id.is_some() && owner_id == project.owner_id
+                    }
+                };
+                if !valid || !exact_agent_owner {
+                    return Err(ServiceError::invalid_operation(
+                        "Project default Actor is no longer authorized for this Project",
+                    ));
+                }
+                let (actor_kind, actor_id) = match actor_ref {
+                    ActorRef::Human(id) => (ActorKind::Human, id),
+                    ActorRef::Agent(id) => (ActorKind::Agent, id),
+                };
+                RoleMembershipRepo::add_in_tx(
+                    &*self.db,
+                    transaction,
+                    CreateRoleMembership {
+                        id: new_uuid_v4(),
+                        task_role_id: task_role.id.clone(),
+                        actor_kind,
+                        actor_id,
+                        status: RoleMembershipStatus::Active,
+                        created_at: created_at.to_owned(),
+                        updated_at: created_at.to_owned(),
+                    },
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Load every TaskRole, including roles that currently have no members.
     /// `include_ended` controls whether ended historical membership records are
     /// returned; current eligibility is always limited to active/suspended
@@ -39,12 +154,37 @@ impl TaskService {
         coordination_mode: CoordinationMode,
         policy_json: String,
     ) -> Result<TaskRole> {
+        let configuration_json = crate::task_role_configuration::store_task_role_configuration(
+            &api_types::TaskRoleConfiguration::default(),
+        )?;
+        self.create_task_role_with_configuration(
+            task_id,
+            role,
+            coordination_mode,
+            policy_json,
+            configuration_json,
+        )
+        .await
+    }
+
+    pub async fn create_task_role_with_configuration(
+        &self,
+        task_id: &str,
+        role: &str,
+        coordination_mode: CoordinationMode,
+        policy_json: String,
+        configuration_json: String,
+    ) -> Result<TaskRole> {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
         let role = canonical_task_role_name(role)
             .ok_or_else(|| ServiceError::invalid_operation("role is not a TaskRole"))?;
         validate_policy_json(&policy_json)?;
+        let configuration =
+            crate::task_role_configuration::parse_task_role_configuration(&configuration_json)?;
+        self.validate_role_configuration_references(&task.id, &configuration)
+            .await?;
         if TaskRoleRepo::get_by_task_and_role(&*self.db, &task.id, &role)
             .await?
             .is_some()
@@ -55,8 +195,10 @@ impl TaskService {
             )));
         }
         let now = now_rfc3339();
-        TaskRoleRepo::create(
+        let mut transaction = self.db.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let task_role = TaskRoleRepo::create_with_configuration_in_tx(
             &*self.db,
+            &mut transaction,
             CreateTaskRole {
                 id: new_uuid_v4(),
                 task_id: task.id,
@@ -66,9 +208,11 @@ impl TaskService {
                 created_at: now.clone(),
                 updated_at: now,
             },
+            &configuration_json,
         )
-        .await
-        .map_err(Into::into)
+        .await?;
+        transaction.commit().await?;
+        Ok(task_role)
     }
 
     pub async fn update_task_role(
@@ -82,6 +226,19 @@ impl TaskService {
         let role = self.task_role_for_task(task_id, role).await?;
         if let Some(policy_json) = policy_json.as_deref() {
             validate_policy_json(policy_json)?;
+            let configuration =
+                db::TaskRoleCapabilityConfigurationRepo::get_by_task_role_id(&*self.db, &role.id)
+                    .await?
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "TaskRole capability configuration is missing",
+                        )
+                    })?;
+            let configuration = crate::task_role_configuration::parse_task_role_configuration(
+                &configuration.configuration_json,
+            )?;
+            self.validate_role_configuration_references(&role.task_id, &configuration)
+                .await?;
         }
         TaskRoleRepo::update(
             &*self.db,
@@ -95,6 +252,86 @@ impl TaskService {
         )
         .await
         .map_err(Into::into)
+    }
+
+    pub async fn update_task_role_with_configuration(
+        &self,
+        task_id: &str,
+        role_name: &str,
+        expected_version: i64,
+        coordination_mode: Option<CoordinationMode>,
+        policy_json: Option<String>,
+        configuration_json: String,
+    ) -> Result<TaskRole> {
+        let role = self.task_role_for_task(task_id, role_name).await?;
+        if let Some(policy_json) = policy_json.as_deref() {
+            validate_policy_json(policy_json)?;
+        }
+        let configuration =
+            crate::task_role_configuration::parse_task_role_configuration(&configuration_json)?;
+        self.validate_role_configuration_references(&role.task_id, &configuration)
+            .await?;
+        TaskRoleRepo::update_with_configuration(
+            &*self.db,
+            UpdateTaskRoleWithConfiguration {
+                id: role.id,
+                expected_version,
+                coordination_mode: coordination_mode.map(Some),
+                policy_json,
+                configuration_json,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn validate_role_configuration_references(
+        &self,
+        task_id: &str,
+        configuration: &api_types::TaskRoleConfiguration,
+    ) -> Result<()> {
+        let Some(rework) = configuration.rework.as_ref() else {
+            return Ok(());
+        };
+        let roles = TaskRoleRepo::list_by_task(&*self.db, task_id).await?;
+        let mut by_id = HashMap::with_capacity(roles.len());
+        for role in &roles {
+            by_id.insert(role.id.as_str(), role);
+        }
+        for role_id in rework
+            .allowed_destination_role_ids
+            .iter()
+            .chain(rework.next_review_role_id.iter())
+        {
+            if !by_id.contains_key(role_id.as_str()) {
+                return Err(ServiceError::invalid_operation(format!(
+                    "rework route references a TaskRole outside this Task: {role_id}"
+                )));
+            }
+        }
+        if let Some(review_role_id) = rework.next_review_role_id.as_deref() {
+            let capability_config = db::TaskRoleCapabilityConfigurationRepo::get_by_task_role_id(
+                &*self.db,
+                review_role_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "next review TaskRole capability configuration is missing",
+                )
+            })?;
+            let capabilities = crate::task_role_configuration::parse_task_role_configuration(
+                &capability_config.configuration_json,
+            )?
+            .capabilities;
+            if !capabilities.contains(&api_types::TaskRoleCapability::FormalReview) {
+                return Err(ServiceError::invalid_operation(
+                    "next review TaskRole must have formal_review capability",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub async fn add_task_role_member(
@@ -285,21 +522,26 @@ pub async fn current_role_memberships_authoritative(
         .map_err(Into::into)
 }
 
-/// Check current Human authority from the target TaskRole membership set.
-pub(crate) async fn human_is_active_role_member_authoritative(
+pub(crate) async fn human_is_active_task_role_member_authoritative(
     db: &db::SqliteDb,
     task_id: &str,
-    role: &str,
+    task_role_id: &str,
     user_id: &str,
 ) -> Result<bool> {
-    let Some(memberships) = current_role_memberships_authoritative(db, task_id, role).await? else {
+    let Some(role) = TaskRoleRepo::get_by_id(db, task_role_id).await? else {
         return Ok(false);
     };
-    Ok(memberships.iter().any(|membership| {
-        membership.actor_kind == db::ActorKind::Human
-            && membership.actor_id == user_id
-            && membership.status == db::RoleMembershipStatus::Active
-    }))
+    if role.task_id != task_id {
+        return Ok(false);
+    }
+    Ok(RoleMembershipRepo::list_by_role(db, task_role_id, false)
+        .await?
+        .iter()
+        .any(|membership| {
+            membership.actor_kind == ActorKind::Human
+                && membership.actor_id == user_id
+                && membership.status == RoleMembershipStatus::Active
+        }))
 }
 
 /// Select the first currently usable Agent from an authoritative membership

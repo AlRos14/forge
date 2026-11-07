@@ -46,6 +46,7 @@ describe('routeSsePayload', () => {
       expect.arrayContaining([
         [{ queryKey: ['tasks', 'task-1'] }],
         [{ queryKey: ['tasks', 'task-1', 'detail'] }],
+        [{ queryKey: ['task-dispatch', 'task-1'] }],
         [{ queryKey: ['tasks', 'task-1', 'gates'] }],
       ]),
     )
@@ -68,6 +69,8 @@ describe('routeSsePayload', () => {
       expect.arrayContaining([
         [{ queryKey: ['executions', 'execution-1'] }],
         [{ queryKey: ['tasks', 'task-1', 'executions'] }],
+        [{ queryKey: ['tasks', 'task-1', 'work-units'] }],
+        [{ queryKey: ['task-dispatch', 'task-1'] }],
         [{ queryKey: ['tasks', 'task-1', 'diff'] }],
       ]),
     )

@@ -15,6 +15,7 @@ import {
   deleteNotification,
   deletePat,
   getOperationsStatus,
+  getProjectTaskRoleDefaults,
   getSettings,
   getUnreadNotificationCount,
   listDependencies,
@@ -30,6 +31,7 @@ import {
   removeMember,
   updateMe,
   updateMemberRole,
+  updateProjectTaskRoleDefaults,
   updateSettings,
 } from '@/api/client'
 import { qk } from '@/api/query-keys'
@@ -51,7 +53,6 @@ import type {
   ExecutionUsage,
   ExecutorType,
   FollowUpRequest,
-  StartExecutionRequest,
   McpConfigActionRequest,
   McpConfigResponse,
   OAuthApproveRequest,
@@ -66,8 +67,16 @@ import type {
   IntegrationResponse,
   ReviewExecutionResponse,
   StartReviewExecutionRequest,
+  TaskDispatchActionRequest,
+  TaskDispatchActionResponse,
+  TaskLaunchPreflightResponse,
+  TaskLaunchResponse,
+  RequestReworkRequest,
+  RequestReworkResponse,
+  TaskReworkAutomationIntentsResponse,
   SubmitReviewReportRequest,
   SubmitReviewReportResponse,
+  SubmitWorkUnitReviewRequest,
   ValidationRunResponse,
   Task,
   TaskLifecycleState,
@@ -76,14 +85,17 @@ import type {
   TaskLifecycleTransitionResponse,
   GateResponse,
   GateEvaluationResponse,
+  ReviewLineResponse,
   UpdateAgentRequest,
   UpdateProjectRequest,
+  UpdateProjectTaskRoleDefaultsRequest,
   UpdateTaskRequest,
   TaskUsageSummary,
   SettingsResponse,
   UpdateSettingsRequest,
   Workspace,
   WorkUnitResponse,
+  WorkUnitArtifactPackageResponse,
 } from '@/types/generated'
 import { recordUserInitiatedTransition } from '@/lib/notification-toast-suppression'
 
@@ -186,6 +198,30 @@ export function useProjectQuery(projectId: string) {
   return useQuery({
     queryKey: qk.project(projectId),
     queryFn: () => apiFetch<Project>(`/projects/${projectId}`),
+  })
+}
+
+export function useProjectTaskRoleDefaultsQuery(projectId: string) {
+  return useQuery({
+    queryKey: qk.projectTaskRoleDefaults(projectId),
+    queryFn: () => getProjectTaskRoleDefaults(projectId),
+    enabled: Boolean(projectId),
+  })
+}
+
+export function useUpdateProjectTaskRoleDefaults() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      projectId,
+      body,
+    }: {
+      projectId: string
+      body: UpdateProjectTaskRoleDefaultsRequest
+    }) => updateProjectTaskRoleDefaults(projectId, body),
+    onSuccess: (defaults) => {
+      queryClient.setQueryData(qk.projectTaskRoleDefaults(defaults.project_id), defaults)
+    },
   })
 }
 
@@ -362,6 +398,7 @@ export function useTransitionTaskLifecycle() {
       void queryClient.invalidateQueries({ queryKey: qk.task(result.task_id) })
       void queryClient.invalidateQueries({ queryKey: qk.taskDetail(result.task_id) })
       void queryClient.invalidateQueries({ queryKey: qk.lifecycleTransitions(result.task_id) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(result.task_id) })
       void queryClient.invalidateQueries({
         predicate: (query) => query.queryKey[0] === 'projects' && query.queryKey[2] === 'tasks',
       })
@@ -390,6 +427,26 @@ export function useTaskWorkUnitsQuery(taskId: string) {
     queryKey: qk.workUnits(taskId),
     queryFn: () => apiFetch<WorkUnitResponse[]>(`/tasks/${taskId}/work-units`),
     enabled: Boolean(taskId),
+  })
+}
+
+export function useTaskReviewLinesQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.reviewLines(taskId),
+    queryFn: () => apiFetch<ReviewLineResponse[]>(`/tasks/${taskId}/review-lines`),
+    enabled: Boolean(taskId),
+    refetchInterval: 5_000,
+  })
+}
+
+export function useWorkUnitArtifactPackageQuery(workUnitId: string) {
+  return useQuery({
+    queryKey: qk.workUnitArtifactPackage(workUnitId),
+    queryFn: () =>
+      apiFetch<WorkUnitArtifactPackageResponse>(
+        `/work-units/${workUnitId}/artifact-package`,
+      ),
+    enabled: Boolean(workUnitId),
   })
 }
 
@@ -442,6 +499,31 @@ export function useSubmitReviewReport() {
       void queryClient.invalidateQueries({ queryKey: qk.reviewExecutions(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+    },
+  })
+}
+
+export function useSubmitWorkUnitReviewReport() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      workUnitId,
+      body,
+    }: {
+      workUnitId: string
+      body: SubmitWorkUnitReviewRequest
+    }) => apiFetch<SubmitReviewReportResponse>(`/work-units/${workUnitId}/review-report`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+    onSuccess: (result) => {
+      const taskId = result.review_execution.execution.task_id
+      void queryClient.invalidateQueries({ queryKey: qk.reviewExecutions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.workUnits(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.reviewLines(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
     },
   })
 }
@@ -866,19 +948,87 @@ export function useExecutionsQuery(taskId: string) {
   })
 }
 
-export function useStartExecution() {
+export function useTaskDispatchQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskDispatch(taskId),
+    queryFn: () => apiFetch<TaskLaunchPreflightResponse>(`/tasks/${taskId}/dispatch`),
+  })
+}
+
+export function useLaunchTask() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ taskId, body }: { taskId: string; body: StartExecutionRequest }) =>
-      apiFetch<Execution>(`/tasks/${taskId}/executions`, {
+    mutationFn: ({ taskId, body }: { taskId: string; body: TaskDispatchActionRequest }) =>
+      apiFetch<TaskLaunchResponse>(`/tasks/${taskId}/dispatch/launch`, {
         method: 'POST',
         body: JSON.stringify(body),
       }),
-    onSuccess: (execution) => {
-      void queryClient.invalidateQueries({ queryKey: qk.executions(execution.task_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.task(execution.task_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.workUnits(execution.task_id) })
+    onSuccess: (response) => {
+      void queryClient.invalidateQueries({ queryKey: qk.task(response.dispatch.task_id) })
+      void queryClient.invalidateQueries({ queryKey: qk.executions(response.dispatch.task_id) })
+      void queryClient.invalidateQueries({ queryKey: qk.workUnits(response.dispatch.task_id) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(response.dispatch.task_id) })
     },
+  })
+}
+
+function useTaskDispatchAction(action: 'pause' | 'resume' | 'cancel') {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, body }: { taskId: string; body: TaskDispatchActionRequest }) =>
+      apiFetch<TaskDispatchActionResponse>(`/tasks/${taskId}/dispatch/${action}`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: (response) => {
+      void queryClient.invalidateQueries({ queryKey: qk.task(response.task.id) })
+      void queryClient.invalidateQueries({ queryKey: qk.executions(response.task.id) })
+      void queryClient.invalidateQueries({ queryKey: qk.workUnits(response.task.id) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(response.task.id) })
+    },
+  })
+}
+
+export function usePauseTask() {
+  return useTaskDispatchAction('pause')
+}
+
+export function useResumeTask() {
+  return useTaskDispatchAction('resume')
+}
+
+export function useCancelTask() {
+  return useTaskDispatchAction('cancel')
+}
+
+export function useRequestRework() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, body }: { taskId: string; body: RequestReworkRequest }) =>
+      apiFetch<RequestReworkResponse>(`/tasks/${taskId}/rework`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: (response) => {
+      const taskId = response.correction_work_unit.task_id
+      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.workUnits(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskReworkAutomation(taskId) })
+    },
+  })
+}
+
+export function useTaskReworkAutomationQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskReworkAutomation(taskId),
+    queryFn: () =>
+      apiFetch<TaskReworkAutomationIntentsResponse>(
+        `/tasks/${taskId}/rework/automation`,
+      ),
+    enabled: Boolean(taskId),
+    refetchInterval: 5_000,
   })
 }
 

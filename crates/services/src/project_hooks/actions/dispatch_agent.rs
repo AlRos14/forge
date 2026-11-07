@@ -1,12 +1,10 @@
 use api_types::ActorRef;
-use db::{AgentRepo, CoordinationMode, ExecutionPurpose, ProjectHookRunStatus};
+use db::{AgentRepo, CoordinationMode, ProjectHookRunStatus};
 use serde_json::Value;
 
 use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
-    project_hooks::actions::{
-        task_type_to_string, ActionContext, ActionOutcome, HookActionHandler,
-    },
+    project_hooks::actions::{ActionContext, ActionOutcome, HookActionHandler},
     Result, ServiceError,
 };
 
@@ -59,7 +57,6 @@ impl HookActionHandler for DispatchAgentAction<'_> {
                 context.project.id.clone(),
                 format!("Automation: {}", context.rule_id),
                 Some(automation_task_description(context)),
-                Some(task_type_to_string(api_types::TaskType::Implementation)),
                 None,
                 None,
             )
@@ -85,13 +82,7 @@ impl HookActionHandler for DispatchAgentAction<'_> {
         let launch = context
             .service
             .task_service
-            .dispatch_initial_role_execution(
-                &task.id,
-                &agent.id,
-                "implementer",
-                ExecutionPurpose::Implement,
-                prompt,
-            )
+            .dispatch_initial_role_execution(&task.id, &agent.id, "implementer", prompt)
             .await;
         let execution = match launch {
             Ok(execution) => execution,

@@ -1,8 +1,9 @@
 use super::*;
 use crate::{
     ActorKind, CoordinationMode, CreateRoleMembership, CreateTaskRole, DbError, RoleMembership,
-    RoleMembershipRepo, RoleMembershipStatus, TaskRole, TaskRoleRepo, UpdateRoleMembership,
-    UpdateTaskRole,
+    RoleMembershipRepo, RoleMembershipStatus, TaskRole, TaskRoleCapabilityConfiguration,
+    TaskRoleCapabilityConfigurationRepo, TaskRoleRepo, UpdateRoleMembership, UpdateTaskRole,
+    UpdateTaskRoleWithConfiguration,
 };
 use sqlx::{sqlite::SqliteRow, Row};
 use std::str::FromStr;
@@ -50,10 +51,48 @@ const TASK_ROLE_COLUMNS: &str =
     "id, task_id, role, coordination_mode, policy_json, version, created_at, updated_at";
 const MEMBERSHIP_COLUMNS: &str =
     "id, task_role_id, actor_kind, actor_id, status, version, created_at, updated_at, ended_at";
+const DEFAULT_TASK_ROLE_CONFIGURATION_JSON: &str =
+    r#"{"schema_version":1,"display_label":null,"capabilities":[],"rework":null}"#;
 
 #[async_trait]
 impl TaskRoleRepo for SqliteDb {
     async fn create(&self, input: CreateTaskRole) -> crate::Result<TaskRole> {
+        self.create_with_configuration(input, DEFAULT_TASK_ROLE_CONFIGURATION_JSON)
+            .await
+    }
+
+    async fn create_with_configuration(
+        &self,
+        input: CreateTaskRole,
+        configuration_json: &str,
+    ) -> crate::Result<TaskRole> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let role = self
+            .create_with_configuration_in_tx(&mut transaction, input, configuration_json)
+            .await?;
+        transaction.commit().await?;
+        Ok(role)
+    }
+
+    async fn create_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: CreateTaskRole,
+    ) -> crate::Result<TaskRole> {
+        self.create_with_configuration_in_tx(
+            transaction,
+            input,
+            DEFAULT_TASK_ROLE_CONFIGURATION_JSON,
+        )
+        .await
+    }
+
+    async fn create_with_configuration_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: CreateTaskRole,
+        configuration_json: &str,
+    ) -> crate::Result<TaskRole> {
         sqlx::query(
             "INSERT INTO task_role
                 (id, task_id, role, coordination_mode, policy_json, version, created_at, updated_at)
@@ -66,13 +105,30 @@ impl TaskRoleRepo for SqliteDb {
         .bind(&input.policy_json)
         .bind(&input.created_at)
         .bind(&input.updated_at)
-        .execute(&self.pool)
+        .execute(&mut **transaction)
         .await
         .map_err(map_role_sqlx_error)?;
 
-        self.get_by_task_and_role(&input.task_id, &input.role)
-            .await?
-            .ok_or(DbError::NotFound)
+        sqlx::query(
+            "INSERT INTO task_role_capability_configuration
+                (task_role_id, configuration_json, updated_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(configuration_json)
+        .bind(&input.updated_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_role_sqlx_error)?;
+
+        let row = sqlx::query(&format!(
+            "SELECT {TASK_ROLE_COLUMNS} FROM task_role WHERE id = ?"
+        ))
+        .bind(&input.id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(map_role_sqlx_error)?;
+        map_task_role(&row)
     }
 
     async fn get_task_id(&self, id: &str) -> crate::Result<Option<String>> {
@@ -174,6 +230,123 @@ impl TaskRoleRepo for SqliteDb {
         .map_err(map_role_sqlx_error)?;
         map_task_role(&row)
     }
+
+    async fn update_with_configuration(
+        &self,
+        input: UpdateTaskRoleWithConfiguration,
+    ) -> crate::Result<TaskRole> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let role_row = sqlx::query(&format!(
+            "SELECT {TASK_ROLE_COLUMNS} FROM task_role WHERE id = ?"
+        ))
+        .bind(&input.id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        let current = map_task_role(&role_row)?;
+        if current.version != input.expected_version {
+            return Err(DbError::VersionConflict);
+        }
+        let current_configuration = sqlx::query_scalar::<_, String>(
+            "SELECT configuration_json FROM task_role_capability_configuration WHERE task_role_id = ?",
+        )
+        .bind(&input.id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        let coordination_mode = input
+            .coordination_mode
+            .map(|mode| mode.map(|mode| mode.to_string()))
+            .unwrap_or_else(|| current.coordination_mode.map(|mode| mode.to_string()));
+        let role_policy_json = input
+            .policy_json
+            .unwrap_or_else(|| current.policy_json.clone());
+        let role_changed = current.coordination_mode.map(|mode| mode.to_string())
+            != coordination_mode
+            || current.policy_json != role_policy_json;
+        let configuration_changed = current_configuration != input.configuration_json;
+        let version_delta = i64::from(role_changed || configuration_changed);
+        if input.expected_version.checked_add(version_delta).is_none() {
+            return Err(DbError::Check("TaskRole version overflow".to_owned()));
+        }
+        let updated = sqlx::query(
+            "UPDATE task_role
+             SET coordination_mode = ?, policy_json = ?,
+                 version = version + CASE WHEN ? THEN 1 ELSE 0 END,
+                 updated_at = CASE WHEN ? THEN ? ELSE updated_at END
+             WHERE id = ? AND version = ?",
+        )
+        .bind(coordination_mode.clone())
+        .bind(&role_policy_json)
+        .bind(role_changed || configuration_changed)
+        .bind(role_changed || configuration_changed)
+        .bind(&input.updated_at)
+        .bind(&input.id)
+        .bind(input.expected_version)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_role_sqlx_error)?
+        .rows_affected();
+        if updated != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        if configuration_changed {
+            let config_updated = sqlx::query(
+                "UPDATE task_role_capability_configuration
+                 SET configuration_json = ?, updated_at = ?
+                 WHERE task_role_id = ?",
+            )
+            .bind(&input.configuration_json)
+            .bind(&input.updated_at)
+            .bind(&input.id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_role_sqlx_error)?
+            .rows_affected();
+            if config_updated != 1 {
+                return Err(DbError::VersionConflict);
+            }
+        }
+        let row = sqlx::query(&format!(
+            "SELECT {TASK_ROLE_COLUMNS} FROM task_role WHERE id = ?"
+        ))
+        .bind(&input.id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(map_role_sqlx_error)?;
+        let role = map_task_role(&row)?;
+        transaction.commit().await?;
+        Ok(role)
+    }
+}
+
+fn map_task_role_configuration(row: &SqliteRow) -> crate::Result<TaskRoleCapabilityConfiguration> {
+    Ok(TaskRoleCapabilityConfiguration {
+        task_role_id: row.try_get("task_role_id")?,
+        task_role_version: row.try_get("task_role_version")?,
+        configuration_json: row.try_get("configuration_json")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+#[async_trait]
+impl TaskRoleCapabilityConfigurationRepo for SqliteDb {
+    async fn get_by_task_role_id(
+        &self,
+        task_role_id: &str,
+    ) -> crate::Result<Option<TaskRoleCapabilityConfiguration>> {
+        let row = sqlx::query(
+            "SELECT config.task_role_id, role.version AS task_role_version,
+                    config.configuration_json, config.updated_at
+             FROM task_role_capability_configuration config
+             JOIN task_role role ON role.id = config.task_role_id
+             WHERE config.task_role_id = ?",
+        )
+        .bind(task_role_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(map_task_role_configuration).transpose()
+    }
 }
 
 #[async_trait]
@@ -198,6 +371,40 @@ impl RoleMembershipRepo for SqliteDb {
         .await
         .map_err(map_role_sqlx_error)?;
         self.get(&input.id).await?.ok_or(DbError::NotFound)
+    }
+
+    async fn add_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: CreateRoleMembership,
+    ) -> crate::Result<RoleMembership> {
+        let ended_at =
+            (input.status == RoleMembershipStatus::Ended).then(|| input.updated_at.clone());
+        sqlx::query(
+            "INSERT INTO role_membership
+                (id, task_role_id, actor_kind, actor_id, status, version, created_at, updated_at, ended_at)
+             VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_role_id)
+        .bind(input.actor_kind.to_string())
+        .bind(&input.actor_id)
+        .bind(input.status.to_string())
+        .bind(&input.created_at)
+        .bind(&input.updated_at)
+        .bind(ended_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_role_sqlx_error)?;
+
+        let row = sqlx::query(&format!(
+            "SELECT {MEMBERSHIP_COLUMNS} FROM role_membership WHERE id = ?"
+        ))
+        .bind(&input.id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(map_role_sqlx_error)?;
+        map_membership(&row)
     }
 
     async fn get(&self, id: &str) -> crate::Result<Option<RoleMembership>> {

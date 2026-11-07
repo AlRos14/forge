@@ -1,8 +1,9 @@
 # Orchestration
 
-An orchestrator is an Actor acting under the orchestrator Role. The Role
-directs active work across Actors; it is not a super-agent runtime and not a
-continuous reviewer.
+An orchestrator is an Actor admitted under a TaskRole with the `orchestration`
+capability. The capability directs active work across Actors; it is not a
+super-agent runtime and not a continuous reviewer. The TaskRole name is an
+identifier and has no authority meaning by itself.
 
 PR4's generic Message, Handoff, Proposal, and Decision records provide the
 initial durable collaboration surface. Their events use the existing
@@ -16,7 +17,7 @@ Roles, Executions, and durable events.
 ## Implemented subset: PR6
 
 The PR6 runtime claims committed Task-scoped `domain_event` rows and records a
-durable wake for the exact active `orchestrator` TaskRole member. Broadcast
+durable wake for the exact active member of an orchestration-capable TaskRole. Broadcast
 events are only low-latency hints. TaskRole coordination mode is captured with
 the wake and checked again before dispatch; ambiguous or stale targeting fails
 closed. `collaborative` may wake every active member, while `partitioned` and
@@ -40,11 +41,16 @@ orchestrator WorkUnit. The stable role/Actor/WorkUnit dedupe key and the normal
 domain-event receipt/wake lease path make migration retry and concurrent
 consumers idempotent.
 
-An Agent wake creates a fresh `purpose=orchestrate` Execution and uses a
-read-only Harness Start. PR6 does not infer or resume a previous session. A
+An Agent wake creates a fresh Execution under the exact orchestration-capable
+TaskRole and uses a read-only Harness Start. PR6 does not infer or resume a previous session. A
 Human wake stays durable as pending Human work and creates no HarnessSession.
 The current typed output set is Message, Handoff, bounded WorkUnit creation,
-and Proposal. WorkUnit creation goes through `WorkUnitService`, carries stable
+and Proposal. A `create_work_unit` action targeting a TaskRole with
+`formal_review` supplies
+`review_subject: { "reviewed_work_unit_id": "..." }`. The service verifies the
+same-Task source and freezes its accepted result; the orchestrator does not
+choose a result version or grant review authority by describing it in text.
+WorkUnit creation goes through `WorkUnitService`, carries stable
 action identity and wake provenance, and does not allocate a workspace or
 start work. WorkUnit-scoped actions stay inside that exact WorkUnit. Steering,
 stopping, reassigning, merging, and other protected mutations are not
@@ -53,8 +59,8 @@ records remain intent and resolution records with no implicit side effect.
 Direct Harness steering has no typed PR6 operation; Message and Handoff record
 communication intent without claiming native, emulated, or queued steering.
 
-Execution lifecycle events from an `orchestrate` Execution are classified
-separately and never generically wake another orchestrator. Creating a
+Execution lifecycle events from an Execution admitted with `orchestration` are
+classified separately and never generically wake another orchestrator. Creating a
 WorkUnit is an orchestrator action, not a wake signal; completion, readiness,
 allocation changes, and explicitly addressed collaboration can wake eligible
 members. Unsupported event producers remain deferred to their lifecycle owner
@@ -129,7 +135,7 @@ review failure, merge conflict, quota issue, and Human input. Log-token
 streaming is not a wake event by default; implementations may debounce or
 coalesce related events.
 
-Each wake is a new orchestrate Execution. The target architecture permits
+Each wake is a new orchestrator Execution. The target architecture permits
 resuming a compatible task-scoped HarnessSession; PR6 always uses Start with a
 fresh, Execution-bound HarnessSession. The Execution remains independently
 auditable.

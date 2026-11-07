@@ -25,7 +25,7 @@ Use `forge-ctl logout` to remove the saved token. Avoid putting passwords or pro
 | `login`, `logout`, `whoami` | Authenticate and inspect the saved login. |
 | `project` | `create`, `list`. |
 | `repo` | `create`, `list`. |
-| `task` | `create`, `list`, `get`, `role list/create/add-member`, `execute`, `transition`. |
+| `task` | `create`, `list`, `get`, `role list/create/add-member`, `launch`, `pause`, `resume`, `cancel`, `transition`. |
 | `agent` | `register`, `list`, `get`, `profile list/select`. |
 | `provider` | `list`, `add`, `login`, `rename`, `remove`. |
 | `daemon` | `link`, `start`, `report`. |
@@ -33,21 +33,29 @@ Use `forge-ctl logout` to remove the saved token. Avoid putting passwords or pro
 
 Use `forge-ctl <command> --help` for the arguments and enum values of that command. Repository creation accepts a local path or a remote URL; the selected source kind must match the supplied path or URL. REST daemon listing and Agent-to-daemon pinning require an administrator.
 
-## Task and Execution workflow
+## Task and WorkUnit workflow
 
-The CLI creates a Project, Repo, Task, TaskRole, and RoleMembership. It does not currently create a WorkUnit. Create and allocate the WorkUnit through the REST or MCP API before starting an Execution.
+The CLI creates a Project, Repo, Task, TaskRole, and RoleMembership. It does not
+currently create a WorkUnit. Create and allocate the WorkUnit through the REST
+or MCP API, prepare its repository Workspace, and then launch the Task. Optional
+WorkUnit `execution_instructions` are passed to the assigned harness.
+
+The current CLI role commands do not edit capability or rework configuration.
+Use the versioned REST TaskRole endpoints or `forge_create_task_role` /
+`forge_update_task_role` through MCP to configure those settings; changes that
+grant capabilities require Project owner/admin authority.
 
 The CLI accepts only the current TaskLifecycle states: `backlog`, `ready`, `active`, `blocked`, `ready-to-merge`, `merging`, `done`, and `cancelled`. A transition includes the current lifecycle version and an idempotency key. A transition to `ready-to-merge` also needs the exact satisfied GateEvaluation.
 
-`task execute` requires all of the following:
+`task launch`, `task pause`, `task resume`, and `task cancel` require the Task
+ID, current Task version, current TaskLifecycle version, and an idempotency key.
+Pause and cancel accept an optional reason. The launch response distinguishes
+admitted intent, admitted Executions, and provider Starts accepted by that
+request. The CLI does not create an Execution, choose an Execution purpose, or
+select an implicit Task Agent or Workspace.
 
-- the Task ID;
-- the exact WorkUnit ID and current WorkUnit version;
-- the Execution Purpose and prompt.
-
-The Actor and Role come from that WorkUnit's allocation. The server prepares and binds the required repository Workspace. A non-repository WorkUnit may run without a Workspace within the supported local host constraints. The CLI does not select an implicit Task Agent or infer a Workspace.
-
-If a provider Start returns an uncertain outcome, inspect the exact Execution and follow the recovery contract. Do not automatically submit another Start.
+If a provider Start is uncertain, inspect the exact admitted Execution and
+follow the recovery contract. Do not automatically submit another Start.
 
 ## Agents, providers, and daemons
 

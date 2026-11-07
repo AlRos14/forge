@@ -18,6 +18,7 @@ export function ModelSelector({
   disabled,
   isLoading,
   hasError,
+  warning,
   className,
   onChange,
 }: {
@@ -28,6 +29,7 @@ export function ModelSelector({
   disabled?: boolean
   isLoading?: boolean
   hasError?: boolean
+  warning?: string
   className?: string
   onChange: (modelId: string | null) => void
 }) {
@@ -73,6 +75,9 @@ export function ModelSelector({
           onChange={onChange}
         />
       )}
+      <p className={cn('text-xs', warning ? 'text-amber-700' : 'text-muted-foreground')}>
+        {warning ?? 'Suggestions only; you can enter any model ID this harness supports.'}
+      </p>
     </div>
   )
 }

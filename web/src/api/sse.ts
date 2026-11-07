@@ -59,6 +59,7 @@ export function routeSsePayload(
     const taskId = typeof facts.task_id === 'string' ? facts.task_id : payload.entity_id
     void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
     void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
+    void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
     invalidateProjectTaskLists(queryClient)
     void queryClient.invalidateQueries({ queryKey: qk.gates(taskId) })
   }
@@ -80,6 +81,8 @@ export function routeSsePayload(
       void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.workUnits(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.taskDiff(taskId) })
       invalidateProjectTaskLists(queryClient)
     }
@@ -99,6 +102,9 @@ export function routeSsePayload(
   if (eventType.startsWith('project.')) {
     void queryClient.invalidateQueries({ queryKey: qk.project(payload.entity_id) })
     void queryClient.invalidateQueries({ queryKey: qk.projects })
+    void queryClient.invalidateQueries({
+      queryKey: qk.projectTaskRoleDefaults(payload.entity_id),
+    })
   }
 
   if (['artifact.created', 'message.created', 'handoff.created', 'handoff.status_changed', 'proposal.created', 'proposal.withdrawn', 'decision.recorded'].includes(eventType)) {

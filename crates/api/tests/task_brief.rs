@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 #[tokio::test]
-async fn tasks_can_be_created_without_task_type() {
+async fn tasks_are_created_from_a_brief() {
     let harness = test_app().await;
     let (project_id, _repo_id) = create_project_and_repo(&harness.app).await;
     let task: TaskResponse = json_request(
@@ -76,7 +76,7 @@ async fn test_app() -> Harness {
         true,
         adapter_registry,
     ));
-    let web_dist_dir = TestDir::new("forge-task-type-web");
+    let web_dist_dir = TestDir::new("forge-task-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
     Harness {
@@ -91,7 +91,7 @@ async fn create_project_and_repo(app: &Router) -> (String, String) {
         app,
         Method::POST,
         "/api/v1/projects",
-        json!({ "name": "Task Type Removed" }),
+        json!({ "name": "Task brief" }),
         StatusCode::OK,
     )
     .await;

@@ -78,4 +78,14 @@ describe('normalizeDiscoveredOptions', () => {
 
     expect(options.permissionPolicies).toEqual(['auto', 'supervised'])
   })
+
+  it('keeps the server-authorized compatible host choices', () => {
+    const availableDaemons = [{ id: 'daemon-1', name: 'forge-host', status: 'online' }]
+    const options = normalizeDiscoveredOptions({
+      models: ['gpt-5-codex'],
+      available_daemons: availableDaemons,
+    })
+
+    expect(options.availableDaemons).toEqual(availableDaemons)
+  })
 })

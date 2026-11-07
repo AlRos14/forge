@@ -56,16 +56,23 @@ fn readiness_to_api(readiness: services::WorkUnitReadiness) -> WorkUnitReadiness
         active_execution_ids: readiness.active_execution_ids,
         unsatisfied_dependency_ids: readiness.unsatisfied_dependency_ids,
         awaiting_integration: readiness.awaiting_integration,
+        awaiting_acceptance: readiness.awaiting_acceptance,
+        awaiting_review_approval: readiness.awaiting_review_approval,
     }
 }
 
-fn work_unit_response(unit: WorkUnit, readiness: services::WorkUnitReadiness) -> WorkUnitResponse {
+fn work_unit_response(
+    unit: WorkUnit,
+    readiness: services::WorkUnitReadiness,
+    review_subject: Option<api_types::ReviewSubjectResponse>,
+) -> WorkUnitResponse {
     WorkUnitResponse {
         id: unit.id,
         task_id: unit.task_id,
         parent_work_unit_id: unit.parent_work_unit_id,
         title: unit.title,
         scope: unit.scope,
+        execution_instructions: unit.execution_instructions,
         status: status_to_api(unit.status),
         role: unit.role,
         assigned_actor: unit.assigned_actor.map(actor_to_api),
@@ -79,15 +86,18 @@ fn work_unit_response(unit: WorkUnit, readiness: services::WorkUnitReadiness) ->
             db::WorkUnitProvenance::External(id) => WorkUnitProvenance::External { id },
             db::WorkUnitProvenance::LegacyActor(id) => WorkUnitProvenance::LegacyActor { id },
         }),
+        review_approval_gate_id: unit.review_approval_gate_id,
+        review_approval_line_id: unit.review_approval_line_id,
         created_by: actor_to_api(unit.created_by),
         version: unit.version,
         created_at: unit.created_at,
         updated_at: unit.updated_at,
         readiness: readiness_to_api(readiness),
+        review_subject,
     }
 }
 
-async fn response_for(
+pub(crate) async fn response_for(
     state: &AppState,
     user: &AuthenticatedUser,
     unit: WorkUnit,
@@ -100,7 +110,12 @@ async fn response_for(
         )
         .await
         .map_err(ApiError::from)?;
-    Ok(work_unit_response(unit, readiness))
+    let review_subject = services::task_rework::get_review_subject(&state.db, &unit.id)
+        .await
+        .map_err(ApiError::from)?
+        .as_ref()
+        .map(services::task_rework::review_subject_response);
+    Ok(work_unit_response(unit, readiness, review_subject))
 }
 
 pub async fn create_work_unit(
@@ -125,11 +140,17 @@ pub async fn create_work_unit(
                 task_id,
                 title: body.title,
                 scope: body.scope,
+                execution_instructions: body.execution_instructions,
                 role: body.role,
                 parent_work_unit_id: body.parent_work_unit_id,
                 assigned_actor: body.assigned_actor.map(actor_to_db),
                 requires_integration: body.requires_integration,
                 provenance,
+                artifact_inputs: body.artifact_inputs.unwrap_or_default(),
+                review_approval: body.review_approval,
+                review_subject: body
+                    .review_subject
+                    .map(|subject| subject.reviewed_work_unit_id),
             },
         )
         .await
@@ -173,6 +194,19 @@ pub async fn get_work_unit(
     Ok(Json(response_for(&state, &user, unit).await?))
 }
 
+pub async fn get_artifact_package(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    user: AuthenticatedUser,
+) -> ApiResult<Json<api_types::WorkUnitArtifactPackageResponse>> {
+    let package = state
+        .work_unit_service
+        .artifact_package(CollaborationActorSource::Human(user.user_id.clone()), &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(package))
+}
+
 pub async fn update_work_unit(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -187,6 +221,7 @@ pub async fn update_work_unit(
             body.expected_version,
             body.title,
             body.scope,
+            body.execution_instructions,
             body.requires_integration,
         )
         .await
@@ -297,6 +332,19 @@ pub async fn readiness(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(readiness_to_api(readiness)))
+}
+
+pub async fn prepare_workspace(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    user: AuthenticatedUser,
+) -> ApiResult<Json<api_types::WorkspaceResponse>> {
+    let workspace = state
+        .work_unit_service
+        .prepare_workspace(CollaborationActorSource::Human(user.user_id.clone()), &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(crate::routes::workspace_response(workspace)))
 }
 
 pub async fn integrate(
