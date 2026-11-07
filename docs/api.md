@@ -235,7 +235,7 @@ are in [the PR0 contract](plans/pr0-task-coordination-contract.md).
 | `POST /tasks/{id}/coordination/plans/{artifact_id}/materialize` | Atomically create WorkUnits, dependencies, review subjects, and Artifact input pins from one approved plan, with a deterministic replay receipt. The operation also records the normal launch intent; dispatch still revalidates every worker assignment, capability, and lease. A paused Task returns `409 coordination.paused`. |
 | `GET/POST /tasks/{id}/coordination/quality-requests` | List or create structured quality requests. Categories are `delivery_correction`, `plan_revision`, `specialist`, and `human_decision`; targets are `implementation`, `orchestrator`, `specialist`, or `human`. Creation records routing facts and a Handoff; it does not claim a WorkUnit exists unless one is linked. |
 | `POST /tasks/{id}/coordination/quality-requests/{request_id}/resolve` | Resolve, cancel, or escalate one exact request using its version. |
-| `GET/POST /tasks/{id}/coordination/interventions` | Read or create one versioned Human/Copilot intervention. Kinds are `instruction`, `decision`, `pause`, `resume`, `cancel`, `revoke_authorization`, and `request_replan`. Project Copilot may record an instruction or request a replan through this same circuit; it cannot pause, cancel, revoke, or decide. |
+| `GET/POST /tasks/{id}/coordination/interventions` | Read or create one versioned Human/Copilot intervention. Kinds are `instruction`, `decision`, `pause`, `resume`, `cancel`, `revoke_authorization`, and `request_replan`. Project Copilot may record an instruction through this same circuit; it cannot request a replan, pause, cancel, revoke, approve, or decide. |
 
 Typed coordination errors use `403 coordination.not_authorized`,
 `409 coordination.version_conflict`, `409 coordination.authorization_stale`,
@@ -559,8 +559,8 @@ The MCP server advertises only registered tools. The current tool names are:
   `forge_create_task_intervention`. They call the same service and authorization
   boundaries as REST. The Project Copilot delegation exposes only
   `forge_get_task_coordination`, `forge_list_task_interventions`, and
-  `forge_create_task_intervention`; the last accepts only an instruction or a
-  replan request for a live Task-scoped run.
+  `forge_create_task_intervention`; the last accepts only an instruction for a
+  live Task-scoped run.
 
 `forge_launch_task` requires the Task ID, expected Task and TaskLifecycle
 versions, and an idempotency key. It records dispatch intent; the dispatcher

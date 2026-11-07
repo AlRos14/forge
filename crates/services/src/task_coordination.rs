@@ -2105,14 +2105,11 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         input: InterventionInput,
     ) -> Result<TaskIntervention> {
         if matches!(source, CollaborationActorSource::ProjectCopilot(_))
-            && !matches!(
-                input.kind,
-                TaskInterventionKind::Instruction | TaskInterventionKind::RequestReplan
-            )
+            && input.kind != TaskInterventionKind::Instruction
         {
             return Err(coordination_error(
                 "coordination.not_authorized",
-                "Project Copilot may only record an instruction or request a replan",
+                "Project Copilot may only record an instruction; decisions, pause, cancel, revocation, and replanning remain Human actions",
             ));
         }
         let user_id = authority_user_id;
