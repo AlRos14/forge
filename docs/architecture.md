@@ -176,7 +176,7 @@ ownership for historical records during a container migration.
 
 Forge originated from [ForgeAILab/forge](upstream.md). The origin and MIT attribution remain. This repository is independently maintained and does not promise architectural or release compatibility with upstream. See [upstream relationship](upstream.md).
 
-## Accepted target operating model — PR0 complete, implementation pending
+## Task operating model — backend implemented, UI acceptance pending
 
 The owner-approved [task operating model](concepts/task-operating-model.md)
 separates Project Copilot assistance from end-to-end Task coordination and makes
@@ -185,6 +185,7 @@ leases, exact evidence, and TaskLifecycle authority remain mandatory. This is a
 target contract, not a claim that the current runtime supports the whole journey.
 The [PR0 contract](plans/pr0-task-coordination-contract.md) and
 [ADR 0016](adr/0016-task-coordination-turn.md) fix the coordination start,
-authority matrix, durable records, recovery rules, and UX states. PR1–PR6 remain
-implementation work; see the
+authority matrix, durable records, recovery rules, and UX states. The backend
+vertical slice (V158–V159, services, REST/MCP/CLI/SSE, generated types) is
+implemented. The guided UI and joint acceptance remain outstanding; see the
 [system review and implementation sequence](plans/task-coordination-and-guided-experience.md).

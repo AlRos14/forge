@@ -880,6 +880,12 @@ impl TaskCoordinationService {
                 "Task coordination authorization changed",
             ));
         }
+        if coordination.revoked_at.is_some() {
+            return Err(coordination_error(
+                "coordination.authorization_revoked",
+                "Task coordination authorization is revoked",
+            ));
+        }
         let plan = TaskCoordinationRepo::get_task_coordination_plan(&*self.db, artifact_id)
             .await?
             .filter(|plan| plan.task_id == task.id)
