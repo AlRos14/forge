@@ -2782,7 +2782,7 @@ mod tests {
     use super::*;
     use db::{
         CreateProject, CreateRoleMembership, CreateTask, CreateTaskRole, ProjectRepo,
-        RoleMembershipRepo, TaskRepo, TaskRoleRepo, User, UserRepo, WorkUnitRepo,
+        RoleMembershipRepo, TaskRepo, TaskRoleRepo, User, UserRepo,
     };
     use sqlx::Row;
 
@@ -2946,6 +2946,16 @@ mod tests {
     ) -> String {
         let now = now_rfc3339();
         let id = new_uuid_v4();
+        let capability_schema: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_role_capability_configuration')",
+        ).fetch_one(database.pool()).await.expect("fixture schema lookup");
+        if !capability_schema {
+            sqlx::query("INSERT INTO task_role (id, task_id, role, coordination_mode, policy_json, version, created_at, updated_at) VALUES (?, ?, 'orchestrator', ?, ?, 1, ?, ?)")
+                .bind(&id).bind(task_id).bind(mode.map(|mode| mode.to_string()))
+                .bind(policy_json).bind(&now).bind(&now)
+                .execute(database.pool()).await.expect("historical TaskRole fixture inserts before capability migration");
+            return id;
+        }
         TaskRoleRepo::create(
             &**database,
             CreateTaskRole {
@@ -4822,9 +4832,9 @@ mod tests {
             .run_once(10)
             .await
             .expect("new Task activation is found by the durable scan");
-        // Task creation, the Gate role-revision fact from membership insert,
-        // and bootstrap reconciliation are separate durable records.
-        assert_eq!(new_task.processed_events, 3);
+        // Task creation, explicit capability configuration, the membership
+        // Gate role-revision fact, and bootstrap are separate durable records.
+        assert_eq!(new_task.processed_events, 4);
         assert_eq!(new_task.admitted_wakes, 1);
         assert_eq!(new_task.dispatched_wakes, 1);
         let new_task_wake: String = sqlx::query_scalar(
@@ -5755,44 +5765,11 @@ mod tests {
         .await;
         let work_unit_id = new_uuid_v4();
         let work_unit_created_at = now_rfc3339();
-        WorkUnitRepo::create(
-            &*database,
-            db::CreateWorkUnit {
-                id: work_unit_id.clone(),
-                task_id: partitioned_task.clone(),
-                parent_work_unit_id: None,
-                title: "Exact orchestrator assignment".to_owned(),
-                scope: "One explicit orchestrator allocation".to_owned(),
-                execution_instructions: None,
-                role: "orchestrator".to_owned(),
-                assigned_actor: Some(ActorRef::Human(human_a.clone())),
-                requires_integration: false,
-                provenance: None,
-                artifact_input_ids: Vec::new(),
-                review_approval_gate_id: None,
-                review_approval_line_id: None,
-                created_by: ActorRef::Human(human_a.clone()),
-                created_at: work_unit_created_at.clone(),
-            },
-            db::CreateDomainEvent {
-                id: new_uuid_v4(),
-                event_type: "work_unit.created".to_owned(),
-                entity_type: "work_unit".to_owned(),
-                entity_id: work_unit_id,
-                actor_type: "human".to_owned(),
-                actor_id: Some(human_a.clone()),
-                scope_type: "task".to_owned(),
-                scope_id: partitioned_task,
-                correlation_id: new_uuid_v4(),
-                causation_id: None,
-                causation_depth: 0,
-                dedupe_key: None,
-                payload_json: r#"{"role":"orchestrator"}"#.to_owned(),
-                created_at: work_unit_created_at,
-            },
-        )
-        .await
-        .expect("partitioned exact WorkUnit allocation creates");
+        // Seed the historical V094 shape without invoking the current mapper.
+        sqlx::query("INSERT INTO work_unit (id, task_id, title, scope, status, role, assigned_actor_kind, assigned_actor_id, requires_integration, created_by_kind, created_by_id, version, created_at, updated_at) VALUES (?, ?, 'Exact orchestrator assignment', 'One explicit orchestrator allocation', 'open', 'orchestrator', 'human', ?, 0, 'human', ?, 1, ?, ?)")
+            .bind(&work_unit_id).bind(&partitioned_task).bind(&human_a).bind(&human_a)
+            .bind(&work_unit_created_at).bind(&work_unit_created_at)
+            .execute(database.pool()).await.expect("historical partitioned WorkUnit allocation creates");
 
         set_orchestrator_cursor_to_head(&database).await;
         let before_v095_head: i64 = sqlx::query_scalar(

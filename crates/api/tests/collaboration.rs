@@ -33,8 +33,8 @@ async fn generic_api_derives_sender_authorizes_ids_and_hides_content_ref() {
     sqlx::query(
         "INSERT INTO execution (
              id, task_id, agent_id, role, status, created_at, updated_at,
-             actor_kind, actor_id, purpose
-         ) VALUES (?, ?, NULL, 'interactive', 'completed', ?, ?, 'human', 'test-user-id', 'general')",
+             actor_kind, actor_id
+         ) VALUES (?, ?, NULL, 'interactive', 'completed', ?, ?, 'human', 'test-user-id')",
     )
     .bind(execution_id)
     .bind(&task.id)
