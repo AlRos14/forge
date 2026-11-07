@@ -1,10 +1,15 @@
 # Plan de implementación — Coordinación de tareas y experiencia guiada
 
-Fecha: 2026-11-07. Baseline inspeccionado: `fd599647`.
-Estado: planificación; no implementación, despliegue ni autorización para lanzar
-FirePOS. El propietario ha aprobado las responsabilidades y el recorrido del
-[modelo operativo objetivo](../concepts/task-operating-model.md). Las decisiones
-de esquema y endpoints deberán fijarse en PR0 antes de codificar dependientes.
+Fecha: 2026-11-07. Baseline inicial: `fd599647`. Baseline de PR0: `ae3b2287`;
+migración última verificada: V157.
+Estado: PR0 (contrato transversal) completado; PR1–PR6 pendientes de
+implementación. No hay despliegue, aceptación funcional ni autorización para
+lanzar FirePOS. El propietario ha aprobado las responsabilidades y el recorrido
+del [modelo operativo objetivo](../concepts/task-operating-model.md). Las
+decisiones de esquema y endpoints están fijadas en el
+[contrato PR0](pr0-task-coordination-contract.md) y el
+[ADR 0016](../adr/0016-task-coordination-turn.md); los PR dependientes deben
+implementarlas sin reintroducir fuentes de verdad paralelas.
 
 ## Revisión del sistema actual
 
@@ -71,6 +76,32 @@ implementar. No mantener ambos mecanismos activos como dos autoridades.
 Salida: ADR, matriz de autoridad, contratos versionados y bocetos de recorrido.
 Gate de diseño: una tarea sin WorkUnits puede solicitar preparación sin conceder
 escritura; todo worker sigue exigiendo WU/asignación/lease explícitos.
+
+### Registro PR0 — 2026-11-07
+
+Completado sobre `ae3b2287` (V157 verificada). Entregables:
+
+- [ADR 0016 — Task-scoped coordination turns](../adr/0016-task-coordination-turn.md):
+  decisión de reutilizar wake/intento/Execution/receipts existentes, no un
+  scheduler nuevo; comparación con la WorkUnit de coordinación y con Copilot.
+- [Contrato PR0 — coordinación de tareas](pr0-task-coordination-contract.md):
+  matriz de autoridad, modos `manual|proposal|prepare_and_execute`, envelope,
+  modelo durable propuesto, contrato del `work_unit_plan`, materialización,
+  carreras, REST/MCP/CLI, proyecciones UX y transición conservadora.
+- Inventario verificado: `orchestrator_wake`/`orchestrator_wake_execution` y
+  guards V152; `task_dispatch` V141/V145; TaskRole/capabilities V149–V152;
+  Project Copilot V139/V140; colaboración V090 y planes V098; rework V143/V153/
+  V157; TaskLifecycle, GateEngine, WorkUnitService y dispatcher.
+- Transición fijada: todas las Tasks existentes pasan a `manual`; no se
+  reetiqueta ni se reproduce ningún wake/Execution histórico; no se arranca
+  trabajo al migrar.
+- Gate de diseño: el turno no crea worker, Workspace ni lease; sólo la
+  materialización determinista crea WorkUnits desde un plan exacto.
+
+No se ejecutaron pruebas de runtime porque PR0 es documental. El siguiente
+paso es PR2 (contrato mínimo backend) y, en el mismo corte vertical, la
+superficie PR1 que no prometa capacidades ausentes. PR3 extiende la supervisión;
+PR4–PR6 conservan revisión, intervención y aceptación.
 
 ## PR1 — Equipo reutilizable y entrada comprensible
 

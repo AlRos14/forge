@@ -90,7 +90,7 @@ A Gate is a deterministic policy over exact durable records. Its immutable GateE
 
 ## Persistence and history
 
-SQLite is the current persistence layer. Numbered migrations V001–V156 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt.
+SQLite is the current persistence layer. Numbered migrations V001–V157 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V159 add the Task coordination authorization, turn, plan, materialization, quality-request, and intervention records described by the PR0 contract.
 
 Historical `agent_session_history`, immutable Execution records, ProjectRelease snapshots, Artifact and Evidence references, HarnessSession identities, cross-record IDs, migration decisions, ADRs, and upstream license attribution remain readable history. History does not regain runtime authority. ProjectRelease is a read-only historical snapshot and does not create a current Charter, milestone, readiness workflow, or release operation.
 
@@ -163,11 +163,15 @@ ownership for historical records during a container migration.
 
 Forge originated from [ForgeAILab/forge](upstream.md). The origin and MIT attribution remain. This repository is independently maintained and does not promise architectural or release compatibility with upstream. See [upstream relationship](upstream.md).
 
-## Accepted target operating model — implementation pending
+## Accepted target operating model — PR0 complete, implementation pending
 
 The owner-approved [task operating model](concepts/task-operating-model.md)
 separates Project Copilot assistance from end-to-end Task coordination and makes
 objective, team, and authorization the primary user journey. Worker WorkUnits,
 leases, exact evidence, and TaskLifecycle authority remain mandatory. This is a
 target contract, not a claim that the current runtime supports the whole journey.
-See the [system review and implementation sequence](plans/task-coordination-and-guided-experience.md).
+The [PR0 contract](plans/pr0-task-coordination-contract.md) and
+[ADR 0016](adr/0016-task-coordination-turn.md) fix the coordination start,
+authority matrix, durable records, recovery rules, and UX states. PR1–PR6 remain
+implementation work; see the
+[system review and implementation sequence](plans/task-coordination-and-guided-experience.md).
