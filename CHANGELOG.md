@@ -49,6 +49,19 @@ PR14 audit on 2026-10-16.
 
 ### Added
 
+- Add the Task coordination model: versioned Task authorization (`manual`,
+  `proposal`, `prepare_and_execute`), a read-only Agent coordination turn over
+  the existing Orchestrator wake/receipt machinery, inspectable
+  `work_unit_plan` Artifacts, exact-digest Human approval, and atomic idempotent
+  materialization of WorkUnits, dependencies, review subjects, and Artifact
+  inputs. V158 preserves every existing Task as `manual` and adds no
+  retrospective turn.
+- Add structured Task quality requests (`delivery_correction`, `plan_revision`,
+  `specialist`, `human_decision`) with category-specific targets, global
+  budgets, versioned resolution, and a single durable intervention circuit for
+  Humans and live Project Copilot runs. V159 adds the additive records.
+- Add REST, MCP, CLI, and SSE coordination contracts, including
+  `forge_get_task_coordination` and the `forge-ctl task coordination` commands.
 - Add `GET/POST /tasks/{id}/dispatch*` Task launch, pause, resume, and cancel
   operations, a read-only preflight with per-WorkUnit blockers, and
   `POST /work-units/{id}/workspace` for explicit repository preparation.

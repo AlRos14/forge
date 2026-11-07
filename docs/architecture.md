@@ -52,6 +52,19 @@ TaskRole and RoleMembership govern eligibility. WorkUnit allocation names the ex
 
 Forge's Orchestrator reacts to durable domain events. Its implemented output set is bounded to Messages, Handoffs, limited WorkUnit creation, and Proposals. It does not directly steer or stop a harness, reassign work, merge repositories, or execute a Proposal or Decision. Human and Agent actions remain subject to the same domain authority.
 
+Task coordination adds a bounded preparation turn over the same durable wake and
+Execution machinery. A Human authorizes a mode, exact coordinator TaskRole and
+Actor, current team digest, and envelope. The `task.coordination_requested`
+event admits an exact-Actor workspace-free wake; its Execution returns one
+`work_unit_plan` Artifact. The model cannot create TaskRoles, memberships,
+capabilities, WorkUnits, or worker Starts. Deterministic materialization validates
+the exact plan, envelope, team, Task version, and authorization version and
+creates WorkUnits, dependencies, review subjects, and Artifact input pins in one
+transaction with an idempotent receipt. `manual` remains the default for existing
+Tasks, and no coordination turn is triggered retrospectively. Quality requests
+and the versioned intervention circuit are separate durable records; they do not
+replace TaskLifecycle, review, Gate, or collaboration authority.
+
 Automatic Orchestrator execution requires the Agent owner and Task Project owner to be the same account, with a current Project owner/admin/member membership. Global Agent visibility supports discovery and TaskRole membership; it does not grant cross-account execution. Forge has no cross-account Agent execution grants, so a missing or mismatched owner or membership fails closed at Execution admission and the transactional Provider Start claim.
 
 ## Harnesses and Executions

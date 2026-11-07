@@ -1,8 +1,12 @@
 use anyhow::Result;
 use api_types::{
-    ActorRef, AddRoleMembershipRequest, CoordinationMode, CreateTaskRequest, CreateTaskRoleRequest,
-    PaginatedResponse, RoleMembershipResponse, TaskDispatchActionRequest,
-    TaskDispatchActionResponse, TaskLaunchResponse, TaskLifecycleState,
+    ActorRef, AddRoleMembershipRequest, ApproveTaskCoordinationPlanRequest,
+    AuthorizeTaskCoordinationRequest, CoordinationMode, CreateTaskCoordinationTurnRequest,
+    CreateTaskCoordinationTurnResponse, CreateTaskRequest, CreateTaskRoleRequest,
+    MaterializeTaskCoordinationPlanRequest, MaterializeTaskCoordinationPlanResponse,
+    PaginatedResponse, RevokeTaskCoordinationRequest, RoleMembershipResponse, TaskCoordinationMode,
+    TaskCoordinationOverviewResponse, TaskCoordinationPlanDecision, TaskCoordinationPlanResponse,
+    TaskDispatchActionRequest, TaskDispatchActionResponse, TaskLaunchResponse, TaskLifecycleState,
     TaskLifecycleTransitionResponse, TaskResponse, TaskRoleResponse,
     TransitionTaskLifecycleRequest,
 };
@@ -87,6 +91,10 @@ pub enum TaskCmd {
         #[command(subcommand)]
         command: TaskRoleCmd,
     },
+    Coordination {
+        #[command(subcommand)]
+        command: CoordinationCmd,
+    },
     Transition {
         id: String,
         #[arg(value_enum)]
@@ -124,6 +132,124 @@ pub enum TaskRoleCmd {
         #[arg(long)]
         actor_id: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum CoordinationCmd {
+    Show {
+        id: String,
+    },
+    Authorize {
+        id: String,
+        #[arg(long)]
+        expected_task_version: i64,
+        #[arg(long)]
+        expected_coordination_version: i64,
+        #[arg(long, value_enum)]
+        mode: TaskCoordinationModeArg,
+        #[arg(long)]
+        role_id: Option<String>,
+        #[arg(long, value_enum)]
+        actor_kind: Option<ActorKindArg>,
+        #[arg(long)]
+        actor_id: Option<String>,
+        #[arg(long)]
+        envelope_json: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    Revoke {
+        id: String,
+        #[arg(long)]
+        expected_task_version: i64,
+        #[arg(long)]
+        expected_coordination_version: i64,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    Request {
+        id: String,
+        #[arg(long)]
+        expected_task_version: i64,
+        #[arg(long)]
+        expected_coordination_version: i64,
+        #[arg(long)]
+        objective: String,
+        #[arg(long)]
+        constraints: Option<String>,
+        #[arg(long = "acceptance")]
+        acceptance_criteria: Vec<String>,
+        #[arg(long)]
+        context: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    Approve {
+        id: String,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        expected_coordination_version: i64,
+        #[arg(long)]
+        expected_plan_digest: String,
+        #[arg(long, value_enum, default_value_t = PlanDecisionArg::Approve)]
+        decision: PlanDecisionArg,
+        #[arg(long)]
+        rationale: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    Materialize {
+        id: String,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        expected_task_version: i64,
+        #[arg(long)]
+        expected_coordination_version: i64,
+        #[arg(long)]
+        expected_plan_digest: String,
+        #[arg(long)]
+        expected_plan_version: i64,
+        #[arg(long)]
+        expected_request_version: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum TaskCoordinationModeArg {
+    Manual,
+    Proposal,
+    PrepareAndExecute,
+}
+
+impl From<TaskCoordinationModeArg> for TaskCoordinationMode {
+    fn from(value: TaskCoordinationModeArg) -> Self {
+        match value {
+            TaskCoordinationModeArg::Manual => Self::Manual,
+            TaskCoordinationModeArg::Proposal => Self::Proposal,
+            TaskCoordinationModeArg::PrepareAndExecute => Self::PrepareAndExecute,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum PlanDecisionArg {
+    Approve,
+    Reject,
+}
+
+impl From<PlanDecisionArg> for TaskCoordinationPlanDecision {
+    fn from(value: PlanDecisionArg) -> Self {
+        match value {
+            PlanDecisionArg::Approve => Self::Approve,
+            PlanDecisionArg::Reject => Self::Reject,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -393,6 +519,9 @@ impl TaskArgs {
                     }
                 }
             },
+            TaskCmd::Coordination { command } => {
+                coordination_command(client, output, command).await
+            }
             TaskCmd::Transition {
                 id,
                 to_state,
@@ -427,6 +556,210 @@ impl TaskArgs {
                         );
                         Ok(())
                     }
+                }
+            }
+        }
+    }
+}
+
+async fn coordination_command(
+    client: &ForgeClient,
+    output: &OutputFormat,
+    command: &CoordinationCmd,
+) -> Result<()> {
+    match command {
+        CoordinationCmd::Show { id } => {
+            let response: TaskCoordinationOverviewResponse = client
+                .get(&format!("/api/v1/tasks/{id}/coordination"))
+                .await?;
+            match output {
+                OutputFormat::Json => print_json(&response),
+                OutputFormat::Table => {
+                    println!(
+                        "Task {} coordination={:?} v{} turns={}/{} quality={}/{} can_request={}",
+                        id,
+                        response.mode,
+                        response.authorization_version,
+                        response.turn_count,
+                        response.max_turns,
+                        response.quality_request_count,
+                        response.max_quality_requests,
+                        response.can_request
+                    );
+                    if let Some(coordinator) = response.coordinator.as_ref() {
+                        println!(
+                            "coordinator: {} ({}) harness={}",
+                            coordinator.display_name,
+                            coordinator.role,
+                            coordinator.harness.as_deref().unwrap_or("none")
+                        );
+                    }
+                    for blocker in &response.blockers {
+                        println!("blocker {}: {}", blocker.code, blocker.message);
+                    }
+                    Ok(())
+                }
+            }
+        }
+        CoordinationCmd::Authorize {
+            id,
+            expected_task_version,
+            expected_coordination_version,
+            mode,
+            role_id,
+            actor_kind,
+            actor_id,
+            envelope_json,
+            idempotency_key,
+        } => {
+            let coordinator_actor = match (actor_kind, actor_id) {
+                (Some(ActorKindArg::Human), Some(actor_id)) => {
+                    Some(ActorRef::Human(actor_id.clone()))
+                }
+                (Some(ActorKindArg::Agent), Some(actor_id)) => {
+                    Some(ActorRef::Agent(actor_id.clone()))
+                }
+                (None, None) => None,
+                _ => anyhow::bail!("--actor-kind and --actor-id must be provided together"),
+            };
+            let envelope = envelope_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?;
+            let request = AuthorizeTaskCoordinationRequest {
+                expected_task_version: *expected_task_version,
+                expected_coordination_version: *expected_coordination_version,
+                mode: (*mode).into(),
+                coordinator_task_role_id: role_id.clone(),
+                coordinator_actor,
+                envelope,
+                idempotency_key: idempotency_key.clone(),
+            };
+            let response: TaskCoordinationOverviewResponse = client
+                .post(
+                    &format!("/api/v1/tasks/{id}/coordination/authorize"),
+                    &request,
+                )
+                .await?;
+            print_json(&response)
+        }
+        CoordinationCmd::Revoke {
+            id,
+            expected_task_version,
+            expected_coordination_version,
+            reason,
+            idempotency_key,
+        } => {
+            let request = RevokeTaskCoordinationRequest {
+                expected_task_version: *expected_task_version,
+                expected_coordination_version: *expected_coordination_version,
+                idempotency_key: idempotency_key.clone(),
+                reason: reason.clone(),
+            };
+            let response: TaskCoordinationOverviewResponse = client
+                .post(&format!("/api/v1/tasks/{id}/coordination/revoke"), &request)
+                .await?;
+            print_json(&response)
+        }
+        CoordinationCmd::Request {
+            id,
+            expected_task_version,
+            expected_coordination_version,
+            objective,
+            constraints,
+            acceptance_criteria,
+            context,
+            idempotency_key,
+        } => {
+            let request = CreateTaskCoordinationTurnRequest {
+                expected_task_version: *expected_task_version,
+                expected_coordination_version: *expected_coordination_version,
+                objective: objective.clone(),
+                constraints: constraints.clone(),
+                acceptance_criteria: acceptance_criteria.clone(),
+                context: context.clone(),
+                idempotency_key: idempotency_key.clone(),
+            };
+            let response: CreateTaskCoordinationTurnResponse = client
+                .post(
+                    &format!("/api/v1/tasks/{id}/coordination/requests"),
+                    &request,
+                )
+                .await?;
+            match output {
+                OutputFormat::Json => print_json(&response),
+                OutputFormat::Table => {
+                    println!(
+                        "request {} state={:?} accepted={}",
+                        response.request.id, response.request.state, response.accepted
+                    );
+                    Ok(())
+                }
+            }
+        }
+        CoordinationCmd::Approve {
+            id,
+            plan,
+            expected_coordination_version,
+            expected_plan_digest,
+            decision,
+            rationale,
+            idempotency_key,
+        } => {
+            let request = ApproveTaskCoordinationPlanRequest {
+                expected_coordination_version: *expected_coordination_version,
+                expected_plan_digest: expected_plan_digest.clone(),
+                decision: (*decision).into(),
+                rationale: rationale.clone(),
+                idempotency_key: idempotency_key.clone(),
+            };
+            let response: TaskCoordinationPlanResponse = client
+                .post(
+                    &format!("/api/v1/tasks/{id}/coordination/plans/{plan}/approve"),
+                    &request,
+                )
+                .await?;
+            print_json(&response)
+        }
+        CoordinationCmd::Materialize {
+            id,
+            plan,
+            expected_task_version,
+            expected_coordination_version,
+            expected_plan_digest,
+            expected_plan_version,
+            expected_request_version,
+            idempotency_key,
+        } => {
+            let request = MaterializeTaskCoordinationPlanRequest {
+                expected_task_version: *expected_task_version,
+                expected_coordination_version: *expected_coordination_version,
+                expected_plan_digest: expected_plan_digest.clone(),
+                expected_plan_version: *expected_plan_version,
+                expected_request_version: *expected_request_version,
+                idempotency_key: idempotency_key.clone(),
+            };
+            let response: MaterializeTaskCoordinationPlanResponse = client
+                .post(
+                    &format!("/api/v1/tasks/{id}/coordination/plans/{plan}/materialize"),
+                    &request,
+                )
+                .await?;
+            match output {
+                OutputFormat::Json => print_json(&response),
+                OutputFormat::Table => {
+                    println!(
+                        "materialized plan {} receipt={} work_units={} replayed={} launch_accepted={}",
+                        response.plan.artifact_id,
+                        response.materialization.id,
+                        response.materialization.work_unit_ids.len(),
+                        response.replayed,
+                        response.launch_intent_accepted
+                    );
+                    for blocker in &response.launch_blockers {
+                        println!("launch blocker: {blocker}");
+                    }
+                    Ok(())
                 }
             }
         }

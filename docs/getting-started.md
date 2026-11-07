@@ -158,6 +158,49 @@ request POST "/tasks/$TASK_ID/task-roles/implementer/members" \
 TaskRole defines the responsibility. RoleMembership admits the Agent to that
 role. Neither record by itself assigns executable scope.
 
+## 5b. Guided alternative: prepare from the objective
+
+A Task with a Team does not require manual WorkUnits before it can start
+coordination. Authorize the Project coordinator and request a preparation turn:
+
+```bash
+TASK_VERSION="$(request GET "/tasks/$TASK_ID" | jq -er '.version')"
+COORDINATION_VERSION="$(request GET "/tasks/$TASK_ID/coordination" | jq -er '.authorization_version')"
+COORDINATOR_ROLE_ID="$(request GET "/tasks/$TASK_ID/task-roles" \
+  | jq -er '.[] | select(.role == "orchestrator") | .id')"
+COORDINATOR_AGENT_ID="<AGENT_ID>"
+
+request POST "/tasks/$TASK_ID/coordination/authorize" "$(jq -cn \
+  --argjson task_version "$TASK_VERSION" \
+  --argjson coordination_version "$COORDINATION_VERSION" \
+  --arg role_id "$COORDINATOR_ROLE_ID" \
+  --arg agent_id "$COORDINATOR_AGENT_ID" \
+  '{expected_task_version:$task_version,
+    expected_coordination_version:$coordination_version,
+    mode:"proposal",
+    coordinator_task_role_id:$role_id,
+    coordinator_actor:{kind:"agent",id:$agent_id},
+    idempotency_key:"guided-authorize-1"}')"
+
+request POST "/tasks/$TASK_ID/coordination/requests" "$(jq -cn \
+  --argjson task_version "$TASK_VERSION" \
+  --argjson coordination_version "$((COORDINATION_VERSION + 1))" \
+  '{expected_task_version:$task_version,
+    expected_coordination_version:$coordination_version,
+    objective:"Deliver the requested outcome",
+    constraints:"Read-only repository access",
+    acceptance_criteria:["The contract and tests are present"],
+    idempotency_key:"guided-turn-1"}')"
+```
+
+Poll the returned request, then inspect
+`GET /tasks/$TASK_ID/coordination/plans/<artifact_id>`. `proposal` creates no
+WorkUnit until a Human approves the exact digest. `prepare_and_execute` can
+materialize only a plan inside the authorization envelope. Materialization is
+atomic and idempotent; the dispatcher still revalidates every WorkUnit, Actor,
+capability, and lease. Use the manual WorkUnit path below when explicit scope
+editing is intended.
+
 ## 6. Create the WorkUnit explicitly
 
 The CLI currently has no WorkUnit creation command, so create it through the

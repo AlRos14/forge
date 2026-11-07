@@ -116,6 +116,144 @@ pub trait TaskLifecycleRepo: Send + Sync {
 }
 
 #[async_trait]
+pub trait TaskCoordinationRepo: Send + Sync {
+    async fn get_task_coordination(&self, task_id: &str) -> Result<Option<TaskCoordination>>;
+    async fn get_task_coordination_receipt(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<TaskCoordinationReceipt>>;
+    async fn authorize_task_coordination(
+        &self,
+        input: AuthorizeTaskCoordinationInput,
+        expected_task_version: i64,
+    ) -> Result<TaskCoordinationWrite>;
+    async fn revoke_task_coordination(
+        &self,
+        input: RevokeTaskCoordinationInput,
+        expected_task_version: i64,
+    ) -> Result<TaskCoordinationWrite>;
+    async fn consume_coordination_turn_budget(&self, task_id: &str) -> Result<bool>;
+    async fn refund_coordination_turn_budget(&self, task_id: &str) -> Result<()>;
+    async fn consume_quality_request_budget(&self, task_id: &str) -> Result<bool>;
+    async fn create_task_coordination_request(
+        &self,
+        input: CreateTaskCoordinationRequestInput,
+    ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)>;
+    async fn get_task_coordination_request(
+        &self,
+        id: &str,
+    ) -> Result<Option<TaskCoordinationRequest>>;
+    async fn get_task_coordination_request_by_key(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<TaskCoordinationRequest>>;
+    async fn link_task_coordination_request_wake(
+        &self,
+        request_id: &str,
+        task_id: &str,
+        wake_id: &str,
+    ) -> Result<()>;
+    async fn list_task_coordination_requests(
+        &self,
+        task_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TaskCoordinationRequest>>;
+    async fn get_task_coordination_request_by_wake(
+        &self,
+        wake_id: &str,
+    ) -> Result<Option<TaskCoordinationRequest>>;
+    async fn get_task_coordination_request_by_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<TaskCoordinationRequest>>;
+    async fn update_task_coordination_request(
+        &self,
+        input: UpdateTaskCoordinationRequestState,
+    ) -> Result<TaskCoordinationRequest>;
+    async fn complete_task_coordination_turn(
+        &self,
+        input: CompleteTaskCoordinationTurnInput,
+    ) -> Result<TaskCoordinationPlanWrite>;
+    async fn get_task_coordination_plan(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<TaskCoordinationPlan>>;
+    async fn list_task_coordination_plans(
+        &self,
+        task_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TaskCoordinationPlan>>;
+    async fn update_task_coordination_plan_state(
+        &self,
+        artifact_id: &str,
+        expected_version: i64,
+        state: TaskCoordinationPlanState,
+        proposal_id: Option<Option<String>>,
+        decision_id: Option<Option<String>>,
+        updated_at: &str,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<TaskCoordinationPlan>;
+    async fn materialize_task_coordination_plan(
+        &self,
+        input: MaterializeTaskCoordinationPlanInput,
+    ) -> Result<TaskCoordinationMaterialization>;
+    async fn get_task_coordination_materialization(
+        &self,
+        plan_artifact_id: &str,
+    ) -> Result<Option<TaskCoordinationMaterialization>>;
+    async fn create_task_quality_request(
+        &self,
+        input: CreateTaskQualityRequestInput,
+    ) -> Result<TaskQualityWrite>;
+    async fn get_task_quality_request(&self, id: &str) -> Result<Option<TaskQualityRequest>>;
+    async fn get_task_quality_request_by_key(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<TaskQualityRequest>>;
+    async fn list_task_quality_requests(
+        &self,
+        task_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TaskQualityRequest>>;
+    async fn update_task_quality_request_state(
+        &self,
+        id: &str,
+        expected_version: i64,
+        state: TaskQualityState,
+        handoff_id: Option<Option<String>>,
+        work_unit_id: Option<Option<String>>,
+        updated_at: &str,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<TaskQualityRequest>;
+    async fn create_task_intervention(
+        &self,
+        input: CreateTaskInterventionInput,
+    ) -> Result<TaskInterventionWrite>;
+    async fn get_task_intervention(&self, id: &str) -> Result<Option<TaskIntervention>>;
+    async fn list_task_interventions(
+        &self,
+        task_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TaskIntervention>>;
+    async fn update_task_intervention_state(
+        &self,
+        id: &str,
+        expected_version: i64,
+        state: TaskInterventionState,
+        proposal_id: Option<Option<String>>,
+        decision_id: Option<Option<String>>,
+        coordination_request_id: Option<Option<String>>,
+        failure_code: Option<Option<String>>,
+        failure_message: Option<Option<String>>,
+        updated_at: &str,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<TaskIntervention>;
+}
+
+#[async_trait]
 pub trait GateRepo: Send + Sync {
     async fn create_gate(&self, input: CreateGate) -> Result<CollaborationWrite<Gate>>;
     /// Create a Gate and its first immutable policy revision with both durable

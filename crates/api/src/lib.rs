@@ -607,6 +607,52 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::task_dispatch::cancel_task),
         )
         .route(
+            "/api/v1/tasks/{id}/coordination",
+            get(routes::task_coordination::get_coordination),
+        )
+        .route(
+            "/api/v1/tasks/{id}/coordination/authorize",
+            post(routes::task_coordination::authorize),
+        )
+        .route(
+            "/api/v1/tasks/{id}/coordination/revoke",
+            post(routes::task_coordination::revoke),
+        )
+        .route(
+            "/api/v1/tasks/{id}/coordination/requests",
+            post(routes::task_coordination::request_turn),
+        )
+        .route(
+            "/api/v1/tasks/{id}/coordination/requests/{request_id}",
+            get(routes::task_coordination::get_request),
+        )
+        .route(
+            "/api/v1/tasks/{id}/coordination/plans/{artifact_id}",
+            get(routes::task_coordination::get_plan),
+        )
+        .route(
+            "/api/v1/tasks/{id}/coordination/plans/{artifact_id}/approve",
+            post(routes::task_coordination::approve_plan),
+        )
+        .route(
+            "/api/v1/tasks/{id}/coordination/plans/{artifact_id}/materialize",
+            post(routes::task_coordination::materialize_plan),
+        )
+        .route(
+            "/api/v1/tasks/{id}/coordination/quality-requests",
+            get(routes::task_coordination::list_quality_requests)
+                .post(routes::task_coordination::create_quality_request),
+        )
+        .route(
+            "/api/v1/tasks/{id}/coordination/quality-requests/{request_id}/resolve",
+            post(routes::task_coordination::resolve_quality_request),
+        )
+        .route(
+            "/api/v1/tasks/{id}/coordination/interventions",
+            get(routes::task_coordination::list_interventions)
+                .post(routes::task_coordination::create_intervention),
+        )
+        .route(
             "/api/v1/tasks/{id}/rework",
             post(routes::task_rework::request_rework),
         )

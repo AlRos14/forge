@@ -63,6 +63,45 @@ pub enum PublicEventType {
     #[serde(rename = "decision.recorded")]
     #[ts(rename = "decision.recorded")]
     DecisionRecorded,
+    #[serde(rename = "task.coordination_authorized")]
+    #[ts(rename = "task.coordination_authorized")]
+    TaskCoordinationAuthorized,
+    #[serde(rename = "task.coordination_revoked")]
+    #[ts(rename = "task.coordination_revoked")]
+    TaskCoordinationRevoked,
+    #[serde(rename = "task.coordination_requested")]
+    #[ts(rename = "task.coordination_requested")]
+    TaskCoordinationRequested,
+    #[serde(rename = "task.coordination_turn_started")]
+    #[ts(rename = "task.coordination_turn_started")]
+    TaskCoordinationTurnStarted,
+    #[serde(rename = "task.coordination_request_state_changed")]
+    #[ts(rename = "task.coordination_request_state_changed")]
+    TaskCoordinationRequestStateChanged,
+    #[serde(rename = "task.coordination_plan_proposed")]
+    #[ts(rename = "task.coordination_plan_proposed")]
+    TaskCoordinationPlanProposed,
+    #[serde(rename = "task.coordination_plan_approved")]
+    #[ts(rename = "task.coordination_plan_approved")]
+    TaskCoordinationPlanApproved,
+    #[serde(rename = "task.coordination_plan_rejected")]
+    #[ts(rename = "task.coordination_plan_rejected")]
+    TaskCoordinationPlanRejected,
+    #[serde(rename = "task.coordination_plan_materialized")]
+    #[ts(rename = "task.coordination_plan_materialized")]
+    TaskCoordinationPlanMaterialized,
+    #[serde(rename = "task.quality_requested")]
+    #[ts(rename = "task.quality_requested")]
+    TaskQualityRequested,
+    #[serde(rename = "task.quality_request_resolved")]
+    #[ts(rename = "task.quality_request_resolved")]
+    TaskQualityRequestResolved,
+    #[serde(rename = "task.intervention_recorded")]
+    #[ts(rename = "task.intervention_recorded")]
+    TaskInterventionRecorded,
+    #[serde(rename = "task.intervention_state_changed")]
+    #[ts(rename = "task.intervention_state_changed")]
+    TaskInterventionStateChanged,
     #[serde(rename = "project.created")]
     #[ts(rename = "project.created")]
     ProjectCreated,
@@ -114,6 +153,19 @@ impl PublicEventType {
             Self::ProposalCreated => "proposal.created",
             Self::ProposalWithdrawn => "proposal.withdrawn",
             Self::DecisionRecorded => "decision.recorded",
+            Self::TaskCoordinationAuthorized => "task.coordination_authorized",
+            Self::TaskCoordinationRevoked => "task.coordination_revoked",
+            Self::TaskCoordinationRequested => "task.coordination_requested",
+            Self::TaskCoordinationTurnStarted => "task.coordination_turn_started",
+            Self::TaskCoordinationRequestStateChanged => "task.coordination_request_state_changed",
+            Self::TaskCoordinationPlanProposed => "task.coordination_plan_proposed",
+            Self::TaskCoordinationPlanApproved => "task.coordination_plan_approved",
+            Self::TaskCoordinationPlanRejected => "task.coordination_plan_rejected",
+            Self::TaskCoordinationPlanMaterialized => "task.coordination_plan_materialized",
+            Self::TaskQualityRequested => "task.quality_requested",
+            Self::TaskQualityRequestResolved => "task.quality_request_resolved",
+            Self::TaskInterventionRecorded => "task.intervention_recorded",
+            Self::TaskInterventionStateChanged => "task.intervention_state_changed",
             Self::ProjectCreated => "project.created",
             Self::ProjectUpdated => "project.updated",
             Self::ProjectDeleted => "project.deleted",

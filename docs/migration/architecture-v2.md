@@ -781,6 +781,11 @@ reads or writes.
 | V143 | Add bounded rework receipts plus exact WorkUnit result-requirement and review-subject relations. |
 | V144 | Add optional WorkUnit harness execution instructions. |
 | V145 | Reject automatic WorkUnit admission when the Task dispatch intent is paused/cancelled and enforce the four-Execution per-Task ceiling inside the admission transaction. |
+| V147 | Freeze review subjects to the accepted WorkUnit revision and require an independent reviewer.
+| V149–V156 | Add versioned TaskRole capability configuration, Execution authority snapshots, durable automatic rework intents, Project role defaults, review lines, Artifact manifests, and exact manual/automatic rework reconciliation.
+| V157 | Advance a review line from the exact reviewed result across parallel reports.
+| V158 | Add versioned Task coordination authorization, turn requests, inspectable `work_unit_plan` Artifacts, approval bindings, and atomic idempotent materialization. Existing Tasks become `manual`; no turn is triggered retrospectively.
+| V159 | Add structured Task quality requests and the single durable Human/Project Copilot intervention circuit. |
 
 ProjectRelease GETs are read-only and reconstruct only from `project_release`,
 `project_release_history_*`, shared media assets, and tombstones. They validate

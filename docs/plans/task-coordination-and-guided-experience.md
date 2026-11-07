@@ -103,6 +103,18 @@ paso es PR2 (contrato mínimo backend) y, en el mismo corte vertical, la
 superficie PR1 que no prometa capacidades ausentes. PR3 extiende la supervisión;
 PR4–PR6 conservan revisión, intervención y aceptación.
 
+### Registro de implementación backend — 2026-11-07
+
+El backend de PR1–PR6 se implementa sobre el contrato PR0 con migraciones
+aditivas V158–V159: autorización de coordinación versionada y equipo resuelto,
+turno read-only sobre wakes existentes, plan `work_unit_plan` inspeccionable,
+aprobación por digest, materialización atómica idempotente, solicitudes de
+calidad con presupuesto global, y un único circuito de intervención para Humans
+y Project Copilot. TaskLifecycle, WorkUnit, review, Gate y WorkspaceLease
+conservan su autoridad. La validación de runtime y la aceptación conjunta con la
+UI se registran en el informe de cierre; las pruebas de Rust se ejecutan sólo en
+la fase de integración solicitada.
+
 ## PR1 — Equipo reutilizable y entrada comprensible
 
 - Presentar equipo y flujo del Proyecto sobre los defaults existentes. Alta de

@@ -8,6 +8,7 @@ use ts_rs::TS;
 #[ts(export)]
 pub enum ArtifactKind {
     Plan,
+    WorkUnitPlan,
     ReviewReport,
     ValidationReport,
     Diff,

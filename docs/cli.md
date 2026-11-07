@@ -57,6 +57,31 @@ select an implicit Task Agent or Workspace.
 If a provider Start is uncertain, inspect the exact admitted Execution and
 follow the recovery contract. Do not automatically submit another Start.
 
+Task coordination is available without creating WorkUnits by hand:
+
+```text
+forge-ctl task coordination show <task>
+forge-ctl task coordination authorize <task> --expected-task-version N \
+  --expected-coordination-version N --mode proposal --role-id <task-role-id> \
+  --actor-kind agent --actor-id <agent-id> --idempotency-key <key>
+forge-ctl task coordination revoke <task> --expected-task-version N \
+  --expected-coordination-version N --idempotency-key <key>
+forge-ctl task coordination request <task> --expected-task-version N \
+  --expected-coordination-version N --objective "..." --idempotency-key <key>
+forge-ctl task coordination approve <task> --plan <artifact-id> \
+  --expected-coordination-version N --expected-plan-digest <sha256> \
+  --decision approve --idempotency-key <key>
+forge-ctl task coordination materialize <task> --plan <artifact-id> \
+  --expected-task-version N --expected-coordination-version N \
+  --expected-plan-digest <sha256> --expected-plan-version N \
+  --expected-request-version N --idempotency-key <key>
+```
+
+`proposal` waits for the exact plan decision. `prepare_and_execute` materializes
+only an in-envelope plan; a plan outside the envelope becomes a Proposal.
+Materialization creates the real WorkUnits and records the normal launch intent;
+the dispatcher still revalidates assignments, capabilities, and leases.
+
 ## Agents, providers, and daemons
 
 Agents are harness-bound Actors. Registration and profile selection are separate commands. The initial profile is selected when the Agent is created; later profile selection uses the Agent's current version. Supported harnesses and profiles depend on the online host and detected providers.

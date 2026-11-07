@@ -38,6 +38,39 @@ pub(crate) async fn dispatch_tool(
         "forge_pause_task" => handlers::forge_pause_task(state, arguments, context).await,
         "forge_resume_task" => handlers::forge_resume_task(state, arguments, context).await,
         "forge_cancel_task" => handlers::forge_cancel_task(state, arguments, context).await,
+        "forge_get_task_coordination" => {
+            handlers::forge_get_task_coordination(state, arguments, context).await
+        }
+        "forge_authorize_task_coordination" => {
+            handlers::forge_authorize_task_coordination(state, arguments, context).await
+        }
+        "forge_revoke_task_coordination" => {
+            handlers::forge_revoke_task_coordination(state, arguments, context).await
+        }
+        "forge_request_task_coordination" => {
+            handlers::forge_request_task_coordination(state, arguments, context).await
+        }
+        "forge_approve_task_coordination_plan" => {
+            handlers::forge_approve_task_coordination_plan(state, arguments, context).await
+        }
+        "forge_materialize_task_coordination_plan" => {
+            handlers::forge_materialize_task_coordination_plan(state, arguments, context).await
+        }
+        "forge_list_task_quality_requests" => {
+            handlers::forge_list_task_quality_requests(state, arguments, context).await
+        }
+        "forge_create_task_quality_request" => {
+            handlers::forge_create_task_quality_request(state, arguments, context).await
+        }
+        "forge_resolve_task_quality_request" => {
+            handlers::forge_resolve_task_quality_request(state, arguments, context).await
+        }
+        "forge_list_task_interventions" => {
+            handlers::forge_list_task_interventions(state, arguments, context).await
+        }
+        "forge_create_task_intervention" => {
+            handlers::forge_create_task_intervention(state, arguments, context).await
+        }
         "forge_request_rework" => handlers::forge_request_rework(state, arguments, context).await,
         "forge_update_task" => handlers::forge_update_task(state, arguments).await,
         "forge_create_work_unit" => {

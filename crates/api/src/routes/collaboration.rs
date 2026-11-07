@@ -75,6 +75,7 @@ fn target_to_api(target: CollaborationTarget) -> ApiTarget {
 fn artifact_kind_to_db(kind: ApiArtifactKind) -> ArtifactKind {
     match kind {
         ApiArtifactKind::Plan => ArtifactKind::Plan,
+        ApiArtifactKind::WorkUnitPlan => ArtifactKind::WorkUnitPlan,
         ApiArtifactKind::ReviewReport => ArtifactKind::ReviewReport,
         ApiArtifactKind::ValidationReport => ArtifactKind::ValidationReport,
         ApiArtifactKind::Diff => ArtifactKind::Diff,
@@ -90,6 +91,7 @@ fn artifact_kind_to_db(kind: ApiArtifactKind) -> ArtifactKind {
 fn artifact_kind_to_api(kind: ArtifactKind) -> ApiArtifactKind {
     match kind {
         ArtifactKind::Plan => ApiArtifactKind::Plan,
+        ArtifactKind::WorkUnitPlan => ApiArtifactKind::WorkUnitPlan,
         ArtifactKind::ReviewReport => ApiArtifactKind::ReviewReport,
         ArtifactKind::ValidationReport => ApiArtifactKind::ValidationReport,
         ArtifactKind::Diff => ApiArtifactKind::Diff,

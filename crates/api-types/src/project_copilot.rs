@@ -20,6 +20,9 @@ pub const PROJECT_COPILOT_MCP_TOOLS: &[&str] = &[
     "forge_list_work_unit_dependencies",
     "forge_add_work_unit_dependency",
     "forge_remove_work_unit_dependency",
+    "forge_get_task_coordination",
+    "forge_list_task_interventions",
+    "forge_create_task_intervention",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

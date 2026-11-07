@@ -2180,6 +2180,7 @@ enum_strings!(ArtifactStorageKind {
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     Plan,
+    WorkUnitPlan,
     ReviewReport,
     ValidationReport,
     Diff,
@@ -2193,6 +2194,7 @@ pub enum ArtifactKind {
 
 enum_strings!(ArtifactKind {
     Plan => "plan",
+    WorkUnitPlan => "work_unit_plan",
     ReviewReport => "review_report",
     ValidationReport => "validation_report",
     Diff => "diff",
@@ -2645,6 +2647,497 @@ pub struct TransitionTaskDispatch {
     pub request_digest: String,
     pub receipt_id: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCoordinationMode {
+    Manual,
+    Proposal,
+    PrepareAndExecute,
+}
+
+enum_strings!(TaskCoordinationMode {
+    Manual => "manual",
+    Proposal => "proposal",
+    PrepareAndExecute => "prepare_and_execute",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCoordinationOperation {
+    Authorize,
+    Revoke,
+}
+
+enum_strings!(TaskCoordinationOperation {
+    Authorize => "authorize",
+    Revoke => "revoke",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCoordination {
+    pub task_id: String,
+    pub mode: TaskCoordinationMode,
+    pub coordinator_task_role_id: Option<String>,
+    pub coordinator_actor: Option<ActorRef>,
+    pub authorization_version: i64,
+    pub team_snapshot_json: String,
+    pub team_digest: String,
+    pub envelope_json: String,
+    pub envelope_digest: String,
+    pub requested_by: Option<String>,
+    pub turn_count: i64,
+    pub quality_request_count: i64,
+    pub max_turns: i64,
+    pub max_quality_requests: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub revoked_at: Option<String>,
+    pub revoke_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCoordinationReceipt {
+    pub id: String,
+    pub task_id: String,
+    pub operation: TaskCoordinationOperation,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub authorization_version: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCoordinationWrite {
+    pub coordination: TaskCoordination,
+    pub receipt: TaskCoordinationReceipt,
+    pub replayed: bool,
+    pub event: Option<DomainEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizeTaskCoordinationInput {
+    pub task_id: String,
+    pub expected_coordination_version: i64,
+    pub mode: TaskCoordinationMode,
+    pub coordinator_task_role_id: Option<String>,
+    pub coordinator_actor: Option<ActorRef>,
+    pub team_snapshot_json: String,
+    pub team_digest: String,
+    pub envelope_json: String,
+    pub envelope_digest: String,
+    pub requested_by: String,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub receipt_id: String,
+    pub created_at: String,
+    pub event: CreateDomainEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokeTaskCoordinationInput {
+    pub task_id: String,
+    pub expected_coordination_version: i64,
+    pub reason: Option<String>,
+    pub requested_by: String,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub receipt_id: String,
+    pub created_at: String,
+    pub event: CreateDomainEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCoordinationRequestState {
+    Requested,
+    Running,
+    PlanReady,
+    AwaitingApproval,
+    Materialized,
+    Failed,
+    Cancelled,
+    Uncertain,
+}
+
+enum_strings!(TaskCoordinationRequestState {
+    Requested => "requested",
+    Running => "running",
+    PlanReady => "plan_ready",
+    AwaitingApproval => "awaiting_approval",
+    Materialized => "materialized",
+    Failed => "failed",
+    Cancelled => "cancelled",
+    Uncertain => "uncertain",
+});
+
+impl TaskCoordinationRequestState {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Materialized | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCoordinationRequest {
+    pub id: String,
+    pub task_id: String,
+    pub authorization_version: i64,
+    pub mode: TaskCoordinationMode,
+    pub brief_json: String,
+    pub objective_digest: String,
+    pub request_digest: String,
+    pub idempotency_key: String,
+    pub state: TaskCoordinationRequestState,
+    pub wake_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub plan_artifact_id: Option<String>,
+    pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTaskCoordinationRequestInput {
+    pub id: String,
+    pub task_id: String,
+    pub authorization_version: i64,
+    pub mode: TaskCoordinationMode,
+    pub brief_json: String,
+    pub objective_digest: String,
+    pub request_digest: String,
+    pub idempotency_key: String,
+    pub created_at: String,
+    pub event: CreateDomainEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateTaskCoordinationRequestState {
+    pub id: String,
+    pub expected_version: i64,
+    pub state: TaskCoordinationRequestState,
+    pub wake_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub plan_artifact_id: Option<String>,
+    pub failure_code: Option<Option<String>>,
+    pub failure_message: Option<Option<String>>,
+    pub completed_at: Option<String>,
+    pub updated_at: String,
+    pub event: Option<CreateDomainEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCoordinationPlanState {
+    Proposed,
+    Approved,
+    Rejected,
+    Superseded,
+    Materialized,
+}
+
+enum_strings!(TaskCoordinationPlanState {
+    Proposed => "proposed",
+    Approved => "approved",
+    Rejected => "rejected",
+    Superseded => "superseded",
+    Materialized => "materialized",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCoordinationPlan {
+    pub artifact_id: String,
+    pub task_id: String,
+    pub request_id: String,
+    pub authorization_version: i64,
+    pub plan_digest: String,
+    pub state: TaskCoordinationPlanState,
+    pub proposal_id: Option<String>,
+    pub decision_id: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteTaskCoordinationTurnInput {
+    pub request_id: String,
+    pub task_id: String,
+    pub authorization_version: i64,
+    pub artifact_id: String,
+    pub plan_digest: String,
+    pub artifact_content: String,
+    pub artifact_metadata_json: String,
+    pub producer_execution_id: String,
+    pub producer_actor: ActorRef,
+    pub plan_state: TaskCoordinationPlanState,
+    pub proposal_id: Option<String>,
+    pub request_state: TaskCoordinationRequestState,
+    pub created_at: String,
+    pub artifact_event: CreateDomainEvent,
+    pub plan_event: CreateDomainEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCoordinationPlanWrite {
+    pub plan: TaskCoordinationPlan,
+    pub request: TaskCoordinationRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCoordinationMaterialization {
+    pub id: String,
+    pub task_id: String,
+    pub request_id: String,
+    pub plan_artifact_id: String,
+    pub plan_digest: String,
+    pub authorization_version: i64,
+    pub task_version_before: i64,
+    pub task_version_after: i64,
+    pub work_unit_ids_json: String,
+    pub receipt_digest: String,
+    pub created_by: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedWorkUnit {
+    pub id: String,
+    pub key: String,
+    pub title: String,
+    pub scope: String,
+    pub execution_instructions: Option<String>,
+    pub role: String,
+    pub assigned_actor: Option<ActorRef>,
+    pub parent_work_unit_id: Option<String>,
+    pub depends_on_work_unit_ids: Vec<String>,
+    pub requires_integration: bool,
+    pub artifact_inputs: Vec<MaterializedArtifactInput>,
+    pub review_subject_work_unit_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedArtifactInput {
+    pub artifact_id: String,
+    pub digest: String,
+    pub producer_execution_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializeTaskCoordinationPlanInput {
+    pub receipt_id: String,
+    pub task_id: String,
+    pub request_id: String,
+    pub plan_artifact_id: String,
+    pub plan_digest: String,
+    pub authorization_version: i64,
+    pub expected_plan_version: i64,
+    pub task_version_before: i64,
+    pub expected_request_version: i64,
+    pub work_units: Vec<MaterializedWorkUnit>,
+    pub receipt_digest: String,
+    pub created_by: String,
+    pub created_at: String,
+    pub events: Vec<CreateDomainEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskQualityCategory {
+    DeliveryCorrection,
+    PlanRevision,
+    Specialist,
+    HumanDecision,
+}
+
+enum_strings!(TaskQualityCategory {
+    DeliveryCorrection => "delivery_correction",
+    PlanRevision => "plan_revision",
+    Specialist => "specialist",
+    HumanDecision => "human_decision",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskQualityTargetKind {
+    Implementation,
+    Orchestrator,
+    Specialist,
+    Human,
+}
+
+enum_strings!(TaskQualityTargetKind {
+    Implementation => "implementation",
+    Orchestrator => "orchestrator",
+    Specialist => "specialist",
+    Human => "human",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskQualityState {
+    Requested,
+    Notified,
+    WorkCreated,
+    Running,
+    Resolved,
+    RequiresHuman,
+    Cancelled,
+}
+
+enum_strings!(TaskQualityState {
+    Requested => "requested",
+    Notified => "notified",
+    WorkCreated => "work_created",
+    Running => "running",
+    Resolved => "resolved",
+    RequiresHuman => "requires_human",
+    Cancelled => "cancelled",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskQualityRequest {
+    pub id: String,
+    pub task_id: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub category: TaskQualityCategory,
+    pub target_kind: TaskQualityTargetKind,
+    pub target_task_role_id: Option<String>,
+    pub target_actor: Option<ActorRef>,
+    pub summary: String,
+    pub findings_json: String,
+    pub resolution_condition: String,
+    pub state: TaskQualityState,
+    pub handoff_id: Option<String>,
+    pub work_unit_id: Option<String>,
+    pub budget_round: i64,
+    pub source_digest: String,
+    pub request_digest: String,
+    pub idempotency_key: String,
+    pub created_by: ActorRef,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTaskQualityRequestInput {
+    pub id: String,
+    pub task_id: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub category: TaskQualityCategory,
+    pub target_kind: TaskQualityTargetKind,
+    pub target_task_role_id: Option<String>,
+    pub target_actor: Option<ActorRef>,
+    pub summary: String,
+    pub findings_json: String,
+    pub resolution_condition: String,
+    pub state: TaskQualityState,
+    pub handoff_id: Option<String>,
+    pub work_unit_id: Option<String>,
+    pub source_digest: String,
+    pub request_digest: String,
+    pub idempotency_key: String,
+    pub created_by: ActorRef,
+    pub created_at: String,
+    pub event: CreateDomainEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskInterventionKind {
+    Instruction,
+    Decision,
+    Pause,
+    Resume,
+    Cancel,
+    RevokeAuthorization,
+    RequestReplan,
+}
+
+enum_strings!(TaskInterventionKind {
+    Instruction => "instruction",
+    Decision => "decision",
+    Pause => "pause",
+    Resume => "resume",
+    Cancel => "cancel",
+    RevokeAuthorization => "revoke_authorization",
+    RequestReplan => "request_replan",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskInterventionState {
+    Recorded,
+    Applied,
+    RequiresHuman,
+    Rejected,
+}
+
+enum_strings!(TaskInterventionState {
+    Recorded => "recorded",
+    Applied => "applied",
+    RequiresHuman => "requires_human",
+    Rejected => "rejected",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskIntervention {
+    pub id: String,
+    pub task_id: String,
+    pub kind: TaskInterventionKind,
+    pub state: TaskInterventionState,
+    pub source_kind: String,
+    pub source_id: String,
+    pub payload_json: String,
+    pub request_digest: String,
+    pub idempotency_key: String,
+    pub expected_task_version: Option<i64>,
+    pub expected_coordination_version: Option<i64>,
+    pub proposal_id: Option<String>,
+    pub decision_id: Option<String>,
+    pub coordination_request_id: Option<String>,
+    pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTaskInterventionInput {
+    pub id: String,
+    pub task_id: String,
+    pub kind: TaskInterventionKind,
+    pub source_kind: String,
+    pub source_id: String,
+    pub payload_json: String,
+    pub request_digest: String,
+    pub idempotency_key: String,
+    pub expected_task_version: Option<i64>,
+    pub expected_coordination_version: Option<i64>,
+    pub created_at: String,
+    pub event: CreateDomainEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskInterventionWrite {
+    pub intervention: TaskIntervention,
+    pub event: Option<DomainEvent>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskQualityWrite {
+    pub request: TaskQualityRequest,
+    pub event: Option<DomainEvent>,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

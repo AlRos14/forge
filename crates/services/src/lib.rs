@@ -39,6 +39,7 @@ pub mod release_history;
 pub mod role_capabilities;
 pub mod shared_media_cleanup;
 pub mod shutdown;
+pub mod task_coordination;
 pub mod task_dispatcher;
 pub mod task_failure_retry;
 mod task_integration_operation;
@@ -94,6 +95,12 @@ pub use recovery::{CrashRecovery, HeartbeatMonitor};
 pub use release_history::HistoricalReleaseReader;
 pub use shared_media_cleanup::SharedMediaCleanupScheduler;
 pub use shutdown::GracefulShutdown;
+pub use task_coordination::{
+    AuthorizationInput, CoordinationBlocker, CoordinationBrief, CoordinationEnvelope,
+    CoordinatorView, InterventionInput, MaterializeInput, MaterializeOutcome, Overview,
+    PlanDecisionInput, PlanView, PlanWorkUnit, QualityRequestInput, TaskCoordinationService,
+    TeamMemberView, TeamRoleView, TurnRequestInput, WorkUnitPlan,
+};
 pub use task_dispatcher::{DispatchOutcome, TaskDispatcher};
 pub use task_rework::{
     RequestReworkInput, RequestReworkResult, TaskReworkService, WorkUnitReviewSubject,
@@ -139,6 +146,9 @@ pub enum ServiceError {
 
     #[error("conflict: {0}")]
     Conflict(String),
+
+    #[error("coordination {code}: {message}")]
+    Coordination { code: &'static str, message: String },
 
     #[error("daemon unavailable: {daemon_id}")]
     DaemonUnavailable { daemon_id: String },

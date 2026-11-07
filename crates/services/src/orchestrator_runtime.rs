@@ -13,8 +13,8 @@ use db::{
     DomainEvent, DomainEventRepo, ExecutionRepo, ExecutionStatus, GateRepo, OrchestratorWake,
     OrchestratorWakeExecution, OrchestratorWakeRepo, OrchestratorWakeState, PageRequest,
     ProposalTarget, ProposalTargetKind, RoleMembership, RoleMembershipRepo, RoleMembershipStatus,
-    SortBy, SortOrder, TaskRepo, TaskRole, TaskRoleRepo, WorkUnit, WorkUnitRepo, WorkUnitStatus,
-    WorkUnitWorkspaceRepo, WorkspaceRepo,
+    SortBy, SortOrder, TaskCoordinationRepo, TaskCoordinationRequestState, TaskRepo, TaskRole,
+    TaskRoleRepo, WorkUnit, WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo,
 };
 use events::{EventBus, ForgeEvent};
 use serde_json::{json, Value};
@@ -660,6 +660,52 @@ impl OrchestratorRuntime {
                     target: WakeTarget::Actor(proposal.proposer),
                 }
             }
+            "task.coordination_requested" => {
+                if event.entity_type != "task_coordination_request" {
+                    return Ok(None);
+                }
+                let Some(request) = TaskCoordinationRepo::get_task_coordination_request(
+                    &*self.db,
+                    &event.entity_id,
+                )
+                .await?
+                else {
+                    return Ok(None);
+                };
+                if request.task_id != task_id
+                    || !matches!(
+                        request.state,
+                        TaskCoordinationRequestState::Requested
+                            | TaskCoordinationRequestState::Running
+                    )
+                {
+                    return Ok(None);
+                }
+                let Some(coordination) =
+                    TaskCoordinationRepo::get_task_coordination(&*self.db, task_id).await?
+                else {
+                    return Ok(None);
+                };
+                if coordination.revoked_at.is_some()
+                    || coordination.authorization_version != request.authorization_version
+                    || coordination.coordinator_task_role_id.is_none()
+                    || coordination
+                        .coordinator_actor
+                        .as_ref()
+                        .is_none_or(|actor| actor.kind() != db::ActorKind::Agent)
+                {
+                    return Ok(None);
+                }
+                WakeSignal {
+                    work_unit_id: None,
+                    target: WakeTarget::Actor(
+                        coordination
+                            .coordinator_actor
+                            .clone()
+                            .expect("coordinator checked above"),
+                    ),
+                }
+            }
             "task.transitioned" | "task.updated" => {
                 if event.entity_type != "task" || event.entity_id != task.id {
                     return Ok(None);
@@ -875,11 +921,34 @@ impl OrchestratorRuntime {
         };
         let now = now_rfc3339();
         let policy_digest = current_policy_digest();
+        let coordination_request = if event.event_type == "task.coordination_requested" {
+            TaskCoordinationRepo::get_task_coordination_request(&*self.db, &event.entity_id).await?
+        } else {
+            None
+        };
+        let coordination_role_id = if let Some(request) = coordination_request.as_ref() {
+            TaskCoordinationRepo::get_task_coordination(&*self.db, task_id)
+                .await?
+                .and_then(|coordination| coordination.coordinator_task_role_id)
+                .filter(|_| {
+                    request.task_id == task_id
+                        && matches!(
+                            request.state,
+                            TaskCoordinationRequestState::Requested
+                                | TaskCoordinationRequestState::Running
+                        )
+                })
+        } else {
+            None
+        };
         let mut admitted = 0;
         for role in TaskRoleRepo::list_by_task(&*self.db, task_id).await? {
             if event_role_id
                 .as_deref()
                 .is_some_and(|event_role_id| event_role_id != role.id)
+                || coordination_role_id
+                    .as_deref()
+                    .is_some_and(|coordinator_role| coordinator_role != role.id)
                 || !crate::role_capabilities::current_task_role_has_capability(
                     &self.db,
                     &role.id,
@@ -914,6 +983,7 @@ impl OrchestratorRuntime {
                     continue;
                 }
                 let id = new_uuid_v4();
+                let wake_id = id.clone();
                 if OrchestratorWakeRepo::admit_orchestrator_wake(
                     &*self.db,
                     CreateOrchestratorWake {
@@ -942,6 +1012,19 @@ impl OrchestratorRuntime {
                 .await?
                 {
                     admitted += 1;
+                    if event.event_type == "task.coordination_requested"
+                        && coordination_request
+                            .as_ref()
+                            .is_some_and(|request| request.id == event.entity_id)
+                    {
+                        TaskCoordinationRepo::link_task_coordination_request_wake(
+                            &*self.db,
+                            &event.entity_id,
+                            task_id,
+                            &wake_id,
+                        )
+                        .await?;
+                    }
                 }
             }
         }
@@ -962,6 +1045,9 @@ impl OrchestratorRuntime {
         else {
             return Ok(DispatchOutcome::Idle);
         };
+        let coordination_request =
+            TaskCoordinationRepo::get_task_coordination_request_by_wake(&*self.db, &wake.id)
+                .await?;
         if !wake_uses_current_policy(&wake) {
             self.fail_wake(
                 &wake,
@@ -1124,6 +1210,25 @@ impl OrchestratorRuntime {
             .await?;
             return Ok(DispatchOutcome::Retried);
         }
+        if let Some(request) = coordination_request.as_ref() {
+            let coordination = crate::task_coordination::TaskCoordinationService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            );
+            if let Err(error) = coordination.validate_turn_authority(request).await {
+                let reason = error.to_string();
+                let code = match &error {
+                    ServiceError::Coordination { code, .. } => *code,
+                    _ => "coordination.authorization_stale",
+                };
+                coordination
+                    .mark_request_failed(request, code, &reason)
+                    .await
+                    .ok();
+                self.fail_wake(&wake, &reason).await?;
+                return Ok(DispatchOutcome::Retried);
+            }
+        }
 
         let context = match self
             .build_context(&wake, &role, &memberships, &role_policy)
@@ -1159,7 +1264,16 @@ impl OrchestratorRuntime {
             .await?;
             return Ok(DispatchOutcome::Retried);
         }
-        let prompt = render_orchestrator_prompt(&wake, &context);
+        let prompt = if let Some(request) = coordination_request.as_ref() {
+            crate::task_coordination::TaskCoordinationService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .render_turn_prompt(request, &context)
+            .await?
+        } else {
+            render_orchestrator_prompt(&wake, &context)
+        };
         let reserved = OrchestratorWakeRepo::reserve_orchestrator_wake_execution(
             &*self.db,
             db::ReserveOrchestratorWakeExecution {
@@ -1258,6 +1372,23 @@ impl OrchestratorRuntime {
             )
             .await?;
             return Ok(DispatchOutcome::Retried);
+        }
+        if let Some(request) = coordination_request.as_ref() {
+            let coordination = crate::task_coordination::TaskCoordinationService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            );
+            if let Err(error) = coordination
+                .mark_turn_started(request, &wake.id, &execution.id)
+                .await
+            {
+                tracing::warn!(
+                    task_id = %wake.task_id,
+                    request_id = %request.id,
+                    %error,
+                    "coordination request could not record its exact running attempt"
+                );
+            }
         }
         if !OrchestratorWakeRepo::transition_orchestrator_wake_execution(
             &*self.db,
@@ -1639,6 +1770,12 @@ impl OrchestratorRuntime {
         let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &event.entity_id).await? else {
             return Ok(false);
         };
+        let coordination_request =
+            TaskCoordinationRepo::get_task_coordination_request_by_execution(
+                &*self.db,
+                &execution.id,
+            )
+            .await?;
         if execution.task_id != event.scope_id
             || !crate::role_capabilities::execution_has_capability(
                 &self.db,
@@ -1718,12 +1855,32 @@ impl OrchestratorRuntime {
         };
         let now = now_rfc3339();
         if event.event_type == "execution.completed" {
-            if let Err(error) = self.apply_completed_actions(&execution, &wake).await {
+            let completed = if let Some(request) = coordination_request.as_ref() {
+                crate::task_coordination::TaskCoordinationService::new(
+                    Arc::clone(&self.db),
+                    Arc::clone(&self.event_bus),
+                )
+                .complete_turn(request, &execution)
+                .await
+            } else {
+                self.apply_completed_actions(&execution, &wake).await
+            };
+            if let Err(error) = completed {
+                if let Some(request) = coordination_request.as_ref() {
+                    crate::task_coordination::TaskCoordinationService::new(
+                        Arc::clone(&self.db),
+                        Arc::clone(&self.event_bus),
+                    )
+                    .mark_request_failed(request, "coordination.plan_invalid", &error.to_string())
+                    .await
+                    .ok();
+                }
                 match error {
                     ServiceError::InvalidOperation { .. }
                     | ServiceError::AuthorizationDenied { .. }
                     | ServiceError::NotFound { .. }
                     | ServiceError::Conflict(_)
+                    | ServiceError::Coordination { .. }
                     | ServiceError::Db(db::DbError::StaleOrchestratorAction) => {
                         OrchestratorWakeRepo::transition_orchestrator_wake_execution(
                             &*self.db,
@@ -1824,6 +1981,24 @@ impl OrchestratorRuntime {
             )
             .await?;
         } else {
+            if let Some(request) = coordination_request.as_ref() {
+                let coordination = crate::task_coordination::TaskCoordinationService::new(
+                    Arc::clone(&self.db),
+                    Arc::clone(&self.event_bus),
+                );
+                if event.event_type == "execution.cancelled" {
+                    coordination.mark_request_cancelled(request).await.ok();
+                } else {
+                    coordination
+                        .mark_request_failed(
+                            request,
+                            "coordination.turn_failed",
+                            "the coordination turn failed after its retry limit",
+                        )
+                        .await
+                        .ok();
+                }
+            }
             let reason = match event.event_type.as_str() {
                 "execution.cancelled" => {
                     "orchestrator Execution was cancelled; a new explicit collaboration wake is required"
@@ -2409,7 +2584,7 @@ impl OrchestratorRuntime {
         OrchestratorWakeRepo::transition_orchestrator_wake(
             &*self.db,
             db::TransitionOrchestratorWake {
-                id: current_wake.id,
+                id: current_wake.id.clone(),
                 expected_state: Some(OrchestratorWakeState::Leased),
                 lease_owner: Some(self.lease_owner.clone()),
                 state: OrchestratorWakeState::Uncertain,
@@ -2420,6 +2595,18 @@ impl OrchestratorRuntime {
             },
         )
         .await?;
+        if let Some(request) =
+            TaskCoordinationRepo::get_task_coordination_request_by_wake(&*self.db, &current_wake.id)
+                .await?
+        {
+            crate::task_coordination::TaskCoordinationService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .mark_request_uncertain(&request, reason)
+            .await
+            .ok();
+        }
         Ok(())
     }
 }
