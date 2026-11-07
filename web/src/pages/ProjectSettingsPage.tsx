@@ -37,6 +37,7 @@ import { SettingsSection } from '@/components/settings/SettingsSection'
 import { settingsErrorMessage } from '@/components/settings/project-settings-utils'
 import { emptyRepoForm, type RepoFormState } from '@/components/settings/RepoForm'
 import { Button } from '@/components/ui/button'
+import { CopyReferenceButton } from '@/components/ui/copy-reference-button'
 import {
   Dialog,
   DialogContent,
@@ -68,7 +69,7 @@ const SETTINGS_TABS: Array<{
   { id: 'general', label: 'General', icon: Gear },
   { id: 'repos', label: 'Repos', icon: GitBranch },
   { id: 'members', label: 'Members', icon: Users },
-  { id: 'workers', label: 'Workers', icon: Users },
+  { id: 'workers', label: 'Team & workflow', icon: Users },
   { id: 'mcp', label: 'MCP', icon: Plugs },
   { id: 'hooks', label: 'Hooks', icon: Lightning },
   { id: 'danger', label: 'Danger zone', icon: WarningOctagon, danger: true },
@@ -106,6 +107,23 @@ export function ProjectSettingsPage({
     }, 0)
     return () => window.clearTimeout(timeout)
   }, [project])
+
+  useEffect(() => {
+    if (window.innerWidth >= 1024) return
+    const activeTab = document.querySelector<HTMLElement>('[data-active-settings-tab="true"]')
+    const navigation = activeTab?.closest<HTMLElement>('[data-settings-navigation="true"]')
+    if (!activeTab || !navigation) return
+    const navBounds = navigation.getBoundingClientRect()
+    const tabBounds = activeTab.getBoundingClientRect()
+    const centeredLeft =
+      navigation.scrollLeft +
+      tabBounds.left -
+      navBounds.left -
+      (navigation.clientWidth - tabBounds.width) / 2
+    if (typeof navigation.scrollTo === 'function') {
+      navigation.scrollTo({ left: Math.max(0, centeredLeft), behavior: 'auto' })
+    }
+  }, [initialTab])
 
   const saveProject = () => {
     if (!project || updateProject.isPending) return
@@ -159,9 +177,21 @@ export function ProjectSettingsPage({
               <Pause size={12} className="shrink-0 text-muted-foreground" weight="fill" />
             ) : null}
           </div>
-          <p className="truncate font-mono text-[11px] text-muted-foreground">{projectId}</p>
+          <details className="mt-1 text-xs text-muted-foreground">
+            <summary className="w-fit cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+              Project reference
+            </summary>
+            <div className="mt-1 flex min-w-0 items-center gap-1">
+              <code className="min-w-0 break-all">{projectId}</code>
+              <CopyReferenceButton value={projectId} label="Project ID" />
+            </div>
+          </details>
         </div>
-        <nav className="flex flex-1 gap-0.5 overflow-x-auto p-2 lg:flex-col">
+        <nav
+          data-settings-navigation="true"
+          aria-label="Project settings"
+          className="flex flex-1 gap-0.5 overflow-x-auto p-2 lg:flex-col"
+        >
           {SETTINGS_TABS.map((tab) => {
             const TabIcon = tab.icon
             return (
@@ -181,6 +211,7 @@ export function ProjectSettingsPage({
                       ? 'text-destructive/70 hover:bg-destructive/5 hover:text-destructive'
                       : 'text-sidebar-foreground hover:bg-accent/50 hover:text-foreground',
                 )}
+                data-active-settings-tab={initialTab === tab.id ? 'true' : undefined}
               >
                 <TabIcon size={16} />
                 {tab.label}

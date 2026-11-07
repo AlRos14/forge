@@ -35,10 +35,6 @@ function parseActor(value: string): ActorRef | null {
   return null
 }
 
-function actorLabel(actor: ActorRef): string {
-  return `${actor.kind}:${actor.id}`
-}
-
 function selectionValue(selection: ReworkActorSelection | null): string {
   if (!selection) return ''
   return selection.kind === 'original_contributor'
@@ -57,12 +53,16 @@ function ActorSelect({
   label,
   value,
   actors,
+  actorLabel,
+  disabled = false,
   allowOriginalContributor = false,
   onChange,
 }: {
   label: string
   value: string
   actors: ActorRef[]
+  actorLabel?: (actor: ActorRef) => string
+  disabled?: boolean
   allowOriginalContributor?: boolean
   onChange: (value: string) => void
 }) {
@@ -71,15 +71,18 @@ function ActorSelect({
     <label className="space-y-1 text-xs">
       <span>{label}</span>
       <select
+        disabled={disabled}
         className="h-9 w-full min-w-0 rounded-md border border-input bg-background px-2 text-sm text-foreground"
         value={value}
         onChange={(event) => onChange(event.target.value)}
       >
         <option value="">Choose an Actor</option>
-        {allowOriginalContributor ? <option value="original_contributor">Sole original contributor</option> : null}
+        {allowOriginalContributor ? (
+          <option value="original_contributor">Sole original contributor</option>
+        ) : null}
         {uniqueActors.map((actor) => (
           <option key={actorKey(actor)} value={actorKey(actor)}>
-            {actorLabel(actor)}
+            {actorLabel?.(actor) ?? (actor.kind === 'agent' ? 'Agent' : 'Project member')}
           </option>
         ))}
       </select>
@@ -91,13 +94,16 @@ function CapabilityFields({
   capabilities,
   label,
   onChange,
+  disabled = false,
 }: {
   capabilities: TaskRoleCapability[]
   label: string | null
   onChange: (capabilities: TaskRoleCapability[], displayLabel: string | null) => void
+  disabled?: boolean
 }) {
   const catalog = useCapabilityCatalog()
-  if (catalog.isLoading) return <p className="text-xs text-muted-foreground">Loading capabilities…</p>
+  if (catalog.isLoading)
+    return <p className="text-xs text-muted-foreground">Loading capabilities…</p>
   if (catalog.isError || !catalog.data) {
     return (
       <p role="alert" className="text-xs text-destructive">
@@ -112,6 +118,7 @@ function CapabilityFields({
         <input
           className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground"
           maxLength={120}
+          disabled={disabled}
           value={label ?? ''}
           onChange={(event) => onChange(capabilities, event.target.value || null)}
         />
@@ -123,6 +130,7 @@ function CapabilityFields({
             <input
               type="checkbox"
               className="mt-0.5"
+              disabled={disabled}
               checked={capabilities.includes(capability)}
               onChange={(event) => {
                 const next = event.target.checked
@@ -157,11 +165,15 @@ export function TaskRoleConfigurationForm({
   roles,
   configuration,
   onChange,
+  actorLabel,
+  disabled = false,
 }: {
   role: TaskRoleResponse
   roles: TaskRoleResponse[]
   configuration: TaskRoleConfiguration
   onChange: (configuration: TaskRoleConfiguration) => void
+  actorLabel?: (actor: ActorRef) => string
+  disabled?: boolean
 }) {
   const changeCapabilities = (capabilities: TaskRoleCapability[], displayLabel: string | null) => {
     const requestsRework = capabilities.includes('request_rework')
@@ -170,24 +182,32 @@ export function TaskRoleConfigurationForm({
       capabilities,
       display_label: displayLabel,
       rework: requestsRework
-        ? configuration.rework ?? {
+        ? (configuration.rework ?? {
             mode: 'manual',
             allowed_destination_role_ids: [],
             next_review_role_id: null,
             correction_actor: null,
             review_actor: null,
-          }
+          })
         : null,
     })
   }
   const rework = configuration.rework
-  const reviewerRoles = roles.filter((item) => item.configuration.capabilities.includes('formal_review'))
-  const correctionActors = (rework?.allowed_destination_role_ids ?? []).flatMap(
-    (id) => roles.find((item) => item.id === id)?.members.filter((member) => member.status === 'active').map((member) => member.actor_ref) ?? [],
+  const reviewerRoles = roles.filter((item) =>
+    item.configuration.capabilities.includes('formal_review'),
   )
-  const reviewActors = roles.find((item) => item.id === rework?.next_review_role_id)?.members
-    .filter((member) => member.status === 'active')
-    .map((member) => member.actor_ref) ?? []
+  const correctionActors = (rework?.allowed_destination_role_ids ?? []).flatMap(
+    (id) =>
+      roles
+        .find((item) => item.id === id)
+        ?.members.filter((member) => member.status === 'active')
+        .map((member) => member.actor_ref) ?? [],
+  )
+  const reviewActors =
+    roles
+      .find((item) => item.id === rework?.next_review_role_id)
+      ?.members.filter((member) => member.status === 'active')
+      .map((member) => member.actor_ref) ?? []
   const correctionValue = selectionValue(rework?.correction_actor ?? null)
   const reviewValue = rework?.review_actor ? actorKey(rework.review_actor) : ''
 
@@ -196,6 +216,7 @@ export function TaskRoleConfigurationForm({
       <CapabilityFields
         capabilities={configuration.capabilities}
         label={configuration.display_label}
+        disabled={disabled}
         onChange={changeCapabilities}
       />
       {rework ? (
@@ -204,9 +225,15 @@ export function TaskRoleConfigurationForm({
           <label className="block max-w-sm space-y-1 text-xs">
             <span>Mode</span>
             <select
+              disabled={disabled}
               className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
               value={rework.mode}
-              onChange={(event) => onChange({ ...configuration, rework: { ...rework, mode: event.target.value as typeof rework.mode } })}
+              onChange={(event) =>
+                onChange({
+                  ...configuration,
+                  rework: { ...rework, mode: event.target.value as typeof rework.mode },
+                })
+              }
             >
               <option value="manual">Manual request</option>
               <option value="automatic">Automatic after request_changes</option>
@@ -214,31 +241,51 @@ export function TaskRoleConfigurationForm({
           </label>
           <fieldset className="space-y-2">
             <legend className="text-xs font-medium">Allowed correction TaskRoles</legend>
-            {roles.filter((item) => item.id !== role.id).map((item) => (
-              <label key={item.id} className="flex items-center gap-2 text-xs">
-                <input
-                  type="checkbox"
-                  checked={rework.allowed_destination_role_ids.includes(item.id)}
-                  onChange={(event) => {
-                    const allowed = new Set(rework.allowed_destination_role_ids)
-                    if (event.target.checked) allowed.add(item.id)
-                    else allowed.delete(item.id)
-                    onChange({ ...configuration, rework: { ...rework, allowed_destination_role_ids: [...allowed] } })
-                  }}
-                />
-                {item.configuration.display_label || item.role}
-              </label>
-            ))}
+            {roles
+              .filter((item) => item.id !== role.id)
+              .map((item) => (
+                <label key={item.id} className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    disabled={disabled}
+                    checked={rework.allowed_destination_role_ids.includes(item.id)}
+                    onChange={(event) => {
+                      const allowed = new Set(rework.allowed_destination_role_ids)
+                      if (event.target.checked) allowed.add(item.id)
+                      else allowed.delete(item.id)
+                      onChange({
+                        ...configuration,
+                        rework: { ...rework, allowed_destination_role_ids: [...allowed] },
+                      })
+                    }}
+                  />
+                  {item.configuration.display_label || item.role}
+                </label>
+              ))}
           </fieldset>
           <label className="block max-w-lg space-y-1 text-xs">
             <span>Next review TaskRole</span>
             <select
+              disabled={disabled}
               className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
               value={rework.next_review_role_id ?? ''}
-              onChange={(event) => onChange({ ...configuration, rework: { ...rework, next_review_role_id: event.target.value || null, review_actor: null } })}
+              onChange={(event) =>
+                onChange({
+                  ...configuration,
+                  rework: {
+                    ...rework,
+                    next_review_role_id: event.target.value || null,
+                    review_actor: null,
+                  },
+                })
+              }
             >
               <option value="">Choose a formal review role</option>
-              {reviewerRoles.map((item) => <option key={item.id} value={item.id}>{item.configuration.display_label || item.role}</option>)}
+              {reviewerRoles.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.configuration.display_label || item.role}
+                </option>
+              ))}
             </select>
           </label>
           <div className="grid gap-3 md:grid-cols-2">
@@ -246,18 +293,39 @@ export function TaskRoleConfigurationForm({
               label="Correction Actor selection"
               value={correctionValue}
               actors={correctionActors}
+              actorLabel={actorLabel}
+              disabled={disabled}
               allowOriginalContributor
-              onChange={(value) => onChange({ ...configuration, rework: { ...rework, correction_actor: selectionFromValue(value) } })}
+              onChange={(value) =>
+                onChange({
+                  ...configuration,
+                  rework: { ...rework, correction_actor: selectionFromValue(value) },
+                })
+              }
             />
             <ActorSelect
               label="Next review Actor"
               value={reviewValue}
               actors={reviewActors}
-              onChange={(value) => onChange({ ...configuration, rework: { ...rework, review_actor: parseActor(value) } })}
+              actorLabel={actorLabel}
+              disabled={disabled}
+              onChange={(value) =>
+                onChange({
+                  ...configuration,
+                  rework: { ...rework, review_actor: parseActor(value) },
+                })
+              }
             />
           </div>
-          {rework.mode === 'automatic' && (!rework.allowed_destination_role_ids.length || !rework.next_review_role_id || !rework.correction_actor || !rework.review_actor) ? (
-            <p className="text-xs text-destructive">Automatic mode requires a correction role, a formal review role, and both Actor selections.</p>
+          {rework.mode === 'automatic' &&
+          (!rework.allowed_destination_role_ids.length ||
+            !rework.next_review_role_id ||
+            !rework.correction_actor ||
+            !rework.review_actor) ? (
+            <p className="text-xs text-destructive">
+              Automatic mode requires a correction role, a formal review role, and both Actor
+              selections.
+            </p>
           ) : null}
         </div>
       ) : null}
@@ -270,11 +338,15 @@ export function ProjectTaskRoleConfigurationForm({
   roles,
   configuration,
   onChange,
+  actorLabel,
+  disabled = false,
 }: {
   roleName: string
   roles: ProjectTaskRoleDefault[]
   configuration: ProjectTaskRoleConfiguration
   onChange: (configuration: ProjectTaskRoleConfiguration) => void
+  actorLabel?: (actor: ActorRef) => string
+  disabled?: boolean
 }) {
   const changeCapabilities = (capabilities: TaskRoleCapability[], displayLabel: string | null) => {
     const requestsRework = capabilities.includes('request_rework')
@@ -283,18 +355,20 @@ export function ProjectTaskRoleConfigurationForm({
       capabilities,
       display_label: displayLabel,
       rework: requestsRework
-        ? configuration.rework ?? {
+        ? (configuration.rework ?? {
             mode: 'manual',
             allowed_destination_roles: [],
             next_review_role: null,
             correction_actor: null,
             review_actor: null,
-          }
+          })
         : null,
     })
   }
   const rework = configuration.rework
-  const reviewerRoles = roles.filter((item) => item.configuration.capabilities.includes('formal_review'))
+  const reviewerRoles = roles.filter((item) =>
+    item.configuration.capabilities.includes('formal_review'),
+  )
   const correctionActors = (rework?.allowed_destination_roles ?? []).flatMap(
     (name) => roles.find((item) => item.role === name)?.members ?? [],
   )
@@ -307,6 +381,7 @@ export function ProjectTaskRoleConfigurationForm({
       <CapabilityFields
         capabilities={configuration.capabilities}
         label={configuration.display_label}
+        disabled={disabled}
         onChange={changeCapabilities}
       />
       {rework ? (
@@ -314,38 +389,108 @@ export function ProjectTaskRoleConfigurationForm({
           <h4 className="text-sm font-medium">Default correction route</h4>
           <label className="block max-w-sm space-y-1 text-xs">
             <span>Mode</span>
-            <select className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground" value={rework.mode} onChange={(event) => onChange({ ...configuration, rework: { ...rework, mode: event.target.value as typeof rework.mode } })}>
+            <select
+              disabled={disabled}
+              className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
+              value={rework.mode}
+              onChange={(event) =>
+                onChange({
+                  ...configuration,
+                  rework: { ...rework, mode: event.target.value as typeof rework.mode },
+                })
+              }
+            >
               <option value="manual">Manual request</option>
               <option value="automatic">Automatic after request_changes</option>
             </select>
           </label>
           <fieldset className="space-y-2">
             <legend className="text-xs font-medium">Allowed correction roles</legend>
-            {roles.filter((item) => item.role !== roleName).map((item) => (
-              <label key={item.role} className="flex items-center gap-2 text-xs">
-                <input type="checkbox" checked={rework.allowed_destination_roles.includes(item.role)} onChange={(event) => {
-                  const allowed = new Set(rework.allowed_destination_roles)
-                  if (event.target.checked) allowed.add(item.role)
-                  else allowed.delete(item.role)
-                  onChange({ ...configuration, rework: { ...rework, allowed_destination_roles: [...allowed] } })
-                }} />
-                {item.configuration.display_label || item.role}
-              </label>
-            ))}
+            {roles
+              .filter((item) => item.role !== roleName)
+              .map((item) => (
+                <label key={item.role} className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    disabled={disabled}
+                    checked={rework.allowed_destination_roles.includes(item.role)}
+                    onChange={(event) => {
+                      const allowed = new Set(rework.allowed_destination_roles)
+                      if (event.target.checked) allowed.add(item.role)
+                      else allowed.delete(item.role)
+                      onChange({
+                        ...configuration,
+                        rework: { ...rework, allowed_destination_roles: [...allowed] },
+                      })
+                    }}
+                  />
+                  {item.configuration.display_label || item.role}
+                </label>
+              ))}
           </fieldset>
           <label className="block max-w-lg space-y-1 text-xs">
             <span>Next review role</span>
-            <select className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground" value={rework.next_review_role ?? ''} onChange={(event) => onChange({ ...configuration, rework: { ...rework, next_review_role: event.target.value || null, review_actor: null } })}>
+            <select
+              disabled={disabled}
+              className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
+              value={rework.next_review_role ?? ''}
+              onChange={(event) =>
+                onChange({
+                  ...configuration,
+                  rework: {
+                    ...rework,
+                    next_review_role: event.target.value || null,
+                    review_actor: null,
+                  },
+                })
+              }
+            >
               <option value="">Choose a formal review role</option>
-              {reviewerRoles.map((item) => <option key={item.role} value={item.role}>{item.configuration.display_label || item.role}</option>)}
+              {reviewerRoles.map((item) => (
+                <option key={item.role} value={item.role}>
+                  {item.configuration.display_label || item.role}
+                </option>
+              ))}
             </select>
           </label>
           <div className="grid gap-3 md:grid-cols-2">
-            <ActorSelect label="Correction Actor selection" value={correctionValue} actors={correctionActors} allowOriginalContributor onChange={(value) => onChange({ ...configuration, rework: { ...rework, correction_actor: selectionFromValue(value) } })} />
-            <ActorSelect label="Next review Actor" value={reviewValue} actors={reviewActors} onChange={(value) => onChange({ ...configuration, rework: { ...rework, review_actor: parseActor(value) } })} />
+            <ActorSelect
+              label="Correction Actor selection"
+              value={correctionValue}
+              actors={correctionActors}
+              actorLabel={actorLabel}
+              disabled={disabled}
+              allowOriginalContributor
+              onChange={(value) =>
+                onChange({
+                  ...configuration,
+                  rework: { ...rework, correction_actor: selectionFromValue(value) },
+                })
+              }
+            />
+            <ActorSelect
+              label="Next review Actor"
+              value={reviewValue}
+              actors={reviewActors}
+              actorLabel={actorLabel}
+              disabled={disabled}
+              onChange={(value) =>
+                onChange({
+                  ...configuration,
+                  rework: { ...rework, review_actor: parseActor(value) },
+                })
+              }
+            />
           </div>
-          {rework.mode === 'automatic' && (!rework.allowed_destination_roles.length || !rework.next_review_role || !rework.correction_actor || !rework.review_actor) ? (
-            <p className="text-xs text-destructive">Automatic mode requires a correction role, a formal review role, and both Actor selections.</p>
+          {rework.mode === 'automatic' &&
+          (!rework.allowed_destination_roles.length ||
+            !rework.next_review_role ||
+            !rework.correction_actor ||
+            !rework.review_actor) ? (
+            <p className="text-xs text-destructive">
+              Automatic mode requires a correction role, a formal review role, and both Actor
+              selections.
+            </p>
           ) : null}
         </div>
       ) : null}

@@ -41,11 +41,20 @@ vi.mock('@/api/hooks', async () => {
   const readyDispatch = { ...staleDispatch, can_launch: true, blockers: [] }
   const noMutation = { isPending: false, mutateAsync: vi.fn().mockResolvedValue({}) }
   return {
+    useProjectQuery: () => ({ data: { owner_id: 'owner-1' } }),
+    useMembersQuery: () => ({ data: [], isLoading: false, isError: false }),
+    useAgentsInfiniteQuery: () => ({ data: { pages: [] }, isLoading: false, isError: false }),
+    useDaemonsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false }),
     useTaskQuery: () => ({ data: task, isLoading: false, isError: false, refetch: vi.fn() }),
     useTaskLifecycleTransitionsQuery: () => ({ data: [], isLoading: false }),
     useExecutionsQuery: () => ({ data: { items: [] }, refetch: vi.fn() }),
     useReviewsQuery: () => ({ data: [], isLoading: false }),
-    useTaskReviewLinesQuery: () => ({ data: [], isLoading: false, isError: false, refetch: vi.fn() }),
+    useTaskReviewLinesQuery: () => ({
+      data: [],
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    }),
     useValidationsQuery: () => ({ data: [], isLoading: false }),
     useTaskGatesQuery: () => ({ data: [], isLoading: false }),
     useTaskWorkUnitsQuery: () => ({ data: [], refetch: vi.fn() }),
@@ -112,30 +121,48 @@ function renderCard(review: ReviewExecutionResponse) {
   return render(<ReviewExecutionCard review={review} />)
 }
 
+function expectTechnicalParagraphContaining(content: string) {
+  expect(
+    screen.getByText(
+      (_, element) => element?.tagName === 'P' && element.textContent?.includes(content) === true,
+    ),
+  ).toBeTruthy()
+}
+
 describe('ReviewExecutionCard authorization', () => {
   it('keeps a running Human Execution as history without a manual submit form', () => {
     renderCard(makeReview({ kind: 'human', id: 'user-1' }))
 
     expect(screen.getByText('Execution execution-1')).toBeTruthy()
     expect(screen.queryByLabelText('Review summary')).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' })).toBeNull()
+    expect(
+      screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' }),
+    ).toBeNull()
   })
 
   it('keeps another Human Execution visible as history without a submit action', () => {
     renderCard(makeReview({ kind: 'human', id: 'user-2' }))
 
     expect(screen.getByText('Execution execution-1')).toBeTruthy()
-    expect(screen.getByText('Actor human:user-2 · Workspace none · base none · head none')).toBeTruthy()
+    fireEvent.click(screen.getByText('Technical references'))
+    expectTechnicalParagraphContaining('Actor human:user-2')
+    expectTechnicalParagraphContaining('Base none · head none')
     expect(screen.queryByLabelText('Review summary')).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' })).toBeNull()
+    expect(
+      screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' }),
+    ).toBeNull()
   })
 
   it('never offers Human submission for an Agent Review Execution', () => {
     renderCard(makeReview({ kind: 'agent', id: 'agent-1' }))
 
     expect(screen.getByText('Execution execution-1')).toBeTruthy()
-    expect(screen.getByText('Actor agent:agent-1 · Workspace none · base none · head none')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' })).toBeNull()
+    fireEvent.click(screen.getByText('Technical references'))
+    expectTechnicalParagraphContaining('Actor agent:agent-1')
+    expectTechnicalParagraphContaining('Base none · head none')
+    expect(
+      screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' }),
+    ).toBeNull()
   })
 
   it('keeps a completed ReviewReport visible without a submit action', () => {
@@ -146,18 +173,20 @@ describe('ReviewExecutionCard authorization', () => {
 
     expect(screen.getByText('Review passed.')).toBeTruthy()
     expect(screen.queryByLabelText('Review summary')).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' })).toBeNull()
+    expect(
+      screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' }),
+    ).toBeNull()
   })
 })
 
 describe('Task WorkUnit preparation and launch', () => {
-  it('refreshes dispatch after WorkUnit setup so Launch Task becomes available', async () => {
+  it('refreshes dispatch after WorkUnit setup so ready work can be started', async () => {
     pageMocks.launch.mockClear()
     render(<TaskDetailPage taskId="task-1" initialTab="work" />)
 
-    expect(screen.queryByRole('button', { name: 'Launch Task' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Start ready work' })).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Create prepared WorkUnit' }))
-    const launch = await screen.findByRole('button', { name: 'Launch Task' })
+    const launch = await screen.findByRole('button', { name: 'Start ready work' })
     fireEvent.click(launch)
 
     await waitFor(() => expect(pageMocks.launch).toHaveBeenCalledTimes(1))

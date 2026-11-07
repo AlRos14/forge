@@ -194,18 +194,19 @@ export function useProjectsInfiniteQuery(limit = 20) {
   })
 }
 
-export function useProjectQuery(projectId: string) {
+export function useProjectQuery(projectId: string, enabled = true) {
   return useQuery({
     queryKey: qk.project(projectId),
     queryFn: () => apiFetch<Project>(`/projects/${projectId}`),
+    enabled: Boolean(projectId) && enabled,
   })
 }
 
-export function useProjectTaskRoleDefaultsQuery(projectId: string) {
+export function useProjectTaskRoleDefaultsQuery(projectId: string, enabled = true) {
   return useQuery({
     queryKey: qk.projectTaskRoleDefaults(projectId),
     queryFn: () => getProjectTaskRoleDefaults(projectId),
-    enabled: Boolean(projectId),
+    enabled: Boolean(projectId) && enabled,
   })
 }
 
@@ -692,7 +693,7 @@ export function useAgentsQuery() {
   })
 }
 
-export function useAgentsInfiniteQuery(limit = 20) {
+export function useAgentsInfiniteQuery(limit = 20, enabled = true) {
   return useInfiniteQuery({
     queryKey: qk.agentPages(limit),
     queryFn: ({ pageParam }) =>
@@ -701,6 +702,7 @@ export function useAgentsInfiniteQuery(limit = 20) {
       }),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled,
   })
 }
 
@@ -1346,11 +1348,11 @@ export function useUserSearch(query: string) {
 
 // --- Project Members ---
 
-export function useMembersQuery(projectId: string) {
+export function useMembersQuery(projectId: string, enabled = true) {
   return useQuery({
     queryKey: qk.projectMembers(projectId),
     queryFn: () => listMembers(projectId),
-    enabled: Boolean(projectId),
+    enabled: Boolean(projectId) && enabled,
   })
 }
 

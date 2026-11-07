@@ -4,15 +4,12 @@ import { apiFetch } from '@/api/client'
 import { qk } from '@/api/query-keys'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CopyReferenceButton } from '@/components/ui/copy-reference-button'
 import { MarkdownView } from '@/components/ui/markdown-editor'
 import { getApiErrorMessage } from '@/lib/api-error'
 import type { ArtifactResponse, PaginatedResponse } from '@/types/generated'
 
-export function TaskArtifactsPanel({
-  taskId,
-}: {
-  taskId: string
-}) {
+export function TaskArtifactsPanel({ taskId }: { taskId: string }) {
   const [expandedArtifactId, setExpandedArtifactId] = useState<string | null>(null)
   const artifactsQuery = useInfiniteQuery({
     queryKey: qk.taskArtifacts(taskId),
@@ -37,8 +34,8 @@ export function TaskArtifactsPanel({
         <div>
           <h2 className="font-semibold">Artifacts</h2>
           <p className="text-xs text-muted-foreground">
-            Purpose Plan saves its completed output as a Plan Artifact. Review it here and pass its
-            exact ID into a later Execution.
+            Durable results, review reports, and other Task outputs are recorded here. Open an item
+            to inspect its content and supporting metadata.
           </p>
         </div>
         <Button size="sm" variant="outline" onClick={() => void artifactsQuery.refetch()}>
@@ -46,7 +43,9 @@ export function TaskArtifactsPanel({
         </Button>
       </div>
 
-      {artifactsQuery.isLoading ? <p className="text-sm text-muted-foreground">Loading Artifacts…</p> : null}
+      {artifactsQuery.isLoading ? (
+        <p className="text-sm text-muted-foreground">Loading Artifacts…</p>
+      ) : null}
       {artifactsQuery.error ? (
         <p role="alert" className="text-sm text-destructive">
           {getApiErrorMessage(artifactsQuery.error, 'Artifacts could not be loaded')}
@@ -57,16 +56,24 @@ export function TaskArtifactsPanel({
         {artifacts.map((artifact) => (
           <article key={artifact.id} className="space-y-2 rounded-md border p-3">
             <div className="flex flex-wrap items-center gap-2">
-              <Badge variant="outline">{artifact.kind}</Badge>
+              <Badge variant="outline">{artifact.kind.replaceAll('_', ' ')}</Badge>
               <span className="text-xs text-muted-foreground">
                 {new Date(artifact.created_at).toLocaleString()}
               </span>
-              <code className="min-w-0 break-all text-xs">{artifact.id}</code>
-              {artifact.producer.kind === 'execution' ? (
-                <span className="text-xs text-muted-foreground">
-                  Execution {artifact.producer.execution_id}
-                </span>
-              ) : null}
+              <details className="min-w-0 text-xs text-muted-foreground">
+                <summary className="w-fit cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                  Technical references
+                </summary>
+                <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
+                  <code className="min-w-0 break-all">Artifact {artifact.id}</code>
+                  <CopyReferenceButton value={artifact.id} label="Artifact ID" />
+                  {artifact.producer.kind === 'execution' ? (
+                    <code className="min-w-0 break-all">
+                      Execution {artifact.producer.execution_id}
+                    </code>
+                  ) : null}
+                </div>
+              </details>
               <div className="ml-auto flex flex-wrap gap-2">
                 <Button
                   size="sm"
@@ -112,7 +119,9 @@ export function TaskArtifactsPanel({
       </div>
 
       {!artifactsQuery.isLoading && !artifactsQuery.error && artifacts.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No Artifacts have been recorded for this Task yet.</p>
+        <p className="text-sm text-muted-foreground">
+          No Artifacts have been recorded for this Task yet.
+        </p>
       ) : null}
 
       {artifactsQuery.hasNextPage ? (
