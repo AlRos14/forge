@@ -2225,6 +2225,9 @@ mod tests {
             membership_digest: actor_set_digest(std::slice::from_ref(&actor)),
             actor_refs: vec![actor.clone()],
         };
+        sqlx::query("UPDATE task_role_capability_configuration SET configuration_json = ? WHERE task_role_id IN (SELECT id FROM task_role WHERE task_id = ? AND role = 'reviewer')")
+            .bind(r#"{"schema_version":1,"display_label":null,"capabilities":["formal_review"],"rework":null}"#)
+            .bind(&task_id).execute(db.pool()).await.expect("explicit formal_review fixture capability");
         let execution_id = new_uuid_v4();
         db::ExecutionRepo::create(
             &*db,

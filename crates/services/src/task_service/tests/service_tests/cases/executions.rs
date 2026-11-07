@@ -115,11 +115,12 @@ async fn add_human_reviewer(
         .is_none()
     {
         service
-            .create_task_role(
+            .create_task_role_with_configuration(
                 &task.id,
                 "reviewer",
                 CoordinationMode::Collaborative,
                 "{}".to_owned(),
+                r#"{"schema_version":1,"display_label":null,"capabilities":["formal_review"],"rework":null}"#.to_owned(),
             )
             .await
             .expect("reviewer TaskRole creates");
@@ -600,11 +601,12 @@ async fn create_claimed_review_execution(
         .await
         .expect("Review fixture Task creates");
     service
-        .create_task_role(
+        .create_task_role_with_configuration(
             &task.id,
             "reviewer",
             CoordinationMode::Collaborative,
             "{}".to_owned(),
+                r#"{"schema_version":1,"display_label":null,"capabilities":["formal_review"],"rework":null}"#.to_owned(),
         )
         .await
         .expect("reviewer TaskRole creates");
@@ -654,6 +656,59 @@ async fn create_claimed_review_execution(
         Arc::new(::workspace::RepoCacheLockManager::new()),
         Arc::new(crate::WorkspaceExecutionLockManager::new()),
     );
+    if TaskRoleRepo::get_by_task_and_role(db, &task.id, "implementer")
+        .await
+        .unwrap()
+        .is_none()
+    {
+        service
+            .create_task_role(
+                &task.id,
+                "implementer",
+                CoordinationMode::Independent,
+                "{}".to_owned(),
+            )
+            .await
+            .unwrap();
+    }
+    service
+        .add_task_role_member(&task.id, "implementer", ActorRef::Human(human_id.clone()))
+        .await
+        .unwrap();
+    let source = work_unit_service
+        .create(
+            crate::CollaborationActorSource::Human(human_id.clone()),
+            crate::CreateWorkUnitInput {
+                task_id: task.id.clone(),
+                title: "Review context delivery".to_owned(),
+                scope: "Provide an independent context result".to_owned(),
+                execution_instructions: None,
+                role: "implementer".to_owned(),
+                parent_work_unit_id: None,
+                assigned_actor: Some(db::ActorRef::Human(human_id.clone())),
+                requires_integration: false,
+                provenance: None,
+                review_subject: None,
+                artifact_inputs: Vec::new(),
+                review_approval: None,
+            },
+        )
+        .await
+        .expect("independent source WorkUnit");
+    let source_execution_id = db::new_uuid_v4();
+    let source_time = now_rfc3339();
+    sqlx::query("INSERT INTO execution (id,task_id,role,status,actor_kind,actor_id,work_unit_id,work_unit_version,created_at,updated_at) VALUES (?,?,'implementer','completed','human',?,?,?, ?,?)")
+        .bind(&source_execution_id).bind(&task.id).bind(&human_id).bind(&source.id).bind(source.version)
+        .bind(&source_time).bind(&source_time).execute(db.pool()).await.expect("completed independent source attempt");
+    work_unit_service
+        .transition(
+            crate::CollaborationActorSource::Human(human_id.clone()),
+            &source.id,
+            source.version,
+            db::WorkUnitStatus::Completed,
+        )
+        .await
+        .expect("accept source delivery before review");
     let work_unit = work_unit_service
         .create(
             crate::collaboration_service::CollaborationActorSource::Human(human_id.clone()),
@@ -667,7 +722,7 @@ async fn create_claimed_review_execution(
                 assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
                 requires_integration: true,
                 provenance: None,
-                review_subject: None,
+                review_subject: Some(source.id),
                 artifact_inputs: Vec::new(),
                 review_approval: None,
             },
@@ -1824,11 +1879,12 @@ async fn pr8_review_subject_uses_exact_workunit_workspace_and_matching_evidence(
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let executor_config_snapshot_json = authorized_execution_snapshot(&db, &task, &agent_id).await;
     service
-        .create_task_role(
+        .create_task_role_with_configuration(
             &task.id,
             "reviewer",
             CoordinationMode::Collaborative,
             "{}".to_owned(),
+                r#"{"schema_version":1,"display_label":null,"capabilities":["formal_review"],"rework":null}"#.to_owned(),
         )
         .await
         .expect("reviewer TaskRole creates");
@@ -4640,6 +4696,21 @@ async fn explicit_multi_work_unit_recovery_keeps_repository_workspaces_and_lease
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
     let agent_a = seed_agent_with_executor_type(&db, "shell", "{}").await;
     let agent_b = seed_agent_with_executor_type(&db, "shell", "{}").await;
+    service
+        .create_task_role(
+            &task.id,
+            "implementer",
+            CoordinationMode::Collaborative,
+            "{}".to_owned(),
+        )
+        .await
+        .expect("shared implementation role creates before admission");
+    for agent_id in [&agent_a, &agent_b] {
+        service
+            .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_id.clone()))
+            .await
+            .expect("both memberships precede the frozen admission snapshots");
+    }
     let (parent_a, workspace_a) = create_running_repository_execution(
         &db,
         &service,

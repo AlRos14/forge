@@ -769,7 +769,7 @@ async fn remote_reviewer_start_rejects_old_daemon_that_cannot_preserve_role() {
             task_id: "task-1".to_owned(),
             execution_id: "execution-review".to_owned(),
             role: "reviewer".to_owned(),
-            task_role_capabilities: vec![],
+            task_role_capabilities: vec![api_types::TaskRoleCapability::FormalReview],
             workspace_path: "/work".to_owned(),
             executor_type: "shell".to_owned(),
             executor_config: json!({"executor_type":"shell","config":{}}),

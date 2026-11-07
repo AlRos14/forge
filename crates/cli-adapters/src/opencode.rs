@@ -1953,7 +1953,7 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
                 invocation: executors::HarnessInvocation::Start,
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
-                role: "project_copilot".to_owned(),
+                role: "implementer".to_owned(),
                 task_role_capabilities: vec![],
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),

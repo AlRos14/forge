@@ -57,6 +57,11 @@ Agent, HarnessSession, or fake System Actor.
 
 ## Immutability and lineage
 
+Daemon connection generations own cancellation and joining of their running
+executions. The harness receives cancellation without its cleanup future being
+dropped by the fallback executor. Retirement waits for cleanup; a timeout aborts
+the task and fails closed rather than proving that provider processes stopped.
+
 Actor, Role, Agent, HarnessProfileRevision, capabilities, and Workspace
 references become immutable after the Execution starts. An attached
 HarnessSession reference cannot be replaced. An unresolved ordered fallback

@@ -422,7 +422,9 @@ fn work_unit_write_error(error: sqlx::Error) -> DbError {
     }
     if let sqlx::Error::Database(database_error) = &error {
         let message = database_error.message().to_ascii_lowercase();
-        if message.contains("dependency would create a cycle") {
+        if message.contains("dependency would create a cycle")
+            || message.contains("dependency would create a combined review cycle")
+        {
             return DbError::CycleDetected;
         }
         if message.contains("unique constraint failed: work_unit_dependency") {

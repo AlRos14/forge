@@ -2116,20 +2116,14 @@ mod tests {
         )
         .await
         .expect("legacy database Human");
-        ProjectRepo::create(
-            &*db,
-            CreateProject {
-                id: project_id.clone(),
-                name: "V101 retry migration".to_owned(),
-                settings: "{}".to_owned(),
-                primary_repo_id: None,
-                owner_id: Some(user_id.clone()),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("legacy Project");
+        // Seed the historical schema directly; current repositories also
+        // write defaults tables that did not exist at this migration boundary.
+        sqlx::query("INSERT INTO project (id, name, settings, primary_repo_id, owner_id, created_at, updated_at) VALUES (?, 'Migration fixture project', '{}', NULL, ?, ?, ?)")
+            .bind(&project_id).bind(&user_id).bind(&now).bind(&now)
+            .execute(db.pool()).await.expect("historical Project fixture");
+        sqlx::query("INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) VALUES (?, ?, ?, 'owner', ?, ?)")
+            .bind(new_uuid_v4()).bind(&project_id).bind(&user_id).bind(&now).bind(&now)
+            .execute(db.pool()).await.expect("historical Project owner membership");
         sqlx::query(
             "INSERT INTO task (id, project_id, title, status, created_at, updated_at)
              VALUES (?, ?, ?, 'in_progress', ?, ?)",
@@ -2709,6 +2703,9 @@ mod tests {
         )
         .await
         .expect("active Human reviewer membership");
+        sqlx::query("UPDATE task_role_capability_configuration SET configuration_json = ? WHERE task_role_id IN (SELECT id FROM task_role WHERE task_id = ? AND role = 'reviewer')")
+            .bind(r#"{"schema_version":1,"display_label":null,"capabilities":["formal_review"],"rework":null}"#)
+            .bind(&task_id).execute(db.pool()).await.expect("explicit formal_review fixture capability");
         let actor = db::ActorRef::Human(user_id.clone());
         ExecutionRepo::create(
             &*db,

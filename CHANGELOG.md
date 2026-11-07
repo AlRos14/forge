@@ -150,6 +150,12 @@ PR14 audit on 2026-10-16.
 
 ### Fixed
 
+- Daemon generation retirement lets the harness finish cancellation cleanup
+  before joining its execution. A timed-out cleanup fails closed instead of
+  reporting a retired generation while provider processes may still run.
+- Combined dependency/review cycles return the typed cycle conflict when
+  rejected by the database guard.
+
 - Automatic rework intents now link to the exact manual receipt when a human
   completes the same ReviewReport first. A concurrent Task pause leaves the
   intent pending for resume, while cancellation records a distinct terminal

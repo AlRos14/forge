@@ -31,7 +31,7 @@ async fn human_reviews_an_exact_work_unit_without_creating_an_execution_manually
             &harness.app,
             Method::POST,
             &format!("/api/v1/tasks/{}/task-roles", task.id),
-            json!({"role":role,"coordination_mode":"independent","policy":{}}),
+            json!({"role":role,"coordination_mode":"independent","policy":{},"configuration":if role=="reviewer" {json!({"capabilities":["formal_review"]})}else{json!({})}}),
             StatusCode::OK,
         )
         .await;
@@ -44,6 +44,30 @@ async fn human_reviews_an_exact_work_unit_without_creating_an_execution_manually
         )
         .await;
     }
+    let roles: Value = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/task-roles", task.id),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    let role = |name: &str| {
+        roles
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["role"] == name)
+            .unwrap()
+    };
+    let implementer_role_id = role("implementer")["id"].as_str().unwrap().to_owned();
+    let _: Value = json_request(&harness.app,Method::PATCH,&format!("/api/v1/tasks/{}/task-roles/reviewer",task.id),json!({
+        "expected_version":role("reviewer")["version"],
+        "configuration":{"capabilities":["formal_review","request_rework"],"rework":{
+            "mode":"manual","allowed_destination_role_ids":[implementer_role_id],"next_review_role_id":role("reviewer")["id"],
+            "correction_actor":null,"review_actor":{"kind":"human","id":"test-user-id"}
+        }}
+    }),StatusCode::OK).await;
     let command =
         "printf delivered > evidence.txt && git add evidence.txt && git commit -m delivered";
     let implementation = create_allocated_work_unit(
@@ -244,9 +268,9 @@ async fn human_reviews_an_exact_work_unit_without_creating_an_execution_manually
             "expected_task_version":task.version,"expected_lifecycle_version":task.lifecycle.version,
             "review_report_artifact_id":submitted.report.id,
             "reviewed_work_unit_id":implementation.id,"reviewed_work_unit_version":implementation.version,
-            "correction_title":"C1","correction_scope":"Add missing evidence","correction_role":"implementer",
+            "correction_title":"C1","correction_scope":"Add missing evidence","correction_role_id":implementer_role_id,
             "correction_actor":null,"review_title":"R2","review_scope":"Review corrected evidence",
-            "review_actor":{"kind":"human","id":"test-user-id"},"review_role":"reviewer",
+            "review_actor":{"kind":"human","id":"test-user-id"},
             "idempotency_key":"late-allocation-round"
         }), StatusCode::OK).await;
     let correction: WorkUnitResponse = json_request(

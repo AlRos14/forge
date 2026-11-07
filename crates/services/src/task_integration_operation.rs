@@ -473,10 +473,10 @@ mod tests {
 
     use super::*;
     use db::{
-        create_sqlite_pool, run_migrations, CreatePrProviderConfig, CreateProject, CreateRepo,
-        CreateTask, CreateTerminalSession, CreateWorkspace, PrMetadataRepo, PrProviderConfigRepo,
-        ProjectRepo, RepoRepo, TaskIntegrationOperationKind, TaskRepo, TerminalSessionRepo,
-        UserRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
+        create_sqlite_pool, run_migrations, CreatePrProviderConfig, CreateRepo, CreateTask,
+        CreateTerminalSession, CreateWorkspace, PrMetadataRepo, PrProviderConfigRepo, ProjectRepo,
+        RepoRepo, TaskIntegrationOperationKind, TaskRepo, TerminalSessionRepo, UserRepo, WorkMode,
+        WorkspaceRepo, WorkspaceStatus,
     };
     use events::EventBus;
     use std::{
@@ -701,20 +701,14 @@ mod tests {
         )
         .await
         .expect("user");
-        ProjectRepo::create(
-            &*db,
-            CreateProject {
-                id: project_id.clone(),
-                name: "Task integration operation recovery".to_owned(),
-                settings: "{}".to_owned(),
-                primary_repo_id: None,
-                owner_id: Some(user_id.clone()),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("project");
+        // Seed the historical schema directly; current repositories also
+        // write defaults tables that did not exist at this migration boundary.
+        sqlx::query("INSERT INTO project (id, name, settings, primary_repo_id, owner_id, created_at, updated_at) VALUES (?, 'Migration fixture project', '{}', NULL, ?, ?, ?)")
+            .bind(&project_id).bind(&user_id).bind(&now).bind(&now)
+            .execute(db.pool()).await.expect("historical Project fixture");
+        sqlx::query("INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) VALUES (?, ?, ?, 'owner', ?, ?)")
+            .bind(new_uuid_v4()).bind(&project_id).bind(&user_id).bind(&now).bind(&now)
+            .execute(db.pool()).await.expect("historical Project owner membership");
         RepoRepo::create(
             &*db,
             CreateRepo {

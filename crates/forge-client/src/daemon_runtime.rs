@@ -229,7 +229,9 @@ impl DaemonRuntime {
         registry: Arc<executors::HarnessAdapterRegistry>,
         active_executions: ActiveExecutionTracker,
     ) -> Arc<Self> {
-        let executor = Arc::new(FallbackExecutor::new(Arc::clone(&registry)));
+        let executor = Arc::new(
+            FallbackExecutor::new(Arc::clone(&registry)).with_adapter_owned_cancellation(),
+        );
         Arc::new(Self {
             workspace_root,
             outbound,

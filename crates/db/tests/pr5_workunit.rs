@@ -939,7 +939,12 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
     .await;
 
     let at_capacity = cleanup_admission_fixture(&db, root.path()).await;
-    for _ in 0..4 {
+    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 1 WHERE id = ?")
+        .bind(&at_capacity.agent_id)
+        .execute(db.pool())
+        .await
+        .expect("isolate Agent capacity below the Task ceiling");
+    {
         let mut running =
             running_execution(&db, &at_capacity.task_id, "unused", &at_capacity.agent_id).await;
         running.workspace_id = None;

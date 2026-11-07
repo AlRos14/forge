@@ -393,6 +393,7 @@ pub struct FallbackExecutor {
     cooldowns: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     cancellations: std::sync::Mutex<HashMap<String, Arc<CancellationState>>>,
     prepared_executions: std::sync::Mutex<HashSet<String>>,
+    adapter_owned_cancellation: bool,
 }
 
 struct CancellationState {
@@ -444,7 +445,15 @@ impl FallbackExecutor {
             cooldowns: std::sync::Mutex::new(HashMap::new()),
             cancellations: std::sync::Mutex::new(HashMap::new()),
             prepared_executions: std::sync::Mutex::new(HashSet::new()),
+            adapter_owned_cancellation: false,
         }
+    }
+
+    /// Let a connection-generation owner cancel and join the adapter itself.
+    /// Dropping its future early cannot prove child/process-group retirement.
+    pub fn with_adapter_owned_cancellation(mut self) -> Self {
+        self.adapter_owned_cancellation = true;
+        self
     }
 
     /// Reserve cancellation state before a daemon runtime spawns the execution
@@ -800,13 +809,17 @@ impl TaskExecutor for FallbackExecutor {
                         }
                     }
                 };
-                let attempt = tokio::select! {
-                    biased;
-                    () = cancellation.signal.cancelled() => Ok(ExecutionResult {
-                        status: crate::ExecutionOutcome::Cancelled,
-                        ..Default::default()
-                    }),
-                    attempt = attempt_future => attempt,
+                let attempt = if self.adapter_owned_cancellation {
+                    attempt_future.await
+                } else {
+                    tokio::select! {
+                        biased;
+                        () = cancellation.signal.cancelled() => Ok(ExecutionResult {
+                            status: crate::ExecutionOutcome::Cancelled,
+                            ..Default::default()
+                        }),
+                        attempt = attempt_future => attempt,
+                    }
                 };
                 writer = crate::LogWriter::new(
                     std::path::Path::new(&ctx.logs_path),
