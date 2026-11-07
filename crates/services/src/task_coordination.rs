@@ -1587,9 +1587,10 @@ impl TaskCoordinationService {
                 .await;
             match materialize {
                 Ok(_) => {}
-                Err(ServiceError::Coordination { code, message })
-                    if code == "coordination.paused" =>
-                {
+                Err(ServiceError::Coordination {
+                    code: "coordination.paused",
+                    message,
+                }) => {
                     tracing::info!(task_id = %request.task_id, %message, "coordination plan waits for resume");
                 }
                 Err(error) => return Err(error),
@@ -2403,6 +2404,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn set_intervention_state(
         &self,
         intervention: &TaskIntervention,
@@ -2722,6 +2724,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         Ok(blockers)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn validate_plan(
         &self,
         task: &Task,
@@ -3075,6 +3078,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn event(
         &self,
         event_type: &str,

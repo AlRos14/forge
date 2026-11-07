@@ -116,6 +116,7 @@ pub trait TaskLifecycleRepo: Send + Sync {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait TaskCoordinationRepo: Send + Sync {
     async fn get_task_coordination(&self, task_id: &str) -> Result<Option<TaskCoordination>>;
     async fn get_task_coordination_receipt(
