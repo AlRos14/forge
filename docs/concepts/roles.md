@@ -1,5 +1,11 @@
 # Roles and memberships
 
+> Diseño objetivo aprobado, todavía pendiente de implementación:
+> [modelo operativo de tareas y UX](task-operating-model.md). Define la
+> separación Copilot/Orquestador, preparación desde objetivo y rutas de calidad.
+> El resto de este documento describe el contrato actual salvo indicación expresa.
+
+
 Roles are Task-scoped responsibility. They are not Agent classes and do not
 describe the intrinsic type of an Actor.
 

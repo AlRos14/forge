@@ -1,5 +1,11 @@
 # Review and validation
 
+> Diseño objetivo aprobado, todavía pendiente de implementación:
+> [modelo operativo de tareas y UX](task-operating-model.md). Define la
+> separación Copilot/Orquestador, preparación desde objetivo y rutas de calidad.
+> El resto de este documento describe el contrato actual salvo indicación expresa.
+
+
 Validation and review are separate kinds of work and separate sources of
 truth.
 

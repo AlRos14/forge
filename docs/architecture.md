@@ -162,3 +162,12 @@ ownership for historical records during a container migration.
 ## Upstream
 
 Forge originated from [ForgeAILab/forge](upstream.md). The origin and MIT attribution remain. This repository is independently maintained and does not promise architectural or release compatibility with upstream. See [upstream relationship](upstream.md).
+
+## Accepted target operating model — implementation pending
+
+The owner-approved [task operating model](concepts/task-operating-model.md)
+separates Project Copilot assistance from end-to-end Task coordination and makes
+objective, team, and authorization the primary user journey. Worker WorkUnits,
+leases, exact evidence, and TaskLifecycle authority remain mandatory. This is a
+target contract, not a claim that the current runtime supports the whole journey.
+See the [system review and implementation sequence](plans/task-coordination-and-guided-experience.md).

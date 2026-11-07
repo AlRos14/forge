@@ -1,5 +1,11 @@
 # WorkUnits
 
+> Diseño objetivo aprobado, todavía pendiente de implementación:
+> [modelo operativo de tareas y UX](task-operating-model.md). Define la
+> separación Copilot/Orquestador, preparación desde objetivo y rutas de calidad.
+> El resto de este documento describe el contrato actual salvo indicación expresa.
+
+
 A WorkUnit is a concrete, executable scope inside a Task. It is not a plan,
 requirements language, or second cognitive authority. Its `role` names the
 TaskRole used for eligibility; formal review behavior comes from that role's
