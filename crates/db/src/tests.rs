@@ -5052,12 +5052,13 @@ async fn migration_creates_schema_and_enforces_foreign_keys() {
         crate::TaskLifecycleState::Ready
     );
 
-    let rejected_task_id = new_uuid_v4();
-    sqlx::query(&format!(
+    let rejected_task_id = "00000000-0000-4000-8000-000000000099".to_owned();
+    sqlx::query(
         "CREATE TRIGGER reject_task_lifecycle_for_test
-         BEFORE INSERT ON task_lifecycle WHEN NEW.task_id = '{rejected_task_id}'
-         BEGIN SELECT RAISE(ABORT, 'injected lifecycle insert failure'); END"
-    ))
+         BEFORE INSERT ON task_lifecycle
+         WHEN NEW.task_id = '00000000-0000-4000-8000-000000000099'
+         BEGIN SELECT RAISE(ABORT, 'injected lifecycle insert failure'); END",
+    )
     .execute(&pool)
     .await
     .expect("failure injection trigger creates");

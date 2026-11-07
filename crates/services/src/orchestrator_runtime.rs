@@ -3784,22 +3784,11 @@ mod tests {
         let execution = ExecutionRepo::get_by_id(&*fixture.database, &execution_id)
             .await
             .expect("Execution lookup succeeds");
-        let resolved_daemon_id = execution
-            .as_ref()
-            .and_then(|execution| execution.executor_config_snapshot_json.as_deref())
-            .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
-            .and_then(|snapshot| {
-                snapshot
-                    .get("resolved_daemon_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            });
         assert!(
             matches!(&outcome, DispatchOutcome::Retried)
                 && provider_calls == 0
                 && execution.is_none(),
-            "cross-account global Agent must be denied before provider Start; got {outcome:?}, {provider_calls} provider calls, resolved daemon {resolved_daemon_id:?} (Agent-owned daemon {})",
-            fixture.daemon_id
+            "cross-account global Agent must be denied before provider Start"
         );
         assert_eq!(attempt_state, "reserved");
         let wake_state: String =

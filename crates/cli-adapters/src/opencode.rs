@@ -1267,14 +1267,12 @@ fn extract_visible_text_part(value: &serde_json::Value) -> Option<String> {
                     .filter(|text| !text.trim().is_empty())
                     .map(str::to_owned);
             }
-            for key in ["text"] {
-                if let Some(text) = object
-                    .get(key)
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|text| !text.trim().is_empty())
-                {
-                    return Some(text.to_owned());
-                }
+            if let Some(text) = object
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+            {
+                return Some(text.to_owned());
             }
             ["part", "parts", "content"]
                 .into_iter()
