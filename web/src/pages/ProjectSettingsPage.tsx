@@ -144,9 +144,9 @@ export function ProjectSettingsPage({
   }
 
   return (
-    <div className="flex min-h-[calc(100dvh-7rem)] max-h-[calc(100dvh-7rem)] flex-col gap-0 overflow-hidden rounded-xl border border-border-subtle bg-card shadow-card lg:flex-row">
+    <div className="flex min-w-0 flex-col gap-0 rounded-xl border border-border-subtle bg-card shadow-card lg:flex-row">
       {/* Settings sidebar */}
-      <aside className="flex w-full shrink-0 flex-col border-b bg-background lg:w-56 lg:border-b-0 lg:border-r">
+      <aside className="flex w-full min-w-0 shrink-0 flex-col border-b bg-background lg:w-56 lg:border-b-0 lg:border-r">
         <div className="border-b px-4 py-3">
           <p className="font-mono text-micro font-semibold uppercase tracking-[1px] text-muted-foreground">
             Settings
@@ -191,7 +191,7 @@ export function ProjectSettingsPage({
       </aside>
 
       {/* Content area */}
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6 lg:px-8 lg:py-6">
+      <div className="min-w-0 flex-1 px-4 py-4 sm:px-6 sm:py-6">
         <div className="max-w-[760px]">
           {projectQuery.isError && (
             <ErrorBanner

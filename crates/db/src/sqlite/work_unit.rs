@@ -3,6 +3,31 @@ use crate::CreateWorkUnitReviewSubject;
 use crate::FollowUpExecutionReceipt;
 use sqlx::Column;
 
+async fn task_role_has_capability_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    role_name: &str,
+    capability: &str,
+) -> Result<bool> {
+    let enabled: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM task_role role
+            JOIN task_role_capability_configuration configuration
+              ON configuration.task_role_id = role.id
+            JOIN json_each(configuration.configuration_json, '$.capabilities') value
+            WHERE role.task_id = ? AND role.role = ?
+              AND json_extract(configuration.configuration_json, '$.schema_version') = 1
+              AND value.type = 'text' AND value.value = ?
+         )",
+    )
+    .bind(task_id)
+    .bind(role_name)
+    .bind(capability)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(enabled != 0)
+}
+
 fn validate_blocking_metadata_execution_identity(
     error_annotation: Option<&str>,
     blocked_json: Option<&str>,
@@ -223,6 +248,8 @@ fn map_work_unit(row: SqliteRow) -> Result<WorkUnit> {
             row.try_get("provenance_id")?,
             row.try_get("provenance_actor_kind")?,
         )?,
+        review_approval_gate_id: row.try_get("review_approval_gate_id")?,
+        review_approval_line_id: row.try_get("review_approval_line_id")?,
         created_by: actor_from_columns(
             Some(row.try_get("created_by_kind")?),
             Some(row.try_get("created_by_id")?),
@@ -308,7 +335,14 @@ async fn insert_work_unit_execution_in_tx(
     }
     if let Some(lease) = admission.workspace_lease.as_ref() {
         let actor = admission.execution.actor_ref.as_ref();
-        let expected_lease_role = if admission.execution.role == "reviewer" {
+        let expected_lease_role = if task_role_has_capability_in_tx(
+            tx,
+            &admission.execution.task_id,
+            &admission.execution.role,
+            "formal_review",
+        )
+        .await?
+        {
             "reviewer"
         } else {
             "worker"
@@ -422,9 +456,10 @@ async fn create_work_unit_row(
                 id, task_id, parent_work_unit_id, title, scope, status, role,
                 assigned_actor_kind, assigned_actor_id, requires_integration,
                 provenance_kind, provenance_id, provenance_actor_kind,
+                review_approval_gate_id, review_approval_line_id,
                 created_by_kind, created_by_id,
                 version, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
     )
     .bind(&input.id)
     .bind(&input.task_id)
@@ -438,6 +473,8 @@ async fn create_work_unit_row(
     .bind(provenance_kind.as_deref())
     .bind(provenance_id.as_deref())
     .bind(provenance_actor_kind.as_deref())
+    .bind(input.review_approval_gate_id.as_deref())
+    .bind(input.review_approval_line_id.as_deref())
     .bind(&created_kind)
     .bind(&created_id)
     .bind(&now)
@@ -445,6 +482,48 @@ async fn create_work_unit_row(
     .execute(&mut *tx)
     .await
     .map_err(work_unit_write_error)?;
+    for artifact_id in &input.artifact_input_ids {
+        let artifact = sqlx::query(
+            "SELECT artifact.digest, producer.execution_id
+             FROM artifact artifact
+             JOIN artifact_execution_producer producer
+               ON producer.artifact_id = artifact.id AND producer.task_id = artifact.task_id
+             JOIN execution execution
+               ON execution.id = producer.execution_id AND execution.task_id = producer.task_id
+             WHERE artifact.id = ? AND artifact.task_id = ? AND execution.status = 'completed'",
+        )
+        .bind(artifact_id)
+        .bind(&input.task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            DbError::Check(
+                "WorkUnit Artifact input must be a completed same-Task producer result".to_owned(),
+            )
+        })?;
+        let digest: Option<String> = artifact.try_get("digest")?;
+        let digest = digest
+            .filter(|digest| !digest.trim().is_empty())
+            .ok_or_else(|| {
+                DbError::Check("WorkUnit Artifact inputs require a persisted digest".to_owned())
+            })?;
+        let producer_execution_id: String = artifact.try_get("execution_id")?;
+        sqlx::query(
+            "INSERT INTO work_unit_artifact_input (
+                work_unit_id, task_id, artifact_id, artifact_digest,
+                producer_execution_id, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(artifact_id)
+        .bind(digest)
+        .bind(producer_execution_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(work_unit_write_error)?;
+    }
     if let Some(execution_instructions) = input.execution_instructions.as_deref() {
         sqlx::query("UPDATE work_unit SET execution_instructions = ? WHERE id = ? AND task_id = ?")
             .bind(execution_instructions)
@@ -459,6 +538,70 @@ async fn create_work_unit_row(
             return Err(DbError::Check(
                 "review subject identity must match the new WorkUnit and Task".to_owned(),
             ));
+        }
+        if let (
+            Some(manifest_json),
+            Some(manifest_digest),
+            Some(result_execution_id),
+            Some(result_artifact_id),
+        ) = (
+            subject.manifest_json.as_deref(),
+            subject.manifest_digest.as_deref(),
+            subject.result_execution_id.as_deref(),
+            subject.result_artifact_id.as_deref(),
+        ) {
+            let existing_manifest = sqlx::query(
+                "SELECT task_id, work_unit_id, work_unit_version,
+                        delivery_artifact_digest, manifest_json, manifest_digest
+                 FROM work_unit_artifact_manifest
+                 WHERE execution_id = ? AND delivery_artifact_id = ?",
+            )
+            .bind(result_execution_id)
+            .bind(result_artifact_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(existing) = existing_manifest {
+                let matches_same_delivery = existing.try_get::<String, _>("task_id")?
+                    == subject.task_id
+                    && existing.try_get::<String, _>("work_unit_id")?
+                        == subject.reviewed_work_unit_id
+                    && existing.try_get::<Option<i64>, _>("work_unit_version")?
+                        == subject.reviewed_work_unit_version
+                    && existing.try_get::<String, _>("manifest_json")? == manifest_json
+                    && existing.try_get::<String, _>("manifest_digest")? == manifest_digest;
+                if !matches_same_delivery {
+                    return Err(DbError::Check(
+                        "an existing Artifact manifest for this result has different exact content"
+                            .to_owned(),
+                    ));
+                }
+            } else {
+                let manifest_id = crate::new_uuid_v4();
+                sqlx::query(
+                    "INSERT INTO work_unit_artifact_manifest (
+                        id, task_id, work_unit_id, work_unit_version, execution_id,
+                        delivery_artifact_id, delivery_artifact_digest, manifest_json,
+                        manifest_digest, created_at
+                     )
+                     SELECT ?, ?, ?, ?, ?, ?, artifact.digest, ?, ?, ?
+                     FROM artifact
+                     WHERE artifact.id = ? AND artifact.task_id = ?",
+                )
+                .bind(&manifest_id)
+                .bind(&subject.task_id)
+                .bind(&subject.reviewed_work_unit_id)
+                .bind(subject.reviewed_work_unit_version)
+                .bind(result_execution_id)
+                .bind(result_artifact_id)
+                .bind(manifest_json)
+                .bind(manifest_digest)
+                .bind(&subject.created_at)
+                .bind(result_artifact_id)
+                .bind(&subject.task_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(work_unit_write_error)?;
+            }
         }
         sqlx::query(
             "INSERT INTO work_unit_review_subject (
@@ -494,6 +637,8 @@ async fn create_work_unit_row(
         assigned_actor: input.assigned_actor,
         requires_integration: input.requires_integration,
         provenance: input.provenance,
+        review_approval_gate_id: input.review_approval_gate_id,
+        review_approval_line_id: input.review_approval_line_id,
         created_by: input.created_by,
         version: 1,
         created_at: now.clone(),
@@ -679,7 +824,142 @@ impl WorkUnitRepo for SqliteDb {
                 Err(DbError::NotFound)
             };
         }
+        if let Some(reviewed_result) = input.reviewed_result.as_ref() {
+            let task_id: String = sqlx::query_scalar("SELECT task_id FROM work_unit WHERE id = ?")
+                .bind(&input.id)
+                .fetch_one(&mut *tx)
+                .await?;
+            match (
+                reviewed_result.result_artifact_id.as_deref(),
+                reviewed_result.result_artifact_digest.as_deref(),
+                reviewed_result.manifest_id.as_deref(),
+                reviewed_result.manifest_json.as_deref(),
+                reviewed_result.manifest_digest.as_deref(),
+            ) {
+                (
+                    Some(artifact_id),
+                    Some(artifact_digest),
+                    Some(manifest_id),
+                    Some(manifest_json),
+                    Some(manifest_digest),
+                ) => {
+                    sqlx::query(
+                        "INSERT INTO work_unit_artifact_manifest (
+                            id, task_id, work_unit_id, work_unit_version, execution_id,
+                            delivery_artifact_id, delivery_artifact_digest, manifest_json,
+                            manifest_digest, created_at
+                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(manifest_id)
+                    .bind(&task_id)
+                    .bind(&input.id)
+                    .bind(input.expected_version)
+                    .bind(&reviewed_result.execution_id)
+                    .bind(artifact_id)
+                    .bind(artifact_digest)
+                    .bind(manifest_json)
+                    .bind(manifest_digest)
+                    .bind(&input.updated_at)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                (None, None, None, None, None) => {}
+                _ => {
+                    return Err(DbError::Check(
+                        "completed reviewed result has incomplete Artifact manifest data"
+                            .to_owned(),
+                    ));
+                }
+            }
+            // The immutable V147 domain-event trigger freezes this exact result
+            // into every pending subject when the completion event is appended
+            // immediately below. The manifest must exist first so the V155
+            // review-line projection captures its identity in the same commit.
+        }
         let event = append_event(self, &mut tx, &event_input).await?;
+        if let Some(reviewed_result) = input.reviewed_result.as_ref() {
+            // V147 freezes the subject from the completion event. Project that
+            // exact result directly as well, because SQLite does not run nested
+            // V155 subject-update triggers from the V147 event trigger.
+            sqlx::query(
+                "INSERT OR IGNORE INTO work_unit_review_line (
+                    id, task_id, root_work_unit_id, current_work_unit_id,
+                    current_work_unit_version, current_result_execution_id,
+                    current_result_artifact_id, current_commit_sha, current_workspace_id,
+                    current_snapshot_digest, current_manifest_id, latest_report_artifact_id,
+                    latest_verdict, revision, created_at, updated_at
+                 )
+                 SELECT lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4'
+                          || lower(substr(hex(randomblob(2)), 2, 3)) || '-'
+                          || substr('89ab', 1 + (abs(random()) % 4), 1)
+                          || lower(substr(hex(randomblob(2)), 2, 3)) || '-' || lower(hex(randomblob(6))),
+                        subject.task_id, subject.reviewed_work_unit_id,
+                        subject.reviewed_work_unit_id, subject.reviewed_work_unit_version,
+                        subject.result_execution_id, subject.result_artifact_id,
+                        subject.result_commit_sha, subject.result_workspace_id,
+                        subject.workspace_snapshot_digest, ?, NULL, NULL, 1,
+                        subject.created_at, ?
+                 FROM work_unit_review_subject subject
+                 WHERE subject.task_id = (SELECT task_id FROM work_unit WHERE id = ?)
+                   AND subject.reviewed_work_unit_id = ?
+                   AND subject.reviewed_work_unit_version = ?
+                   AND subject.result_execution_id = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_rework_receipt receipt
+                       WHERE receipt.review_work_unit_id = subject.review_work_unit_id
+                   )",
+            )
+            .bind(reviewed_result.manifest_id.as_deref())
+            .bind(&input.updated_at)
+            .bind(&input.id)
+            .bind(&input.id)
+            .bind(input.expected_version)
+            .bind(&reviewed_result.execution_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE work_unit_review_line
+                 SET current_work_unit_version = ?, current_result_execution_id = ?,
+                     current_result_artifact_id = ?, current_commit_sha = ?,
+                     current_workspace_id = ?, current_snapshot_digest = ?,
+                     current_manifest_id = ?, latest_report_artifact_id = NULL,
+                     latest_verdict = NULL, revision = revision + 1, updated_at = ?
+                 WHERE task_id = (SELECT task_id FROM work_unit WHERE id = ?)
+                   AND current_work_unit_id = ? AND current_result_execution_id IS NULL",
+            )
+            .bind(input.expected_version)
+            .bind(&reviewed_result.execution_id)
+            .bind(reviewed_result.result_artifact_id.as_deref())
+            .bind(reviewed_result.result_commit_sha.as_deref())
+            .bind(reviewed_result.result_workspace_id.as_deref())
+            .bind(reviewed_result.workspace_snapshot_digest.as_deref())
+            .bind(reviewed_result.manifest_id.as_deref())
+            .bind(&input.updated_at)
+            .bind(&input.id)
+            .bind(&input.id)
+            .execute(&mut *tx)
+            .await?;
+            let review_line_projected: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM work_unit_review_line
+                    WHERE task_id = (SELECT task_id FROM work_unit WHERE id = ?)
+                      AND current_work_unit_id = ?
+                      AND current_result_execution_id = ?
+                      AND current_manifest_id IS ?
+                )",
+            )
+            .bind(&input.id)
+            .bind(&input.id)
+            .bind(&reviewed_result.execution_id)
+            .bind(reviewed_result.manifest_id.as_deref())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !review_line_projected {
+                return Err(DbError::Check(
+                    "completed WorkUnit result was not frozen into its review line".to_owned(),
+                ));
+            }
+        }
         let record = map_work_unit(
             sqlx::query("SELECT * FROM work_unit WHERE id = ?")
                 .bind(&input.id)
@@ -2048,7 +2328,14 @@ impl WorkUnitExecutionRepo for SqliteDb {
         }
         if let Some(lease) = admission.workspace_lease.as_ref() {
             let actor = admission.execution.actor_ref.as_ref();
-            let expected_lease_role = if admission.execution.role == "reviewer" {
+            let expected_lease_role = if task_role_has_capability_in_tx(
+                &mut tx,
+                &admission.execution.task_id,
+                &admission.execution.role,
+                "formal_review",
+            )
+            .await?
+            {
                 "reviewer"
             } else {
                 "worker"

@@ -40,6 +40,11 @@ currently create a WorkUnit. Create and allocate the WorkUnit through the REST
 or MCP API, prepare its repository Workspace, and then launch the Task. Optional
 WorkUnit `execution_instructions` are passed to the assigned harness.
 
+The current CLI role commands do not edit capability or rework configuration.
+Use the versioned REST TaskRole endpoints or `forge_create_task_role` /
+`forge_update_task_role` through MCP to configure those settings; changes that
+grant capabilities require Project owner/admin authority.
+
 The CLI accepts only the current TaskLifecycle states: `backlog`, `ready`, `active`, `blocked`, `ready-to-merge`, `merging`, `done`, and `cancelled`. A transition includes the current lifecycle version and an idempotency key. A transition to `ready-to-merge` also needs the exact satisfied GateEvaluation.
 
 `task launch`, `task pause`, `task resume`, and `task cancel` require the Task

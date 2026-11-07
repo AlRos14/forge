@@ -73,6 +73,7 @@ import type {
   TaskLaunchResponse,
   RequestReworkRequest,
   RequestReworkResponse,
+  TaskReworkAutomationIntentsResponse,
   SubmitReviewReportRequest,
   SubmitReviewReportResponse,
   SubmitWorkUnitReviewRequest,
@@ -84,6 +85,7 @@ import type {
   TaskLifecycleTransitionResponse,
   GateResponse,
   GateEvaluationResponse,
+  ReviewLineResponse,
   UpdateAgentRequest,
   UpdateProjectRequest,
   UpdateProjectTaskRoleDefaultsRequest,
@@ -93,6 +95,7 @@ import type {
   UpdateSettingsRequest,
   Workspace,
   WorkUnitResponse,
+  WorkUnitArtifactPackageResponse,
 } from '@/types/generated'
 import { recordUserInitiatedTransition } from '@/lib/notification-toast-suppression'
 
@@ -427,6 +430,26 @@ export function useTaskWorkUnitsQuery(taskId: string) {
   })
 }
 
+export function useTaskReviewLinesQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.reviewLines(taskId),
+    queryFn: () => apiFetch<ReviewLineResponse[]>(`/tasks/${taskId}/review-lines`),
+    enabled: Boolean(taskId),
+    refetchInterval: 5_000,
+  })
+}
+
+export function useWorkUnitArtifactPackageQuery(workUnitId: string) {
+  return useQuery({
+    queryKey: qk.workUnitArtifactPackage(workUnitId),
+    queryFn: () =>
+      apiFetch<WorkUnitArtifactPackageResponse>(
+        `/work-units/${workUnitId}/artifact-package`,
+      ),
+    enabled: Boolean(workUnitId),
+  })
+}
+
 export function useEvaluateGate() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -498,6 +521,7 @@ export function useSubmitWorkUnitReviewReport() {
       void queryClient.invalidateQueries({ queryKey: qk.reviewExecutions(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.workUnits(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.reviewLines(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
     },
@@ -991,7 +1015,20 @@ export function useRequestRework() {
       void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.workUnits(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskReworkAutomation(taskId) })
     },
+  })
+}
+
+export function useTaskReworkAutomationQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskReworkAutomation(taskId),
+    queryFn: () =>
+      apiFetch<TaskReworkAutomationIntentsResponse>(
+        `/tasks/${taskId}/rework/automation`,
+      ),
+    enabled: Boolean(taskId),
+    refetchInterval: 5_000,
   })
 }
 

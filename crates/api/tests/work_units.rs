@@ -537,6 +537,8 @@ async fn rest_and_mcp_cannot_route_an_account_to_another_accounts_embedded_shell
                 requires_integration: false,
                 provenance: None,
                 review_subject: None,
+                artifact_inputs: Vec::new(),
+                review_approval: None,
             },
         )
         .await

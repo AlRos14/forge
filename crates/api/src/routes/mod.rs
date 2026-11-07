@@ -279,9 +279,19 @@ pub async fn task_roles_response(
     let mut response = Vec::with_capacity(roles.len());
     for role in roles {
         let members = RoleMembershipRepo::list_by_role(db, &role.id, include_ended).await?;
-        let policy = serde_json::from_str(&role.policy_json).map_err(|error| {
+        let policy = serde_json::from_str::<Value>(&role.policy_json).map_err(|error| {
             ApiError::internal(format!("invalid persisted TaskRole policy: {error}"))
         })?;
+        let configuration_record =
+            db::TaskRoleCapabilityConfigurationRepo::get_by_task_role_id(db, &role.id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::internal("TaskRole capability configuration is missing")
+                })?;
+        let configuration = services::task_role_configuration::parse_task_role_configuration(
+            &configuration_record.configuration_json,
+        )
+        .map_err(ApiError::from)?;
         response.push(TaskRoleResponse {
             id: role.id,
             task_id: role.task_id,
@@ -292,6 +302,7 @@ pub async fn task_roles_response(
                 DbCoordinationMode::Independent => api_types::CoordinationMode::Independent,
             }),
             policy,
+            configuration,
             version: role.version,
             members: members.into_iter().map(role_membership_response).collect(),
             created_at: role.created_at,

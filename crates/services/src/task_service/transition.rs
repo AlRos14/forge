@@ -32,13 +32,22 @@ impl TaskService {
             },
         )
         .await?;
-        Ok(executions.items.iter().any(|execution| {
-            execution.role == "reviewer"
+        for execution in executions.items {
+            if execution.status == ExecutionStatus::Running
                 && execution
                     .actor_ref()
                     .is_some_and(|actor| matches!(actor, db::ActorRef::Human(_)))
-                && execution.status == ExecutionStatus::Running
-        }))
+                && crate::role_capabilities::execution_has_capability(
+                    &self.db,
+                    &execution.id,
+                    api_types::TaskRoleCapability::FormalReview,
+                )
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub async fn executor_attempt_count(&self, task_id: &str) -> Result<i64> {

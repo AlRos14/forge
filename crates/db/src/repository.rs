@@ -819,6 +819,7 @@ pub trait ExecutionRepo: Send + Sync {
     async fn find_running_human_review_execution(
         &self,
         task_id: &str,
+        task_role_id: &str,
         user_id: &str,
         workspace_id: Option<&str>,
     ) -> Result<Option<Execution>>;
@@ -1898,6 +1899,9 @@ pub struct CreateWorkUnit {
     pub assigned_actor: Option<ActorRef>,
     pub requires_integration: bool,
     pub provenance: Option<WorkUnitProvenance>,
+    pub artifact_input_ids: Vec<String>,
+    pub review_approval_gate_id: Option<String>,
+    pub review_approval_line_id: Option<String>,
     pub created_by: ActorRef,
     pub created_at: String,
 }
@@ -1913,6 +1917,8 @@ pub struct CreateWorkUnitReviewSubject {
     pub result_commit_sha: Option<String>,
     pub result_workspace_id: Option<String>,
     pub workspace_snapshot_digest: Option<String>,
+    pub manifest_json: Option<String>,
+    pub manifest_digest: Option<String>,
     pub created_at: String,
 }
 
@@ -1965,6 +1971,23 @@ pub struct TransitionWorkUnit {
     pub expected_version: i64,
     pub status: WorkUnitStatus,
     pub updated_at: String,
+    /// Exact completed result to freeze into any review subjects prepared
+    /// before this WorkUnit completed. Kept in the same transaction as the
+    /// WorkUnit transition and its review-line projection.
+    pub reviewed_result: Option<CompleteReviewedWorkUnitResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteReviewedWorkUnitResult {
+    pub execution_id: String,
+    pub result_artifact_id: Option<String>,
+    pub result_artifact_digest: Option<String>,
+    pub result_commit_sha: Option<String>,
+    pub result_workspace_id: Option<String>,
+    pub workspace_snapshot_digest: Option<String>,
+    pub manifest_id: Option<String>,
+    pub manifest_json: Option<String>,
+    pub manifest_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2305,10 +2328,21 @@ pub struct CreateTaskComment {
 #[async_trait]
 pub trait TaskRoleRepo: Send + Sync {
     async fn create(&self, input: CreateTaskRole) -> std::result::Result<TaskRole, crate::DbError>;
+    async fn create_with_configuration(
+        &self,
+        input: CreateTaskRole,
+        configuration_json: &str,
+    ) -> std::result::Result<TaskRole, crate::DbError>;
     async fn create_in_tx(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
         input: CreateTaskRole,
+    ) -> std::result::Result<TaskRole, crate::DbError>;
+    async fn create_with_configuration_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateTaskRole,
+        configuration_json: &str,
     ) -> std::result::Result<TaskRole, crate::DbError>;
     async fn get_task_id(&self, id: &str) -> std::result::Result<Option<String>, crate::DbError>;
     async fn get_by_task_and_role(
@@ -2322,6 +2356,26 @@ pub trait TaskRoleRepo: Send + Sync {
         task_id: &str,
     ) -> std::result::Result<Vec<TaskRole>, crate::DbError>;
     async fn update(&self, input: UpdateTaskRole) -> std::result::Result<TaskRole, crate::DbError>;
+    async fn update_with_configuration(
+        &self,
+        input: UpdateTaskRoleWithConfiguration,
+    ) -> std::result::Result<TaskRole, crate::DbError>;
+}
+
+#[async_trait]
+pub trait TaskRoleCapabilityConfigurationRepo: Send + Sync {
+    async fn get_by_task_role_id(
+        &self,
+        task_role_id: &str,
+    ) -> std::result::Result<Option<TaskRoleCapabilityConfiguration>, crate::DbError>;
+}
+
+#[async_trait]
+pub trait ExecutionTaskRoleAuthorityRepo: Send + Sync {
+    async fn get_by_execution_id(
+        &self,
+        execution_id: &str,
+    ) -> std::result::Result<Option<ExecutionTaskRoleAuthority>, crate::DbError>;
 }
 
 #[async_trait]

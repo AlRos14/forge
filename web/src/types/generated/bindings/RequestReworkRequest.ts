@@ -9,4 +9,4 @@ review_report_artifact_id: string,
 /**
  * WorkUnit revision the report reviewed.
  */
-reviewed_work_unit_id: string, reviewed_work_unit_version: number, correction_title: string, correction_scope: string, correction_role: string, correction_actor: ActorRef | null, review_title: string, review_scope: string, review_role: string | null, review_actor: ActorRef | null, idempotency_key: string, };
+reviewed_work_unit_id: string, reviewed_work_unit_version: number, correction_title: string, correction_scope: string, correction_role_id: string, correction_actor: ActorRef | null, review_title: string, review_scope: string, review_actor: ActorRef | null, idempotency_key: string, };

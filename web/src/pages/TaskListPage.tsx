@@ -41,7 +41,7 @@ export function TaskListPage({
   const tasks = tasksQuery.data?.pages.flatMap((page) => page.items) ?? []
 
   return (
-    <main className="mx-auto w-full max-w-6xl space-y-5 p-4 sm:p-6">
+    <main className="mx-auto w-full max-w-6xl min-w-0 space-y-5">
       <header className="flex flex-wrap items-end gap-3">
         <div className="min-w-0 flex-1">
           <h1 className="text-2xl font-semibold">Tasks</h1>
@@ -60,13 +60,13 @@ export function TaskListPage({
         <Input className="max-w-xs" value={queryText} onChange={(event) => setQueryText(event.target.value)} placeholder="Search tasks" aria-label="Search tasks" />
         <label className="flex items-center gap-2 text-sm">
           <span>TaskLifecycle</span>
-          <select className="h-9 rounded-md border bg-background px-2" value={lifecycleState ?? ''} onChange={(event) => onFilterChange((event.target.value || undefined) as TaskLifecycleState | undefined)}>
+          <select className="h-10 min-w-0 max-w-full rounded-md border bg-background px-2" value={lifecycleState ?? ''} onChange={(event) => onFilterChange((event.target.value || undefined) as TaskLifecycleState | undefined)}>
             {lifecycleStates.map((state) => <option key={state || 'all'} value={state}>{state ? state.replaceAll('_', ' ') : 'All states'}</option>)}
           </select>
         </label>
         <label className="flex items-center gap-2 text-sm">
           <span>Sort</span>
-          <select className="h-9 rounded-md border bg-background px-2" value={`${sortBy}:${sortOrder}`} onChange={(event) => {
+          <select className="h-10 min-w-0 max-w-full rounded-md border bg-background px-2" value={`${sortBy}:${sortOrder}`} onChange={(event) => {
             const [key, order] = event.target.value.split(':') as [TaskListSortBy, TaskListSortOrder]
             onSortChange(key, order)
           }}>
@@ -80,7 +80,7 @@ export function TaskListPage({
 
       {tasksQuery.isError ? <ErrorBanner error={tasksQuery.error} fallback="Tasks failed to load" onRetry={() => void tasksQuery.refetch()} /> : null}
       <section className="overflow-hidden rounded-lg border">
-        <div className="grid grid-cols-[minmax(0,1fr)_140px_90px] gap-3 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
+        <div className="grid grid-cols-[minmax(0,1fr)_6rem_3rem] sm:grid-cols-[minmax(0,1fr)_140px_90px] gap-3 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
           <span>Task</span><span>TaskLifecycle</span><span>Priority</span>
         </div>
         {tasksQuery.isLoading ? <p className="p-4 text-sm text-muted-foreground">Loading tasks…</p> : null}
@@ -89,9 +89,9 @@ export function TaskListPage({
             key={task.id}
             to="/tasks/$taskId"
             params={{ taskId: task.id }}
-            className="grid grid-cols-[minmax(0,1fr)_140px_90px] items-center gap-3 border-b px-4 py-3 text-sm last:border-b-0 hover:bg-muted/30"
+            className="grid grid-cols-[minmax(0,1fr)_6rem_3rem] sm:grid-cols-[minmax(0,1fr)_140px_90px] items-center gap-3 border-b px-4 py-3 text-sm last:border-b-0 hover:bg-muted/30"
           >
-            <span className="min-w-0"><strong className="block truncate">{task.title}</strong><span className="font-mono text-[11px] text-muted-foreground">{task.id}</span></span>
+            <span className="min-w-0"><strong className="block break-words">{task.title}</strong><span className="break-all font-mono text-[11px] text-muted-foreground">{task.id}</span></span>
             <span className="capitalize">{task.lifecycle.state.replaceAll('_', ' ')}</span>
             <span>{task.priority}</span>
           </Link>

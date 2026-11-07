@@ -260,10 +260,60 @@ impl TaskLifecycleService {
             let awaiting_acceptance = unit.status == WorkUnitStatus::Open
                 && active_execution_ids.is_empty()
                 && latest_execution_status.as_deref() == Some("completed");
-            let review_subject_ready = if unit.role == "reviewer" {
-                crate::task_rework::review_subject_ready(&self.db, &unit.id).await?
+            let has_review_subject: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM work_unit_review_subject WHERE review_work_unit_id = ?)",
+            )
+            .bind(&unit.id)
+            .fetch_one(self.db.pool())
+            .await?;
+            let formal_review = crate::role_capabilities::task_role_name_has_capability(
+                &self.db,
+                &unit.task_id,
+                &unit.role,
+                api_types::TaskRoleCapability::FormalReview,
+            )
+            .await?;
+            let review_subject_ready = if has_review_subject || formal_review {
+                if !has_review_subject || !formal_review {
+                    false
+                } else {
+                    crate::task_rework::review_subject_ready(&self.db, &unit.id).await?
+                }
             } else {
                 true
+            };
+            let awaiting_review_approval = if let (Some(gate_id), Some(line_id)) = (
+                unit.review_approval_gate_id.as_deref(),
+                unit.review_approval_line_id.as_deref(),
+            ) {
+                let current_approval: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM work_unit_review_line line
+                        JOIN gate gate ON gate.id = ? AND gate.task_id = line.task_id
+                        JOIN gate_evaluation evaluation
+                          ON evaluation.gate_id = gate.id AND evaluation.task_id = gate.task_id
+                         AND evaluation.outcome = 'satisfied'
+                         AND evaluation.policy_revision = gate.active_policy_revision
+                        JOIN gate_evaluation_input input
+                          ON input.evaluation_id = evaluation.id AND input.task_id = evaluation.task_id
+                         AND input.input_kind = 'review_line' AND input.input_id = line.id
+                         AND input.input_version = line.revision AND input.status = 'pass'
+                        WHERE line.id = ? AND line.latest_verdict = 'pass'
+                          AND line.current_result_execution_id IS NOT NULL
+                          AND evaluation.id = (
+                              SELECT latest.id FROM gate_evaluation latest
+                              WHERE latest.gate_id = gate.id
+                          ORDER BY latest.evaluated_at DESC, latest.id DESC LIMIT 1
+                          )
+                    )",
+                )
+                .bind(gate_id)
+                .bind(line_id)
+                .fetch_one(self.db.pool())
+                .await?;
+                !current_approval
+            } else {
+                false
             };
             let (state, reason, blocker) = match unit.status {
                 WorkUnitStatus::Cancelled => ("cancelled", Some("WorkUnit is cancelled"), None),
@@ -289,6 +339,11 @@ impl TaskLifecycleService {
                 WorkUnitStatus::Open if awaiting_acceptance => (
                     "awaiting_acceptance",
                     Some("a completed Execution result awaits WorkUnit acceptance"),
+                    None,
+                ),
+                WorkUnitStatus::Open if awaiting_review_approval => (
+                    "awaiting_review_approval",
+                    Some("the latest exact review line does not have a current satisfied Gate evaluation"),
                     None,
                 ),
                 WorkUnitStatus::Open if recovery_required_work_units.contains(&unit.id) => (
@@ -378,6 +433,7 @@ impl TaskLifecycleService {
                     unsatisfied_dependency_ids,
                     awaiting_integration: state == "awaiting_integration",
                     awaiting_acceptance: state == "awaiting_acceptance",
+                    awaiting_review_approval,
                 },
                 state: state.to_owned(),
                 reason: reason.map(str::to_owned),

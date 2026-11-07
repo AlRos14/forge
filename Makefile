@@ -40,3 +40,8 @@ ci-web:
 # Wipe local test data (./test directory)
 clean-test:
 	rm -rf ./test
+
+# Isolated UI audit; never uses the shared ./test root or starts a daemon.
+.PHONY: dev-ui-audit
+dev-ui-audit:
+	FORGE_SERVER_BIND=127.0.0.1:18081 cargo run -p forge-cli -- --data-dir ./test/ui-consistency --no-embedded-daemon --no-mcp

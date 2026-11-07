@@ -805,7 +805,12 @@ impl TaskFailureRetryService {
                 {
                     if execution.task_id == event.scope_id
                         && execution.status == db::ExecutionStatus::Failed
-                        && execution.role != "orchestrator"
+                        && !crate::role_capabilities::execution_has_capability(
+                            &self.db,
+                            &execution.id,
+                            api_types::TaskRoleCapability::Orchestration,
+                        )
+                        .await?
                         && !execution_is_executor_unavailable(&execution)
                     {
                         failures.push(FailureFact {
@@ -2832,6 +2837,7 @@ mod tests {
                         allow_agents: true,
                         allowed_actor_refs: Vec::new(),
                         task_role_snapshot: None,
+                        review_line_id: None,
                         candidates: vec![crate::gate_engine::ReviewReportRequirement {
                             artifact_id: report_id,
                             digest: report_digest,

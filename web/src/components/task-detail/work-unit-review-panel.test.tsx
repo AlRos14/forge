@@ -17,9 +17,15 @@ function task(): Task {
       {
         id: 'role-reviewer',
         task_id: 'task-1',
-        role: 'reviewer',
+        role: 'planning-reviewer',
         coordination_mode: 'independent',
         policy: {},
+        configuration: {
+          schema_version: 1,
+          display_label: 'Planning reviewer',
+          capabilities: ['formal_review'],
+          rework: null,
+        },
         version: 1,
         members: [
           {
@@ -49,10 +55,12 @@ function reviewUnit(): WorkUnitResponse {
     scope: 'Check the implementation against the exact result.',
     execution_instructions: null,
     status: 'open',
-    role: 'reviewer',
+    role: 'planning-reviewer',
     assigned_actor: { kind: 'human', id: 'user-1' },
     requires_integration: false,
     provenance: null,
+    review_approval_gate_id: null,
+    review_approval_line_id: null,
     created_by: { kind: 'human', id: 'user-1' },
     version: 3,
     created_at: '',
@@ -64,6 +72,7 @@ function reviewUnit(): WorkUnitResponse {
       unsatisfied_dependency_ids: [],
       awaiting_integration: false,
       awaiting_acceptance: false,
+      awaiting_review_approval: false,
     },
     review_subject: {
       id: 'unit-review',
@@ -127,6 +136,22 @@ describe('Human WorkUnit review report', () => {
       <WorkUnitHumanReviewPanel
         task={task()}
         unit={{ ...reviewUnit(), assigned_actor: { kind: 'human', id: 'user-2' } }}
+        currentUserId="user-1"
+      />,
+    )
+
+    expect(screen.queryByRole('button', { name: 'Submit Human ReviewReport' })).toBeNull()
+  })
+
+  it('does not grant formal review to a role named reviewer without the capability', () => {
+    const unprivilegedTask = task()
+    unprivilegedTask.task_roles[0].role = 'reviewer'
+    unprivilegedTask.task_roles[0].configuration.capabilities = []
+
+    render(
+      <WorkUnitHumanReviewPanel
+        task={unprivilegedTask}
+        unit={{ ...reviewUnit(), role: 'reviewer' }}
         currentUserId="user-1"
       />,
     )

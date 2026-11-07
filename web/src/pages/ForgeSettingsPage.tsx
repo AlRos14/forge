@@ -1,11 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { Icon } from '@phosphor-icons/react'
-import {
-  Database,
-  HardDrive,
-  Robot,
-  Warning,
-} from '@phosphor-icons/react'
+import { Database, HardDrive, Robot, Warning } from '@phosphor-icons/react'
 import { Link } from '@tanstack/react-router'
 import { toast } from 'sonner'
 import { useSettingsQuery, useUpdateSettings } from '@/api/hooks'
@@ -44,18 +39,10 @@ function EffectiveHint({ setting }: { setting: ForgeSettingResponse | undefined 
   if (!setting?.restart_required) return null
   const val = String(setting.effective_value ?? '')
   if (!val) return null
-  return (
-    <p className="mt-1 font-mono text-[11px] text-muted-foreground">
-      Running: {val}
-    </p>
-  )
+  return <p className="mt-1 font-mono text-[11px] text-muted-foreground">Running: {val}</p>
 }
 
-export function ForgeSettingsPage({
-  initialTab = 'server',
-}: {
-  initialTab?: ForgeSettingsTab
-}) {
+export function ForgeSettingsPage({ initialTab = 'server' }: { initialTab?: ForgeSettingsTab }) {
   const settingsQuery = useSettingsQuery()
   const updateSettings = useUpdateSettings()
 
@@ -144,9 +131,9 @@ export function ForgeSettingsPage({
   const isLoading = settingsQuery.isLoading
 
   return (
-    <div className="flex h-[calc(100vh-7rem)] gap-0 overflow-hidden rounded-xl border border-border-subtle bg-card shadow-card">
+    <div className="flex min-w-0 flex-col gap-0 lg:flex-row rounded-xl border border-border-subtle bg-card shadow-card">
       {/* Settings sidebar */}
-      <aside className="flex w-56 shrink-0 flex-col border-r bg-background">
+      <aside className="flex w-full min-w-0 shrink-0 flex-col border-b bg-background lg:w-56 lg:border-b-0 lg:border-r">
         <div className="border-b px-4 py-3">
           <p className="font-mono text-micro font-semibold uppercase tracking-[1px] text-muted-foreground">
             System Settings
@@ -161,7 +148,7 @@ export function ForgeSettingsPage({
             </p>
           )}
         </div>
-        <nav className="flex flex-1 flex-col gap-0.5 p-2">
+        <nav className="flex flex-wrap gap-0.5 p-2 lg:flex-col">
           {TABS.map((t) => {
             const TabIcon = t.icon
             return (
@@ -170,7 +157,7 @@ export function ForgeSettingsPage({
                 to={t.id === 'server' ? '/settings' : '/settings/$tab'}
                 params={{ tab: t.id }}
                 className={cn(
-                  'relative flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-[7px] text-left text-[13px] leading-none font-medium transition-colors',
+                  'relative flex w-auto shrink-0 lg:w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-[7px] text-left text-[13px] leading-none font-medium transition-colors',
                   initialTab === t.id
                     ? 'bg-[var(--ember-surface)] text-sidebar-active-foreground before:absolute before:left-0 before:top-1/2 before:-translate-y-1/2 before:h-4 before:w-[3px] before:rounded-r-full before:bg-primary'
                     : 'text-sidebar-foreground hover:bg-accent/50 hover:text-foreground',
@@ -185,7 +172,7 @@ export function ForgeSettingsPage({
       </aside>
 
       {/* Content area */}
-      <div className="flex-1 overflow-y-auto px-8 py-6">
+      <div className="min-w-0 flex-1 px-4 py-4 sm:px-6 sm:py-6">
         <div className="max-w-[760px]">
           {settingsQuery.data?.restart_required && (
             <div className="mb-6 flex items-center gap-2.5 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-300">

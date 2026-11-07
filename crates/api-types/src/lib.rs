@@ -25,6 +25,7 @@ mod public_events;
 mod repo_review;
 mod requests;
 mod review_validation;
+mod role_capabilities;
 mod roles;
 mod runtime;
 mod settings;
@@ -56,6 +57,7 @@ pub use public_events::*;
 pub use repo_review::*;
 pub use requests::*;
 pub use review_validation::*;
+pub use role_capabilities::*;
 pub use roles::*;
 pub use runtime::*;
 pub use settings::*;
@@ -89,6 +91,9 @@ fn export_typescript() {
     UpdateProjectRequest::export().expect("export UpdateProjectRequest");
     ProjectResponse::export().expect("export ProjectResponse");
     ProjectTaskRoleDefault::export().expect("export ProjectTaskRoleDefault");
+    ProjectTaskRoleConfiguration::export().expect("export ProjectTaskRoleConfiguration");
+    ProjectTaskRoleReworkConfiguration::export()
+        .expect("export ProjectTaskRoleReworkConfiguration");
     ProjectTaskRoleDefaultsResponse::export().expect("export ProjectTaskRoleDefaultsResponse");
     UpdateProjectTaskRoleDefaultsRequest::export()
         .expect("export UpdateProjectTaskRoleDefaultsRequest");
@@ -156,6 +161,11 @@ fn export_typescript() {
     TaskLaunchResponse::export().expect("export TaskLaunchResponse");
     RequestReworkRequest::export().expect("export RequestReworkRequest");
     RequestReworkResponse::export().expect("export RequestReworkResponse");
+    TaskReworkAutomationState::export().expect("export TaskReworkAutomationState");
+    TaskReworkAutomationIntentResponse::export()
+        .expect("export TaskReworkAutomationIntentResponse");
+    TaskReworkAutomationIntentsResponse::export()
+        .expect("export TaskReworkAutomationIntentsResponse");
     ReviewSubjectResponse::export().expect("export ReviewSubjectResponse");
     FollowUpRequest::export().expect("export FollowUpRequest");
     RecoverWorkUnitExecutionRequest::export().expect("export RecoverWorkUnitExecutionRequest");
@@ -176,6 +186,11 @@ fn export_typescript() {
     ValidationRunStatus::export().expect("export ValidationRunStatus");
     ValidationRunResponse::export().expect("export ValidationRunResponse");
     EvidenceResponse::export().expect("export EvidenceResponse");
+    ReviewLineRevisionResponse::export().expect("export ReviewLineRevisionResponse");
+    ReviewLineResponse::export().expect("export ReviewLineResponse");
+    WorkUnitArtifactInputResponse::export().expect("export WorkUnitArtifactInputResponse");
+    WorkUnitArtifactManifestResponse::export().expect("export WorkUnitArtifactManifestResponse");
+    WorkUnitArtifactPackageResponse::export().expect("export WorkUnitArtifactPackageResponse");
 
     CreateTaskRoleRequest::export().expect("export CreateTaskRoleRequest");
     UpdateTaskRoleRequest::export().expect("export UpdateTaskRoleRequest");
@@ -185,6 +200,13 @@ fn export_typescript() {
     RoleMembershipStatus::export().expect("export RoleMembershipStatus");
     RoleMembershipResponse::export().expect("export RoleMembershipResponse");
     TaskRoleResponse::export().expect("export TaskRoleResponse");
+    TaskRoleCapability::export().expect("export TaskRoleCapability");
+    TaskRoleReworkMode::export().expect("export TaskRoleReworkMode");
+    ReworkActorSelection::export().expect("export ReworkActorSelection");
+    TaskRoleReworkConfiguration::export().expect("export TaskRoleReworkConfiguration");
+    TaskRoleConfiguration::export().expect("export TaskRoleConfiguration");
+    TaskRoleTemplate::export().expect("export TaskRoleTemplate");
+    TaskRoleCapabilityCatalog::export().expect("export TaskRoleCapabilityCatalog");
 
     ArtifactKind::export().expect("export ArtifactKind");
     ArtifactStorageKind::export().expect("export ArtifactStorageKind");
@@ -210,6 +232,7 @@ fn export_typescript() {
     CollaborationListQuery::export().expect("export CollaborationListQuery");
 
     CreateWorkUnitRequest::export().expect("export CreateWorkUnitRequest");
+    WorkUnitReviewApprovalRequest::export().expect("export WorkUnitReviewApprovalRequest");
     CreateWorkUnitReviewSubjectRequest::export()
         .expect("export CreateWorkUnitReviewSubjectRequest");
     CreateWorkUnitProvenance::export().expect("export CreateWorkUnitProvenance");

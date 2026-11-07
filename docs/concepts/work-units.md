@@ -1,7 +1,9 @@
 # WorkUnits
 
 A WorkUnit is a concrete, executable scope inside a Task. It is not a plan,
-requirements language, or second cognitive authority.
+requirements language, or second cognitive authority. Its `role` names the
+TaskRole used for eligibility; formal review behavior comes from that role's
+`formal_review` capability, never the string itself.
 
 ~~~text
 WorkUnit
@@ -172,6 +174,13 @@ A review WorkUnit may record `work_unit_review_subject`: the exact reviewed
 WorkUnit version, result Execution, commit, Workspace, and snapshot digest. A
 correction WorkUnit may record `work_unit_result_requirement`: the exact source
 result it consumes. These are minimal relations, not a workflow DSL.
+
+For multiple deliverables, prepare one package WorkUnit that consumes the exact
+source Artifacts and records an immutable manifest for its package result. A
+formal review then names that package WorkUnit as its one exact subject. The
+manifest records each source Artifact ID and digest, the producing Execution,
+and the delivery Artifact. The PO delivery WorkUnit follows the review line and
+cannot run until the latest package result has a favorable report.
 
 Requesting changes and a new review is one idempotent operation. It requires a
 ReviewReport whose exact subject names the reviewed WorkUnit and version; a

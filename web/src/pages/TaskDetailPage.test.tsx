@@ -45,6 +45,7 @@ vi.mock('@/api/hooks', async () => {
     useTaskLifecycleTransitionsQuery: () => ({ data: [], isLoading: false }),
     useExecutionsQuery: () => ({ data: { items: [] }, refetch: vi.fn() }),
     useReviewsQuery: () => ({ data: [], isLoading: false }),
+    useTaskReviewLinesQuery: () => ({ data: [], isLoading: false, isError: false, refetch: vi.fn() }),
     useValidationsQuery: () => ({ data: [], isLoading: false }),
     useTaskGatesQuery: () => ({ data: [], isLoading: false }),
     useTaskWorkUnitsQuery: () => ({ data: [], refetch: vi.fn() }),

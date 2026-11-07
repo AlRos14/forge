@@ -12,6 +12,7 @@ pub const METHOD_HARNESS_DISCOVER_OPTIONS: &str = "harness.discover_options";
 pub const DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1: &str =
     "generic_harness_invocation_v1";
 pub const DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1: &str = "execution_role_v1";
+pub const DAEMON_PROTOCOL_FEATURE_TASK_ROLE_CAPABILITIES_V1: &str = "task_role_capabilities_v1";
 pub const METHOD_EXECUTION_LOG: &str = "execution.log";
 pub const METHOD_EXECUTION_TERMINAL: &str = "execution.terminal";
 pub const METHOD_TERMINAL_START: &str = "terminal.start";
@@ -114,6 +115,8 @@ pub struct ExecutionStartParams {
     pub execution_id: String,
     #[serde(default)]
     pub role: String,
+    #[serde(default)]
+    pub task_role_capabilities: Vec<crate::TaskRoleCapability>,
     pub workspace_path: String,
     pub executor_type: String,
     #[ts(type = "unknown")]
@@ -362,6 +365,7 @@ mod tests {
             task_id: "task-1".to_owned(),
             execution_id: "execution-1".to_owned(),
             role: "coder".to_owned(),
+            task_role_capabilities: vec![],
             workspace_path: "/tmp/worktree".to_owned(),
             executor_type: "codex".to_owned(),
             executor_config: serde_json::json!({"model":"test"}),
@@ -471,6 +475,7 @@ mod tests {
             task_id: "task-1".to_owned(),
             execution_id: "execution-1".to_owned(),
             role: "worker".to_owned(),
+            task_role_capabilities: vec![],
             workspace_path: "/work".to_owned(),
             executor_type: "codex".to_owned(),
             executor_config: serde_json::json!({"executor_type":"codex","config":{}}),

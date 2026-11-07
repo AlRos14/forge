@@ -110,11 +110,76 @@ impl TaskService {
         user_id: &str,
         workspace_id: Option<&str>,
     ) -> Result<Execution> {
+        let roles = TaskRoleRepo::list_by_task(&*self.db, task_id).await?;
+        let mut eligible = Vec::new();
+        for role in roles {
+            if crate::role_capabilities::current_task_role_has_capability(
+                &self.db,
+                &role.id,
+                api_types::TaskRoleCapability::FormalReview,
+            )
+            .await?
+                && human_is_active_task_role_member_authoritative(
+                    &self.db, task_id, &role.id, user_id,
+                )
+                .await?
+            {
+                eligible.push(role.id);
+            }
+        }
+        let role_id = match eligible.as_slice() {
+            [role_id] => role_id,
+            [] => {
+                return Err(ServiceError::AuthorizationDenied {
+                    message: "Human is not an active member of a formal_review TaskRole".to_owned(),
+                })
+            }
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "select the exact formal_review TaskRole when the Human belongs to several",
+                ))
+            }
+        };
+        self.start_human_review_execution_for_role(task_id, user_id, role_id, workspace_id)
+            .await
+    }
+
+    pub async fn start_human_review_execution_for_role(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        task_role_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Execution> {
         validate_required("task_id", task_id)?;
         validate_required("user_id", user_id)?;
+        validate_required("task_role_id", task_role_id)?;
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let task_role = TaskRoleRepo::get_by_id(&*self.db, task_role_id)
+            .await?
+            .filter(|role| role.task_id == task_id)
+            .ok_or_else(|| ServiceError::not_found("task_role", task_role_id.to_owned()))?;
+        if !crate::role_capabilities::current_task_role_has_capability(
+            &self.db,
+            &task_role.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
+            || !human_is_active_task_role_member_authoritative(
+                &self.db,
+                task_id,
+                &task_role.id,
+                user_id,
+            )
+            .await?
+        {
+            return Err(ServiceError::AuthorizationDenied {
+                message: "Human is not an active member of the selected formal_review TaskRole"
+                    .to_owned(),
+            });
+        }
         let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
@@ -123,15 +188,6 @@ impl TaskService {
                 "Human Review Execution requires an active aggregate Task lifecycle",
             ));
         }
-        if !human_is_active_role_member_authoritative(&self.db, task_id, "reviewer", user_id)
-            .await?
-        {
-            return Err(ServiceError::AuthorizationDenied {
-                message: "Human reviewer is not an active member of the reviewer TaskRole"
-                    .to_owned(),
-            });
-        }
-
         let _workspace_review_guard = if let (Some(workspace_id), Some(locks)) =
             (workspace_id, self.workspace_exec_locks.as_ref())
         {
@@ -148,11 +204,16 @@ impl TaskService {
                     "Human Review Execution requires an active aggregate Task lifecycle",
                 ));
             }
-            if !human_is_active_role_member_authoritative(&self.db, task_id, "reviewer", user_id)
-                .await?
+            if !human_is_active_task_role_member_authoritative(
+                &self.db,
+                task_id,
+                &task_role.id,
+                user_id,
+            )
+            .await?
             {
                 return Err(ServiceError::AuthorizationDenied {
-                    message: "Human reviewer is not an active member of the reviewer TaskRole"
+                    message: "Human is not an active member of the selected formal_review TaskRole"
                         .to_owned(),
                 });
             }
@@ -161,6 +222,7 @@ impl TaskService {
         if let Some(existing) = ExecutionRepo::find_running_human_review_execution(
             &*self.db,
             task_id,
+            &task_role.id,
             user_id,
             workspace_id,
         )
@@ -216,7 +278,8 @@ impl TaskService {
                 "execution_id": id,
                 "task_id": task_id,
                 "project_id": task.project_id,
-                "role": "reviewer",
+                "role": task_role.role.clone(),
+                "task_role_id": task_role.id.clone(),
                 "actor_kind": "human",
                 "actor_id": user_id,
                 "workspace_id": workspace_subject.as_ref().map(|subject| &subject.0),
@@ -232,7 +295,7 @@ impl TaskService {
             task_id: task_id.to_owned(),
             agent_id: None,
             actor_ref: Some(db::ActorRef::Human(user_id.to_owned())),
-            role: "reviewer".to_owned(),
+            role: task_role.role.clone(),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -311,7 +374,12 @@ impl TaskService {
         execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;
-        if execution.role != "reviewer"
+        if !crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
             || execution.actor_ref() != Some(db::ActorRef::Human(user_id.to_owned()))
         {
             return Err(ServiceError::AuthorizationDenied {

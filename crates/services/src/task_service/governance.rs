@@ -39,7 +39,9 @@ impl TaskService {
             ));
         }
         self.ensure_task_runnable(task).await?;
-        let canonical_role = canonical_workspace_lease_role(&work_unit.role)?;
+        let canonical_role = self
+            .workspace_lease_role_for_task_role(task, &work_unit.role)
+            .await?;
         let db::ActorRef::Agent(principal_id) = actor else {
             return Err(ServiceError::invalid_operation(
                 "repository WorkUnit leases require an Agent Actor under current repository policy",
@@ -271,7 +273,9 @@ impl TaskService {
                     "invalid WorkUnit WorkspaceLease capability set: {error}"
                 ))
             })?;
-        let canonical_role = canonical_workspace_lease_role(&unit.role)?;
+        let canonical_role = self
+            .workspace_lease_role_for_task_role(task, &unit.role)
+            .await?;
         if lease.status != "active"
             || lease.project_id != task.project_id
             || lease.task_id != task.id
@@ -384,7 +388,13 @@ impl TaskService {
         &self,
         execution: &db::Execution,
     ) -> Result<Option<db::WorkspaceLease>> {
-        if execution.role == "orchestrator" {
+        if crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::Orchestration,
+        )
+        .await?
+        {
             if execution.workspace_id.is_some() {
                 return Err(ServiceError::invalid_operation(
                     "orchestrator Execution cannot receive a mutable WorkspaceLease",
@@ -450,16 +460,32 @@ impl TaskService {
             );
         }
     }
+
+    async fn workspace_lease_role_for_task_role(
+        &self,
+        task: &db::Task,
+        role_name: &str,
+    ) -> Result<&'static str> {
+        let canonical = db::canonical_task_role_name(role_name)
+            .ok_or_else(|| ServiceError::invalid_operation("WorkUnit role is not a TaskRole"))?;
+        let role = db::TaskRoleRepo::get_by_task_and_role(&*self.db, &task.id, &canonical)
+            .await?
+            .ok_or_else(|| ServiceError::invalid_operation("WorkUnit TaskRole does not exist"))?;
+        let is_formal_review = crate::role_capabilities::current_task_role_has_capability(
+            &self.db,
+            &role.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?;
+        Ok(canonical_workspace_lease_role(is_formal_review))
+    }
 }
 
-fn canonical_workspace_lease_role(role: &str) -> Result<&'static str> {
-    match role.trim() {
-        "reviewer" => Ok("reviewer"),
-        // Workflow role names are user-configurable. Every scheduler-resolved
-        // execution role other than the dedicated reviewer role is a bounded
-        // Task Worker for lease purposes; the exact original role still has
-        // to match the authoritative Task role assignment.
-        _ => Ok("worker"),
+fn canonical_workspace_lease_role(is_formal_review: bool) -> &'static str {
+    if is_formal_review {
+        "reviewer"
+    } else {
+        "worker"
     }
 }
 
@@ -487,17 +513,8 @@ mod tests {
 
     #[test]
     fn workspace_lease_roles_preserve_reviewer_and_bound_custom_workers() {
-        assert_eq!(
-            canonical_workspace_lease_role("reviewer").expect("reviewer role"),
-            "reviewer"
-        );
-        assert_eq!(
-            canonical_workspace_lease_role("implementer").expect("custom worker role"),
-            "worker"
-        );
-        assert_eq!(
-            canonical_workspace_lease_role("orchestrator").expect("workflow worker role"),
-            "worker"
-        );
+        assert_eq!(canonical_workspace_lease_role(true), "reviewer");
+        assert_eq!(canonical_workspace_lease_role(false), "worker");
+        assert_eq!(canonical_workspace_lease_role(false), "worker");
     }
 }

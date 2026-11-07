@@ -282,8 +282,12 @@ and task-move storage. Public routes and UI use exact TaskLifecycle transition
 receipts, Gate policy revisions/evaluations, and current TaskRole/RoleMembership
 records. MCP exposes target lifecycle, Gates, Review Executions/reports,
 ValidationRuns, Evidence, roles/memberships, and generic collaboration through
-exact identities. Formal Review is the reviewer Role and its exact
-ReviewReport output.
+exact identities. V149–V156 add versioned TaskRole capability configuration and
+immutable Execution authority snapshots. Formal Review is an Execution admitted
+with `formal_review` and its exact ReviewReport output; a role name alone has no
+authority. Review lines bind approval to the latest exact result, while durable
+rework intents preserve replay safety and Artifact manifests bind multi-input
+package results.
 
 PR12 stopped applying historical `ProjectSettings.default_role_assignments`
 to newly created Tasks and removed the old state-driven lifecycle script
@@ -607,9 +611,10 @@ an uncertain external effect is never sent again.
 
 An Orchestrator Execution has no WorkUnit or WorkspaceLease. Its claim instead
 resolves the exact current OrchestratorWake attempt and, in that same write
-transaction, checks the Execution's Task, Agent Actor, `orchestrator` Role,
-active TaskRole membership, TaskRole version and policy
-snapshot, current Wake state, attempt number, and unexpired Wake lease. A lost
+transaction, checks the Execution's Task, Agent Actor, exact TaskRole and
+`orchestration` capability snapshot, active TaskRole membership, current
+TaskRole version and policy snapshot, current Wake state, attempt number, and
+unexpired Wake lease. A lost
 authority claim records no provider attempt. The external attempt receipt is
 still checked first so accepted, rejected, and uncertain provider outcomes
 cannot be replayed.

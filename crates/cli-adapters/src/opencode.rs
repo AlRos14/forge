@@ -1956,6 +1956,7 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 role: "project_copilot".to_owned(),
+                task_role_capabilities: vec![],
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),
                 agent_config: serde_json::json!({
@@ -2074,6 +2075,7 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
             task_id: "task-tree".to_owned(),
             execution_id: "execution-tree".to_owned(),
             role: "coder".to_owned(),
+            task_role_capabilities: vec![],
             worktree_path: dir.path().to_string_lossy().to_string(),
             description: "tree test".to_owned(),
             agent_config: serde_json::json!({
@@ -2177,6 +2179,7 @@ printf '%s\n' '{"type":"error","sessionID":"ses_test","error":{"data":{"message"
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),
                 agent_config: serde_json::json!({
@@ -2222,6 +2225,7 @@ printf '%s\n' '{"type":"step_start","sessionID":"ses_test","part":{"type":"step-
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),
                 agent_config: serde_json::json!({

@@ -16,7 +16,9 @@ pub use adapter::{
     ExecutionOverrides, ExecutorKind, FallbackExecutor, HarnessAdapter, HarnessAdapterRegistry,
     HarnessPolicyInterpretation, UsageObservation, DEFAULT_ACCOUNT_COOLDOWN,
 };
-pub use api_types::{CapabilitySupport, HarnessCapabilities, HarnessInvocation};
+pub use api_types::{
+    CapabilitySupport, HarnessCapabilities, HarnessInvocation, TaskRoleCapability,
+};
 pub use command::{build_shell_command_plan, ShellCommandPlan};
 pub use config::{
     account_key, account_key_for_context, candidate_key, merge_overrides, normalize_harness_config,
@@ -42,6 +44,7 @@ pub struct ExecutionContext {
     /// Adapter routing label. `project_copilot` is a management run label and
     /// does not represent a persisted TaskRole or Task Execution.
     pub role: String,
+    pub task_role_capabilities: Vec<api_types::TaskRoleCapability>,
     pub worktree_path: String,
     pub description: String,
     pub agent_config: serde_json::Value,

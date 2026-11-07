@@ -11,7 +11,11 @@ export const qk = {
   artifact: (artifactId: string) => ['artifacts', artifactId] as const,
   gates: (taskId: string) => ['tasks', taskId, 'gates'] as const,
   workUnits: (taskId: string) => ['tasks', taskId, 'work-units'] as const,
+  reviewLines: (taskId: string) => ['tasks', taskId, 'review-lines'] as const,
+  workUnitArtifactPackage: (workUnitId: string) =>
+    ['work-units', workUnitId, 'artifact-package'] as const,
   reviewExecutions: (taskId: string) => ['tasks', taskId, 'review-executions'] as const,
+  taskReworkAutomation: (taskId: string) => ['tasks', taskId, 'rework-automation'] as const,
   validationRuns: (taskId: string) => ['tasks', taskId, 'validation-runs'] as const,
   agents: ['agents'] as const,
   agentPages: (limit: number) => ['agents', 'pages', limit] as const,

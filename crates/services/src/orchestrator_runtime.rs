@@ -306,6 +306,15 @@ impl OrchestratorRuntime {
     }
 
     pub async fn run_once(&self, limit: i64) -> Result<OrchestratorRun> {
+        // Pending automatic rework is durable and remains pending across a
+        // Task pause. The periodic run rechecks it after resume, even though
+        // Task dispatch transitions are not EventBus-delivered.
+        crate::task_rework::TaskReworkService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .process_pending_automatic_rework(100)
+        .await?;
         let now = now_rfc3339();
         let events = DomainEventRepo::claim_event_batch(
             &*self.db,
@@ -329,6 +338,12 @@ impl OrchestratorRuntime {
 
         for event in events {
             self.gate_engine.process_domain_event(&event).await?;
+            crate::task_rework::TaskReworkService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .process_domain_event(&event)
+            .await?;
             crate::task_failure_retry::TaskFailureRetryService::new(
                 Arc::clone(&self.db),
                 Arc::clone(&self.event_bus),
@@ -356,6 +371,16 @@ impl OrchestratorRuntime {
             .await?;
             run.processed_events += 1;
         }
+
+        // An artifact.created event may have added a pending intent above.
+        // Process it after the whole claimed batch has been classified so a
+        // crash/replay cannot make event ordering the source of authority.
+        crate::task_rework::TaskReworkService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .process_pending_automatic_rework(100)
+        .await?;
 
         for _ in 0..16 {
             match self.dispatch_one().await? {
@@ -427,7 +452,12 @@ impl OrchestratorRuntime {
                     &event.event_type,
                     &event.scope_id,
                     &execution.task_id,
-                    &execution.role,
+                    crate::role_capabilities::execution_has_capability(
+                        &self.db,
+                        &execution.id,
+                        api_types::TaskRoleCapability::Orchestration,
+                    )
+                    .await?,
                 ) {
                     return Ok(None);
                 }
@@ -655,7 +685,14 @@ impl OrchestratorRuntime {
                 let Some(role) = TaskRoleRepo::get_by_id(&*self.db, &event.entity_id).await? else {
                     return Ok(None);
                 };
-                if role.task_id != task_id || role.role != "orchestrator" {
+                if role.task_id != task_id
+                    || !crate::role_capabilities::current_task_role_has_capability(
+                        &self.db,
+                        &role.id,
+                        api_types::TaskRoleCapability::Orchestration,
+                    )
+                    .await?
+                {
                     return Ok(None);
                 }
                 let payload = parse_payload(event);
@@ -690,7 +727,7 @@ impl OrchestratorRuntime {
                         return Ok(None);
                     };
                     if unit.task_id != task_id
-                        || unit.role != "orchestrator"
+                        || unit.role != role.role
                         || unit.assigned_actor.as_ref() != Some(actor)
                     {
                         return Ok(None);
@@ -722,7 +759,14 @@ impl OrchestratorRuntime {
                 else {
                     return Ok(None);
                 };
-                if role.task_id != task_id || role.role != "orchestrator" {
+                if role.task_id != task_id
+                    || !crate::role_capabilities::current_task_role_has_capability(
+                        &self.db,
+                        &role.id,
+                        api_types::TaskRoleCapability::Orchestration,
+                    )
+                    .await?
+                {
                     return Ok(None);
                 }
                 let target = if membership.status == RoleMembershipStatus::Active {
@@ -744,7 +788,12 @@ impl OrchestratorRuntime {
                 };
                 let payload = parse_payload(event);
                 if role.task_id != task_id
-                    || role.role != "orchestrator"
+                    || !crate::role_capabilities::current_task_role_has_capability(
+                        &self.db,
+                        &role.id,
+                        api_types::TaskRoleCapability::Orchestration,
+                    )
+                    .await?
                     || payload.get("task_role_id").and_then(Value::as_str) != Some(role.id.as_str())
                     || payload.get("bootstrap_version").and_then(Value::as_i64) != Some(1)
                 {
@@ -781,7 +830,7 @@ impl OrchestratorRuntime {
                         return Ok(None);
                     };
                     if unit.task_id != task_id
-                        || unit.role != "orchestrator"
+                        || unit.role != role.role
                         || unit.assigned_actor.as_ref() != Some(&actor)
                     {
                         return Ok(None);
@@ -801,16 +850,17 @@ impl OrchestratorRuntime {
 
     async fn admit_signal(&self, event: &DomainEvent, signal: WakeSignal) -> Result<usize> {
         let task_id = event.scope_id.as_str();
-        let Some(role) =
-            TaskRoleRepo::get_by_task_and_role(&*self.db, task_id, "orchestrator").await?
-        else {
-            return Ok(0);
+        let event_role_id = match event.event_type.as_str() {
+            "orchestrator.task_role_changed" | "orchestrator.bootstrap_reconciled" => {
+                Some(event.entity_id.as_str().to_owned())
+            }
+            "orchestrator.membership_changed" => {
+                RoleMembershipRepo::get(&*self.db, &event.entity_id)
+                    .await?
+                    .map(|membership| membership.task_role_id)
+            }
+            _ => None,
         };
-        let memberships = RoleMembershipRepo::list_by_role(&*self.db, &role.id, false).await?;
-        let active: Vec<_> = memberships
-            .into_iter()
-            .filter(|membership| membership.status == RoleMembershipStatus::Active)
-            .collect();
         let unit = match signal.work_unit_id.as_deref() {
             Some(id) => {
                 let Some(unit) = WorkUnitRepo::get_by_id(&*self.db, id).await? else {
@@ -823,57 +873,76 @@ impl OrchestratorRuntime {
             }
             None => None,
         };
-        let targets = select_orchestrator_targets(
-            role.coordination_mode,
-            &role.id,
-            &active,
-            unit.as_ref(),
-            &signal.target,
-        );
         let now = now_rfc3339();
         let policy_digest = current_policy_digest();
-        let role_policy = TaskRoleOrchestratorPolicy::parse(&role.policy_json).ok();
         let mut admitted = 0;
-        for membership in targets {
-            if event_is_authored_by_member(event, membership) {
-                continue;
-            }
-            if membership.actor_kind == ActorKind::Agent
-                && role_policy
-                    .as_ref()
-                    .is_some_and(|policy| !policy.permits_automatic_orchestration())
+        for role in TaskRoleRepo::list_by_task(&*self.db, task_id).await? {
+            if event_role_id
+                .as_deref()
+                .is_some_and(|event_role_id| event_role_id != role.id)
+                || !crate::role_capabilities::current_task_role_has_capability(
+                    &self.db,
+                    &role.id,
+                    api_types::TaskRoleCapability::Orchestration,
+                )
+                .await?
+                || unit.as_ref().is_some_and(|unit| unit.role != role.role)
             {
                 continue;
             }
-            let id = new_uuid_v4();
-            if OrchestratorWakeRepo::admit_orchestrator_wake(
-                &*self.db,
-                CreateOrchestratorWake {
-                    id,
-                    event_id: event.id.clone(),
-                    event_sequence: event.sequence,
-                    task_id: task_id.to_owned(),
-                    task_role_id: role.id.clone(),
-                    coordination_mode: role.coordination_mode,
-                    actor_kind: membership.actor_kind,
-                    actor_id: membership.actor_id.clone(),
-                    work_unit_id: signal.work_unit_id.clone(),
-                    correlation_id: event.correlation_id.clone(),
-                    causation_id: Some(event.id.clone()),
-                    causation_depth: event.causation_depth,
-                    policy_ref: POLICY_REF.to_owned(),
-                    policy_version: POLICY_VERSION,
-                    policy_digest: policy_digest.clone(),
-                    task_role_version: role.version,
-                    task_role_policy_json: role.policy_json.clone(),
-                    available_at: now.clone(),
-                    created_at: now.clone(),
-                    updated_at: now.clone(),
-                },
-            )
-            .await?
-            {
-                admitted += 1;
+            let memberships = RoleMembershipRepo::list_by_role(&*self.db, &role.id, false).await?;
+            let active: Vec<_> = memberships
+                .into_iter()
+                .filter(|membership| membership.status == RoleMembershipStatus::Active)
+                .collect();
+            let role_policy = TaskRoleOrchestratorPolicy::parse(&role.policy_json).ok();
+            let targets = select_orchestrator_targets(
+                role.coordination_mode,
+                &role.id,
+                &role.role,
+                &active,
+                unit.as_ref(),
+                &signal.target,
+            );
+            for membership in targets {
+                if event_is_authored_by_member(event, membership)
+                    || (membership.actor_kind == ActorKind::Agent
+                        && role_policy
+                            .as_ref()
+                            .is_some_and(|policy| !policy.permits_automatic_orchestration()))
+                {
+                    continue;
+                }
+                let id = new_uuid_v4();
+                if OrchestratorWakeRepo::admit_orchestrator_wake(
+                    &*self.db,
+                    CreateOrchestratorWake {
+                        id,
+                        event_id: event.id.clone(),
+                        event_sequence: event.sequence,
+                        task_id: task_id.to_owned(),
+                        task_role_id: role.id.clone(),
+                        coordination_mode: role.coordination_mode,
+                        actor_kind: membership.actor_kind,
+                        actor_id: membership.actor_id.clone(),
+                        work_unit_id: signal.work_unit_id.clone(),
+                        correlation_id: event.correlation_id.clone(),
+                        causation_id: Some(event.id.clone()),
+                        causation_depth: event.causation_depth,
+                        policy_ref: POLICY_REF.to_owned(),
+                        policy_version: POLICY_VERSION,
+                        policy_digest: policy_digest.clone(),
+                        task_role_version: role.version,
+                        task_role_policy_json: role.policy_json.clone(),
+                        available_at: now.clone(),
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    },
+                )
+                .await?
+                {
+                    admitted += 1;
+                }
             }
         }
         Ok(admitted)
@@ -902,13 +971,25 @@ impl OrchestratorRuntime {
             return Ok(DispatchOutcome::Retried);
         }
         let role = TaskRoleRepo::get_by_id(&*self.db, &wake.task_role_id).await?;
-        let Some(role) =
-            role.filter(|role| role.task_id == wake.task_id && role.role == "orchestrator")
-        else {
+        let Some(role) = role.filter(|role| role.task_id == wake.task_id) else {
             self.fail_wake(&wake, "canonical TaskRole was removed or changed")
                 .await?;
             return Ok(DispatchOutcome::Retried);
         };
+        if !crate::role_capabilities::current_task_role_has_capability(
+            &self.db,
+            &role.id,
+            api_types::TaskRoleCapability::Orchestration,
+        )
+        .await?
+        {
+            self.fail_wake(
+                &wake,
+                "orchestration capability was revoked after wake admission",
+            )
+            .await?;
+            return Ok(DispatchOutcome::Retried);
+        }
         if role.version != wake.task_role_version || role.policy_json != wake.task_role_policy_json
         {
             self.fail_wake(
@@ -981,6 +1062,7 @@ impl OrchestratorRuntime {
         let selected = select_orchestrator_targets(
             role.coordination_mode,
             &role.id,
+            &role.role,
             &memberships,
             unit.as_ref(),
             &signal.target,
@@ -1152,10 +1234,21 @@ impl OrchestratorRuntime {
                 }
             },
         };
+        let execution_has_orchestration = crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::Orchestration,
+        )
+        .await?;
+        let exact_execution_role =
+            db::ExecutionTaskRoleAuthorityRepo::get_by_execution_id(&*self.db, &execution.id)
+                .await?
+                .is_some_and(|authority| authority.task_role_id == wake.task_role_id);
         if execution.status != ExecutionStatus::Running
             || execution.task_id != wake.task_id
             || execution.workspace_id.is_some()
-            || execution.role != "orchestrator"
+            || !execution_has_orchestration
+            || !exact_execution_role
             || execution.actor_ref() != Some(ActorRef::Agent(wake.actor_id.clone()))
         {
             self.make_uncertain(
@@ -1546,7 +1639,14 @@ impl OrchestratorRuntime {
         let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &event.entity_id).await? else {
             return Ok(false);
         };
-        if execution.role != "orchestrator" || execution.task_id != event.scope_id {
+        if execution.task_id != event.scope_id
+            || !crate::role_capabilities::execution_has_capability(
+                &self.db,
+                &execution.id,
+                api_types::TaskRoleCapability::Orchestration,
+            )
+            .await?
+        {
             return Ok(false);
         }
         let event_status_matches =
@@ -1998,6 +2098,8 @@ impl OrchestratorRuntime {
                                 ))),
                                 review_subject: review_subject
                                     .map(|subject| subject.reviewed_work_unit_id),
+                                artifact_inputs: Vec::new(),
+                                review_approval: None,
                             },
                             record.result_id.clone(),
                         )
@@ -2093,7 +2195,6 @@ impl OrchestratorRuntime {
             return Err(invalid_action("orchestrator TaskRole no longer exists"));
         };
         if role.task_id != wake.task_id
-            || role.role != "orchestrator"
             || role.coordination_mode != wake.coordination_mode
             || role.version != wake.task_role_version
             || role.policy_json != wake.task_role_policy_json
@@ -2101,6 +2202,15 @@ impl OrchestratorRuntime {
             return Err(invalid_action(
                 "TaskRole version, coordination, or policy changed after wake admission",
             ));
+        }
+        if !crate::role_capabilities::current_task_role_has_capability(
+            &self.db,
+            &role.id,
+            api_types::TaskRoleCapability::Orchestration,
+        )
+        .await?
+        {
+            return Err(invalid_action("TaskRole lost orchestration capability"));
         }
         let memberships = RoleMembershipRepo::list_by_role(&*self.db, &role.id, false).await?;
         if !memberships.iter().any(|membership| {
@@ -2507,6 +2617,7 @@ fn validate_action_policy(
 fn select_orchestrator_targets<'a>(
     mode: Option<CoordinationMode>,
     orchestrator_role_id: &str,
+    orchestrator_role_name: &str,
     members: &'a [RoleMembership],
     work_unit: Option<&WorkUnit>,
     target: &WakeTarget,
@@ -2526,7 +2637,7 @@ fn select_orchestrator_targets<'a>(
                 .filter(|member| member.status == RoleMembershipStatus::Active)
                 .collect(),
             Some(CoordinationMode::Partitioned) => {
-                if let Some(unit) = work_unit.filter(|unit| unit.role == "orchestrator") {
+                if let Some(unit) = work_unit.filter(|unit| unit.role == orchestrator_role_name) {
                     unit.assigned_actor
                         .as_ref()
                         .and_then(exact_actor)
@@ -2545,7 +2656,7 @@ fn select_orchestrator_targets<'a>(
                 .filter(|member| member.status == RoleMembershipStatus::Active)
                 .collect(),
             Some(CoordinationMode::Partitioned) => work_unit
-                .filter(|unit| unit.role == "orchestrator")
+                .filter(|unit| unit.role == orchestrator_role_name)
                 .and_then(|unit| unit.assigned_actor.as_ref())
                 .and_then(exact_actor)
                 .into_iter()
@@ -2591,13 +2702,13 @@ fn execution_lifecycle_is_orchestrator_wake(
     event_type: &str,
     event_task_id: &str,
     execution_task_id: &str,
-    role: &str,
+    has_orchestration_capability: bool,
 ) -> bool {
     matches!(
         event_type,
         "execution.started" | "execution.completed" | "execution.failed" | "execution.stalled"
     ) && event_task_id == execution_task_id
-        && role != "orchestrator"
+        && !has_orchestration_capability
 }
 
 fn event_is_authored_by_member(event: &DomainEvent, member: &RoleMembership) -> bool {
@@ -5654,6 +5765,9 @@ mod tests {
                 assigned_actor: Some(ActorRef::Human(human_a.clone())),
                 requires_integration: false,
                 provenance: None,
+                artifact_input_ids: Vec::new(),
+                review_approval_gate_id: None,
+                review_approval_line_id: None,
                 created_by: ActorRef::Human(human_a.clone()),
                 created_at: work_unit_created_at.clone(),
             },
@@ -6408,6 +6522,7 @@ mod tests {
         let targets = select_orchestrator_targets(
             Some(CoordinationMode::Collaborative),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Task,
@@ -6432,6 +6547,8 @@ mod tests {
             assigned_actor: Some(ActorRef::Agent("b".to_owned())),
             requires_integration: false,
             provenance: None,
+            review_approval_gate_id: None,
+            review_approval_line_id: None,
             created_by: ActorRef::Agent("a".to_owned()),
             version: 1,
             created_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -6440,6 +6557,7 @@ mod tests {
         let targets = select_orchestrator_targets(
             Some(CoordinationMode::Partitioned),
             "role-orchestrator",
+            "orchestrator",
             &members,
             Some(&unit),
             &WakeTarget::Task,
@@ -6449,6 +6567,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Partitioned),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Task,
@@ -6462,6 +6581,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Independent),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Task,
@@ -6470,6 +6590,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Independent),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Role("role-orchestrator".to_owned()),
@@ -6478,6 +6599,7 @@ mod tests {
         let exact = select_orchestrator_targets(
             Some(CoordinationMode::Independent),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Actor(ActorRef::Agent("b".to_owned())),
@@ -6492,6 +6614,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             None,
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Task
@@ -6500,6 +6623,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             None,
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &WakeTarget::Role("role-orchestrator".to_owned()),
@@ -6509,6 +6633,7 @@ mod tests {
             select_orchestrator_targets(
                 None,
                 "role-orchestrator",
+                "orchestrator",
                 &members,
                 None,
                 &WakeTarget::Actor(ActorRef::Agent("a".to_owned())),
@@ -6526,6 +6651,7 @@ mod tests {
             select_orchestrator_targets(
                 Some(CoordinationMode::Collaborative),
                 "role-orchestrator",
+                "orchestrator",
                 &members,
                 None,
                 &role,
@@ -6536,6 +6662,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Partitioned),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &role,
@@ -6544,6 +6671,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Independent),
             "role-orchestrator",
+            "orchestrator",
             &members,
             None,
             &role,
@@ -6560,6 +6688,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Collaborative),
             "role-orchestrator",
+            "orchestrator",
             &[suspended.clone(), ended.clone()],
             None,
             &WakeTarget::Task,
@@ -6568,6 +6697,7 @@ mod tests {
         assert!(select_orchestrator_targets(
             Some(CoordinationMode::Collaborative),
             "role-orchestrator",
+            "orchestrator",
             &[suspended.clone(), ended],
             None,
             &WakeTarget::Actor(ActorRef::Agent("a".to_owned())),
@@ -6607,25 +6737,25 @@ mod tests {
             "execution.completed",
             "task-1",
             "task-1",
-            "implementer",
+            false,
         ));
         assert!(!execution_lifecycle_is_orchestrator_wake(
             "execution.completed",
             "task-1",
             "task-1",
-            "orchestrator",
+            true,
         ));
         assert!(!execution_lifecycle_is_orchestrator_wake(
             "execution.log",
             "task-1",
             "task-1",
-            "implementer",
+            false,
         ));
         assert!(!execution_lifecycle_is_orchestrator_wake(
             "execution.failed",
             "task-1",
             "task-2",
-            "implementer",
+            false,
         ));
     }
 

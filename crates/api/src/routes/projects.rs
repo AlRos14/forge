@@ -275,7 +275,7 @@ pub async fn get_task_role_defaults(
 ) -> ApiResult<Json<ProjectTaskRoleDefaultsResponse>> {
     require_project_visible(&state, &id, &user.user_id).await?;
     let defaults = ProjectTaskRoleDefaultsRepo::get_task_role_defaults(&*state.db, &id).await?;
-    Ok(Json(project_task_role_defaults_response(defaults)))
+    Ok(Json(project_task_role_defaults_response(defaults)?))
 }
 
 pub async fn update_task_role_defaults(
@@ -285,6 +285,45 @@ pub async fn update_task_role_defaults(
     Json(request): Json<UpdateProjectTaskRoleDefaultsRequest>,
 ) -> ApiResult<Json<ProjectTaskRoleDefaultsResponse>> {
     require_project_admin(&state, &id, &user.user_id).await?;
+    let configured_roles = request
+        .roles
+        .iter()
+        .map(|role| {
+            db::canonical_task_role_name(&role.role)
+                .ok_or_else(|| ApiError::bad_request("role is not a TaskRole"))
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    for role in &request.roles {
+        services::task_role_configuration::project_configuration_to_json(&role.configuration)
+            .map_err(ApiError::from)?;
+        if let Some(next_review_role) = role
+            .configuration
+            .rework
+            .as_ref()
+            .and_then(|rework| rework.next_review_role.as_deref())
+        {
+            let reviewer = request
+                .roles
+                .iter()
+                .zip(&configured_roles)
+                .find(|(_, canonical)| canonical.as_str() == next_review_role)
+                .map(|(role, _)| role)
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "next review Project role is not configured: {next_review_role}"
+                    ))
+                })?;
+            if !reviewer
+                .configuration
+                .capabilities
+                .contains(&api_types::TaskRoleCapability::FormalReview)
+            {
+                return Err(ApiError::bad_request(
+                    "next review Project role must have formal_review capability",
+                ));
+            }
+        }
+    }
     let roles = request
         .roles
         .into_iter()
@@ -300,6 +339,11 @@ pub async fn update_task_role_defaults(
                     }
                     api_types::CoordinationMode::Independent => db::CoordinationMode::Independent,
                 },
+                configuration_json:
+                    services::task_role_configuration::project_configuration_to_json(
+                        &role.configuration,
+                    )
+                    .map_err(ApiError::from)?,
                 members: role.members.into_iter().map(api_actor_ref_to_db).collect(),
             })
         })
@@ -319,7 +363,7 @@ pub async fn update_task_role_defaults(
         timestamp: event_timestamp(),
         context: EventContext::ProjectUpdated {},
     });
-    Ok(Json(project_task_role_defaults_response(defaults)))
+    Ok(Json(project_task_role_defaults_response(defaults)?))
 }
 
 fn api_actor_ref_to_db(actor: api_types::ActorRef) -> db::ActorRef {
@@ -338,27 +382,40 @@ fn db_actor_ref_to_api(actor: db::ActorRef) -> api_types::ActorRef {
 
 fn project_task_role_defaults_response(
     defaults: db::ProjectTaskRoleDefaults,
-) -> ProjectTaskRoleDefaultsResponse {
-    ProjectTaskRoleDefaultsResponse {
+) -> ApiResult<ProjectTaskRoleDefaultsResponse> {
+    Ok(ProjectTaskRoleDefaultsResponse {
         project_id: defaults.project_id,
         version: defaults.version,
         roles: defaults
             .roles
             .into_iter()
-            .map(|role| ProjectTaskRoleDefaultResponse {
-                role: role.role,
-                coordination_mode: match role.coordination_mode {
-                    db::CoordinationMode::Partitioned => api_types::CoordinationMode::Partitioned,
-                    db::CoordinationMode::Collaborative => {
-                        api_types::CoordinationMode::Collaborative
-                    }
-                    db::CoordinationMode::Independent => api_types::CoordinationMode::Independent,
-                },
-                members: role.members.into_iter().map(db_actor_ref_to_api).collect(),
+            .map(|role| {
+                let configuration =
+                    serde_json::from_str(&role.configuration_json).map_err(|error| {
+                        ApiError::internal(format!(
+                            "invalid persisted Project TaskRole configuration: {error}"
+                        ))
+                    })?;
+                Ok(ProjectTaskRoleDefaultResponse {
+                    role: role.role,
+                    coordination_mode: match role.coordination_mode {
+                        db::CoordinationMode::Partitioned => {
+                            api_types::CoordinationMode::Partitioned
+                        }
+                        db::CoordinationMode::Collaborative => {
+                            api_types::CoordinationMode::Collaborative
+                        }
+                        db::CoordinationMode::Independent => {
+                            api_types::CoordinationMode::Independent
+                        }
+                    },
+                    configuration,
+                    members: role.members.into_iter().map(db_actor_ref_to_api).collect(),
+                })
             })
-            .collect(),
+            .collect::<ApiResult<Vec<_>>>()?,
         updated_at: defaults.updated_at,
-    }
+    })
 }
 
 pub(super) async fn require_project_visible(

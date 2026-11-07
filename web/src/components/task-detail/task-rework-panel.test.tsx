@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({ request: vi.fn() }))
 
 vi.mock('@/api/hooks', () => ({
   useRequestRework: () => ({ mutateAsync: mocks.request, isPending: false }),
+  useTaskReworkAutomationQuery: () => ({ data: { items: [] } }),
 }))
 
 const task = {
@@ -14,8 +15,29 @@ const task = {
   version: 4,
   lifecycle: { task_id: 'task-1', state: 'active', version: 3 },
   task_roles: [
-    { id: 'role-implementer', role: 'implementer', members: [] },
-    { id: 'role-reviewer', role: 'reviewer', members: [] },
+    {
+      id: 'role-implementer',
+      role: 'implementer',
+      configuration: { schema_version: 1, display_label: null, capabilities: [], rework: null },
+      members: [],
+    },
+    {
+      id: 'role-reviewer',
+      role: 'reviewer',
+      configuration: {
+        schema_version: 1,
+        display_label: null,
+        capabilities: ['formal_review', 'request_rework'],
+        rework: {
+          mode: 'manual',
+          allowed_destination_role_ids: ['role-implementer'],
+          next_review_role_id: 'role-reviewer',
+          correction_actor: { kind: 'original_contributor' },
+          review_actor: { kind: 'human', id: 'reviewer-1' },
+        },
+      },
+      members: [{ status: 'active', actor_ref: { kind: 'human', id: 'reviewer-1' } }],
+    },
   ],
 } as unknown as Task
 
@@ -62,6 +84,7 @@ describe('Task rework panel retry identity', () => {
       review_report_artifact_id: 'artifact-review-1',
       reviewed_work_unit_id: 'unit-implementation',
       reviewed_work_unit_version: 2,
+      correction_role_id: 'role-implementer',
     })
     expect(retryBody).toEqual(firstBody)
     expect(retryBody.idempotency_key).toBeTruthy()

@@ -14,8 +14,8 @@ use db::{
     Execution, ExecutionRepo, ExecutionStatus, ExecutionUsageRepo, HarnessSession,
     HarnessSessionRepo, HarnessSessionStatus, PageRequest, ProjectRepo, RepoRepo, SoftDeleteTask,
     SortBy, SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo, TaskMetadata, TaskRepo,
-    UpsertExecutionUsage, WorkUnitRepo, WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo,
-    WorkspaceRepo, WorkspaceStatus,
+    TaskRoleRepo, UpsertExecutionUsage, WorkUnitRepo, WorkUnitWorkspaceRepo, Workspace,
+    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
@@ -48,7 +48,7 @@ pub(crate) mod workspace;
 pub use actions::TaskActionResult;
 pub use create_subtasks::NewSubtaskInput;
 pub(crate) use memberships::{
-    current_role_memberships_authoritative, human_is_active_role_member_authoritative,
+    current_role_memberships_authoritative, human_is_active_task_role_member_authoritative,
     is_usable_active_agent, is_usable_repository_agent, repository_worker_identity_is_eligible,
     select_usable_agent_id, select_usable_repository_agent_id,
 };
@@ -387,7 +387,13 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        if execution.role == "orchestrator" {
+        if crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::Orchestration,
+        )
+        .await?
+        {
             self.validate_orchestrator_execution(execution).await?;
             return Ok(ExecutionWorkingContext {
                 path: create_isolated_context_directory(
@@ -1300,9 +1306,13 @@ impl TaskService {
                 "remote terminal report refers to an Execution whose provider Start was never attempted",
             ));
         }
-        if current_execution.status == ExecutionStatus::Running
-            && current_execution.role == "reviewer"
-        {
+        let is_formal_review = crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &current_execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?;
+        if current_execution.status == ExecutionStatus::Running && is_formal_review {
             let expected_output = notification
                 .assistant_output
                 .as_deref()
@@ -1314,20 +1324,19 @@ impl TaskService {
                 return Ok(completed);
             }
         }
-        let _workspace_review_guard = if current_execution.status == ExecutionStatus::Running
-            && current_execution.role == "reviewer"
-        {
-            if let (Some(workspace_id), Some(locks)) = (
-                current_execution.workspace_id.as_deref(),
-                self.workspace_exec_locks.as_ref(),
-            ) {
-                Some(locks.acquire(workspace_id).await)
+        let _workspace_review_guard =
+            if current_execution.status == ExecutionStatus::Running && is_formal_review {
+                if let (Some(workspace_id), Some(locks)) = (
+                    current_execution.workspace_id.as_deref(),
+                    self.workspace_exec_locks.as_ref(),
+                ) {
+                    Some(locks.acquire(workspace_id).await)
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
         if _workspace_review_guard.is_some() {
             current_execution = ExecutionRepo::get_by_id(&*self.db, &notification.execution_id)
                 .await?
@@ -1373,7 +1382,7 @@ impl TaskService {
                 .create_plan_artifact_from_execution(&current_execution.id, assistant_output)
                 .await?;
         }
-        if current_execution.role == "reviewer" && outcome == "completed" {
+        if is_formal_review && outcome == "completed" {
             let assistant_output = notification
                 .assistant_output
                 .as_deref()

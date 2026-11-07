@@ -597,7 +597,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       ) : null}
 
       {/* Main content */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         {/* Header */}
         <header className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-sidebar-border bg-background px-3 sm:px-4 lg:px-5">
           <div className="flex min-w-0 items-center gap-2">
@@ -656,7 +656,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <main
           id="main-content"
           className={cn(
-            'min-h-0 flex-1 bg-card p-3 sm:p-4 lg:p-5',
+            'min-h-0 min-w-0 flex-1 bg-card p-4 lg:p-6',
             isBoardRoute ? 'overflow-hidden' : 'overflow-auto',
           )}
         >

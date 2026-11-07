@@ -115,7 +115,7 @@ pub(crate) struct RequestReworkParams {
     pub(crate) reviewed_work_unit_version: i64,
     pub(crate) correction_title: String,
     pub(crate) correction_scope: String,
-    pub(crate) correction_role: String,
+    pub(crate) correction_role_id: String,
     pub(crate) correction_actor: Option<ActorRef>,
     pub(crate) review_title: String,
     pub(crate) review_scope: String,
@@ -136,6 +136,10 @@ pub(crate) struct CreateWorkUnitParams {
     pub(crate) assigned_actor: Option<ActorRef>,
     pub(crate) requires_integration: bool,
     pub(crate) provenance: Option<CreateWorkUnitProvenance>,
+    #[serde(default)]
+    pub(crate) artifact_inputs: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) review_approval: Option<api_types::WorkUnitReviewApprovalRequest>,
     pub(crate) review_subject: Option<CreateWorkUnitReviewSubjectRequest>,
 }
 
@@ -202,6 +206,18 @@ pub(crate) struct CreateTaskRoleParams {
     pub(crate) role: String,
     pub(crate) coordination_mode: api_types::CoordinationMode,
     pub(crate) policy: Option<Value>,
+    pub(crate) configuration: Option<api_types::TaskRoleConfiguration>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateTaskRoleParams {
+    pub(crate) task_id: String,
+    pub(crate) role: String,
+    pub(crate) expected_version: i64,
+    pub(crate) coordination_mode: Option<api_types::CoordinationMode>,
+    pub(crate) policy: Option<Value>,
+    pub(crate) configuration: Option<api_types::TaskRoleConfiguration>,
 }
 
 #[derive(Debug, Deserialize)]

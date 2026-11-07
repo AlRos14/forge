@@ -87,6 +87,7 @@ mod tests {
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 worktree_path: ".".to_owned(),
                 description: "test".to_owned(),
                 agent_config: serde_json::json!({"delay_seconds": 1}),

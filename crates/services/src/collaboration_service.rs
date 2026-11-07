@@ -114,9 +114,15 @@ impl CollaborationService {
         &self,
         execution: &db::Execution,
     ) -> Result<()> {
-        if execution.role != "reviewer" {
+        if !crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
+        {
             return Err(invalid(
-                "Review subject check requires a reviewer Execution",
+                "Review subject check requires an admitted formal_review Execution",
             ));
         }
         let Some(workspace_id) = execution.workspace_id.as_deref() else {
@@ -174,9 +180,15 @@ impl CollaborationService {
         &self,
         execution: &db::Execution,
     ) -> Result<Option<Artifact>> {
-        if execution.role != "reviewer" {
+        if !crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
+        {
             return Err(invalid(
-                "ReviewReport reconciliation requires its exact reviewer Execution",
+                "ReviewReport reconciliation requires its exact formal_review Execution",
             ));
         }
         let Some(actor) = execution.actor_ref() else {
@@ -667,14 +679,19 @@ impl CollaborationService {
         let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
             .await?
             .ok_or_else(|| not_found("execution", execution_id.to_owned()))?;
-        if execution.role != "reviewer"
+        if !crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
             || !matches!(
                 execution.status,
                 db::ExecutionStatus::Running | db::ExecutionStatus::Completed
             )
         {
             return Err(invalid(
-                "ReviewReport producer must be a running or completed reviewer Review Execution",
+                "ReviewReport producer must be a running or completed formal_review Execution",
             ));
         }
         let existing_output = CollaborationRepo::get_execution_artifact_output(
@@ -2073,7 +2090,13 @@ impl CollaborationService {
                         .to_owned(),
                 });
             }
-            if execution.role == "orchestrator" {
+            if crate::role_capabilities::execution_has_capability(
+                &self.db,
+                &execution.id,
+                api_types::TaskRoleCapability::Orchestration,
+            )
+            .await?
+            {
                 let start_event = DomainEventRepo::get_event_by_dedupe(
                     &*self.db,
                     &format!("execution.started:{}", execution.id),

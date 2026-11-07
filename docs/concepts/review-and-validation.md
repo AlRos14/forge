@@ -39,7 +39,7 @@ review and review may be required even when no validation command exists.
 
 ## Review
 
-Review is an Execution under the reviewer Role. Human and Agent reviewers use
+Review is an Execution admitted under a TaskRole with `formal_review`. Human and Agent reviewers use
 the same domain record. The review Artifact records criteria, findings,
 severity where useful, verdict, questions, references, the Evidence
 considered, and the exact subject: Task, Workspace, base/head commit, snapshot
@@ -62,6 +62,11 @@ A review report that requests changes finishes its own review WorkUnit and is a
 valid result, but it does not accept the reviewed implementation and does not
 satisfy an approval Gate. A technical reviewer failure produces no valid
 negative report.
+
+A typed approval requirement follows a durable review line from its source
+result through exact correction and review rounds. It is satisfied only by a
+favorable report over the latest result on that line. A pass over an earlier
+result and a completion dependency do not approve a later correction.
 
 A reviewer may inspect changes, ask a question, request validation, pass, or
 request changes. It does not directly mutate implementation work through a
@@ -86,7 +91,9 @@ reviewer's failure.
 ## Rework
 
 The flow keeps request-changes in the exact ReviewReport and evaluates its Gate
-as unsatisfied. One idempotent domain operation over that exact report creates a
+as unsatisfied. A TaskRole needs `request_rework` and an explicit route before
+it can request a correction. Manual mode is the default; automatic processing
+requires an owner/admin policy. One idempotent domain operation over that exact report creates a
 correction WorkUnit and a new reviewer WorkUnit, records their dependency,
 provenance, and result subject, and consumes one bounded per-Task rework round
 atomically. Replaying the same idempotency key consumes nothing and returns the

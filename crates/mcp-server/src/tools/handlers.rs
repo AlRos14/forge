@@ -31,9 +31,9 @@ use crate::{
         ListWorkUnitsParams, RegisterAgentParams, RemoveTaskDependencyParams, RequestReworkParams,
         ReviewExecutionParams, ReviewTaskParams, ReviseGatePolicyParams,
         SubmitWorkUnitReviewParams, TaskDispatchActionParams, TransitionTaskLifecycleParams,
-        UpdateProjectHooksParams, UpdateProjectParams, UpdateTaskParams, UpdateWorkUnitParams,
-        ValidationRunParams, ValidationTaskParams, WorkUnitDependencyParams, WorkUnitIdParams,
-        WorkUnitTransitionParams,
+        UpdateProjectHooksParams, UpdateProjectParams, UpdateTaskParams, UpdateTaskRoleParams,
+        UpdateWorkUnitParams, ValidationRunParams, ValidationTaskParams, WorkUnitDependencyParams,
+        WorkUnitIdParams, WorkUnitTransitionParams,
     },
     protocol::McpContext,
     state::AppState,
@@ -487,12 +487,13 @@ pub(super) async fn forge_request_rework(
                 reviewed_work_unit_version: params.reviewed_work_unit_version,
                 correction_title: params.correction_title,
                 correction_scope: params.correction_scope,
-                correction_role: params.correction_role,
+                correction_role_id: params.correction_role_id,
                 correction_actor: params.correction_actor,
                 review_title: params.review_title,
                 review_scope: params.review_scope,
                 review_actor: params.review_actor,
                 idempotency_key: params.idempotency_key,
+                expected_source_configuration_json: None,
             },
         )
         .await?;
@@ -568,6 +569,8 @@ pub(super) async fn forge_create_work_unit(
                 assigned_actor: params.assigned_actor.map(work_unit_actor_to_db),
                 requires_integration: params.requires_integration,
                 provenance,
+                artifact_inputs: params.artifact_inputs.unwrap_or_default(),
+                review_approval: params.review_approval,
                 review_subject: params
                     .review_subject
                     .map(|subject| subject.reviewed_work_unit_id),
@@ -646,6 +649,38 @@ pub(super) async fn forge_get_work_unit(
         .get(source.clone(), &params.work_unit_id)
         .await?;
     work_unit_value_for(state, source, unit).await
+}
+
+pub(super) async fn forge_get_work_unit_artifact_package(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: WorkUnitIdParams = parse_params(params)?;
+    let package = state
+        .work_unit_service
+        .artifact_package(work_unit_source(context)?, &params.work_unit_id)
+        .await?;
+    serde_json::to_value(package).map_err(|error| {
+        McpToolError::new(
+            -32603,
+            format!("failed to serialize Artifact package: {error}"),
+        )
+    })
+}
+
+pub(super) async fn forge_list_task_review_lines(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: GetTaskParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    require_task_access(state, &params.task_id, user_id).await?;
+    let lines = services::task_rework::list_review_lines(&state.db, &params.task_id).await?;
+    serde_json::to_value(lines).map_err(|error| {
+        McpToolError::new(-32603, format!("failed to serialize review lines: {error}"))
+    })
 }
 
 pub(super) async fn forge_update_work_unit(
@@ -1411,12 +1446,23 @@ pub(super) async fn forge_list_task_roles(
     let mut roles = Vec::new();
     for role in TaskRoleRepo::list_by_task(&*state.db, &params.task_id).await? {
         let members = RoleMembershipRepo::list_by_role(&*state.db, &role.id, true).await?;
+        let configuration_record =
+            db::TaskRoleCapabilityConfigurationRepo::get_by_task_role_id(&*state.db, &role.id)
+                .await?
+                .ok_or_else(|| {
+                    McpToolError::new(-32603, "TaskRole capability configuration is missing")
+                })?;
+        let (policy, configuration) = task_role_policy_and_configuration(
+            &role.policy_json,
+            &configuration_record.configuration_json,
+        )?;
         roles.push(json!({
             "id": role.id,
             "task_id": role.task_id,
             "role": role.role,
             "coordination_mode": role.coordination_mode.map(|mode| mode.to_string()),
-            "policy": serde_json::from_str::<Value>(&role.policy_json).unwrap_or(Value::Null),
+            "policy": policy,
+            "configuration": configuration,
             "version": role.version,
             "members": members.into_iter().map(|member| json!({
                 "id": member.id,
@@ -1442,8 +1488,15 @@ pub(super) async fn forge_create_task_role(
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
     let params: CreateTaskRoleParams = parse_params(params)?;
-    require_task_access(state, &params.task_id, user_id).await?;
+    let task = require_task_access(state, &params.task_id, user_id).await?;
+    require_project_admin_access(state, &task.project_id, user_id).await?;
     let policy = params.policy.unwrap_or_else(|| json!({}));
+    let configuration = params.configuration.unwrap_or_default();
+    let policy_json = serde_json::to_string(&policy)
+        .map_err(|error| McpToolError::new(-32602, error.to_string()))?;
+    let configuration_json =
+        services::task_role_configuration::store_task_role_configuration(&configuration)
+            .map_err(|error| McpToolError::new(-32602, error.to_string()))?;
     let coordination_mode = match params.coordination_mode {
         PublicCoordinationMode::Partitioned => db::CoordinationMode::Partitioned,
         PublicCoordinationMode::Collaborative => db::CoordinationMode::Collaborative,
@@ -1451,16 +1504,74 @@ pub(super) async fn forge_create_task_role(
     };
     let role = state
         .task_service
-        .create_task_role(
+        .create_task_role_with_configuration(
             &params.task_id,
             &params.role,
             coordination_mode,
-            serde_json::to_string(&policy)
-                .map_err(|error| McpToolError::new(-32602, error.to_string()))?,
+            policy_json,
+            configuration_json.clone(),
         )
         .await?;
     let members = RoleMembershipRepo::list_by_role(&*state.db, &role.id, false).await?;
-    task_role_value(role, members)
+    task_role_value(role, members, &configuration_json)
+}
+
+pub(super) async fn forge_update_task_role(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    let params: UpdateTaskRoleParams = parse_params(params)?;
+    let task = require_task_access(state, &params.task_id, user_id).await?;
+    require_project_admin_access(state, &task.project_id, user_id).await?;
+    let role_name = db::canonical_task_role_name(&params.role)
+        .ok_or_else(|| McpToolError::new(-32602, "role is not a TaskRole"))?;
+    let role = TaskRoleRepo::get_by_task_and_role(&*state.db, &task.id, &role_name)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("task_role", role_name.clone()))?;
+    let current_configuration_record =
+        db::TaskRoleCapabilityConfigurationRepo::get_by_task_role_id(&*state.db, &role.id)
+            .await?
+            .ok_or_else(|| {
+                McpToolError::new(-32603, "TaskRole capability configuration is missing")
+            })?;
+    let (current_policy, current_configuration) = task_role_policy_and_configuration(
+        &role.policy_json,
+        &current_configuration_record.configuration_json,
+    )?;
+    let policy_changed = params.policy.is_some();
+    let configuration_changed = params.configuration.is_some();
+    let policy = params.policy.unwrap_or(current_policy);
+    let policy_json = policy_changed
+        .then(|| serde_json::to_string(&policy))
+        .transpose()
+        .map_err(|error| McpToolError::new(-32602, error.to_string()))?;
+    let configuration = params.configuration.unwrap_or(current_configuration);
+    let configuration_json = if configuration_changed {
+        services::task_role_configuration::store_task_role_configuration(&configuration)
+            .map_err(|error| McpToolError::new(-32602, error.to_string()))?
+    } else {
+        current_configuration_record.configuration_json
+    };
+    let coordination_mode = params.coordination_mode.map(|mode| match mode {
+        PublicCoordinationMode::Partitioned => db::CoordinationMode::Partitioned,
+        PublicCoordinationMode::Collaborative => db::CoordinationMode::Collaborative,
+        PublicCoordinationMode::Independent => db::CoordinationMode::Independent,
+    });
+    let updated = state
+        .task_service
+        .update_task_role_with_configuration(
+            &task.id,
+            &role_name,
+            params.expected_version,
+            coordination_mode,
+            policy_json,
+            configuration_json.clone(),
+        )
+        .await?;
+    let members = RoleMembershipRepo::list_by_role(&*state.db, &updated.id, true).await?;
+    task_role_value(updated, members, &configuration_json)
 }
 
 pub(super) async fn forge_add_task_role_member(
@@ -1490,16 +1601,17 @@ pub(super) async fn forge_add_task_role_member(
 fn task_role_value(
     role: db::TaskRole,
     members: Vec<db::RoleMembership>,
+    configuration_json: &str,
 ) -> Result<Value, McpToolError> {
-    let policy = serde_json::from_str::<Value>(&role.policy_json).map_err(|error| {
-        McpToolError::new(-32603, format!("invalid stored TaskRole policy: {error}"))
-    })?;
+    let (policy, configuration) =
+        task_role_policy_and_configuration(&role.policy_json, configuration_json)?;
     Ok(json!({
         "id": role.id,
         "task_id": role.task_id,
         "role": role.role,
         "coordination_mode": role.coordination_mode.map(|mode| mode.to_string()),
         "policy": policy,
+        "configuration": configuration,
         "version": role.version,
         "members": members.into_iter().map(|member| json!({
             "id": member.id,
@@ -1514,6 +1626,19 @@ fn task_role_value(
         "created_at": role.created_at,
         "updated_at": role.updated_at,
     }))
+}
+
+fn task_role_policy_and_configuration(
+    policy_raw: &str,
+    configuration_raw: &str,
+) -> Result<(Value, api_types::TaskRoleConfiguration), McpToolError> {
+    let policy = serde_json::from_str::<Value>(policy_raw).map_err(|error| {
+        McpToolError::new(-32603, format!("invalid stored TaskRole policy: {error}"))
+    })?;
+    let configuration =
+        services::task_role_configuration::parse_task_role_configuration(configuration_raw)
+            .map_err(|error| McpToolError::new(-32603, error.to_string()))?;
+    Ok((policy, configuration))
 }
 
 pub(crate) async fn require_project_access(
@@ -1795,11 +1920,16 @@ pub(super) async fn forge_list_task_review_executions(
     )
     .await?;
     let mut reviews = Vec::new();
-    for execution in page
-        .items
-        .into_iter()
-        .filter(|execution| execution.role == "reviewer")
-    {
+    for execution in page.items {
+        if !services::role_capabilities::execution_has_capability(
+            &state.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
+        {
+            continue;
+        }
         reviews.push(review_execution_value(state, execution).await?);
     }
     Ok(json!({"items": reviews}))
@@ -1812,8 +1942,16 @@ pub(super) async fn forge_get_review_execution(
     let params: ReviewExecutionParams = parse_params(params)?;
     let execution = ExecutionRepo::get_by_id(&*state.db, &params.execution_id)
         .await?
-        .filter(|execution| execution.role == "reviewer")
         .ok_or_else(|| McpToolError::not_found("review_execution", params.execution_id))?;
+    if !services::role_capabilities::execution_has_capability(
+        &state.db,
+        &execution.id,
+        api_types::TaskRoleCapability::FormalReview,
+    )
+    .await?
+    {
+        return Err(McpToolError::not_found("review_execution", execution.id));
+    }
     review_execution_value(state, execution).await
 }
 

@@ -18,6 +18,23 @@ fn unique_temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("forge-{name}-{}-{nanos}", std::process::id()))
 }
 
+async fn ensure_current_project_repo_fixture_table(pool: &sqlx::SqlitePool) {
+    // Current ProjectRepo inserts a defaults header introduced in V136. Some
+    // historical migration fixtures intentionally stop earlier than V136 and
+    // still use the current repository helper to create their parent Project.
+    // Supply only that unrelated header table in each disposable fixture.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS project_task_role_defaults (
+            project_id TEXT PRIMARY KEY REFERENCES project(id) ON DELETE CASCADE,
+            version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+            updated_at TEXT NOT NULL
+         )",
+    )
+    .execute(pool)
+    .await
+    .expect("current ProjectRepo defaults header exists in the fixture");
+}
+
 async fn insert_legacy_task(
     pool: &sqlx::SqlitePool,
     id: &str,
@@ -55,6 +72,7 @@ async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_
     let now = db::now_rfc3339();
     let project_id = db::new_uuid_v4();
     let task_id = db::new_uuid_v4();
+    ensure_current_project_repo_fixture_table(&pool).await;
     ProjectRepo::create(
         &db,
         CreateProject {
@@ -151,6 +169,7 @@ async fn pr9_migration_maps_legacy_task_states_conservatively_and_audits_ambigui
     let db = SqliteDb::new(pool.clone());
     let now = db::now_rfc3339();
     let project_id = db::new_uuid_v4();
+    ensure_current_project_repo_fixture_table(&pool).await;
     ProjectRepo::create(
         &db,
         CreateProject {
@@ -294,6 +313,7 @@ async fn pr5_rebuild_preserves_legacy_workspace_as_task_integration_scope() {
     let repo_id = db::new_uuid_v4();
     let task_id = db::new_uuid_v4();
     let workspace_id = db::new_uuid_v4();
+    ensure_current_project_repo_fixture_table(&pool).await;
     db::ProjectRepo::create(
         &db,
         db::CreateProject {
@@ -1319,6 +1339,7 @@ async fn v114_preserves_legacy_pr_outcomes_without_granting_admission_authority(
         db::new_uuid_v4(),
         db::new_uuid_v4(),
     ];
+    ensure_current_project_repo_fixture_table(&pool).await;
     db::ProjectRepo::create(
         &db,
         CreateProject {
@@ -1477,6 +1498,7 @@ async fn v114_recovers_v110_terminal_pr_outcome_from_its_exact_result_event() {
     let metadata_id = db::new_uuid_v4();
     let merge_id = db::new_uuid_v4();
     let publish_id = db::new_uuid_v4();
+    ensure_current_project_repo_fixture_table(&pool).await;
     ProjectRepo::create(
         &db,
         CreateProject {

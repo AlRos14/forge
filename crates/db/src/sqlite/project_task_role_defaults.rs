@@ -29,7 +29,8 @@ impl ProjectTaskRoleDefaultsRepo for SqliteDb {
         let version: i64 = header.try_get("version")?;
         let updated_at: String = header.try_get("updated_at")?;
         let rows = sqlx::query(
-            "SELECT role.role, role.coordination_mode, member.actor_kind, member.actor_id
+            "SELECT role.role, role.coordination_mode, role.configuration_json,
+                    member.actor_kind, member.actor_id
              FROM project_task_role_default_role AS role
              LEFT JOIN project_task_role_default_member AS member
                ON member.project_id = role.project_id AND member.role = role.role
@@ -51,6 +52,9 @@ impl ProjectTaskRoleDefaultsRepo for SqliteDb {
                 .or_insert_with(|| ProjectTaskRoleDefault {
                     role: role_name,
                     coordination_mode,
+                    configuration_json: row
+                        .try_get("configuration_json")
+                        .expect("selected configuration_json has a stable SQLite type"),
                     members: Vec::new(),
                 });
             if let (Some(actor_kind), Some(actor_id)) = (
@@ -124,6 +128,24 @@ impl ProjectTaskRoleDefaultsRepo for SqliteDb {
                     role.role
                 )));
             }
+        }
+        let available_roles = seen_roles.clone();
+        seen_roles.clear();
+        for role in &roles {
+            let canonical = crate::canonical_task_role_name(&role.role)
+                .ok_or_else(|| DbError::Check("role is not a TaskRole".to_owned()))?;
+            if canonical != role.role || role.role.len() > 64 {
+                return Err(DbError::Check(
+                    "role must be a canonical TaskRole name of at most 64 bytes".to_owned(),
+                ));
+            }
+            if !seen_roles.insert(role.role.clone()) {
+                return Err(DbError::Check(format!(
+                    "duplicate Project default role: {}",
+                    role.role
+                )));
+            }
+            validate_project_role_configuration(&role.configuration_json, &available_roles)?;
             let mut seen_members = HashSet::new();
             for actor in &role.members {
                 let (kind, actor_id) = match actor {
@@ -187,12 +209,13 @@ impl ProjectTaskRoleDefaultsRepo for SqliteDb {
         for role in roles {
             sqlx::query(
                 "INSERT INTO project_task_role_default_role
-                    (project_id, role, coordination_mode, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?)",
+                    (project_id, role, coordination_mode, configuration_json, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(project_id)
             .bind(&role.role)
             .bind(role.coordination_mode.to_string())
+            .bind(&role.configuration_json)
             .bind(updated_at)
             .bind(updated_at)
             .execute(&mut *transaction)
@@ -234,4 +257,84 @@ impl ProjectTaskRoleDefaultsRepo for SqliteDb {
         transaction.commit().await?;
         Ok(defaults)
     }
+}
+
+fn validate_project_role_configuration(raw: &str, available_roles: &HashSet<String>) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+        DbError::Check(format!("invalid Project TaskRole configuration: {error}"))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        DbError::Check("Project TaskRole configuration must be an object".to_owned())
+    })?;
+    if object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|version| version != 1)
+    {
+        return Err(DbError::Check(
+            "unsupported Project TaskRole configuration schema version".to_owned(),
+        ));
+    }
+    if let Some(capabilities) = object.get("capabilities") {
+        let capabilities = capabilities.as_array().ok_or_else(|| {
+            DbError::Check("Project TaskRole capabilities must be an array".to_owned())
+        })?;
+        let mut seen = HashSet::new();
+        for capability in capabilities {
+            let name = capability.as_str().ok_or_else(|| {
+                DbError::Check("Project TaskRole capability must be a string".to_owned())
+            })?;
+            if !matches!(name, "formal_review" | "orchestration" | "request_rework")
+                || !seen.insert(name)
+            {
+                return Err(DbError::Check(format!(
+                    "unknown or duplicate Project TaskRole capability: {name}"
+                )));
+            }
+        }
+    }
+    if let Some(label) = object.get("display_label") {
+        if !label.is_null()
+            && (!label
+                .as_str()
+                .is_some_and(|label| !label.trim().is_empty() && label.len() <= 120))
+        {
+            return Err(DbError::Check(
+                "Project TaskRole display_label must be a non-empty string of at most 120 bytes"
+                    .to_owned(),
+            ));
+        }
+    }
+    if let Some(rework) = object.get("rework").filter(|value| !value.is_null()) {
+        let rework = rework.as_object().ok_or_else(|| {
+            DbError::Check("Project TaskRole rework configuration must be an object".to_owned())
+        })?;
+        let destinations = rework
+            .get("allowed_destination_roles")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                DbError::Check("Project rework destinations must be an array".to_owned())
+            })?;
+        for destination in destinations {
+            let name = destination.as_str().ok_or_else(|| {
+                DbError::Check("Project rework destination must be a role name".to_owned())
+            })?;
+            if !available_roles.contains(name) {
+                return Err(DbError::Check(format!(
+                    "Project rework destination role is not configured: {name}"
+                )));
+            }
+        }
+        if let Some(next_review) = rework
+            .get("next_review_role")
+            .and_then(serde_json::Value::as_str)
+        {
+            if !available_roles.contains(next_review) {
+                return Err(DbError::Check(format!(
+                    "Project next review role is not configured: {next_review}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }

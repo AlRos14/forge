@@ -596,6 +596,7 @@ impl ProjectCopilotService {
             task_id: format!("project-copilot:{}", run.id),
             execution_id: run.id.clone(),
             role: "project_copilot".to_owned(),
+            task_role_capabilities: vec![],
             worktree_path: context_dir.to_string_lossy().into_owned(),
             description,
             agent_config: runtime_snapshot.clone(),

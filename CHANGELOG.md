@@ -10,6 +10,19 @@ PR14 audit on 2026-10-16.
 
 ### Breaking
 
+- TaskRole names no longer define formal review, orchestration, or rework
+  authority. Use typed `configuration` with the capability catalog and exact
+  TaskRole version. `GET /api/v1/task-role-capabilities` returns the closed
+  catalog and editable templates. A role named `reviewer` without
+  `formal_review` cannot review; a custom role can when an owner/admin grants
+  it. Executions preserve an immutable admission snapshot; Provider Start
+  rejects revoked or changed configuration.
+- Approval requirements follow an exact review line and latest result. A
+  `request_changes` report and ordinary WorkUnit completion do not unlock the
+  final consumer. Rework routes are manual by default; enabling automatic
+  rework is an owner/admin configuration change. Project role defaults resolve
+  role names to local TaskRole IDs when a new Task is created.
+
 - Reviewer WorkUnits can name their initial `review_subject` during preparation;
   Forge freezes the accepted result rather than a mutable preparation version.
   Humans submit through `POST /work-units/{id}/review-report` without creating
@@ -137,6 +150,11 @@ PR14 audit on 2026-10-16.
 
 ### Fixed
 
+- Automatic rework intents now link to the exact manual receipt when a human
+  completes the same ReviewReport first. A concurrent Task pause leaves the
+  intent pending for resume, while cancellation records a distinct terminal
+  outcome. Escape from a portalled Select closes the Select without closing its
+  surrounding Dialog.
 - Run OpenCode Project Copilot turns against a private OpenCode server with a
   preflight session, so the per-run agent and MCP catalog are loaded before the
   real turn. The policy is written as a real config file so MCP `{env:...}`

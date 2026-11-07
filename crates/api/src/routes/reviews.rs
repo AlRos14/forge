@@ -20,7 +20,13 @@ async fn exact_review_execution(state: &AppState, execution_id: &str) -> ApiResu
     let execution = ExecutionRepo::get_by_id(&*state.db, execution_id)
         .await?
         .ok_or_else(|| ApiError::not_found("review_execution", execution_id.to_owned()))?;
-    if execution.role != "reviewer" {
+    if !services::role_capabilities::execution_has_capability(
+        &state.db,
+        &execution.id,
+        api_types::TaskRoleCapability::FormalReview,
+    )
+    .await?
+    {
         return Err(ApiError::not_found(
             "review_execution",
             execution_id.to_owned(),

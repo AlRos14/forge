@@ -163,6 +163,7 @@ pub struct CopilotMessagePageQuery {
 pub struct ProjectTaskRoleDefault {
     pub role: String,
     pub coordination_mode: CoordinationMode,
+    pub configuration_json: String,
     pub members: Vec<ActorRef>,
 }
 
@@ -698,6 +699,8 @@ pub struct WorkUnit {
     pub assigned_actor: Option<ActorRef>,
     pub requires_integration: bool,
     pub provenance: Option<WorkUnitProvenance>,
+    pub review_approval_gate_id: Option<String>,
+    pub review_approval_line_id: Option<String>,
     pub created_by: ActorRef,
     pub version: i64,
     pub created_at: String,
@@ -1909,6 +1912,28 @@ pub struct TaskRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRoleCapabilityConfiguration {
+    pub task_role_id: String,
+    pub task_role_version: i64,
+    pub configuration_json: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionTaskRoleAuthority {
+    pub execution_id: String,
+    pub task_role_id: String,
+    pub task_role_version: Option<i64>,
+    pub configuration_json: String,
+    pub capabilities_json: String,
+    pub membership_id: String,
+    pub actor_kind: ActorKind,
+    pub actor_id: String,
+    pub source: String,
+    pub captured_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateTaskRole {
     pub id: String,
     pub task_id: String,
@@ -1925,6 +1950,16 @@ pub struct UpdateTaskRole {
     pub expected_version: i64,
     pub coordination_mode: Option<Option<CoordinationMode>>,
     pub policy_json: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateTaskRoleWithConfiguration {
+    pub id: String,
+    pub expected_version: i64,
+    pub coordination_mode: Option<Option<CoordinationMode>>,
+    pub policy_json: Option<String>,
+    pub configuration_json: String,
     pub updated_at: String,
 }
 

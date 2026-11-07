@@ -1,6 +1,9 @@
 import { useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { useRequestRework } from '@/api/hooks'
+import {
+  useRequestRework,
+  useTaskReworkAutomationQuery,
+} from '@/api/hooks'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -75,19 +78,26 @@ export function TaskReworkPanel({
 }) {
   const subject = useMemo(() => parseReworkSubject(review), [review])
   const requestRework = useRequestRework()
-  const implementerRoles = task.task_roles.filter(
-    (role) => role.role !== 'reviewer',
+  const automationQuery = useTaskReworkAutomationQuery(task.id)
+  const reviewerRole = task.task_roles.find((role) => role.role === review.execution.role)
+  const reworkPolicy = reviewerRole?.configuration.rework
+  const allowedRoles = task.task_roles.filter((role) =>
+    reworkPolicy?.allowed_destination_role_ids.includes(role.id),
   )
   const [correctionTitle, setCorrectionTitle] = useState('Correction')
   const [correctionScope, setCorrectionScope] = useState(
     'Apply exactly the changes requested by the ReviewReport.',
   )
   const [correctionRole, setCorrectionRole] = useState(
-    implementerRoles.find((role) => role.role === 'implementer')?.role ??
-      implementerRoles[0]?.role ??
+    allowedRoles[0]?.id ??
       '',
   )
-  const [correctionActor, setCorrectionActor] = useState('')
+  const [correctionActor, setCorrectionActor] = useState(() => {
+    const selection = reworkPolicy?.correction_actor
+    return selection?.kind === 'explicit'
+      ? actorKey(selection.actor_ref)
+      : ''
+  })
   const [reviewTitle, setReviewTitle] = useState('Review correction')
   const [reviewScope, setReviewScope] = useState(
     'Review the exact correction result against the requested changes.',
@@ -97,16 +107,31 @@ export function TaskReworkPanel({
 
   if (!subject) return null
 
+  const automationIntent = automationQuery.data?.items.find(
+    (intent) => intent.review_report_artifact_id === review.report?.id,
+  )
+
   const correctionMembers = activeMembers(
     task.task_roles.find((role) => role.role === correctionRole),
   )
-  const reviewerMembers = activeMembers(
-    task.task_roles.find((role) => role.role === 'reviewer'),
+  const nextReviewRole = task.task_roles.find(
+    (role) => role.id === reworkPolicy?.next_review_role_id,
   )
+  const reviewerMembers = activeMembers(nextReviewRole)
+  const configuredCorrectionActor = reworkPolicy?.correction_actor
+  const correctionActorRequired = !configuredCorrectionActor
+  const configuredReviewActor = reworkPolicy?.review_actor
 
   async function submit() {
     if (!review.report || !subject) return
-    if (!correctionTitle.trim() || !correctionScope.trim() || !correctionRole) {
+    if (
+      !correctionTitle.trim() ||
+      !correctionScope.trim() ||
+      !correctionRole ||
+      !nextReviewRole ||
+      (correctionActorRequired && !correctionActor) ||
+      (!configuredReviewActor && !reviewActor)
+    ) {
       toast.error('Correction title, scope, and role are required')
       return
     }
@@ -119,14 +144,13 @@ export function TaskReworkPanel({
         reviewed_work_unit_version: subject.reviewedWorkUnitVersion,
         correction_title: correctionTitle.trim(),
         correction_scope: correctionScope.trim(),
-        correction_role: correctionRole,
-        correction_actor: parseActor(correctionActor),
+        correction_role_id: correctionRole,
+        correction_actor: correctionActorRequired ? parseActor(correctionActor) : null,
         review_title: reviewTitle.trim() || 'Review correction',
         review_scope:
           reviewScope.trim() ||
           'Review the exact correction result against the requested changes.',
-        review_role: 'reviewer',
-        review_actor: parseActor(reviewActor),
+        review_actor: configuredReviewActor ?? parseActor(reviewActor),
       }
       const fingerprint = JSON.stringify(request)
       const idempotencyKey =
@@ -162,6 +186,31 @@ export function TaskReworkPanel({
           correction WorkUnit and a new reviewer WorkUnit with an exact result subject.
         </p>
       </div>
+      {automationIntent?.state === 'pending' ? (
+        <p role="status" className="rounded bg-muted/40 p-2 text-xs text-muted-foreground">
+          Automatic correction is durably queued. It will create the correction and next review after the Task resumes and the saved authority is revalidated.
+        </p>
+      ) : null}
+      {automationIntent?.state === 'blocked' ? (
+        <p role="status" className="rounded border border-amber-400 bg-amber-50 p-2 text-xs text-amber-950">
+          Automatic correction needs a human decision: {automationIntent.block_reason || 'the saved route is no longer eligible'}.
+        </p>
+      ) : null}
+      {automationIntent?.state === 'cancelled' ? (
+        <p role="status" className="rounded bg-muted/40 p-2 text-xs text-muted-foreground">
+          Automatic correction was cancelled with the Task. No new WorkUnits were created.
+        </p>
+      ) : null}
+      {automationIntent?.state === 'completed' ? (
+        <p role="status" className="rounded bg-muted/40 p-2 text-xs text-muted-foreground">
+          Automatic correction round {String(automationIntent.rework_round)} created and linked to the exact ReviewReport.
+        </p>
+      ) : null}
+      {!reviewerRole?.configuration.capabilities.includes('request_rework') || !reworkPolicy ? (
+        <p role="status" className="rounded bg-muted/40 p-2 text-xs text-muted-foreground">
+          This ReviewReport was produced by a role without request_rework routing. A Project owner or admin must configure an authorized route before a correction pair can be created.
+        </p>
+      ) : null}
       <div className="grid gap-2 md:grid-cols-2">
         <label className="space-y-1 text-xs">
           <span>Correction title</span>
@@ -180,9 +229,9 @@ export function TaskReworkPanel({
               setCorrectionActor('')
             }}
           >
-            {implementerRoles.map((role) => (
-              <option key={role.id} value={role.role}>
-                {role.role}
+            {allowedRoles.map((role) => (
+              <option key={role.id} value={role.id}>
+                {role.configuration.display_label || role.role}
               </option>
             ))}
           </select>
@@ -195,13 +244,14 @@ export function TaskReworkPanel({
           />
         </label>
         <label className="space-y-1 text-xs">
-          <span>Correction Actor (optional)</span>
+          <span>Correction Actor{correctionActorRequired ? '' : ' (configured)'}</span>
           <select
             className="h-9 w-full rounded-md border bg-background px-2 text-sm"
             value={correctionActor}
+            disabled={!correctionActorRequired}
             onChange={(event) => setCorrectionActor(event.target.value)}
           >
-            <option value="">Leave allocation pending</option>
+            <option value="">Choose an active member of the correction role</option>
             {correctionMembers.map((actor) => (
               <option key={actorKey(actor)} value={actorKey(actor)}>
                 {actor.kind}:{actor.id}
@@ -224,13 +274,14 @@ export function TaskReworkPanel({
           />
         </label>
         <label className="space-y-1 text-xs">
-          <span>Reviewer Actor (optional)</span>
+          <span>Next review Actor{configuredReviewActor ? ' (configured)' : ''}</span>
           <select
             className="h-9 w-full rounded-md border bg-background px-2 text-sm"
             value={reviewActor}
+            disabled={Boolean(configuredReviewActor)}
             onChange={(event) => setReviewActor(event.target.value)}
           >
-            <option value="">Leave reviewer allocation pending</option>
+            <option value="">Choose an active member of the next review role</option>
             {reviewerMembers.map((actor) => (
               <option key={actorKey(actor)} value={actorKey(actor)}>
                 {actor.kind}:{actor.id}

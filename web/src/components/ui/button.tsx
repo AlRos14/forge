@@ -11,8 +11,8 @@ const variantStyles = {
 }
 
 const sizeStyles = {
-  default: 'px-[14px] py-[7px] text-ui',
-  sm: 'px-[9px] py-[5px] text-xs rounded-md',
+  default: 'h-10 px-[14px] py-2 text-ui',
+  sm: 'h-8 px-[9px] py-1 text-xs rounded-md',
   lg: 'h-11 rounded-md px-8 text-sm',
   icon: 'h-8 w-8',
   'icon-sm': 'h-7 w-7 rounded-md',

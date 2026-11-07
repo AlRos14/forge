@@ -2027,6 +2027,7 @@ mod tests {
                 task_id: "task-1".to_owned(),
                 execution_id,
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 worktree_path: worktree.path().display().to_string(),
                 description: "x".repeat(MAX_DIRECT_PROMPT_BYTES + 1),
                 agent_config: serde_json::json!({
@@ -2087,6 +2088,7 @@ mod tests {
                 task_id: "task-1".to_owned(),
                 execution_id,
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 worktree_path: worktree.path().display().to_string(),
                 description: prompt.clone(),
                 agent_config: serde_json::json!({

@@ -113,11 +113,10 @@ pub struct RequestReworkRequest {
     pub reviewed_work_unit_version: i64,
     pub correction_title: String,
     pub correction_scope: String,
-    pub correction_role: String,
+    pub correction_role_id: String,
     pub correction_actor: Option<ActorRef>,
     pub review_title: String,
     pub review_scope: String,
-    pub review_role: Option<String>,
     pub review_actor: Option<ActorRef>,
     pub idempotency_key: String,
 }
@@ -131,6 +130,43 @@ pub struct RequestReworkResponse {
     #[ts(type = "number")]
     pub rounds_remaining: i64,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TaskReworkAutomationState {
+    Pending,
+    Completed,
+    Blocked,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TaskReworkAutomationIntentResponse {
+    pub id: String,
+    pub review_report_artifact_id: String,
+    pub reviewed_work_unit_id: String,
+    #[ts(type = "number")]
+    pub reviewed_work_unit_version: i64,
+    pub state: TaskReworkAutomationState,
+    pub block_reason: Option<String>,
+    pub correction_work_unit_id: Option<String>,
+    pub review_work_unit_id: Option<String>,
+    /// Exact manual receipt used to reconcile this automatic intent, when one
+    /// was committed under a different idempotency key.
+    pub reconciled_manual_receipt_id: Option<String>,
+    #[ts(type = "number | null")]
+    pub rework_round: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TaskReworkAutomationIntentsResponse {
+    pub items: Vec<TaskReworkAutomationIntentResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

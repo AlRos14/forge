@@ -1600,13 +1600,15 @@ async fn session_identity_and_execution_history_are_immutable_and_snapshotted() 
     .await
     .expect_err("Execution Actor cannot be rewritten");
     assert!(actor_change.to_string().contains("immutable"));
-    let purpose_change = sqlx::query(
-        "UPDATE execution SET purpose = 'investigate' WHERE id = 'pr2-execution-immutable'",
+    let purpose_column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('execution') WHERE name = 'purpose'
+        )",
     )
-    .execute(db.pool())
+    .fetch_one(db.pool())
     .await
-    .expect_err("Execution Purpose cannot be rewritten");
-    assert!(purpose_change.to_string().contains("immutable"));
+    .expect("retired Execution purpose column can be checked");
+    assert!(!purpose_column_exists, "Execution purpose remains retired");
     let session_agent_change =
         sqlx::query("UPDATE harness_session SET agent_id = 'pr2-agent-other' WHERE id = ?")
             .bind(&session_id)

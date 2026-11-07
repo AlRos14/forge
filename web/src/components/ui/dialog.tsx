@@ -182,7 +182,7 @@ export function DialogContent({
   className?: string
   children: ReactNode
 }) {
-  return <div className={cn('p-6', className)}>{children}</div>
+  return <div className={cn('min-w-0 p-4 sm:p-6', className)}>{children}</div>
 }
 
 export function DialogHeader({ className, children }: { className?: string; children: ReactNode }) {
@@ -227,7 +227,12 @@ export function DialogDescription({
 
 export function DialogFooter({ className, children }: { className?: string; children: ReactNode }) {
   return (
-    <div className={cn('flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2', className)}>
+    <div
+      className={cn(
+        'flex flex-col-reverse gap-2 sm:flex-row sm:flex-wrap sm:justify-end',
+        className,
+      )}
+    >
       {children}
     </div>
   )

@@ -37,7 +37,13 @@ impl TaskService {
         &self,
         execution: Execution,
     ) -> Result<Execution> {
-        if execution.role != "reviewer" {
+        if !crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
+        {
             return Ok(execution);
         }
         let Some(workspace_id) = execution.workspace_id.as_deref() else {
@@ -191,7 +197,12 @@ impl TaskService {
                 accepted: false,
             });
         }
-        if execution.role == "reviewer"
+        if crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
             && self
                 .reconcile_existing_review_report(&execution, None, None)
                 .await?
@@ -233,7 +244,13 @@ impl TaskService {
             }
         }
         let prepared = async {
-            if execution.role == "reviewer" {
+            if crate::role_capabilities::execution_has_capability(
+                &self.db,
+                &execution.id,
+                api_types::TaskRoleCapability::FormalReview,
+            )
+            .await?
+            {
                 self.verify_execution_workspace_authority(&execution)
                     .await?;
             }
@@ -406,7 +423,13 @@ impl TaskService {
                 "only running executions can be executed",
             ));
         }
-        if execution.role == "reviewer" {
+        if crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
+        {
             if let Some((completed, _report)) = self
                 .reconcile_existing_review_report(&execution, None, None)
                 .await?
@@ -551,7 +574,12 @@ impl TaskService {
             return Err(error);
         }
 
-        let is_review_execution = execution_before_launch.role == "reviewer";
+        let is_review_execution = crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution_before_launch.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?;
         let mut review_worktree_snapshot = None;
         let mut review_snapshot_digest = None;
         if is_review_execution && execution_before_launch.workspace_id.is_some() {
@@ -904,6 +932,11 @@ impl TaskService {
                     task_id: task.id.clone(),
                     execution_id: execution_id.clone(),
                     role: execution.role.clone(),
+                    task_role_capabilities: crate::role_capabilities::execution_capabilities(
+                        &self.db,
+                        &execution.id,
+                    )
+                    .await?,
                     worktree_path: worktree_path.clone(),
                     description,
                     agent_config,
@@ -1069,7 +1102,14 @@ impl TaskService {
             }
         }
 
-        if current_execution.role == "reviewer" && result.status == ExecutionOutcome::Completed {
+        if crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &current_execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
+            && result.status == ExecutionOutcome::Completed
+        {
             let output = result
                 .assistant_output
                 .as_deref()
@@ -1433,6 +1473,11 @@ impl TaskService {
             task_id: task.id.clone(),
             execution_id: execution.id.clone(),
             role: execution.role.clone(),
+            task_role_capabilities: crate::role_capabilities::execution_capabilities(
+                &self.db,
+                &execution.id,
+            )
+            .await?,
             workspace_path,
             executor_type,
             executor_config,

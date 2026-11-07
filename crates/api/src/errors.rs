@@ -539,10 +539,12 @@ impl From<DbError> for ApiError {
                 "task_at_capacity",
                 "Task has reached its automatic Execution capacity",
             ),
-            DbError::TaskDispatchPaused => Self::conflict_with_code(
-                "task_dispatch_paused",
-                "Task dispatch is paused or cancelled",
-            ),
+            DbError::TaskDispatchPaused => {
+                Self::conflict_with_code("task_dispatch_paused", "Task dispatch is paused")
+            }
+            DbError::TaskDispatchCancelled => {
+                Self::conflict_with_code("task_dispatch_cancelled", "Task dispatch is cancelled")
+            }
             DbError::WorkUnitRecoveryPending => Self::conflict_with_code(
                 "work_unit_recovery_pending",
                 "WorkUnit must resolve its exact interrupted Execution before fresh admission",

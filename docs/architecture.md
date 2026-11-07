@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the implementation after PR13. The ordered migration contract and invariants are in [Architecture V2](migration/architecture-v2.md); domain details are in [concepts](concepts/).
+This document describes the current implementation after PR15. The ordered migration contract and invariants are in [Architecture V2](migration/architecture-v2.md); domain details are in [concepts](concepts/).
 
 > The Orchestrator owns work boundaries. The harness owns cognition.
 
@@ -28,7 +28,7 @@ Project
     └── Message* / Handoff* / Proposal* / Decision*
 ~~~
 
-An Actor is a Human or Agent. An Agent has a harness identity and selectable profile. A TaskRole defines responsibility for one Task; RoleMembership records which Actors may participate. Neither membership nor a legacy Task field assigns executable scope. A WorkUnit names the Role and, when allocated, the Actor for that scope.
+An Actor is a Human or Agent. An Agent has a harness identity and selectable profile. A TaskRole defines responsibility for one Task; its versioned configuration can grant the closed capabilities `formal_review`, `orchestration`, and `request_rework`. RoleMembership records which Actors may participate. Neither membership, role name, nor a legacy Task field assigns executable scope. A WorkUnit names the Role and, when allocated, the Actor for that scope.
 
 Projects can store default TaskRoles, coordination modes, and workers as a
 template. Ordinary Tasks and subtasks copy the template atomically into their
@@ -78,11 +78,11 @@ A non-repository WorkUnit may have no Workspace and no WorkspaceLease. The curre
 
 Dependencies form a same-Task directed acyclic graph. Readiness is derived from WorkUnit state, dependencies, Execution results, workspace state, and integration outcomes. A Task transition or completed Execution does not silently complete or integrate a WorkUnit. An open WorkUnit with a completed result is `awaiting_acceptance` and receives no automatic retry until that result is accepted or the unit is cancelled.
 
-Task dispatch is a durable intent owned by TaskLifecycle authority. An authenticated launch binds the exact Task and TaskLifecycle versions and an idempotency key. The TaskDispatcher admits exact assigned Agent WorkUnits while the intent is `running`; pause blocks new admissions and provider starts, and resume dispatches currently ready units. A Human-assigned WorkUnit is pending human work with no synthetic Execution. A bounded rework operation over an exact request-changes ReviewReport creates correction plus new review units and consumes one per-Task round atomically.
+Task dispatch is a durable intent owned by TaskLifecycle authority. An authenticated launch binds the exact Task and TaskLifecycle versions and an idempotency key. The TaskDispatcher admits exact assigned Agent WorkUnits while the intent is `running`; pause blocks new admissions and provider starts, and resume dispatches currently ready units. A Human-assigned WorkUnit is pending human work with no synthetic Execution. A bounded rework operation over an exact request-changes ReviewReport creates correction plus new review units and consumes one per-Task round atomically. Automatic routes are explicit, durable, replay-safe, and revalidated after pause or configuration changes.
 
 ## Review, validation, and Gates
 
-Formal review is an Execution under Role `reviewer`. Its ReviewReport is an Artifact with exact Execution provenance. Review judgment remains distinct from deterministic checks.
+Formal review is an Execution admitted under a TaskRole snapshot with `formal_review`. Its ReviewReport is an Artifact with exact Execution provenance. Review judgment remains distinct from deterministic checks. A durable review line follows the source result and each correction; a typed approval requirement is satisfied only by a favorable report for the line's latest result.
 
 A ValidationRun represents a deterministic command or check and its exact workspace, commit, status, output, and Evidence. In this implementation snapshot the public REST, MCP, CLI, and web surfaces expose ValidationRuns for reading; they do not expose a command to start one. Agent validation-related cognition is ordinary WorkUnit work, not deterministic validation evidence.
 
@@ -90,7 +90,7 @@ A Gate is a deterministic policy over exact durable records. Its immutable GateE
 
 ## Persistence and history
 
-SQLite is the current persistence layer. Numbered migrations V001–V135 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects.
+SQLite is the current persistence layer. Numbered migrations V001–V156 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt.
 
 Historical `agent_session_history`, immutable Execution records, ProjectRelease snapshots, Artifact and Evidence references, HarnessSession identities, cross-record IDs, migration decisions, ADRs, and upstream license attribution remain readable history. History does not regain runtime authority. ProjectRelease is a read-only historical snapshot and does not create a current Charter, milestone, readiness workflow, or release operation.
 

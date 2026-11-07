@@ -731,11 +731,18 @@ async fn request_changes_report_leaves_lifecycle_to_gate_and_orchestration() {
 async fn assign_test_user_as_reviewer(state: &AppState, task_id: &str) {
     state
         .task_service
-        .create_task_role(
+        .create_task_role_with_configuration(
             task_id,
             "reviewer",
             CoordinationMode::Collaborative,
             "{}".to_owned(),
+            services::task_role_configuration::store_task_role_configuration(
+                &api_types::TaskRoleConfiguration {
+                    capabilities: vec![api_types::TaskRoleCapability::FormalReview],
+                    ..Default::default()
+                },
+            )
+            .expect("explicit formal review configuration serializes"),
         )
         .await
         .expect("reviewer TaskRole creates");

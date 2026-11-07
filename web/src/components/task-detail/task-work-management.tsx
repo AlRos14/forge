@@ -2,10 +2,18 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { apiFetch } from '@/api/client'
-import { useAgentsQuery, useMembersQuery, useProjectQuery } from '@/api/hooks'
+import {
+  useAgentsQuery,
+  useMembersQuery,
+  useProjectQuery,
+  useTaskGatesQuery,
+  useTaskReviewLinesQuery,
+  useWorkUnitArtifactPackageQuery,
+} from '@/api/hooks'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
+import { TaskRoleConfigurationForm } from '@/features/task-roles/TaskRoleConfigurationForm'
 import { getApiErrorMessage } from '@/lib/api-error'
 import type {
   ActorRef,
@@ -20,6 +28,8 @@ import type {
   RoleMembershipStatus,
   Task,
   TaskRoleResponse,
+  TaskRoleCapabilityCatalog,
+  TaskRoleConfiguration,
   UpdateRoleMembershipRequest,
   UpdateTaskRoleRequest,
   UpdateWorkUnitRequest,
@@ -38,12 +48,21 @@ type Props = {
   onChanged: () => Promise<unknown>
 }
 
-type RoleDraft = { coordinationMode: CoordinationMode; policy: string }
+type RoleDraft = {
+  coordinationMode: CoordinationMode
+  policy: string
+  configuration: TaskRoleConfiguration
+}
 type UnitDraft = { title: string; scope: string; executionInstructions: string; requiresIntegration: boolean }
 
 const COORDINATION_MODES: CoordinationMode[] = ['partitioned', 'collaborative', 'independent']
 const MEMBERSHIP_STATUSES: RoleMembershipStatus[] = ['active', 'suspended', 'ended']
 const WORK_UNIT_STATUSES: WorkUnitStatus[] = ['open', 'completed', 'cancelled']
+const capabilityCatalogQueryKey = ['task-role-capability-catalog'] as const
+
+function hasFormalReview(role: TaskRoleResponse | undefined): boolean {
+  return role?.configuration.capabilities.includes('formal_review') ?? false
+}
 
 function actorKey(actor: ActorRef | null): string {
   return actor ? `${actor.kind}:${actor.id}` : ''
@@ -91,9 +110,16 @@ async function postOrPatch<T>(
 }
 
 export function TaskWorkManagement({ task, workUnits, executions, onChanged }: Props) {
+  const capabilityCatalog = useQuery({
+    queryKey: capabilityCatalogQueryKey,
+    queryFn: () => apiFetch<TaskRoleCapabilityCatalog>('/task-role-capabilities'),
+    staleTime: 5 * 60 * 1000,
+  })
   const projectQuery = useProjectQuery(task.project_id)
   const agentsQuery = useAgentsQuery()
   const membersQuery = useMembersQuery(task.project_id)
+  const gatesQuery = useTaskGatesQuery(task.id)
+  const reviewLinesQuery = useTaskReviewLinesQuery(task.id)
   const projectOwnerId = projectQuery.data?.owner_id
   // Global visibility is discovery only. A Task Agent must belong to this
   // Project's canonical owner account to pass current execution authority.
@@ -107,6 +133,7 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
   const projectMembers = membersQuery.data ?? []
   const rolePath = `/tasks/${task.id}/task-roles`
   const [newRole, setNewRole] = useState('implementer')
+  const [newRoleTemplate, setNewRoleTemplate] = useState('implementer')
   const [newRoleMode, setNewRoleMode] = useState<CoordinationMode>('collaborative')
   const [roleDrafts, setRoleDrafts] = useState<Record<string, RoleDraft>>({})
   const [memberActors, setMemberActors] = useState<Record<string, string>>({})
@@ -126,6 +153,9 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
     parentId: '',
     assignedActor: '',
     reviewedWorkUnitId: '',
+    artifactInputIds: '',
+    approvalGateId: '',
+    approvalLineId: '',
     requiresIntegration: false,
     provenanceKind: '',
     provenanceRef: '',
@@ -140,6 +170,7 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
           {
             coordinationMode: role.coordination_mode ?? 'collaborative',
             policy: JSON.stringify(role.policy, null, 2),
+            configuration: role.configuration,
           },
         ]),
       ),
@@ -179,6 +210,14 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
     const body: CreateTaskRoleRequest = {
       role: newRole.trim(),
       coordination_mode: newRoleMode,
+      configuration: {
+        schema_version: 1,
+        display_label: null,
+        capabilities:
+          capabilityCatalog.data?.templates.find((template) => template.id === newRoleTemplate)
+            ?.default_capabilities ?? [],
+        rework: null,
+      },
       policy: {},
     }
     try {
@@ -206,6 +245,7 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
     const body: UpdateTaskRoleRequest = {
       expected_version: role.version,
       coordination_mode: draft.coordinationMode,
+      configuration: draft.configuration,
       policy,
     }
     try {
@@ -266,8 +306,13 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
       toast.error('Title, scope, and an existing TaskRole are required')
       return
     }
-    if (role === 'reviewer' && !creation.reviewedWorkUnitId) {
+    const formalReviewRole = hasFormalReview(task.task_roles.find((item) => item.role === role))
+    if (formalReviewRole && !creation.reviewedWorkUnitId) {
       toast.error('Choose the exact WorkUnit this reviewer will inspect')
+      return
+    }
+    if (Boolean(creation.approvalGateId) !== Boolean(creation.approvalLineId)) {
+      toast.error('Choose both a Gate and a review line to require approval')
       return
     }
     const provenanceActor = parseActorKey(creation.provenanceActor)
@@ -300,7 +345,11 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
       assigned_actor: parseActorKey(creation.assignedActor),
       requires_integration: creation.requiresIntegration,
       provenance,
-      ...(role === 'reviewer'
+      artifact_inputs: [...new Set(creation.artifactInputIds.split(/[\n,]/).map((id) => id.trim()).filter(Boolean))],
+      review_approval: creation.approvalGateId && creation.approvalLineId
+        ? { gate_id: creation.approvalGateId, review_line_id: creation.approvalLineId }
+        : null,
+      ...(formalReviewRole
         ? { review_subject: { reviewed_work_unit_id: creation.reviewedWorkUnitId } }
         : {}),
     }
@@ -315,6 +364,9 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
         parentId: '',
         assignedActor: '',
         reviewedWorkUnitId: '',
+        artifactInputIds: '',
+        approvalGateId: '',
+        approvalLineId: '',
         requiresIntegration: false,
         provenanceKind: '',
         provenanceRef: '',
@@ -349,11 +401,14 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
     const allocation = allocations[unit.id]
     if (!allocation?.role) return
     const reviewSubject = unit.review_subject
-    if (allocation.role === 'reviewer' && !reviewSubject) {
+    const formalReviewRole = hasFormalReview(
+      task.task_roles.find((item) => item.role === allocation.role),
+    )
+    if (formalReviewRole && !reviewSubject) {
       toast.error('Create a new reviewer WorkUnit with an exact subject instead')
       return
     }
-    if (reviewSubject && allocation.role !== 'reviewer') {
+    if (reviewSubject && !formalReviewRole) {
       toast.error('The role cannot change after an exact reviewer subject is assigned')
       return
     }
@@ -482,6 +537,27 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
         onSubmit={(event) => void createRole(event)}
         className="grid gap-2 rounded-md border p-3 sm:grid-cols-[1fr_180px_auto]"
       >
+        <label className="space-y-1 text-xs sm:col-span-3">
+          <span>Role template</span>
+          <select
+            aria-label="TaskRole template"
+            className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+            value={newRoleTemplate}
+            onChange={(event) => {
+              const templateId = event.target.value
+              setNewRoleTemplate(templateId)
+              const template = capabilityCatalog.data?.templates.find((item) => item.id === templateId)
+              if (template?.default_role) setNewRole(template.default_role)
+            }}
+          >
+            {(capabilityCatalog.data?.templates ?? []).map((template) => (
+              <option key={template.id} value={template.id}>{template.label}</option>
+            ))}
+          </select>
+          <span className="block text-muted-foreground">
+            Templates only prefill editable configuration. Capabilities never follow from the role name.
+          </span>
+        </label>
         <Input
           aria-label="New TaskRole name"
           value={newRole}
@@ -577,6 +653,19 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
                   />
                 </label>
               </div>
+            ) : null}
+            {draft ? (
+              <TaskRoleConfigurationForm
+                role={role}
+                roles={task.task_roles}
+                configuration={draft.configuration}
+                onChange={(configuration) =>
+                  setRoleDrafts((current) => ({
+                    ...current,
+                    [role.role]: { ...draft, configuration },
+                  }))
+                }
+              />
             ) : null}
             <div className="space-y-2">
               <h4 className="text-sm font-medium">Members</h4>
@@ -685,7 +774,9 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
               ))}
             </select>
           </label>
-          {(creation.role || task.task_roles[0]?.role) === 'reviewer' ? (
+          {hasFormalReview(
+            task.task_roles.find((role) => role.role === (creation.role || task.task_roles[0]?.role)),
+          ) ? (
             <label className="space-y-1 text-xs md:col-span-2">
               <span>Exact WorkUnit to review</span>
               <select
@@ -700,7 +791,11 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
               >
                 <option value="">Choose the WorkUnit under review</option>
                 {workUnits
-                  .filter((unit) => unit.role !== 'reviewer' && unit.status !== 'cancelled')
+                  .filter(
+                    (unit) =>
+                      !hasFormalReview(task.task_roles.find((role) => role.role === unit.role)) &&
+                      unit.status !== 'cancelled',
+                  )
                   .map((unit) => (
                     <option key={unit.id} value={unit.id}>
                       {unit.title} · {unit.status}
@@ -735,6 +830,60 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
               placeholder="Exact instructions passed to the assigned harness instead of the generic Task/WorkUnit prompt"
             />
           </label>
+          <label className="space-y-1 text-xs md:col-span-2">
+            <span>Exact Artifact inputs (optional, one ID per line)</span>
+            <Textarea
+              value={creation.artifactInputIds}
+              onChange={(event) =>
+                setCreation((current) => ({ ...current, artifactInputIds: event.target.value }))
+              }
+              placeholder="Copy Artifact IDs from this Task&apos;s Artifacts tab"
+            />
+            <span className="block text-muted-foreground">
+              Forge pins each selected Artifact, digest, and producer Execution. The WorkUnit&apos;s
+              own result manifest records those inputs with its delivery Artifact.
+            </span>
+          </label>
+          <div className="grid gap-2 rounded-md border p-3 md:col-span-2 md:grid-cols-2">
+            <label className="space-y-1 text-xs">
+              <span>Approval Gate (optional)</span>
+              <select
+                className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+                value={creation.approvalGateId}
+                onChange={(event) => setCreation((current) => ({
+                  ...current,
+                  approvalGateId: event.target.value,
+                }))}
+              >
+                <option value="">No review approval requirement</option>
+                {(gatesQuery.data ?? []).map((gate) => (
+                  <option key={gate.gate.id} value={gate.gate.id}>{gate.gate.gate_kind} · {gate.gate.id}</option>
+                ))}
+              </select>
+            </label>
+            <label className="space-y-1 text-xs">
+              <span>Review line</span>
+              <select
+                className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+                value={creation.approvalLineId}
+                onChange={(event) => setCreation((current) => ({
+                  ...current,
+                  approvalLineId: event.target.value,
+                }))}
+              >
+                <option value="">Choose the exact review line</option>
+                {(reviewLinesQuery.data ?? []).map((line) => (
+                  <option key={line.id} value={line.id}>
+                    {workUnits.find((unit) => unit.id === line.current_work_unit_id)?.title ?? line.current_work_unit_id} · {line.latest_verdict ?? 'pending'} · r{String(line.revision)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <p className="text-xs text-muted-foreground md:col-span-2">
+              The selected Gate&apos;s active review policy must name this exact line. A new correction
+              advances the line and makes an older Gate evaluation unusable.
+            </p>
+          </div>
           <label className="space-y-1 text-xs">
             <span>Parent WorkUnit</span>
             <select
@@ -944,6 +1093,8 @@ function WorkUnitCard(props: WorkUnitCardProps) {
   )
   const completedExecutions = executions.filter((execution) => execution.status === 'completed')
   const readiness = props.readiness
+  const isFormalReviewUnit = hasFormalReview(roles.find((role) => role.role === unit.role))
+  const artifactPackageQuery = useWorkUnitArtifactPackageQuery(unit.id)
   return (
     <article className="space-y-3 rounded-md border p-3">
       <div className="flex flex-wrap items-center gap-2">
@@ -953,7 +1104,7 @@ function WorkUnitCard(props: WorkUnitCardProps) {
         </span>
         <code className="ml-auto text-xs text-muted-foreground">{unit.id}</code>
       </div>
-      {unit.role === 'reviewer' ? (
+      {isFormalReviewUnit ? (
         <div className="rounded bg-amber-50/60 p-2 text-xs" aria-label="Reviewer subject">
           {reviewSubject ? (
             <>
@@ -1048,7 +1199,7 @@ function WorkUnitCard(props: WorkUnitCardProps) {
                 key={role.id}
                 value={role.role}
                 disabled={
-                  reviewSubject ? role.role !== 'reviewer' : role.role === 'reviewer'
+                  reviewSubject ? !hasFormalReview(role) : hasFormalReview(role)
                 }
               >
                 {role.role}
@@ -1097,7 +1248,8 @@ function WorkUnitCard(props: WorkUnitCardProps) {
           Runnable: {String(readiness.runnable)} · ready for allocation:{' '}
           {String(readiness.ready_for_allocation)} · awaiting integration:{' '}
           {String(readiness.awaiting_integration)} · awaiting acceptance:{' '}
-          {String(readiness.awaiting_acceptance)}
+          {String(readiness.awaiting_acceptance)} · awaiting review approval:{' '}
+          {String(readiness.awaiting_review_approval)}
           {readiness.active_execution_ids.length
             ? ` · active Executions: ${readiness.active_execution_ids.join(', ')}`
             : ''}
@@ -1193,6 +1345,38 @@ function WorkUnitCard(props: WorkUnitCardProps) {
             result.
           </p>
         </div>
+      ) : null}
+      {artifactPackageQuery.data &&
+      (artifactPackageQuery.data.inputs.length > 0 || artifactPackageQuery.data.manifests.length > 0) ? (
+        <section className="space-y-2 rounded-md border p-3 text-xs" aria-label="WorkUnit Artifact package">
+          <h4 className="font-medium">Exact Artifact bindings and result manifests</h4>
+          {artifactPackageQuery.data.inputs.length ? (
+            <div className="space-y-1">
+              <strong>Inputs</strong>
+              {artifactPackageQuery.data.inputs.map((input) => (
+                <p key={input.artifact_id} className="break-all">
+                  Artifact {input.artifact_id} · digest {input.digest} · producer {input.producer_execution_id}
+                </p>
+              ))}
+            </div>
+          ) : null}
+          {artifactPackageQuery.data.manifests.map((manifest) => (
+            <details key={manifest.id} className="rounded bg-muted/30 p-2">
+              <summary className="cursor-pointer break-all">
+                Result {manifest.result_execution_id} · delivery {manifest.delivery_artifact_id} · manifest {manifest.manifest_digest}
+              </summary>
+              <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-all">{JSON.stringify(manifest.manifest, null, 2)}</pre>
+            </details>
+          ))}
+        </section>
+      ) : null}
+      {artifactPackageQuery.isError ? (
+        <p role="alert" className="text-xs text-destructive">
+          Artifact bindings could not be loaded.{' '}
+          <button type="button" className="underline" onClick={() => void artifactPackageQuery.refetch()}>
+            Retry
+          </button>
+        </p>
       ) : null}
     </article>
   )

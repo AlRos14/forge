@@ -8,6 +8,8 @@ use ts_rs::TS;
 pub struct ProjectTaskRoleDefault {
     pub role: String,
     pub coordination_mode: CoordinationMode,
+    #[serde(default)]
+    pub configuration: crate::ProjectTaskRoleConfiguration,
     pub members: Vec<ActorRef>,
 }
 

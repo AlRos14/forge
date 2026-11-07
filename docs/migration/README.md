@@ -21,3 +21,13 @@ moment, not the current repository.
 For current behavior use [architecture.md](../architecture.md),
 [concepts](../concepts/), [api.md](../api.md), [cli.md](../cli.md), and
 [getting-started.md](../getting-started.md).
+
+## Proposed independent follow-up plans
+
+These are implementation proposals, not current runtime contracts:
+
+- [Plan A: roles, capabilities, and correction routing](../plans/roles-capabilities-and-rework.md).
+- [Plan B: UI consistency and layout](../plans/ui-consistency-and-layout.md).
+
+Each plan includes a separate agent brief, file ownership, acceptance criteria,
+and a final integration boundary. Neither authorizes changing live Tasks.

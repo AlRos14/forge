@@ -34,6 +34,7 @@ async fn codex_adapter_writes_file_in_live_repo() -> TestResult {
         task_id: "smoke".to_owned(),
         execution_id: "smoke-exec".to_owned(),
         role: "coder".to_owned(),
+        task_role_capabilities: vec![],
         description: "Create a file called HELLO.md in the repo root with the single word banana."
             .to_owned(),
         agent_config: json!({

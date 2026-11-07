@@ -253,6 +253,8 @@ mod tests {
             assigned_actor: Some(db::ActorRef::Agent("agent".to_owned())),
             requires_integration: false,
             provenance: None,
+            review_approval_gate_id: None,
+            review_approval_line_id: None,
             created_by: db::ActorRef::Human("user".to_owned()),
             version: 3,
             created_at: "2026-11-05T00:00:00Z".to_owned(),

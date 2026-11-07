@@ -2,8 +2,13 @@
 import type { ActorRef } from "./ActorRef";
 import type { CreateWorkUnitProvenance } from "./CreateWorkUnitProvenance";
 import type { CreateWorkUnitReviewSubjectRequest } from "./CreateWorkUnitReviewSubjectRequest";
+import type { WorkUnitReviewApprovalRequest } from "./WorkUnitReviewApprovalRequest";
 
 export type CreateWorkUnitRequest = { title: string, scope: string, execution_instructions?: string | null, role: string, parent_work_unit_id: string | null, assigned_actor: ActorRef | null, requires_integration: boolean, provenance: CreateWorkUnitProvenance | null,
+/**
+ * Exact completed Task Artifacts consumed by this WorkUnit.
+ */
+artifact_inputs?: Array<string> | null, review_approval?: WorkUnitReviewApprovalRequest | null,
 /**
  * Exact WorkUnit result this reviewer WorkUnit will inspect. The target
  * version is frozen when its first result Execution is admitted.

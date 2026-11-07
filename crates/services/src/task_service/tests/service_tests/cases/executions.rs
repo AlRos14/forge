@@ -668,6 +668,8 @@ async fn create_claimed_review_execution(
                 requires_integration: true,
                 provenance: None,
                 review_subject: None,
+                artifact_inputs: Vec::new(),
+                review_approval: None,
             },
         )
         .await
@@ -831,6 +833,8 @@ async fn create_running_repository_execution(
                 requires_integration: true,
                 provenance: None,
                 review_subject: None,
+                artifact_inputs: Vec::new(),
+                review_approval: None,
             },
         )
         .await
@@ -1858,6 +1862,9 @@ async fn pr8_review_subject_uses_exact_workunit_workspace_and_matching_evidence(
             assigned_actor: Some(db::ActorRef::Agent(agent_id.clone())),
             requires_integration: true,
             provenance: None,
+            artifact_input_ids: Vec::new(),
+            review_approval_gate_id: None,
+            review_approval_line_id: None,
             created_by: db::ActorRef::Agent(agent_id.clone()),
             created_at: now.clone(),
         },
@@ -4093,6 +4100,9 @@ async fn blocked_recovery_fixture_for_executor(
                 assigned_actor: Some(db::ActorRef::Agent(agent_id.clone())),
                 requires_integration: false,
                 provenance: None,
+                artifact_input_ids: Vec::new(),
+                review_approval_gate_id: None,
+                review_approval_line_id: None,
                 created_by: db::ActorRef::Agent(agent_id.clone()),
                 created_at: now.clone(),
             },
@@ -4576,6 +4586,8 @@ async fn recovery_uses_the_parent_work_units_workspace_when_task_has_siblings() 
                 requires_integration: true,
                 provenance: None,
                 review_subject: None,
+                artifact_inputs: Vec::new(),
+                review_approval: None,
             },
         )
         .await
@@ -5407,6 +5419,9 @@ async fn launch_work_unit_for_override_snapshot(
             assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
             requires_integration: false,
             provenance: None,
+            artifact_input_ids: Vec::new(),
+            review_approval_gate_id: None,
+            review_approval_line_id: None,
             created_by: db::ActorRef::Agent(agent_id.to_owned()),
             created_at: now.clone(),
         },
@@ -5502,6 +5517,9 @@ async fn create_simple_execution_work_unit(
             assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
             requires_integration: false,
             provenance: None,
+            artifact_input_ids: Vec::new(),
+            review_approval_gate_id: None,
+            review_approval_line_id: None,
             created_by: db::ActorRef::Agent(agent_id.to_owned()),
             created_at: now.clone(),
         },

@@ -186,7 +186,9 @@ provenance and active defaults use an exact `default_implementer` ActorRef.
 | `GET /gates/{id}`, `PUT /gates/{id}/policy`, `POST /gates/{id}/evaluate` | Read a Gate, revise its policy against the expected revision, or evaluate its exact current inputs. |
 | `GET /gate-evaluations/{id}` | Read one immutable GateEvaluation and its frozen input facts. |
 | `POST /tasks/{id}/merge` | Request merge admission using the exact satisfied GateEvaluation. The service rechecks its current policy and input identities under the Task integration lock. |
-| `GET /tasks/{id}/task-roles`, `POST /tasks/{id}/task-roles`, `PATCH /tasks/{id}/task-roles/{role}` | Read or update TaskRole definitions. |
+| `GET /task-role-capabilities` | Read the closed capability catalog and editable role templates. The web client uses this response instead of maintaining its own catalog. |
+| `GET /tasks/{id}/task-roles`, `POST /tasks/{id}/task-roles`, `PATCH /tasks/{id}/task-roles/{role}` | Read or update TaskRole definitions, including versioned `configuration` with `display_label`, `capabilities`, and optional `rework` route. Capability and orchestration policy changes require Project owner/admin authority and exact TaskRole version. |
+| `GET /projects/{id}/task-role-defaults`, `PUT /projects/{id}/task-role-defaults` | Read or replace Project TaskRole templates. Defaults store route references by role name and resolve them to Task-local IDs on Task creation. Updates require Project owner/admin authority and the expected defaults version. |
 | `POST /tasks/{id}/task-roles/{role}/members`, `PATCH /tasks/{id}/task-roles/{role}/members/{membership_id}` | Add or update an exact RoleMembership. Memberships name a Human or Agent Actor. |
 
 When present, `parent_task_id` must identify a root Task in the same Project;
@@ -217,11 +219,28 @@ TaskLifecycle authority and does not create Executions directly in the request.
 | `POST /tasks/{id}/dispatch/pause` | Record pause intent and optional reason. Pause prevents new admissions and provider starts; it does not claim to stop running work. |
 | `POST /tasks/{id}/dispatch/resume` | Resume a paused dispatch intent and dispatch currently ready WorkUnits. |
 | `POST /tasks/{id}/dispatch/cancel` | Request Task cancellation and record the dispatch receipt. Execution cancellation and observed results remain separate exact records. |
-| `POST /tasks/{id}/rework` | Create or replay one correction plus new-review round from an exact request-changes ReviewReport whose subject names the reviewed WorkUnit and version. The operation is bounded by the per-Task rework budget and returns the exact units and review subject. |
+| `POST /tasks/{id}/rework` | Create or replay one correction plus new-review round from an exact request-changes ReviewReport whose subject names the reviewed WorkUnit and version. Supply `correction_role_id`; the next review role comes from the producer role's persisted route. The operation checks current authority, independence, and the per-Task rework budget, then returns the exact units and review subject. A transaction that observes concurrent pause or cancellation returns `409 task_dispatch_paused` or `409 task_dispatch_cancelled`. |
+| `GET /tasks/{id}/rework/automation` | Read durable automatic rework intents and their `pending`, `completed`, `blocked`, or `cancelled` state. A paused Task retains a pending intent; after resume the processor revalidates the captured TaskRole configuration, Execution snapshot, membership, exact subject, Actors, and round budget. `reconciled_manual_receipt_id` identifies the exact manual receipt when it fulfilled an automatic intent. |
+
+Automatic rework is created only from a newly recorded exact `request_changes`
+ReviewReport produced under an unchanged admitted role configuration. Replay and
+concurrent consumers share one policy/report/subject key and the atomic rework
+receipt. A missing Actor, ambiguous destination, revoked authority, or exhausted
+budget becomes a durable blocker with a reason. Changing a role from manual to
+automatic does not process earlier reports. The endpoint is read-only and is
+available to Project readers; changes to capabilities and routing remain
+Project owner/admin operations.
+
+`GET /tasks/{id}/review-lines` returns each stable review-line ID, its current
+WorkUnit result, latest exact report and manifest, and immutable revision
+history. A Gate review policy may bind `review.review_line_id`; each evaluation
+records that line's exact revision as an immutable input. A later correction
+advances the line and makes the earlier evaluation ineligible for a consumer.
 
 A WorkUnit state in the preflight response is one of `ready`, `running`,
 `waiting_dependency`, `waiting_human`, `awaiting_acceptance`,
-`awaiting_integration`, `unassigned`, `blocked`, `completed`, or `cancelled`.
+`awaiting_review_approval`, `awaiting_integration`, `unassigned`, `blocked`,
+`completed`, or `cancelled`.
 An open WorkUnit with a completed result is `awaiting_acceptance` and receives
 no automatic retry. A Human-assigned WorkUnit is `waiting_human` and creates no
 synthetic Execution.
@@ -247,20 +266,22 @@ migration evidence only. Unsupported harness capabilities fail closed.
 
 ## Review, ValidationRun, Evidence, and Artifact
 
-Formal Review is exactly `Execution.role = reviewer` with its exact
-ReviewReport Artifact output. The legacy Review table does not authorize a
-decision or satisfy a Gate.
+Formal Review is an Execution admitted under a TaskRole whose immutable
+admission snapshot contains `formal_review`, with its exact ReviewReport
+Artifact output. Role names do not grant this capability. The legacy Review
+table does not authorize a decision or satisfy a Gate.
 
 | Method and path | Contract |
 | --- | --- |
-| `POST /tasks/{id}/review-executions` | Start a Human Review Execution. `workspace_id`, when supplied, must name the exact Ready Workspace to review; `null` starts a Workspace-free review and never selects a Task Workspace implicitly. The response names that exact Execution. |
-| `GET /tasks/{id}/review-executions` | List exact reviewer Executions and their ReviewReport Artifact outputs. |
+| `POST /tasks/{id}/review-executions` | Start a Human Review Execution with `{ "task_role_id": "...", "workspace_id": "..." }`. The exact role must currently grant `formal_review` and contain the caller as an active member. `workspace_id`, when supplied, must name the exact Ready Workspace to review; `null` starts a Workspace-free review and never selects a Task Workspace implicitly. |
+| `GET /tasks/{id}/review-executions` | List exact Executions admitted with `formal_review` and their ReviewReport Artifact outputs. |
 | `GET /review-executions/{id}` | Read one exact formal Review Execution and report. |
 | `POST /review-executions/{id}` | Submit a ReviewReport to that exact reviewer Execution. Optional `reviewed_work_unit_id` and `reviewed_work_unit_version` pin the exact WorkUnit subject; both must be supplied together. |
 | `GET /tasks/{id}/validation-runs`, `GET /validation-runs/{id}` | List or read exact ValidationRuns. |
 | `GET /evidence/{id}` | Read exact Evidence and its producer ValidationRun identity. |
 | `GET /tasks/{task_id}/artifacts`, `POST /tasks/{task_id}/artifacts` | List or create generic Artifacts with exact provenance. |
 | `GET /artifacts/{id}` | Read one exact Artifact. |
+| `GET /tasks/{task_id}/review-lines` | Read stable review lines, current exact results, and immutable revision history. |
 
 ValidationRuns and Evidence are distinct from ReviewReports. A Gate consumes
 exact input facts and immutable evaluations; it never uses a latest Review or
@@ -270,11 +291,12 @@ ValidationRun lookup.
 
 | Method and path | Contract |
 | --- | --- |
-| `GET /tasks/{task_id}/work-units`, `POST /tasks/{task_id}/work-units` | List or create Task-scoped WorkUnits. Creation accepts optional `execution_instructions` passed to the assigned harness instead of the generic Task/WorkUnit prompt. |
+| `GET /tasks/{task_id}/work-units`, `POST /tasks/{task_id}/work-units` | List or create Task-scoped WorkUnits. Creation accepts optional `execution_instructions` passed to the assigned harness instead of the generic Task/WorkUnit prompt, exact `artifact_inputs` IDs to pin on every Execution, and `review_approval: { gate_id, review_line_id }` to require a current satisfied review Gate before admission. |
 | `GET /work-units/{id}`, `PATCH /work-units/{id}` | Read or update an exact WorkUnit. |
+| `GET /work-units/{id}/artifact-package` | Read the WorkUnit's exact immutable Artifact input bindings and result manifests, including producer Executions and digests. |
 | `POST /work-units/{id}/allocation`, `POST /work-units/{id}/status` | Allocate a WorkUnit or request its target state transition. |
 | `GET /work-units/{id}/dependencies`, `POST /work-units/{id}/dependencies/{prerequisite_id}`, `DELETE /work-units/{id}/dependencies/{prerequisite_id}` | Read or update exact WorkUnit dependencies. |
-| `GET /work-units/{id}/readiness` | Read deterministic WorkUnit readiness, including `awaiting_acceptance`. |
+| `GET /work-units/{id}/readiness` | Read deterministic WorkUnit readiness, including `awaiting_acceptance` and `awaiting_review_approval`. |
 | `POST /work-units/{id}/workspace` | Prepare or rebuild the exact repository WorkUnit Workspace before launch. |
 | `POST /work-units/{id}/integrations` | Integrate an explicitly scoped WorkUnit under the existing integration lock. |
 | `GET /tasks/{task_id}/messages`, `POST /tasks/{task_id}/messages`, `GET /messages/{id}` | Create or read generic collaboration Messages. |
@@ -452,10 +474,11 @@ The MCP server advertises only registered tools. The current tool names are:
 - Executions and roles: `forge_list_executions`, `forge_get_task_dispatch`,
   `forge_launch_task`, `forge_pause_task`, `forge_resume_task`,
   `forge_cancel_task`, `forge_request_rework`, `forge_follow_up_execution`,
-  `forge_list_task_roles`, `forge_create_task_role`,
+  `forge_list_task_roles`, `forge_create_task_role`, `forge_update_task_role`,
   `forge_add_task_role_member`.
 - WorkUnits: `forge_create_work_unit`, `forge_list_work_units`,
-  `forge_get_work_unit`, `forge_update_work_unit`, `forge_allocate_work_unit`,
+  `forge_get_work_unit`, `forge_get_work_unit_artifact_package`,
+  `forge_list_task_review_lines`, `forge_update_work_unit`, `forge_allocate_work_unit`,
   `forge_transition_work_unit`, `forge_list_work_unit_dependencies`,
   `forge_add_work_unit_dependency`, `forge_remove_work_unit_dependency`.
   Creation requires a caller-scoped `idempotency_key`; an exact retry returns

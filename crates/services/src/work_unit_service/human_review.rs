@@ -20,12 +20,19 @@ impl WorkUnitService {
         let unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
             .await?
             .ok_or_else(|| not_found("work_unit", work_unit_id))?;
-        if unit.role != "reviewer"
+        let formal_review = crate::role_capabilities::task_role_name_has_capability(
+            &self.db,
+            &unit.task_id,
+            &unit.role,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?;
+        if !formal_review
             || unit.requires_integration
             || unit.assigned_actor != Some(ActorRef::Human(user_id.to_owned()))
         {
             return Err(invalid(
-                "Review submission requires the exact assigned Human reviewer",
+                "Review submission requires the exact assigned Human in a formal_review TaskRole",
             ));
         }
         if !crate::task_rework::review_subject_ready(&self.db, work_unit_id).await?
@@ -91,7 +98,7 @@ impl WorkUnitService {
                         task_id: unit.task_id.clone(),
                         agent_id: None,
                         actor_ref: Some(ActorRef::Human(user_id.to_owned())),
-                        role: "reviewer".to_owned(),
+                        role: unit.role.clone(),
                         status: ExecutionStatus::Running,
                         stop_reason: None,
                         stopped_by: None,

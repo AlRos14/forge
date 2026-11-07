@@ -48,6 +48,12 @@ pub(crate) async fn dispatch_tool(
             handlers::forge_submit_work_unit_review(state, arguments, context).await
         }
         "forge_get_work_unit" => handlers::forge_get_work_unit(state, arguments, context).await,
+        "forge_get_work_unit_artifact_package" => {
+            handlers::forge_get_work_unit_artifact_package(state, arguments, context).await
+        }
+        "forge_list_task_review_lines" => {
+            handlers::forge_list_task_review_lines(state, arguments, context).await
+        }
         "forge_update_work_unit" => {
             handlers::forge_update_work_unit(state, arguments, context).await
         }
@@ -91,6 +97,9 @@ pub(crate) async fn dispatch_tool(
         "forge_list_task_roles" => handlers::forge_list_task_roles(state, arguments).await,
         "forge_create_task_role" => {
             handlers::forge_create_task_role(state, arguments, context).await
+        }
+        "forge_update_task_role" => {
+            handlers::forge_update_task_role(state, arguments, context).await
         }
         "forge_add_task_role_member" => {
             handlers::forge_add_task_role_member(state, arguments, context).await

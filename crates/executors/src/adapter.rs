@@ -1129,6 +1129,7 @@ mod tests {
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 worktree_path: ".".to_owned(),
                 description: "do it".to_owned(),
                 agent_config: serde_json::json!({
@@ -1425,6 +1426,7 @@ mod tests {
             task_id: "task".to_owned(),
             execution_id: execution_id.to_owned(),
             role: "coder".to_owned(),
+            task_role_capabilities: vec![],
             worktree_path: ".".to_owned(),
             description: "do it".to_owned(),
             agent_config: serde_json::json!({

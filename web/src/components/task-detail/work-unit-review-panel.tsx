@@ -46,9 +46,10 @@ export function WorkUnitHumanReviewPanel({
     }
   }, [subject])
   const submitReview = useSubmitWorkUnitReviewReport()
-  const reviewerRole = task.task_roles.find((role) => role.role === 'reviewer')
+  const reviewerRole = task.task_roles.find((role) => role.role === unit.role)
+  const hasFormalReview = reviewerRole?.configuration.capabilities.includes('formal_review') ?? false
   const isAssignedReviewer = Boolean(
-    currentUserId &&
+    hasFormalReview && currentUserId &&
       unit.assigned_actor?.kind === 'human' &&
       unit.assigned_actor.id === currentUserId &&
       reviewerRole?.members.some(
@@ -66,7 +67,7 @@ export function WorkUnitHumanReviewPanel({
       <article className="rounded-lg border border-amber-300 p-4 text-sm">
         <h3 className="font-semibold">{unit.title}</h3>
         <p className="mt-1 text-muted-foreground">
-          This reviewer WorkUnit has no exact subject. Create a new reviewer WorkUnit and select
+          This formal review WorkUnit has no exact subject. Create a new review WorkUnit and select
           the WorkUnit to inspect.
         </p>
       </article>

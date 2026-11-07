@@ -347,6 +347,7 @@ impl TaskArgs {
                     let request = CreateTaskRoleRequest {
                         role: role.clone(),
                         coordination_mode: (*coordination_mode).into(),
+                        configuration: api_types::TaskRoleConfiguration::default(),
                         policy: None,
                     };
                     let response: TaskRoleResponse = client

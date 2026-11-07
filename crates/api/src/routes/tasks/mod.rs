@@ -11,8 +11,8 @@ use axum::{
 };
 use db::{
     now_rfc3339, ExecutionRepo, PageRequest, ProjectRepo, SharedMediaRepo, SortBy, SortOrder,
-    TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo, UpdateTask,
-    WorkspaceRepo,
+    TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo, TaskRoleRepo,
+    UpdateTask, WorkspaceRepo,
 };
 use serde_json::Value;
 use services::{DiffService, ServiceError};
@@ -43,8 +43,8 @@ pub use gates::{
 };
 pub use reviews::{list_reviews, trigger_review};
 pub use roles::{
-    add_task_role_member, create_task_role_model, list_task_role_model, update_task_role_member,
-    update_task_role_model,
+    add_task_role_member, create_task_role_model, list_task_role_model,
+    task_role_capability_catalog, update_task_role_member, update_task_role_model,
 };
 pub use workspace::{get_task_diff, get_task_workspace};
 

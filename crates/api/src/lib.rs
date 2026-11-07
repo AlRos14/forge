@@ -234,8 +234,16 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::work_units::create_work_unit).get(routes::work_units::list_work_units),
         )
         .route(
+            "/api/v1/tasks/{task_id}/review-lines",
+            get(routes::task_rework::list_review_lines),
+        )
+        .route(
             "/api/v1/work-units/{id}",
             get(routes::work_units::get_work_unit).patch(routes::work_units::update_work_unit),
+        )
+        .route(
+            "/api/v1/work-units/{id}/artifact-package",
+            get(routes::work_units::get_artifact_package),
         )
         .route(
             "/api/v1/work-units/{id}/allocation",
@@ -372,6 +380,10 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/tasks/{id}/lifecycle/transitions",
             get(routes::tasks::list_task_lifecycle_transitions),
+        )
+        .route(
+            "/api/v1/task-role-capabilities",
+            get(routes::tasks::task_role_capability_catalog),
         )
         .route(
             "/api/v1/tasks/{id}/task-roles",
@@ -597,6 +609,10 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/tasks/{id}/rework",
             post(routes::task_rework::request_rework),
+        )
+        .route(
+            "/api/v1/tasks/{id}/rework/automation",
+            get(routes::task_rework::list_automatic_rework_intents),
         )
         .route(
             "/api/v1/tasks/{task_id}/executions/{execution_id}/recovery",

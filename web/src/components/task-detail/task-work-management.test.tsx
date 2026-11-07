@@ -8,6 +8,12 @@ vi.mock('@/api/hooks', () => ({
   useAgentsQuery: () => ({ data: { items: [] }, isError: false, isLoading: false }),
   useMembersQuery: () => ({ data: [], isError: false, isLoading: false }),
   useProjectQuery: () => ({ data: { owner_id: 'owner-1' }, isError: false, isLoading: false }),
+  useTaskGatesQuery: () => ({ data: [], isLoading: false }),
+  useTaskReviewLinesQuery: () => ({ data: [], isLoading: false }),
+  useWorkUnitArtifactPackageQuery: () => ({
+    data: { work_unit_id: 'unit-implementation', inputs: [], manifests: [] },
+    isError: false,
+  }),
 }))
 
 function role(id: string, name: string) {
@@ -17,6 +23,12 @@ function role(id: string, name: string) {
     role: name,
     coordination_mode: 'collaborative',
     policy: {},
+    configuration: {
+      schema_version: 1,
+      display_label: null,
+      capabilities: name === 'reviewer' ? ['formal_review'] : [],
+      rework: null,
+    },
     version: 1,
     members: [],
     created_at: '',
@@ -37,6 +49,8 @@ function sourceUnit(): WorkUnitResponse {
     assigned_actor: { kind: 'agent', id: 'agent-1' },
     requires_integration: false,
     provenance: null,
+    review_approval_gate_id: null,
+    review_approval_line_id: null,
     created_by: { kind: 'human', id: 'user-1' },
     version: 2,
     created_at: '',
@@ -49,6 +63,7 @@ function sourceUnit(): WorkUnitResponse {
       unsatisfied_dependency_ids: [],
       awaiting_integration: false,
       awaiting_acceptance: false,
+      awaiting_review_approval: false,
     },
   }
 }
@@ -76,6 +91,13 @@ describe('TaskWorkManagement reviewer setup', () => {
     }
     const fetchMock = vi.spyOn(window, 'fetch').mockImplementation(async (input, init) => {
       const path = new URL(input.toString()).pathname
+      if (path === '/api/v1/task-role-capabilities') {
+        return new Response(JSON.stringify({
+          schema_version: 1,
+          capabilities: ['formal_review', 'orchestration', 'request_rework'],
+          templates: [],
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
       if (path.endsWith('/dependencies')) return new Response('[]', { status: 200 })
       if (path === '/api/v1/tasks/task-1/work-units' && init?.method === 'POST') {
         return new Response(JSON.stringify(created), {
@@ -116,6 +138,9 @@ describe('TaskWorkManagement reviewer setup', () => {
     fireEvent.change(within(form).getByLabelText('Scope'), {
       target: { value: 'Review the exact implementation result.' },
     })
+    fireEvent.change(within(form).getByLabelText(/Exact Artifact inputs/), {
+      target: { value: 'artifact-a\nartifact-b' },
+    })
     fireEvent.change(screen.getByLabelText('Exact WorkUnit to review'), {
       target: { value: 'unit-implementation' },
     })
@@ -130,6 +155,7 @@ describe('TaskWorkManagement reviewer setup', () => {
     expect(JSON.parse(String(createRequest?.[1]?.body))).toMatchObject({
       role: 'reviewer',
       review_subject: { reviewed_work_unit_id: 'unit-implementation' },
+      artifact_inputs: ['artifact-a', 'artifact-b'],
     })
     expect(onChanged).toHaveBeenCalledTimes(1)
     queryClient.clear()

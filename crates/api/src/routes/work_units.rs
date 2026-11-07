@@ -57,6 +57,7 @@ fn readiness_to_api(readiness: services::WorkUnitReadiness) -> WorkUnitReadiness
         unsatisfied_dependency_ids: readiness.unsatisfied_dependency_ids,
         awaiting_integration: readiness.awaiting_integration,
         awaiting_acceptance: readiness.awaiting_acceptance,
+        awaiting_review_approval: readiness.awaiting_review_approval,
     }
 }
 
@@ -85,6 +86,8 @@ fn work_unit_response(
             db::WorkUnitProvenance::External(id) => WorkUnitProvenance::External { id },
             db::WorkUnitProvenance::LegacyActor(id) => WorkUnitProvenance::LegacyActor { id },
         }),
+        review_approval_gate_id: unit.review_approval_gate_id,
+        review_approval_line_id: unit.review_approval_line_id,
         created_by: actor_to_api(unit.created_by),
         version: unit.version,
         created_at: unit.created_at,
@@ -143,6 +146,8 @@ pub async fn create_work_unit(
                 assigned_actor: body.assigned_actor.map(actor_to_db),
                 requires_integration: body.requires_integration,
                 provenance,
+                artifact_inputs: body.artifact_inputs.unwrap_or_default(),
+                review_approval: body.review_approval,
                 review_subject: body
                     .review_subject
                     .map(|subject| subject.reviewed_work_unit_id),
@@ -187,6 +192,19 @@ pub async fn get_work_unit(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(response_for(&state, &user, unit).await?))
+}
+
+pub async fn get_artifact_package(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    user: AuthenticatedUser,
+) -> ApiResult<Json<api_types::WorkUnitArtifactPackageResponse>> {
+    let package = state
+        .work_unit_service
+        .artifact_package(CollaborationActorSource::Human(user.user_id.clone()), &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(package))
 }
 
 pub async fn update_work_unit(

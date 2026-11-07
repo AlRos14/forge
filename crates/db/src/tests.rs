@@ -773,6 +773,15 @@ async fn seed_pr8_human_reviewer_role(
     )
     .await
     .expect("reviewer TaskRole creates");
+    sqlx::query(
+        "UPDATE task_role_capability_configuration
+         SET configuration_json = ? WHERE task_role_id = ?",
+    )
+    .bind(r#"{"schema_version":1,"display_label":null,"capabilities":["formal_review"],"rework":null}"#)
+    .bind(&role.id)
+    .execute(db.pool())
+    .await
+    .expect("reviewer TaskRole receives its explicit formal_review capability");
     let membership = RoleMembershipRepo::add(
         db,
         CreateRoleMembership {
@@ -997,6 +1006,15 @@ async fn seed_pr6_orchestrator_event(
     )
     .await
     .expect("orchestrator TaskRole creates");
+    sqlx::query(
+        "UPDATE task_role_capability_configuration
+         SET configuration_json = ? WHERE task_role_id = ?",
+    )
+    .bind(r#"{"schema_version":1,"display_label":null,"capabilities":["orchestration"],"rework":null}"#)
+    .bind(&role.id)
+    .execute(db.pool())
+    .await
+    .expect("orchestrator TaskRole receives its explicit orchestration capability");
     RoleMembershipRepo::add(
         db,
         CreateRoleMembership {
@@ -1639,9 +1657,27 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
     .await
     .expect("TaskRole changes to policy P2 after admission");
 
+    // V097 is a historical migration whose recovery predicate used the
+    // Execution purpose column. This disposable current-schema fixture
+    // temporarily supplies the exact legacy value for the exact orchestrator
+    // Execution under test so the old migration can be replayed; it is dropped
+    // immediately afterward and never enters the current runtime schema.
+    sqlx::query("ALTER TABLE execution ADD COLUMN purpose TEXT")
+        .execute(db.pool())
+        .await
+        .expect("temporary V097 compatibility column adds to the disposable DB");
+    sqlx::query("UPDATE execution SET purpose = 'orchestrate' WHERE id = ?")
+        .bind(&execution_id)
+        .execute(db.pool())
+        .await
+        .expect("exact fixture Execution has its historical orchestration purpose");
     crate::run_migrations(db.pool())
         .await
         .expect("V097 repairs the committed V096 effect receipt");
+    sqlx::query("ALTER TABLE execution DROP COLUMN purpose")
+        .execute(db.pool())
+        .await
+        .expect("temporary V097 compatibility column is removed again");
     let recovered_state: String =
         sqlx::query_scalar("SELECT state FROM orchestrator_action WHERE result_id = ?")
             .bind(&orphaned_receipt_id)
@@ -3627,6 +3663,7 @@ async fn pr8_review_report_is_exact_human_execution_output_before_completion() {
     .execute(db.pool())
     .await
     .expect("Human Actor persists");
+    seed_pr8_human_reviewer_role(&db, &task_id, &user_id).await;
     let execution_id = new_uuid_v4();
     let execution = ExecutionRepo::create(
         &db,
@@ -5502,6 +5539,341 @@ async fn migration_runner_is_idempotent() {
 }
 
 #[tokio::test]
+async fn v148_facts_and_legacy_task_roles_survive_role_capability_migrations() {
+    let migrations = tempfile::TempDir::new().expect("migration temp dir");
+    copy_migrations_through(148, migrations.path());
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool creates");
+    run_migrations_from(&pool, migrations.path())
+        .await
+        .expect("database migrates through the V148 baseline");
+
+    let now = now_rfc3339();
+    let user_id = new_uuid_v4();
+    let project_id = new_uuid_v4();
+    let task_id = new_uuid_v4();
+    let work_unit_id = new_uuid_v4();
+    let gate_id = new_uuid_v4();
+    let evaluation_id = new_uuid_v4();
+    let digest_a = "a".repeat(64);
+    let digest_b = "b".repeat(64);
+    let digest_c = "c".repeat(64);
+
+    sqlx::query(
+        "INSERT INTO user (id, email, password_hash, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&user_id)
+    .bind(format!("{user_id}@example.invalid"))
+    .bind("fixture-only-password-hash")
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture Human exists");
+    sqlx::query(
+        "INSERT INTO project (
+            id, name, settings, primary_repo_id, owner_id, project_hooks_json,
+            project_work_epoch, created_at, updated_at
+         ) VALUES (?, ?, '{}', NULL, NULL, '[]', 0, ?, ?)",
+    )
+    .bind(&project_id)
+    .bind("V148 migration fixture")
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture Project exists");
+    sqlx::query(
+        "INSERT INTO task (
+            id, project_id, repo_id, parent_task_id, title, description,
+            is_automation, priority, board_position, subtask_order, merge_config,
+            metadata_json, error_annotation, blocked_json, failed_json,
+            deleted_at, version, created_at, updated_at
+         ) VALUES (?, ?, NULL, NULL, ?, NULL, 0, 0, 1.0, NULL, NULL, NULL,
+                   NULL, NULL, NULL, NULL, 1, ?, ?)",
+    )
+    .bind(&task_id)
+    .bind(&project_id)
+    .bind("Preserve the exact Gate input")
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture Task exists");
+    sqlx::query(
+        "INSERT INTO task_lifecycle (task_id, state, version, created_at, updated_at)
+         VALUES (?, 'ready', 1, ?, ?)",
+    )
+    .bind(&task_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture TaskLifecycle exists");
+    let mut implementer_role_id = None;
+    for role in ["implementer", "reviewer", "orchestrator", "Revisor técnico"] {
+        let role_id = new_uuid_v4();
+        if role == "implementer" {
+            implementer_role_id = Some(role_id.clone());
+        }
+        sqlx::query(
+            "INSERT INTO task_role (
+                id, task_id, role, coordination_mode, policy_json, version,
+                created_at, updated_at
+             ) VALUES (?, ?, ?, 'independent', '{}', 1, ?, ?)",
+        )
+        .bind(role_id)
+        .bind(&task_id)
+        .bind(role)
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("fixture TaskRole exists");
+    }
+    let implementer_role_id = implementer_role_id.expect("implementer TaskRole ID");
+    sqlx::query(
+        "INSERT INTO work_unit (
+            id, task_id, parent_work_unit_id, title, scope, status, role,
+            assigned_actor_kind, assigned_actor_id, requires_integration,
+            provenance_kind, provenance_id, execution_instructions,
+            created_by_kind, created_by_id, version, created_at, updated_at
+         ) VALUES (?, ?, NULL, 'Historical scope', 'Preserve its input', 'open',
+                   'implementer', NULL, NULL, 0, NULL, NULL, NULL,
+                   'human', ?, 1, ?, ?)",
+    )
+    .bind(&work_unit_id)
+    .bind(&task_id)
+    .bind(&user_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture WorkUnit exists");
+    let migration_db = SqliteDb::new(pool.clone());
+    let membership = RoleMembershipRepo::add(
+        &migration_db,
+        CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id: implementer_role_id,
+            actor_kind: ActorKind::Human,
+            actor_id: user_id.clone(),
+            status: RoleMembershipStatus::Active,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("legacy Human membership exists for the implementer role");
+    let legacy_execution_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &migration_db,
+        CreateExecution {
+            id: legacy_execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: None,
+            actor_ref: Some(crate::ActorRef::Human(user_id.clone())),
+            role: "implementer".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("historical task-level attempt".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("legacy Execution is recorded before the capability migration");
+    sqlx::query(
+        "INSERT INTO gate (
+            id, task_id, gate_kind, scope_kind, scope_id,
+            active_policy_revision, created_at
+         ) VALUES (?, ?, 'delivery_acceptance', 'task', ?, NULL, ?)",
+    )
+    .bind(&gate_id)
+    .bind(&task_id)
+    .bind(&task_id)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture Gate exists");
+    sqlx::query(
+        "INSERT INTO gate_policy_revision (
+            gate_id, revision, schema_version, policy_json, policy_digest, created_at
+         ) VALUES (?, 1, 1, '{}', ?, ?)",
+    )
+    .bind(&gate_id)
+    .bind(&digest_a)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture Gate policy exists");
+    sqlx::query("UPDATE gate SET active_policy_revision = 1 WHERE id = ?")
+        .bind(&gate_id)
+        .execute(&pool)
+        .await
+        .expect("fixture Gate policy is active");
+    sqlx::query(
+        "INSERT INTO gate_evaluation (
+            id, gate_id, task_id, policy_revision, outcome, input_digest,
+            result_json, evaluated_at
+         ) VALUES (?, ?, ?, 1, 'unsatisfied', ?, '{}', ?)",
+    )
+    .bind(&evaluation_id)
+    .bind(&gate_id)
+    .bind(&task_id)
+    .bind(&digest_b)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("fixture GateEvaluation exists");
+    sqlx::query(
+        "INSERT INTO gate_evaluation_input (
+            evaluation_id, task_id, ordinal, input_kind, input_id,
+            input_version, input_digest, producer_ref, subject_json, status
+         ) VALUES (?, ?, 0, 'work_unit', ?, 1, ?, NULL, '{}', 'open')",
+    )
+    .bind(&evaluation_id)
+    .bind(&task_id)
+    .bind(&work_unit_id)
+    .bind(&digest_c)
+    .execute(&pool)
+    .await
+    .expect("fixture immutable Gate input exists");
+
+    let old_input: String = sqlx::query_scalar(
+        "SELECT json_object(
+            'evaluation_id', evaluation_id, 'task_id', task_id, 'ordinal', ordinal,
+            'input_kind', input_kind, 'input_id', input_id,
+            'input_version', input_version, 'input_digest', input_digest,
+            'producer_ref', producer_ref, 'subject_json', subject_json, 'status', status
+         ) FROM gate_evaluation_input",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("historical Gate input loads");
+
+    copy_migrations_through(156, migrations.path());
+    run_migrations_from(&pool, migrations.path())
+        .await
+        .expect("database migrates from V148 through V156");
+
+    let migrated_input: String = sqlx::query_scalar(
+        "SELECT json_object(
+            'evaluation_id', evaluation_id, 'task_id', task_id, 'ordinal', ordinal,
+            'input_kind', input_kind, 'input_id', input_id,
+            'input_version', input_version, 'input_digest', input_digest,
+            'producer_ref', producer_ref, 'subject_json', subject_json, 'status', status
+         ) FROM gate_evaluation_input",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("historical Gate input remains readable");
+    assert_eq!(migrated_input, old_input);
+
+    let legacy_authority = sqlx::query(
+        "SELECT authority.task_role_id, authority.task_role_version,
+                authority.configuration_json, authority.capabilities_json,
+                authority.membership_id, authority.actor_kind, authority.actor_id,
+                authority.source
+         FROM execution_task_role_authority authority
+         WHERE authority.execution_id = ?",
+    )
+    .bind(&legacy_execution_id)
+    .fetch_one(&pool)
+    .await
+    .expect("V150 preserves exact historical role authority");
+    assert_eq!(
+        legacy_authority
+            .try_get::<Option<i64>, _>("task_role_version")
+            .unwrap(),
+        None,
+        "the migration does not infer an old TaskRole version"
+    );
+    assert_eq!(
+        legacy_authority
+            .try_get::<String, _>("configuration_json")
+            .unwrap(),
+        "{\"schema_version\":1,\"display_label\":null,\"capabilities\":[],\"rework\":null}"
+    );
+    assert_eq!(
+        legacy_authority
+            .try_get::<String, _>("capabilities_json")
+            .unwrap(),
+        "[]",
+        "ordinary historical roles receive a valid empty capability snapshot"
+    );
+    assert_eq!(
+        legacy_authority
+            .try_get::<String, _>("membership_id")
+            .unwrap(),
+        membership.id
+    );
+    assert_eq!(
+        legacy_authority.try_get::<String, _>("actor_kind").unwrap(),
+        "human"
+    );
+    assert_eq!(
+        legacy_authority.try_get::<String, _>("actor_id").unwrap(),
+        user_id
+    );
+    assert_eq!(
+        legacy_authority.try_get::<String, _>("source").unwrap(),
+        "legacy_role_contract"
+    );
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_role_capability_migration_audit audit
+         JOIN task_role role ON role.id = audit.task_role_id
+         WHERE role.task_id = ? AND (
+             (role.role = 'reviewer' AND audit.capability = 'formal_review') OR
+             (role.role = 'orchestrator' AND audit.capability = 'orchestration')
+         )",
+    )
+    .bind(&task_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy capability provenance counts");
+    assert_eq!(audit_count, 2);
+    let custom_capabilities: String = sqlx::query_scalar(
+        "SELECT configuration.configuration_json
+         FROM task_role role
+         JOIN task_role_capability_configuration configuration
+           ON configuration.task_role_id = role.id
+         WHERE role.task_id = ? AND role.role = 'Revisor técnico'",
+    )
+    .bind(&task_id)
+    .fetch_one(&pool)
+    .await
+    .expect("custom TaskRole configuration remains available");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&custom_capabilities)
+            .expect("custom configuration JSON"),
+        serde_json::json!({
+            "schema_version": 1,
+            "display_label": null,
+            "capabilities": [],
+            "rework": null
+        }),
+        "migration does not infer capabilities for a custom localized role"
+    );
+}
+
+#[tokio::test]
 async fn task_board_revision_migration_preserves_tasks_and_tracks_board_changes() {
     let pool = create_sqlite_pool("sqlite::memory:")
         .await
@@ -6733,36 +7105,24 @@ async fn pr7_migration_preserves_legacy_plan_history_and_maps_only_verifiable_au
     let user_id = seed_user(&db).await;
     let now = now_rfc3339();
     let execution_id = new_uuid_v4();
-    ExecutionRepo::create(
-        &db,
-        CreateExecution {
-            id: execution_id.clone(),
-            task_id: task_id.clone(),
-            agent_id: Some(agent_id.clone()),
-            actor_ref: Some(crate::ActorRef::Agent(agent_id.clone())),
-            harness_session_id: None,
-            role: "planner".to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
+    // This test deliberately builds the pre-V098 history schema. Seed a
+    // historical row with its retired Purpose directly instead of using the
+    // current Execution writer, whose public model has no Purpose field.
+    sqlx::query(
+        "INSERT INTO execution (
+            id, task_id, agent_id, role, purpose, status, actor_kind, actor_id,
+            created_at, updated_at
+         ) VALUES (?, ?, ?, 'planner', 'plan', 'completed', 'agent', ?, ?, ?)",
     )
+    .bind(&execution_id)
+    .bind(&task_id)
+    .bind(&agent_id)
+    .bind(&agent_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
     .await
-    .expect("real Plan Execution creates");
+    .expect("historical Plan Execution creates with its retired Purpose");
 
     let markdown = "# Durable plan\n- [ ] implement\n";
     let digest = hex::encode(sha2::Sha256::digest(markdown.as_bytes()));

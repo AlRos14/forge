@@ -12,6 +12,7 @@ import {
   useTaskDispatchQuery,
   useTaskGatesQuery,
   useTaskLifecycleTransitionsQuery,
+  useTaskReviewLinesQuery,
   useTaskQuery,
   useUpdateTask,
   useTaskWorkUnitsQuery,
@@ -80,6 +81,7 @@ export function TaskDetailPage({
   const transitionsQuery = useTaskLifecycleTransitionsQuery(taskId)
   const executionsQuery = useExecutionsQuery(taskId)
   const reviewsQuery = useReviewsQuery(taskId)
+  const reviewLinesQuery = useTaskReviewLinesQuery(taskId)
   const validationsQuery = useValidationsQuery(taskId)
   const gatesQuery = useTaskGatesQuery(taskId)
   const workUnitsQuery = useTaskWorkUnitsQuery(taskId)
@@ -450,11 +452,54 @@ export function TaskDetailPage({
         <section className="space-y-4">
           <div className="rounded-lg border p-4">
             <h2 className="font-semibold">Review Executions</h2>
-            <p className="text-xs text-muted-foreground">Formal Review is prepared as a reviewer WorkUnit with an exact subject. Assigned Human reviewers submit their report from that WorkUnit; the Task dispatcher records Agent reviewer attempts.</p>
+            <p className="text-xs text-muted-foreground">Formal Review is prepared as a WorkUnit for a TaskRole with the formal_review capability and an exact subject. Assigned Humans submit their report from that WorkUnit; the Task dispatcher records Agent attempts.</p>
           </div>
+          <section className="space-y-3 rounded-lg border p-4">
+            <h3 className="font-semibold">Review lines and approval state</h3>
+            <p className="text-xs text-muted-foreground">
+              A correction advances its line and clears the previous verdict. Consumers that
+              require approval can run only after a Gate evaluation covers the current passing
+              revision.
+            </p>
+            {reviewLinesQuery.isLoading ? (
+              <p className="text-sm text-muted-foreground">Loading review lines…</p>
+            ) : null}
+            {(reviewLinesQuery.data ?? []).map((line) => (
+              <article key={line.id} className="space-y-2 rounded-md border p-3 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant="outline">{line.latest_verdict ?? 'pending'}</Badge>
+                  <span>revision {String(line.revision)}</span>
+                  <span>current WorkUnit {line.current_work_unit_id} · v{String(line.current_work_unit_version)}</span>
+                  <code className="ml-auto">Review line {line.id}</code>
+                </div>
+                <p>
+                  Result Execution {line.current_result_execution_id ?? 'pending'} · Artifact{' '}
+                  {line.current_result_artifact_id ?? 'none'} · manifest {line.current_manifest_id ?? 'none'}
+                </p>
+                <div className="space-y-1 border-l pl-3">
+                  {line.history.map((revision) => (
+                    <p key={`${line.id}:${revision.revision}`}>
+                      r{String(revision.revision)} · {revision.work_unit_id} v{String(revision.work_unit_version)} ·{' '}
+                      {revision.verdict ?? 'awaiting result or review'}
+                      {revision.review_report_artifact_id
+                        ? ` · report ${revision.review_report_artifact_id}`
+                        : ''}
+                      {revision.manifest_id ? ` · manifest ${revision.manifest_id}` : ''}
+                    </p>
+                  ))}
+                </div>
+              </article>
+            ))}
+            {!reviewLinesQuery.isLoading && (reviewLinesQuery.data?.length ?? 0) === 0 ? (
+              <p className="text-sm text-muted-foreground">No durable review line is recorded yet.</p>
+            ) : null}
+            {reviewLinesQuery.isError ? (
+              <p role="alert" className="text-sm text-destructive">Review lines could not be loaded.</p>
+            ) : null}
+          </section>
           {workUnits.some(
             (unit) =>
-              unit.role === 'reviewer' &&
+              task.task_roles.find((role) => role.role === unit.role)?.configuration.capabilities.includes('formal_review') &&
               unit.status === 'open' &&
               unit.assigned_actor?.kind === 'human' &&
               unit.assigned_actor.id === userId,
@@ -464,7 +509,7 @@ export function TaskDetailPage({
               {workUnits
                 .filter(
                   (unit) =>
-                    unit.role === 'reviewer' &&
+                    task.task_roles.find((role) => role.role === unit.role)?.configuration.capabilities.includes('formal_review') &&
                     unit.status === 'open' &&
                     unit.assigned_actor?.kind === 'human' &&
                     unit.assigned_actor.id === userId,
@@ -490,6 +535,7 @@ export function TaskDetailPage({
                   await Promise.all([
                     taskQuery.refetch(),
                     workUnitsQuery.refetch(),
+                    reviewLinesQuery.refetch(),
                     dispatchQuery.refetch(),
                     executionsQuery.refetch(),
                   ])

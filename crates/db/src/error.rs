@@ -58,8 +58,11 @@ pub enum DbError {
     #[error("Task is at its automatic Execution capacity")]
     TaskAtCapacity,
 
-    #[error("Task dispatch is paused or cancelled")]
+    #[error("Task dispatch is paused")]
     TaskDispatchPaused,
+
+    #[error("Task dispatch is cancelled")]
+    TaskDispatchCancelled,
 
     #[error("WorkUnit must resolve its exact interrupted Execution before fresh admission")]
     WorkUnitRecoveryPending,

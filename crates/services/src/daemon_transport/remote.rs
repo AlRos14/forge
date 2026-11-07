@@ -126,8 +126,14 @@ impl ExecutionProvider for RemoteExecutionProvider {
         // reconnected, older daemon after capability negotiation completes.
         let mut required_features =
             vec![api_types::DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1];
-        if params.role == "reviewer" {
+        if params
+            .task_role_capabilities
+            .contains(&api_types::TaskRoleCapability::FormalReview)
+        {
             required_features.push(api_types::DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1);
+        }
+        if !params.task_role_capabilities.is_empty() {
+            required_features.push(api_types::DAEMON_PROTOCOL_FEATURE_TASK_ROLE_CAPABILITIES_V1);
         }
         {
             let capabilities: api_types::DaemonProtocolCapabilities = self

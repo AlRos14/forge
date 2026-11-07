@@ -14,7 +14,8 @@ use api_types::{
     ExecutionTerminalNotification, FsBranchesParams, FsListParams, RemoteExecutionFailureClass,
     RemoteResolvedCandidate, RemoteRouteAttempt, RemoteTokenUsage,
     DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1,
-    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1, INVALID_FRAME, INVALID_INPUT,
+    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1,
+    DAEMON_PROTOCOL_FEATURE_TASK_ROLE_CAPABILITIES_V1, INVALID_FRAME, INVALID_INPUT,
     METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_LOG, METHOD_EXECUTION_START,
     METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES, METHOD_FS_LIST, METHOD_HARNESS_DISCOVER_OPTIONS,
     METHOD_PROTOCOL_CAPABILITIES, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE,
@@ -263,6 +264,7 @@ impl DaemonRuntime {
                             features: vec![
                                 DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1.to_owned(),
                                 DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1.to_owned(),
+                                DAEMON_PROTOCOL_FEATURE_TASK_ROLE_CAPABILITIES_V1.to_owned(),
                             ],
                         },
                     ),
@@ -377,6 +379,7 @@ impl DaemonRuntime {
             task_id: params.task_id.clone(),
             execution_id: params.execution_id.clone(),
             role: params.role.clone(),
+            task_role_capabilities: params.task_role_capabilities.clone(),
             worktree_path: worktree_path.to_string_lossy().into_owned(),
             description,
             agent_config: params.executor_config,
@@ -1228,6 +1231,7 @@ mod tests {
             task_id: "task-generation".to_owned(),
             execution_id: execution_id.to_owned(),
             role: "coder".to_owned(),
+            task_role_capabilities: vec![],
             workspace_path: workspace_root.to_string_lossy().into_owned(),
             executor_type: "codex".to_owned(),
             executor_config: serde_json::json!({
@@ -1369,6 +1373,7 @@ mod tests {
                 task_id: "task-1".to_owned(),
                 execution_id: execution_id.clone(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "shell".to_owned(),
                 executor_config: serde_json::json!({
@@ -1415,6 +1420,7 @@ mod tests {
                 task_id: "task-remote-resume".to_owned(),
                 execution_id: "exec-remote-resume".to_owned(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "codex".to_owned(),
                 executor_config: serde_json::json!({
@@ -1470,6 +1476,7 @@ mod tests {
                 task_id: "task-cursor-usage".to_owned(),
                 execution_id: "exec-cursor-usage".to_owned(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "cursor".to_owned(),
                 executor_config: serde_json::json!({
@@ -1511,6 +1518,7 @@ mod tests {
                 task_id: "task-1".to_owned(),
                 execution_id: execution_id.clone(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "shell".to_owned(),
                 executor_config: serde_json::json!({

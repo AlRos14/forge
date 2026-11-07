@@ -805,6 +805,7 @@ fn tools_list_returns_descriptors() {
             "forge_get_task_lifecycle",
             "forge_get_validation_run",
             "forge_get_work_unit",
+            "forge_get_work_unit_artifact_package",
             "forge_list_agent_profiles",
             "forge_list_agents",
             "forge_list_executions",
@@ -816,6 +817,7 @@ fn tools_list_returns_descriptors() {
             "forge_list_task_lifecycle_transitions",
             "forge_list_task_messages",
             "forge_list_task_proposals",
+            "forge_list_task_review_lines",
             "forge_list_task_review_executions",
             "forge_list_task_roles",
             "forge_list_tasks",
@@ -836,9 +838,11 @@ fn tools_list_returns_descriptors() {
             "forge_resume_task",
             "forge_cancel_task",
             "forge_request_rework",
+            "forge_submit_work_unit_review",
             "forge_update_project",
             "forge_update_project_hooks",
             "forge_update_task",
+            "forge_update_task_role",
             "forge_update_work_unit",
         ]
         .into_iter()

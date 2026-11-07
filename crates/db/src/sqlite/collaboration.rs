@@ -680,9 +680,29 @@ impl CollaborationRepo for SqliteDb {
             .await?;
             if has_existing_output == 0 {
                 let producer = sqlx::query(
-                    "SELECT actor_kind, actor_id, status FROM execution
-                     WHERE id = ? AND task_id = ?
-                       AND role = 'reviewer'",
+                    "SELECT execution.actor_kind, execution.actor_id, execution.status
+                     FROM execution
+                     JOIN execution_task_role_authority authority
+                       ON authority.execution_id = execution.id
+                     JOIN task_role role
+                       ON role.id = authority.task_role_id AND role.task_id = execution.task_id
+                     JOIN task_role_capability_configuration current_configuration
+                       ON current_configuration.task_role_id = role.id
+                     JOIN role_membership membership
+                       ON membership.task_role_id = role.id
+                      AND membership.actor_kind = execution.actor_kind
+                      AND membership.actor_id = execution.actor_id
+                     JOIN json_each(authority.capabilities_json) capability
+                     WHERE execution.id = ? AND execution.task_id = ?
+                       AND capability.type = 'text'
+                       AND capability.value = 'formal_review'
+                       AND membership.status = 'active'
+                       AND json_extract(current_configuration.configuration_json, '$.schema_version') = 1
+                       AND EXISTS (
+                           SELECT 1 FROM json_each(current_configuration.configuration_json, '$.capabilities') current_capability
+                           WHERE current_capability.type = 'text'
+                             AND current_capability.value = 'formal_review'
+                       )",
                 )
                 .bind(&input.producer_execution_id)
                 .bind(&input.task_id)
@@ -690,30 +710,22 @@ impl CollaborationRepo for SqliteDb {
                 .await?;
                 let Some(producer) = producer else {
                     return Err(DbError::Check(
-                        "ReviewReport requires its exact reviewer Execution producer".to_owned(),
+                        "ReviewReport requires current authoritative reviewer membership and its exact Execution producer".to_owned(),
                     ));
                 };
                 let actor_kind: String = producer.try_get("actor_kind")?;
                 let actor_id: Option<String> = producer.try_get("actor_id")?;
                 let status: String = producer.try_get("status")?;
                 if actor_kind == "human" {
-                    let Some(actor_id) = actor_id else {
+                    if actor_id.is_none() {
                         return Err(DbError::Check(
                             "new Human ReviewReport requires its persisted Human ActorRef"
                                 .to_owned(),
                         ));
                     };
-                    if status != "running"
-                        || !super::execution::human_has_current_role_authority_in_tx(
-                            &mut tx,
-                            &input.task_id,
-                            "reviewer",
-                            &actor_id,
-                        )
-                        .await?
-                    {
+                    if status != "running" {
                         return Err(DbError::Check(
-                            "new Human ReviewReport requires current authoritative reviewer membership"
+                            "new Human ReviewReport requires its exact Running Human Execution"
                                 .to_owned(),
                         ));
                     }
@@ -913,39 +925,42 @@ impl CollaborationRepo for SqliteDb {
             });
         }
 
-        let human_actor_id: Option<String> = sqlx::query_scalar(
-            "SELECT e.actor_id
+        let review_authority: Option<i64> = sqlx::query_scalar(
+            "SELECT 1
              FROM execution e
+             JOIN execution_task_role_authority authority
+               ON authority.execution_id = e.id
+             JOIN task_role role
+               ON role.id = authority.task_role_id AND role.task_id = e.task_id
+             JOIN task_role_capability_configuration current_configuration
+               ON current_configuration.task_role_id = role.id
+             JOIN role_membership membership
+               ON membership.task_role_id = role.id
+              AND membership.actor_kind = e.actor_kind
+              AND membership.actor_id = e.actor_id
+             JOIN json_each(authority.capabilities_json) capability
+               ON capability.type = 'text' AND capability.value = 'formal_review'
              WHERE e.id = ? AND e.task_id = ?
-               AND e.role = 'reviewer'
                AND e.actor_kind = 'human' AND e.actor_id IS NOT NULL
                AND EXISTS (SELECT 1 FROM user u WHERE u.id = e.actor_id)
+               AND membership.status = 'active'
+               AND json_extract(current_configuration.configuration_json, '$.schema_version') = 1
+               AND EXISTS (
+                   SELECT 1 FROM json_each(current_configuration.configuration_json, '$.capabilities') current_capability
+                   WHERE current_capability.type = 'text'
+                     AND current_capability.value = 'formal_review'
+               )
                AND e.status = 'running'",
         )
         .bind(&input.producer_execution_id)
         .bind(&input.task_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(human_actor_id) = human_actor_id else {
+        let Some(_) = review_authority else {
             return Err(DbError::Check(
-                "new Human ReviewReport requires its exact Running Human reviewer Execution"
-                    .to_owned(),
+                "new Human ReviewReport requires current authoritative reviewer membership and its exact Running formal_review Execution".to_owned(),
             ));
         };
-        if !super::execution::human_has_current_role_authority_in_tx(
-            &mut tx,
-            &input.task_id,
-            "reviewer",
-            &human_actor_id,
-        )
-        .await?
-        {
-            return Err(DbError::Check(
-                "new Human ReviewReport requires current authoritative reviewer membership"
-                    .to_owned(),
-            ));
-        }
-
         for evidence_id in &evidence_input_ids {
             super::validation_run::pin_execution_evidence_input_in_tx(
                 &mut tx,

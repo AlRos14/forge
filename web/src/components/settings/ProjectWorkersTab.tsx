@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { Plus, Trash } from '@phosphor-icons/react'
 import { toast } from 'sonner'
 import {
@@ -9,9 +10,17 @@ import {
   useUpdateProjectTaskRoleDefaults,
 } from '@/api/hooks'
 import { Button } from '@/components/ui/button'
+import { apiFetch } from '@/api/client'
+import { ProjectTaskRoleConfigurationForm } from '@/features/task-roles/TaskRoleConfigurationForm'
 import { settingsErrorMessage } from '@/components/settings/project-settings-utils'
 import { useAuthStore } from '@/stores/auth'
-import type { ActorRef, CoordinationMode, ProjectTaskRoleDefault } from '@/types/generated'
+import type {
+  ActorRef,
+  CoordinationMode,
+  ProjectTaskRoleConfiguration,
+  TaskRoleCapabilityCatalog,
+  ProjectTaskRoleDefault,
+} from '@/types/generated'
 
 const COORDINATION_MODES: Array<{ value: CoordinationMode; label: string }> = [
   { value: 'independent', label: 'Independent' },
@@ -40,9 +49,15 @@ export function ProjectWorkersTab({ projectId }: { projectId: string }) {
   const membersQuery = useMembersQuery(projectId)
   const agentsQuery = useAgentsInfiniteQuery(100)
   const defaultsQuery = useProjectTaskRoleDefaultsQuery(projectId)
+  const capabilityCatalog = useQuery({
+    queryKey: ['task-role-capability-catalog'],
+    queryFn: () => apiFetch<TaskRoleCapabilityCatalog>('/task-role-capabilities'),
+    staleTime: 5 * 60 * 1000,
+  })
   const updateDefaults = useUpdateProjectTaskRoleDefaults()
   const [roles, setRoles] = useState<ProjectTaskRoleDefault[]>([])
   const [newRole, setNewRole] = useState('')
+  const [newRoleTemplate, setNewRoleTemplate] = useState('custom')
   const [selectedActors, setSelectedActors] = useState<Record<string, string>>({})
 
   useEffect(() => {
@@ -82,7 +97,21 @@ export function ProjectWorkersTab({ projectId }: { projectId: string }) {
       toast.error('That role already has Project defaults')
       return
     }
-    setRoles((current) => [...current, { role, coordination_mode: 'independent', members: [] }])
+    const template = capabilityCatalog.data?.templates.find((item) => item.id === newRoleTemplate)
+    setRoles((current) => [
+      ...current,
+      {
+        role,
+        coordination_mode: 'independent',
+        configuration: {
+          schema_version: 1,
+          display_label: null,
+          capabilities: template?.default_capabilities ?? [],
+          rework: null,
+        },
+        members: [],
+      },
+    ])
     setNewRole('')
   }
 
@@ -226,6 +255,17 @@ export function ProjectWorkersTab({ projectId }: { projectId: string }) {
                 </Button>
               </div>
 
+              <div className="mt-4">
+                <ProjectTaskRoleConfigurationForm
+                  roleName={role.role}
+                  roles={roles}
+                  configuration={role.configuration}
+                  onChange={(configuration: ProjectTaskRoleConfiguration) =>
+                    updateRole(role.role, (current) => ({ ...current, configuration }))
+                  }
+                />
+              </div>
+
               <div className="mt-3 flex flex-wrap gap-2">
                 {role.members.map((actor) => {
                   const member =
@@ -319,6 +359,22 @@ export function ProjectWorkersTab({ projectId }: { projectId: string }) {
       </div>
 
       <div className="mt-5 flex flex-wrap gap-2">
+        <select
+          aria-label="Project role template"
+          className="h-9 min-w-48 rounded-md border border-input bg-background px-3 text-sm text-foreground"
+          disabled={!canManage}
+          value={newRoleTemplate}
+          onChange={(event) => {
+            const templateId = event.target.value
+            setNewRoleTemplate(templateId)
+            const template = capabilityCatalog.data?.templates.find((item) => item.id === templateId)
+            if (template?.default_role) setNewRole(template.default_role)
+          }}
+        >
+          {(capabilityCatalog.data?.templates ?? []).map((template) => (
+            <option key={template.id} value={template.id}>{template.label}</option>
+          ))}
+        </select>
         <input
           aria-label="New Task role"
           className="h-9 min-w-56 rounded-md border border-input bg-background px-3 text-sm text-foreground"
