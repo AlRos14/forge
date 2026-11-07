@@ -119,3 +119,9 @@ assignment, unresolved disagreement, or expanded scope produces an explicit
 human decision instead of an automatic approval. Rework receipts do not release
 blocks owned by unrelated causes. Historical reviewer and implementer
 Executions remain unchanged.
+
+Quality requests are durable routing records, not ReviewReports. A
+`delivery_correction` request names an exact ReviewReport source and the
+responsible implementation route; it does not fabricate a reviewer verdict or
+a ValidationRun. Review independence remains enforced by the existing review
+line and the plan-level reviewer-Actor check.

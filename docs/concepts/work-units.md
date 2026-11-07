@@ -252,3 +252,8 @@ A plan Artifact may mention or motivate WorkUnits. Forge does not maintain a
 mandatory bidirectional plan-to-WorkUnit synchronization. A changed plan does
 not rewrite historical WorkUnits; a changed WorkUnit does not rewrite the
 historical plan.
+
+Coordination materialization creates WorkUnits only after an exact approved
+`work_unit_plan`; the model never names WorkUnit IDs or grants executable scope.
+A coordination turn itself is not a WorkUnit and has no WorkspaceLease. The
+deterministic materialization receipt makes replay return the same WorkUnits.
