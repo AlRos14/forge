@@ -2811,6 +2811,11 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                     .await?;
             }
             if let Some(review_key) = unit.review_subject_key.as_deref() {
+                if unit.requires_integration {
+                    return Err(invalid_plan(
+                        "a formal review WorkUnit cannot require repository integration",
+                    ));
+                }
                 if !keys.contains(review_key) || review_key == unit.key {
                     return Err(invalid_plan(
                         "a review subject must name a different WorkUnit in this plan",
