@@ -2926,6 +2926,18 @@ mod tests {
         id
     }
 
+    async fn grant_test_orchestration_capability(database: &Arc<db::SqliteDb>, role_id: &str) {
+        let migrated: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_role_capability_configuration')",
+        )
+        .fetch_one(database.pool()).await.expect("capability schema lookup");
+        if migrated {
+            sqlx::query("UPDATE task_role_capability_configuration SET configuration_json = ?, updated_at = ? WHERE task_role_id = ?")
+                .bind(r#"{"schema_version":1,"display_label":null,"capabilities":["orchestration"],"rework":null}"#)
+                .bind(now_rfc3339()).bind(role_id).execute(database.pool()).await.expect("fixture explicitly grants orchestration capability");
+        }
+    }
+
     async fn test_orchestrator_role(
         database: &Arc<db::SqliteDb>,
         task_id: &str,
@@ -2948,6 +2960,7 @@ mod tests {
         )
         .await
         .expect("canonical orchestrator TaskRole creates");
+        grant_test_orchestration_capability(database, &id).await;
         id
     }
 
@@ -4379,6 +4392,7 @@ mod tests {
         )
         .await
         .expect("canonical TaskRole creates");
+        grant_test_orchestration_capability(&database, &task_role_id).await;
         RoleMembershipRepo::add(
             &*database,
             CreateRoleMembership {
@@ -6089,6 +6103,7 @@ mod tests {
         )
         .await
         .expect("orchestrator TaskRole creates");
+        grant_test_orchestration_capability(&database, &orchestrator_role_id).await;
         RoleMembershipRepo::add(
             &*database,
             CreateRoleMembership {
