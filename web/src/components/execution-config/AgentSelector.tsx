@@ -31,6 +31,9 @@ export function AgentSelector({
   isLoading,
   hasWarning,
   className,
+  label = 'Agent',
+  placeholder,
+  loadingPlaceholder,
   onChange,
 }: {
   id: string
@@ -40,6 +43,9 @@ export function AgentSelector({
   isLoading?: boolean
   hasWarning?: boolean
   className?: string
+  label?: string
+  placeholder?: string
+  loadingPlaceholder?: string
   onChange: (agentId: string | null) => void
 }) {
   const selectedAgent = agents.find((a) => a.id === value)
@@ -49,7 +55,7 @@ export function AgentSelector({
       <div className="flex items-center justify-between gap-2">
         <Label htmlFor={id} className="flex items-center gap-1.5">
           <Robot size={12} />
-          Agent
+          {label}
         </Label>
         {selectedAgent ? (
           <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
@@ -78,7 +84,9 @@ export function AgentSelector({
         value={value ?? ''}
         disabled={disabled || isLoading}
         className="h-9 text-xs"
-        placeholder={isLoading ? 'Loading agents...' : 'Select agent'}
+        placeholder={
+          isLoading ? (loadingPlaceholder ?? 'Loading agents...') : (placeholder ?? 'Select agent')
+        }
         options={agents.map<SelectOption>((agent) => ({
           value: agent.id,
           label: agent.name + (agent.model ? ` · ${agent.model}` : ''),

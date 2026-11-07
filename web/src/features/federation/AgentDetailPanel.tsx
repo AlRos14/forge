@@ -71,7 +71,10 @@ export function AgentDetailPanel({
           {[
             { label: 'Model', value: agent.model ?? 'Pending' },
             { label: 'Provider', value: agent.provider ? humanize(agent.provider) : 'CLI-managed' },
-            { label: 'Reasoning', value: agent.reasoning_effort ? humanize(agent.reasoning_effort) : '—' },
+            {
+              label: agent.executor_type === 'claude_code' ? 'Effort' : 'Reasoning',
+              value: agent.reasoning_effort ? humanize(agent.reasoning_effort) : '—',
+            },
             { label: 'Execution policy', value: agent.permission_policy ? humanize(agent.permission_policy) : '—' },
             { label: 'Total runs', value: agent.total_runs },
           ].map((stat) => (

@@ -8,16 +8,6 @@ pub async fn create_task(
 ) -> ApiResult<Json<TaskResponse>> {
     crate::routes::projects::require_project_mutable(&state, &project_id, &user.user_id).await?;
     let request: CreateTaskRequest = serde_json::from_value(body)?;
-    let task_type = request.task_type.map(|t| {
-        match t {
-            api_types::TaskType::Implementation => "implementation",
-            api_types::TaskType::Planning => "planning",
-            api_types::TaskType::Discovery => "discovery",
-            api_types::TaskType::Review => "review",
-            api_types::TaskType::Validation => "validation",
-        }
-        .to_owned()
-    });
     let task = state
         .task_service
         .create_task(
@@ -26,7 +16,6 @@ pub async fn create_task(
             request.description,
             request.parent_task_id,
             request.priority,
-            task_type,
             None,
             None,
         )

@@ -294,12 +294,25 @@ impl OrchestratorWakeRepo for SqliteDb {
         if input.state == "running" {
             let execution_is_running: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
-                    SELECT 1 FROM execution
-                    WHERE id = ? AND role = 'orchestrator'
-                      AND purpose = 'orchestrate' AND status = 'running'
+                    SELECT 1 FROM execution execution
+                    JOIN orchestrator_wake_execution attempt
+                      ON attempt.execution_id = execution.id
+                    JOIN orchestrator_wake wake ON wake.id = attempt.wake_id
+                    JOIN execution_task_role_authority authority
+                      ON authority.execution_id = execution.id
+                     AND authority.task_role_id = wake.task_role_id
+                    JOIN json_each(authority.capabilities_json) capability
+                    WHERE execution.id = ? AND wake.id = ?
+                      AND attempt.attempt_number = ?
+                      AND wake.task_id = execution.task_id
+                      AND execution.status = 'running'
+                      AND capability.type = 'text'
+                      AND capability.value = 'orchestration'
                 )",
             )
             .bind(&input.execution_id)
+            .bind(&input.wake_id)
+            .bind(input.attempt_number)
             .fetch_one(&mut *transaction)
             .await?;
             if !execution_is_running {

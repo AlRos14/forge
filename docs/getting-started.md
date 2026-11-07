@@ -191,23 +191,41 @@ Agent executions require the online embedded host and a supported local CLI
 adapter. An unsupported remote daemon/provider combination is rejected before
 the Execution enters `running`.
 
-## 7. Start an Execution with its exact identity
+## 7. Launch the Task with prepared WorkUnits
 
-This shell example writes a file. The prompt is executed by the selected shell
-adapter; for a model harness, provide a natural-language task prompt instead.
-The request names the WorkUnit and its current version. The Role and Agent
-Actor come from that WorkUnit's allocation.
+The Human prepares the WorkUnit and then launches the Task. There is no manual
+Execution form and no Execution purpose. Optional `execution_instructions` are
+passed to the assigned harness instead of the generic Task/WorkUnit prompt. A
+shell example uses that field as the exact command.
 
 ```bash
 PROMPT="printf 'hello from Forge\\n' > greeting.txt"
-EXECUTION="$(request POST "/tasks/$TASK_ID/executions" "$(jq -cn \
-  --arg work_unit_id "$WORK_UNIT_ID" \
+WORK_UNIT="$(request PATCH "/work-units/$WORK_UNIT_ID" "$(jq -cn \
   --arg prompt "$PROMPT" \
-  --argjson work_unit_version "$WORK_UNIT_VERSION" \
-  '{work_unit_id:$work_unit_id,expected_work_unit_version:$work_unit_version,
-    purpose:"implement",prompt:$prompt,input_artifact_ids:[],overrides:null}')")"
-EXECUTION_ID="$(jq -er '.id' <<<"$EXECUTION")"
+  --argjson expected_version "$WORK_UNIT_VERSION" \
+  '{expected_version:$expected_version,title:null,scope:null,
+    execution_instructions:$prompt,requires_integration:null}')")"
+WORK_UNIT_VERSION="$(jq -er '.version' <<<"$WORK_UNIT")"
+if [[ "$(jq -r '.requires_integration' <<<"$WORK_UNIT")" == "true" ]]; then
+  request POST "/work-units/$WORK_UNIT_ID/workspace" '{}' >/dev/null
+fi
+TASK="$(request GET "/tasks/$TASK_ID")"
+LAUNCH="$(request POST "/tasks/$TASK_ID/dispatch/launch" "$(jq -cn \
+  --arg key "$(uuidgen)" \
+  --argjson task_version "$(jq -r '.version' <<<"$TASK")" \
+  --argjson lifecycle_version "$(jq -r '.lifecycle.version' <<<"$TASK")" \
+  '{expected_task_version:$task_version,
+    expected_lifecycle_version:$lifecycle_version,
+    idempotency_key:$key,reason:null}')")"
+EXECUTION_ID="$(jq -er '.admitted_execution_ids[0]' <<<"$LAUNCH")"
+```
 
+If `admitted_execution_ids` is empty, read `GET "/tasks/$TASK_ID/dispatch"` and
+resolve the reported blocker: unassigned or ineligible Actor, paused Agent,
+unprepared Workspace, unsatisfied dependency, or Task block. The dispatcher
+does not pick an arbitrary Role member.
+
+```bash
 while :; do
   EXECUTION="$(request GET "/executions/$EXECUTION_ID")"
   STATUS="$(jq -er '.status' <<<"$EXECUTION")"
@@ -221,16 +239,18 @@ if [[ "$STATUS" != "completed" ]]; then
     "$EXECUTION_ID" "$STATUS" >&2
   exit 1
 fi
-jq '{id,status,actor_ref,role,purpose,work_unit_id,harness_session_id,workspace_id,summary}' \
+jq '{id,status,actor_ref,role,work_unit_id,harness_session_id,workspace_id,summary}' \
   <<<"$EXECUTION"
 request GET "/executions/$EXECUTION_ID/logs" | jq .
 ```
 
-The Execution snapshots its Actor, role, purpose, profile/routing and any
+The Execution snapshots its Actor, role, WorkUnit, profile/routing and any
 HarnessSession. Repository executions bind the exact isolated Workspace;
-non-repository executions have `workspace_id: null`. If Provider Start may
-have taken effect but its result is uncertain, do not retry it automatically.
-Inspect the exact Execution and follow the explicit recovery path in
+non-repository executions have `workspace_id: null`. A completed Execution
+leaves an open WorkUnit `awaiting_acceptance`; accept or integrate it
+explicitly. If Provider Start may have taken effect but its result is uncertain,
+do not retry it automatically. Inspect the exact Execution and follow the
+explicit recovery path in
 [the API reference](api.md#executions-and-harnesssessions).
 
 ## 8. Review, validation, gates, integration, and closure

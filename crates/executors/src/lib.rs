@@ -16,14 +16,17 @@ pub use adapter::{
     ExecutionOverrides, ExecutorKind, FallbackExecutor, HarnessAdapter, HarnessAdapterRegistry,
     HarnessPolicyInterpretation, UsageObservation, DEFAULT_ACCOUNT_COOLDOWN,
 };
-pub use api_types::{CapabilitySupport, HarnessCapabilities, HarnessInvocation};
+pub use api_types::{
+    CapabilitySupport, HarnessCapabilities, HarnessInvocation, TaskRoleCapability,
+};
 pub use command::{build_shell_command_plan, ShellCommandPlan};
 pub use config::{
     account_key, account_key_for_context, candidate_key, merge_overrides, normalize_harness_config,
     validate_ordered_fallback_routing, validate_same_agent_candidate, ClaudeCodeConfig,
     CodexConfig, CommandOverrides, CursorConfig, ExecutorCandidate, ExecutorRouting, GeminiConfig,
-    NullConfig, OpencodeConfig, PermissionPolicy, RouteAttempt, RouteAttemptOutcome, ShellConfig,
-    SmithConfig, FALLBACKS_CONFIG_KEY, ROUTING_POLICY_ORDERED_FALLBACK_V1, ROUTING_SNAPSHOT_KEY,
+    NullConfig, OpencodeConfig, PermissionPolicy, ProjectCopilotMcp, RouteAttempt,
+    RouteAttemptOutcome, ShellConfig, SmithConfig, FALLBACKS_CONFIG_KEY,
+    ROUTING_POLICY_ORDERED_FALLBACK_V1, ROUTING_SNAPSHOT_KEY,
 };
 pub use log_reader::{LogReadResult, LogReader};
 pub use log_schema::{LogEntry, LogKind, LogStream};
@@ -33,32 +36,15 @@ pub use shell::{is_pid_alive, ShellExecutor};
 
 use async_trait::async_trait;
 
-const READ_ONLY_WORKTREE_KEY: &str = "_forge_read_only_worktree";
-/// Mark an executor config so the runtime restores the worktree after execution.
-pub fn mark_worktree_read_only(config: &mut serde_json::Value) {
-    if let Some(object) = config.as_object_mut() {
-        object.insert(
-            READ_ONLY_WORKTREE_KEY.to_owned(),
-            serde_json::Value::Bool(true),
-        );
-    }
-}
-
-/// Whether the runtime must discard all tracked and untracked worktree changes.
-pub fn is_worktree_read_only(config: &serde_json::Value) -> bool {
-    config
-        .get(READ_ONLY_WORKTREE_KEY)
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
 /// Context passed to an executor when running a task.
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
     pub task_id: String,
     pub execution_id: String,
-    /// Generic TaskRole name for bounded adapter compatibility behavior.
+    /// Adapter routing label. `project_copilot` is a management run label and
+    /// does not represent a persisted TaskRole or Task Execution.
     pub role: String,
+    pub task_role_capabilities: Vec<api_types::TaskRoleCapability>,
     pub worktree_path: String,
     pub description: String,
     pub agent_config: serde_json::Value,
@@ -67,22 +53,6 @@ pub struct ExecutionContext {
     pub heartbeat_interval_seconds: u64,
     pub max_turns: Option<u32>,
     pub log_sender: Option<tokio::sync::mpsc::UnboundedSender<LogEntry>>,
-}
-
-#[cfg(test)]
-mod worktree_policy_tests {
-    use super::*;
-
-    #[test]
-    fn read_only_worktree_policy_is_opt_in() {
-        let mut config = serde_json::json!({ "executor_type": "claude_code" });
-        assert!(!is_worktree_read_only(&config));
-
-        mark_worktree_read_only(&mut config);
-
-        assert!(is_worktree_read_only(&config));
-        assert_eq!(config["executor_type"], "claude_code");
-    }
 }
 
 /// Accumulated token usage from an executor run.
@@ -169,6 +139,21 @@ pub enum ExecutionOutcome {
 
 #[async_trait]
 pub trait TaskExecutor: Send + Sync {
+    /// Registered integrations which implement scoped Project management.
+    /// An executor without this capability never advertises it implicitly.
+    fn project_copilot_harnesses(&self) -> Vec<ExecutorKind> {
+        Vec::new()
+    }
+
+    /// Reserve cancellation state before an admitted execution can be cancelled.
+    /// Executors without shared process state may keep the default no-op.
+    fn prepare_execution(&self, _execution_id: &str) {}
+
+    /// Release cancellation state after the caller has persisted the terminal
+    /// outcome. This lets callers keep cancellation effective through result
+    /// persistence, even if the harness future has already returned.
+    fn finish_execution(&self, _execution_id: &str) {}
+
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError>;
     async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError>;
 

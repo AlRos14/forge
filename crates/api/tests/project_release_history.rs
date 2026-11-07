@@ -509,9 +509,25 @@ async fn seed_authentic_v120_release_history(pool: &sqlx::SqlitePool) -> Vec<Pro
     let task_ref = ReleaseTaskReference {
         task_id: "historical-task-without-canonical-row".to_owned(),
         task_version: 7,
-        task_type: "implementation".to_owned(),
         task_state: "active".to_owned(),
         acceptance_check_ids: vec!["check-frozen-1".to_owned()],
+    };
+    // V120 persisted task_type inside the immutable snapshot. Keep those
+    // original bytes in the fixture while the current public DTO omits it.
+    #[derive(serde::Serialize)]
+    struct V120TaskReference<'a> {
+        task_id: &'a str,
+        task_version: i64,
+        task_type: &'static str,
+        task_state: &'a str,
+        acceptance_check_ids: &'a [String],
+    }
+    let frozen_task_ref = V120TaskReference {
+        task_id: &task_ref.task_id,
+        task_version: task_ref.task_version,
+        task_type: "implementation",
+        task_state: &task_ref.task_state,
+        acceptance_check_ids: &task_ref.acceptance_check_ids,
     };
     let document_ref = ArtifactRef {
         artifact_id: "historical-document".to_owned(),
@@ -630,6 +646,7 @@ async fn seed_authentic_v120_release_history(pool: &sqlx::SqlitePool) -> Vec<Pro
             .as_object_mut()
             .expect("snapshot object")
             .remove("snapshot_digest");
+        digest_input["included_tasks"] = serde_json::json!([&frozen_task_ref]);
         snapshot.snapshot_digest = api_types::canonical_digest_with_schema(SCHEMA, &digest_input)
             .expect("authentic V120 snapshot digest");
 
@@ -734,7 +751,7 @@ async fn seed_authentic_v120_release_history(pool: &sqlx::SqlitePool) -> Vec<Pro
         .bind(CHARTER_REVISION)
         .bind(serde_json::to_string(&snapshot.document_revisions).unwrap())
         .bind(serde_json::to_string(&snapshot.included_decisions).unwrap())
-        .bind(serde_json::to_string(&snapshot.included_tasks).unwrap())
+        .bind(serde_json::to_string(&[&frozen_task_ref]).unwrap())
         .bind(serde_json::to_string(&snapshot.validation_results).unwrap())
         .bind(serde_json::to_string(&snapshot.evidence_pins).unwrap())
         .bind(serde_json::to_string(&snapshot.waived_check_ids).unwrap())
@@ -757,7 +774,7 @@ async fn seed_authentic_v120_release_history(pool: &sqlx::SqlitePool) -> Vec<Pro
                 Some(task_ref.task_version.to_string()),
                 Some(task_ref.task_state.clone()),
                 None,
-                serde_json::to_string(&task_ref).unwrap(),
+                serde_json::to_string(&frozen_task_ref).unwrap(),
             ),
             (
                 "validation",

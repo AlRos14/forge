@@ -160,7 +160,7 @@ pub(super) fn executor_snapshot_with_sticky_candidate(
 
 pub(super) async fn build_executor_config_snapshot(
     db: &SqliteDb,
-    task: &Task,
+    _task: &Task,
     agent: &Agent,
     overrides: Option<ExecutionOverrides>,
     adapter_registry: Option<&executors::HarnessAdapterRegistry>,
@@ -226,16 +226,6 @@ pub(super) async fn build_executor_config_snapshot(
         routing_snapshot_value(kind, &snapshot["config"], &fallbacks, adapter_registry)?
     {
         snapshot[executors::ROUTING_SNAPSHOT_KEY] = routing;
-    }
-    // Charter-backed discovery and planning Tasks may inspect a repository,
-    // but they are never allowed to receive a write-capable execution
-    // profile.  Persist the capability in the immutable execution snapshot
-    // so every executor backend sees the same server-derived restriction.
-    if matches!(
-        task.task_type.as_str(),
-        "planning" | "discovery" | "review" | "validation"
-    ) {
-        executors::mark_worktree_read_only(&mut snapshot);
     }
     serde_json::to_string(&snapshot)
         .map(Some)

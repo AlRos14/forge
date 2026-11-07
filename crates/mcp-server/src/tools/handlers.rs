@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
 use api_types::{
-    parse_project_hooks_json, Actor, CoordinationMode as PublicCoordinationMode,
-    ExecutionPurpose as PublicExecutionPurpose, UserActionSource,
+    parse_project_hooks_json, Actor, ActorRef, CoordinationMode as PublicCoordinationMode,
+    UserActionSource,
 };
 use db::{
     new_uuid_v4, now_rfc3339, AgentListQuery, AgentProfileRepo, AgentRepo, ArtifactKind,
-    CollaborationRepo, CreateProject, ExecutionPurpose, ExecutionRepo, GateRepo, GateScopeKind,
-    PageRequest, ProjectRepo, RoleMembershipRepo, SortBy, SortOrder, Task, TaskDependencyRepo,
+    CollaborationRepo, CreateProject, ExecutionRepo, GateRepo, GateScopeKind, PageRequest,
+    ProjectRepo, RoleMembershipRepo, SortBy, SortOrder, Task, TaskDependencyRepo,
     TaskLifecycleRepo, TaskListQuery, TaskRepo, TaskRoleRepo, UpdateProject, UpdateTask,
-    ValidationRunRepo,
+    ValidationRunRepo, WorkUnitDependency, WorkUnitRepo,
 };
 use executors::ExecutionOverrides;
 use serde_json::{json, Map, Value};
@@ -23,15 +23,17 @@ use crate::{
     error::McpToolError,
     params::{
         page_request, parse_params, task_page_request, AddTaskDependencyParams,
-        AddTaskRoleMemberParams, CollaborationListParams, CreateProjectParams,
-        CreateSubTasksParams, CreateTaskParams, CreateTaskRoleParams, EvidenceParams,
-        GateEvaluationParams, GateIdParams, GateTaskParams, GetProjectParams, GetTaskParams,
-        ListAgentProfilesParams, ListAgentsParams, ListExecutionsParams, ListProjectsParams,
-        ListTaskDependenciesParams, ListTasksParams, RegisterAgentParams,
-        RemoveTaskDependencyParams, ReviewExecutionParams, ReviewTaskParams,
-        ReviseGatePolicyParams, StartExecutionParams, TransitionTaskLifecycleParams,
-        UpdateProjectHooksParams, UpdateProjectParams, UpdateTaskParams, ValidationRunParams,
-        ValidationTaskParams,
+        AddTaskRoleMemberParams, AllocateWorkUnitParams, CollaborationListParams,
+        CreateProjectParams, CreateSubTasksParams, CreateTaskParams, CreateTaskRoleParams,
+        CreateWorkUnitParams, EvidenceParams, GateEvaluationParams, GateIdParams, GateTaskParams,
+        GetProjectParams, GetTaskParams, ListAgentProfilesParams, ListAgentsParams,
+        ListExecutionsParams, ListProjectsParams, ListTaskDependenciesParams, ListTasksParams,
+        ListWorkUnitsParams, RegisterAgentParams, RemoveTaskDependencyParams, RequestReworkParams,
+        ReviewExecutionParams, ReviewTaskParams, ReviseGatePolicyParams,
+        SubmitWorkUnitReviewParams, TaskDispatchActionParams, TransitionTaskLifecycleParams,
+        UpdateProjectHooksParams, UpdateProjectParams, UpdateTaskParams, UpdateTaskRoleParams,
+        UpdateWorkUnitParams, ValidationRunParams, ValidationTaskParams, WorkUnitDependencyParams,
+        WorkUnitIdParams, WorkUnitTransitionParams,
     },
     protocol::McpContext,
     state::AppState,
@@ -100,7 +102,6 @@ pub(super) async fn forge_create_task(
             params.description,
             params.parent_task_id,
             params.priority,
-            params.task_type,
             None,
             None,
         )
@@ -230,34 +231,6 @@ fn validate_create_task_arguments(params: &Value) -> Result<(), McpToolError> {
             ));
         }
     }
-    if let Some(value) = object.get("type") {
-        let Some(task_type) = value.as_str() else {
-            return Err(invalid_field_error(
-                "type",
-                "must be one of the accepted values",
-                Some(json!({
-                    "type": "string",
-                    "enum": ["implementation", "planning", "discovery", "review", "validation"]
-                })),
-            ));
-        };
-        if task_type != "implementation"
-            && task_type != "planning"
-            && task_type != "discovery"
-            && task_type != "review"
-            && task_type != "validation"
-        {
-            return Err(invalid_field_error(
-                "type",
-                format!("unsupported value `{task_type}`"),
-                Some(json!({
-                    "type": "string",
-                    "enum": ["implementation", "planning", "discovery", "review", "validation"]
-                })),
-            ));
-        }
-    }
-
     Ok(())
 }
 
@@ -332,67 +305,209 @@ pub(super) async fn forge_list_executions(
     Ok(execution_page_value(page))
 }
 
-pub(super) async fn forge_start_execution(
+pub(super) async fn forge_get_task_dispatch(
     state: &AppState,
     params: Value,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: StartExecutionParams = parse_params(params)?;
+    let params: GetTaskParams = parse_params(params)?;
     let user_id = authenticated_user(context)?;
-    let work_unit = db::WorkUnitRepo::get_by_id(&*state.db, &params.work_unit_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("work_unit", params.work_unit_id.clone()))?;
-    let task = TaskRepo::get_by_id(&*state.db, &work_unit.task_id, false)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("task", work_unit.task_id.clone()))?;
-    let project = ProjectRepo::get_by_id(&*state.db, &task.project_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("project", task.project_id.clone()))?;
-    require_project_access(state, &project.id, user_id).await?;
-    if params.prompt.trim().is_empty() {
-        return Err(McpToolError::new(
-            -32602,
-            "prompt must be non-empty for an Execution",
-        ));
-    }
-    if let Some(db::ActorRef::Agent(agent_id)) = work_unit.assigned_actor.as_ref() {
-        services::agent_service::require_agent_account(&state.db, agent_id, user_id).await?;
-    }
-    if work_unit.requires_integration {
-        state
-            .work_unit_service
-            .prepare_workspace(
-                CollaborationActorSource::Human(user_id.to_owned()),
-                &work_unit.id,
-            )
-            .await?;
-    }
-    let purpose = match params.purpose {
-        PublicExecutionPurpose::Plan => ExecutionPurpose::Plan,
-        PublicExecutionPurpose::Implement => ExecutionPurpose::Implement,
-        PublicExecutionPurpose::Review => ExecutionPurpose::Review,
-        PublicExecutionPurpose::Validate => ExecutionPurpose::Validate,
-        PublicExecutionPurpose::Investigate => ExecutionPurpose::Investigate,
-        PublicExecutionPurpose::Orchestrate => ExecutionPurpose::Orchestrate,
-        PublicExecutionPurpose::General => ExecutionPurpose::General,
-    };
-    let launched = state
-        .task_service
-        .launch_work_unit_execution(
-            &work_unit.id,
-            params.expected_work_unit_version,
-            purpose,
-            params.prompt,
-            params.input_artifact_ids,
-            None,
+    require_task_access(state, &params.task_id, user_id).await?;
+    let preflight = dispatch_service(state)
+        .launch_preflight(&params.task_id)
+        .await?;
+    serde_json::to_value(preflight).map_err(|error| {
+        McpToolError::new(-32603, format!("failed to serialize dispatch: {error}"))
+    })
+}
+
+pub(super) async fn forge_launch_task(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: TaskDispatchActionParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    let task = require_task_access(state, &params.task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let write = dispatch_service(state)
+        .launch_task(
+            &params.task_id,
+            params.expected_task_version,
+            params.expected_lifecycle_version,
+            &ActorRef::Human(user_id.to_owned()),
+            &params.idempotency_key,
         )
         .await?;
+    let outcome = services::DispatchOutcome::default();
+    let preflight = dispatch_service(state)
+        .launch_preflight(&params.task_id)
+        .await?;
+    Ok(json!({
+        "admitted": true,
+        "dispatch": dispatch_intent_value(&write.dispatch),
+        "preflight": preflight,
+        "admitted_execution_ids": outcome.admitted_execution_ids,
+        "started_execution_ids": outcome.started_execution_ids,
+    }))
+}
+
+pub(super) async fn forge_pause_task(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: TaskDispatchActionParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    let task = require_task_access(state, &params.task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let write = dispatch_service(state)
+        .pause_task(
+            &params.task_id,
+            params.expected_task_version,
+            params.expected_lifecycle_version,
+            &ActorRef::Human(user_id.to_owned()),
+            params.reason,
+            &params.idempotency_key,
+        )
+        .await?;
+    dispatch_action_value(state, &params.task_id, write).await
+}
+
+pub(super) async fn forge_resume_task(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: TaskDispatchActionParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    let task = require_task_access(state, &params.task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let write = dispatch_service(state)
+        .resume_task(
+            &params.task_id,
+            params.expected_task_version,
+            params.expected_lifecycle_version,
+            &ActorRef::Human(user_id.to_owned()),
+            &params.idempotency_key,
+        )
+        .await?;
+    dispatch_action_value(state, &params.task_id, write).await
+}
+
+pub(super) async fn forge_cancel_task(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: TaskDispatchActionParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    let task = require_task_access(state, &params.task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    if let Some(receipt) = TaskLifecycleRepo::get_task_dispatch_receipt(
+        &*state.db,
+        &params.task_id,
+        &params.idempotency_key,
+    )
+    .await?
+    {
+        if receipt.operation != db::TaskDispatchOperation::Cancel {
+            return Err(McpToolError::new(
+                -32602,
+                "Task dispatch idempotency key belongs to another operation",
+            ));
+        }
+        let write = dispatch_service(state)
+            .record_cancelled_dispatch_after_cancel(
+                &params.task_id,
+                params.expected_task_version,
+                params.expected_lifecycle_version,
+                &ActorRef::Human(user_id.to_owned()),
+                params.reason,
+                &params.idempotency_key,
+            )
+            .await?;
+        return dispatch_action_value(state, &params.task_id, write).await;
+    }
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*state.db, &params.task_id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("task lifecycle", params.task_id.clone()))?;
+    if task.version != params.expected_task_version {
+        return Err(McpToolError::from(db::DbError::TaskVersionConflict {
+            expected: params.expected_task_version,
+            actual: task.version,
+        }));
+    }
+    if lifecycle.version != params.expected_lifecycle_version {
+        return Err(McpToolError::from(db::DbError::VersionConflict));
+    }
     state
         .task_service
-        .start_execution(launched.execution.id.clone())
-        .await
-        .map_err(McpToolError::from)?;
-    Ok(execution_value(launched.execution))
+        .cancel_task_as(
+            params.task_id.clone(),
+            Actor::User {
+                user_id: Some(user_id.to_owned()),
+                source: UserActionSource::Mcp,
+            },
+        )
+        .await?;
+    let write = dispatch_service(state)
+        .record_cancelled_dispatch_after_cancel(
+            &params.task_id,
+            task.version,
+            lifecycle.version,
+            &ActorRef::Human(user_id.to_owned()),
+            params.reason,
+            &params.idempotency_key,
+        )
+        .await?;
+    dispatch_action_value(state, &params.task_id, write).await
+}
+
+pub(super) async fn forge_request_rework(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: RequestReworkParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    let task = require_task_access(state, &params.task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let service =
+        services::TaskReworkService::new(Arc::clone(&state.db), Arc::clone(&state.event_bus));
+    let result = service
+        .request_rework(
+            CollaborationActorSource::Human(user_id.to_owned()),
+            services::RequestReworkInput {
+                task_id: params.task_id.clone(),
+                expected_task_version: params.expected_task_version,
+                expected_lifecycle_version: params.expected_lifecycle_version,
+                review_report_artifact_id: params.review_report_artifact_id,
+                reviewed_work_unit_id: params.reviewed_work_unit_id,
+                reviewed_work_unit_version: params.reviewed_work_unit_version,
+                correction_title: params.correction_title,
+                correction_scope: params.correction_scope,
+                correction_role_id: params.correction_role_id,
+                correction_actor: params.correction_actor,
+                review_title: params.review_title,
+                review_scope: params.review_scope,
+                review_actor: params.review_actor,
+                idempotency_key: params.idempotency_key,
+                expected_source_configuration_json: None,
+            },
+        )
+        .await?;
+    let source = CollaborationActorSource::Human(user_id.to_owned());
+    let correction =
+        work_unit_value_for(state, source.clone(), result.correction_work_unit).await?;
+    let review = work_unit_value_for(state, source, result.review_work_unit).await?;
+    Ok(json!({
+        "correction_work_unit": correction,
+        "review_work_unit": review,
+        "review_subject": result.review_subject.as_ref().map(services::task_rework::review_subject_response),
+        "rounds_remaining": result.rounds_remaining,
+        "replayed": result.replayed,
+    }))
 }
 
 pub(super) async fn forge_update_task(
@@ -417,6 +532,377 @@ pub(super) async fn forge_update_task(
         })
         .await?;
     task_public_value(state, task).await
+}
+
+pub(super) async fn forge_create_work_unit(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: CreateWorkUnitParams = parse_params(params)?;
+    let source = work_unit_source(context)?;
+    let provenance = params.provenance.map(|provenance| match provenance {
+        api_types::CreateWorkUnitProvenance::Actor { actor } => {
+            db::WorkUnitProvenance::Actor(work_unit_actor_to_db(actor))
+        }
+        api_types::CreateWorkUnitProvenance::WorkUnit { id } => {
+            db::WorkUnitProvenance::WorkUnit(id)
+        }
+        api_types::CreateWorkUnitProvenance::Artifact { id } => {
+            db::WorkUnitProvenance::Artifact(id)
+        }
+        api_types::CreateWorkUnitProvenance::External { id } => {
+            db::WorkUnitProvenance::External(id)
+        }
+    });
+    let unit = state
+        .work_unit_service
+        .create_idempotent(
+            source.clone(),
+            services::CreateWorkUnitInput {
+                task_id: params.task_id,
+                title: params.title,
+                scope: params.scope,
+                execution_instructions: params.execution_instructions,
+                role: params.role,
+                parent_work_unit_id: params.parent_work_unit_id,
+                assigned_actor: params.assigned_actor.map(work_unit_actor_to_db),
+                requires_integration: params.requires_integration,
+                provenance,
+                artifact_inputs: params.artifact_inputs.unwrap_or_default(),
+                review_approval: params.review_approval,
+                review_subject: params
+                    .review_subject
+                    .map(|subject| subject.reviewed_work_unit_id),
+            },
+            &params.idempotency_key,
+        )
+        .await?;
+    work_unit_value_for(state, source, unit).await
+}
+
+pub(super) async fn forge_list_work_units(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: ListWorkUnitsParams = parse_params(params)?;
+    let source = work_unit_source(context)?;
+    let units = state
+        .work_unit_service
+        .list(source.clone(), &params.task_id)
+        .await?;
+    let mut items = Vec::with_capacity(units.len());
+    for unit in units {
+        items.push(work_unit_value_for(state, source.clone(), unit).await?);
+    }
+    let total_count = items.len();
+    Ok(json!({"items": items, "total_count": total_count}))
+}
+
+pub(super) async fn forge_submit_work_unit_review(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    if context.copilot_run_id.is_some() {
+        return Err(McpToolError::new(
+            -32003,
+            "Human authentication is required for WorkUnit review submission",
+        ));
+    }
+    let params: SubmitWorkUnitReviewParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    let task_id = WorkUnitRepo::get_task_id(&*state.db, &params.work_unit_id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("work_unit", params.work_unit_id.clone()))?;
+    let task = require_task_access(state, &task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let (execution, report) = state
+        .work_unit_service
+        .submit_human_review(
+            &state.task_service,
+            &params.work_unit_id,
+            user_id,
+            params.expected_version,
+            params.report,
+        )
+        .await?;
+    Ok(json!({
+        "review_execution": {
+            "execution": execution_value(execution),
+            "report": artifact_value(report.clone())?,
+        },
+        "report": artifact_value(report)?,
+    }))
+}
+
+pub(super) async fn forge_get_work_unit(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: WorkUnitIdParams = parse_params(params)?;
+    let source = work_unit_source(context)?;
+    let unit = state
+        .work_unit_service
+        .get(source.clone(), &params.work_unit_id)
+        .await?;
+    work_unit_value_for(state, source, unit).await
+}
+
+pub(super) async fn forge_get_work_unit_artifact_package(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: WorkUnitIdParams = parse_params(params)?;
+    let package = state
+        .work_unit_service
+        .artifact_package(work_unit_source(context)?, &params.work_unit_id)
+        .await?;
+    serde_json::to_value(package).map_err(|error| {
+        McpToolError::new(
+            -32603,
+            format!("failed to serialize Artifact package: {error}"),
+        )
+    })
+}
+
+pub(super) async fn forge_list_task_review_lines(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: GetTaskParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    require_task_access(state, &params.task_id, user_id).await?;
+    let lines = services::task_rework::list_review_lines(&state.db, &params.task_id).await?;
+    serde_json::to_value(lines).map_err(|error| {
+        McpToolError::new(-32603, format!("failed to serialize review lines: {error}"))
+    })
+}
+
+pub(super) async fn forge_update_work_unit(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: UpdateWorkUnitParams = parse_params(params)?;
+    let source = work_unit_source(context)?;
+    let unit = state
+        .work_unit_service
+        .update(
+            source.clone(),
+            &params.work_unit_id,
+            params.expected_version,
+            params.title,
+            params.scope,
+            params.execution_instructions,
+            params.requires_integration,
+        )
+        .await?;
+    work_unit_value_for(state, source, unit).await
+}
+
+pub(super) async fn forge_allocate_work_unit(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: AllocateWorkUnitParams = parse_params(params)?;
+    let source = work_unit_source(context)?;
+    let unit = state
+        .work_unit_service
+        .allocate(
+            source.clone(),
+            &params.work_unit_id,
+            params.expected_version,
+            params.role,
+            params.assigned_actor.map(work_unit_actor_to_db),
+        )
+        .await?;
+    work_unit_value_for(state, source, unit).await
+}
+
+pub(super) async fn forge_list_work_unit_dependencies(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: WorkUnitIdParams = parse_params(params)?;
+    let dependencies = state
+        .work_unit_service
+        .dependencies(work_unit_source(context)?, &params.work_unit_id)
+        .await?;
+    Ok(json!({
+        "items": dependencies.iter().map(work_unit_dependency_value).collect::<Vec<_>>(),
+        "total_count": dependencies.len(),
+    }))
+}
+
+pub(super) async fn forge_add_work_unit_dependency(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: WorkUnitDependencyParams = parse_params(params)?;
+    let dependency = state
+        .work_unit_service
+        .add_dependency(
+            work_unit_source(context)?,
+            &params.work_unit_id,
+            &params.depends_on_work_unit_id,
+            params.expected_version,
+        )
+        .await?;
+    Ok(work_unit_dependency_value(&dependency))
+}
+
+pub(super) async fn forge_remove_work_unit_dependency(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: WorkUnitDependencyParams = parse_params(params)?;
+    let source = work_unit_source(context)?;
+    let unit = state
+        .work_unit_service
+        .remove_dependency(
+            source.clone(),
+            &params.work_unit_id,
+            &params.depends_on_work_unit_id,
+            params.expected_version,
+        )
+        .await?;
+    work_unit_value_for(state, source, unit).await
+}
+
+pub(super) async fn forge_transition_work_unit(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: WorkUnitTransitionParams = parse_params(params)?;
+    let status = match params.status {
+        api_types::WorkUnitStatus::Completed => db::WorkUnitStatus::Completed,
+        api_types::WorkUnitStatus::Cancelled => db::WorkUnitStatus::Cancelled,
+        api_types::WorkUnitStatus::Open => {
+            return Err(McpToolError::new(
+                -32602,
+                "WorkUnit cannot transition back to open",
+            ));
+        }
+    };
+    let source = work_unit_source(context)?;
+    let unit = state
+        .work_unit_service
+        .transition(
+            source.clone(),
+            &params.work_unit_id,
+            params.expected_version,
+            status,
+        )
+        .await?;
+    work_unit_value_for(state, source, unit).await
+}
+
+fn work_unit_source(context: &McpContext) -> Result<CollaborationActorSource, McpToolError> {
+    if let Some(run_id) = context.copilot_run_id.as_ref() {
+        return Ok(CollaborationActorSource::ProjectCopilot(run_id.clone()));
+    }
+    let user_id = context
+        .user_id
+        .as_ref()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| McpToolError::new(-32003, "authenticated server identity is required"))?;
+    Ok(CollaborationActorSource::Human(user_id.clone()))
+}
+
+fn work_unit_actor_to_db(actor: api_types::ActorRef) -> db::ActorRef {
+    match actor {
+        api_types::ActorRef::Human(id) => db::ActorRef::Human(id),
+        api_types::ActorRef::Agent(id) => db::ActorRef::Agent(id),
+    }
+}
+
+fn work_unit_actor_value(actor: &db::ActorRef) -> Value {
+    match actor {
+        db::ActorRef::Human(id) => json!(api_types::ActorRef::Human(id.clone())),
+        db::ActorRef::Agent(id) => json!(api_types::ActorRef::Agent(id.clone())),
+    }
+}
+
+fn work_unit_provenance_value(provenance: &db::WorkUnitProvenance) -> Value {
+    match provenance {
+        db::WorkUnitProvenance::Actor(actor) => {
+            json!(api_types::WorkUnitProvenance::Actor {
+                actor: match actor {
+                    db::ActorRef::Human(id) => api_types::ActorRef::Human(id.clone()),
+                    db::ActorRef::Agent(id) => api_types::ActorRef::Agent(id.clone()),
+                }
+            })
+        }
+        db::WorkUnitProvenance::WorkUnit(id) => {
+            json!(api_types::WorkUnitProvenance::WorkUnit { id: id.clone() })
+        }
+        db::WorkUnitProvenance::Artifact(id) => {
+            json!(api_types::WorkUnitProvenance::Artifact { id: id.clone() })
+        }
+        db::WorkUnitProvenance::External(id) => {
+            json!(api_types::WorkUnitProvenance::External { id: id.clone() })
+        }
+        db::WorkUnitProvenance::LegacyActor(id) => {
+            json!(api_types::WorkUnitProvenance::LegacyActor { id: id.clone() })
+        }
+    }
+}
+
+fn work_unit_dependency_value(dependency: &WorkUnitDependency) -> Value {
+    json!({
+        "work_unit_id": dependency.work_unit_id,
+        "depends_on_work_unit_id": dependency.depends_on_work_unit_id,
+        "satisfied": dependency.satisfied,
+        "created_at": dependency.created_at,
+    })
+}
+
+async fn work_unit_value_for(
+    state: &AppState,
+    source: CollaborationActorSource,
+    unit: db::WorkUnit,
+) -> Result<Value, McpToolError> {
+    let readiness = state.work_unit_service.readiness(source, &unit.id).await?;
+    let review_subject = services::task_rework::get_review_subject(&state.db, &unit.id)
+        .await?
+        .as_ref()
+        .map(services::task_rework::review_subject_response);
+    Ok(json!({
+        "id": unit.id,
+        "task_id": unit.task_id,
+        "parent_work_unit_id": unit.parent_work_unit_id,
+        "title": unit.title,
+        "scope": unit.scope,
+        "execution_instructions": unit.execution_instructions,
+        "status": unit.status.to_string(),
+        "role": unit.role,
+        "assigned_actor": unit.assigned_actor.as_ref().map(work_unit_actor_value),
+        "requires_integration": unit.requires_integration,
+        "provenance": unit.provenance.as_ref().map(work_unit_provenance_value),
+        "created_by": work_unit_actor_value(&unit.created_by),
+        "version": unit.version,
+        "created_at": unit.created_at,
+        "updated_at": unit.updated_at,
+        "readiness": {
+            "runnable": readiness.runnable,
+            "ready_for_allocation": readiness.ready_for_allocation,
+            "active_execution_ids": readiness.active_execution_ids,
+            "unsatisfied_dependency_ids": readiness.unsatisfied_dependency_ids,
+            "awaiting_integration": readiness.awaiting_integration,
+            "awaiting_acceptance": readiness.awaiting_acceptance,
+        },
+        "review_subject": review_subject,
+    }))
 }
 
 pub(super) async fn forge_register_agent(
@@ -820,7 +1306,6 @@ async fn task_public_value(state: &AppState, task: Task) -> Result<Value, McpToo
         "parent_task_id": task.parent_task_id,
         "title": task.title,
         "description": task.description,
-        "task_type": task.task_type,
         "lifecycle": {
             "task_id": lifecycle.task_id,
             "state": lifecycle.state.to_string(),
@@ -961,12 +1446,23 @@ pub(super) async fn forge_list_task_roles(
     let mut roles = Vec::new();
     for role in TaskRoleRepo::list_by_task(&*state.db, &params.task_id).await? {
         let members = RoleMembershipRepo::list_by_role(&*state.db, &role.id, true).await?;
+        let configuration_record =
+            db::TaskRoleCapabilityConfigurationRepo::get_by_task_role_id(&*state.db, &role.id)
+                .await?
+                .ok_or_else(|| {
+                    McpToolError::new(-32603, "TaskRole capability configuration is missing")
+                })?;
+        let (policy, configuration) = task_role_policy_and_configuration(
+            &role.policy_json,
+            &configuration_record.configuration_json,
+        )?;
         roles.push(json!({
             "id": role.id,
             "task_id": role.task_id,
             "role": role.role,
             "coordination_mode": role.coordination_mode.map(|mode| mode.to_string()),
-            "policy": serde_json::from_str::<Value>(&role.policy_json).unwrap_or(Value::Null),
+            "policy": policy,
+            "configuration": configuration,
             "version": role.version,
             "members": members.into_iter().map(|member| json!({
                 "id": member.id,
@@ -992,8 +1488,15 @@ pub(super) async fn forge_create_task_role(
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
     let params: CreateTaskRoleParams = parse_params(params)?;
-    require_task_access(state, &params.task_id, user_id).await?;
+    let task = require_task_access(state, &params.task_id, user_id).await?;
+    require_project_admin_access(state, &task.project_id, user_id).await?;
     let policy = params.policy.unwrap_or_else(|| json!({}));
+    let configuration = params.configuration.unwrap_or_default();
+    let policy_json = serde_json::to_string(&policy)
+        .map_err(|error| McpToolError::new(-32602, error.to_string()))?;
+    let configuration_json =
+        services::task_role_configuration::store_task_role_configuration(&configuration)
+            .map_err(|error| McpToolError::new(-32602, error.to_string()))?;
     let coordination_mode = match params.coordination_mode {
         PublicCoordinationMode::Partitioned => db::CoordinationMode::Partitioned,
         PublicCoordinationMode::Collaborative => db::CoordinationMode::Collaborative,
@@ -1001,16 +1504,74 @@ pub(super) async fn forge_create_task_role(
     };
     let role = state
         .task_service
-        .create_task_role(
+        .create_task_role_with_configuration(
             &params.task_id,
             &params.role,
             coordination_mode,
-            serde_json::to_string(&policy)
-                .map_err(|error| McpToolError::new(-32602, error.to_string()))?,
+            policy_json,
+            configuration_json.clone(),
         )
         .await?;
     let members = RoleMembershipRepo::list_by_role(&*state.db, &role.id, false).await?;
-    task_role_value(role, members)
+    task_role_value(role, members, &configuration_json)
+}
+
+pub(super) async fn forge_update_task_role(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    let params: UpdateTaskRoleParams = parse_params(params)?;
+    let task = require_task_access(state, &params.task_id, user_id).await?;
+    require_project_admin_access(state, &task.project_id, user_id).await?;
+    let role_name = db::canonical_task_role_name(&params.role)
+        .ok_or_else(|| McpToolError::new(-32602, "role is not a TaskRole"))?;
+    let role = TaskRoleRepo::get_by_task_and_role(&*state.db, &task.id, &role_name)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("task_role", role_name.clone()))?;
+    let current_configuration_record =
+        db::TaskRoleCapabilityConfigurationRepo::get_by_task_role_id(&*state.db, &role.id)
+            .await?
+            .ok_or_else(|| {
+                McpToolError::new(-32603, "TaskRole capability configuration is missing")
+            })?;
+    let (current_policy, current_configuration) = task_role_policy_and_configuration(
+        &role.policy_json,
+        &current_configuration_record.configuration_json,
+    )?;
+    let policy_changed = params.policy.is_some();
+    let configuration_changed = params.configuration.is_some();
+    let policy = params.policy.unwrap_or(current_policy);
+    let policy_json = policy_changed
+        .then(|| serde_json::to_string(&policy))
+        .transpose()
+        .map_err(|error| McpToolError::new(-32602, error.to_string()))?;
+    let configuration = params.configuration.unwrap_or(current_configuration);
+    let configuration_json = if configuration_changed {
+        services::task_role_configuration::store_task_role_configuration(&configuration)
+            .map_err(|error| McpToolError::new(-32602, error.to_string()))?
+    } else {
+        current_configuration_record.configuration_json
+    };
+    let coordination_mode = params.coordination_mode.map(|mode| match mode {
+        PublicCoordinationMode::Partitioned => db::CoordinationMode::Partitioned,
+        PublicCoordinationMode::Collaborative => db::CoordinationMode::Collaborative,
+        PublicCoordinationMode::Independent => db::CoordinationMode::Independent,
+    });
+    let updated = state
+        .task_service
+        .update_task_role_with_configuration(
+            &task.id,
+            &role_name,
+            params.expected_version,
+            coordination_mode,
+            policy_json,
+            configuration_json.clone(),
+        )
+        .await?;
+    let members = RoleMembershipRepo::list_by_role(&*state.db, &updated.id, true).await?;
+    task_role_value(updated, members, &configuration_json)
 }
 
 pub(super) async fn forge_add_task_role_member(
@@ -1040,16 +1601,17 @@ pub(super) async fn forge_add_task_role_member(
 fn task_role_value(
     role: db::TaskRole,
     members: Vec<db::RoleMembership>,
+    configuration_json: &str,
 ) -> Result<Value, McpToolError> {
-    let policy = serde_json::from_str::<Value>(&role.policy_json).map_err(|error| {
-        McpToolError::new(-32603, format!("invalid stored TaskRole policy: {error}"))
-    })?;
+    let (policy, configuration) =
+        task_role_policy_and_configuration(&role.policy_json, configuration_json)?;
     Ok(json!({
         "id": role.id,
         "task_id": role.task_id,
         "role": role.role,
         "coordination_mode": role.coordination_mode.map(|mode| mode.to_string()),
         "policy": policy,
+        "configuration": configuration,
         "version": role.version,
         "members": members.into_iter().map(|member| json!({
             "id": member.id,
@@ -1064,6 +1626,19 @@ fn task_role_value(
         "created_at": role.created_at,
         "updated_at": role.updated_at,
     }))
+}
+
+fn task_role_policy_and_configuration(
+    policy_raw: &str,
+    configuration_raw: &str,
+) -> Result<(Value, api_types::TaskRoleConfiguration), McpToolError> {
+    let policy = serde_json::from_str::<Value>(policy_raw).map_err(|error| {
+        McpToolError::new(-32603, format!("invalid stored TaskRole policy: {error}"))
+    })?;
+    let configuration =
+        services::task_role_configuration::parse_task_role_configuration(configuration_raw)
+            .map_err(|error| McpToolError::new(-32603, error.to_string()))?;
+    Ok((policy, configuration))
 }
 
 pub(crate) async fn require_project_access(
@@ -1138,6 +1713,49 @@ pub(crate) async fn require_task_access(
         .ok_or_else(|| McpToolError::not_found("task", task_id.to_owned()))?;
     require_project_access(state, &task.project_id, user_id).await?;
     Ok(task)
+}
+
+fn dispatch_service(state: &AppState) -> services::task_lifecycle::TaskLifecycleService {
+    services::task_lifecycle::TaskLifecycleService::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+    )
+}
+
+fn dispatch_intent_value(dispatch: &db::TaskDispatch) -> Value {
+    json!({
+        "task_id": dispatch.task_id,
+        "state": dispatch.state.to_string(),
+        "version": dispatch.version,
+        "requested_by": match (
+            dispatch.requested_by_kind.as_str(),
+            dispatch.requested_by_id.as_deref(),
+        ) {
+            ("human", Some(id)) => Some(json!({"kind": "human", "id": id})),
+            ("agent", Some(id)) => Some(json!({"kind": "agent", "id": id})),
+            _ => None,
+        },
+        "reason": dispatch.reason,
+        "created_at": dispatch.created_at,
+        "updated_at": dispatch.updated_at,
+    })
+}
+
+async fn dispatch_action_value(
+    state: &AppState,
+    task_id: &str,
+    write: db::TaskDispatchWrite,
+) -> Result<Value, McpToolError> {
+    let task = TaskRepo::get_by_id(&*state.db, task_id, false)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("task", task_id.to_owned()))?;
+    let task = task_public_value(state, task).await?;
+    let preflight = dispatch_service(state).launch_preflight(task_id).await?;
+    Ok(json!({
+        "task": task,
+        "dispatch": dispatch_intent_value(&write.dispatch),
+        "preflight": preflight,
+    }))
 }
 
 fn gate_value(
@@ -1302,9 +1920,16 @@ pub(super) async fn forge_list_task_review_executions(
     )
     .await?;
     let mut reviews = Vec::new();
-    for execution in page.items.into_iter().filter(|execution| {
-        execution.role == "reviewer" && execution.purpose == Some(ExecutionPurpose::Review)
-    }) {
+    for execution in page.items {
+        if !services::role_capabilities::execution_has_capability(
+            &state.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
+        {
+            continue;
+        }
         reviews.push(review_execution_value(state, execution).await?);
     }
     Ok(json!({"items": reviews}))
@@ -1317,10 +1942,16 @@ pub(super) async fn forge_get_review_execution(
     let params: ReviewExecutionParams = parse_params(params)?;
     let execution = ExecutionRepo::get_by_id(&*state.db, &params.execution_id)
         .await?
-        .filter(|execution| {
-            execution.role == "reviewer" && execution.purpose == Some(ExecutionPurpose::Review)
-        })
         .ok_or_else(|| McpToolError::not_found("review_execution", params.execution_id))?;
+    if !services::role_capabilities::execution_has_capability(
+        &state.db,
+        &execution.id,
+        api_types::TaskRoleCapability::FormalReview,
+    )
+    .await?
+    {
+        return Err(McpToolError::not_found("review_execution", execution.id));
+    }
     review_execution_value(state, execution).await
 }
 

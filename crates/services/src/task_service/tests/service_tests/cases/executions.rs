@@ -159,6 +159,8 @@ fn human_review_request(
         questions: Vec::new(),
         evidence_ids,
         artifact_ids,
+        reviewed_work_unit_id: None,
+        reviewed_work_unit_version: None,
     }
 }
 
@@ -425,7 +427,6 @@ async fn start_execution_rejects_agent_daemon_rebind_after_admission() {
         &task,
         &agent_id,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("frozen host start".to_owned()),
         Some(snapshot),
@@ -517,7 +518,6 @@ async fn unpinned_start_fails_closed_when_frozen_daemon_disappears() {
         &task,
         &agent_id,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("frozen unpinned host start".to_owned()),
         Some(snapshot),
@@ -587,28 +587,18 @@ async fn create_claimed_review_execution(
     let service = TaskService::new(Arc::new(db.clone()), event_bus)
         .with_workspace_root(workspace_root.to_path_buf())
         .with_workspace_exec_locks(Arc::new(crate::WorkspaceExecutionLockManager::new()));
-    let now = now_rfc3339();
-    let task = TaskRepo::create(
-        db,
-        db::CreateTask {
-            id: db::new_uuid_v4(),
-            project_id: project_id.to_owned(),
-            repo_id: Some(repo_id.to_owned()),
-            parent_task_id: None,
-            subtask_order: None,
-            title: "Read-only exact Review fixture".to_owned(),
-            description: Some("Review a dirty Workspace snapshot".to_owned()),
-            task_type: "review".to_owned(),
-            lifecycle_state: db::TaskLifecycleState::Active,
-            is_automation: false,
-            priority: 0,
-            merge_config: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("Review fixture Task creates");
+    let task = service
+        .create_task(
+            project_id.to_owned(),
+            "Exact Review fixture",
+            Some("Review a dirty Workspace snapshot".to_owned()),
+            None,
+            Some(0),
+            Some(db::TaskLifecycleState::Active),
+            None,
+        )
+        .await
+        .expect("Review fixture Task creates");
     service
         .create_task_role(
             &task.id,
@@ -671,11 +661,15 @@ async fn create_claimed_review_execution(
                 task_id: task.id.clone(),
                 title: "Exact Review workspace".to_owned(),
                 scope: "Read-only Review fixture".to_owned(),
+                execution_instructions: None,
                 role: "reviewer".to_owned(),
                 parent_work_unit_id: None,
                 assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
                 requires_integration: true,
                 provenance: None,
+                review_subject: None,
+                artifact_inputs: Vec::new(),
+                review_approval: None,
             },
         )
         .await
@@ -705,7 +699,6 @@ async fn create_claimed_review_execution(
                 task_id: task.id.clone(),
                 agent_id: Some(agent_id.to_owned()),
                 actor_ref: Some(db::ActorRef::Agent(agent_id.to_owned())),
-                purpose: Some(db::ExecutionPurpose::Review),
                 harness_session_id: None,
                 role: "reviewer".to_owned(),
                 status: ExecutionStatus::Running,
@@ -744,7 +737,6 @@ async fn create_running_repository_execution(
     task: &db::Task,
     agent_id: &str,
     role: &str,
-    purpose: db::ExecutionPurpose,
     workspace_root: &std::path::Path,
     summary: Option<String>,
     executor_config_snapshot_json: Option<String>,
@@ -834,11 +826,15 @@ async fn create_running_repository_execution(
                 task_id: task.id.clone(),
                 title: "Exact repository Execution".to_owned(),
                 scope: "Execution test fixture".to_owned(),
+                execution_instructions: None,
                 role: role.to_owned(),
                 parent_work_unit_id: None,
                 assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
                 requires_integration: true,
                 provenance: None,
+                review_subject: None,
+                artifact_inputs: Vec::new(),
+                review_approval: None,
             },
         )
         .await
@@ -860,7 +856,6 @@ async fn create_running_repository_execution(
                 task_id: task.id.clone(),
                 agent_id: Some(agent_id.to_owned()),
                 actor_ref: Some(db::ActorRef::Agent(agent_id.to_owned())),
-                purpose: Some(purpose),
                 harness_session_id: None,
                 role: role.to_owned(),
                 status: ExecutionStatus::Running,
@@ -921,7 +916,6 @@ impl TaskExecutor for ReviewOutputExecutor {
         &self,
         ctx: ExecutionContext,
     ) -> std::result::Result<executors::ExecutionResult, executors::ExecutorError> {
-        assert!(executors::is_worktree_read_only(&ctx.agent_config));
         let worktree = std::path::Path::new(&ctx.worktree_path);
         if self.mutate_worktree {
             std::fs::write(worktree.join("README.md"), "reviewer mutation\n")
@@ -1285,7 +1279,7 @@ async fn create_remote_execution_fixture(
     db: &db::SqliteDb,
     task_id: &str,
     agent_id: &str,
-    purpose: db::ExecutionPurpose,
+    role: &str,
 ) -> Execution {
     let now = now_rfc3339();
     let task = db::TaskRepo::get_by_id(db, task_id, false)
@@ -1308,13 +1302,8 @@ async fn create_remote_execution_fixture(
             task_id: task_id.to_owned(),
             agent_id: Some(agent_id.to_owned()),
             actor_ref: Some(db::ActorRef::Agent(agent_id.to_owned())),
-            purpose: Some(purpose.clone()),
             harness_session_id: None,
-            role: if purpose == db::ExecutionPurpose::Plan {
-                "planner".to_owned()
-            } else {
-                "coder".to_owned()
-            },
+            role: role.to_owned(),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -1355,7 +1344,6 @@ async fn pr8_agent_review_execution_materializes_one_exact_review_report() {
             agent_id: Some(agent_id.clone()),
             actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
             role: "reviewer".to_owned(),
-            purpose: Some(db::ExecutionPurpose::Review),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -1434,7 +1422,6 @@ async fn pr8_human_review_uses_only_plural_active_memberships() {
         Some(db::ActorRef::Human(human_a.clone()))
     );
     assert_eq!(execution_a.role, "reviewer");
-    assert_eq!(execution_a.purpose, Some(db::ExecutionPurpose::Review));
     assert!(execution_a.workspace_id.is_none());
     assert!(
         db::ExecutionRepo::get_review_execution_subject(&*db, &execution_a.id)
@@ -1449,7 +1436,6 @@ async fn pr8_human_review_uses_only_plural_active_memberships() {
         .expect("singleton projection to A does not block active member B");
     assert_eq!(execution_b.actor_ref(), Some(db::ActorRef::Human(human_b)));
     assert_eq!(execution_b.role, "reviewer");
-    assert_eq!(execution_b.purpose, Some(db::ExecutionPurpose::Review));
     let reused_a = service
         .start_human_review_execution(&task.id, &human_a, None)
         .await
@@ -1639,6 +1625,8 @@ async fn pr8_running_human_report_reconciles_after_membership_and_workspace_chan
             &human_output,
             Vec::new(),
             Vec::new(),
+            None,
+            None,
         )
         .await
         .expect("ReviewReport commits while Execution remains Running");
@@ -1727,7 +1715,14 @@ async fn pr8_conflicting_human_report_retry_fails_without_replacing_artifact() {
         })
     );
     let report = crate::CollaborationService::new(Arc::clone(&db), Arc::clone(&service.event_bus))
-        .create_human_review_report_from_execution(&execution.id, &output, Vec::new(), Vec::new())
+        .create_human_review_report_from_execution(
+            &execution.id,
+            &output,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+        )
         .await
         .expect("original PASS report is durable before terminalization");
     let mut conflict = original_request;
@@ -1862,10 +1857,14 @@ async fn pr8_review_subject_uses_exact_workunit_workspace_and_matching_evidence(
             parent_work_unit_id: None,
             title: "Review isolated workspace".to_owned(),
             scope: "Exact Review subject fixture".to_owned(),
+            execution_instructions: None,
             role: "reviewer".to_owned(),
             assigned_actor: Some(db::ActorRef::Agent(agent_id.clone())),
             requires_integration: true,
             provenance: None,
+            artifact_input_ids: Vec::new(),
+            review_approval_gate_id: None,
+            review_approval_line_id: None,
             created_by: db::ActorRef::Agent(agent_id.clone()),
             created_at: now.clone(),
         },
@@ -1958,7 +1957,6 @@ async fn pr8_review_subject_uses_exact_workunit_workspace_and_matching_evidence(
             agent_id: Some(agent_id.clone()),
             actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
             role: "reviewer".to_owned(),
-            purpose: Some(db::ExecutionPurpose::Review),
             status: ExecutionStatus::Running,
             stop_reason: None,
             stopped_by: None,
@@ -2129,8 +2127,7 @@ async fn pr8_human_review_inputs_and_report_commit_atomically_and_retry_exactly(
         .run_command(&task.id, &workspace.id, "printf pass", 0, None, None)
         .await
         .expect("exact ValidationRun creates Evidence");
-    let plan_execution =
-        create_remote_execution_fixture(&db, &task.id, &agent_id, db::ExecutionPurpose::Plan).await;
+    let plan_execution = create_remote_execution_fixture(&db, &task.id, &agent_id, "planner").await;
     let collaboration = crate::CollaborationService::new(Arc::clone(&db), Arc::clone(&event_bus));
     let artifact_a = collaboration
         .create_plan_artifact_from_execution(&plan_execution.id, "Exact pinned plan input")
@@ -2363,7 +2360,6 @@ async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
         &task,
         &agent_id,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("printf service-run-ok".to_owned()),
         executor_config_snapshot_json,
@@ -2479,7 +2475,6 @@ async fn run_cursor_execution_does_not_poll_or_persist_usage() {
         &task,
         &agent_id,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("complete Cursor work".to_owned()),
         snapshot,
@@ -2533,7 +2528,6 @@ async fn run_execution_emits_terminal_execution_event() {
         &task,
         &agent_id,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("Emit terminal event".to_owned()),
         None,
@@ -2582,7 +2576,6 @@ async fn run_execution_rejects_when_terminal_active_in_workspace() {
         &task,
         &agent_id,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("Terminal blocks execution".to_owned()),
         None,
@@ -2622,7 +2615,6 @@ async fn run_execution_batches_execution_log_events() {
         &task,
         &agent_id,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("Batch execution logs".to_owned()),
         None,
@@ -2687,7 +2679,6 @@ async fn task_scoped_execution_entrypoints_fail_closed_without_storage() {
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("Task creates");
@@ -2705,7 +2696,6 @@ async fn task_scoped_execution_entrypoints_fail_closed_without_storage() {
             &task.id,
             &agent_id,
             "implementer",
-            db::ExecutionPurpose::Implement,
             "legacy workflow dispatch".to_owned(),
         )
         .await
@@ -2760,7 +2750,6 @@ async fn plan_artifact_output_is_idempotent_across_sqlite_connections() {
             task_id: task.id.clone(),
             agent_id: Some(agent_id.clone()),
             actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(db::ExecutionPurpose::Plan),
             harness_session_id: None,
             role: "planner".to_owned(),
             status: ExecutionStatus::Completed,
@@ -2850,7 +2839,6 @@ async fn execution_start_event_and_initial_artifact_inputs_commit_atomically() {
             task_id: task.id.clone(),
             agent_id: Some(agent_id.clone()),
             actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(db::ExecutionPurpose::Plan),
             harness_session_id: None,
             role: "planner".to_owned(),
             status: ExecutionStatus::Completed,
@@ -2886,7 +2874,6 @@ async fn execution_start_event_and_initial_artifact_inputs_commit_atomically() {
         task_id: task.id.clone(),
         agent_id: Some(agent_id.clone()),
         actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-        purpose: Some(db::ExecutionPurpose::Implement),
         harness_session_id: None,
         role: "coder".to_owned(),
         status: ExecutionStatus::Running,
@@ -2969,7 +2956,6 @@ async fn execution_start_event_and_initial_artifact_inputs_commit_atomically() {
         task_id: task.id.clone(),
         agent_id: Some(agent_id.clone()),
         actor_ref: Some(db::ActorRef::Agent(agent_id)),
-        purpose: Some(db::ExecutionPurpose::Implement),
         harness_session_id: None,
         role: "coder".to_owned(),
         status: ExecutionStatus::Running,
@@ -3033,8 +3019,7 @@ async fn remote_plan_completion_materializes_output_before_terminal_state_and_re
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
-    let execution =
-        create_remote_execution_fixture(&db, &task.id, &agent_id, db::ExecutionPurpose::Plan).await;
+    let execution = create_remote_execution_fixture(&db, &task.id, &agent_id, "planner").await;
     let full_output = "# Complete plan\n- Inspect the migration\n- Verify recovery\n";
     let notification = completed_remote_notification(&execution.id, Some(full_output));
 
@@ -3097,8 +3082,7 @@ async fn remote_plan_completion_requires_full_output_and_non_plan_completion_is_
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
-    let plan_execution =
-        create_remote_execution_fixture(&db, &task.id, &agent_id, db::ExecutionPurpose::Plan).await;
+    let plan_execution = create_remote_execution_fixture(&db, &task.id, &agent_id, "planner").await;
 
     let error = service
         .complete_remote_execution(
@@ -3122,9 +3106,7 @@ async fn remote_plan_completion_requires_full_output_and_non_plan_completion_is_
     .expect("missing Plan output lookup succeeds")
     .is_none());
 
-    let implementation =
-        create_remote_execution_fixture(&db, &task.id, &agent_id, db::ExecutionPurpose::Implement)
-            .await;
+    let implementation = create_remote_execution_fixture(&db, &task.id, &agent_id, "coder").await;
     let completed = service
         .complete_remote_execution(
             completed_remote_notification(&implementation.id, None),
@@ -3197,7 +3179,6 @@ async fn work_unit_execution_ignores_legacy_state_hook_settings() {
         &task,
         &agent_id,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("start scoped work".to_owned()),
         Some(executor_config_snapshot),
@@ -3237,10 +3218,6 @@ async fn work_unit_execution_ignores_legacy_state_hook_settings() {
         Some(db::ActorRef::Agent(agent_id))
     );
     assert_eq!(stored_execution.role, "implementer");
-    assert_eq!(
-        stored_execution.purpose,
-        Some(db::ExecutionPurpose::Implement)
-    );
     assert!(stored_execution.harness_session_id.is_none());
 }
 
@@ -3326,7 +3303,6 @@ async fn follow_up_without_exact_work_unit_fails_closed() {
             task_id: task.id.clone(),
             agent_id: Some(agent_id.clone()),
             actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
-            purpose: Some(db::ExecutionPurpose::Implement),
             harness_session_id: None,
             role: "implementer".to_owned(),
             status: ExecutionStatus::Completed,
@@ -3406,7 +3382,6 @@ async fn follow_up_uses_its_exact_work_unit_while_a_sibling_work_unit_runs() {
         .launch_work_unit_execution(
             &sibling_work_unit.id,
             sibling_work_unit.version,
-            db::ExecutionPurpose::Implement,
             "Sibling WorkUnit remains in progress".to_owned(),
             Vec::new(),
             None,
@@ -3531,7 +3506,6 @@ async fn follow_up_execution_rejects_running_parent() {
             task_id: task.id.clone(),
             agent_id: Some(agent_id),
             actor_ref: None,
-            purpose: None,
             harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Running,
@@ -3721,7 +3695,6 @@ async fn follow_up_execution_rejects_terminal_task() {
             task_id: task.id.clone(),
             agent_id: Some(agent_id),
             actor_ref: None,
-            purpose: None,
             harness_session_id: None,
             role: "executor".to_owned(),
             status: ExecutionStatus::Completed,
@@ -3874,7 +3847,6 @@ async fn re_execute_rejects_running_parent() {
             task_id: task.id.clone(),
             agent_id: Some(agent_id),
             actor_ref: None,
-            purpose: None,
             harness_session_id: None,
             role: "coder".to_owned(),
             status: ExecutionStatus::Running,
@@ -3926,7 +3898,6 @@ async fn re_execute_rejects_concurrent_running_execution() {
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "cancelled parent".to_owned(),
             Vec::new(),
             None,
@@ -3961,7 +3932,6 @@ async fn re_execute_rejects_concurrent_running_execution() {
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "running sibling".to_owned(),
             Vec::new(),
             None,
@@ -4095,7 +4065,6 @@ async fn blocked_recovery_fixture_for_executor(
             &task,
             &agent_id,
             "implementer",
-            db::ExecutionPurpose::Implement,
             workspace_root.path(),
             Some("exact blocked parent".to_owned()),
             None,
@@ -4126,10 +4095,14 @@ async fn blocked_recovery_fixture_for_executor(
                 parent_work_unit_id: None,
                 title: "Exact recovery target".to_owned(),
                 scope: "Recovery admission test target".to_owned(),
+                execution_instructions: None,
                 role: "implementer".to_owned(),
                 assigned_actor: Some(db::ActorRef::Agent(agent_id.clone())),
                 requires_integration: false,
                 provenance: None,
+                artifact_input_ids: Vec::new(),
+                review_approval_gate_id: None,
+                review_approval_line_id: None,
                 created_by: db::ActorRef::Agent(agent_id.clone()),
                 created_at: now.clone(),
             },
@@ -4157,7 +4130,6 @@ async fn blocked_recovery_fixture_for_executor(
             .launch_work_unit_execution(
                 &work_unit.id,
                 work_unit.version,
-                db::ExecutionPurpose::Implement,
                 "exact blocked parent".to_owned(),
                 Vec::new(),
                 None,
@@ -4285,7 +4257,6 @@ fn recovery_admission_input(fixture: &BlockedRecoveryFixture, id: String) -> db:
         agent_id: fixture.parent.agent_id.clone(),
         actor_ref: fixture.parent.actor_ref(),
         role: fixture.work_unit.role.clone(),
-        purpose: fixture.parent.purpose.clone(),
         status: ExecutionStatus::Running,
         stop_reason: None,
         stopped_by: None,
@@ -4608,11 +4579,15 @@ async fn recovery_uses_the_parent_work_units_workspace_when_task_has_siblings() 
                 task_id: fixture.task.id.clone(),
                 title: "Sibling recovery target".to_owned(),
                 scope: "Must not replace the blocked parent's exact Workspace".to_owned(),
+                execution_instructions: None,
                 role: fixture.work_unit.role.clone(),
                 parent_work_unit_id: None,
                 assigned_actor: fixture.work_unit.assigned_actor.clone(),
                 requires_integration: true,
                 provenance: None,
+                review_subject: None,
+                artifact_inputs: Vec::new(),
+                review_approval: None,
             },
         )
         .await
@@ -4671,7 +4646,6 @@ async fn explicit_multi_work_unit_recovery_keeps_repository_workspaces_and_lease
         &task,
         &agent_a,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("repository parent A".to_owned()),
         None,
@@ -4683,7 +4657,6 @@ async fn explicit_multi_work_unit_recovery_keeps_repository_workspaces_and_lease
         &task,
         &agent_b,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("repository parent B".to_owned()),
         None,
@@ -4888,7 +4861,6 @@ async fn concurrent_dispatcher_ticks_recover_post_commit_auto_start_after_unpaus
         &task,
         &agent_id,
         "implementer",
-        ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("automatic recovery dispatcher race".to_owned()),
         Some(snapshot),
@@ -4928,6 +4900,10 @@ async fn concurrent_dispatcher_ticks_recover_post_commit_auto_start_after_unpaus
         .await
         .expect("Auto parent reloads")
         .expect("Auto parent remains historical");
+    let work_unit_id = stopped_parent
+        .work_unit_id
+        .clone()
+        .expect("Auto parent retains its exact WorkUnit");
     assert_eq!(stopped_parent.status, ExecutionStatus::Cancelled);
     assert_eq!(stopped_parent.resume_policy, Some(db::ResumePolicy::Auto));
     assert_eq!(
@@ -4945,6 +4921,40 @@ async fn concurrent_dispatcher_ticks_recover_post_commit_auto_start_after_unpaus
         .expect("HarnessSession resumability preflight succeeds")
         .as_deref(),
         Some("codex-session-for-dispatch-race")
+    );
+
+    let current_task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task reloads before dispatch intent is launched")
+        .expect("Task exists");
+    let current_lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
+        .await
+        .expect("TaskLifecycle loads before dispatch intent is launched")
+        .expect("TaskLifecycle exists");
+    let lifecycle_service =
+        crate::task_lifecycle::TaskLifecycleService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    lifecycle_service
+        .launch_task(
+            &task.id,
+            current_task.version,
+            current_lifecycle.version,
+            &api_types::ActorRef::Human("test-user".to_owned()),
+            "dispatch-auto-recovery",
+        )
+        .await
+        .expect("the Task's durable intent is Running while Auto recovery is pending");
+    let pending_recovery = lifecycle_service
+        .launch_preflight(&task.id)
+        .await
+        .expect("launch preflight retains the exact Auto recovery blocker");
+    assert_eq!(
+        pending_recovery
+            .work_units
+            .iter()
+            .find(|candidate| candidate.work_unit_id == work_unit_id)
+            .map(|candidate| candidate.state.as_str()),
+        Some("awaiting_recovery"),
+        "ordinary dispatch must leave the canceled parent for exact Auto recovery"
     );
 
     let admission_barrier = Arc::new(tokio::sync::Barrier::new(3));
@@ -4979,6 +4989,18 @@ async fn concurrent_dispatcher_ticks_recover_post_commit_auto_start_after_unpaus
             .await
             .expect("post-commit child count loads before provider dispatch");
     assert_eq!(committed_children, 1);
+    let parentless_attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution
+         WHERE work_unit_id = ? AND parent_execution_id IS NULL",
+    )
+    .bind(&work_unit_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("parentless attempt count loads");
+    assert_eq!(
+        parentless_attempts, 1,
+        "the running dispatch intent must not preempt the exact recovery with fresh work"
+    );
     db::AgentRepo::set_paused(&*db, &agent_id, true)
         .await
         .expect("Agent pauses after the child commit");
@@ -5392,10 +5414,14 @@ async fn launch_work_unit_for_override_snapshot(
             parent_work_unit_id: None,
             title: "Snapshot test WorkUnit".to_owned(),
             scope: "Exact assigned execution target".to_owned(),
+            execution_instructions: None,
             role: "implementer".to_owned(),
             assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
             requires_integration: false,
             provenance: None,
+            artifact_input_ids: Vec::new(),
+            review_approval_gate_id: None,
+            review_approval_line_id: None,
             created_by: db::ActorRef::Agent(agent_id.to_owned()),
             created_at: now.clone(),
         },
@@ -5429,7 +5455,6 @@ async fn launch_work_unit_for_override_snapshot(
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "snapshot override test".to_owned(),
             Vec::new(),
             overrides,
@@ -5487,10 +5512,14 @@ async fn create_simple_execution_work_unit(
             parent_work_unit_id: None,
             title: "Atomic launch target".to_owned(),
             scope: "Exact launch admission test target".to_owned(),
+            execution_instructions: None,
             role: "implementer".to_owned(),
             assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
             requires_integration: false,
             provenance: None,
+            artifact_input_ids: Vec::new(),
+            review_approval_gate_id: None,
+            review_approval_line_id: None,
             created_by: db::ActorRef::Agent(agent_id.to_owned()),
             created_at: now.clone(),
         },
@@ -5533,7 +5562,6 @@ async fn terminal_work_unit_execution(
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "exact WorkUnit parent Execution".to_owned(),
             Vec::new(),
             None,
@@ -5721,7 +5749,6 @@ async fn ordinary_launch_snapshot_failure_does_not_activate_task() {
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "snapshot failure must not activate lifecycle".to_owned(),
             Vec::new(),
             None,
@@ -5750,7 +5777,6 @@ async fn ordinary_launch_artifact_rejection_rolls_back_activation_receipt_and_ev
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "invalid artifact admission".to_owned(),
             vec!["missing-launch-artifact".to_owned()],
             None,
@@ -5773,7 +5799,6 @@ async fn ordinary_provider_start_failure_keeps_one_admitted_execution_and_event(
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "provider start occurs after durable admission".to_owned(),
             Vec::new(),
             None,
@@ -5957,7 +5982,6 @@ async fn non_repository_work_unit_admits_starts_and_finishes_in_its_isolated_con
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "write only inside this WorkUnit context".to_owned(),
             Vec::new(),
             None,
@@ -6028,7 +6052,6 @@ async fn non_repository_context_preparation_failure_leaves_no_running_execution(
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "context preparation must fail before admission".to_owned(),
             Vec::new(),
             None,
@@ -6077,7 +6100,6 @@ async fn non_repository_remote_host_rejects_before_running_execution() {
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "remote no-repository context is unsupported".to_owned(),
             Vec::new(),
             None,
@@ -6222,7 +6244,6 @@ async fn non_repository_sibling_work_units_have_independent_contexts() {
         .launch_work_unit_execution(
             &first_unit.id,
             first_unit.version,
-            db::ExecutionPurpose::Implement,
             "first sibling".to_owned(),
             Vec::new(),
             None,
@@ -6233,7 +6254,6 @@ async fn non_repository_sibling_work_units_have_independent_contexts() {
         .launch_work_unit_execution(
             &second_unit.id,
             second_unit.version,
-            db::ExecutionPurpose::Implement,
             "second sibling".to_owned(),
             Vec::new(),
             None,
@@ -6327,7 +6347,6 @@ async fn non_repository_start_replay_after_restart_never_duplicates_provider_sta
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "recover the exact pending Start".to_owned(),
             Vec::new(),
             None,
@@ -6437,7 +6456,6 @@ async fn assert_provider_start_claim_rejects_authority_race(
         &task,
         &agent_id,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("provider Start authority race fixture".to_owned()),
         Some(snapshot),
@@ -6704,7 +6722,6 @@ async fn concurrent_provider_start_claims_dispatch_one_external_start() {
         &task,
         &agent_id,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("concurrent provider claim fixture".to_owned()),
         Some(snapshot),
@@ -6814,7 +6831,6 @@ async fn uncertain_provider_start_retry_never_sends_a_second_external_start() {
         &task,
         &agent_id,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("external Start response may be uncertain".to_owned()),
         Some(routing_snapshot),
@@ -7018,7 +7034,6 @@ async fn crash_recovery_resolves_pending_start_after_its_workspace_lease_expired
         &task,
         &agent_id,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("provider Start is still pending".to_owned()),
         None,
@@ -7198,7 +7213,6 @@ async fn ordinary_launch_work_unit_version_race_rolls_back_lifecycle() {
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "version race must roll back activation".to_owned(),
             Vec::new(),
             None,
@@ -7226,7 +7240,6 @@ async fn ordinary_repository_launch_workspace_readiness_race_rolls_back_lifecycl
         &task,
         &agent_id,
         "implementer",
-        db::ExecutionPurpose::Implement,
         workspace_root.path(),
         Some("workspace readiness race parent".to_owned()),
         None,
@@ -7287,7 +7300,6 @@ async fn ordinary_repository_launch_workspace_readiness_race_rolls_back_lifecycl
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "workspace readiness race must roll back activation".to_owned(),
             Vec::new(),
             None,
@@ -7843,7 +7855,6 @@ async fn durable_admission_rejects_block_owner_changed_after_preflight() {
         task_id: task.id.clone(),
         agent_id: parent_a.agent_id.clone(),
         actor_ref: parent_a.actor_ref(),
-        purpose: parent_a.purpose.clone(),
         harness_session_id: None,
         role: work_unit_a.role.clone(),
         status: ExecutionStatus::Running,
@@ -8227,7 +8238,6 @@ async fn initial_launch_on_sibling_work_unit_preserves_current_block() {
         .launch_work_unit_execution(
             &work_unit_a.id,
             work_unit_a.version,
-            db::ExecutionPurpose::Implement,
             "launch another WorkUnit while B remains blocked".to_owned(),
             Vec::new(),
             None,
@@ -8270,7 +8280,6 @@ async fn follow_up_artifact_pin_rejection_preserves_blocking_annotation_and_life
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Plan,
             "produce follow-up plan artifact".to_owned(),
             Vec::new(),
             None,
@@ -8627,7 +8636,6 @@ async fn ordinary_reexecute_snapshot_failure_keeps_ready_lifecycle_without_child
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "ordinary re-execution source".to_owned(),
             Vec::new(),
             None,
@@ -8733,7 +8741,6 @@ async fn ordinary_reexecute_work_unit_version_race_rolls_back_activation() {
         .launch_work_unit_execution(
             &work_unit.id,
             work_unit.version,
-            db::ExecutionPurpose::Implement,
             "ordinary re-execution source".to_owned(),
             Vec::new(),
             None,
@@ -8827,7 +8834,6 @@ async fn work_unit_launch_records_execution_permission_policy_override_in_snapsh
             None,
             None,
             None,
-            None,
         )
         .await
         .expect("task creates");
@@ -8879,7 +8885,6 @@ async fn work_unit_launch_records_codex_overrides_in_normalized_snapshot() {
             project_id,
             "Snapshot codex overrides",
             Some("unused".to_owned()),
-            None,
             None,
             None,
             None,

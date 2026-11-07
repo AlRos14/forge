@@ -1,5 +1,24 @@
 # API Reference
 
+### WorkUnit review submission
+
+`POST /api/v1/work-units/{id}/review-report` accepts
+`{ "expected_version": number, "report": SubmitReviewReportRequest }` and
+returns `SubmitReviewReportResponse`. It requires the exact assigned Human
+reviewer and an available, independent, same-Task result subject. Forge derives
+the technical attempt and frozen subject; request fields cannot replace them.
+The operation stores the ReviewReport and completes the reviewer WorkUnit;
+`request_changes` completes the review work without approving the delivery.
+An identical retry reuses the same provenance attempt and Artifact.
+
+Review Gate candidates may pin `subject.reviewed_result` with
+`work_unit_id`, the admitted `work_unit_version`, `execution_id`, optional
+`artifact_id`, `commit_sha`, `workspace_id`, and `workspace_snapshot_digest`.
+Those fields identify the delivered result, independently of the reviewer's
+own workspace. Gate evaluation verifies the report against the durable
+review-subject relation and source attempt. A WorkUnit-scoped review Gate
+targets the reviewed WorkUnit, rather than its separate reviewer WorkUnit.
+
 Forge exposes the versioned REST API at `/api/v1`. This reference describes
 the post-PR13 public contract for Project, Task,
 Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit,
@@ -42,12 +61,14 @@ unsupported lifecycle request, `401` for missing/invalid credentials, `404`
 for absent or invisible records, `409` for version or authority conflicts,
 and `422` for malformed DTOs or unknown request fields.
 
-If a provider Start may have taken effect but its response is uncertain,
-`POST /tasks/{id}/executions` returns HTTP `409` with code
-`execution_start_uncertain`; its message identifies the exact Execution. Read
-that Execution and do not submit the Start again automatically.
+If a provider Start may have taken effect but its response is uncertain, Forge
+does not send another Start. A launch response can admit an Execution without
+listing it in `started_execution_ids`; read that exact Execution and its
+`execution_start_uncertain` state. Do not create another attempt or resend the
+Start automatically.
 
-WorkUnit creation currently has no idempotency key. Validation of PR14's
+REST WorkUnit creation currently has no idempotency key. The MCP creation tool
+uses an explicit caller-scoped key. Validation of PR14's
 original head observed `POST /tasks/{task_id}/work-units` return
 `500 internal_error` with SQLite code 517 (`database is locked`) after the
 WorkUnit row had committed. A deterministic two-connection reproduction
@@ -69,6 +90,11 @@ the maximum is 100.
 | `GET /projects` | List Projects visible to the authenticated user. |
 | `GET /projects/{id}` | Read a Project and its generic Project hook configuration. |
 | `PATCH /projects/{id}` | Update Project identity, pause state, and supported generic hooks. |
+| `GET /projects/{id}/task-role-defaults`, `PUT /projects/{id}/task-role-defaults` | Read or replace the role-to-worker template copied into new ordinary Tasks. Reads require Project visibility; updates require owner/admin membership and `expected_version`. Humans must be current Project members. Agents must be owned by the canonical Project owner; global visibility alone is not consent to run an Agent from another account. |
+| `GET /projects/{id}/copilot`, `PUT /projects/{id}/copilot` | Read or assign the Project Copilot. Assignment accepts `expected_version` and nullable `agent_id`, requires current Project owner/admin authority and same-account Agent ownership. |
+| `GET /projects/{id}/copilot/messages`, `POST /projects/{id}/copilot/messages` | Read the durable Project conversation using an opaque cursor, or send `{content, idempotency_key, task_id?}`. Sending requires Project write authority and enabled MCP, returns HTTP 202 with the durable run and user message. An optional Task must belong to the same Project. |
+| `GET /projects/{id}/copilot/runs/{run_id}`, `DELETE /projects/{id}/copilot/runs/{run_id}` | Poll the exact run and its response, or cancel it. Cancellation revokes delegation; an uncertain or interrupted turn is not automatically replayed. |
+| `GET /projects/{id}/copilot/activity` | Read the Project's Copilot tool outcomes and domain mutations, newest first, with `limit` and an opaque keyset `cursor`. Includes the run, exact entity and optional Task reference; excludes tool argument bodies and credentials. |
 | `DELETE /projects/{id}` | Delete a Project under the existing workspace cleanup contract. |
 | `POST /projects/{id}/pause`, `POST /projects/{id}/resume` | Pause or resume the Project. |
 | `GET /projects/{id}/repos`, `POST /projects/{id}/repos` | List or add repositories. |
@@ -77,7 +103,7 @@ the maximum is 100.
 | `GET /projects/{id}/media`, `POST /projects/{id}/media` | List or upload Project media. |
 | `GET /projects/{id}/media/{asset_id}` | Read an exact media asset. |
 | `POST /projects/{id}/media/{asset_id}/redact`, `.../purge` | Record the existing media redaction or purge action. |
-| `GET /projects/{id}/integration`, `POST /projects/{id}/integration`, `PATCH /projects/{id}/integration`, `POST /projects/{id}/integration/sync` | Manage the Project's external issue integration. Create accepts and GET/PATCH return `credential_env_var`, the environment variable name Forge reads during sync; the credential value is never returned or stored. Optional `default_implementer` is an exact `ActorRef`; imported issues create ordinary Tasks and, when configured, an `implementer` TaskRole with that Actor as a RoleMembership. Sync fails closed if the configured Actor is not valid for the Project. Lifecycle begins at the normal Task creation state; legacy `default_task_state` and singular assignment fields are rejected. |
+| `GET /projects/{id}/integration`, `POST /projects/{id}/integration`, `PATCH /projects/{id}/integration`, `POST /projects/{id}/integration/sync` | Manage the Project's external issue integration. Create accepts and GET/PATCH return `credential_env_var`, the environment variable name Forge reads during sync; the credential value is never returned or stored. Optional `default_implementer` is an exact `ActorRef`; imported issues create ordinary Tasks and add that Actor to the copied `implementer` TaskRole, creating the role only when the Project has no default for it. Sync fails closed if the configured Actor is not valid for the Project. Lifecycle begins at the normal Task creation state; legacy `default_task_state` and singular assignment fields are rejected. |
 | `GET /projects/{id}/members`, `POST /projects/{id}/members`, `PATCH /projects/{id}/members/{user_id}`, `DELETE /projects/{id}/members/{user_id}` | Manage Project membership. |
 
 Project reads require an exact `project_member` row for a Project with a
@@ -129,11 +155,14 @@ cursors and page metadata do not reveal other users' Agents. Provider runtime
 projections include only visible Agents and Daemons.
 
 Project media remains a Project resource. The retired Task comment/media
-attachment surface is not part of this API. Ordinary Task creation does not
-inherit role assignments from historical Project settings; create exact
-TaskRole and RoleMembership records through the Task role endpoints. Legacy
-state-driven lifecycle hook settings are preserved as history but are no
-longer dispatched. Generic Project hook rules are a separate target surface.
+attachment surface is not part of this API. Project task-role defaults are a
+template, not a replacement for Task-scoped authority: ordinary Task creation
+and subtask creation copy the configured roles, coordination modes, and active
+memberships in the Task creation transaction. Later Project default edits do
+not change existing Tasks, and Task role edits do not change the Project
+template. Automation Tasks do not inherit these defaults. Legacy state-driven
+lifecycle hook settings are preserved as history but are no longer dispatched.
+Generic Project hook rules are a separate target surface.
 
 External issue integration secrets are accepted only on create/update and are
 never returned. Legacy integration default-state and singular-assignee values
@@ -144,8 +173,8 @@ provenance and active defaults use an exact `default_implementer` ActorRef.
 
 | Method and path | Contract |
 | --- | --- |
-| `POST /projects/{project_id}/tasks` | Create an ordinary Task. Supported fields are `title`, `description`, `parent_task_id`, `task_type`, and `priority`. |
-| `GET /projects/{project_id}/tasks` | List Tasks. Filter with `lifecycle_state`, `task_type`, `priority`, and `q`; order with the supported Task sort fields. `status`, `include_cancelled`, and `include_archived` are rejected. |
+| `POST /projects/{project_id}/tasks` | Create a Task. Supported fields are `title`, `description`, `parent_task_id`, and `priority`; Task classification and access modes are not part of the contract. Project task-role defaults are copied atomically. |
+| `GET /projects/{project_id}/tasks` | List Tasks. Filter with `lifecycle_state`, `priority`, and `q`; order with the supported Task sort fields. Task classification is not a filter. `status`, `include_cancelled`, and `include_archived` are rejected. |
 | `GET /tasks/{id}`, `PATCH /tasks/{id}`, `DELETE /tasks/{id}` | Read, update, or delete a Task. Updates require the Task `version`. |
 | `POST /tasks/{id}/subtasks/reorder` | Reorder exact child Task IDs. |
 | `GET /tasks/{id}/dependencies`, `POST /tasks/{id}/dependencies`, `DELETE /tasks/{id}/dependencies/{dep_id}`, `GET /tasks/{id}/dependents` | Read and update Task dependencies. |
@@ -157,7 +186,9 @@ provenance and active defaults use an exact `default_implementer` ActorRef.
 | `GET /gates/{id}`, `PUT /gates/{id}/policy`, `POST /gates/{id}/evaluate` | Read a Gate, revise its policy against the expected revision, or evaluate its exact current inputs. |
 | `GET /gate-evaluations/{id}` | Read one immutable GateEvaluation and its frozen input facts. |
 | `POST /tasks/{id}/merge` | Request merge admission using the exact satisfied GateEvaluation. The service rechecks its current policy and input identities under the Task integration lock. |
-| `GET /tasks/{id}/task-roles`, `POST /tasks/{id}/task-roles`, `PATCH /tasks/{id}/task-roles/{role}` | Read or update TaskRole definitions. |
+| `GET /task-role-capabilities` | Read the closed capability catalog and editable role templates. The web client uses this response instead of maintaining its own catalog. |
+| `GET /tasks/{id}/task-roles`, `POST /tasks/{id}/task-roles`, `PATCH /tasks/{id}/task-roles/{role}` | Read or update TaskRole definitions, including versioned `configuration` with `display_label`, `capabilities`, and optional `rework` route. Capability and orchestration policy changes require Project owner/admin authority and exact TaskRole version. |
+| `GET /projects/{id}/task-role-defaults`, `PUT /projects/{id}/task-role-defaults` | Read or replace Project TaskRole templates. Defaults store route references by role name and resolve them to Task-local IDs on Task creation. Updates require Project owner/admin authority and the expected defaults version. |
 | `POST /tasks/{id}/task-roles/{role}/members`, `PATCH /tasks/{id}/task-roles/{role}/members/{membership_id}` | Add or update an exact RoleMembership. Memberships name a Human or Agent Actor. |
 
 When present, `parent_task_id` must identify a root Task in the same Project;
@@ -176,14 +207,52 @@ barrier compatibility columns after archiving their exact values. Workflow
 templates, transition logs, and legacy GateConfig do not advance TaskLifecycle;
 their source records remain only in migration history where preserved.
 
+## Task dispatch
+
+Task dispatch is the durable intent to admit prepared WorkUnits. It is owned by
+TaskLifecycle authority and does not create Executions directly in the request.
+
+| Method and path | Contract |
+| --- | --- |
+| `GET /tasks/{id}/dispatch` | Read the current dispatch intent, launch/pause/resume/cancel availability, blockers, and each WorkUnit's derived dispatch state. |
+| `POST /tasks/{id}/dispatch/launch` | Record or replay the exact launch intent using `expected_task_version`, `expected_lifecycle_version`, and `idempotency_key`. The response separates admitted intent, admitted Executions, and provider Starts accepted in this request. Repeating the same key replays without creating another Execution. |
+| `POST /tasks/{id}/dispatch/pause` | Record pause intent and optional reason. Pause prevents new admissions and provider starts; it does not claim to stop running work. |
+| `POST /tasks/{id}/dispatch/resume` | Resume a paused dispatch intent and dispatch currently ready WorkUnits. |
+| `POST /tasks/{id}/dispatch/cancel` | Request Task cancellation and record the dispatch receipt. Execution cancellation and observed results remain separate exact records. |
+| `POST /tasks/{id}/rework` | Create or replay one correction plus new-review round from an exact request-changes ReviewReport whose subject names the reviewed WorkUnit and version. Supply `correction_role_id`; the next review role comes from the producer role's persisted route. The operation checks current authority, independence, and the per-Task rework budget, then returns the exact units and review subject. A transaction that observes concurrent pause or cancellation returns `409 task_dispatch_paused` or `409 task_dispatch_cancelled`. |
+| `GET /tasks/{id}/rework/automation` | Read durable automatic rework intents and their `pending`, `completed`, `blocked`, or `cancelled` state. A paused Task retains a pending intent; after resume the processor revalidates the captured TaskRole configuration, Execution snapshot, membership, exact subject, Actors, and round budget. `reconciled_manual_receipt_id` identifies the exact manual receipt when it fulfilled an automatic intent. |
+
+Automatic rework is created only from a newly recorded exact `request_changes`
+ReviewReport produced under an unchanged admitted role configuration. Replay and
+concurrent consumers share one policy/report/subject key and the atomic rework
+receipt. A missing Actor, ambiguous destination, revoked authority, or exhausted
+budget becomes a durable blocker with a reason. Changing a role from manual to
+automatic does not process earlier reports. The endpoint is read-only and is
+available to Project readers; changes to capabilities and routing remain
+Project owner/admin operations.
+
+`GET /tasks/{id}/review-lines` returns each stable review-line ID, its current
+WorkUnit result, latest exact report and manifest, and immutable revision
+history. A Gate review policy may bind `review.review_line_id`; each evaluation
+records that line's exact revision as an immutable input. A later correction
+advances the line and makes the earlier evaluation ineligible for a consumer.
+
+A WorkUnit state in the preflight response is one of `ready`, `running`,
+`waiting_dependency`, `waiting_human`, `awaiting_acceptance`,
+`awaiting_review_approval`, `awaiting_integration`, `unassigned`, `blocked`,
+`completed`, or `cancelled`.
+An open WorkUnit with a completed result is `awaiting_acceptance` and receives
+no automatic retry. A Human-assigned WorkUnit is `waiting_human` and creates no
+synthetic Execution.
+
 ## Executions and HarnessSessions
 
 | Method and path | Contract |
 | --- | --- |
 | `GET /tasks/{id}/executions` | List exact historical Task Executions. |
-| `POST /tasks/{id}/executions` | Start an Agent Execution from `work_unit_id` and `expected_work_unit_version`, with explicit `purpose`, `prompt`, and optional exact `input_artifact_ids` and overrides. Role and Actor come from the allocated WorkUnit. A repository WorkUnit that requires integration prepares and binds its exact isolated Workspace; supported non-repository WorkUnits have no Workspace. |
+| `POST /tasks/{id}/executions` | Retired. Returns `410 Gone` with code `execution.manual_launch_retired`; use Task dispatch and prepared WorkUnits. |
 | `POST /tasks/{task_id}/executions/{execution_id}/recovery` | Explicitly select one cancelled exact crash-recovery, Agent-timeout, or graceful-shutdown Execution for a fresh child attempt. Supply its exact `work_unit_id`, expected Task, TaskLifecycle, and WorkUnit versions, and an `idempotency_key`; an optional `context` is included in the request identity. The selected Execution's Agent must still be the WorkUnit's current assignee and active role member. The requesting Human must be authorized to mutate the Task and is recorded in the decision receipt. A same-key retry returns the exact admitted child without dispatching it again. Selecting one candidate from an ambiguous aggregate block resolves that block and admits the child in one transaction; remaining WorkUnits keep their own pending Execution history and can be selected afterward. This human selection may explicitly override an Auto candidate when the operator chooses a fresh attempt; dispatcher Auto recovery itself resumes only the parent's exact reusable HarnessSession. |
-| `GET /executions/{id}` | Read one exact Execution, including its Actor, role, purpose, HarnessSession reference, frozen execution configuration, and workspace identity. |
+| `GET /executions/{id}` | Read one exact Execution, including its Actor, role, WorkUnit, HarnessSession reference, frozen execution configuration, and workspace identity. |
 | `POST /executions/{id}/follow-up` | Create a child from the exact parent Execution. `idempotency_key`, `message`, and `agent_id` are required. Repeating the same key and request replays the exact child; reusing the key with different request content conflicts. A new authorized follow-up uses a new key. A same-Agent continuation can reuse only the exact compatible HarnessSession; it never substitutes a current role member or latest Execution. |
 | `POST /executions/{id}/cancel` | Cancel the exact Execution. |
 | `GET /executions/{id}/logs`, `GET /executions/{id}/hook-logs` | Read the exact Execution's persisted log output and hook logs. |
@@ -191,26 +260,28 @@ their source records remain only in migration history where preserved.
 | `GET /workspaces/{id}/diff` | Read an exact Workspace diff. |
 
 The public Execution projection identifies the participant through `actor_ref`;
-it does not expose the legacy AgentSession identity. A Human Execution has no
-HarnessSession. `purpose` describes why the Actor works; it grants no
-permission. Unsupported harness capabilities fail closed.
+it does not expose a purpose classification or the legacy AgentSession identity.
+A Human Execution has no HarnessSession. Historical purpose values remain
+migration evidence only. Unsupported harness capabilities fail closed.
 
 ## Review, ValidationRun, Evidence, and Artifact
 
-Formal Review is exactly `Execution.role = reviewer AND
-Execution.purpose = review`. The legacy Review table does not authorize a
-decision or satisfy a Gate.
+Formal Review is an Execution admitted under a TaskRole whose immutable
+admission snapshot contains `formal_review`, with its exact ReviewReport
+Artifact output. Role names do not grant this capability. The legacy Review
+table does not authorize a decision or satisfy a Gate.
 
 | Method and path | Contract |
 | --- | --- |
-| `POST /tasks/{id}/review-executions` | Start a Human Review Execution. `workspace_id`, when supplied, must name the exact Ready Workspace to review; `null` starts a Workspace-free review and never selects a Task Workspace implicitly. The response names that exact Execution. |
-| `GET /tasks/{id}/review-executions` | List exact reviewer+review Executions and their ReviewReport Artifact outputs. |
+| `POST /tasks/{id}/review-executions` | Start a Human Review Execution with `{ "task_role_id": "...", "workspace_id": "..." }`. The exact role must currently grant `formal_review` and contain the caller as an active member. `workspace_id`, when supplied, must name the exact Ready Workspace to review; `null` starts a Workspace-free review and never selects a Task Workspace implicitly. |
+| `GET /tasks/{id}/review-executions` | List exact Executions admitted with `formal_review` and their ReviewReport Artifact outputs. |
 | `GET /review-executions/{id}` | Read one exact formal Review Execution and report. |
-| `POST /review-executions/{id}` | Submit a ReviewReport to that exact reviewer+review Execution. |
+| `POST /review-executions/{id}` | Submit a ReviewReport to that exact reviewer Execution. Optional `reviewed_work_unit_id` and `reviewed_work_unit_version` pin the exact WorkUnit subject; both must be supplied together. |
 | `GET /tasks/{id}/validation-runs`, `GET /validation-runs/{id}` | List or read exact ValidationRuns. |
 | `GET /evidence/{id}` | Read exact Evidence and its producer ValidationRun identity. |
 | `GET /tasks/{task_id}/artifacts`, `POST /tasks/{task_id}/artifacts` | List or create generic Artifacts with exact provenance. |
 | `GET /artifacts/{id}` | Read one exact Artifact. |
+| `GET /tasks/{task_id}/review-lines` | Read stable review lines, current exact results, and immutable revision history. |
 
 ValidationRuns and Evidence are distinct from ReviewReports. A Gate consumes
 exact input facts and immutable evaluations; it never uses a latest Review or
@@ -220,11 +291,13 @@ ValidationRun lookup.
 
 | Method and path | Contract |
 | --- | --- |
-| `GET /tasks/{task_id}/work-units`, `POST /tasks/{task_id}/work-units` | List or create Task-scoped WorkUnits. |
+| `GET /tasks/{task_id}/work-units`, `POST /tasks/{task_id}/work-units` | List or create Task-scoped WorkUnits. Creation accepts optional `execution_instructions` passed to the assigned harness instead of the generic Task/WorkUnit prompt, exact `artifact_inputs` IDs to pin on every Execution, and `review_approval: { gate_id, review_line_id }` to require a current satisfied review Gate before admission. |
 | `GET /work-units/{id}`, `PATCH /work-units/{id}` | Read or update an exact WorkUnit. |
+| `GET /work-units/{id}/artifact-package` | Read the WorkUnit's exact immutable Artifact input bindings and result manifests, including producer Executions and digests. |
 | `POST /work-units/{id}/allocation`, `POST /work-units/{id}/status` | Allocate a WorkUnit or request its target state transition. |
 | `GET /work-units/{id}/dependencies`, `POST /work-units/{id}/dependencies/{prerequisite_id}`, `DELETE /work-units/{id}/dependencies/{prerequisite_id}` | Read or update exact WorkUnit dependencies. |
-| `GET /work-units/{id}/readiness` | Read deterministic WorkUnit readiness. |
+| `GET /work-units/{id}/readiness` | Read deterministic WorkUnit readiness, including `awaiting_acceptance` and `awaiting_review_approval`. |
+| `POST /work-units/{id}/workspace` | Prepare or rebuild the exact repository WorkUnit Workspace before launch. |
 | `POST /work-units/{id}/integrations` | Integrate an explicitly scoped WorkUnit under the existing integration lock. |
 | `GET /tasks/{task_id}/messages`, `POST /tasks/{task_id}/messages`, `GET /messages/{id}` | Create or read generic collaboration Messages. |
 | `GET /tasks/{task_id}/handoffs`, `POST /tasks/{task_id}/handoffs`, `GET /handoffs/{id}`, `POST /handoffs/{id}/status` | Create, read, or update generic Handoffs. |
@@ -256,6 +329,23 @@ ineligible to ordinary accounts. Agent availability and discovered options
 apply the same account and authenticated-capability checks as dispatch.
 Selecting a profile with a fixed daemon applies that check before the profile
 becomes active.
+Discovered model options run on the account's authorized online daemon, where
+the harness CLI and provider configuration live. A missing or older daemon can
+return a warning and an empty catalog; callers may enter a model ID directly.
+Catalog entries are suggestions, not proof that the account or provider grants
+access to a model. The harness validates access when it starts an Execution.
+Adapters use the installed harness's model-list command where one is available;
+Forge does not keep fallback lists of model IDs. Claude Code currently has no
+supported non-interactive model-list command, so its catalog is empty with a
+warning and callers can enter an alias or full model ID. Refreshing model
+options re-queries the daemon; the daemon must be running the updated CLI for
+the new version's catalog to appear.
+Claude Code's optional Router mode uses the system-installed `ccr` executable.
+`claude_code_router_profile` selects a profile in profile-based Router CLIs;
+omitting it uses the legacy `ccr code` pass-through.
+OpenCode v2 stores provider credentials in its SQLite data store; daemon
+detection checks for an active provider credential in read-only mode and never
+loads or returns the credential value.
 
 Credential and provider infrastructure remains usable after PR10. It does not
 restore Forge-owned cognition or native runtime dispatch.
@@ -336,6 +426,33 @@ limited to administrators; resync hints carry no Project data.
 
 ## MCP
 
+Project Copilot harnesses receive a separate short-lived `fgc_` Bearer
+credential tied to an exact active Project management run. `GET /projects/{id}/copilot`
+reports `supported_executor_types` and the exact
+`supported_daemon_id`: harnesses are listed only when their adapter supports
+scoped Project management and the Project owner's current authority permits
+that harness on the online embedded host. Assignment UI filters to Agents owned
+by the Project owner that have no host pin or name that daemon; an unpinned
+Agent resolves to the embedded host when the run is admitted. The credential is
+accepted only
+by MCP and never as a REST credential. Each use rechecks the binding,
+current requesting Human, current Agent ownership and expiry. Project scope is
+fixed by the authenticated delegation rather than client arguments. The
+`GET /api/v1/projects/{id}/copilot/runs/{run_id}/logs` returns the exact run's
+redacted harness JSONL trace with opaque sequence paging (`tail`, `limit`) for
+Project viewers. It includes reasoning, tool, session, stdout/stderr, output,
+and error events and does not expose runtime secrets.
+The Copilot's `tools/list` exposes context reads and WorkUnit create/update/allocate
+and dependency management only; execution start, WorkUnit completion, lifecycle,
+Gates, global administration and membership changes are outside its tool set.
+An attached Task also removes Project-wide Task listing and fences Task reads
+and mutations to that exact Task. The management runner uses only registered
+harness adapters that disable native tools and configure the exact Forge MCP
+tool allowlist for the run. Remote hosts are not accepted.
+WorkUnit mutations are attributed to the Agent, and durable activity events
+correlate them with the run and requesting Human. See
+[Project Copilot](concepts/project-copilot.md).
+
 MCP accepts the same current-authority Bearer credentials as REST: a PAT, an
 access JWT, or a valid OAuth MCP token. Query-string credentials are not
 accepted. OAuth access tokens are checked against their issuer, audience, and
@@ -354,9 +471,21 @@ The MCP server advertises only registered tools. The current tool names are:
   `forge_list_task_lifecycle_transitions`, `forge_transition_task_lifecycle`,
   `forge_add_task_dependency`, `forge_remove_task_dependency`,
   `forge_list_task_dependencies`.
-- Executions and roles: `forge_list_executions`, `forge_start_execution`,
-  `forge_follow_up_execution`, `forge_list_task_roles`,
-  `forge_create_task_role`, `forge_add_task_role_member`.
+- Executions and roles: `forge_list_executions`, `forge_get_task_dispatch`,
+  `forge_launch_task`, `forge_pause_task`, `forge_resume_task`,
+  `forge_cancel_task`, `forge_request_rework`, `forge_follow_up_execution`,
+  `forge_list_task_roles`, `forge_create_task_role`, `forge_update_task_role`,
+  `forge_add_task_role_member`.
+- WorkUnits: `forge_create_work_unit`, `forge_list_work_units`,
+  `forge_get_work_unit`, `forge_get_work_unit_artifact_package`,
+  `forge_list_task_review_lines`, `forge_update_work_unit`, `forge_allocate_work_unit`,
+  `forge_transition_work_unit`, `forge_list_work_unit_dependencies`,
+  `forge_add_work_unit_dependency`, `forge_remove_work_unit_dependency`.
+  Creation requires a caller-scoped `idempotency_key`; an exact retry returns
+  the current WorkUnit from its immutable creation intent, even after later
+  updates. Reusing the key with changed request content conflicts. Mutations
+  require exact expected versions where applicable and use the same domain
+  services as REST.
 - Gates and evidence: `forge_create_task_gate`, `forge_get_gate`,
   `forge_revise_gate_policy`, `forge_evaluate_gate`,
   `forge_get_gate_evaluation`, `forge_list_task_review_executions`,
@@ -368,12 +497,19 @@ The MCP server advertises only registered tools. The current tool names are:
   `forge_list_task_handoffs`, `forge_list_task_proposals`,
   `forge_list_task_decisions`.
 
-`forge_start_execution` requires the exact WorkUnit ID and version, Purpose,
-and prompt. The server resolves the matching Workspace when the WorkUnit needs
-repository integration; non-repository WorkUnits have no Workspace. The
-descriptor schemas are returned by MCP `tools/list` and are implemented in
+`forge_launch_task` requires the Task ID, expected Task and TaskLifecycle
+versions, and an idempotency key. It records dispatch intent; the dispatcher
+admits prepared Agent WorkUnits. `forge_pause_task`, `forge_resume_task`, and
+`forge_cancel_task` use the same version and key contract. `forge_get_task_dispatch`
+reads the preflight and per-WorkUnit blockers. The descriptor schemas are
+returned by MCP `tools/list` and are implemented in
 `crates/mcp-server/src/tools/descriptors.rs`. Retired tool names return MCP
 `-32601 method not found`; they are not forwarded to a different tool.
+
+`forge_create_task` accepts a Task title and Markdown description, with
+optional parent Task and priority. Task classification and access modes are
+not part of the MCP contract. Repository WorkUnit Executions receive write
+capability when the Agent meets the current TaskRole and authority checks.
 
 `tools/list` is authoritative for the deployed descriptor set. Tools that
 start work require an exact Actor or explicit Agent identity and do not infer a

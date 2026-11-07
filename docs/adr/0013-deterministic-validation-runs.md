@@ -1,10 +1,10 @@
 # ADR 0013: Deterministic validation is a ValidationRun
 
-Status: Accepted in Plan PR0
+Status: Accepted in Plan PR0; purpose wording superseded by ADR 0014.
 
 ## Context
 
-An Execution has exactly one Actor, Role, and Purpose, while automated tests,
+An Execution has exactly one Actor and Role, while automated tests,
 typechecks, builds, lint, and scanners are core-controlled evidence rather
 than model cognition. Inventing a System Actor would make deterministic
 authority look like human or Agent work and would blur validation with review.
@@ -19,10 +19,9 @@ Artifact through `ArtifactProducer::ValidationRun`, without requiring an
 Actor, HarnessSession, or fake System Actor. Actor-produced Artifacts instead
 use `ArtifactProducer::Execution` and derive their Actor from that Execution.
 
-Human or Agent investigation, reproduction, or interpretation remains an
-ordinary Execution with purpose `validate` or `investigate`. Review remains a
-separate reviewer Execution. Validation and review remain independent Gate
-inputs.
+Human or Agent investigation, reproduction, or interpretation remains ordinary
+WorkUnit work. Review remains a separate reviewer Execution. Validation and
+review remain independent Gate inputs.
 
 ## Migration
 

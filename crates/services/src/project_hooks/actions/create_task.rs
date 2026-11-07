@@ -1,14 +1,11 @@
 use crate::{
-    project_hooks::actions::{
-        task_type_to_string, ActionContext, ActionOutcome, HookActionHandler,
-    },
+    project_hooks::actions::{ActionContext, ActionOutcome, HookActionHandler},
     Result,
 };
 
 pub struct CreateTaskAction<'a> {
     pub title: &'a str,
     pub description: Option<&'a str>,
-    pub task_type: Option<api_types::TaskType>,
     pub priority: Option<i64>,
 }
 
@@ -24,7 +21,6 @@ impl HookActionHandler for CreateTaskAction<'_> {
                 Some(description_with_hook_context(context, self.description)),
                 None,
                 self.priority,
-                self.task_type.map(task_type_to_string),
                 None,
                 None,
             )

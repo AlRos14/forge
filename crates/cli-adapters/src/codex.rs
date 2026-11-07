@@ -25,7 +25,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CODEX_VERSION: &str = "0.147.0";
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const MODEL_DISCOVERY_TIMEOUT_SECONDS: u64 = 10;
 pub(crate) const CODEX_SYSTEM_ERROR_FALLBACK: &str = "codex thread entered systemError status";
@@ -50,6 +49,7 @@ struct CodexReasoningLevel {
     effort: String,
 }
 
+#[derive(Default)]
 struct CodexModelOptions {
     models: Vec<String>,
     reasoning_efforts: Vec<String>,
@@ -95,11 +95,7 @@ impl CodexAdapter {
 
     fn build_command(config: &CodexConfig) -> tokio::process::Command {
         let overrides = &config.command_overrides;
-        let builder = crate::command::CommandBuilder::new("npx")
-            .default_args(vec![
-                "-y".to_owned(),
-                format!("@openai/codex@{DEFAULT_CODEX_VERSION}"),
-            ])
+        let builder = crate::command::CommandBuilder::new("codex")
             .adapter_args(vec!["app-server".to_owned()])
             .overrides(overrides);
         let mut cmd = builder.build();
@@ -107,8 +103,6 @@ impl CodexAdapter {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("NPM_CONFIG_LOGLEVEL", "error")
-            .env("NODE_NO_WARNINGS", "1")
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "error");
         cmd
@@ -119,17 +113,9 @@ impl CodexAdapter {
         if bundled_only {
             adapter_args.push("--bundled".to_owned());
         }
-        let builder = crate::command::CommandBuilder::new("npx")
-            .default_args(vec![
-                "-y".to_owned(),
-                format!("@openai/codex@{DEFAULT_CODEX_VERSION}"),
-            ])
-            .adapter_args(adapter_args);
+        let builder = crate::command::CommandBuilder::new("codex").adapter_args(adapter_args);
         let mut command = builder.build();
-        command
-            .env("NPM_CONFIG_LOGLEVEL", "error")
-            .env("NODE_NO_WARNINGS", "1")
-            .env("NO_COLOR", "1");
+        command.env("NO_COLOR", "1");
         command
     }
 
@@ -405,7 +391,10 @@ impl HarnessAdapter for CodexAdapter {
         &self,
         _ctx: DiscoverContext,
     ) -> Result<DiscoveredOptions, ExecutorError> {
-        let discovered = discover_codex_model_options().await;
+        let (discovered, warning) = match discover_codex_model_options().await {
+            Ok(discovered) => (discovered, None),
+            Err(error) => (CodexModelOptions::default(), Some(error.to_string())),
+        };
         Ok(DiscoveredOptions {
             models: discovered.models,
             permission_policies: vec!["auto".into(), "supervised".into(), "plan".into()],
@@ -414,8 +403,8 @@ impl HarnessAdapter for CodexAdapter {
                 "approval_modes": ["never", "on-request", "on-failure", "unless-trusted"],
                 "reasoning_efforts": discovered.reasoning_efforts,
                 "model_reasoning_efforts": discovered.model_reasoning_efforts,
-                "codex_version": DEFAULT_CODEX_VERSION,
             }),
+            warning,
         })
     }
 
@@ -491,11 +480,14 @@ impl HarnessAdapter for CodexAdapter {
             return Err(registration_error);
         }
 
-        let writer = Arc::new(AsyncMutex::new(LogWriter::new(
-            &ctx.logs_path,
-            ctx.execution_id.clone(),
-            DEFAULT_MAX_OUTPUT_BYTES,
-        )));
+        let writer = Arc::new(AsyncMutex::new(
+            LogWriter::new(
+                &ctx.logs_path,
+                ctx.execution_id.clone(),
+                DEFAULT_MAX_OUTPUT_BYTES,
+            )
+            .with_runtime_secret_redactions(&ctx.agent_config),
+        ));
         {
             let mut w = writer.lock().await;
             if let Some(sender) = ctx.log_sender.clone() {
@@ -666,7 +658,7 @@ impl CodexAdapter {
             let _ = client.cancel_turn(thread_id.clone(), turn_id).await;
         }
 
-        let auto_commit = config.auto_commit.unwrap_or(true);
+        let auto_commit = config.auto_commit.unwrap_or(true) && ctx.role != "project_copilot";
         // Commit reminder: if completed but worktree is dirty, nudge Codex once
         if auto_commit
             && outcome == ExecutionOutcome::Completed
@@ -729,10 +721,15 @@ impl CodexAdapter {
         if !auto_commit {
             return Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,
-                after_sha: git::get_current_sha(Path::new(&ctx.worktree_path))
-                    .await
-                    .ok(),
+                after_sha: if ctx.role == "project_copilot" {
+                    None
+                } else {
+                    git::get_current_sha(Path::new(&ctx.worktree_path))
+                        .await
+                        .ok()
+                },
                 agent_session_id,
+                assistant_output: summary.clone(),
                 summary,
                 error: None,
                 usage: usage.map(|usage| usage_with_model(usage, &config)),
@@ -767,6 +764,7 @@ impl CodexAdapter {
             status: ExecutionOutcome::Completed,
             after_sha,
             agent_session_id,
+            assistant_output: summary.clone(),
             summary,
             error: None,
             usage: usage.map(|usage| usage_with_model(usage, &config)),
@@ -1021,72 +1019,31 @@ fn parse_codex_model_catalog(output: &[u8]) -> Option<CodexModelOptions> {
     })
 }
 
-fn default_codex_model_options() -> CodexModelOptions {
-    let entries = [
-        (
-            "gpt-5.6-sol",
-            &["low", "medium", "high", "xhigh", "max", "ultra"][..],
-        ),
-        (
-            "gpt-5.6-terra",
-            &["low", "medium", "high", "xhigh", "max", "ultra"][..],
-        ),
-        (
-            "gpt-5.6-luna",
-            &["low", "medium", "high", "xhigh", "max"][..],
-        ),
-        ("gpt-5.5", &["low", "medium", "high", "xhigh"][..]),
-        ("gpt-5.4", &["low", "medium", "high", "xhigh"][..]),
-        ("gpt-5.4-mini", &["low", "medium", "high", "xhigh"][..]),
-        (
-            "gpt-5.3-codex-spark",
-            &["low", "medium", "high", "xhigh"][..],
-        ),
-    ];
-    let mut models = Vec::new();
-    let mut reasoning_efforts = Vec::new();
-    let mut model_reasoning_efforts = BTreeMap::new();
-
-    for (model, efforts) in entries {
-        models.push(model.to_owned());
-        let efforts = efforts
-            .iter()
-            .map(|effort| (*effort).to_owned())
-            .collect::<Vec<_>>();
-        for effort in &efforts {
-            if !reasoning_efforts.contains(effort) {
-                reasoning_efforts.push(effort.clone());
-            }
-        }
-        model_reasoning_efforts.insert(model.to_owned(), efforts);
+async fn discover_codex_model_options() -> Result<CodexModelOptions, ExecutorError> {
+    if which::which("codex").is_err() {
+        return Err(ExecutorError::Unavailable(
+            "Codex CLI is not available on this daemon. Enter a model ID supported by the installed harness.".to_owned(),
+        ));
     }
 
-    CodexModelOptions {
-        models,
-        reasoning_efforts,
-        model_reasoning_efforts,
-    }
-}
+    for bundled_only in [false, true] {
+        let command = CodexAdapter::build_model_discovery_command(bundled_only);
 
-async fn discover_codex_model_options() -> CodexModelOptions {
-    if which::which("npx").is_ok() {
-        for bundled_only in [false, true] {
-            let command = CodexAdapter::build_model_discovery_command(bundled_only);
-
-            if let Some(output) = crate::command::output_with_timeout(
-                command,
-                Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECONDS),
-            )
-            .await
-                && output.status.success()
-                && let Some(discovered) = parse_codex_model_catalog(&output.stdout)
-            {
-                return discovered;
-            }
+        if let Some(output) = crate::command::output_with_timeout(
+            command,
+            Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECONDS),
+        )
+        .await
+            && output.status.success()
+            && let Some(discovered) = parse_codex_model_catalog(&output.stdout)
+        {
+            return Ok(discovered);
         }
     }
 
-    default_codex_model_options()
+    Err(ExecutorError::Unavailable(
+        "Codex could not load model options from its installed CLI. Enter a model ID supported by the harness.".to_owned(),
+    ))
 }
 
 #[cfg(test)]
@@ -1147,37 +1104,25 @@ mod tests {
         };
 
         let cmd = CodexAdapter::build_command(&config);
-        assert_eq!(cmd.as_std().get_program(), "npx");
+        assert_eq!(cmd.as_std().get_program(), "codex");
         let args: Vec<_> = cmd
             .as_std()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            args,
-            vec!["-y", "@openai/codex@0.147.0", "app-server", "--verbose"]
-        );
+        assert_eq!(args, vec!["app-server", "--verbose"]);
     }
 
     #[test]
-    fn model_discovery_uses_the_pinned_codex_harness() {
+    fn model_discovery_uses_the_installed_codex_harness() {
         let command = CodexAdapter::build_model_discovery_command(true);
-        assert_eq!(command.as_std().get_program(), "npx");
+        assert_eq!(command.as_std().get_program(), "codex");
         let args = command
             .as_std()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(
-            args,
-            vec![
-                "-y",
-                "@openai/codex@0.147.0",
-                "debug",
-                "models",
-                "--bundled"
-            ]
-        );
+        assert_eq!(args, vec!["debug", "models", "--bundled"]);
     }
 
     #[test]
@@ -1196,16 +1141,6 @@ mod tests {
             vec!["low", "ultra"]
         );
         assert_eq!(discovered.reasoning_efforts, vec!["low", "ultra", "max"]);
-    }
-
-    #[test]
-    fn default_codex_catalog_remains_available() {
-        let discovered = default_codex_model_options();
-        assert!(discovered.models.contains(&"gpt-5.6-sol".to_owned()));
-        assert_eq!(
-            discovered.model_reasoning_efforts["gpt-5.6-luna"],
-            vec!["low", "medium", "high", "xhigh", "max"]
-        );
     }
 
     #[test]
@@ -1368,6 +1303,7 @@ mod tests {
             task_id: "task-1".to_owned(),
             execution_id: "exec-1".to_owned(),
             role: "reviewer".to_owned(),
+            task_role_capabilities: vec![],
             worktree_path: "/tmp/forge-codex-worktree".to_owned(),
             description: "Review the changes".to_owned(),
             agent_config: json!({}),
@@ -1410,6 +1346,7 @@ mod tests {
             task_id: "conversation-1".to_owned(),
             execution_id: "message-1".to_owned(),
             role: "interactive".to_owned(),
+            task_role_capabilities: vec![],
             worktree_path: "/tmp/forge-codex-worktree".to_owned(),
             description: "Continue the conversation".to_owned(),
             agent_config: json!({}),
@@ -1462,6 +1399,7 @@ mod tests {
             task_id: "conversation-1".to_owned(),
             execution_id: "message-1".to_owned(),
             role: "interactive".to_owned(),
+            task_role_capabilities: vec![],
             worktree_path: "/tmp/forge-codex-worktree".to_owned(),
             description: "Continue the conversation".to_owned(),
             agent_config: json!({}),
@@ -1533,6 +1471,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
                 task_id: "task-1".to_owned(),
                 execution_id: "exec-1".to_owned(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 worktree_path: dir.path().display().to_string(),
                 description: "Do the task".to_owned(),
                 agent_config: json!({
@@ -1591,6 +1530,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
                 task_id: "task-1".to_owned(),
                 execution_id: "exec-1".to_owned(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 worktree_path: dir.path().display().to_string(),
                 description: "Plan the task".to_owned(),
                 agent_config: json!({

@@ -14,12 +14,12 @@ export function SettingsSection({
 }) {
   return (
     <section className="border-b py-6 last:border-b-0">
-      <div className="grid grid-cols-[220px_1fr] items-start gap-8">
+      <div className="grid min-w-0 grid-cols-1 items-start gap-4 xl:grid-cols-[220px_minmax(0,1fr)] xl:gap-6">
         <div>
           <h3
             className={cn(
               'text-[13px] font-semibold leading-snug',
-              danger ? 'text-red-300' : 'text-foreground',
+              danger ? 'text-destructive' : 'text-foreground',
             )}
           >
             {title}
@@ -28,7 +28,7 @@ export function SettingsSection({
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{description}</p>
           )}
         </div>
-        <div>{children}</div>
+        <div className="min-w-0">{children}</div>
       </div>
     </section>
   )

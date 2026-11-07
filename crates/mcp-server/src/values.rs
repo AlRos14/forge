@@ -133,7 +133,6 @@ pub(crate) fn execution_value(execution: Execution) -> Value {
             db::ActorRef::Agent(id) => json!({"kind": "agent", "id": id}),
         }),
         "role": execution.role.to_string(),
-        "purpose": execution.purpose.map(|purpose| purpose.to_string()),
         "status": execution.status.to_string(),
         "parent_execution_id": execution.parent_execution_id,
         "harness_session_id": execution.harness_session_id,

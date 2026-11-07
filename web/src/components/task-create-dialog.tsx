@@ -8,20 +8,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Select } from '@/components/ui/select'
 import { MarkdownEditor } from '@/components/ui/markdown-editor'
 import { toastApiError } from '@/lib/api-error'
-import type { Task, TaskType } from '@/types/generated'
-
-const taskTypes: { value: TaskType; label: string }[] = [
-  { value: 'implementation', label: 'Implementation' },
-  { value: 'planning', label: 'Planning' },
-  { value: 'discovery', label: 'Discovery' },
-  { value: 'review', label: 'Review' },
-  { value: 'validation', label: 'Validation' },
-]
+import { splitTaskContent } from '@/lib/task-content'
+import type { Task } from '@/types/generated'
 
 interface TaskCreateDialogProps {
   open: boolean
@@ -36,27 +27,22 @@ export function TaskCreateDialog({
   onOpenChange,
   onCreated,
 }: TaskCreateDialogProps) {
-  const [title, setTitle] = useState('')
-  const [description, setDescription] = useState('')
-  const [taskType, setTaskType] = useState<TaskType>('implementation')
+  const [content, setContent] = useState('')
   const createTask = useCreateTask(projectId)
 
   const reset = () => {
-    setTitle('')
-    setDescription('')
-    setTaskType('implementation')
+    setContent('')
   }
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    const trimmedTitle = title.trim()
-    if (!trimmedTitle) return
+    const taskContent = splitTaskContent(content)
+    if (!content.trim()) return
 
     createTask.mutate(
       {
-        title: trimmedTitle,
-        description: description.trim() || undefined,
-        task_type: taskType,
+        ...taskContent,
+        priority: 0,
       },
       {
         onError: (error) => toastApiError(error, 'Task creation failed'),
@@ -77,36 +63,19 @@ export function TaskCreateDialog({
             <DialogTitle>Create Task</DialogTitle>
           </DialogHeader>
           <div className="space-y-2">
-            <Label htmlFor="task-title">Title</Label>
-            <Input
-              required
-              autoFocus
-              id="task-title"
-              placeholder="What needs to be done?"
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-            />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="task-type">Type</Label>
-            <Select
-              id="task-type"
-              value={taskType}
-              options={taskTypes.map((type) => ({ value: type.value, label: type.label }))}
-              onChange={(v) => setTaskType(v as TaskType)}
-            />
-          </div>
-          <div className="space-y-2">
-            <Label>
-              Description{' '}
-              <span className="text-xs font-normal text-muted-foreground">(optional)</span>
-            </Label>
+            <Label>Task</Label>
             <MarkdownEditor
-              placeholder="Add more details... (markdown supported)"
-              minHeight="96px"
-              value={description}
-              onChange={setDescription}
+              ariaLabel="Task"
+              autoFocus
+              placeholder={'Describe the task… Add a first-level heading like “# Plan FirePOS” if you want to set its title.'}
+              minHeight="240px"
+              value={content}
+              onChange={setContent}
             />
+            <p className="text-xs text-muted-foreground">
+              A first-level “# heading” becomes the title. Without one, the first line becomes the
+              title. The remaining text is saved as the Markdown description.
+            </p>
           </div>
           <DialogFooter>
             <Button
@@ -117,7 +86,7 @@ export function TaskCreateDialog({
             >
               Cancel
             </Button>
-            <Button disabled={createTask.isPending || !title.trim()} type="submit">
+            <Button disabled={createTask.isPending || !content.trim()} type="submit">
               {createTask.isPending ? 'Creating...' : 'Create Task'}
             </Button>
           </DialogFooter>

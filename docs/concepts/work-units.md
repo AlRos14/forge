@@ -1,7 +1,9 @@
 # WorkUnits
 
 A WorkUnit is a concrete, executable scope inside a Task. It is not a plan,
-requirements language, or second cognitive authority.
+requirements language, or second cognitive authority. Its `role` names the
+TaskRole used for eligibility; formal review behavior comes from that role's
+`formal_review` capability, never the string itself.
 
 ~~~text
 WorkUnit
@@ -12,6 +14,7 @@ WorkUnit
   scope
   role
   assigned_actor?
+  execution_instructions?
   status
   dependencies
   requires_integration
@@ -26,6 +29,9 @@ WorkUnit remains independently durable.
 
 Actor provenance records a typed `ActorRef` and must resolve to an existing
 Human or Agent. WorkUnit and Artifact provenance must belong to the same Task.
+Optional `execution_instructions` are the exact harness instructions used
+instead of the generic Task/WorkUnit prompt when the dispatcher admits an
+Agent Execution. They are prepared scope, not a second Task or Execution form.
 External provenance remains an opaque reference. Old V091 Actor references
 that cannot be resolved unambiguously remain readable as `legacy_actor` and
 cannot be written by new requests.
@@ -89,7 +95,9 @@ edges, cross-Task edges, and indirect cycles are rejected. For a WorkUnit with
 `requires_integration`, completion alone does not satisfy a dependency: an
 explicit successful integration of its exact Execution result is required.
 For a non-repository WorkUnit, completion satisfies the dependency. Readiness
-is computed by the core; PR6 owns acting on ready WorkUnits.
+is computed by the core. The TaskDispatcher acts on ready WorkUnits only while
+the Task dispatch intent is `running`; pause prevents new admissions and
+provider starts.
 
 For repository WorkUnits, declare dependencies before preparing the WorkUnit
 Workspace. Once that Workspace exists, its base commit is pinned, so dependency
@@ -102,8 +110,13 @@ untracked non-repository attempt.
 
 An Execution may target a WorkUnit and records the exact WorkUnit ID and
 admitted version. A WorkUnit can have retries or historical attempts, but
-every attempt is a separate Execution with immutable Actor, Role, Purpose,
-WorkUnit, Workspace, and session references.
+every attempt is a separate Execution with immutable Actor, Role, WorkUnit,
+Workspace, and session references.
+
+An open WorkUnit with a completed Execution result is `awaiting_acceptance`.
+The dispatcher does not create another automatic attempt while that result is
+pending. Acceptance and repository integration remain explicit facts; a
+completed Execution alone does not complete the WorkUnit.
 
 The Execution admission transaction also records that an Agent provider Start
 is pending. The existing dispatcher may retry only until it atomically records
@@ -120,6 +133,72 @@ conditional on the absence of the provider-attempt receipt, so a concurrent
 Start attempt keeps its existing uncertain or accepted recovery behavior.
 Explicit Task cancellation still cancels pending work locally and cleans up
 Running Executions even if recovery had already transitioned the Task lifecycle.
+
+## Launch, pause, and cancellation
+
+Task launch is a durable dispatch intent under TaskLifecycle authority. The
+Human requests a Task launch with expected Task and TaskLifecycle versions and
+an idempotency key; the response distinguishes intent admission, admitted
+Executions, and accepted provider starts. Pause prevents new admissions and
+provider starts but does not claim to stop work already started. Resume
+re-dispatch currently ready WorkUnits; cancellation records the request and
+observes exact Execution outcomes separately.
+
+The dispatcher resolves readiness from current records, admits only exact
+assigned Agent WorkUnits, and respects Agent capacity and the bounded per-Task
+concurrency ceiling. The current ceiling is four concurrent Executions per
+Task, enforced inside Execution admission as well as by the dispatcher tick. A
+Human-assigned WorkUnit remains pending human work and creates no fake
+Execution. A missing or paused Agent leaves an explicit blocker; the dispatcher
+never selects another account or Actor. Pause is rechecked at both automatic
+admission and Provider Start claim, so a successful pause response prevents
+later automatic starts.
+
+## Result subjects and rework
+
+An initial reviewer WorkUnit is prepared with `review_subject` naming the exact
+same-Task WorkUnit it will review. The target may still be unassigned or running.
+Preparation versions do not identify its result: Forge freezes the admitted
+result version and attempt when the target produces its accepted delivery.
+Allocation and instruction edits before dispatch must not strand the review on
+an earlier preparation version. Until a concrete result is available, the
+review is waiting; absence of a frozen result is never permission to run.
+
+An assigned Human submits a report through the reviewer WorkUnit's
+`review-report` operation. Forge creates the provenance attempt internally,
+stores the report, and completes the review WorkUnit. Retries reuse the exact
+attempt/report, including recovery after a report was persisted before WorkUnit
+completion. The Human does not select an Execution or a HarnessSession.
+
+A review WorkUnit may record `work_unit_review_subject`: the exact reviewed
+WorkUnit version, result Execution, commit, Workspace, and snapshot digest. A
+correction WorkUnit may record `work_unit_result_requirement`: the exact source
+result it consumes. These are minimal relations, not a workflow DSL.
+
+For multiple deliverables, prepare one package WorkUnit that consumes the exact
+source Artifacts and records an immutable manifest for its package result. A
+formal review then names that package WorkUnit as its one exact subject. The
+manifest records each source Artifact ID and digest, the producing Execution,
+and the delivery Artifact. The PO delivery WorkUnit follows the review line and
+cannot run until the latest package result has a favorable report.
+
+Requesting changes and a new review is one idempotent operation. It requires a
+ReviewReport whose exact subject names the reviewed WorkUnit and version; a
+generic Task report cannot be applied to another delivery. The operation
+validates the report and subject, creates a correction and a new reviewer
+WorkUnit, records the correction result subject, and consumes one bounded
+rework round atomically. The current budget is eight correction rounds per
+Task. Replaying the same key consumes no additional round.
+
+A repository correction Workspace is prepared from the reviewed result commit,
+not from the Task integration branch, so it can correct a result that has not
+been integrated. The new reviewer WorkUnit waits for the exact completed
+correction result through the result subject relation; it does not require the
+correction to be integrated first. The independent reviewer cannot be the
+Actor assigned to or contributing to the reviewed result, including the new
+correction Actor, and the check is repeated on later allocation. Exhaustion or
+an unavailable independent reviewer leaves an explicit human decision instead
+of an automatic approval.
 
 ## Isolation
 

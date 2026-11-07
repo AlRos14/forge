@@ -26,7 +26,7 @@ export function getAgentUsage(identityId: string): Promise<AgentUsage> {
   return apiFetch<AgentUsage>(`/agents/${identityId}/usage`)
 }
 
-export function registerHarnessAgent(input: {
+export type RegisterHarnessAgentInput = {
   name: string
   description?: string | null
   executor_type: string
@@ -34,7 +34,10 @@ export function registerHarnessAgent(input: {
   reasoning_effort?: string | null
   permission_policy?: string | null
   credential_id?: string | null
-}): Promise<FederatedAgent> {
+  daemon_id?: string | null
+}
+
+export function registerHarnessAgent(input: RegisterHarnessAgentInput): Promise<FederatedAgent> {
   return apiFetch<FederatedAgent>('/agents', {
     method: 'POST',
     body: JSON.stringify(input),

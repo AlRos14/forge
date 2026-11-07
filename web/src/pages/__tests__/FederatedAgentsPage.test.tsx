@@ -2,17 +2,23 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { FederatedAgentsPage } from '@/pages/FederatedAgentsPage'
-import type { FederatedAgent } from '@/features/federation/types'
+import type { AgentProfile, FederatedAgent } from '@/features/federation/types'
 import type {
   ProviderAuthorizationOperationResponse,
   ProviderEntryResponse,
 } from '@/types/generated'
+
+const mockAuth = vi.hoisted(() => ({
+  user: null as { id: string; is_admin: boolean } | null,
+  versionConflict: false as boolean,
+}))
 
 const registerHarnessAgent = vi.fn().mockResolvedValue({})
 const createProviderEntry = vi.fn()
 const removeProviderEntry = vi.fn().mockResolvedValue({ provider_revocation: 'succeeded' })
 const cancelAuthorization = vi.fn().mockResolvedValue({})
 const updateAgent = vi.fn().mockResolvedValue({})
+const selectProfile = vi.fn().mockResolvedValue({})
 const testProviderEntry = vi.fn().mockResolvedValue({
   status: 'ok',
   latency_ms: 123,
@@ -51,7 +57,8 @@ vi.mock('@tanstack/react-router', () => ({
   useSearch: () => ({}),
 }))
 vi.mock('@/stores/auth', () => ({
-  useAuthStore: (selector: (state: { user: null }) => unknown) => selector({ user: null }),
+  useAuthStore: (selector: (state: { user: typeof mockAuth.user }) => unknown) =>
+    selector({ user: mockAuth.user }),
 }))
 vi.mock('@/api/hooks', () => ({
   useUpdateAgent: () => ({ mutateAsync: updateAgent, isPending: false }),
@@ -82,6 +89,7 @@ vi.mock('@/hooks/useDiscoveredOptions', async (importOriginal) => ({
               { id: 'high', label: 'High' },
             ],
             permissionPolicies: ['auto', 'supervised', 'plan'],
+            availableDaemons: [{ id: 'daemon-1', name: 'forge-host', status: 'online' }],
           }
         : undefined,
     isLoading: false,
@@ -90,16 +98,16 @@ vi.mock('@/hooks/useDiscoveredOptions', async (importOriginal) => ({
 }))
 vi.mock('@/features/federation/hooks', () => ({
   federationQueryKeys: { agents: ['agents'] },
-  isVersionConflict: () => false,
+  isVersionConflict: () => mockAuth.versionConflict,
   useFederatedAgentsQuery: () => ({
-    data: { items: [cliAgent], has_more: false },
+    data: { items: [agentFixture], has_more: false },
     isLoading: false,
     isError: false,
     refetch: vi.fn(),
   }),
-  useAgentProfilesQuery: () => ({ data: [], isLoading: false, isError: false }),
+  useAgentProfilesQuery: () => ({ data: profilesFixture, isLoading: false, isError: false }),
   useAgentUsageQuery: () => ({ data: undefined, isLoading: false, isError: false }),
-  useSelectAgentProfileMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useSelectAgentProfileMutation: () => ({ mutateAsync: selectProfile, isPending: false }),
   useRegisterHarnessAgentMutation: () => ({
     mutateAsync: registerHarnessAgent,
     isPending: false,
@@ -270,6 +278,9 @@ const cliAgent: FederatedAgent = {
   updated_at: '2026-08-12T12:00:00Z',
 }
 
+let agentFixture = cliAgent
+let profilesFixture: AgentProfile[] = []
+
 function renderPage() {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -290,6 +301,10 @@ function openProvidersTab() {
 
 describe('FederatedAgentsPage', () => {
   beforeEach(() => {
+    mockAuth.user = { id: 'user-1', is_admin: false }
+    mockAuth.versionConflict = false
+    agentFixture = cliAgent
+    profilesFixture = []
     authorizationOperation = undefined
     registerHarnessAgent.mockClear()
     createProviderEntry.mockClear()
@@ -298,6 +313,7 @@ describe('FederatedAgentsPage', () => {
     startAuthorization.mockClear()
     cancelAuthorization.mockClear()
     updateAgent.mockClear()
+    selectProfile.mockClear()
   })
 
   it('offers only providers and external harness Agents', () => {
@@ -344,7 +360,6 @@ describe('FederatedAgentsPage', () => {
         agentId: 'agent-2',
         body: {
           name: 'Codex Reviewer',
-          description: 'A CLI-harness worker.',
           model: 'gpt-5.2-codex',
           reasoning_effort: 'high',
           permission_policy: 'supervised',
@@ -468,6 +483,7 @@ describe('FederatedAgentsPage', () => {
     const wizard = within(screen.getByRole('dialog'))
     fireEvent.click(wizard.getByRole('button', { name: /Openai · Work key/i }))
     fireEvent.click(wizard.getByRole('button', { name: /Codex CLI harness/i }))
+    expect(wizard.queryByLabelText('Execution host')).toBeNull()
     fireEvent.change(wizard.getByLabelText('Agent name'), { target: { value: 'Codex worker' } })
     fireEvent.click(wizard.getByLabelText('Model'))
     fireEvent.click(screen.getByRole('option', { name: /gpt-5.2-codex/i }))
@@ -488,5 +504,109 @@ describe('FederatedAgentsPage', () => {
         }),
       ),
     )
+    expect(registerHarnessAgent.mock.calls[0]?.[0]).not.toHaveProperty('daemon_id')
+  })
+
+  it('creates an administrator Agent with automatic host resolution', async () => {
+    mockAuth.user = { id: 'user-1', is_admin: true }
+    renderPage()
+    fireEvent.click(screen.getAllByRole('button', { name: /new agent/i })[0])
+    const wizard = within(screen.getByRole('dialog'))
+    fireEvent.click(wizard.getByRole('button', { name: /Openai · Work key/i }))
+    fireEvent.click(wizard.getByRole('button', { name: /Codex CLI harness/i }))
+    expect(wizard.queryByLabelText('Execution host')).toBeNull()
+    fireEvent.change(wizard.getByLabelText('Agent name'), { target: { value: 'Automatic worker' } })
+    fireEvent.click(wizard.getByRole('button', { name: /create agent/i }))
+
+    await vi.waitFor(() =>
+      expect(registerHarnessAgent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'Automatic worker',
+          executor_type: 'codex',
+        }),
+      ),
+    )
+    expect(registerHarnessAgent.mock.calls[0]?.[0]).not.toHaveProperty('daemon_id')
+  })
+
+  it('changes only the host for an Agent without a model', async () => {
+    mockAuth.user = { id: 'user-1', is_admin: true }
+    agentFixture = { ...cliAgent, model: null, reasoning_effort: null, permission_policy: null }
+    renderPage()
+    fireEvent.click(screen.getByText('Codex Runner'))
+    fireEvent.click(screen.getByRole('button', { name: /edit agent…/i }))
+    const dialog = within(screen.getByRole('dialog'))
+    fireEvent.click(dialog.getByLabelText('Execution host'))
+    fireEvent.click(screen.getByRole('option', { name: /forge-host · online/i }))
+    fireEvent.click(dialog.getByRole('button', { name: /save changes/i }))
+
+    await vi.waitFor(() =>
+      expect(updateAgent).toHaveBeenCalledWith({
+        agentId: 'agent-2',
+        body: { daemon_id: 'daemon-1', version: 3 },
+      }),
+    )
+  })
+
+  it('keeps version-conflict feedback when a host update races another edit', async () => {
+    mockAuth.user = { id: 'user-1', is_admin: true }
+    mockAuth.versionConflict = true
+    updateAgent.mockRejectedValueOnce(new Error('stale version'))
+    renderPage()
+    fireEvent.click(screen.getByText('Codex Runner'))
+    fireEvent.click(screen.getByRole('button', { name: /edit agent…/i }))
+    const dialog = within(screen.getByRole('dialog'))
+    fireEvent.click(dialog.getByLabelText('Execution host'))
+    fireEvent.click(screen.getByRole('option', { name: /forge-host · online/i }))
+    fireEvent.click(dialog.getByRole('button', { name: /save changes/i }))
+
+    expect((await screen.findByRole('alert')).textContent).toContain(
+      'This Agent changed in another session. Refresh and try again.',
+    )
+    expect(updateAgent).toHaveBeenCalledWith({
+      agentId: 'agent-2',
+      body: { daemon_id: 'daemon-1', version: 3 },
+    })
+  })
+
+  it('applies a host change before selecting an existing profile with the returned version', async () => {
+    mockAuth.user = { id: 'user-1', is_admin: true }
+    profilesFixture = [
+      {
+        id: 'profile-3',
+        identity_id: 'agent-2',
+        executor_type: 'codex',
+        provider: 'openai',
+        model: 'gpt-4.1',
+        reasoning_effort: null,
+        permission_policy: null,
+        system_prompt: null,
+        capabilities: {},
+        tool_policy: {},
+        config: {},
+        credential_handle_id: 'credential-2',
+        version: 4,
+        created_at: '2026-08-13T12:00:00Z',
+      },
+    ]
+    updateAgent.mockResolvedValueOnce({ version: 4 })
+    renderPage()
+    fireEvent.click(screen.getByText('Codex Runner'))
+    fireEvent.click(screen.getByRole('button', { name: /edit agent…/i }))
+    const dialog = within(screen.getByRole('dialog'))
+    fireEvent.click(dialog.getByRole('tab', { name: /select existing profile/i }))
+    fireEvent.click(dialog.getByLabelText('Execution host'))
+    fireEvent.click(screen.getByRole('option', { name: /forge-host · online/i }))
+    fireEvent.click(dialog.getByLabelText('Profile'))
+    fireEvent.click(screen.getByRole('option', { name: /openai · gpt-4.1 · v4/i }))
+    fireEvent.click(dialog.getByRole('button', { name: /select profile/i }))
+
+    await vi.waitFor(() =>
+      expect(updateAgent).toHaveBeenCalledWith({
+        agentId: 'agent-2',
+        body: { daemon_id: 'daemon-1', version: 3 },
+      }),
+    )
+    expect(selectProfile).toHaveBeenCalledWith({ profileId: 'profile-3', version: 4 })
   })
 })

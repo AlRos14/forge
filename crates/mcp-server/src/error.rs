@@ -259,11 +259,27 @@ impl From<ServiceError> for McpToolError {
 impl From<DbError> for McpToolError {
     fn from(error: DbError) -> Self {
         match error {
+            DbError::Sqlx(error)
+                if error.as_database_error().is_some_and(|error| {
+                    error.message() == "project copilot run authority is stale"
+                }) =>
+            {
+                Self::new(-32003, "Project Copilot delegation is no longer valid")
+            }
             DbError::NotFound => Self::new(-32004, "not found"),
             DbError::VersionConflict => Self::new(-32009, "version conflict"),
+            DbError::ProjectCopilotRunAuthority => {
+                Self::new(-32003, "Project Copilot delegation is no longer valid")
+            }
+            DbError::IdempotencyConflict => {
+                Self::new(-32009, "idempotency key conflicts with another request")
+            }
             DbError::InvalidTransition => Self::new(-32010, "invalid transition"),
             DbError::InvalidSoftDelete => Self::new(-32010, "invalid soft delete"),
             DbError::AgentAtCapacity => Self::new(-32029, "agent at capacity"),
+            DbError::TaskAtCapacity => Self::new(-32030, "task at automatic capacity"),
+            DbError::TaskDispatchPaused => Self::new(-32031, "task dispatch is paused"),
+            DbError::TaskDispatchCancelled => Self::new(-32031, "task dispatch is cancelled"),
             DbError::InvalidCursor => Self::new(-32602, "invalid cursor"),
             error => Self::new(-32603, "internal error").with_data(json!({
                 "details": error.to_string()

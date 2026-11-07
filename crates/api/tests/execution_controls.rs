@@ -31,7 +31,6 @@ async fn task_response_exposes_execution_aggregates_without_latest_identity() {
             task_id: task.id.clone(),
             agent_id: None,
             actor_ref: Some(db::ActorRef::Human("test-user-id".to_owned())),
-            purpose: Some(db::ExecutionPurpose::General),
             harness_session_id: None,
             role: "interactive".to_owned(),
             status: ExecutionStatus::Completed,

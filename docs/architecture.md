@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the implementation after PR13. The ordered migration contract and invariants are in [Architecture V2](migration/architecture-v2.md); domain details are in [concepts](concepts/).
+This document describes the current implementation after PR15. The ordered migration contract and invariants are in [Architecture V2](migration/architecture-v2.md); domain details are in [concepts](concepts/).
 
 > The Orchestrator owns work boundaries. The harness owns cognition.
 
@@ -18,7 +18,8 @@ Project
     ├── WorkUnit*
     ├── Execution*
     │   ├── Actor
-    │   ├── Role and Purpose
+    │   ├── Role
+    │   ├── WorkUnit?
     │   ├── HarnessSession?
     │   └── Workspace?
     ├── ReviewReport / Artifact*
@@ -27,9 +28,21 @@ Project
     └── Message* / Handoff* / Proposal* / Decision*
 ~~~
 
-An Actor is a Human or Agent. An Agent has a harness identity and selectable profile. A TaskRole defines responsibility for one Task; RoleMembership records which Actors may participate. Neither membership nor a legacy Task field assigns executable scope. A WorkUnit names the Role and, when allocated, the Actor for that scope.
+An Actor is a Human or Agent. An Agent has a harness identity and selectable profile. A TaskRole defines responsibility for one Task; its versioned configuration can grant the closed capabilities `formal_review`, `orchestration`, and `request_rework`. RoleMembership records which Actors may participate. Neither membership, role name, nor a legacy Task field assigns executable scope. A WorkUnit names the Role and, when allocated, the Actor for that scope.
 
-An Execution records one Actor, Role, Purpose, and Task, with an explicit WorkUnit, Workspace, and HarnessSession when applicable. Parent Execution records lineage; it does not grant authority or imply session reuse. Execution identity and configuration snapshots are historical.
+Projects can store default TaskRoles, coordination modes, and workers as a
+template. Ordinary Tasks and subtasks copy the template atomically into their
+own TaskRole and RoleMembership records. Existing Tasks remain independent when
+the Project template changes. Human defaults require current Project
+membership; Agent defaults require ownership by the canonical Project owner,
+so global discovery does not create cross-account execution authority.
+
+An Execution records one Actor, Role, and Task, with an explicit WorkUnit, Workspace, and HarnessSession when applicable. Execution purpose is retired; historical purpose values remain migration evidence only. Parent Execution records lineage; it does not grant authority or imply session reuse. Execution identity and configuration snapshots are historical.
+
+Tasks have no classification or Task-level repository access mode. An Agent
+that passes the current TaskRole, ownership, and WorkspaceLease checks receives
+the `repository_write` capability for its repository WorkUnit. Task instructions
+describe the intended outcome; they do not select repository capability.
 
 ## Authority and lifecycle
 
@@ -43,6 +56,14 @@ Automatic Orchestrator execution requires the Agent owner and Task Project owner
 
 ## Harnesses and Executions
 
+The [Project Copilot](concepts/project-copilot.md) is an explicitly configured
+harness-bound Agent helping Humans organize a Project. Its persistent
+conversation and Project management runs are separate from Task Executions;
+they create no synthetic Task, TaskRole, WorkUnit or WorkspaceLease. A live,
+Project-scoped MCP delegation permits bounded WorkUnit management with exact
+Agent attribution and current ownership checks. Task execution and lifecycle
+authority continue to use the contracts below.
+
 `HarnessAdapter` is the boundary for supported harness detection, profile/configuration translation, capability evidence, Start/Resume, cancellation, normalized results, and usage observations. Forge fails closed when a required capability is unknown or unsupported. It does not read a harness's private credential store.
 
 A Human Execution has no HarnessSession. An Agent Execution references a HarnessSession explicitly when continuity is used. Resume never selects a session by Task, Role, Agent model label, or latest Execution.
@@ -55,19 +76,21 @@ A repository WorkUnit that requires integration receives its exact isolated Work
 
 A non-repository WorkUnit may have no Workspace and no WorkspaceLease. The current Agent path requires an online embedded host and a supported local CLI adapter. Unsupported remote daemon/provider combinations are rejected before the Execution enters `running`. This path is not a general remote no-Workspace execution feature.
 
-Dependencies form a same-Task directed acyclic graph. Readiness is derived from WorkUnit state, dependencies, Execution results, workspace state, and integration outcomes. A Task transition or completed Execution does not silently complete or integrate a WorkUnit.
+Dependencies form a same-Task directed acyclic graph. Readiness is derived from WorkUnit state, dependencies, Execution results, workspace state, and integration outcomes. A Task transition or completed Execution does not silently complete or integrate a WorkUnit. An open WorkUnit with a completed result is `awaiting_acceptance` and receives no automatic retry until that result is accepted or the unit is cancelled.
+
+Task dispatch is a durable intent owned by TaskLifecycle authority. An authenticated launch binds the exact Task and TaskLifecycle versions and an idempotency key. The TaskDispatcher admits exact assigned Agent WorkUnits while the intent is `running`; pause blocks new admissions and provider starts, and resume dispatches currently ready units. A Human-assigned WorkUnit is pending human work with no synthetic Execution. A bounded rework operation over an exact request-changes ReviewReport creates correction plus new review units and consumes one per-Task round atomically. Automatic routes are explicit, durable, replay-safe, and revalidated after pause or configuration changes.
 
 ## Review, validation, and Gates
 
-Formal review is an Execution under Role `reviewer` and Purpose `review`. Its ReviewReport is an Artifact with exact Execution provenance. Review judgment remains distinct from deterministic checks.
+Formal review is an Execution admitted under a TaskRole snapshot with `formal_review`. Its ReviewReport is an Artifact with exact Execution provenance. Review judgment remains distinct from deterministic checks. A durable review line follows the source result and each correction; a typed approval requirement is satisfied only by a favorable report for the line's latest result.
 
-A ValidationRun represents a deterministic command or check and its exact workspace, commit, status, output, and Evidence. In this implementation snapshot the public REST, MCP, CLI, and web surfaces expose ValidationRuns for reading; they do not expose a command to start one. An Agent Execution with Purpose `validate` is cognitive investigation, not deterministic validation evidence.
+A ValidationRun represents a deterministic command or check and its exact workspace, commit, status, output, and Evidence. In this implementation snapshot the public REST, MCP, CLI, and web surfaces expose ValidationRuns for reading; they do not expose a command to start one. Agent validation-related cognition is ordinary WorkUnit work, not deterministic validation evidence.
 
 A Gate is a deterministic policy over exact durable records. Its immutable GateEvaluation records the exact policy revision, inputs, and outcome. A Gate does not run a test, perform a review, integrate a WorkUnit, or merge a Repo. Lifecycle transitions and merge admission use the exact current evaluation where required.
 
 ## Persistence and history
 
-SQLite is the current persistence layer. Numbered migrations V001–V135 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects.
+SQLite is the current persistence layer. Numbered migrations V001–V156 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt.
 
 Historical `agent_session_history`, immutable Execution records, ProjectRelease snapshots, Artifact and Evidence references, HarnessSession identities, cross-record IDs, migration decisions, ADRs, and upstream license attribution remain readable history. History does not regain runtime authority. ProjectRelease is a read-only historical snapshot and does not create a current Charter, milestone, readiness workflow, or release operation.
 

@@ -11,10 +11,10 @@ use api_types::Actor;
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentRepo, CommentAuthorType, CreateDomainEvent,
     CreateExecution, CreateTask, CreateTaskComment, CreateWorkspace, CreateWorkspaceLease,
-    Execution, ExecutionPurpose, ExecutionRepo, ExecutionStatus, ExecutionUsageRepo,
-    HarnessSession, HarnessSessionRepo, HarnessSessionStatus, PageRequest, ProjectRepo, RepoRepo,
-    SoftDeleteTask, SortBy, SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo, TaskMetadata,
-    TaskRepo, UpsertExecutionUsage, WorkUnitRepo, WorkUnitWorkspaceRepo, Workspace,
+    Execution, ExecutionRepo, ExecutionStatus, ExecutionUsageRepo, HarnessSession,
+    HarnessSessionRepo, HarnessSessionStatus, PageRequest, ProjectRepo, RepoRepo, SoftDeleteTask,
+    SortBy, SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo, TaskMetadata, TaskRepo,
+    TaskRoleRepo, UpsertExecutionUsage, WorkUnitRepo, WorkUnitWorkspaceRepo, Workspace,
     WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
@@ -48,7 +48,7 @@ pub(crate) mod workspace;
 pub use actions::TaskActionResult;
 pub use create_subtasks::NewSubtaskInput;
 pub(crate) use memberships::{
-    current_role_memberships_authoritative, human_is_active_role_member_authoritative,
+    current_role_memberships_authoritative, human_is_active_task_role_member_authoritative,
     is_usable_active_agent, is_usable_repository_agent, repository_worker_identity_is_eligible,
     select_usable_agent_id, select_usable_repository_agent_id,
 };
@@ -145,7 +145,6 @@ pub(crate) fn execution_domain_event(
             "execution_id": input.id,
             "task_id": input.task_id,
             "role": input.role,
-            "purpose": input.purpose.as_ref().map(ToString::to_string),
             "actor_kind": actor.as_ref().map(|actor| actor.kind().to_string()),
             "actor_id": actor.map(|actor| actor.id()),
             "work_unit_id": null,
@@ -267,7 +266,6 @@ pub(crate) fn execution_status_domain_event(
             "execution_id": execution.id,
             "task_id": execution.task_id,
             "role": execution.role,
-            "purpose": execution.purpose.as_ref().map(ToString::to_string),
             "actor_kind": actor.as_ref().map(|actor| actor.kind().to_string()),
             "actor_id": execution.actor_id,
             "work_unit_id": execution.work_unit_id,
@@ -389,8 +387,12 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        if execution.role == "orchestrator"
-            && execution.purpose == Some(ExecutionPurpose::Orchestrate)
+        if crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::Orchestration,
+        )
+        .await?
         {
             self.validate_orchestrator_execution(execution).await?;
             return Ok(ExecutionWorkingContext {
@@ -633,7 +635,6 @@ impl TaskService {
             || work_unit.status != db::WorkUnitStatus::Open
             || work_unit.role != input.role
             || input.status != ExecutionStatus::Running
-            || input.purpose.is_none()
         {
             return Err(ServiceError::Db(db::DbError::VersionConflict));
         }
@@ -900,7 +901,6 @@ impl TaskService {
             || input.task_id != task.id
             || input.parent_execution_id.as_deref() != Some(blocked_execution_id)
             || input.status != ExecutionStatus::Running
-            || input.purpose.is_none()
         {
             return Err(ServiceError::invalid_operation(
                 "recovery admission requires the exact blocked Task, parent Execution, and WorkUnit target",
@@ -1306,10 +1306,13 @@ impl TaskService {
                 "remote terminal report refers to an Execution whose provider Start was never attempted",
             ));
         }
-        if current_execution.status == ExecutionStatus::Running
-            && current_execution.role == "reviewer"
-            && current_execution.purpose == Some(ExecutionPurpose::Review)
-        {
+        let is_formal_review = crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &current_execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?;
+        if current_execution.status == ExecutionStatus::Running && is_formal_review {
             let expected_output = notification
                 .assistant_output
                 .as_deref()
@@ -1321,21 +1324,19 @@ impl TaskService {
                 return Ok(completed);
             }
         }
-        let _workspace_review_guard = if current_execution.status == ExecutionStatus::Running
-            && current_execution.role == "reviewer"
-            && current_execution.purpose == Some(ExecutionPurpose::Review)
-        {
-            if let (Some(workspace_id), Some(locks)) = (
-                current_execution.workspace_id.as_deref(),
-                self.workspace_exec_locks.as_ref(),
-            ) {
-                Some(locks.acquire(workspace_id).await)
+        let _workspace_review_guard =
+            if current_execution.status == ExecutionStatus::Running && is_formal_review {
+                if let (Some(workspace_id), Some(locks)) = (
+                    current_execution.workspace_id.as_deref(),
+                    self.workspace_exec_locks.as_ref(),
+                ) {
+                    Some(locks.acquire(workspace_id).await)
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
         if _workspace_review_guard.is_some() {
             current_execution = ExecutionRepo::get_by_id(&*self.db, &notification.execution_id)
                 .await?
@@ -1367,7 +1368,7 @@ impl TaskService {
             .unwrap_or(if succeeded { "completed" } else { "failed" })
             .to_owned();
         let mut review_result_error = None;
-        if current_execution.purpose == Some(ExecutionPurpose::Plan) && outcome == "completed" {
+        if current_execution.role == "planner" && outcome == "completed" {
             let assistant_output = notification
                 .assistant_output
                 .as_deref()
@@ -1381,10 +1382,7 @@ impl TaskService {
                 .create_plan_artifact_from_execution(&current_execution.id, assistant_output)
                 .await?;
         }
-        if current_execution.role == "reviewer"
-            && current_execution.purpose == Some(ExecutionPurpose::Review)
-            && outcome == "completed"
-        {
+        if is_formal_review && outcome == "completed" {
             let assistant_output = notification
                 .assistant_output
                 .as_deref()

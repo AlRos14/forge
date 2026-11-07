@@ -7,6 +7,8 @@ import type { ReasoningOption } from '@/hooks/useDiscoveredOptions'
 
 export function ReasoningSelector({
   id,
+  label = 'Reasoning',
+  placeholder = 'Default (agent setting)',
   options,
   value,
   disabled,
@@ -16,6 +18,8 @@ export function ReasoningSelector({
   onChange,
 }: {
   id: string
+  label?: string
+  placeholder?: string
   options: ReasoningOption[]
   value: string | null
   disabled?: boolean
@@ -28,7 +32,7 @@ export function ReasoningSelector({
     <div className={cn('min-w-0 space-y-1', className)}>
       <Label htmlFor={id} className="flex items-center gap-1.5">
         <Brain size={12} />
-        Reasoning
+        {label}
       </Label>
       {isLoading ? (
         <Skeleton className="h-9 w-full" />
@@ -36,7 +40,7 @@ export function ReasoningSelector({
         <Select
           id={id}
           value={value ?? ''}
-          placeholder={hasError ? 'Could not load options' : 'Default (agent setting)'}
+          placeholder={hasError ? 'Could not load options' : placeholder}
           disabled={disabled}
           options={options.map((o) => ({ value: o.id, label: o.label }))}
           onChange={(v) => onChange(v || null)}

@@ -17,7 +17,8 @@ use crate::{
     NotificationRepo, Page, PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig,
     PrProviderConfigRepo, Project, ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus,
     ProjectIntegration, ProjectMediaTombstone, ProjectReleaseMediaPin, ProjectRepo,
-    ProviderStartClaim, RecordRemotePrOutcome, RecordWorkUnitIntegration, RecoverWorkUnitExecution,
+    ProjectTaskRoleDefaults, ProjectTaskRoleDefaultsRepo, ProviderStartClaim,
+    RecordRemotePrOutcome, RecordWorkUnitIntegration, RecoverWorkUnitExecution,
     RecoveryWorkUnitExecutionWrite, RemotePrAdmission, RemoveWorkUnitDependency, Repo, RepoRepo,
     Result, ReviewExecutionSubject, ReviewExecutionSubjectWrite, Runtime, RuntimeListQuery,
     RuntimeRepo, SelectAgentProfile, SharedMediaRepo, Skill, SkillRepo, SortBy, SortOrder, Task,
@@ -67,8 +68,10 @@ mod personal_access_token;
 mod pr_metadata;
 mod pr_provider_config;
 mod project;
+mod project_copilot;
 mod project_hook_run;
 mod project_member;
+mod project_task_role_defaults;
 mod provider_authorization;
 mod repo;
 mod role;
@@ -167,14 +170,12 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
         (SortBy::Agent, SortOrder::Desc) => {
             "(SELECT MIN(rm.actor_id) FROM task_role tr JOIN role_membership rm ON rm.task_role_id = tr.id WHERE tr.task_id = task.id AND tr.role = 'implementer' AND rm.actor_kind = 'agent' AND rm.status = 'active') DESC, id DESC"
         }
-        (SortBy::TaskType, SortOrder::Asc) => "task_type ASC, id ASC",
-        (SortBy::TaskType, SortOrder::Desc) => "task_type DESC, id DESC",
         (SortBy::Id, SortOrder::Asc) => "id ASC",
         (SortBy::Id, SortOrder::Desc) => "id DESC",
     }
 }
 
-const TASK_COLUMNS: &str = "task.id, task.project_id, task.repo_id, task.parent_task_id, task.title, task.description, task.task_type, (SELECT state FROM task_lifecycle WHERE task_id = task.id) AS lifecycle_state, task.is_automation, task.priority, task.board_position, task.subtask_order, task.merge_config, task.metadata_json, task.error_annotation, task.blocked_json, task.failed_json, task.deleted_at, task.version, task.created_at, task.updated_at";
+const TASK_COLUMNS: &str = "task.id, task.project_id, task.repo_id, task.parent_task_id, task.title, task.description, (SELECT state FROM task_lifecycle WHERE task_id = task.id) AS lifecycle_state, task.is_automation, task.priority, task.board_position, task.subtask_order, task.merge_config, task.metadata_json, task.error_annotation, task.blocked_json, task.failed_json, task.deleted_at, task.version, task.created_at, task.updated_at";
 const PROJECT_COLUMNS: &str = "id, name, settings, primary_repo_id, paused_at, owner_id, project_hooks_json, project_work_epoch, version, created_at, updated_at";
 
 fn limit(page: &PageRequest) -> i64 {
@@ -234,6 +235,9 @@ pub(super) fn work_unit_execution_admission_error(error: &sqlx::Error) -> Option
     };
     match database_error.message() {
         "FORGE_WU_ADMISSION_AGENT_AT_CAPACITY" => Some(DbError::AgentAtCapacity),
+        "FORGE_WU_ADMISSION_TASK_AT_CAPACITY" => Some(DbError::TaskAtCapacity),
+        "FORGE_WU_ADMISSION_TASK_PAUSED" => Some(DbError::TaskDispatchPaused),
+        "FORGE_WU_ADMISSION_RECOVERY_PENDING" => Some(DbError::WorkUnitRecoveryPending),
         "FORGE_WU_ADMISSION_AGENT_MISSING" | "FORGE_WU_ADMISSION_WORK_UNIT_MISSING" => {
             Some(DbError::NotFound)
         }
@@ -439,7 +443,6 @@ fn map_task(row: SqliteRow) -> Result<Task> {
         parent_task_id: row.try_get("parent_task_id")?,
         title: row.try_get("title")?,
         description: row.try_get("description")?,
-        task_type: row.try_get("task_type")?,
         lifecycle_state: parse_enum(row.try_get::<String, _>("lifecycle_state")?)?,
         is_automation: row.try_get::<i64, _>("is_automation")? != 0,
         priority: row.try_get("priority")?,
@@ -468,10 +471,6 @@ fn map_execution(row: SqliteRow) -> Result<Execution> {
             .transpose()?,
         actor_id: row.try_get("actor_id")?,
         role: row.try_get::<String, _>("role")?,
-        purpose: row
-            .try_get::<Option<String>, _>("purpose")?
-            .map(parse_enum)
-            .transpose()?,
         status: parse_enum(row.try_get::<String, _>("status")?)?,
         stop_reason: row
             .try_get::<Option<String>, _>("stop_reason")?
@@ -657,11 +656,6 @@ impl SqliteDb {
                 ));
             }
         }
-        if input.actor_ref.is_some() && input.purpose.is_none() {
-            return Err(DbError::Check(
-                "new Execution writes require an explicit purpose".to_owned(),
-            ));
-        }
         if input.actor_ref.is_some() {
             let explicitly_supplied_harness_session = input.harness_session_id.is_some();
             if let Some(session_id) =
@@ -680,7 +674,7 @@ impl SqliteDb {
         let resume_policy = input.resume_policy.as_ref().map(ToString::to_string);
         let prompt = input.summary.as_deref();
         sqlx::query(
-            "INSERT INTO execution (id, task_id, agent_id, actor_kind, actor_id, role, purpose, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, harness_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, work_unit_id, work_unit_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO execution (id, task_id, agent_id, actor_kind, actor_id, role, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, harness_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, work_unit_id, work_unit_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.task_id)
@@ -688,7 +682,6 @@ impl SqliteDb {
         .bind(actor_kind.map(|value| value.to_string()))
         .bind(actor_id.as_deref())
         .bind(&input.role)
-        .bind(input.purpose.as_ref().map(ToString::to_string))
         .bind(input.status.to_string())
         .bind(stop_reason.as_deref())
         .bind(input.stopped_by.as_deref())

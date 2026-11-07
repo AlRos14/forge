@@ -29,12 +29,14 @@ import {
   MagnifyingGlass,
   SignOut,
   UserCircle,
+  Sparkle,
 } from '@phosphor-icons/react'
 import { useTranslation } from 'react-i18next'
 import { useCreateProject, useProjectsInfiniteQuery } from '@/api/hooks'
 import { logoutApi } from '@/api/auth'
 import { Avatar } from '@/components/ui/avatar'
 import { NotificationCenter } from '@/components/notification-center'
+import { projectCopilotRouteScope } from '@/features/project-copilot/route-context'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -60,17 +62,15 @@ const CommandPalette = lazy(() =>
     default: module.CommandPalette,
   })),
 )
+const ProjectCopilotDock = lazy(() =>
+  import('@/features/project-copilot/ProjectCopilotDock').then((module) => ({
+    default: module.ProjectCopilotDock,
+  })),
+)
 
 type NavItem = {
   to: string
-  key:
-    | 'board'
-    | 'tasks'
-    | 'agentSettings'
-    | 'daemons'
-    | 'operations'
-    | 'settings'
-    | 'forgeSettings'
+  key: 'board' | 'tasks' | 'agentSettings' | 'daemons' | 'operations' | 'settings' | 'forgeSettings'
   icon: ComponentType<{ size?: string | number; weight?: IconWeight }>
   section: 'main' | 'project' | 'global'
 }
@@ -414,7 +414,8 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const menuButtonRef = useRef<HTMLButtonElement>(null)
   const params = useRouterState({
-    select: (state) => state.matches.at(-1)?.params as { projectId?: string } | undefined,
+    select: (state) =>
+      state.matches.at(-1)?.params as { projectId?: string; taskId?: string } | undefined,
   })
   const projectsQuery = useProjectsInfiniteQuery(PROJECTS_PAGE_SIZE)
   const storedProjectId = useLayoutStore((s) => s.selectedProjectId)
@@ -422,6 +423,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const routeProjectId = params?.projectId
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const isBoardRoute = /^\/projects\/[^/]+\/board$/.test(pathname)
+  const copilotRouteScope = projectCopilotRouteScope(pathname, params)
   const firstProjectId = projectsQuery.data?.pages[0]?.items[0]?.id
   const projectId = routeProjectId ?? storedProjectId ?? firstProjectId
   const effectiveCollapsed =
@@ -454,11 +456,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   const projectNavItems = navigationItemsForSection('project')
   const globalNavItems = navigationItemsForSection('global').filter((item) => {
-    if (
-      item.key === 'daemons' ||
-      item.key === 'operations' ||
-      item.key === 'forgeSettings'
-    ) {
+    if (item.key === 'daemons' || item.key === 'operations' || item.key === 'forgeSettings') {
       return isAdmin
     }
     return true
@@ -599,7 +597,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       ) : null}
 
       {/* Main content */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         {/* Header */}
         <header className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-sidebar-border bg-background px-3 sm:px-4 lg:px-5">
           <div className="flex min-w-0 items-center gap-2">
@@ -658,13 +656,31 @@ export function AppShell({ children }: { children: ReactNode }) {
         <main
           id="main-content"
           className={cn(
-            'min-h-0 flex-1 bg-card p-3 sm:p-4 lg:p-5',
+            'min-h-0 min-w-0 flex-1 bg-card p-4 lg:p-6',
             isBoardRoute ? 'overflow-hidden' : 'overflow-auto',
           )}
         >
           {children}
         </main>
       </div>
+      {copilotRouteScope.projectId || copilotRouteScope.taskId ? (
+        <Suspense
+          fallback={
+            <button
+              type="button"
+              disabled
+              aria-busy="true"
+              aria-label={t('projectCopilot.open')}
+              className="fixed bottom-4 right-4 z-40 inline-flex h-11 items-center gap-1.5 rounded-full bg-primary px-4 text-ui font-medium text-primary-foreground opacity-70 shadow-lg"
+            >
+              <Sparkle size={17} weight="fill" aria-hidden="true" />
+              {t('projectCopilot.button')}
+            </button>
+          }
+        >
+          <ProjectCopilotDock {...copilotRouteScope} />
+        </Suspense>
+      ) : null}
     </div>
   )
 }

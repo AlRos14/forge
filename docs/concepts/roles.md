@@ -21,9 +21,13 @@ RoleMembership
   ended_at
 ~~~
 
-A TaskRole contains zero or more memberships. The initial role vocabulary is
-planner, implementer, reviewer, and orchestrator. Persistence may support
-future role names without hard-coding role-specific classes. During the
+A TaskRole contains zero or more memberships. The initial template identifiers
+are planner, implementer, reviewer, and orchestrator. They are starting values,
+not authority: only the persisted capability configuration enables formal
+review, orchestration, or rework. A TaskRole named `reviewer` with no
+`formal_review` capability cannot produce an authoritative ReviewReport, and a
+custom name can do so when a Project administrator grants that capability.
+Persistence supports new names without role-specific classes. During the
 singular-assignment migration, `coder`, `worker`, `assignee`, and `executor`
 are normalized to `implementer`; `interactive`, `merge_fixer`, and `system`
 remain execution labels rather than becoming TaskRoles.
@@ -34,9 +38,41 @@ WorkUnit and Execution: an implementer may remain a member while moving
 between WorkUnits, and changing that allocation never rewrites membership
 history.
 
+A Project may store a default set of TaskRoles, coordination modes, and
+workers. New ordinary Tasks and subtasks copy those values into their own
+TaskRole and active RoleMembership rows in the creation transaction. These
+Project defaults are templates: edits do not rewrite existing Tasks, and
+Task-specific membership edits do not flow back to the Project. Humans must be
+current Project members. An Agent default must be owned by the canonical
+Project owner; global Agent visibility does not grant cross-account execution
+consent. Project owner/admin membership is required to change the template.
+
 The same Actor can belong to several roles on one Task. Each Execution records
 the concrete Role, so an Actor acting as orchestrator and later reviewer has
 two distinguishable historical records.
+
+## Capabilities and templates
+
+TaskRole configuration is separate from its coordination mode and the strict
+PR6 orchestration policy. It has a schema version, optional display label, and
+the closed capability set `formal_review`, `orchestration`, and
+`request_rework`. Unknown values and fields fail closed. A capability permits
+only its typed operation; it does not grant repository, Workspace, Actor, or
+Task access.
+
+Planner and Implementer templates start without privileged capabilities.
+Reviewer starts with `formal_review`; Orchestrator starts with `orchestration`;
+Custom starts empty. Templates are editable values, not classes. Human owners
+or admins administer Task capabilities and rework automation. Changing a
+configuration advances the TaskRole version. New Executions snapshot the exact
+TaskRole ID, version, configuration, capabilities, and matching membership.
+Provider Start rechecks the same configuration and active membership. A
+snapshot proves authority for that attempt only and cannot be reused for a new
+mutation.
+
+Project defaults store references by role name and resolve them to new
+Task-local IDs as a Task is created. Editing defaults never changes an existing
+Task.
 
 ## Coordination modes
 

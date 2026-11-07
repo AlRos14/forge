@@ -14,12 +14,38 @@ use api_types::{
 use chrono::DateTime;
 use db::{ProjectReleaseRecord, SqliteDb};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{sqlite::SqliteRow, Row};
 
 const MAX_AUTHORIZATION_TIMESTAMP_LEN: usize = 64;
 const RELEASE_SCHEMA_VERSION: &str = "forge.milestone-release/v1";
 const RELEASE_DIGEST_SCHEMA_VERSION: &str = "forge.milestone-release/v1";
+
+/// Frozen V120 Release references remain in historical snapshot digests.
+/// The retired classification is retained only while validating that history
+/// and is never projected through the current API contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenReleaseTaskReference {
+    task_id: String,
+    task_version: i64,
+    task_type: String,
+    task_state: String,
+    #[serde(default)]
+    acceptance_check_ids: Vec<String>,
+}
+
+impl From<&FrozenReleaseTaskReference> for api_types::ReleaseTaskReference {
+    fn from(reference: &FrozenReleaseTaskReference) -> Self {
+        Self {
+            task_id: reference.task_id.clone(),
+            task_version: reference.task_version,
+            task_state: reference.task_state.clone(),
+            acceptance_check_ids: reference.acceptance_check_ids.clone(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct HistoricalReleaseReader {
@@ -212,6 +238,8 @@ impl HistoricalReleaseReader {
             occurred_at: record.authorization_occurred_at.clone(),
         };
         validate_persisted_authorization(&authorization, "project.milestone.release")?;
+        let frozen_task_references: Vec<FrozenReleaseTaskReference> =
+            parse_json_required(&record.task_references_json, "release task_references")?;
 
         let mut snapshot = ReleaseSnapshot {
             schema_version: record.schema_version.clone(),
@@ -242,10 +270,7 @@ impl HistoricalReleaseReader {
                 &record.decision_ids_json,
                 "release decision_ids",
             )?,
-            included_tasks: parse_json_required(
-                &record.task_references_json,
-                "release task_references",
-            )?,
+            included_tasks: frozen_task_references.iter().map(Into::into).collect(),
             validation_results: parse_json_required(
                 &record.validation_references_json,
                 "release validation_references",
@@ -265,14 +290,14 @@ impl HistoricalReleaseReader {
             snapshot_digest: record.snapshot_digest.clone(),
         };
 
-        let digest = release_snapshot_digest(&snapshot)
+        let digest = release_snapshot_digest(&snapshot, &frozen_task_references)
             .map_err(|error| invalid(format!("invalid immutable Release snapshot: {error}")))?;
         if digest != record.snapshot_digest {
             return Err(invalid(
                 "immutable release snapshot digest does not match its contents",
             ));
         }
-        self.validate_release_references(&record.id, &snapshot)
+        self.validate_release_references(&record.id, &snapshot, &frozen_task_references)
             .await?;
         // Availability is a read-time overlay from immutable tombstones. Keep
         // the stored pin projection in the digest input, then expose the
@@ -294,6 +319,7 @@ impl HistoricalReleaseReader {
         &self,
         release_id: &str,
         snapshot: &ReleaseSnapshot,
+        frozen_task_references: &[FrozenReleaseTaskReference],
     ) -> crate::Result<()> {
         type ExpectedReference = (
             &'static str,
@@ -304,15 +330,29 @@ impl HistoricalReleaseReader {
             String,
         );
         let mut expected = Vec::<ExpectedReference>::new();
-        for task in &snapshot.included_tasks {
+        if snapshot.included_tasks.len() != frozen_task_references.len() {
+            return Err(invalid(
+                "immutable release task projection does not match frozen task references",
+            ));
+        }
+        for (task, frozen) in snapshot.included_tasks.iter().zip(frozen_task_references) {
             expected.push((
                 "task",
-                task.task_id.clone(),
-                Some(task.task_version.to_string()),
-                Some(task.task_state.clone()),
+                frozen.task_id.clone(),
+                Some(frozen.task_version.to_string()),
+                Some(frozen.task_state.clone()),
                 None,
-                serde_json::to_string(task).map_err(json_error)?,
+                serde_json::to_string(frozen).map_err(json_error)?,
             ));
+            if task.task_id != frozen.task_id
+                || task.task_version != frozen.task_version
+                || task.task_state != frozen.task_state
+                || task.acceptance_check_ids != frozen.acceptance_check_ids
+            {
+                return Err(invalid(
+                    "public release task projection disagrees with its frozen reference",
+                ));
+            }
         }
         for validation in &snapshot.validation_results {
             expected.push((
@@ -535,9 +575,16 @@ impl HistoricalReleaseReader {
     }
 }
 
-fn release_snapshot_digest(snapshot: &ReleaseSnapshot) -> Result<String, serde_json::Error> {
+fn release_snapshot_digest(
+    snapshot: &ReleaseSnapshot,
+    frozen_task_references: &[FrozenReleaseTaskReference],
+) -> Result<String, serde_json::Error> {
     let mut value = serde_json::to_value(snapshot)?;
     if let serde_json::Value::Object(object) = &mut value {
+        object.insert(
+            "included_tasks".to_owned(),
+            serde_json::to_value(frozen_task_references)?,
+        );
         object.remove("snapshot_digest");
     }
     canonical_digest_with_schema(RELEASE_DIGEST_SCHEMA_VERSION, &value)

@@ -403,7 +403,6 @@ mod tests {
                 subtask_order: None,
                 title: "Shutdown test".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state,
                 is_automation: false,
                 priority: 0,
@@ -468,7 +467,6 @@ mod tests {
                 actor_ref: harness_session_id
                     .as_ref()
                     .map(|_| db::ActorRef::Agent(agent_id)),
-                purpose: Some(db::ExecutionPurpose::Implement),
                 harness_session_id,
                 role: "coder".to_owned(),
                 status: ExecutionStatus::Running,

@@ -7,7 +7,10 @@ use executors::{
 const REVIEW_RESULT_COMMAND: &str = r#"echo 'FORGE_RESULT: {"schema_version":1,"kind":"review","verdict":"pass","summary":"clear","findings":[],"questions":[]}'"#;
 
 fn command_for_context(ctx: &ExecutionContext) -> &str {
-    if ctx.role == "reviewer" {
+    if ctx
+        .task_role_capabilities
+        .contains(&executors::TaskRoleCapability::FormalReview)
+    {
         REVIEW_RESULT_COMMAND
     } else {
         &ctx.description
@@ -93,7 +96,10 @@ impl HarnessAdapter for ShellAdapter {
     }
 
     async fn execute(&self, mut ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
-        if ctx.role == "reviewer" {
+        if ctx
+            .task_role_capabilities
+            .contains(&executors::TaskRoleCapability::FormalReview)
+        {
             ctx.description = command_for_context(&ctx).to_owned();
         }
         self.inner.execute(ctx).await
@@ -115,9 +121,9 @@ mod tests {
             executors::HarnessInvocation::Start,
             serde_json::json!({}),
         );
-        ctx.role = "reviewer".to_owned();
+        ctx.task_role_capabilities = vec![executors::TaskRoleCapability::FormalReview];
         assert_eq!(command_for_context(&ctx), REVIEW_RESULT_COMMAND);
-        ctx.role = "coder".to_owned();
+        ctx.task_role_capabilities.clear();
         ctx.description = "printf normal-task".to_owned();
         assert_eq!(command_for_context(&ctx), "printf normal-task");
     }
@@ -134,6 +140,7 @@ mod tests {
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "printf shell-adapter-ok".to_owned(),
                 agent_config: serde_json::json!({}),

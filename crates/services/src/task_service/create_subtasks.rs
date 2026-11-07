@@ -53,7 +53,6 @@ impl TaskService {
                     parent_task_id: Some(parent_task_id.clone()),
                     title: item.title.clone(),
                     description: item.description.clone(),
-                    task_type: "implementation".to_owned(),
                     lifecycle_state: db::TaskLifecycleState::Ready,
                     is_automation: false,
                     priority: 0,
@@ -62,6 +61,13 @@ impl TaskService {
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 },
+            )
+            .await?;
+            self.apply_project_task_role_defaults_in_tx(
+                &mut transaction,
+                &task.project_id,
+                &task.id,
+                &now,
             )
             .await?;
             TaskRepo::set_metadata_json_in_tx(

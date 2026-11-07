@@ -7,10 +7,9 @@ use std::sync::Arc;
 
 use db::{
     new_uuid_v4, now_rfc3339, ArtifactKind, CollaborationRepo, CreateDomainEvent, DomainEvent,
-    DomainEventRepo, ExecutionPurpose, ExecutionRepo, GateEvaluationOutcome, GateRepo,
-    TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskLifecycleRepo,
-    TaskLifecycleState, TaskRepo, ValidationRunRepo, ValidationRunStatus,
-    WorkUnitIntegrationOutcome, WorkUnitRepo,
+    DomainEventRepo, ExecutionRepo, GateEvaluationOutcome, GateRepo, TaskIntegrationOperationKind,
+    TaskIntegrationOperationRepo, TaskLifecycleRepo, TaskLifecycleState, TaskRepo,
+    ValidationRunRepo, ValidationRunStatus, WorkUnitIntegrationOutcome, WorkUnitRepo,
 };
 use events::EventBus;
 use serde_json::{json, Value};
@@ -806,7 +805,12 @@ impl TaskFailureRetryService {
                 {
                     if execution.task_id == event.scope_id
                         && execution.status == db::ExecutionStatus::Failed
-                        && execution.purpose != Some(ExecutionPurpose::Orchestrate)
+                        && !crate::role_capabilities::execution_has_capability(
+                            &self.db,
+                            &execution.id,
+                            api_types::TaskRoleCapability::Orchestration,
+                        )
+                        .await?
                         && !execution_is_executor_unavailable(&execution)
                     {
                         failures.push(FailureFact {
@@ -1345,7 +1349,6 @@ mod tests {
                     parent_task_id: None,
                     title: "Retry override Task".to_owned(),
                     description: None,
-                    task_type: "implementation".to_owned(),
                     lifecycle_state: db::TaskLifecycleState::Active,
                     is_automation: false,
                     priority: 0,
@@ -2600,8 +2603,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO execution (
                  id, task_id, agent_id, role, status, created_at, updated_at,
-                 actor_kind, actor_id, purpose
-             ) VALUES (?, ?, ?, 'implementer', 'completed', ?, ?, 'agent', ?, 'implement')",
+                 actor_kind, actor_id
+             ) VALUES (?, ?, ?, 'implementer', 'completed', ?, ?, 'agent', ?)",
         )
         .bind(&execution_id)
         .bind(task_id)
@@ -2667,7 +2670,6 @@ mod tests {
                 parent_task_id: None,
                 title: "Review rework Task".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state: db::TaskLifecycleState::Active,
                 is_automation: false,
                 priority: 0,
@@ -2715,7 +2717,6 @@ mod tests {
                 task_id: task_id.clone(),
                 agent_id: None,
                 actor_ref: Some(actor.clone()),
-                purpose: Some(ExecutionPurpose::Review),
                 role: "reviewer".to_owned(),
                 status: ExecutionStatus::Running,
                 stop_reason: None,
@@ -2836,6 +2837,7 @@ mod tests {
                         allow_agents: true,
                         allowed_actor_refs: Vec::new(),
                         task_role_snapshot: None,
+                        review_line_id: None,
                         candidates: vec![crate::gate_engine::ReviewReportRequirement {
                             artifact_id: report_id,
                             digest: report_digest,
@@ -2846,6 +2848,7 @@ mod tests {
                                 base_commit_sha: None,
                                 head_commit_sha: None,
                                 workspace_snapshot_digest: None,
+                                reviewed_result: None,
                             },
                         }],
                     }),
@@ -2971,7 +2974,6 @@ mod tests {
                 parent_task_id: None,
                 title: "Retry receipt Task".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state: db::TaskLifecycleState::Active,
                 is_automation: false,
                 priority: 0,
@@ -2993,7 +2995,6 @@ mod tests {
                 task_id: task_id.clone(),
                 agent_id: None,
                 actor_ref: None,
-                purpose: Some(ExecutionPurpose::Implement),
                 harness_session_id: None,
                 role: "implementer".to_owned(),
                 status: ExecutionStatus::Failed,
@@ -3069,7 +3070,6 @@ mod tests {
                     task_id: task_id.clone(),
                     agent_id: None,
                     actor_ref: None,
-                    purpose: Some(ExecutionPurpose::Implement),
                     harness_session_id: None,
                     role: "implementer".to_owned(),
                     status: ExecutionStatus::Failed,
@@ -3302,7 +3302,6 @@ mod tests {
                 parent_task_id: None,
                 title: "Independently blocked Task".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state: db::TaskLifecycleState::Active,
                 is_automation: false,
                 priority: 0,
@@ -3340,7 +3339,6 @@ mod tests {
                 task_id: blocked_task_id.clone(),
                 agent_id: None,
                 actor_ref: None,
-                purpose: Some(ExecutionPurpose::Implement),
                 harness_session_id: None,
                 role: "implementer".to_owned(),
                 status: ExecutionStatus::Failed,
@@ -3407,7 +3405,6 @@ mod tests {
                 parent_task_id: None,
                 title: "Merge failure rework Task".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state: db::TaskLifecycleState::Active,
                 is_automation: false,
                 priority: 0,
@@ -3536,7 +3533,6 @@ mod tests {
                 parent_task_id: None,
                 title: "Retry domains".to_owned(),
                 description: None,
-                task_type: "implementation".to_owned(),
                 lifecycle_state: db::TaskLifecycleState::Active,
                 is_automation: false,
                 priority: 0,

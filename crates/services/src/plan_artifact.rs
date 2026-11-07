@@ -5,8 +5,8 @@
 
 use api_types::{PlanArtifactDetail, PlanChecklistItem, PlanProgressSummary};
 use db::{
-    Artifact, ArtifactKind, ArtifactStorageKind, CollaborationRepo, ExecutionPurpose,
-    ExecutionRepo, PageRequest, SortBy, SortOrder, SqliteDb,
+    Artifact, ArtifactKind, ArtifactStorageKind, CollaborationRepo, ExecutionRepo, PageRequest,
+    SortBy, SortOrder, SqliteDb,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,15 +91,11 @@ pub async fn plan_artifacts_for_execution(
             "Execution belongs to another Task",
         ));
     }
-    if execution.purpose == Some(ExecutionPurpose::Plan) {
-        return Ok(CollaborationRepo::get_execution_artifact_output(
-            db,
-            execution_id,
-            ArtifactKind::Plan,
-        )
-        .await?
-        .into_iter()
-        .collect());
+    if let Some(artifact) =
+        CollaborationRepo::get_execution_artifact_output(db, execution_id, ArtifactKind::Plan)
+            .await?
+    {
+        return Ok(vec![artifact]);
     }
 
     let mut artifacts = Vec::new();

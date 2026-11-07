@@ -25,6 +25,9 @@ pub enum DbError {
     #[error("project owner or administrator membership is required")]
     ProjectAdminRequired,
 
+    #[error("Project owner, admin, or member membership is required")]
+    ProjectWriteRequired,
+
     #[error("version conflict")]
     VersionConflict,
 
@@ -52,6 +55,18 @@ pub enum DbError {
     #[error("agent at capacity")]
     AgentAtCapacity,
 
+    #[error("Task is at its automatic Execution capacity")]
+    TaskAtCapacity,
+
+    #[error("Task dispatch is paused")]
+    TaskDispatchPaused,
+
+    #[error("Task dispatch is cancelled")]
+    TaskDispatchCancelled,
+
+    #[error("WorkUnit must resolve its exact interrupted Execution before fresh admission")]
+    WorkUnitRecoveryPending,
+
     #[error("agent is paused: {agent_id}")]
     AgentPaused { agent_id: String },
 
@@ -63,6 +78,12 @@ pub enum DbError {
 
     #[error("WorkUnit Workspace is not available for Execution admission")]
     WorkUnitWorkspaceUnavailable,
+
+    #[error("Project Copilot already has an active run")]
+    ProjectCopilotActiveRun,
+
+    #[error("Project Copilot run authority is stale")]
+    ProjectCopilotRunAuthority,
 
     #[error("WorkUnit already has a Running Execution")]
     WorkUnitExecutionAlreadyRunning,

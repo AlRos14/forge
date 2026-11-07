@@ -22,9 +22,9 @@ export function AccountPage({ initialTab = 'profile' }: { initialTab?: AccountTa
   const label = user?.display_name ?? user?.email ?? 'Account'
 
   return (
-    <div className="flex h-[calc(100vh-7rem)] gap-0 overflow-hidden rounded-xl border border-border-subtle bg-card shadow-card">
+    <div className="flex min-w-0 flex-col gap-0 lg:flex-row rounded-xl border border-border-subtle bg-card shadow-card">
       {/* Sidebar */}
-      <aside className="flex w-56 shrink-0 flex-col border-r bg-background">
+      <aside className="flex w-full min-w-0 shrink-0 flex-col border-b bg-background lg:w-56 lg:border-b-0 lg:border-r">
         <div className="border-b px-4 py-3">
           <p className="font-mono text-micro font-semibold uppercase tracking-[1px] text-muted-foreground">
             Account
@@ -38,7 +38,7 @@ export function AccountPage({ initialTab = 'profile' }: { initialTab?: AccountTa
             </p>
           </div>
         </div>
-        <nav className="flex flex-1 flex-col gap-0.5 p-2">
+        <nav className="flex flex-wrap gap-0.5 p-2 lg:flex-col">
           {TABS.map((t) => {
             const TabIcon = t.icon
             return (
@@ -47,7 +47,7 @@ export function AccountPage({ initialTab = 'profile' }: { initialTab?: AccountTa
                 to={t.id === 'profile' ? '/account' : '/account/$tab'}
                 params={{ tab: t.id }}
                 className={cn(
-                  'relative flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-[7px] text-left text-[13px] leading-none font-medium transition-colors',
+                  'relative flex w-auto shrink-0 lg:w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-[7px] text-left text-[13px] leading-none font-medium transition-colors',
                   initialTab === t.id
                     ? 'bg-[var(--ember-surface)] text-sidebar-active-foreground before:absolute before:left-0 before:top-1/2 before:-translate-y-1/2 before:h-4 before:w-[3px] before:rounded-r-full before:bg-primary'
                     : 'text-sidebar-foreground hover:bg-accent/50 hover:text-foreground',
@@ -62,7 +62,7 @@ export function AccountPage({ initialTab = 'profile' }: { initialTab?: AccountTa
       </aside>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto px-8 py-6">
+      <div className="min-w-0 flex-1 px-4 py-4 sm:px-6 sm:py-6">
         <div className="max-w-[760px]">
           {initialTab === 'profile' && <ProfileTab />}
           {initialTab === 'tokens' && <AccessTokensTab />}

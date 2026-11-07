@@ -20,8 +20,18 @@ pub use opencode::OpencodeAdapter;
 pub use shell::ShellAdapter;
 pub use smith::SmithAdapter;
 
-use executors::HarnessAdapterRegistry;
 use executors::HarnessCapabilities as C;
+use executors::{AvailabilityInfo, ExecutorKind, HarnessAdapter, HarnessAdapterRegistry};
+
+/// Detect adapter availability, including authentication metadata that is
+/// stored by the external CLI in its own database.
+pub async fn detect_availability(adapter: &dyn HarnessAdapter) -> AvailabilityInfo {
+    if adapter.kind() == ExecutorKind::Opencode {
+        opencode::detect_availability().await
+    } else {
+        adapter.check_availability()
+    }
+}
 
 /// Refuse to report a successful Resume unless the integration's normalized
 /// result confirms the exact external session requested by Forge.
@@ -64,6 +74,7 @@ pub(crate) fn test_execution_context(
         task_id: "task-test".to_owned(),
         execution_id: "execution-test".to_owned(),
         role: "coder".to_owned(),
+        task_role_capabilities: Vec::new(),
         worktree_path: "/tmp/forge-test-worktree".to_owned(),
         description: "test invocation".to_owned(),
         agent_config,
@@ -196,7 +207,7 @@ mod capability_tests {
                 usage_reporting: S::Unsupported,
                 account_usage_observation: S::Unsupported,
                 model_selection: S::Native,
-                reasoning_controls: S::Unsupported,
+                reasoning_controls: S::Native,
                 approval_policy: S::Native,
                 sandbox_controls: S::Unsupported,
                 planning: S::Unsupported,

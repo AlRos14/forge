@@ -81,7 +81,6 @@ pub(super) async fn seed_task_with_status(
             subtask_order: None,
             title: format!("task-{lifecycle_state:?}"),
             description: Some("seeded task".to_owned()),
-            task_type: "implementation".to_owned(),
             lifecycle_state,
             is_automation: false,
             priority: 0,

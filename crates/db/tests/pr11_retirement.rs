@@ -1759,7 +1759,6 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
         task_type: &'static str,
         task_role: &'static str,
         lease_role: &'static str,
-        purpose: &'static str,
         capability: &'static str,
     }
     const CASES: [LeaseCase; 10] = [
@@ -1768,7 +1767,6 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "implementation",
             task_role: "implementer",
             lease_role: "worker",
-            purpose: "implement",
             capability: "repository_write",
         },
         LeaseCase {
@@ -1776,7 +1774,6 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "planning",
             task_role: "planner",
             lease_role: "worker",
-            purpose: "plan",
             capability: "repository_read",
         },
         LeaseCase {
@@ -1784,7 +1781,6 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "review",
             task_role: "reviewer",
             lease_role: "reviewer",
-            purpose: "review",
             capability: "repository_read",
         },
         LeaseCase {
@@ -1792,7 +1788,6 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "validation",
             task_role: "validator",
             lease_role: "worker",
-            purpose: "validate",
             capability: "repository_read",
         },
         LeaseCase {
@@ -1800,7 +1795,6 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "discovery",
             task_role: "investigator",
             lease_role: "worker",
-            purpose: "investigate",
             capability: "repository_read",
         },
         LeaseCase {
@@ -1808,7 +1802,6 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "implementation",
             task_role: "implementer",
             lease_role: "worker",
-            purpose: "general",
             capability: "repository_write",
         },
         LeaseCase {
@@ -1816,7 +1809,6 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "planning",
             task_role: "planner",
             lease_role: "worker",
-            purpose: "general",
             capability: "repository_read",
         },
         LeaseCase {
@@ -1824,7 +1816,6 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "review",
             task_role: "reviewer",
             lease_role: "worker",
-            purpose: "general",
             capability: "repository_read",
         },
         LeaseCase {
@@ -1832,7 +1823,6 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "validation",
             task_role: "validator",
             lease_role: "worker",
-            purpose: "general",
             capability: "repository_read",
         },
         LeaseCase {
@@ -1840,7 +1830,6 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             task_type: "discovery",
             task_role: "investigator",
             lease_role: "worker",
-            purpose: "general",
             capability: "repository_read",
         },
     ];
@@ -1994,6 +1983,12 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
         .await
         .expect("active exact and wrong TaskRole memberships");
         membership_ids.push((membership_id, task_time.clone()));
+        let purpose = match case.execution_role {
+            "planner" => "plan",
+            "reviewer" | "auditor" => "review",
+            "orchestrator" => "orchestrate",
+            _ => "implement",
+        };
 
         for (id, actor_id) in [
             (&execution_id, &active_actor),
@@ -2011,7 +2006,7 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
             .bind(actor_id)
             .bind(case.execution_role)
             .bind(actor_id)
-            .bind(case.purpose)
+            .bind(purpose)
             .bind(&task_time)
             .bind(&task_time)
             .execute(&pool)
@@ -2164,7 +2159,7 @@ async fn v120_keeps_task_roles_separate_from_workspace_lease_classes() {
         .bind(&active_actor)
         .bind(&active_actor)
         .bind(case.execution_role)
-        .bind(case.purpose)
+        .bind(purpose)
         .bind(&task_role_id)
         .bind(case.task_role)
         .fetch_one(&pool)

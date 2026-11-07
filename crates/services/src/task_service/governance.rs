@@ -4,27 +4,12 @@ use super::*;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sha2::{Digest, Sha256};
 
-const READ_ONLY_CAPABILITY_TYPES: &[&str] = &["planning", "discovery", "review", "validation"];
 const WORKSPACE_LEASE_SECONDS: i64 = 15 * 60;
 const CAPABILITY_PROFILE_REVISION: &str = "forge.capability-profile/v1";
 
-/// Resolve the capability axis independently from TaskRole and lease class.
-fn workspace_lease_capability_class(
-    task_type: &str,
-    purpose: Option<&str>,
-    execution_role: &str,
-) -> &'static str {
-    let read_only = execution_role.eq_ignore_ascii_case("reviewer")
-        || matches!(
-            purpose,
-            Some("plan" | "review" | "investigate" | "validate")
-        )
-        || READ_ONLY_CAPABILITY_TYPES.contains(&task_type);
-    if read_only {
-        "repository_read"
-    } else {
-        "repository_write"
-    }
+/// Current Tasks grant repository write capability to their assigned Agents.
+fn workspace_lease_capability_class() -> &'static str {
+    "repository_write"
 }
 
 impl TaskService {
@@ -54,7 +39,9 @@ impl TaskService {
             ));
         }
         self.ensure_task_runnable(task).await?;
-        let canonical_role = canonical_workspace_lease_role(&work_unit.role)?;
+        let canonical_role = self
+            .workspace_lease_role_for_task_role(task, &work_unit.role)
+            .await?;
         let db::ActorRef::Agent(principal_id) = actor else {
             return Err(ServiceError::invalid_operation(
                 "repository WorkUnit leases require an Agent Actor under current repository policy",
@@ -89,19 +76,7 @@ impl TaskService {
         self.ensure_repository_worker_identity(&task.project_id, principal_id)
             .await?;
         let (_repo, capability_class, base_ref) = self
-            .workspace_lease_inputs(
-                task,
-                workspace,
-                repo_id,
-                &execution.id,
-                Some(
-                    execution
-                        .purpose
-                        .clone()
-                        .unwrap_or(db::ExecutionPurpose::General),
-                ),
-                &work_unit.role,
-            )
+            .workspace_lease_inputs(task, workspace, repo_id, &execution.id, true)
             .await?;
         let issued_at = now_rfc3339();
         let expires_at =
@@ -270,7 +245,7 @@ impl TaskService {
             ServiceError::invalid_operation("WorkUnit WorkspaceLease requires a repository Task")
         })?;
         let (repo, capability_class, base_ref) = self
-            .workspace_lease_inputs(task, workspace, repo_id, execution_id, None, &unit.role)
+            .workspace_lease_inputs(task, workspace, repo_id, execution_id, false)
             .await?;
         if repo.project_id != task.project_id {
             return Err(ServiceError::invalid_operation(
@@ -298,7 +273,9 @@ impl TaskService {
                     "invalid WorkUnit WorkspaceLease capability set: {error}"
                 ))
             })?;
-        let canonical_role = canonical_workspace_lease_role(&unit.role)?;
+        let canonical_role = self
+            .workspace_lease_role_for_task_role(task, &unit.role)
+            .await?;
         if lease.status != "active"
             || lease.project_id != task.project_id
             || lease.task_id != task.id
@@ -330,8 +307,7 @@ impl TaskService {
         workspace: &db::Workspace,
         repo_id: &str,
         execution_id: &str,
-        purpose: Option<db::ExecutionPurpose>,
-        role: &str,
+        is_new_execution: bool,
     ) -> Result<(db::Repo, String, String)> {
         if workspace.repo_id != repo_id {
             return Err(ServiceError::invalid_operation(
@@ -346,10 +322,8 @@ impl TaskService {
                 "Task repository binding belongs to a different Project",
             ));
         }
-        let purpose = if let Some(purpose) = purpose {
-            purpose
-        } else {
-            let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+        if !is_new_execution {
+            let _execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
                 .await?
                 .filter(|execution| execution.task_id == task.id)
                 .ok_or_else(|| {
@@ -357,11 +331,8 @@ impl TaskService {
                         "WorkspaceLease requires an exact Task Execution",
                     )
                 })?;
-            execution.purpose.unwrap_or(db::ExecutionPurpose::General)
-        };
-        let purpose = purpose.to_string();
-        let capability_class =
-            workspace_lease_capability_class(&task.task_type, Some(&purpose), role).to_owned();
+        }
+        let capability_class = workspace_lease_capability_class().to_owned();
         if !is_supported_capability_profile(&capability_class) {
             return Err(ServiceError::invalid_operation(format!(
                 "Task capability profile '{}' is not server-approved",
@@ -417,8 +388,12 @@ impl TaskService {
         &self,
         execution: &db::Execution,
     ) -> Result<Option<db::WorkspaceLease>> {
-        if execution.role == "orchestrator"
-            && execution.purpose == Some(db::ExecutionPurpose::Orchestrate)
+        if crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::Orchestration,
+        )
+        .await?
         {
             if execution.workspace_id.is_some() {
                 return Err(ServiceError::invalid_operation(
@@ -485,16 +460,32 @@ impl TaskService {
             );
         }
     }
+
+    async fn workspace_lease_role_for_task_role(
+        &self,
+        task: &db::Task,
+        role_name: &str,
+    ) -> Result<&'static str> {
+        let canonical = db::canonical_task_role_name(role_name)
+            .ok_or_else(|| ServiceError::invalid_operation("WorkUnit role is not a TaskRole"))?;
+        let role = db::TaskRoleRepo::get_by_task_and_role(&*self.db, &task.id, &canonical)
+            .await?
+            .ok_or_else(|| ServiceError::invalid_operation("WorkUnit TaskRole does not exist"))?;
+        let is_formal_review = crate::role_capabilities::current_task_role_has_capability(
+            &self.db,
+            &role.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?;
+        Ok(canonical_workspace_lease_role(is_formal_review))
+    }
 }
 
-fn canonical_workspace_lease_role(role: &str) -> Result<&'static str> {
-    match role.trim() {
-        "reviewer" => Ok("reviewer"),
-        // Workflow role names are user-configurable. Every scheduler-resolved
-        // execution role other than the dedicated reviewer role is a bounded
-        // Task Worker for lease purposes; the exact original role still has
-        // to match the authoritative Task role assignment.
-        _ => Ok("worker"),
+fn canonical_workspace_lease_role(is_formal_review: bool) -> &'static str {
+    if is_formal_review {
+        "reviewer"
+    } else {
+        "worker"
     }
 }
 
@@ -513,10 +504,7 @@ fn capability_profile_digest(capability_class: &str) -> String {
 }
 
 fn is_supported_capability_profile(capability_class: &str) -> bool {
-    matches!(
-        capability_class,
-        "repository_read" | "repository_write" | "read_only" | "discovery_read" | "planning_read"
-    )
+    matches!(capability_class, "repository_write")
 }
 
 #[cfg(test)]
@@ -525,120 +513,8 @@ mod tests {
 
     #[test]
     fn workspace_lease_roles_preserve_reviewer_and_bound_custom_workers() {
-        assert_eq!(
-            canonical_workspace_lease_role("reviewer").expect("reviewer role"),
-            "reviewer"
-        );
-        assert_eq!(
-            canonical_workspace_lease_role("implementer").expect("custom worker role"),
-            "worker"
-        );
-        assert_eq!(
-            canonical_workspace_lease_role("orchestrator").expect("workflow worker role"),
-            "worker"
-        );
-    }
-
-    #[test]
-    fn task_role_execution_purpose_lease_class_and_capability_stay_independent() {
-        struct Case {
-            execution_role: &'static str,
-            task_type: &'static str,
-            lease_role: &'static str,
-            purpose: &'static str,
-            capability: &'static str,
-        }
-        let cases = [
-            Case {
-                execution_role: "implementer",
-                task_type: "implementation",
-                lease_role: "worker",
-                purpose: "implement",
-                capability: "repository_write",
-            },
-            Case {
-                execution_role: "planner",
-                task_type: "planning",
-                lease_role: "worker",
-                purpose: "plan",
-                capability: "repository_read",
-            },
-            Case {
-                execution_role: "reviewer",
-                task_type: "review",
-                lease_role: "reviewer",
-                purpose: "review",
-                capability: "repository_read",
-            },
-            Case {
-                execution_role: "validator",
-                task_type: "validation",
-                lease_role: "worker",
-                purpose: "validate",
-                capability: "repository_read",
-            },
-            Case {
-                execution_role: "investigator",
-                task_type: "discovery",
-                lease_role: "worker",
-                purpose: "investigate",
-                capability: "repository_read",
-            },
-            Case {
-                execution_role: "interactive",
-                task_type: "implementation",
-                lease_role: "worker",
-                purpose: "general",
-                capability: "repository_write",
-            },
-            Case {
-                execution_role: "interactive",
-                task_type: "planning",
-                lease_role: "worker",
-                purpose: "general",
-                capability: "repository_read",
-            },
-            Case {
-                execution_role: "interactive",
-                task_type: "review",
-                lease_role: "worker",
-                purpose: "general",
-                capability: "repository_read",
-            },
-            Case {
-                execution_role: "interactive",
-                task_type: "validation",
-                lease_role: "worker",
-                purpose: "general",
-                capability: "repository_read",
-            },
-            Case {
-                execution_role: "interactive",
-                task_type: "discovery",
-                lease_role: "worker",
-                purpose: "general",
-                capability: "repository_read",
-            },
-        ];
-
-        for case in cases {
-            let purpose = crate::task_service::execution::execution_purpose_for_task_type(
-                case.task_type,
-                case.execution_role,
-            );
-            assert_eq!(
-                canonical_workspace_lease_role(case.execution_role).expect("lease class"),
-                case.lease_role
-            );
-            assert_eq!(purpose.to_string(), case.purpose);
-            assert_eq!(
-                workspace_lease_capability_class(
-                    case.task_type,
-                    Some(&purpose.to_string()),
-                    case.execution_role,
-                ),
-                case.capability
-            );
-        }
+        assert_eq!(canonical_workspace_lease_role(true), "reviewer");
+        assert_eq!(canonical_workspace_lease_role(false), "worker");
+        assert_eq!(canonical_workspace_lease_role(false), "worker");
     }
 }

@@ -4,11 +4,18 @@ export const qk = {
   tasks: (projectId: string, filterKey: string) =>
     ['projects', projectId, 'tasks', filterKey] as const,
   task: (taskId: string) => ['tasks', taskId] as const,
+  taskDispatch: (taskId: string) => ['task-dispatch', taskId] as const,
   taskDiff: (taskId: string) => ['tasks', taskId, 'diff'] as const,
   taskDetail: (taskId: string) => ['tasks', taskId, 'detail'] as const,
+  taskArtifacts: (taskId: string) => ['tasks', taskId, 'artifacts'] as const,
+  artifact: (artifactId: string) => ['artifacts', artifactId] as const,
   gates: (taskId: string) => ['tasks', taskId, 'gates'] as const,
   workUnits: (taskId: string) => ['tasks', taskId, 'work-units'] as const,
+  reviewLines: (taskId: string) => ['tasks', taskId, 'review-lines'] as const,
+  workUnitArtifactPackage: (workUnitId: string) =>
+    ['work-units', workUnitId, 'artifact-package'] as const,
   reviewExecutions: (taskId: string) => ['tasks', taskId, 'review-executions'] as const,
+  taskReworkAutomation: (taskId: string) => ['tasks', taskId, 'rework-automation'] as const,
   validationRuns: (taskId: string) => ['tasks', taskId, 'validation-runs'] as const,
   agents: ['agents'] as const,
   agentPages: (limit: number) => ['agents', 'pages', limit] as const,
@@ -18,6 +25,8 @@ export const qk = {
     ['projects', projectId, 'releases', releaseId] as const,
   projectPages: (limit: number) => ['projects', 'pages', limit] as const,
   projectHookRuns: (projectId: string) => ['projects', projectId, 'project-hook-runs'] as const,
+  projectTaskRoleDefaults: (projectId: string) =>
+    ['projects', projectId, 'task-role-defaults'] as const,
   projectHookRunPages: (projectId: string, limit: number) =>
     ['projects', projectId, 'project-hook-runs', limit] as const,
   repos: (projectId: string) => ['projects', projectId, 'repos'] as const,

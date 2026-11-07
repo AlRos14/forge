@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { CaretDown, Check } from '@phosphor-icons/react'
 import { cn } from '@/lib/cn'
+import { popoverPosition } from './popover-position'
 
 export type SelectOption = {
   value: string
@@ -85,13 +86,7 @@ export function Select({
   const updatePosition = useCallback(() => {
     if (!triggerRef.current) return
     const rect = triggerRef.current.getBoundingClientRect()
-    setStyle({
-      position: 'fixed',
-      zIndex: 9999,
-      top: rect.bottom + 4,
-      left: rect.left,
-      minWidth: rect.width,
-    })
+    setStyle(popoverPosition(rect))
   }, [])
 
   useEffect(() => {
@@ -113,10 +108,12 @@ export function Select({
     const onScroll = () => updatePosition()
     document.addEventListener('mousedown', onMouseDown)
     window.addEventListener('scroll', onScroll, true)
+    window.addEventListener('resize', onScroll)
     return () => {
       window.clearTimeout(focusTimer)
       document.removeEventListener('mousedown', onMouseDown)
       window.removeEventListener('scroll', onScroll, true)
+      window.removeEventListener('resize', onScroll)
     }
   }, [firstEnabledIndex, focusOption, open, selectedEnabledIndex, updatePosition])
 
@@ -129,6 +126,7 @@ export function Select({
     }
     if (e.key === 'Escape' && open) {
       e.preventDefault()
+      e.stopPropagation()
       closeSelect(true)
     }
     if (e.key === 'ArrowDown' && !open) {
@@ -163,6 +161,7 @@ export function Select({
       }
     } else if (e.key === 'Escape') {
       e.preventDefault()
+      e.stopPropagation()
       closeSelect(true)
     } else if (e.key === 'Tab') {
       closeSelect(false)
@@ -182,7 +181,7 @@ export function Select({
         aria-expanded={open}
         title={title}
         className={cn(
-          'flex h-9 w-full cursor-pointer items-center justify-between gap-2 rounded-md border border-input bg-background px-3 py-2 text-ui ring-offset-background transition-colors',
+          'flex h-10 min-w-0 w-full cursor-pointer items-center justify-between gap-2 rounded-md border border-input bg-background px-3 py-2 text-ui ring-offset-background transition-colors',
           'hover:bg-accent/40 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2',
           'disabled:cursor-not-allowed disabled:opacity-50',
           className,
@@ -247,7 +246,7 @@ export function Select({
                   size={12}
                   className={cn('shrink-0', option.value === value ? 'opacity-100' : 'opacity-0')}
                 />
-                <span className="truncate">{option.label}</span>
+                <span className="min-w-0 break-words text-left">{option.label}</span>
               </button>
             ))}
           </div>,

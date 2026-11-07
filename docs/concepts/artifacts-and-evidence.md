@@ -65,7 +65,7 @@ principal-bound action.
 
 ## Reproducibility
 
-Artifact and Evidence producers, role, purpose, harness/profile/capability
+Artifact and Evidence producers, role, harness/profile/capability
 snapshots, relevant workspace or commit, timestamps, and content digests are
 preserved sufficiently for audit. Later edits append a new Artifact or
 Evidence record; they do not rewrite historical outputs.

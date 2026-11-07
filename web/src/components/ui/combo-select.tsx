@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { CaretDown, Check, MagnifyingGlass } from '@phosphor-icons/react'
 import { cn } from '@/lib/cn'
+import { popoverPosition } from './popover-position'
 
 export type ComboSelectOption = {
   value: string
@@ -49,17 +50,14 @@ export function ComboSelect({
   const updatePosition = useCallback(() => {
     if (!triggerRef.current) return
     const rect = triggerRef.current.getBoundingClientRect()
-    setStyle({
-      position: 'fixed',
-      zIndex: 9999,
-      top: rect.bottom + 4,
-      left: rect.left,
-      minWidth: Math.max(rect.width, 200),
-    })
+    setStyle(popoverPosition(rect, Math.max(rect.width, 200)))
   }, [])
 
   useEffect(() => {
-    if (!open) { setQuery(''); return }
+    if (!open) {
+      setQuery('')
+      return
+    }
     updatePosition()
     requestAnimationFrame(() => searchRef.current?.focus())
 
@@ -72,9 +70,11 @@ export function ComboSelect({
     const onScroll = () => updatePosition()
     document.addEventListener('mousedown', onMouseDown)
     window.addEventListener('scroll', onScroll, true)
+    window.addEventListener('resize', onScroll)
     return () => {
       document.removeEventListener('mousedown', onMouseDown)
       window.removeEventListener('scroll', onScroll, true)
+      window.removeEventListener('resize', onScroll)
     }
   }, [open, updatePosition])
 
@@ -89,7 +89,9 @@ export function ComboSelect({
   const showCustomOption =
     allowCustom &&
     query.trim() &&
-    !options.some((o) => o.value === query.trim() || o.label.toLowerCase() === query.trim().toLowerCase())
+    !options.some(
+      (o) => o.value === query.trim() || o.label.toLowerCase() === query.trim().toLowerCase(),
+    )
 
   const selectValue = (v: string | null) => {
     onChange(v)
@@ -97,11 +99,20 @@ export function ComboSelect({
   }
 
   const handleSearchKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Escape') { setOpen(false); return }
+    if (e.key === 'Escape') {
+      setOpen(false)
+      return
+    }
     if (e.key === 'Enter') {
       if (e.nativeEvent.isComposing) return
-      if (filtered.length === 1) { selectValue(filtered[0].value); return }
-      if (showCustomOption) { selectValue(query.trim()); return }
+      if (filtered.length === 1) {
+        selectValue(filtered[0].value)
+        return
+      }
+      if (showCustomOption) {
+        selectValue(query.trim())
+        return
+      }
       if (filtered.length === 0 && !allowCustom) return
     }
   }
@@ -126,19 +137,27 @@ export function ComboSelect({
         aria-haspopup="listbox"
         aria-expanded={open}
         className={cn(
-          'flex h-9 w-full cursor-pointer items-center justify-between gap-2 rounded-md border border-input bg-background px-3 py-2 text-ui ring-offset-background transition-colors',
+          'flex h-10 min-w-0 w-full cursor-pointer items-center justify-between gap-2 rounded-md border border-input bg-background px-3 py-2 text-ui ring-offset-background transition-colors',
           'hover:bg-accent/40 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2',
           'disabled:cursor-not-allowed disabled:opacity-50',
           className,
         )}
-        onClick={() => { if (!disabled && !isLoading) { if (!open) updatePosition(); setOpen((v) => !v) } }}
+        onClick={() => {
+          if (!disabled && !isLoading) {
+            if (!open) updatePosition()
+            setOpen((v) => !v)
+          }
+        }}
       >
         <span className={cn('truncate text-left', showPlaceholder && 'text-muted-foreground')}>
           {isLoading ? 'Loading...' : displayLabel}
         </span>
         <CaretDown
           size={12}
-          className={cn('shrink-0 text-muted-foreground transition-transform', open && 'rotate-180')}
+          className={cn(
+            'shrink-0 text-muted-foreground transition-transform',
+            open && 'rotate-180',
+          )}
         />
       </button>
 
@@ -165,7 +184,7 @@ export function ComboSelect({
             </div>
 
             {/* Options */}
-            <div className="max-h-56 overflow-y-auto p-1">
+            <div className="min-h-0 max-h-56 overflow-y-auto p-1">
               {/* Default / clear option */}
               {!query && (
                 <button
@@ -204,7 +223,13 @@ export function ComboSelect({
                       )}
                       onClick={() => selectValue(opt.value)}
                     >
-                      <Check size={12} className={cn('shrink-0', opt.value === value ? 'opacity-100' : 'opacity-0')} />
+                      <Check
+                        size={12}
+                        className={cn(
+                          'shrink-0',
+                          opt.value === value ? 'opacity-100' : 'opacity-0',
+                        )}
+                      />
                       <span className="min-w-0">
                         <span className="block truncate">{opt.label}</span>
                         {opt.description && (

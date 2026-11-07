@@ -226,7 +226,6 @@ async fn seed_task(harness: &Harness) -> SeededTask {
             parent_task_id: None,
             title: "Terminal task".to_owned(),
             description: None,
-            task_type: "implementation".to_owned(),
             lifecycle_state: db::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,

@@ -61,6 +61,7 @@ impl Default for ShutdownSignal {
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<SqliteDb>,
+    pub project_copilot_service: Arc<services::ProjectCopilotService>,
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
     pub credential_service: Arc<CredentialService>,
@@ -172,6 +173,12 @@ impl AppState {
         let cli_task_executor: Arc<dyn TaskExecutor> =
             Arc::new(FallbackExecutor::new(Arc::clone(&adapter_registry)));
         let task_executor = cli_task_executor;
+        let project_copilot_service = Arc::new(services::ProjectCopilotService::new(
+            Arc::clone(&db),
+            Arc::clone(&task_executor),
+            Arc::clone(&credential_service),
+            effective_config.forge.data_dir.clone(),
+        ));
         let workspace_exec_locks = merge_service.workspace_exec_locks();
         let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
         merge_service.set_cleanup_scheduler(Arc::clone(&cleanup_scheduler));
@@ -267,6 +274,7 @@ impl AppState {
 
         Self {
             db,
+            project_copilot_service,
             task_service,
             agent_service,
             credential_service,
@@ -304,6 +312,12 @@ impl AppState {
     }
 
     pub fn with_effective_config(mut self, config: ForgeConfig) -> Self {
+        self.project_copilot_service = Arc::new(services::ProjectCopilotService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.task_executor),
+            Arc::clone(&self.credential_service),
+            config.forge.data_dir.clone(),
+        ));
         self.oauth_service = Arc::new(services::OAuthService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.auth_service),

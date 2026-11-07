@@ -31,8 +31,47 @@ pub(crate) async fn dispatch_tool(
         "forge_get_task" => handlers::forge_get_task(state, arguments).await,
         "forge_get_task_diff" => handlers::forge_get_task_diff(state, arguments).await,
         "forge_list_executions" => handlers::forge_list_executions(state, arguments).await,
-        "forge_start_execution" => handlers::forge_start_execution(state, arguments, context).await,
+        "forge_get_task_dispatch" => {
+            handlers::forge_get_task_dispatch(state, arguments, context).await
+        }
+        "forge_launch_task" => handlers::forge_launch_task(state, arguments, context).await,
+        "forge_pause_task" => handlers::forge_pause_task(state, arguments, context).await,
+        "forge_resume_task" => handlers::forge_resume_task(state, arguments, context).await,
+        "forge_cancel_task" => handlers::forge_cancel_task(state, arguments, context).await,
+        "forge_request_rework" => handlers::forge_request_rework(state, arguments, context).await,
         "forge_update_task" => handlers::forge_update_task(state, arguments).await,
+        "forge_create_work_unit" => {
+            handlers::forge_create_work_unit(state, arguments, context).await
+        }
+        "forge_list_work_units" => handlers::forge_list_work_units(state, arguments, context).await,
+        "forge_submit_work_unit_review" => {
+            handlers::forge_submit_work_unit_review(state, arguments, context).await
+        }
+        "forge_get_work_unit" => handlers::forge_get_work_unit(state, arguments, context).await,
+        "forge_get_work_unit_artifact_package" => {
+            handlers::forge_get_work_unit_artifact_package(state, arguments, context).await
+        }
+        "forge_list_task_review_lines" => {
+            handlers::forge_list_task_review_lines(state, arguments, context).await
+        }
+        "forge_update_work_unit" => {
+            handlers::forge_update_work_unit(state, arguments, context).await
+        }
+        "forge_allocate_work_unit" => {
+            handlers::forge_allocate_work_unit(state, arguments, context).await
+        }
+        "forge_list_work_unit_dependencies" => {
+            handlers::forge_list_work_unit_dependencies(state, arguments, context).await
+        }
+        "forge_add_work_unit_dependency" => {
+            handlers::forge_add_work_unit_dependency(state, arguments, context).await
+        }
+        "forge_remove_work_unit_dependency" => {
+            handlers::forge_remove_work_unit_dependency(state, arguments, context).await
+        }
+        "forge_transition_work_unit" => {
+            handlers::forge_transition_work_unit(state, arguments, context).await
+        }
         "forge_register_agent" => handlers::forge_register_agent(state, arguments, context).await,
         "forge_list_agents" => handlers::forge_list_agents(state, arguments, context).await,
         "forge_list_projects" => handlers::forge_list_projects(state, arguments, context).await,
@@ -58,6 +97,9 @@ pub(crate) async fn dispatch_tool(
         "forge_list_task_roles" => handlers::forge_list_task_roles(state, arguments).await,
         "forge_create_task_role" => {
             handlers::forge_create_task_role(state, arguments, context).await
+        }
+        "forge_update_task_role" => {
+            handlers::forge_update_task_role(state, arguments, context).await
         }
         "forge_add_task_role_member" => {
             handlers::forge_add_task_role_member(state, arguments, context).await

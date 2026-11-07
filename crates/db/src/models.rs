@@ -19,6 +19,155 @@ pub struct Project {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectTaskRoleDefaults {
+    pub project_id: String,
+    pub version: i64,
+    pub roles: Vec<ProjectTaskRoleDefault>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCopilotBinding {
+    pub project_id: String,
+    pub agent_id: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectCopilotRunStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl fmt::Display for ProjectCopilotRunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        })
+    }
+}
+
+impl FromStr for ProjectCopilotRunStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
+            _ => Err(format!("unknown Project Copilot run status: {value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCopilotRun {
+    pub id: String,
+    pub project_id: String,
+    pub agent_id: String,
+    pub user_id: String,
+    pub binding_version: i64,
+    pub agent_version: i64,
+    pub agent_snapshot_json: String,
+    pub context_task_id: Option<String>,
+    pub status: ProjectCopilotRunStatus,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub mcp_token_hash: Option<String>,
+    pub mcp_token_expires_at: Option<String>,
+    pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCopilotMessage {
+    pub id: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub role: String,
+    pub actor_type: String,
+    pub actor_id: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCopilotRunGrant {
+    pub run_id: String,
+    pub project_id: String,
+    pub agent_id: String,
+    pub user_id: String,
+    pub binding_version: i64,
+    pub context_task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectCopilotRun {
+    pub id: String,
+    pub project_id: String,
+    pub agent_id: String,
+    pub user_id: String,
+    pub binding_version: i64,
+    pub agent_version: i64,
+    pub agent_snapshot_json: String,
+    pub context_task_id: Option<String>,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectCopilotMessage {
+    pub id: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub role: String,
+    pub actor_type: String,
+    pub actor_id: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCopilotRunAdmission {
+    pub run: ProjectCopilotRun,
+    pub user_message: ProjectCopilotMessage,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopilotMessagePageQuery {
+    pub cursor: Option<String>,
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectTaskRoleDefault {
+    pub role: String,
+    pub coordination_mode: CoordinationMode,
+    pub configuration_json: String,
+    pub members: Vec<ActorRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectHookRunStatus {
     Queued,
     Running,
@@ -544,11 +693,14 @@ pub struct WorkUnit {
     pub parent_work_unit_id: Option<String>,
     pub title: String,
     pub scope: String,
+    pub execution_instructions: Option<String>,
     pub status: WorkUnitStatus,
     pub role: String,
     pub assigned_actor: Option<ActorRef>,
     pub requires_integration: bool,
     pub provenance: Option<WorkUnitProvenance>,
+    pub review_approval_gate_id: Option<String>,
+    pub review_approval_line_id: Option<String>,
     pub created_by: ActorRef,
     pub version: i64,
     pub created_at: String,
@@ -901,7 +1053,6 @@ pub struct Task {
     pub parent_task_id: Option<String>,
     pub title: String,
     pub description: Option<String>,
-    pub task_type: String,
     pub lifecycle_state: TaskLifecycleState,
     pub is_automation: bool,
     pub priority: i64,
@@ -926,7 +1077,6 @@ pub struct Execution {
     pub actor_kind: Option<ActorKind>,
     pub actor_id: Option<String>,
     pub role: String,
-    pub purpose: Option<ExecutionPurpose>,
     pub status: ExecutionStatus,
     pub stop_reason: Option<StopReason>,
     pub stopped_by: Option<String>,
@@ -1042,17 +1192,6 @@ pub enum ExecutionStatus {
     Completed,
     Failed,
     Cancelled,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExecutionPurpose {
-    Plan,
-    Implement,
-    Review,
-    Validate,
-    Investigate,
-    Orchestrate,
-    General,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1574,16 +1713,6 @@ enum_strings!(ExecutionStatus {
     Cancelled => "cancelled",
 });
 
-enum_strings!(ExecutionPurpose {
-    Plan => "plan",
-    Implement => "implement",
-    Review => "review",
-    Validate => "validate",
-    Investigate => "investigate",
-    Orchestrate => "orchestrate",
-    General => "general",
-});
-
 enum_strings!(HarnessSessionStatus {
     Pending => "pending",
     Active => "active",
@@ -1783,6 +1912,28 @@ pub struct TaskRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRoleCapabilityConfiguration {
+    pub task_role_id: String,
+    pub task_role_version: i64,
+    pub configuration_json: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionTaskRoleAuthority {
+    pub execution_id: String,
+    pub task_role_id: String,
+    pub task_role_version: Option<i64>,
+    pub configuration_json: String,
+    pub capabilities_json: String,
+    pub membership_id: String,
+    pub actor_kind: ActorKind,
+    pub actor_id: String,
+    pub source: String,
+    pub captured_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateTaskRole {
     pub id: String,
     pub task_id: String,
@@ -1799,6 +1950,16 @@ pub struct UpdateTaskRole {
     pub expected_version: i64,
     pub coordination_mode: Option<Option<CoordinationMode>>,
     pub policy_json: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateTaskRoleWithConfiguration {
+    pub id: String,
+    pub expected_version: i64,
+    pub coordination_mode: Option<Option<CoordinationMode>>,
+    pub policy_json: Option<String>,
+    pub configuration_json: String,
     pub updated_at: String,
 }
 
@@ -2407,6 +2568,83 @@ pub struct TaskLifecycle {
     pub reason_ref: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskDispatchState {
+    Idle,
+    Running,
+    Paused,
+    Cancelled,
+}
+
+enum_strings!(TaskDispatchState {
+    Idle => "idle",
+    Running => "running",
+    Paused => "paused",
+    Cancelled => "cancelled",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskDispatchOperation {
+    Launch,
+    Pause,
+    Resume,
+    Cancel,
+}
+
+enum_strings!(TaskDispatchOperation {
+    Launch => "launch",
+    Pause => "pause",
+    Resume => "resume",
+    Cancel => "cancel",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDispatch {
+    pub task_id: String,
+    pub state: TaskDispatchState,
+    pub version: i64,
+    pub requested_by_kind: String,
+    pub requested_by_id: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDispatchReceipt {
+    pub id: String,
+    pub task_id: String,
+    pub operation: TaskDispatchOperation,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub intent_version: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDispatchWrite {
+    pub dispatch: TaskDispatch,
+    pub receipt: TaskDispatchReceipt,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionTaskDispatch {
+    pub task_id: String,
+    pub operation: TaskDispatchOperation,
+    pub state: TaskDispatchState,
+    pub expected_intent_version: i64,
+    pub requested_by_kind: String,
+    pub requested_by_id: Option<String>,
+    pub reason: Option<String>,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub receipt_id: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

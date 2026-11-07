@@ -19,6 +19,20 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
+            let dispatch_state: Option<String> =
+                sqlx::query_scalar("SELECT state FROM task_dispatch WHERE task_id = ?")
+                    .bind(&execution.task_id)
+                    .fetch_optional(self.db.pool())
+                    .await?;
+            if matches!(dispatch_state.as_deref(), Some("paused" | "cancelled")) {
+                tracing::debug!(
+                    task_id = %execution.task_id,
+                    execution_id = %execution.id,
+                    state = ?dispatch_state,
+                    "pending provider Start remains blocked by Task dispatch intent"
+                );
+                continue;
+            }
             let Some(agent_id) = execution.agent_id.as_deref() else {
                 continue;
             };
@@ -61,6 +75,14 @@ impl TaskDispatcher {
         for execution in candidates {
             if self.is_stopped() {
                 break;
+            }
+            let dispatch_state: Option<String> =
+                sqlx::query_scalar("SELECT state FROM task_dispatch WHERE task_id = ?")
+                    .bind(&execution.task_id)
+                    .fetch_optional(self.db.pool())
+                    .await?;
+            if matches!(dispatch_state.as_deref(), Some("paused" | "cancelled")) {
+                continue;
             }
             if !is_exact_auto_recovery_candidate(&execution) {
                 continue;
@@ -172,7 +194,6 @@ mod tests {
             actor_kind: None,
             actor_id: None,
             role: "implementer".to_owned(),
-            purpose: None,
             status: ExecutionStatus::Cancelled,
             stop_reason: Some(StopReason::CrashRecovery),
             stopped_by: Some("system:recovery".to_owned()),

@@ -318,7 +318,6 @@ async fn install_demo_tasks(
                 // independent assignment source.
                 title: demo_task.title.to_owned(),
                 description: Some(demo_task.description.to_owned()),
-                task_type: "implementation".to_owned(),
                 lifecycle_state: demo_task.lifecycle_state,
                 is_automation: false,
                 priority: demo_task.priority,

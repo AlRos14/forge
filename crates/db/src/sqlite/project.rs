@@ -394,6 +394,16 @@ impl ProjectRepo for SqliteDb {
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM task_lifecycle_transition WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_dispatch_receipt WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_dispatch WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_rework_receipt WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM work_unit_result_requirement WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM work_unit_review_subject WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM gate_evaluation_input WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM gate_evaluation WHERE task_id IN
@@ -494,6 +504,15 @@ impl SqliteDb {
             .bind(&input.updated_at)
             .execute(&mut *transaction)
             .await?;
+
+        sqlx::query(
+            "INSERT INTO project_task_role_defaults (project_id, version, updated_at)
+             VALUES (?, 1, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.updated_at)
+        .execute(&mut *transaction)
+        .await?;
 
         if let (Some(member_id), Some(owner_id)) = (owner_member_id, input.owner_id.as_deref()) {
             sqlx::query(

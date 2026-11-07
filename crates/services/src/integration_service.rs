@@ -133,22 +133,38 @@ impl IntegrationService {
                     None,
                     None,
                     None,
-                    None,
                 )
                 .await?;
 
             if let Some(actor) = default_implementer.as_ref() {
-                self.task_service
-                    .create_task_role(
-                        &task.id,
-                        "implementer",
-                        CoordinationMode::Independent,
-                        "{}".to_owned(),
-                    )
-                    .await?;
-                self.task_service
-                    .add_task_role_member(&task.id, "implementer", actor.clone())
-                    .await?;
+                let roles = self.task_service.list_task_roles(&task.id, false).await?;
+                if let Some((_, members)) =
+                    roles.iter().find(|(role, _)| role.role == "implementer")
+                {
+                    let db_actor = match actor {
+                        ActorRef::Human(id) => db::ActorRef::Human(id.clone()),
+                        ActorRef::Agent(id) => db::ActorRef::Agent(id.clone()),
+                    };
+                    let already_present =
+                        members.iter().any(|member| member.actor_ref() == db_actor);
+                    if !already_present {
+                        self.task_service
+                            .add_task_role_member(&task.id, "implementer", actor.clone())
+                            .await?;
+                    }
+                } else {
+                    self.task_service
+                        .create_task_role(
+                            &task.id,
+                            "implementer",
+                            CoordinationMode::Independent,
+                            "{}".to_owned(),
+                        )
+                        .await?;
+                    self.task_service
+                        .add_task_role_member(&task.id, "implementer", actor.clone())
+                        .await?;
+                }
             }
 
             let now = now_rfc3339();

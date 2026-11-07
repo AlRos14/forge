@@ -33,6 +33,28 @@ Plan PR0 does not change:
   locations;
 * deployment, publication, or upstream integration.
 
+## Task-driven dispatch implementation status
+
+The current runtime implements Task-level dispatch intent in `task_dispatch`
+and `task_dispatch_receipt` (V141). An authenticated launch binds the exact
+Task and TaskLifecycle versions and records an idempotency receipt. The
+existing TaskDispatcher reads running intents, derives WorkUnit readiness, and
+admits exact assigned Agent WorkUnits; it does not allocate Roles, choose an
+unassigned member, or create WorkUnits. Human-assigned WorkUnits remain
+pending human work with no synthetic Execution.
+
+V142 retires the active `execution.purpose` column after preserving every
+historical value in `pr13_execution_purpose_history`; purpose-dependent
+triggers and views were rewritten over Role, WorkUnit, Artifact, subject, and
+Wake facts. V143 adds bounded rework receipts plus exact result/review subject
+relations. V144 adds optional WorkUnit harness instructions.
+
+A completed Execution leaves an open WorkUnit `awaiting_acceptance`; it does
+not silently complete the WorkUnit or authorize another automatic attempt.
+Correction plus new review is one idempotent operation over an exact
+request-changes ReviewReport. See
+[ADR 0014](../adr/0014-task-launch-and-purpose-retirement.md).
+
 ## Invariants touched
 
 The documentation establishes all INV-001 through INV-037 below. No runtime
@@ -105,10 +127,9 @@ optional validation-report Artifact, and their domain events commit together.
 Evidence SQL guards compare its same-Task producer and its recorded check,
 configuration, Workspace, commit, snapshot, status, and exit code.
 
-Cognitive review is now a real Human or Agent reviewer Execution with purpose
-`review`. Completion requires its unique exact `review_report` Artifact;
-structured `FORGE_RESULT` remains only the harness transport parsed into that
-Artifact. New deterministic checks create ValidationRuns and Evidence and do
+Cognitive review is now a real Human or Agent reviewer Execution. Completion
+requires its unique exact `review_report` Artifact; structured `FORGE_RESULT`
+remains only the harness transport parsed into that Artifact. New deterministic checks create ValidationRuns and Evidence and do
 not create or update a Review row. Review output and Validation output remain
 independent. TaskLifecycle and Gate policy own current transition admission;
 retired workflow hooks and review rows cannot affect it.
@@ -261,8 +282,12 @@ and task-move storage. Public routes and UI use exact TaskLifecycle transition
 receipts, Gate policy revisions/evaluations, and current TaskRole/RoleMembership
 records. MCP exposes target lifecycle, Gates, Review Executions/reports,
 ValidationRuns, Evidence, roles/memberships, and generic collaboration through
-exact identities. Formal Review remains exactly reviewer role plus review
-purpose.
+exact identities. V149–V156 add versioned TaskRole capability configuration and
+immutable Execution authority snapshots. Formal Review is an Execution admitted
+with `formal_review` and its exact ReviewReport output; a role name alone has no
+authority. Review lines bind approval to the latest exact result, while durable
+rework intents preserve replay safety and Artifact manifests bind multi-input
+package results.
 
 PR12 stopped applying historical `ProjectSettings.default_role_assignments`
 to newly created Tasks and removed the old state-driven lifecycle script
@@ -409,16 +434,25 @@ Concurrent activity is represented by Executions and derived projections.
 
 ### INV-008 — Execution is the atomic historical work record
 
-Each Execution has exactly one Task, Actor, Role, and Purpose. It may reference
-a WorkUnit, HarnessSession, Workspace, parent Execution, configuration and
+Each Execution has exactly one Task, Actor, and Role. It may reference a
+WorkUnit, HarnessSession, Workspace, parent Execution, configuration and
 capability snapshots, usage, outputs, and timestamps. Identity-bearing fields
 are immutable after start.
 
-### INV-009 — Execution Purpose is not permission
+Project Copilot adds a separate Project management boundary: its durable run
+records the exact Project, Agent, requesting Human and configuration revision
+without claiming to be a Task Execution. Management conversations and WorkUnit
+decomposition proposals are Project activity. Formal Task deliverables and
+their Artifact producers continue to require real Task Executions. The
+[Project Copilot contract](../concepts/project-copilot.md) describes its bounded
+MCP delegation and transactional authority checks.
 
-Purpose answers why an Execution exists. Permission and sandbox policy answer
-what it may do. Initial purposes are plan, implement, review, validate,
-investigate, orchestrate, and general. Plan is never a permission level.
+### INV-009 — Execution classification is not permission
+
+Role, WorkUnit scope, WorkspaceLease, sandbox policy, and explicit Artifact or
+subject relations answer what an Execution is doing and what it may do.
+Permission and sandbox policy never derive from a separate execution-purpose
+classification. Historical purpose values are migration evidence only.
 
 ### INV-010 — HarnessSession is first-class
 
@@ -445,9 +479,9 @@ Unknown capability is not supported capability.
 
 ### INV-014 — Planning is an Execution
 
-Planning is an Execution with purpose plan. Its output is a generic plan
+Planning is an ordinary Execution whose deliverable is a generic plan
 Artifact produced by the Actor. Planning is not a separate Forge cognition
-subsystem.
+subsystem and does not require a purpose classification.
 
 ### INV-015 — No canonical plan engine
 
@@ -549,10 +583,10 @@ environment/configuration summary, workspace/commit identity, timestamps,
 status, exit code, and log/output reference. It does not require a Human,
 Agent, HarnessSession, or fake System Actor and produces Evidence plus an
 optional generic validation-report Artifact. A Human or Agent may perform
-cognitive validation through an ordinary Execution with purpose `validate` or
-`investigate`. Review is cognitive judgment recorded by a reviewer Execution.
-CI passing does not imply review passing, and review passing does not imply a
-ValidationRun ran. Both may be Gates.
+cognitive validation or investigation through an ordinary Execution under its
+explicit Role and WorkUnit scope. Review is cognitive judgment recorded by a
+reviewer Execution. CI passing does not imply review passing, and review
+passing does not imply a ValidationRun ran. Both may be Gates.
 
 ### INV-029 — Review feedback is collaboration
 
@@ -577,9 +611,10 @@ an uncertain external effect is never sent again.
 
 An Orchestrator Execution has no WorkUnit or WorkspaceLease. Its claim instead
 resolves the exact current OrchestratorWake attempt and, in that same write
-transaction, checks the Execution's Task, Agent Actor, `orchestrator` Role,
-`orchestrate` Purpose, active TaskRole membership, TaskRole version and policy
-snapshot, current Wake state, attempt number, and unexpired Wake lease. A lost
+transaction, checks the Execution's Task, Agent Actor, exact TaskRole and
+`orchestration` capability snapshot, active TaskRole membership, current
+TaskRole version and policy snapshot, current Wake state, attempt number, and
+unexpired Wake lease. A lost
 authority claim records no provider attempt. The external attempt receipt is
 still checked first so accepted, rejected, and uncertain provider outcomes
 cannot be replayed.
@@ -608,7 +643,7 @@ claims native success.
 
 ### INV-033 — Historical execution is auditable
 
-Execution history persists Actor, Role, Purpose, Agent, harness, model/profile,
+Execution history persists Actor, Role, Agent, harness, model/profile,
 capability, workspace, session, relevant configuration, usage, and outputs
 well enough to reproduce the authority and environment of the run. Later
 configuration changes do not rewrite history.
@@ -722,9 +757,11 @@ that is documented and reviewed.
 
 PR13 applied migrations V121–V134 after the PR12 V120 baseline. The post-V2
 security hardening adds V135, a forward-only canonical Project owner membership
-repair. The cutover preserves historical values in dedicated history tables and
-migration receipts; those records do not authorize legacy runtime reads or
-writes.
+repair. The task-driven WorkUnit follow-up adds V141–V144 for dispatch intent,
+purpose retirement, bounded rework/result subjects, and WorkUnit harness
+instructions. The cutover preserves historical values in dedicated history
+tables and migration receipts; those records do not authorize legacy runtime
+reads or writes.
 
 | Migration | Cutover |
 | --- | --- |
@@ -739,6 +776,11 @@ writes.
 | V133 | Add immutable follow-up operation receipts so one idempotency key replays its exact child Execution and cannot authorize different request content. |
 | V134 | Replace the WorkUnit Execution admission trigger with distinct rejection markers, preserving exact typed causes for capacity, RoleMembership, WorkUnit, Workspace, dependency, and concurrent-Execution failures. |
 | V135 | Repair `Project.owner_id` representation by inserting or aligning the exact role-`owner` membership, without inventing an owner for an ownerless Project. |
+| V141 | Add durable Task dispatch intent and immutable launch/pause/resume/cancel receipts; backfill every existing Task as `idle`. |
+| V142 | Preserve exact historical Execution purpose values, rewrite purpose-dependent triggers/views over Role and exact records, and remove the active purpose column. |
+| V143 | Add bounded rework receipts plus exact WorkUnit result-requirement and review-subject relations. |
+| V144 | Add optional WorkUnit harness execution instructions. |
+| V145 | Reject automatic WorkUnit admission when the Task dispatch intent is paused/cancelled and enforce the four-Execution per-Task ceiling inside the admission transaction. |
 
 ProjectRelease GETs are read-only and reconstruct only from `project_release`,
 `project_release_history_*`, shared media assets, and tombstones. They validate

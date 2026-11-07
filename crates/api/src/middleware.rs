@@ -173,6 +173,28 @@ pub async fn mcp_auth_middleware(
         );
     };
 
+    if token.starts_with("fgc_") {
+        return match state
+            .project_copilot_service
+            .authenticate_token(&token)
+            .await
+        {
+            Ok(grant) => {
+                req.extensions_mut().insert(mcp_server::McpUser {
+                    user_id: grant.user_id.clone(),
+                    is_admin: false,
+                });
+                req.extensions_mut().insert(grant);
+                next.run(req).await
+            }
+            Err(_) => unauthorized_response_with_challenge(
+                "invalid_token",
+                "Authentication failed",
+                state.effective_config.trusted_origin().as_str(),
+            ),
+        };
+    }
+
     let result: Result<(String, String, bool), String> = if token.starts_with("fg_") {
         state.auth_service.verify_pat(&token).await
     } else if let Ok(claims) = state.auth_service.verify_token(&token).await {

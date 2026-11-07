@@ -28,7 +28,7 @@ pub use execution_events::ServerExecutionEventSink;
 pub use execution_local::EmbeddedExecutionProvider;
 pub use fs_local::EmbeddedFilesystemProvider;
 pub use providers::{ExecutionProvider, FilesystemProvider};
-pub use remote::{RemoteExecutionProvider, RemoteFilesystemProvider};
+pub use remote::{discover_harness_options, RemoteExecutionProvider, RemoteFilesystemProvider};
 pub use router::{select_execution_provider, select_filesystem_provider};
 
 pub const DAEMON_OUTBOUND_BUFFER: usize = 256;

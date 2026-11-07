@@ -4,7 +4,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -87,6 +87,8 @@ pub struct DiscoveredOptions {
     pub models: Vec<String>,
     pub permission_policies: Vec<String>,
     pub cli_specific: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// Generic policy posture after one adapter interprets its concrete config.
@@ -110,6 +112,13 @@ pub struct ExecutionOverrides {
 #[async_trait]
 pub trait HarnessAdapter: Send + Sync {
     fn kind(&self) -> ExecutorKind;
+
+    /// This integration can bind the delegated management MCP and restrict
+    /// model-callable tools for a Project Copilot run. Availability and the
+    /// current Agent/host authority are checked separately at invocation.
+    fn supports_project_copilot(&self) -> bool {
+        false
+    }
 
     /// Legacy family-level detector used by adapters whose availability does
     /// not depend on one candidate's normalized configuration.
@@ -287,6 +296,18 @@ fn require_planning_capability(
 
 #[async_trait]
 impl TaskExecutor for AdapterExecutor {
+    fn project_copilot_harnesses(&self) -> Vec<ExecutorKind> {
+        self.registry
+            .kinds()
+            .into_iter()
+            .filter(|kind| {
+                self.registry
+                    .get(kind)
+                    .is_some_and(HarnessAdapter::supports_project_copilot)
+            })
+            .collect()
+    }
+
     async fn execute(&self, mut ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
         let (kind, raw_config) = executor_config_pair(&ctx.agent_config)?;
         let adapter = self.registry.get(&kind).ok_or_else(|| {
@@ -370,7 +391,41 @@ pub const DEFAULT_ACCOUNT_COOLDOWN: std::time::Duration = std::time::Duration::f
 pub struct FallbackExecutor {
     registry: Arc<HarnessAdapterRegistry>,
     cooldowns: std::sync::Mutex<HashMap<String, std::time::Instant>>,
-    cancellations: std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    cancellations: std::sync::Mutex<HashMap<String, Arc<CancellationState>>>,
+    prepared_executions: std::sync::Mutex<HashSet<String>>,
+}
+
+struct CancellationState {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    signal: CancellationToken,
+}
+
+impl CancellationState {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            signal: CancellationToken::new(),
+        }
+    }
+}
+
+struct ClearUnpreparedCancellation<'a> {
+    executor: &'a FallbackExecutor,
+    execution_id: String,
+}
+
+impl Drop for ClearUnpreparedCancellation<'_> {
+    fn drop(&mut self) {
+        let prepared = self
+            .executor
+            .prepared_executions
+            .lock()
+            .expect("prepared execution lock poisoned")
+            .contains(&self.execution_id);
+        if !prepared {
+            self.executor.clear_cancellation(&self.execution_id);
+        }
+    }
 }
 
 struct RouteCandidate {
@@ -388,6 +443,7 @@ impl FallbackExecutor {
             registry,
             cooldowns: std::sync::Mutex::new(HashMap::new()),
             cancellations: std::sync::Mutex::new(HashMap::new()),
+            prepared_executions: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -395,12 +451,20 @@ impl FallbackExecutor {
     /// task. This lets a generation retirement cancel a Start that has been
     /// accepted but has not entered `execute` yet.
     pub fn prepare_execution(&self, execution_id: &str) {
-        let _ = self.cancellation_flag(execution_id);
+        let _ = self.cancellation_state(execution_id);
+        self.prepared_executions
+            .lock()
+            .expect("prepared execution lock poisoned")
+            .insert(execution_id.to_owned());
     }
 
     /// Release the reservation after the daemon execution task has completed,
     /// including failures that happen before `execute` is entered.
     pub fn finish_execution(&self, execution_id: &str) {
+        self.prepared_executions
+            .lock()
+            .expect("prepared execution lock poisoned")
+            .remove(execution_id);
         self.clear_cancellation(execution_id);
     }
 
@@ -529,12 +593,12 @@ impl FallbackExecutor {
             .insert(account_key.to_owned(), std::time::Instant::now() + cooldown);
     }
 
-    fn cancellation_flag(&self, execution_id: &str) -> Arc<std::sync::atomic::AtomicBool> {
+    fn cancellation_state(&self, execution_id: &str) -> Arc<CancellationState> {
         self.cancellations
             .lock()
             .expect("cancellation lock poisoned")
             .entry(execution_id.to_owned())
-            .or_default()
+            .or_insert_with(|| Arc::new(CancellationState::new()))
             .clone()
     }
 
@@ -588,7 +652,32 @@ impl FallbackExecutor {
 
 #[async_trait]
 impl TaskExecutor for FallbackExecutor {
+    fn project_copilot_harnesses(&self) -> Vec<ExecutorKind> {
+        self.registry
+            .kinds()
+            .into_iter()
+            .filter(|kind| {
+                self.registry
+                    .get(kind)
+                    .is_some_and(HarnessAdapter::supports_project_copilot)
+            })
+            .collect()
+    }
+
+    fn prepare_execution(&self, execution_id: &str) {
+        FallbackExecutor::prepare_execution(self, execution_id);
+    }
+
+    fn finish_execution(&self, execution_id: &str) {
+        FallbackExecutor::finish_execution(self, execution_id);
+    }
+
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
+        let cancellation = self.cancellation_state(&ctx.execution_id);
+        let _clear_unprepared = ClearUnpreparedCancellation {
+            executor: self,
+            execution_id: ctx.execution_id.clone(),
+        };
         let is_resume = matches!(
             &ctx.invocation,
             api_types::HarnessInvocation::Resume { .. }
@@ -597,14 +686,15 @@ impl TaskExecutor for FallbackExecutor {
                 }
         );
         let candidates = self.route(&ctx, !is_resume)?;
-        let cancelled = self.cancellation_flag(&ctx.execution_id);
+        let cancelled = Arc::clone(&cancellation.cancelled);
         let single_candidate = candidates.len() == 1;
 
         let mut writer = crate::LogWriter::new(
             std::path::Path::new(&ctx.logs_path),
             ctx.execution_id.clone(),
             crate::log_writer::DEFAULT_MAX_OUTPUT_BYTES,
-        );
+        )
+        .with_runtime_secret_redactions(&ctx.agent_config);
         if let Some(sender) = ctx.log_sender.clone() {
             writer.set_log_sender(sender);
         }
@@ -695,22 +785,35 @@ impl TaskExecutor for FallbackExecutor {
                 let invocation = candidate_ctx.invocation.clone();
                 let capabilities = &candidate.harness_capabilities;
                 require_planning_capability(capabilities, &invocation)?;
-                let attempt = if invocation.is_planning() {
-                    adapter.execute(candidate_ctx).await
-                } else {
-                    match invocation {
-                        api_types::HarnessInvocation::Start => adapter.start(candidate_ctx).await,
-                        api_types::HarnessInvocation::Resume {
-                            external_session_id,
-                        } => adapter.resume(candidate_ctx, &external_session_id).await,
-                        api_types::HarnessInvocation::Planning { .. } => unreachable!(),
+                let attempt_future = async {
+                    if invocation.is_planning() {
+                        adapter.execute(candidate_ctx).await
+                    } else {
+                        match invocation {
+                            api_types::HarnessInvocation::Start => {
+                                adapter.start(candidate_ctx).await
+                            }
+                            api_types::HarnessInvocation::Resume {
+                                external_session_id,
+                            } => adapter.resume(candidate_ctx, &external_session_id).await,
+                            api_types::HarnessInvocation::Planning { .. } => unreachable!(),
+                        }
                     }
+                };
+                let attempt = tokio::select! {
+                    biased;
+                    () = cancellation.signal.cancelled() => Ok(ExecutionResult {
+                        status: crate::ExecutionOutcome::Cancelled,
+                        ..Default::default()
+                    }),
+                    attempt = attempt_future => attempt,
                 };
                 writer = crate::LogWriter::new(
                     std::path::Path::new(&ctx.logs_path),
                     ctx.execution_id.clone(),
                     crate::log_writer::DEFAULT_MAX_OUTPUT_BYTES,
-                );
+                )
+                .with_runtime_secret_redactions(&ctx.agent_config);
                 if let Some(sender) = ctx.log_sender.clone() {
                     writer.set_log_sender(sender);
                 }
@@ -789,8 +892,6 @@ impl TaskExecutor for FallbackExecutor {
             None
         };
 
-        self.clear_cancellation(&ctx.execution_id);
-
         if let Some(result) = outcome {
             return Ok(result);
         }
@@ -826,14 +927,11 @@ impl TaskExecutor for FallbackExecutor {
     }
 
     async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError> {
-        if let Some(flag) = self
-            .cancellations
-            .lock()
-            .expect("cancellation lock poisoned")
-            .get(execution_id)
-        {
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        let cancellation = self.cancellation_state(execution_id);
+        cancellation
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        cancellation.signal.cancel();
         let mut failures = Vec::new();
         for kind in self.registry.kinds() {
             if let Some(adapter) = self.registry.get(&kind) {
@@ -1031,6 +1129,7 @@ mod tests {
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),
+                task_role_capabilities: vec![],
                 worktree_path: ".".to_owned(),
                 description: "do it".to_owned(),
                 agent_config: serde_json::json!({
@@ -1148,6 +1247,7 @@ mod tests {
             usage_output_tokens: i64,
         },
         AwaitCancel,
+        AwaitBeforeDispatch,
         UnavailableAtDetect,
     }
 
@@ -1158,6 +1258,7 @@ mod tests {
         observed_configs: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         invocations: Arc<std::sync::Mutex<Vec<api_types::HarnessInvocation>>>,
         started: Arc<tokio::sync::Notify>,
+        dispatch_gate: Arc<tokio::sync::Notify>,
         cancelled: Arc<std::sync::atomic::AtomicBool>,
     }
 
@@ -1173,6 +1274,7 @@ mod tests {
                 observed_configs: Arc::default(),
                 invocations: Arc::default(),
                 started: Arc::new(tokio::sync::Notify::new()),
+                dispatch_gate: Arc::new(tokio::sync::Notify::new()),
                 cancelled: Arc::default(),
             }
         }
@@ -1249,6 +1351,13 @@ mod tests {
                 .or_else(|| ctx.agent_config["profile"].as_str())
                 .expect("scripted config has model or profile")
                 .to_owned();
+            if matches!(
+                self.behaviors.get(&key),
+                Some(ScriptedBehavior::AwaitBeforeDispatch)
+            ) {
+                self.started.notify_one();
+                self.dispatch_gate.notified().await;
+            }
             self.calls.lock().unwrap().push(key.clone());
             let usage = |output_tokens: i64| crate::TokenUsage {
                 output_tokens,
@@ -1284,6 +1393,10 @@ mod tests {
                         ..Default::default()
                     })
                 }
+                ScriptedBehavior::AwaitBeforeDispatch => Ok(ExecutionResult {
+                    status: ExecutionOutcome::Completed,
+                    ..Default::default()
+                }),
                 ScriptedBehavior::UnavailableAtDetect => Err(ExecutorError::Unavailable(
                     "scripted candidate should have been filtered by detect".to_owned(),
                 )),
@@ -1313,6 +1426,7 @@ mod tests {
             task_id: "task".to_owned(),
             execution_id: execution_id.to_owned(),
             role: "coder".to_owned(),
+            task_role_capabilities: vec![],
             worktree_path: ".".to_owned(),
             description: "do it".to_owned(),
             agent_config: serde_json::json!({
@@ -1558,7 +1672,80 @@ mod tests {
             .expect("pre-cancelled execution returns a terminal outcome");
         assert_eq!(result.status, ExecutionOutcome::Cancelled);
         assert!(calls.lock().unwrap().is_empty());
+        executor.finish_execution("pre-cancelled");
         assert!(!executor.owns_execution("pre-cancelled"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_before_execute_without_reservation_never_starts_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, calls) = fallback_executor(&[(
+            "model-a",
+            ScriptedBehavior::Complete {
+                usage_output_tokens: 1,
+            },
+        )]);
+
+        executor
+            .cancel("cancelled-before-execute")
+            .await
+            .expect("early cancellation installs a tombstone");
+        assert!(executor.owns_execution("cancelled-before-execute"));
+        let result = executor
+            .execute(routed_ctx("cancelled-before-execute", dir.path()))
+            .await
+            .expect("cancelled execution returns terminal outcome");
+
+        assert_eq!(result.status, ExecutionOutcome::Cancelled);
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(!executor.owns_execution("cancelled-before-execute"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_adapter_pre_dispatch_await_drops_start_before_side_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ScriptedAdapter::new(
+            ExecutorKind::Smith,
+            &[
+                ("model-a", ScriptedBehavior::AwaitBeforeDispatch),
+                (
+                    "model-b",
+                    ScriptedBehavior::Complete {
+                        usage_output_tokens: 5,
+                    },
+                ),
+            ],
+        );
+        let calls = Arc::clone(&adapter.calls);
+        let entered_dispatch = Arc::clone(&adapter.started);
+        let mut registry = HarnessAdapterRegistry::new();
+        registry.register(Box::new(adapter));
+        let executor = Arc::new(FallbackExecutor::new(Arc::new(registry)));
+        let run = tokio::spawn({
+            let executor = Arc::clone(&executor);
+            let ctx = routed_ctx("cancel-during-dispatch", dir.path());
+            async move { executor.execute(ctx).await }
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            entered_dispatch.notified(),
+        )
+        .await
+        .expect("adapter reached the pre-dispatch barrier");
+        executor
+            .cancel("cancel-during-dispatch")
+            .await
+            .expect("cancellation interrupts the pending adapter future");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("cancelled route terminates promptly")
+            .expect("execution task joins")
+            .expect("terminal outcome returns");
+
+        assert_eq!(result.status, ExecutionOutcome::Cancelled);
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(!executor.owns_execution("cancel-during-dispatch"));
     }
 
     #[tokio::test]
