@@ -254,7 +254,7 @@ impl TaskCoordinationRepo for SqliteDb {
         input: AuthorizeTaskCoordinationInput,
         expected_task_version: i64,
     ) -> Result<TaskCoordinationWrite> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(existing) = sqlx::query(
             "SELECT * FROM task_coordination_receipt
              WHERE task_id = ? AND idempotency_key = ?",
@@ -377,7 +377,7 @@ impl TaskCoordinationRepo for SqliteDb {
         input: RevokeTaskCoordinationInput,
         expected_task_version: i64,
     ) -> Result<TaskCoordinationWrite> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(existing) = sqlx::query(
             "SELECT * FROM task_coordination_receipt
              WHERE task_id = ? AND idempotency_key = ?",
@@ -527,7 +527,7 @@ impl TaskCoordinationRepo for SqliteDb {
         &self,
         input: CreateTaskCoordinationRequestInput,
     ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(existing) = sqlx::query(
             "SELECT * FROM task_coordination_request
              WHERE task_id = ? AND idempotency_key = ?",
@@ -670,7 +670,7 @@ impl TaskCoordinationRepo for SqliteDb {
         &self,
         input: UpdateTaskCoordinationRequestState,
     ) -> Result<TaskCoordinationRequest> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut query =
             sqlx::QueryBuilder::<Sqlite>::new("UPDATE task_coordination_request SET state = ");
         query.push_bind(input.state.to_string());
@@ -725,7 +725,7 @@ impl TaskCoordinationRepo for SqliteDb {
         &self,
         input: CompleteTaskCoordinationTurnInput,
     ) -> Result<TaskCoordinationPlanWrite> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let request = sqlx::query("SELECT * FROM task_coordination_request WHERE id = ?")
             .bind(&input.request_id)
             .fetch_optional(&mut *tx)
@@ -884,7 +884,7 @@ impl TaskCoordinationRepo for SqliteDb {
         updated_at: &str,
         event: Option<CreateDomainEvent>,
     ) -> Result<TaskCoordinationPlan> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut query =
             sqlx::QueryBuilder::<Sqlite>::new("UPDATE task_coordination_plan SET state = ");
         query.push_bind(state.to_string());
@@ -925,7 +925,7 @@ impl TaskCoordinationRepo for SqliteDb {
         &self,
         input: MaterializeTaskCoordinationPlanInput,
     ) -> Result<TaskCoordinationMaterialization> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(existing) = sqlx::query(
             "SELECT * FROM task_coordination_materialization WHERE plan_artifact_id = ?",
         )
@@ -1157,7 +1157,7 @@ impl TaskCoordinationRepo for SqliteDb {
         &self,
         input: CreateTaskQualityRequestInput,
     ) -> Result<TaskQualityWrite> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(existing) = sqlx::query(
             "SELECT * FROM task_quality_request WHERE task_id = ? AND idempotency_key = ?",
         )
@@ -1290,7 +1290,7 @@ impl TaskCoordinationRepo for SqliteDb {
         updated_at: &str,
         event: Option<CreateDomainEvent>,
     ) -> Result<TaskQualityRequest> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut query =
             sqlx::QueryBuilder::<Sqlite>::new("UPDATE task_quality_request SET state = ");
         query.push_bind(state.to_string());
@@ -1334,7 +1334,7 @@ impl TaskCoordinationRepo for SqliteDb {
         &self,
         input: CreateTaskInterventionInput,
     ) -> Result<TaskInterventionWrite> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(existing) =
             sqlx::query("SELECT * FROM task_intervention WHERE task_id = ? AND idempotency_key = ?")
                 .bind(&input.task_id)
@@ -1431,7 +1431,7 @@ impl TaskCoordinationRepo for SqliteDb {
         updated_at: &str,
         event: Option<CreateDomainEvent>,
     ) -> Result<TaskIntervention> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut query = sqlx::QueryBuilder::<Sqlite>::new("UPDATE task_intervention SET state = ");
         query.push_bind(state.to_string());
         query
