@@ -6,7 +6,14 @@ from pathlib import Path
 
 document = Path(__file__).resolve().parents[1] / "docs/getting-started.md"
 text = document.read_text(encoding="utf-8")
-section = text.split("## 8. Review, validation, gates, integration, and closure", 1)[1]
+anchor = "### 1. Confirm the exact Execution completed"
+anchor_index = text.find(anchor)
+if anchor_index < 0:
+    raise SystemExit("Getting Started review/closure anchor is missing")
+heading_index = text.rfind("## ", 0, anchor_index)
+if heading_index < 0:
+    raise SystemExit("Getting Started review/closure heading is missing")
+section = text[heading_index:]
 
 if 'if [[ "$STATUS" != "completed" ]]; then' not in text:
     raise SystemExit("Getting Started must stop unless the exact Execution completed")
