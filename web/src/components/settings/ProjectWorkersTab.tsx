@@ -229,11 +229,24 @@ export function ProjectWorkersTab({ projectId }: { projectId: string }) {
               <Plus size={15} aria-hidden="true" /> Add role
             </Button>
           </div>
-          {selectedTemplate?.description ? (
-            <p className="mt-3 max-w-3xl text-xs leading-relaxed text-muted-foreground">
-              <span className="font-medium text-foreground">{selectedTemplate.label}:</span>{' '}
-              {selectedTemplate.description}
-            </p>
+          {selectedTemplate ? (
+            <div className="mt-3 max-w-3xl space-y-1 text-xs leading-relaxed text-muted-foreground">
+              {selectedTemplate.description ? (
+                <p>
+                  <span className="font-medium text-foreground">{selectedTemplate.label}:</span>{' '}
+                  {selectedTemplate.description}
+                </p>
+              ) : null}
+              <p>
+                <span className="font-medium text-foreground">Starts with:</span>{' '}
+                {selectedTemplate.default_capabilities.length
+                  ? selectedTemplate.default_capabilities
+                      .map((capability) => capability.replaceAll('_', ' '))
+                      .join(', ')
+                  : 'no special capability; review the role before saving'}
+                . You can edit capabilities and correction routing below.
+              </p>
+            </div>
           ) : null}
         </section>
       </div>

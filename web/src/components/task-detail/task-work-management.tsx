@@ -64,6 +64,15 @@ function hasFormalReview(role: TaskRoleResponse | undefined): boolean {
   return role?.configuration.capabilities.includes('formal_review') ?? false
 }
 
+function taskRoleLabel(role: TaskRoleResponse): string {
+  return role.configuration.display_label?.trim() || role.role.replaceAll('_', ' ')
+}
+
+function roleNameLabel(roles: TaskRoleResponse[], roleName: string): string {
+  const role = roles.find((item) => item.role === roleName)
+  return role ? taskRoleLabel(role) : roleName.replaceAll('_', ' ')
+}
+
 function actorKey(actor: ActorRef | null): string {
   return actor ? `${actor.kind}:${actor.id}` : ''
 }
@@ -207,15 +216,17 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
 
   const createRole = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
+    const template = capabilityCatalog.data?.templates.find(
+      (item) => item.id === newRoleTemplate,
+    )
     const body: CreateTaskRoleRequest = {
       role: newRole.trim(),
       coordination_mode: newRoleMode,
       configuration: {
         schema_version: 1,
-        display_label: null,
-        capabilities:
-          capabilityCatalog.data?.templates.find((template) => template.id === newRoleTemplate)
-            ?.default_capabilities ?? [],
+        display_label:
+          template && template.default_role !== 'custom' ? (template.label ?? null) : null,
+        capabilities: template?.default_capabilities ?? [],
         rework: null,
       },
       policy: {},
@@ -601,9 +612,11 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
         return (
           <article key={role.id} className="space-y-3 rounded-md border p-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <h3 className="font-medium">{role.role}</h3>
-                <p className="text-xs text-muted-foreground">TaskRole v{role.version}</p>
+              <div className="min-w-0">
+                <h3 className="break-words font-medium">{taskRoleLabel(role)}</h3>
+                <p className="text-xs text-muted-foreground">
+                  TaskRole {role.role} · v{role.version}
+                </p>
               </div>
               <Button
                 size="sm"
@@ -769,7 +782,7 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
               <option value="">Create a TaskRole first</option>
               {task.task_roles.map((role) => (
                 <option key={role.id} value={role.role}>
-                  {role.role}
+                  {taskRoleLabel(role)}
                 </option>
               ))}
             </select>
@@ -1100,7 +1113,7 @@ function WorkUnitCard(props: WorkUnitCardProps) {
       <div className="flex flex-wrap items-center gap-2">
         <strong>{unit.title}</strong>
         <span className="text-xs text-muted-foreground">
-          {unit.status} · v{unit.version} · {unit.role}
+          {unit.status} · v{unit.version} · {roleNameLabel(roles, unit.role)}
         </span>
         <code className="ml-auto text-xs text-muted-foreground">{unit.id}</code>
       </div>
@@ -1202,7 +1215,7 @@ function WorkUnitCard(props: WorkUnitCardProps) {
                   reviewSubject ? !hasFormalReview(role) : hasFormalReview(role)
                 }
               >
-                {role.role}
+                {taskRoleLabel(role)}
               </option>
             ))}
           </select>

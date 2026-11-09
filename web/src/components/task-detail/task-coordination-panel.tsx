@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { Link } from '@tanstack/react-router'
 import { toast } from 'sonner'
 import {
   useAgentAvailability,
@@ -13,6 +14,14 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CopyReferenceButton } from '@/components/ui/copy-reference-button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
@@ -30,6 +39,13 @@ import type {
   TaskInterventionKind,
   TaskCoordinationPlanDecision,
 } from '@/types/generated'
+import {
+  coordinationRoleLabel,
+  deriveCoordinationNextAction,
+  dispatchStateLabel,
+  isTurnBudgetExhausted,
+  readableCoordinationCode,
+} from './task-coordination-status'
 import { TaskInterventionsPanel } from './task-interventions-panel'
 import { TaskQualityRequestsPanel } from './task-quality-requests-panel'
 
@@ -78,37 +94,24 @@ const planStateLabels: Record<TaskCoordinationPlanResponse['state'], string> = {
   materialized: 'Materialized',
 }
 
-const dispatchStateLabels: Record<TaskCoordinationOverviewResponse['dispatch']['state'], string> = {
-  idle: 'No dispatch intent',
-  running: 'Dispatch intent is running',
-  paused: 'Dispatch is paused',
-  cancelled: 'Dispatch is cancelled',
-}
-
 function newIdempotencyKey() {
   return crypto.randomUUID()
 }
 
 function roleLabel(role: TaskCoordinationOverviewResponse['team'][number]) {
-  return role.display_label?.trim() || role.role.replaceAll('_', ' ')
+  return coordinationRoleLabel(role)
 }
 
-function readableCode(code: string) {
-  const labels: Record<string, string> = {
-    'coordination.authorization_revoked': 'Coordination authorization has been revoked.',
-    'coordination.authorization_stale':
-      'The saved Task team changed. Review and authorize it again.',
-    'coordination.budget_exhausted': 'The Task has reached its coordination turn limit.',
-    'coordination.coordinator_capability_missing':
-      'The selected role no longer has orchestration capability.',
-    'coordination.coordinator_missing':
-      'Select an active Agent in a role with orchestration capability.',
-    'coordination.coordinator_not_member':
-      'The selected coordinator is no longer an active role member.',
-    'coordination.not_authorized':
-      'The current Task team or authorization does not allow this action.',
-  }
-  return labels[code] ?? code.replaceAll('.', ' ').replaceAll('_', ' ')
+const nextActionToneClass: Record<
+  ReturnType<typeof deriveCoordinationNextAction>['tone'],
+  string
+> = {
+  action: 'border-primary/40 bg-primary/5',
+  wait: 'border-border-subtle bg-muted/20',
+  blocked:
+    'border-amber-400/60 bg-amber-50 text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100',
+  done: 'border-emerald-700/30 bg-emerald-50 text-emerald-950 dark:border-emerald-400/30 dark:bg-emerald-950/20 dark:text-emerald-100',
+  info: 'border-border-subtle bg-muted/20',
 }
 
 function shortDigest(value: string) {
@@ -144,27 +147,6 @@ function getCoordinatorChoices(
   })
 }
 
-function requestNextAction(
-  overview: TaskCoordinationOverviewResponse,
-  request: TaskCoordinationRequestResponse | null,
-  plan: TaskCoordinationPlanResponse | null,
-) {
-  if (overview.revoked_at) return 'Coordination authorization is revoked.'
-  if (overview.can_authorize) return 'Choose a coordinator and authorization mode.'
-  if (request?.state === 'requested' || request?.state === 'running') {
-    return 'Forge is preparing the requested plan.'
-  }
-  if (plan?.state === 'proposed') return 'Review the proposed work before creating WorkUnits.'
-  if (plan?.state === 'approved' && !plan.materialization) {
-    return 'The plan is approved; materialize it to create WorkUnits.'
-  }
-  if (plan?.materialization)
-    return `Work items exist. ${dispatchStateLabels[overview.dispatch.state]}.`
-  if (overview.can_request) return 'Describe the outcome and request a preparation turn.'
-  if (overview.blockers.length) return readableCode(overview.blockers[0].code)
-  return 'Continue using the saved Task team and current coordination state.'
-}
-
 export function TaskCoordinationPanel({
   task,
   agents,
@@ -197,6 +179,9 @@ export function TaskCoordinationPanel({
     () => (overview ? getCoordinatorChoices(overview, agents, daemons, members) : []),
     [agents, daemons, members, overview],
   )
+  const currentCoordinatorValue = overview?.coordinator
+    ? `${overview.coordinator.task_role_id}:${overview.coordinator.actor_ref.kind}:${overview.coordinator.actor_ref.id}`
+    : ''
   const [mode, setMode] = useState<Exclude<TaskCoordinationMode, 'manual'>>('proposal')
   const [coordinatorKey, setCoordinatorKey] = useState('')
   const [objective, setObjective] = useState(task.title)
@@ -209,6 +194,8 @@ export function TaskCoordinationPanel({
     launch_blockers: string[]
   } | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [revokeOpen, setRevokeOpen] = useState(false)
+  const [revokeReason, setRevokeReason] = useState('')
 
   useEffect(() => {
     setObjective(task.title)
@@ -216,39 +203,84 @@ export function TaskCoordinationPanel({
   }, [task.description, task.id, task.title])
 
   useEffect(() => {
-    if (!coordinatorKey || !choices.some((choice) => choice.value === coordinatorKey)) {
-      setCoordinatorKey(choices[0]?.value ?? '')
+    if (!choices.length) {
+      if (coordinatorKey) setCoordinatorKey('')
+      return
     }
-  }, [choices, coordinatorKey])
+    if (!coordinatorKey || !choices.some((choice) => choice.value === coordinatorKey)) {
+      const current = choices.find((choice) => choice.value === currentCoordinatorValue)
+      setCoordinatorKey(current?.value ?? choices[0]?.value ?? '')
+    }
+  }, [choices, coordinatorKey, currentCoordinatorValue])
+
+  const authorizedMode = overview?.mode
+  useEffect(() => {
+    if (authorizedMode && authorizedMode !== 'manual') setMode(authorizedMode)
+  }, [authorizedMode])
 
   const selectedCoordinator = choices.find((choice) => choice.value === coordinatorKey)
+  const displayedCoordinatorAgent =
+    overview?.can_authorize && selectedCoordinator
+      ? selectedCoordinator.member
+      : (overview?.coordinator ?? null)
   const coordinatorAgentId =
-    overview?.coordinator?.actor_ref.kind === 'agent'
-      ? overview.coordinator.actor_ref.id
-      : overview?.can_authorize && selectedCoordinator?.member.actor_ref.kind === 'agent'
-        ? selectedCoordinator.member.actor_ref.id
-        : null
+    displayedCoordinatorAgent?.actor_ref.kind === 'agent'
+      ? displayedCoordinatorAgent.actor_ref.id
+      : null
   const coordinatorAvailability = useAgentAvailability(coordinatorAgentId)
-  const supportedCoordinator = overview?.coordinator?.harness?.toLowerCase() === 'codex'
+  const supportedCoordinator =
+    displayedCoordinatorAgent?.harness?.toLowerCase() === 'codex'
   const coordinatorAvailable = Boolean(
     supportedCoordinator && coordinatorAvailability.data?.available,
   )
   const plannedModeIsAuthorized = Boolean(
     overview && overview.mode !== 'manual' && !overview.revoked_at,
   )
-  const nextAction = overview
-    ? overview.can_request
-      ? coordinatorAvailability.isLoading
-        ? 'Checking the current coordinator Agent and host.'
-        : coordinatorAvailability.isError
-          ? 'The current coordinator availability could not be checked.'
-          : !supportedCoordinator
-            ? 'The selected coordinator harness is not supported for automatic preparation.'
-            : !coordinatorAvailable
-              ? `The coordinator is not available to accept a turn${coordinatorAvailability.data?.reason ? `: ${coordinatorAvailability.data.reason}` : '.'}`
-              : requestNextAction(overview, request, plan)
-      : requestNextAction(overview, request, plan)
-    : ''
+  const turnBudgetExhausted = overview ? isTurnBudgetExhausted(overview) : false
+  const coordinatorRole = overview?.team.find(
+    (role) => role.id === overview.coordinator?.task_role_id,
+  )
+  const baseNextAction = overview
+    ? deriveCoordinationNextAction(overview, request, plan)
+    : null
+  const nextAction = baseNextAction
+    ? baseNextAction.kind === 'request' && coordinatorAvailability.isLoading
+      ? {
+          ...baseNextAction,
+          summary: 'Checking the current coordinator Agent and host.',
+          detail:
+            'Forge checks availability again before admitting a read-only turn. No request has been sent.',
+          tone: 'wait' as const,
+          kind: 'wait' as const,
+        }
+      : baseNextAction.kind === 'request' && coordinatorAvailability.isError
+        ? {
+            ...baseNextAction,
+            summary: 'Coordinator availability could not be checked.',
+            detail:
+              'No preparation request has been sent. Retry the status check before requesting a turn.',
+            tone: 'blocked' as const,
+            kind: 'blocked' as const,
+          }
+        : baseNextAction.kind === 'request' && !supportedCoordinator
+          ? {
+              ...baseNextAction,
+              summary: 'The selected coordinator harness cannot accept an automatic turn.',
+              detail:
+                'The current turn runtime requires a Codex CLI Agent with the verified read-only path. Reauthorize with a supported Agent or continue through Advanced work.',
+              tone: 'blocked' as const,
+              kind: 'blocked' as const,
+            }
+          : baseNextAction.kind === 'request' && !coordinatorAvailable
+            ? {
+                ...baseNextAction,
+                summary: 'The coordinator is not currently available.',
+                detail: `No preparation request has been sent${coordinatorAvailability.data?.reason ? `: ${coordinatorAvailability.data.reason}` : '.'} Reauthorize with an available Agent or retry the status check.`,
+                tone: 'blocked' as const,
+                kind: 'blocked' as const,
+              }
+            : baseNextAction
+    : null
 
   async function authorizeCoordination() {
     if (!overview || !overview.can_authorize || !selectedCoordinator) return
@@ -276,7 +308,13 @@ export function TaskCoordinationPanel({
 
   async function requestPlan(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!overview?.can_request || !coordinatorAvailable || !objective.trim()) return
+    if (
+      !overview?.can_request ||
+      turnBudgetExhausted ||
+      !coordinatorAvailable ||
+      !objective.trim()
+    )
+      return
     setActionError(null)
     try {
       const response = await requestTurn.mutateAsync({
@@ -369,6 +407,80 @@ export function TaskCoordinationPanel({
     }
   }
 
+  async function resumePausedTask() {
+    if (!overview || overview.dispatch.state !== 'paused') return
+    setActionError(null)
+    try {
+      const response = await createIntervention.mutateAsync({
+        taskId: task.id,
+        body: {
+          kind: 'resume',
+          expected_task_version: overview.task_version,
+          expected_coordination_version: overview.authorization_version,
+          expected_lifecycle_version: overview.lifecycle.version,
+          instruction: null,
+          plan_artifact_id: null,
+          decision: null,
+          rationale: null,
+          reason: 'Resume requested from the guided Task flow',
+          brief: null,
+          idempotency_key: newIdempotencyKey(),
+        },
+      })
+      if (response.state === 'rejected') {
+        throw new Error(
+          response.failure_message ?? response.failure_code ?? 'Task resume was rejected',
+        )
+      }
+      toast.success('Task dispatch resumed. Existing work was not restarted.')
+    } catch (error) {
+      const message = getApiErrorMessage(error, 'Task could not be resumed')
+      setActionError(message)
+      toast.error(message)
+    }
+  }
+
+  async function revokeAuthorization() {
+    if (
+      !overview ||
+      overview.mode === 'manual' ||
+      overview.revoked_at ||
+      !overview.can_authorize
+    )
+      return
+    setActionError(null)
+    try {
+      const response = await createIntervention.mutateAsync({
+        taskId: task.id,
+        body: {
+          kind: 'revoke_authorization',
+          expected_task_version: overview.task_version,
+          expected_coordination_version: overview.authorization_version,
+          expected_lifecycle_version: null,
+          instruction: null,
+          plan_artifact_id: null,
+          decision: null,
+          rationale: null,
+          reason: revokeReason.trim() || null,
+          brief: null,
+          idempotency_key: newIdempotencyKey(),
+        },
+      })
+      if (response.state === 'rejected') {
+        throw new Error(
+          response.failure_message ?? response.failure_code ?? 'Revocation was rejected',
+        )
+      }
+      setRevokeOpen(false)
+      setRevokeReason('')
+      toast.success('Coordination authorization revoked. Existing work was preserved.')
+    } catch (error) {
+      const message = getApiErrorMessage(error, 'Coordination authorization was not revoked')
+      setActionError(message)
+      toast.error(message)
+    }
+  }
+
   if (query.isLoading) {
     return (
       <section className="rounded-lg border p-4 text-sm text-muted-foreground">
@@ -402,32 +514,88 @@ export function TaskCoordinationPanel({
       className="min-w-0 space-y-4 rounded-lg border border-primary/30 bg-card p-4 sm:p-5"
       aria-labelledby="task-coordination-title"
     >
-      <header className="flex min-w-0 flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <h2 id="task-coordination-title" className="text-lg font-semibold">
-              Plan and next step
-            </h2>
-            <Badge variant="outline">
-              {overview.mode === 'manual'
-                ? 'Manual planning'
-                : (modeOptions.find((option) => option.value === overview.mode)?.title ??
-                  overview.mode)}
-            </Badge>
-            {overview.revoked_at ? (
-              <Badge variant="destructive">Authorization revoked</Badge>
-            ) : null}
+      <header className="space-y-3">
+        <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 id="task-coordination-title" className="text-lg font-semibold">
+                Plan and next step
+              </h2>
+              <Badge variant="outline">
+                {overview.mode === 'manual'
+                  ? 'Manual planning'
+                  : (modeOptions.find((option) => option.value === overview.mode)?.title ??
+                    overview.mode)}
+              </Badge>
+              {overview.revoked_at ? (
+                <Badge variant="destructive">Authorization revoked</Badge>
+              ) : null}
+              {overview.dispatch.state === 'paused' ? (
+                <Badge variant="secondary">New work paused</Badge>
+              ) : null}
+            </div>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Who acts, what Forge expects, and why the flow is waiting.
+            </p>
           </div>
-          <p className="mt-1 text-sm text-muted-foreground">{nextAction}</p>
+          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            <span>
+              {overview.turn_count} / {overview.max_turns} preparation turns
+            </span>
+            <span>·</span>
+            <span>{dispatchStateLabel(overview.dispatch.state)}</span>
+          </div>
         </div>
-        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-          <span>
-            {overview.turn_count} / {overview.max_turns} preparation turns
-          </span>
-          <span>·</span>
-          <span>{dispatchStateLabels[overview.dispatch.state]}</span>
-        </div>
+        {nextAction ? (
+          <div
+            role="status"
+            aria-live="polite"
+            className={`rounded-md border p-3 ${nextActionToneClass[nextAction.tone]}`}
+          >
+            <p className="text-xs font-medium uppercase tracking-wide opacity-80">
+              Next step · {nextAction.owner}
+            </p>
+            <p className="mt-1 break-words text-sm font-semibold">{nextAction.summary}</p>
+            <p className="mt-1 break-words text-sm opacity-90">{nextAction.detail}</p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {nextAction.kind === 'resume' ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={createIntervention.isPending}
+                  onClick={() => void resumePausedTask()}
+                >
+                  {createIntervention.isPending ? 'Resuming…' : 'Resume Task'}
+                </Button>
+              ) : null}
+              {nextAction.kind === 'manual' ||
+              nextAction.kind === 'blocked' ||
+              nextAction.kind === 'authorize' ? (
+                <Button size="sm" variant="outline" onClick={onOpenAdvancedWork}>
+                  Open Advanced work
+                </Button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
       </header>
+
+      {overview.mode !== 'manual' && !overview.revoked_at && overview.can_authorize ? (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border-subtle bg-muted/20 p-3">
+          <p className="min-w-0 text-sm text-muted-foreground">
+            Revoking stops automatic preparation and task dispatch under this authorization. Existing
+            plans, WorkUnits, reviews, and running Executions are preserved.
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={createIntervention.isPending}
+            onClick={() => setRevokeOpen(true)}
+          >
+            Revoke authorization…
+          </Button>
+        </div>
+      ) : null}
 
       {overview.coordinator ? (
         <div className="rounded-md border p-3">
@@ -442,7 +610,8 @@ export function TaskCoordinationPanel({
               daemons={daemons}
             />
             <span className="text-sm text-muted-foreground">
-              {overview.coordinator.role.replaceAll('_', ' ')} · orchestration
+              {coordinatorRole ? `${roleLabel(coordinatorRole)} · ` : ''}
+              {overview.coordinator.harness ?? 'harness unavailable'} · orchestration
             </span>
           </div>
         </div>
@@ -457,31 +626,62 @@ export function TaskCoordinationPanel({
             Coordination needs attention
           </h3>
           <ul className="space-y-1 text-sm">
-            {overview.blockers.map((blocker, index) => (
-              <li key={`${blocker.code}:${index}`} className="break-words">
-                {readableCode(blocker.code)}
-                <details className="mt-1 text-xs text-muted-foreground">
-                  <summary className="w-fit cursor-pointer">Technical details</summary>
-                  <p className="mt-1 break-all">{blocker.message}</p>
-                  {blocker.task_role_id ? (
-                    <p>
-                      TaskRole: <code>{blocker.task_role_id}</code>
-                    </p>
+            {overview.blockers.map((blocker, index) => {
+              const blockerRole = blocker.task_role_id
+                ? overview.team.find((role) => role.id === blocker.task_role_id)
+                : undefined
+              return (
+                <li key={`${blocker.code}:${index}`} className="min-w-0 break-words">
+                  {readableCoordinationCode(blocker.code)}
+                  {blocker.actor_ref ? (
+                    <div className="mt-1">
+                      <ActorIdentity
+                        actor={blocker.actor_ref}
+                        agents={agents}
+                        members={members}
+                        daemons={daemons}
+                      />
+                    </div>
                   ) : null}
-                </details>
-              </li>
-            ))}
+                  <details className="mt-1 text-xs text-muted-foreground">
+                    <summary className="w-fit cursor-pointer">Technical details</summary>
+                    <p className="mt-1 break-all">{blocker.message}</p>
+                    {blockerRole ? <p>TaskRole: {roleLabel(blockerRole)}</p> : null}
+                    {blocker.task_role_id ? (
+                      <p>
+                        TaskRole reference: <code className="break-all">{blocker.task_role_id}</code>
+                      </p>
+                    ) : null}
+                  </details>
+                </li>
+              )
+            })}
           </ul>
         </div>
       ) : null}
 
       {actionError ? (
-        <p
+        <div
           role="alert"
-          className="rounded-md border border-destructive/40 p-3 text-sm text-destructive"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/40 p-3 text-sm text-destructive"
         >
-          {actionError}
-        </p>
+          <span className="min-w-0 break-words">{actionError}</span>
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                setActionError(null)
+                void query.refetch()
+              }}
+            >
+              Refresh state
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setActionError(null)}>
+              Dismiss
+            </Button>
+          </div>
+        </div>
       ) : null}
       {planQuery.isError ? (
         <p
@@ -510,7 +710,11 @@ export function TaskCoordinationPanel({
       {overview.can_authorize ? (
         <div className="space-y-4 rounded-md border p-3">
           <div>
-            <h3 className="font-medium">Authorize a Task coordinator</h3>
+            <h3 className="font-medium">
+              {overview.mode === 'manual' || overview.revoked_at
+                ? 'Authorize a Task coordinator'
+                : 'Change Task coordination authorization'}
+            </h3>
             <p className="mt-1 text-sm text-muted-foreground">
               Choose a current Agent member of a role that has the orchestration capability. The
               current turn runtime supports the Codex CLI path; Forge checks the selected Agent and
@@ -566,12 +770,22 @@ export function TaskCoordinationPanel({
                 No eligible coordinator is available in this Task team.
               </p>
               <p className="mt-1 text-sm text-muted-foreground">
-                Add an active Codex CLI Agent to a Task role with orchestration capability. Existing
-                Task roles and memberships can be edited in Advanced work.
+                The current automatic turn requires an active Codex CLI Agent in a Task role with
+                orchestration capability. You can change this Task&apos;s roles in Advanced work, or
+                reuse a Project team template so new Tasks start with eligible members.
               </p>
-              <Button size="sm" variant="outline" className="mt-3" onClick={onOpenAdvancedWork}>
-                Open Advanced work
-              </Button>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" onClick={onOpenAdvancedWork}>
+                  Open Advanced work
+                </Button>
+                <Link
+                  to="/projects/$projectId/settings/$tab"
+                  params={{ projectId: task.project_id, tab: 'workers' }}
+                  className="inline-flex h-8 items-center justify-center rounded-md px-[9px] text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  Manage Project team &amp; templates
+                </Link>
+              </div>
             </div>
           )}
           <fieldset className="space-y-3" disabled={!choices.length}>
@@ -628,7 +842,27 @@ export function TaskCoordinationPanel({
         </div>
       ) : null}
 
-      {plannedModeIsAuthorized && overview.can_request && coordinatorAvailable ? (
+      {plannedModeIsAuthorized && turnBudgetExhausted ? (
+        <div
+          role="status"
+          className="rounded-md border border-amber-400/60 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100"
+        >
+          <p className="font-medium">Preparation-turn limit reached</p>
+          <p className="mt-1">
+            Forge recorded {overview.turn_count} of {overview.max_turns} preparation turns. No
+            further automatic turn will be admitted. Existing plans and WorkUnits are preserved;
+            continue through Advanced work or ask a Project owner to decide a new Task budget.
+          </p>
+          <Button size="sm" variant="outline" className="mt-3" onClick={onOpenAdvancedWork}>
+            Continue with Advanced work
+          </Button>
+        </div>
+      ) : null}
+
+      {plannedModeIsAuthorized &&
+      overview.can_request &&
+      !turnBudgetExhausted &&
+      coordinatorAvailable ? (
         <form
           onSubmit={(event) => void requestPlan(event)}
           className="space-y-4 rounded-md border p-3"
@@ -689,7 +923,10 @@ export function TaskCoordinationPanel({
         </form>
       ) : null}
 
-      {plannedModeIsAuthorized && overview.can_request && !coordinatorAvailable ? (
+      {plannedModeIsAuthorized &&
+      overview.can_request &&
+      !turnBudgetExhausted &&
+      !coordinatorAvailable ? (
         <div
           role={coordinatorAvailability.isError ? 'alert' : 'status'}
           className="rounded-md border border-dashed p-3 text-sm text-muted-foreground"
@@ -960,7 +1197,7 @@ export function TaskCoordinationPanel({
               <p className="text-sm">
                 {plan.materialization.work_unit_ids.length} WorkUnit ID
                 {plan.materialization.work_unit_ids.length === 1 ? '' : 's'} recorded. Current
-                dispatch: {dispatchStateLabels[overview.dispatch.state]}.
+                dispatch: {dispatchStateLabel(overview.dispatch.state)}.
               </p>
               <details className="text-xs">
                 <summary className="w-fit cursor-pointer">Receipt and WorkUnit references</summary>
@@ -1014,23 +1251,42 @@ export function TaskCoordinationPanel({
           {plan.state === 'approved' && !plan.materialization ? (
             <div className="space-y-2 rounded-md border p-3">
               <p className="text-sm">This approved plan has no materialization receipt yet.</p>
-              <Button
-                size="sm"
-                disabled={
-                  !request || materialize.isPending || planQuery.isError || requestQuery.isError
-                }
-                onClick={() => void materializePlan()}
-              >
-                {materialize.isPending
-                  ? 'Creating WorkUnits…'
-                  : 'Create WorkUnits from approved plan'}
-              </Button>
-              {!request ? (
-                <p className="text-xs text-muted-foreground">
-                  The exact coordination request version is not available, so materialization is
-                  disabled.
-                </p>
-              ) : null}
+              {overview.dispatch.state === 'paused' ? (
+                <>
+                  <p className="text-sm text-muted-foreground">
+                    The Task is paused, so Forge will not materialize this plan yet. Resume the Task
+                    first; no worker is started by this plan alone.
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={createIntervention.isPending}
+                    onClick={() => void resumePausedTask()}
+                  >
+                    {createIntervention.isPending ? 'Resuming…' : 'Resume Task to continue'}
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Button
+                    size="sm"
+                    disabled={
+                      !request || materialize.isPending || planQuery.isError || requestQuery.isError
+                    }
+                    onClick={() => void materializePlan()}
+                  >
+                    {materialize.isPending
+                      ? 'Creating WorkUnits…'
+                      : 'Create WorkUnits from approved plan'}
+                  </Button>
+                  {!request ? (
+                    <p className="text-xs text-muted-foreground">
+                      The exact coordination request version is not available, so materialization is
+                      disabled.
+                    </p>
+                  ) : null}
+                </>
+              )}
             </div>
           ) : null}
 
@@ -1073,6 +1329,46 @@ export function TaskCoordinationPanel({
         daemons={daemons}
       />
       <TaskInterventionsPanel task={task} coordination={overview} />
+
+      <Dialog open={revokeOpen} onOpenChange={setRevokeOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Revoke coordination authorization?</DialogTitle>
+            <DialogDescription>
+              Forge stops automatic preparation and task dispatch under this authorization. Existing
+              plans, WorkUnits, reviews, and running Executions are preserved. Running Executions are
+              not silently stopped. You can authorize coordination again later.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label htmlFor="coordination-revoke-reason">Reason (optional)</Label>
+            <Textarea
+              id="coordination-revoke-reason"
+              value={revokeReason}
+              onChange={(event) => setRevokeReason(event.target.value)}
+              placeholder="Why should automatic coordination stop?"
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={createIntervention.isPending}
+              onClick={() => setRevokeOpen(false)}
+            >
+              Keep authorization
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={createIntervention.isPending}
+              onClick={() => void revokeAuthorization()}
+            >
+              {createIntervention.isPending ? 'Revoking…' : 'Revoke authorization'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </section>
   )
 }

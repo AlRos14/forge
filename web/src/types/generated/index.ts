@@ -305,6 +305,8 @@ export type { MaterializeTaskCoordinationPlanRequest } from './bindings/Material
 export type { MaterializeTaskCoordinationPlanResponse } from './bindings/MaterializeTaskCoordinationPlanResponse'
 export type { CreateTaskQualityRequest } from './bindings/CreateTaskQualityRequest'
 export type { TaskQualityRequestResponse } from './bindings/TaskQualityRequestResponse'
+export type { TaskQualityRouteResponse } from './bindings/TaskQualityRouteResponse'
+export type { TaskQualityEscalationResponse } from './bindings/TaskQualityEscalationResponse'
 export type { TaskQualityRequestsResponse } from './bindings/TaskQualityRequestsResponse'
 export type { ResolveTaskQualityRequest } from './bindings/ResolveTaskQualityRequest'
 export type { CreateTaskInterventionRequest } from './bindings/CreateTaskInterventionRequest'

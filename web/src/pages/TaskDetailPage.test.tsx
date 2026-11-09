@@ -46,6 +46,7 @@ vi.mock('@/api/hooks', async () => {
     useMembersQuery: () => ({ data: [], isLoading: false, isError: false }),
     useAgentsInfiniteQuery: () => ({ data: { pages: [] }, isLoading: false, isError: false }),
     useDaemonsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false }),
+    useTaskCoordinationQuery: () => ({ data: undefined, isError: false }),
     useTaskQuery: () => ({ data: task, isLoading: false, isError: false, refetch: vi.fn() }),
     useTaskLifecycleTransitionsQuery: () => ({ data: [], isLoading: false }),
     useExecutionsQuery: () => ({ data: { items: [] }, refetch: vi.fn() }),

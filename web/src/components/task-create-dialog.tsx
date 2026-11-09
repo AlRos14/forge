@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from 'react'
+import { Link } from '@tanstack/react-router'
 import {
   useAgentsInfiniteQuery,
   useCreateTask,
@@ -175,9 +176,19 @@ export function TaskCreateDialog({
                   ))}
                 </ul>
               ) : (
-                <p className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
-                  This Project has no saved roles yet. They can be added in Project settings.
-                </p>
+                <div className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
+                  <p>
+                    This Project has no saved roles yet. New Tasks copy the Project team, so add
+                    roles and templates once in Project settings.
+                  </p>
+                  <Link
+                    to="/projects/$projectId/settings/$tab"
+                    params={{ projectId, tab: 'workers' }}
+                    className="mt-2 inline-flex items-center text-sm font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    Manage Project team &amp; templates
+                  </Link>
+                </div>
               )
             ) : null}
             {daemonsQuery.isError ? (

@@ -118,6 +118,65 @@ export function routeSsePayload(
     })
     browserEvents.dispatch('forge:notification-created', { ...payload, ...facts })
   }
+
+  if (eventType.startsWith('task.coordination_')) {
+    const taskId =
+      typeof facts.task_id === 'string'
+        ? facts.task_id
+        : payload.scope_type === 'task'
+          ? payload.scope_id ?? undefined
+          : undefined
+    if (taskId) {
+      void queryClient.invalidateQueries({ queryKey: qk.taskCoordination(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.workUnits(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.lifecycleTransitions(taskId) })
+      invalidateProjectTaskLists(queryClient)
+    } else {
+      invalidateAllActiveQueries(queryClient)
+    }
+  }
+
+  if (eventType.startsWith('task.quality_request')) {
+    const taskId =
+      typeof facts.task_id === 'string'
+        ? facts.task_id
+        : payload.scope_type === 'task'
+          ? payload.scope_id ?? undefined
+          : undefined
+    if (taskId) {
+      void queryClient.invalidateQueries({ queryKey: qk.taskQualityRequests(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskCoordination(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.workUnits(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.reviewLines(taskId) })
+    } else {
+      invalidateAllActiveQueries(queryClient)
+    }
+  }
+
+  if (eventType.startsWith('task.intervention_')) {
+    const taskId =
+      typeof facts.task_id === 'string'
+        ? facts.task_id
+        : payload.scope_type === 'task'
+          ? payload.scope_id ?? undefined
+          : undefined
+    if (taskId) {
+      void queryClient.invalidateQueries({ queryKey: qk.taskInterventions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskCoordination(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.lifecycleTransitions(taskId) })
+    } else {
+      invalidateAllActiveQueries(queryClient)
+    }
+  }
 }
 
 export function useSSE(queryClient: QueryClient, accessToken: string | null): void {
@@ -184,6 +243,19 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
             'proposal.created',
             'proposal.withdrawn',
             'decision.recorded',
+            'task.coordination_authorized',
+            'task.coordination_revoked',
+            'task.coordination_requested',
+            'task.coordination_turn_started',
+            'task.coordination_request_state_changed',
+            'task.coordination_plan_proposed',
+            'task.coordination_plan_approved',
+            'task.coordination_plan_rejected',
+            'task.coordination_plan_materialized',
+            'task.quality_requested',
+            'task.quality_request_resolved',
+            'task.intervention_recorded',
+            'task.intervention_state_changed',
             'project.created',
             'project.updated',
             'project.deleted',
