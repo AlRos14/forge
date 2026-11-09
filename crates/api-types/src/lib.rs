@@ -189,6 +189,8 @@ fn export_typescript() {
     MaterializeTaskCoordinationPlanRequest::export().expect("export materialize request");
     MaterializeTaskCoordinationPlanResponse::export().expect("export materialize response");
     CreateTaskQualityRequest::export().expect("export quality request");
+    TaskQualityEscalationResponse::export().expect("export quality escalation");
+    TaskQualityRouteResponse::export().expect("export quality route");
     TaskQualityRequestResponse::export().expect("export quality response");
     TaskQualityRequestsResponse::export().expect("export quality list");
     ResolveTaskQualityRequest::export().expect("export quality resolution");

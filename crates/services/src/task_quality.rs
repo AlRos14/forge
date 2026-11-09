@@ -1190,6 +1190,20 @@ impl TaskQualityService {
                 resolution_kind,
                 resolution_ref,
                 resolution_digest,
+                requires_human_reason_code: if state == TaskQualityState::RequiresHuman {
+                    Some(Some(
+                        failure_code
+                            .unwrap_or("coordination.requires_human")
+                            .to_owned(),
+                    ))
+                } else {
+                    None
+                },
+                requires_human_reason: if state == TaskQualityState::RequiresHuman {
+                    Some(Some(message.to_owned()))
+                } else {
+                    None
+                },
                 updated_at: now,
                 event: Some(event),
             },

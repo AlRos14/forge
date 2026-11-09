@@ -426,6 +426,33 @@ pub struct TaskQualityRequestResponse {
     pub resolution_kind: Option<String>,
     pub resolution_ref: Option<String>,
     pub resolution_digest: Option<String>,
+    pub quality_route: TaskQualityRouteResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TaskQualityRouteResponse {
+    /// Stable identity for the review-line/source chain. It deliberately does
+    /// not include quality category or target role.
+    pub id: String,
+    #[ts(type = "number")]
+    pub round: i64,
+    #[ts(type = "number")]
+    pub limit: i64,
+    /// Exact TaskRole that produced the source ReviewReport, when applicable.
+    pub source_task_role_id: Option<String>,
+    pub escalation: Option<TaskQualityEscalationResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TaskQualityEscalationResponse {
+    pub reason_code: String,
+    pub reason: String,
+    /// Exact quality-request IDs participating in a detected role cycle.
+    pub cycle_request_ids: Vec<String>,
+    /// Exact TaskRole IDs in the detected cycle; role labels are not authority.
+    pub cycle_task_role_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

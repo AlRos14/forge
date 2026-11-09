@@ -14,8 +14,9 @@ use api_types::{
     TaskCoordinationTeamMemberResponse, TaskCoordinationTeamRoleResponse,
     TaskDispatchIntentResponse, TaskDispatchState, TaskInterventionKind, TaskInterventionResponse,
     TaskInterventionState, TaskInterventionsResponse, TaskLifecycleResponse, TaskLifecycleState,
-    TaskQualityCategory, TaskQualityRequestResponse, TaskQualityRequestsResponse,
-    TaskQualityResolution, TaskQualityState, TaskQualityTargetKind,
+    TaskQualityCategory, TaskQualityEscalationResponse, TaskQualityRequestResponse,
+    TaskQualityRequestsResponse, TaskQualityResolution, TaskQualityRouteResponse, TaskQualityState,
+    TaskQualityTargetKind,
 };
 use axum::{
     extract::{Path, State},
@@ -531,6 +532,20 @@ fn quality_response(request: db::TaskQualityRequest) -> ApiResult<TaskQualityReq
         serde_json::from_str::<Vec<String>>(&request.findings_json).map_err(|error| {
             ApiError::internal(format!("stored quality findings are invalid: {error}"))
         })?;
+    let cycle_request_ids = serde_json::from_str::<Vec<String>>(&request.cycle_request_ids_json)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "stored quality route request cycle is invalid: {error}"
+            ))
+        })?;
+    let cycle_task_role_ids = serde_json::from_str::<Vec<String>>(
+        &request.cycle_task_role_ids_json,
+    )
+    .map_err(|error| {
+        ApiError::internal(format!(
+            "stored quality route role cycle is invalid: {error}"
+        ))
+    })?;
     Ok(TaskQualityRequestResponse {
         id: request.id,
         task_id: request.task_id,
@@ -573,6 +588,24 @@ fn quality_response(request: db::TaskQualityRequest) -> ApiResult<TaskQualityReq
         resolution_kind: request.resolution_kind,
         resolution_ref: request.resolution_ref,
         resolution_digest: request.resolution_digest,
+        quality_route: TaskQualityRouteResponse {
+            id: request.route_id,
+            round: request.route_round,
+            limit: request.route_limit,
+            source_task_role_id: request.source_task_role_id,
+            escalation: match (
+                request.requires_human_reason_code,
+                request.requires_human_reason,
+            ) {
+                (Some(reason_code), Some(reason)) => Some(TaskQualityEscalationResponse {
+                    reason_code,
+                    reason,
+                    cycle_request_ids,
+                    cycle_task_role_ids,
+                }),
+                _ => None,
+            },
+        },
     })
 }
 

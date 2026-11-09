@@ -60,6 +60,12 @@ PR14 audit on 2026-10-16.
   `specialist`, `human_decision`) with category-specific targets, global
   budgets, versioned resolution, and a single durable intervention circuit for
   Humans and live Project Copilot runs. V159 adds the additive records.
+- Add a durable automatic quality budget of four requests per exact source
+  chain, shared across category and target-role changes. Detect pending-role
+  A→B→A cycles and persist the Human escalation reason, request IDs, and exact
+  TaskRole IDs in `TaskQualityRequestResponse.quality_route`. V161 backfills
+  route accounting without changing historical request states; the separate
+  eight-round exact rework limit is unchanged.
 - Add REST, MCP, CLI, and SSE coordination contracts, including
   `forge_get_task_coordination` and the `forge-ctl task coordination` commands.
 - Add `GET/POST /tasks/{id}/dispatch*` Task launch, pause, resume, and cancel

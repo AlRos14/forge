@@ -1960,6 +1960,58 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                 sha256_hex(input.summary.as_bytes()),
             )
         };
+        let (route_id, route_kind, route_ref, source_task_role_id) =
+            if source_kind == "review_report" {
+                let review_line_id: Option<String> = sqlx::query_scalar(
+                    "SELECT MIN(line_id) FROM work_unit_review_line_revision
+                     WHERE review_report_artifact_id = ?",
+                )
+                .bind(&source_id)
+                .fetch_one(self.db.pool())
+                .await?;
+                let source_task_role_id: Option<String> = sqlx::query_scalar(
+                    "SELECT authority.task_role_id
+                     FROM artifact_execution_producer producer
+                     JOIN execution_task_role_authority authority
+                       ON authority.execution_id = producer.execution_id
+                     WHERE producer.artifact_id = ?",
+                )
+                .bind(&source_id)
+                .fetch_optional(self.db.pool())
+                .await?;
+                if let Some(line_id) = review_line_id {
+                    (
+                        format!("review_line:{line_id}"),
+                        "review_line".to_owned(),
+                        line_id,
+                        source_task_role_id,
+                    )
+                } else {
+                    (
+                        format!(
+                            "source:{}:{}:{}",
+                            hex::encode_upper(source_kind.as_bytes()),
+                            hex::encode_upper(source_id.as_bytes()),
+                            source_digest
+                        ),
+                        "source".to_owned(),
+                        source_id.clone(),
+                        source_task_role_id,
+                    )
+                }
+            } else {
+                (
+                    format!(
+                        "source:{}:{}:{}",
+                        hex::encode_upper(source_kind.as_bytes()),
+                        hex::encode_upper(source_id.as_bytes()),
+                        source_digest
+                    ),
+                    "source".to_owned(),
+                    source_id.clone(),
+                    None,
+                )
+            };
         let findings_json = serde_json::to_string(&input.findings)
             .map_err(|_| invalid_plan("quality findings cannot be serialized"))?;
         let request_digest = sha256_hex(
@@ -2077,6 +2129,15 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         } else {
             TaskQualityState::Requested
         };
+        let (initial_requires_human_reason_code, initial_requires_human_reason) =
+            if input.category == TaskQualityCategory::HumanDecision {
+                (
+                    Some("coordination.requires_human".to_owned()),
+                    Some("the quality request explicitly requires a Human decision".to_owned()),
+                )
+            } else {
+                (None, None)
+            };
         let write = TaskCoordinationRepo::create_task_quality_request(
             &*self.db,
             db::CreateTaskQualityRequestInput {
@@ -2095,6 +2156,12 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                 handoff_id: None,
                 work_unit_id: None,
                 source_digest,
+                route_id,
+                route_kind,
+                route_ref,
+                source_task_role_id,
+                initial_requires_human_reason_code,
+                initial_requires_human_reason,
                 request_digest,
                 idempotency_key: input.idempotency_key.clone(),
                 created_by: actor.clone(),
@@ -2109,7 +2176,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         if let Some(event) = write.event.as_ref() {
             self.domain_events.publish_committed(event);
         }
-        if state == TaskQualityState::RequiresHuman {
+        if write.request.state == TaskQualityState::RequiresHuman {
             return Ok(write.request);
         }
         // The handoff is an informational notification, not the effect
@@ -2155,6 +2222,8 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                 resolution_kind: None,
                 resolution_ref: None,
                 resolution_digest: None,
+                requires_human_reason_code: None,
+                requires_human_reason: None,
                 updated_at: now_rfc3339(),
                 event: Some(self.event(
                     "task.quality_request_notified",
@@ -2236,6 +2305,8 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                 resolution_kind: None,
                 resolution_ref: None,
                 resolution_digest: None,
+                requires_human_reason_code: None,
+                requires_human_reason: None,
                 updated_at: now,
                 event: Some(event),
             },

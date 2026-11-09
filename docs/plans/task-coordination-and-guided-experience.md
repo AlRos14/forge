@@ -2,10 +2,10 @@
 
 Fecha: 2026-11-07. Baseline inicial: `fd599647`. Baseline de PR0: `ae3b2287`;
 migración última verificada: V157.
-Estado: PR0 (contrato transversal) completado; PR1–PR3 implementados, PR4 con
-el circuito de calidad y rework exacto implementado y límites por ruta/ping-pong
-pendientes, y el circuito de intervención de PR5 disponible; PR6 pendiente. No
-hay despliegue, aceptación funcional ni autorización para lanzar FirePOS. El
+Estado: PR0 (contrato transversal) completado; PR1–PR4 implementados, incluido
+el circuito de calidad/rework exacto, límites por ruta y escalado de ciclos
+entre roles; el circuito de intervención de PR5 está disponible y PR6 sigue
+pendiente. No hay despliegue, aceptación funcional ni autorización para lanzar FirePOS. El
 propietario ha aprobado las responsabilidades y el recorrido del
 [modelo operativo objetivo](../concepts/task-operating-model.md). Las
 decisiones de esquema y endpoints están fijadas en el
@@ -105,15 +105,15 @@ paso es PR2 (contrato mínimo backend) y, en el mismo corte vertical, la
 superficie PR1 que no prometa capacidades ausentes. PR3 extiende la supervisión;
 PR4–PR6 conservan revisión, intervención y aceptación.
 
-### Registro de implementación backend — 2026-11-07
+### Registro de implementación backend — 2026-11-09
 
-El backend de PR1–PR6 se implementa sobre el contrato PR0 con migraciones
-aditivas V158–V160: autorización de coordinación versionada y equipo resuelto,
+El backend disponible de PR1–PR5 se implementa sobre el contrato PR0 con
+migraciones aditivas V158–V161: autorización de coordinación versionada y equipo resuelto,
 turno read-only sobre wakes existentes, plan `work_unit_plan` inspeccionable,
 aprobación por digest, materialización atómica idempotente, solicitudes de
-calidad con presupuesto global y consumo atómico, y un único circuito de
-intervención para Humans y Project Copilot. TaskLifecycle, WorkUnit, review,
-Gate y WorkspaceLease conservan su autoridad.
+calidad con presupuestos global y por cadena, escalado durable de ciclos entre
+TaskRoles y un único circuito de intervención para Humans y Project Copilot.
+TaskLifecycle, WorkUnit, review, Gate y WorkspaceLease conservan su autoridad.
 
 ### Alcance real del corte — 2026-11-09
 
@@ -135,12 +135,19 @@ cero efecto automático. Las Tasks históricas/manuales no se automatizan
 retroactivamente. La materialización crea la línea de revisión y el Gate de
 aprobación que consumen las WorkUnits dependientes de la revisión.
 
-No se declara PR1–PR6 completo. Siguen pendientes, con acuerdo de producto:
+El límite automático por cadena es cuatro solicitudes y comparte identidad por
+review line, sin reiniciarse por cambio de categoría o TaskRole. Para cadenas
+sin review line se usa el origen exacto y su digest. La admisión consume el
+contador global y el de ruta en el mismo `BEGIN IMMEDIATE`; replays no consumen
+otra ronda. Una secuencia de destinos pendientes A→B→A escala a Human en la
+tercera solicitud y conserva sus tres IDs y roles exactos. La razón y evidencia
+de escalado viven en `task_quality_request` y se proyectan como
+`quality_route.escalation`. La migración V161 agrega accounting para solicitudes
+históricas sin cambiar sus estados ni volver a procesarlas. El límite separado
+de ocho reworks permanece intacto.
 
-- límites por ruta de calidad y detección de ping-pong más allá del presupuesto
-  global de la Task;
-- aceptación E2E conjunta, recorrido con host/proveedor real y evidencia visual
-  independiente (PR6).
+No se declara PR1–PR6 completo. Sigue pendiente la aceptación E2E conjunta, el
+recorrido con host/proveedor real y la evidencia visual independiente (PR6).
 
 El PR 23 no debe mergearse presentando el programa completo. La validación de
 runtime y la aceptación conjunta con la UI se registran en el informe de cierre;
@@ -197,9 +204,14 @@ las pruebas de Rust se ejecutan en la fase de integración solicitada.
 - El supervisor puede recibir un defecto de planificación y coordinar ajuste;
   el revisor puede dirigirse a otros roles permitidos. Sin destino válido, pedir
   decisión humana. Nunca elegir aleatoriamente un Actor ni evadir independencia.
-- Límites globales y por ruta, detección de ping-pong e idempotencia entre rutas.
-  Cambiar categoría o rol no reinicia el presupuesto. Preservar ocho rondas de
-  rework existentes salvo una decisión de producto posterior explícita.
+- Implementado: límite global y límite automático de cuatro por cadena estable;
+  una review line mantiene la identidad al cambiar categoría o TaskRole.
+  Replays y admisiones concurrentes comparten el recibo transaccional.
+- Implementado: el ciclo de destinos pendientes A→B→A escala a Human con
+  código, motivo, solicitudes y TaskRole exactos. Los fallos de destino o
+  membresía guardan el motivo en la solicitud.
+- Preservar ocho rondas del mecanismo exacto de rework; su recibo y presupuesto
+  no se derivan ni se modifican por el nuevo presupuesto de routing.
 
 ## PR5 — Intervención humana y Copilot coherentes
 
@@ -240,7 +252,7 @@ las pruebas de Rust se ejecutan en la fase de integración solicitada.
 | Pausa/resume/cancel concurrentes | Sin nuevos Starts tras pausa; diferimientos recuperables; cancelación sin trabajo nuevo |
 | Revocación antes de Start/acción | Autoridad vigente revalidada, sin efecto protegido |
 | Reinicio/resultado incierto | Sin duplicar proveedor, WU, corrección ni presupuesto |
-| Ciclo entre roles | Límite global y escalado humano, sin bucle indefinido |
+| Ciclo entre roles | Presupuesto global y por cadena; A→B→A queda en escalado durable con IDs exactos, sin bucle indefinido |
 | Migración de instalación real | IDs, permisos, evidencia y tareas preservados; automatización no retroactiva |
 | UI móvil/dark/teclado | Acción principal accesible, nombres legibles, sin recortes ni cierre accidental |
 

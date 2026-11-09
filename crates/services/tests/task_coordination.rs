@@ -183,6 +183,39 @@ async fn fixture(suffix: &str) -> Fixture {
     }
 }
 
+async fn add_quality_role(fixture: &Fixture, role_id: &str, role_label: &str) {
+    let now = now_rfc3339();
+    TaskRoleRepo::create_with_configuration(
+        &*fixture.db,
+        CreateTaskRole {
+            id: role_id.to_owned(),
+            task_id: fixture.task_id.clone(),
+            role: role_label.to_owned(),
+            coordination_mode: Some(CoordinationMode::Independent),
+            policy_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        r#"{"schema_version":1,"display_label":null,"capabilities":[],"rework":null}"#,
+    )
+    .await
+    .expect("quality role");
+    RoleMembershipRepo::add(
+        &*fixture.db,
+        CreateRoleMembership {
+            id: new_uuid_v4(),
+            task_role_id: role_id.to_owned(),
+            actor_kind: ActorKind::Human,
+            actor_id: fixture.user_id.clone(),
+            status: db::RoleMembershipStatus::Active,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("quality role membership");
+}
+
 #[tokio::test]
 async fn request_turn_replay_compares_the_received_brief() {
     let fixture = fixture("replay").await;
@@ -753,6 +786,14 @@ async fn delivery_correction_without_exact_rework_escalates_instead_of_faking_wo
         .expect("request row");
     assert_eq!(request.state, db::TaskQualityState::RequiresHuman);
     assert!(request.work_unit_id.is_none());
+    assert_eq!(
+        request.requires_human_reason_code.as_deref(),
+        Some("coordination.rework_unavailable")
+    );
+    assert!(request
+        .requires_human_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("exact ReviewReport")));
     let units: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_unit WHERE task_id = ?")
         .bind(&fixture.task_id)
         .fetch_one(fixture.db.pool())
@@ -963,17 +1004,33 @@ async fn rework_correction_completion_freezes_result_for_its_review() {
     .execute(fixture.db.pool())
     .await
     .expect("review subject");
+    let quality_route_id = "source:legacy-rework-completion";
+    sqlx::query(
+        "INSERT INTO task_quality_route (
+             task_id, route_id, route_kind, route_ref, request_count, budget_used,
+             max_requests, created_at, updated_at
+         ) VALUES (?, ?, 'source', ?, 1, 1, 4, ?, ?)",
+    )
+    .bind(&fixture.task_id)
+    .bind(quality_route_id)
+    .bind(&fixture.user_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(fixture.db.pool())
+    .await
+    .expect("quality route fixture");
     sqlx::query(
         "INSERT INTO task_quality_request (
              id, task_id, source_kind, source_id, category, target_kind,
              target_task_role_id, target_actor_kind, target_actor_id, summary,
              findings_json, resolution_condition, state, handoff_id, work_unit_id,
              budget_round, source_digest, request_digest, idempotency_key,
-             created_by_kind, created_by_id, version, created_at, updated_at
+             created_by_kind, created_by_id, version, created_at, updated_at,
+             route_id, route_round, route_limit
          ) VALUES (?, ?, 'human', ?, 'delivery_correction', 'implementation',
                    ?, 'human', ?, 'Correct the delivery', '[]',
                    'The correction is reviewed', 'work_created', NULL, ?,
-                   1, ?, ?, 'rework-completion-quality', 'human', ?, 1, ?, ?)",
+                   1, ?, ?, 'rework-completion-quality', 'human', ?, 1, ?, ?, ?, 1, 4)",
     )
     .bind(new_uuid_v4())
     .bind(&fixture.task_id)
@@ -986,6 +1043,7 @@ async fn rework_correction_completion_freezes_result_for_its_review() {
     .bind(&fixture.user_id)
     .bind(&now)
     .bind(&now)
+    .bind(quality_route_id)
     .execute(fixture.db.pool())
     .await
     .expect("quality request link");
@@ -1062,6 +1120,274 @@ async fn rework_correction_completion_freezes_result_for_its_review() {
     .expect("correction review line");
     assert!(line.1.is_none());
     assert_eq!(line.2.as_deref(), Some("correction-sha"));
+}
+
+#[tokio::test]
+async fn quality_route_budget_is_atomic_and_does_not_reset_with_category_or_role() {
+    let fixture = fixture("quality-route-budget").await;
+    let role_a = "quality-route-role-a";
+    add_quality_role(&fixture, role_a, "specialist-alpha").await;
+    let quality = TaskQualityService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)));
+
+    let mut first_route_id = None;
+    for round in 1..=4 {
+        let request = fixture
+            .service
+            .create_quality_request(
+                &fixture.task_id,
+                &fixture.user_id,
+                services::QualityRequestInput {
+                    source_artifact_id: None,
+                    category: db::TaskQualityCategory::Specialist,
+                    target_kind: db::TaskQualityTargetKind::Specialist,
+                    target_task_role_id: Some(role_a.to_owned()),
+                    target_actor: None,
+                    summary: "same durable quality issue".to_owned(),
+                    findings: vec![format!("finding {round}")],
+                    resolution_condition: "the issue is resolved".to_owned(),
+                    idempotency_key: format!("quality-route-{round}"),
+                },
+            )
+            .await
+            .expect("quality request within route budget");
+        assert_eq!(request.route_round, round);
+        assert_eq!(request.route_limit, 4);
+        assert!(request.requires_human_reason_code.is_none());
+        if let Some(route_id) = first_route_id.as_ref() {
+            assert_eq!(&request.route_id, route_id);
+        } else {
+            first_route_id = Some(request.route_id.clone());
+        }
+        assert_eq!(request.state, db::TaskQualityState::Notified);
+    }
+
+    // The fifth request changes both category and target TaskRole. The exact
+    // same source chain still reaches its persisted route limit.
+    let exhausted = fixture
+        .service
+        .create_quality_request(
+            &fixture.task_id,
+            &fixture.user_id,
+            services::QualityRequestInput {
+                source_artifact_id: None,
+                category: db::TaskQualityCategory::PlanRevision,
+                target_kind: db::TaskQualityTargetKind::Orchestrator,
+                target_task_role_id: Some(fixture.role_id.clone()),
+                target_actor: None,
+                summary: "same durable quality issue".to_owned(),
+                findings: Vec::new(),
+                resolution_condition: "the plan revision is inspected".to_owned(),
+                idempotency_key: "quality-route-5".to_owned(),
+            },
+        )
+        .await
+        .expect("route exhaustion is recorded for Human handling");
+    assert_eq!(exhausted.route_id, first_route_id.expect("route ID"));
+    assert_eq!(exhausted.route_round, 5);
+    assert_eq!(exhausted.route_limit, 4);
+    assert_eq!(exhausted.state, db::TaskQualityState::RequiresHuman);
+    assert_eq!(
+        exhausted.requires_human_reason_code.as_deref(),
+        Some("coordination.quality_route_budget_exhausted")
+    );
+    assert!(exhausted
+        .requires_human_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("4 of 4")));
+
+    let replay = fixture
+        .service
+        .create_quality_request(
+            &fixture.task_id,
+            &fixture.user_id,
+            services::QualityRequestInput {
+                source_artifact_id: None,
+                category: db::TaskQualityCategory::PlanRevision,
+                target_kind: db::TaskQualityTargetKind::Orchestrator,
+                target_task_role_id: Some(fixture.role_id.clone()),
+                target_actor: None,
+                summary: "same durable quality issue".to_owned(),
+                findings: Vec::new(),
+                resolution_condition: "the plan revision is inspected".to_owned(),
+                idempotency_key: "quality-route-5".to_owned(),
+            },
+        )
+        .await
+        .expect("idempotent replay");
+    assert_eq!(replay.id, exhausted.id);
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT request_count, budget_used FROM task_quality_route
+         WHERE task_id = ? AND route_id = ?",
+    )
+    .bind(&fixture.task_id)
+    .bind(&exhausted.route_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("route counters");
+    assert_eq!(counts, (5, 4));
+    assert_eq!(quality.process_pending(10).await.expect("recovery scan"), 4);
+}
+
+#[tokio::test]
+async fn concurrent_quality_route_requests_consume_one_round_each_and_replay_once() {
+    let fixture = fixture("quality-route-concurrency").await;
+    let role_id = "quality-route-concurrent-role";
+    add_quality_role(&fixture, role_id, "custom-specialist").await;
+    for round in 1..=3 {
+        fixture
+            .service
+            .create_quality_request(
+                &fixture.task_id,
+                &fixture.user_id,
+                services::QualityRequestInput {
+                    source_artifact_id: None,
+                    category: db::TaskQualityCategory::Specialist,
+                    target_kind: db::TaskQualityTargetKind::Specialist,
+                    target_task_role_id: Some(role_id.to_owned()),
+                    target_actor: None,
+                    summary: "concurrent route chain".to_owned(),
+                    findings: Vec::new(),
+                    resolution_condition: "the issue is resolved".to_owned(),
+                    idempotency_key: format!("concurrent-prior-{round}"),
+                },
+            )
+            .await
+            .expect("prior route request");
+    }
+
+    let request = |key: &'static str| services::QualityRequestInput {
+        source_artifact_id: None,
+        category: db::TaskQualityCategory::Specialist,
+        target_kind: db::TaskQualityTargetKind::Specialist,
+        target_task_role_id: Some(role_id.to_owned()),
+        target_actor: None,
+        summary: "concurrent route chain".to_owned(),
+        findings: Vec::new(),
+        resolution_condition: "the issue is resolved".to_owned(),
+        idempotency_key: key.to_owned(),
+    };
+    let (left, right) = tokio::join!(
+        fixture.service.create_quality_request(
+            &fixture.task_id,
+            &fixture.user_id,
+            request("concurrent-left"),
+        ),
+        fixture.service.create_quality_request(
+            &fixture.task_id,
+            &fixture.user_id,
+            request("concurrent-right"),
+        ),
+    );
+    let left = left.expect("left concurrent request");
+    let right = right.expect("right concurrent request");
+    assert_eq!(left.route_id, right.route_id);
+    let mut rounds = vec![left.route_round, right.route_round];
+    rounds.sort_unstable();
+    assert_eq!(rounds, vec![4, 5]);
+    assert_eq!(
+        [left.state, right.state]
+            .into_iter()
+            .filter(|state| *state == db::TaskQualityState::RequiresHuman)
+            .count(),
+        1
+    );
+
+    let replay = fixture
+        .service
+        .create_quality_request(
+            &fixture.task_id,
+            &fixture.user_id,
+            request("concurrent-left"),
+        )
+        .await
+        .expect("replay");
+    assert_eq!(replay.id, left.id);
+    let counters: (i64, i64) = sqlx::query_as(
+        "SELECT request_count, budget_used FROM task_quality_route
+         WHERE task_id = ? AND route_id = ?",
+    )
+    .bind(&fixture.task_id)
+    .bind(&left.route_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("route counters");
+    assert_eq!(counters, (5, 4));
+}
+
+#[tokio::test]
+async fn pending_role_ping_pong_is_durably_escalated_with_exact_cycle_evidence() {
+    let fixture = fixture("quality-route-ping-pong").await;
+    let role_a = "quality-cycle-role-a";
+    let role_b = "quality-cycle-role-b";
+    add_quality_role(&fixture, role_a, "custom-alpha").await;
+    add_quality_role(&fixture, role_b, "custom-beta").await;
+    let make_request = |role_id: &str, key: &str| services::QualityRequestInput {
+        source_artifact_id: None,
+        category: db::TaskQualityCategory::Specialist,
+        target_kind: db::TaskQualityTargetKind::Specialist,
+        target_task_role_id: Some(role_id.to_owned()),
+        target_actor: None,
+        summary: "same pending quality chain".to_owned(),
+        findings: Vec::new(),
+        resolution_condition: "the issue is resolved".to_owned(),
+        idempotency_key: key.to_owned(),
+    };
+    let first = fixture
+        .service
+        .create_quality_request(
+            &fixture.task_id,
+            &fixture.user_id,
+            make_request(role_a, "cycle-a-1"),
+        )
+        .await
+        .expect("first role route");
+    let second = fixture
+        .service
+        .create_quality_request(
+            &fixture.task_id,
+            &fixture.user_id,
+            make_request(role_b, "cycle-b-2"),
+        )
+        .await
+        .expect("second role route");
+    let third = fixture
+        .service
+        .create_quality_request(
+            &fixture.task_id,
+            &fixture.user_id,
+            make_request(role_a, "cycle-a-3"),
+        )
+        .await
+        .expect("cycle escalation");
+
+    assert_eq!(first.route_id, second.route_id);
+    assert_eq!(second.route_id, third.route_id);
+    assert_eq!(third.state, db::TaskQualityState::RequiresHuman);
+    assert_eq!(
+        third.requires_human_reason_code.as_deref(),
+        Some("coordination.quality_route_ping_pong")
+    );
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&third.cycle_request_ids_json)
+            .expect("cycle request IDs"),
+        vec![first.id.clone(), second.id.clone(), third.id.clone()]
+    );
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&third.cycle_task_role_ids_json)
+            .expect("cycle TaskRole IDs"),
+        vec![role_a.to_owned(), role_b.to_owned(), role_a.to_owned()]
+    );
+    let recovered = TaskQualityService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)));
+    assert_eq!(recovered.process_pending(10).await.expect("recovery"), 2);
+    let persisted = db::TaskCoordinationRepo::get_task_quality_request(&*fixture.db, &third.id)
+        .await
+        .expect("durable escalation read")
+        .expect("escalation exists");
+    assert_eq!(persisted.state, db::TaskQualityState::RequiresHuman);
+    assert_eq!(
+        persisted.requires_human_reason_code.as_deref(),
+        Some("coordination.quality_route_ping_pong")
+    );
 }
 
 #[tokio::test]

@@ -75,6 +75,19 @@ revisions open a coordination turn. Quality-linked WorkUnits complete
 technically when their Execution finishes, but a delivery correction is never
 resolved by that completion alone.
 
+Each quality chain also has a persisted four-request automatic routing budget.
+Review requests on one `work_unit_review_line` share the same route identity
+across new reports, corrections, category changes, and destination-role
+changes. When three unresolved requests target roles A, B, A in order, Forge
+records a durable `requires_human` escalation with the exact request and
+TaskRole IDs. Budget exhaustion, a pending escalation, and failures discovered
+by the durable quality consumer also persist a concrete reason on the request.
+Replays do not consume another
+global or route round; `BEGIN IMMEDIATE` serializes concurrent admissions.
+The existing eight-round rework receipt limit remains separate. Migration V161
+backfills route accounting for existing quality requests without changing their
+states or replaying them.
+
 Materialization also creates a durable review line and a WorkUnit-scoped
 `review_approval` Gate for each formal review subject. Any materialized WorkUnit
 that directly depends on the review consumes that Gate and line, so it cannot
@@ -90,11 +103,10 @@ result, so a revocation or mode change winning the race leaves zero automatic
 effect. Completion is not approval.
 
 The delivered coordination slice covers PR1–PR2, the PR4 quality-routing
-circuit, technical completion of plan deliveries, and automatic review Gate
-linkage. Remaining product scope is per-route quality budgets and ping-pong
-detection beyond the Task-global budget, plus PR6 joint UI and
-provider/host acceptance. The program must not be presented as PR1–PR6
-complete.
+circuit with per-route budgets and pending-role cycle escalation, technical
+completion of plan deliveries, and automatic review Gate linkage. Remaining
+product scope is PR6 joint UI and provider/host acceptance. The program must not
+be presented as PR1–PR6 complete.
 
 Automatic Orchestrator execution requires the Agent owner and Task Project owner to be the same account, with a current Project owner/admin/member membership. Global Agent visibility supports discovery and TaskRole membership; it does not grant cross-account execution. Forge has no cross-account Agent execution grants, so a missing or mismatched owner or membership fails closed at Execution admission and the transactional Provider Start claim.
 
@@ -134,7 +146,7 @@ A Gate is a deterministic policy over exact durable records. Its immutable GateE
 
 ## Persistence and history
 
-SQLite is the current persistence layer. Numbered migrations V001–V157 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add the Task coordination authorization, turn, plan, materialization, quality-request, intervention, team-staleness, and quality-resolution records described by the PR0 contract.
+SQLite is the current persistence layer. Numbered migrations V001–V161 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add the Task coordination authorization, turn, plan, materialization, quality-request, intervention, team-staleness, and quality-resolution records described by the PR0 contract. V161 adds persisted quality-route counters, exact cycle evidence, and inspectable Human-escalation reasons; it preserves historical request states.
 
 Historical `agent_session_history`, immutable Execution records, ProjectRelease snapshots, Artifact and Evidence references, HarnessSession identities, cross-record IDs, migration decisions, ADRs, and upstream license attribution remain readable history. History does not regain runtime authority. ProjectRelease is a read-only historical snapshot and does not create a current Charter, milestone, readiness workflow, or release operation.
 
@@ -217,6 +229,6 @@ target contract, not a claim that the current runtime supports the whole journey
 The [PR0 contract](plans/pr0-task-coordination-contract.md) and
 [ADR 0016](adr/0016-task-coordination-turn.md) fix the coordination start,
 authority matrix, durable records, recovery rules, and UX states. The backend
-vertical slice (V158–V159, services, REST/MCP/CLI/SSE, generated types) is
+vertical slice (V158–V161, services, REST/MCP/CLI/SSE, generated types) is
 implemented. The guided UI and joint acceptance remain outstanding; see the
 [system review and implementation sequence](plans/task-coordination-and-guided-experience.md).

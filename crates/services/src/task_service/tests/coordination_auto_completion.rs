@@ -146,16 +146,32 @@ async fn auto_completion_revalidates_coordination_inside_the_work_unit_transacti
     )
     .await
     .expect("work unit");
+    let quality_route_id = "source:race-quality";
+    sqlx::query(
+        "INSERT INTO task_quality_route (
+             task_id, route_id, route_kind, route_ref, request_count, budget_used,
+             max_requests, created_at, updated_at
+         ) VALUES (?, ?, 'source', ?, 1, 1, 4, ?, ?)",
+    )
+    .bind(&task.id)
+    .bind(quality_route_id)
+    .bind(&owner_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("quality route");
     sqlx::query(
         "INSERT INTO task_quality_request (
              id, task_id, source_kind, source_id, category, target_kind,
              target_task_role_id, target_actor_kind, target_actor_id, summary,
              findings_json, resolution_condition, state, handoff_id, work_unit_id,
              budget_round, source_digest, request_digest, idempotency_key,
-             created_by_kind, created_by_id, version, created_at, updated_at
+             created_by_kind, created_by_id, version, created_at, updated_at,
+             route_id, route_round, route_limit
          ) VALUES (?, ?, 'human', ?, 'delivery_correction', 'implementation',
                    ?, 'human', ?, 'Correct', '[]', 'Reviewed', 'work_created', NULL, ?,
-                   1, ?, ?, 'race-quality', 'human', ?, 1, ?, ?)",
+                   1, ?, ?, 'race-quality', 'human', ?, 1, ?, ?, ?, 1, 4)",
     )
     .bind(new_uuid_v4())
     .bind(&task.id)
@@ -168,6 +184,7 @@ async fn auto_completion_revalidates_coordination_inside_the_work_unit_transacti
     .bind(&owner_id)
     .bind(&now)
     .bind(&now)
+    .bind(quality_route_id)
     .execute(db.pool())
     .await
     .expect("quality link");

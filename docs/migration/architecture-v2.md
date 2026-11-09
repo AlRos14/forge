@@ -786,6 +786,8 @@ reads or writes.
 | V157 | Advance a review line from the exact reviewed result across parallel reports.
 | V158 | Add versioned Task coordination authorization, turn requests, inspectable `work_unit_plan` Artifacts, approval bindings, and atomic idempotent materialization. Existing Tasks become `manual`; no turn is triggered retrospectively.
 | V159 | Add structured Task quality requests and the single durable Human/Project Copilot intervention circuit. |
+| V160 | Fence coordination authorization against TaskRole, capability, and membership changes; link quality requests to exact coordination turns and resolution evidence. |
+| V161 | Add per-source-chain quality-route counters, stable review-line identity, pending-role cycle evidence, and durable Human-escalation reasons. Existing request states and exact review/rework evidence are preserved. |
 
 ProjectRelease GETs are read-only and reconstruct only from `project_release`,
 `project_release_history_*`, shared media assets, and tombstones. They validate

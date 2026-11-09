@@ -396,6 +396,14 @@ fn map_quality_request(row: SqliteRow) -> Result<TaskQualityRequest> {
         resolution_kind: row.try_get("resolution_kind")?,
         resolution_ref: row.try_get("resolution_ref")?,
         resolution_digest: row.try_get("resolution_digest")?,
+        route_id: row.try_get("route_id")?,
+        route_round: row.try_get("route_round")?,
+        route_limit: row.try_get("route_limit")?,
+        source_task_role_id: row.try_get("source_task_role_id")?,
+        requires_human_reason_code: row.try_get("requires_human_reason_code")?,
+        requires_human_reason: row.try_get("requires_human_reason")?,
+        cycle_request_ids_json: row.try_get("cycle_request_ids_json")?,
+        cycle_task_role_ids_json: row.try_get("cycle_task_role_ids_json")?,
     })
 }
 
@@ -1529,32 +1537,169 @@ impl TaskCoordinationRepo for SqliteDb {
                 replayed: true,
             });
         }
-        let consumed = sqlx::query(
+        let route_identity = sqlx::query(
+            "SELECT route_kind, route_ref, request_count, budget_used, max_requests
+             FROM task_quality_route WHERE task_id = ? AND route_id = ?",
+        )
+        .bind(&input.task_id)
+        .bind(&input.route_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(route) = route_identity.as_ref() {
+            let route_kind: String = route.try_get("route_kind")?;
+            let route_ref: String = route.try_get("route_ref")?;
+            if route_kind != input.route_kind || route_ref != input.route_ref {
+                return Err(DbError::Check(
+                    "quality route identity conflicts with its durable source".to_owned(),
+                ));
+            }
+        } else {
+            sqlx::query(
+                "INSERT INTO task_quality_route (
+                    task_id, route_id, route_kind, route_ref, request_count,
+                    budget_used, max_requests, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, 0, 0, 4, ?, ?)",
+            )
+            .bind(&input.task_id)
+            .bind(&input.route_id)
+            .bind(&input.route_kind)
+            .bind(&input.route_ref)
+            .bind(&input.created_at)
+            .bind(&input.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(check_error)?;
+        }
+        let route = sqlx::query(
+            "SELECT request_count, budget_used, max_requests
+             FROM task_quality_route WHERE task_id = ? AND route_id = ?",
+        )
+        .bind(&input.task_id)
+        .bind(&input.route_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let route_request_count: i64 = route.try_get("request_count")?;
+        let route_budget_used: i64 = route.try_get("budget_used")?;
+        let route_limit: i64 = route.try_get("max_requests")?;
+        let (global_count, global_limit): (i64, i64) = sqlx::query_as(
+            "SELECT quality_request_count, max_quality_requests
+             FROM task_coordination WHERE task_id = ?",
+        )
+        .bind(&input.task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        let global_available = global_count < global_limit;
+        let route_available = route_budget_used < route_limit;
+        let route_round = route_request_count + 1;
+        let budget_round = (global_count + if global_available { 1 } else { 0 }).max(1);
+
+        let pending_human_request: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM task_quality_request
+             WHERE task_id = ? AND route_id = ? AND state = 'requires_human'
+             ORDER BY route_round, id LIMIT 1",
+        )
+        .bind(&input.task_id)
+        .bind(&input.route_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let previous_roles: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, target_task_role_id FROM task_quality_request
+             WHERE task_id = ? AND route_id = ? AND state IN (
+                 'requested', 'notified', 'work_created', 'running'
+             ) AND target_task_role_id IS NOT NULL
+             ORDER BY route_round DESC, id DESC LIMIT 2",
+        )
+        .bind(&input.task_id)
+        .bind(&input.route_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut cycle_request_ids = Vec::new();
+        let mut cycle_task_role_ids = Vec::new();
+        if let (Some(target_role_id), [newest, oldest]) = (
+            input.target_task_role_id.as_deref(),
+            previous_roles.as_slice(),
+        ) {
+            if let (Some(oldest_role), Some(newest_role)) =
+                (oldest.1.as_deref(), newest.1.as_deref())
+            {
+                if oldest_role != newest_role && oldest_role == target_role_id {
+                    cycle_request_ids = vec![oldest.0.clone(), newest.0.clone(), input.id.clone()];
+                    cycle_task_role_ids = vec![
+                        oldest_role.to_owned(),
+                        newest_role.to_owned(),
+                        target_role_id.to_owned(),
+                    ];
+                }
+            }
+        }
+
+        let (reason_code, reason) = match (
+            input.initial_requires_human_reason_code.as_deref(),
+            input.initial_requires_human_reason.as_deref(),
+        ) {
+            (Some(code), Some(reason)) => (Some(code.to_owned()), Some(reason.to_owned())),
+            _ if input.state == TaskQualityState::RequiresHuman => (
+                Some("coordination.requires_human".to_owned()),
+                Some("this quality request requires a Human decision".to_owned()),
+            ),
+            _ if !global_available => (
+                Some("coordination.budget_exhausted".to_owned()),
+                Some(format!(
+                    "Task quality request budget exhausted at {global_count} of {global_limit}; Human routing is required"
+                )),
+            ),
+            _ if !route_available => (
+                Some("coordination.quality_route_budget_exhausted".to_owned()),
+                Some(format!(
+                    "quality route budget exhausted at {route_budget_used} of {route_limit}; Human routing is required"
+                )),
+            ),
+            _ if pending_human_request.is_some() => (
+                Some("coordination.quality_route_human_pending".to_owned()),
+                Some(format!(
+                    "quality route is waiting for Human resolution of request {}",
+                    pending_human_request.as_deref().unwrap_or_default()
+                )),
+            ),
+            _ if !cycle_request_ids.is_empty() => (
+                Some("coordination.quality_route_ping_pong".to_owned()),
+                Some(format!(
+                    "pending quality targets alternate between TaskRoles {} and {} and return to the first role",
+                    cycle_task_role_ids.first().map(String::as_str).unwrap_or_default(),
+                    cycle_task_role_ids.get(1).map(String::as_str).unwrap_or_default()
+                )),
+            ),
+            _ => (None, None),
+        };
+        let state = if reason_code.is_some() {
+            TaskQualityState::RequiresHuman
+        } else {
+            input.state
+        };
+
+        sqlx::query(
+            "UPDATE task_quality_route
+             SET request_count = request_count + 1,
+                 budget_used = budget_used + CASE WHEN budget_used < max_requests THEN 1 ELSE 0 END,
+                 updated_at = ?
+             WHERE task_id = ? AND route_id = ?",
+        )
+        .bind(&input.created_at)
+        .bind(&input.task_id)
+        .bind(&input.route_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
             "UPDATE task_coordination
-             SET quality_request_count = quality_request_count + 1, updated_at = ?
-             WHERE task_id = ? AND quality_request_count < max_quality_requests",
+             SET quality_request_count = quality_request_count + CASE
+                     WHEN quality_request_count < max_quality_requests THEN 1 ELSE 0 END,
+                 updated_at = ?
+             WHERE task_id = ?",
         )
         .bind(&input.created_at)
         .bind(&input.task_id)
         .execute(&mut *tx)
-        .await?;
-        if consumed.rows_affected() != 1 {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM task_coordination WHERE task_id = ?)",
-            )
-            .bind(&input.task_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if !exists {
-                return Err(DbError::NotFound);
-            }
-            return Err(DbError::QualityRequestBudgetExhausted);
-        }
-        let budget_round: i64 = sqlx::query_scalar(
-            "SELECT quality_request_count FROM task_coordination WHERE task_id = ?",
-        )
-        .bind(&input.task_id)
-        .fetch_one(&mut *tx)
         .await?;
         let (actor_kind, actor_id) = coordination_actor_columns(input.target_actor.as_ref());
         sqlx::query(
@@ -1563,8 +1708,11 @@ impl TaskCoordinationRepo for SqliteDb {
                 target_task_role_id, target_actor_kind, target_actor_id, summary,
                 findings_json, resolution_condition, state, handoff_id, work_unit_id,
                 budget_round, source_digest, request_digest, idempotency_key,
-                created_by_kind, created_by_id, version, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                created_by_kind, created_by_id, version, created_at, updated_at,
+                route_id, route_round, route_limit, source_task_role_id,
+                requires_human_reason_code, requires_human_reason,
+                cycle_request_ids_json, cycle_task_role_ids_json
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.task_id)
@@ -1578,7 +1726,7 @@ impl TaskCoordinationRepo for SqliteDb {
         .bind(&input.summary)
         .bind(&input.findings_json)
         .bind(&input.resolution_condition)
-        .bind(input.state.to_string())
+        .bind(state.to_string())
         .bind(input.handoff_id.as_deref())
         .bind(input.work_unit_id.as_deref())
         .bind(budget_round)
@@ -1589,10 +1737,35 @@ impl TaskCoordinationRepo for SqliteDb {
         .bind(input.created_by.id())
         .bind(&input.created_at)
         .bind(&input.created_at)
+        .bind(&input.route_id)
+        .bind(route_round)
+        .bind(route_limit)
+        .bind(input.source_task_role_id.as_deref())
+        .bind(reason_code.as_deref())
+        .bind(reason.as_deref())
+        .bind(serde_json::to_string(&cycle_request_ids).map_err(|error| {
+            DbError::Check(format!("quality route cycle requests cannot serialize: {error}"))
+        })?)
+        .bind(serde_json::to_string(&cycle_task_role_ids).map_err(|error| {
+            DbError::Check(format!("quality route cycle roles cannot serialize: {error}"))
+        })?)
         .execute(&mut *tx)
         .await
         .map_err(check_error)?;
-        let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &input.event).await?;
+        let mut event_input = input.event;
+        let mut event_payload: serde_json::Value = serde_json::from_str(&event_input.payload_json)
+            .map_err(|error| {
+                DbError::Check(format!("quality event payload is invalid: {error}"))
+            })?;
+        event_payload["route_id"] = serde_json::json!(input.route_id);
+        event_payload["route_round"] = serde_json::json!(route_round);
+        event_payload["route_limit"] = serde_json::json!(route_limit);
+        event_payload["state"] = serde_json::json!(state.to_string());
+        event_payload["requires_human_reason_code"] = serde_json::json!(reason_code);
+        event_payload["cycle_request_ids"] = serde_json::json!(cycle_request_ids);
+        event_payload["cycle_task_role_ids"] = serde_json::json!(cycle_task_role_ids);
+        event_input.payload_json = event_payload.to_string();
+        let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &event_input).await?;
         let request = sqlx::query("SELECT * FROM task_quality_request WHERE id = ?")
             .bind(&input.id)
             .fetch_one(&mut *tx)
@@ -1694,6 +1867,16 @@ impl TaskCoordinationRepo for SqliteDb {
             query
                 .push(", resolution_digest = ")
                 .push_bind(resolution_digest.as_deref());
+        }
+        if let Some(reason_code) = input.requires_human_reason_code.as_ref() {
+            query
+                .push(", requires_human_reason_code = ")
+                .push_bind(reason_code.as_deref());
+        }
+        if let Some(reason) = input.requires_human_reason.as_ref() {
+            query
+                .push(", requires_human_reason = ")
+                .push_bind(reason.as_deref());
         }
         query
             .push(" WHERE id = ")

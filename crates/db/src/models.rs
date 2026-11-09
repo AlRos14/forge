@@ -3031,6 +3031,14 @@ pub struct TaskQualityRequest {
     pub resolution_kind: Option<String>,
     pub resolution_ref: Option<String>,
     pub resolution_digest: Option<String>,
+    pub route_id: String,
+    pub route_round: i64,
+    pub route_limit: i64,
+    pub source_task_role_id: Option<String>,
+    pub requires_human_reason_code: Option<String>,
+    pub requires_human_reason: Option<String>,
+    pub cycle_request_ids_json: String,
+    pub cycle_task_role_ids_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3050,6 +3058,12 @@ pub struct CreateTaskQualityRequestInput {
     pub handoff_id: Option<String>,
     pub work_unit_id: Option<String>,
     pub source_digest: String,
+    pub route_id: String,
+    pub route_kind: String,
+    pub route_ref: String,
+    pub source_task_role_id: Option<String>,
+    pub initial_requires_human_reason_code: Option<String>,
+    pub initial_requires_human_reason: Option<String>,
     pub request_digest: String,
     pub idempotency_key: String,
     pub created_by: ActorRef,
@@ -3068,6 +3082,8 @@ pub struct UpdateTaskQualityRequestState {
     pub resolution_kind: Option<Option<String>>,
     pub resolution_ref: Option<Option<String>>,
     pub resolution_digest: Option<Option<String>>,
+    pub requires_human_reason_code: Option<Option<String>>,
+    pub requires_human_reason: Option<Option<String>>,
     pub updated_at: String,
     pub event: Option<CreateDomainEvent>,
 }

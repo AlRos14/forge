@@ -135,6 +135,16 @@ fallo técnico no equivale a un informe request_changes; una aprobación antigua
 no valida un resultado nuevo. Conservar independencia, resultados inmutables,
 review lines, manifiestos y Gates exactos.
 
+Forge mantiene además un presupuesto automático por cadena de calidad, separado
+del presupuesto global de la Task y del límite de ocho reworks exactos. Los
+informes de una misma review line comparten ruta aunque cambien la categoría o
+el TaskRole destino. Si tres solicitudes aún pendientes apuntan en orden a los
+roles A, B y A, la tercera queda en `requires_human`; la solicitud conserva los
+IDs exactos de la cadena y una razón inspeccionable. Agotar cualquier límite o
+que el consumidor durable descubra un destino/membresía no utilizable también
+produce una solicitud durable para decisión humana. La detección compara IDs
+de TaskRole; las etiquetas de rol no conceden autoridad.
+
 Replanificar conserva la historia: crear o sustituir solo trabajo futuro seguro,
 registrar qué requisitos/entregas cambian y qué revisión debe repetirse. No editar
 un alcance en ejecución ni invalidar silenciosamente trabajo ya aprobado. Los

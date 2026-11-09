@@ -217,6 +217,13 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "category",
                 "target_kind",
                 "source_kind",
+                "state",
+                "route_id",
+                "route_round",
+                "route_limit",
+                "requires_human_reason_code",
+                "cycle_request_ids",
+                "cycle_task_role_ids",
             ],
         ),
         "task.quality_request_resolved" => {
@@ -480,6 +487,27 @@ mod tests {
         assert_eq!(payload["plan_artifact_id"], "artifact-1");
         assert!(payload.get("content").is_none());
         assert!(payload.get("objective").is_none());
+    }
+
+    #[test]
+    fn quality_route_event_exposes_safe_cycle_evidence_without_reason_text() {
+        let event = domain_event(
+            "task.quality_requested",
+            r#"{"task_id":"task-1","quality_request_id":"quality-3","category":"specialist","target_kind":"specialist","source_kind":"review_report","state":"requires_human","route_id":"review_line:line-1","route_round":3,"route_limit":4,"requires_human_reason_code":"coordination.quality_route_ping_pong","requires_human_reason":"private free-form detail","cycle_request_ids":["quality-1","quality-2","quality-3"],"cycle_task_role_ids":["role-a","role-b","role-a"],"summary":"private summary"}"#,
+        );
+        let projected = project_domain_event(&event).expect("quality route event");
+        let payload = projected.payload.expect("payload");
+        assert_eq!(payload["state"], "requires_human");
+        assert_eq!(payload["route_round"], 3);
+        assert_eq!(payload["route_limit"], 4);
+        assert_eq!(
+            payload["requires_human_reason_code"],
+            "coordination.quality_route_ping_pong"
+        );
+        assert_eq!(payload["cycle_request_ids"][0], "quality-1");
+        assert_eq!(payload["cycle_task_role_ids"][1], "role-b");
+        assert!(payload.get("requires_human_reason").is_none());
+        assert!(payload.get("summary").is_none());
     }
 
     #[test]

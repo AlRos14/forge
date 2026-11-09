@@ -376,6 +376,37 @@ Reglas de validación:
 - Textos: title <= 512, scope <= 4096, instructions <= 64 KiB, acceptance
   <= 32 items, dependencies <= 32, plan <= 256 KiB.
 
+### 5.7 `task_quality_route` — añadido por V161
+
+El límite global de calidad de `task_coordination` no basta para impedir que
+una misma cadena consuma todas sus rondas ni para detectar alternancia entre
+destinatarios. V161 añade un registro por cadena con identidad estable,
+`request_count`, `budget_used` y `max_requests` (cuatro admisiones automáticas
+por defecto). El ID se basa en el `work_unit_review_line` cuando el origen es
+un ReviewReport con línea; en otro caso queda anclado al tipo, ID y digest del
+origen exacto. Categoría y TaskRole destino no forman parte de la identidad.
+
+La inserción, el presupuesto global y el de ruta, el orden de la solicitud, la
+decisión de escalado y el evento se confirman bajo `BEGIN IMMEDIATE`. El
+reintento por la misma clave devuelve la fila existente sin consumir rondas.
+Si se agota el presupuesto global o el de ruta, Forge conserva la solicitud en
+`requires_human`, sin superar el contador limitado, e incluye el código y la
+razón concreta.
+
+La detección compara los IDs exactos de TaskRole de las solicitudes aún
+pendientes dentro de esa ruta. Si las dos últimas rutas pendientes se dirigen
+a A y B y la nueva vuelve a A (A != B), Forge persiste la tercera como
+`requires_human` con los tres IDs de solicitud y roles. Una escalación sin
+resolver mantiene las nuevas solicitudes de esa ruta en espera humana. La
+resolución/cancelación humana permite continuar, pero no reinicia el presupuesto
+de ruta. Esto no sustituye la cadena inmutable ReviewReport → rework exacto →
+nueva revisión ni cambia el límite separado de ocho rondas de rework.
+
+`TaskQualityRequestResponse.quality_route` expone `id`, `round`, `limit`,
+`source_task_role_id` y una `escalation` opcional con `reason_code`, `reason`,
+`cycle_request_ids` y `cycle_task_role_ids`. La migración crea accounting para
+las solicitudes existentes sin reescribir sus estados ni reproducir efectos.
+
 ## 6. Admisión, Start, recuperación y carreras
 
 ### 6.1 Secuencia
