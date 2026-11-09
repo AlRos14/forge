@@ -381,8 +381,8 @@ Reglas de validación:
 El límite global de calidad de `task_coordination` no basta para impedir que
 una misma cadena consuma todas sus rondas ni para detectar alternancia entre
 destinatarios. V161 añade un registro por cadena con identidad estable,
-`request_count`, `budget_used` y `max_requests` (cuatro admisiones automáticas
-por defecto). El ID se basa en el `work_unit_review_line` cuando el origen es
+`request_count`, `budget_used` y `max_requests` (cuatro solicitudes por defecto).
+El ID se basa en el `work_unit_review_line` cuando el origen es
 un ReviewReport con línea; en otro caso queda anclado al tipo, ID y digest del
 origen exacto. Categoría y TaskRole destino no forman parte de la identidad.
 

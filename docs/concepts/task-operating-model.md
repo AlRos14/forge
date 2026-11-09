@@ -135,7 +135,7 @@ fallo técnico no equivale a un informe request_changes; una aprobación antigua
 no valida un resultado nuevo. Conservar independencia, resultados inmutables,
 review lines, manifiestos y Gates exactos.
 
-Forge mantiene además un presupuesto automático por cadena de calidad, separado
+Forge mantiene además un presupuesto por cadena de calidad, separado
 del presupuesto global de la Task y del límite de ocho reworks exactos. Los
 informes de una misma review line comparten ruta aunque cambien la categoría o
 el TaskRole destino. Si tres solicitudes aún pendientes apuntan en orden a los

@@ -265,7 +265,7 @@ plan content, prompts, briefs, free-form escalation text, credentials, or paths.
 when present. The free-form reason remains available on the durable request
 response only.
 
-Automatic quality routing is limited to four requests per durable source chain,
+Quality requests are limited to four admissions per durable source chain,
 in addition to the existing Task-global budget. The eight-round exact rework
 receipt limit remains independent. If unresolved route requests target roles
 A, B, then A, the third request is persisted as `requires_human` with

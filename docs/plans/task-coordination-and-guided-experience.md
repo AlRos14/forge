@@ -135,7 +135,7 @@ cero efecto automático. Las Tasks históricas/manuales no se automatizan
 retroactivamente. La materialización crea la línea de revisión y el Gate de
 aprobación que consumen las WorkUnits dependientes de la revisión.
 
-El límite automático por cadena es cuatro solicitudes y comparte identidad por
+El límite por cadena es cuatro solicitudes de calidad y comparte identidad por
 review line, sin reiniciarse por cambio de categoría o TaskRole. Para cadenas
 sin review line se usa el origen exacto y su digest. La admisión consume el
 contador global y el de ruta en el mismo `BEGIN IMMEDIATE`; replays no consumen
@@ -204,7 +204,7 @@ las pruebas de Rust se ejecutan en la fase de integración solicitada.
 - El supervisor puede recibir un defecto de planificación y coordinar ajuste;
   el revisor puede dirigirse a otros roles permitidos. Sin destino válido, pedir
   decisión humana. Nunca elegir aleatoriamente un Actor ni evadir independencia.
-- Implementado: límite global y límite automático de cuatro por cadena estable;
+- Implementado: límite global y límite de cuatro por cadena estable;
   una review line mantiene la identidad al cambiar categoría o TaskRole.
   Replays y admisiones concurrentes comparten el recibo transaccional.
 - Implementado: el ciclo de destinos pendientes A→B→A escala a Human con

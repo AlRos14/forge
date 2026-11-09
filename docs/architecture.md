@@ -75,7 +75,7 @@ revisions open a coordination turn. Quality-linked WorkUnits complete
 technically when their Execution finishes, but a delivery correction is never
 resolved by that completion alone.
 
-Each quality chain also has a persisted four-request automatic routing budget.
+Each quality chain also has a persisted four-request quality-routing budget.
 Review requests on one `work_unit_review_line` share the same route identity
 across new reports, corrections, category changes, and destination-role
 changes. When three unresolved requests target roles A, B, A in order, Forge
