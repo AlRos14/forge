@@ -1915,11 +1915,15 @@ fn quality_value(request: db::TaskQualityRequest) -> Value {
         "state": request.state.to_string(),
         "handoff_id": request.handoff_id,
         "work_unit_id": request.work_unit_id,
+        "coordination_request_id": request.coordination_request_id,
         "budget_round": request.budget_round,
         "version": request.version,
         "created_at": request.created_at,
         "updated_at": request.updated_at,
         "resolved_at": request.resolved_at,
+        "resolution_kind": request.resolution_kind,
+        "resolution_ref": request.resolution_ref,
+        "resolution_digest": request.resolution_digest,
     })
 }
 fn intervention_value(intervention: db::TaskIntervention) -> Value {
@@ -2164,9 +2168,14 @@ pub(super) async fn forge_create_task_quality_request(
         "human" => db::TaskQualityTargetKind::Human,
         _ => return Err(McpToolError::new(-32602, "quality target is unsupported")),
     };
+    let source = match coordination_opt_str(&params, "source_execution_id") {
+        Some(execution_id) => CollaborationActorSource::Execution(execution_id),
+        None => CollaborationActorSource::Human(user_id.to_owned()),
+    };
     let request = coordination_service(state)
-        .create_quality_request(
+        .create_quality_request_as(
             &task.id,
+            source,
             user_id,
             services::task_coordination::QualityRequestInput {
                 source_artifact_id: coordination_opt_str(&params, "source_artifact_id"),

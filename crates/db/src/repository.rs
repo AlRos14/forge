@@ -136,7 +136,6 @@ pub trait TaskCoordinationRepo: Send + Sync {
     ) -> Result<TaskCoordinationWrite>;
     async fn consume_coordination_turn_budget(&self, task_id: &str) -> Result<bool>;
     async fn refund_coordination_turn_budget(&self, task_id: &str) -> Result<()>;
-    async fn consume_quality_request_budget(&self, task_id: &str) -> Result<bool>;
     async fn create_task_coordination_request(
         &self,
         input: CreateTaskCoordinationRequestInput,
@@ -221,13 +220,7 @@ pub trait TaskCoordinationRepo: Send + Sync {
     ) -> Result<Vec<TaskQualityRequest>>;
     async fn update_task_quality_request_state(
         &self,
-        id: &str,
-        expected_version: i64,
-        state: TaskQualityState,
-        handoff_id: Option<Option<String>>,
-        work_unit_id: Option<Option<String>>,
-        updated_at: &str,
-        event: Option<CreateDomainEvent>,
+        input: UpdateTaskQualityRequestState,
     ) -> Result<TaskQualityRequest>;
     async fn create_task_intervention(
         &self,
@@ -587,6 +580,10 @@ pub struct CreateOrchestratorWake {
     pub policy_digest: String,
     pub task_role_version: i64,
     pub task_role_policy_json: String,
+    /// When this wake admits a Task coordination turn, the exact request is
+    /// linked under the same transaction as the wake row. A crash can never
+    /// leave a coordination wake observable without its durable request.
+    pub coordination_request_id: Option<String>,
     pub available_at: String,
     pub created_at: String,
     pub updated_at: String,
@@ -777,6 +774,15 @@ pub trait WorkUnitRepo: Send + Sync {
     async fn transition(
         &self,
         input: TransitionWorkUnit,
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnit>>;
+    /// Complete a WorkUnit only if the exact Task coordination authorization
+    /// is still current inside the same write transaction that freezes the
+    /// result. Used by the automatic/system completion path.
+    async fn transition_with_coordination_fence(
+        &self,
+        input: TransitionWorkUnit,
+        expected_authorization_version: i64,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<WorkUnit>>;
     async fn list_dependencies(&self, id: &str) -> Result<Vec<WorkUnitDependency>>;

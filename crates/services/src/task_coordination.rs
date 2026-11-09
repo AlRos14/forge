@@ -513,6 +513,7 @@ impl TaskCoordinationService {
                 "proposal and prepare_and_execute require an exact coordinator TaskRole and Actor",
             ));
         }
+        let coordination_before = self.require_coordination(&task.id).await?;
         let team = self.current_team(&task.id).await?;
         let team_snapshot_json = self.team_snapshot_json(&team)?;
         let team_digest = sha256_hex(team_snapshot_json.as_bytes());
@@ -584,6 +585,7 @@ impl TaskCoordinationService {
             db::AuthorizeTaskCoordinationInput {
                 task_id: task.id.clone(),
                 expected_coordination_version: input.expected_coordination_version,
+                expected_team_generation: coordination_before.team_generation,
                 mode: input.mode,
                 coordinator_task_role_id: input.coordinator_task_role_id,
                 coordinator_actor: coordinator,
@@ -714,8 +716,7 @@ impl TaskCoordinationService {
         )
         .await?
         {
-            let brief = self.parse_brief(&request)?;
-            let request_digest = self.turn_request_digest(&task, &coordination, &brief)?;
+            let request_digest = self.turn_request_digest(&task, &coordination, &input.brief)?;
             if request.request_digest != request_digest {
                 return Err(coordination_error(
                     "coordination.idempotency_conflict",
@@ -725,7 +726,7 @@ impl TaskCoordinationService {
             return Ok((request, false));
         }
         let team = self.current_team(&task.id).await?;
-        if self.team_digest(&team)? != coordination.team_digest {
+        if coordination.team_stale || self.team_digest(&team)? != coordination.team_digest {
             return Err(coordination_error(
                 "coordination.authorization_stale",
                 "Task team changed since the coordination authorization; reauthorize it",
@@ -1080,10 +1081,10 @@ impl TaskCoordinationService {
                 "Task coordination authorization changed",
             ));
         }
-        if coordination.revoked_at.is_some() {
+        if coordination.revoked_at.is_some() || coordination.team_stale {
             return Err(coordination_error(
                 "coordination.authorization_revoked",
-                "Task coordination authorization is revoked",
+                "Task coordination authorization is revoked or stale",
             ));
         }
         let request =
@@ -1235,6 +1236,7 @@ impl TaskCoordinationService {
                 plan_artifact_id: artifact_id.to_owned(),
                 plan_digest: plan.plan_digest.clone(),
                 authorization_version: coordination.authorization_version,
+                expected_team_digest: current_team_digest.clone(),
                 expected_plan_version: plan.version,
                 task_version_before: task.version,
                 expected_request_version: request.version,
@@ -1256,6 +1258,43 @@ impl TaskCoordinationService {
             .ok_or_else(|| {
                 ServiceError::not_found("task_coordination_request", request.id.clone())
             })?;
+        let request = if request.state != TaskCoordinationRequestState::Materialized {
+            let now = now_rfc3339();
+            let event = self.event(
+                "task.coordination_request_materialized",
+                "task_coordination_request",
+                &request.id,
+                "system",
+                None,
+                &request.task_id,
+                json!({
+                    "task_id": request.task_id,
+                    "request_id": request.id,
+                    "plan_artifact_id": artifact_id,
+                    "state": TaskCoordinationRequestState::Materialized.to_string(),
+                }),
+                &now,
+            );
+            TaskCoordinationRepo::update_task_coordination_request(
+                &*self.db,
+                db::UpdateTaskCoordinationRequestState {
+                    id: request.id.clone(),
+                    expected_version: request.version,
+                    state: TaskCoordinationRequestState::Materialized,
+                    wake_id: None,
+                    execution_id: None,
+                    plan_artifact_id: Some(artifact_id.to_owned()),
+                    failure_code: None,
+                    failure_message: None,
+                    completed_at: Some(now.clone()),
+                    updated_at: now,
+                    event: Some(event),
+                },
+            )
+            .await?
+        } else {
+            request
+        };
         let (launch_intent_accepted, launch_blockers) =
             self.launch_materialized_work(&task.id, user_id).await?;
         Ok(MaterializeOutcome {
@@ -1276,6 +1315,29 @@ impl TaskCoordinationService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let coordination = self.require_coordination(task_id).await?;
+        if coordination.revoked_at.is_some()
+            || coordination.team_stale
+            || coordination.mode == TaskCoordinationMode::Manual
+        {
+            return Ok((
+                false,
+                vec![
+                    "coordination.authorization_revoked: Task coordination authorization is revoked or stale"
+                        .to_owned(),
+                ],
+            ));
+        }
+        let team = self.current_team(task_id).await?;
+        if self.team_digest(&team)? != coordination.team_digest {
+            return Ok((
+                false,
+                vec![
+                    "coordination.authorization_stale: the Task team changed after the coordination authorization"
+                        .to_owned(),
+                ],
+            ));
+        }
         let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, task_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
@@ -1318,6 +1380,7 @@ impl TaskCoordinationService {
         if coordination.revoked_at.is_some()
             || coordination.authorization_version != request.authorization_version
             || coordination.mode != request.mode
+            || coordination.team_stale
         {
             return Err(coordination_error(
                 "coordination.authorization_stale",
@@ -1759,7 +1822,7 @@ impl TaskCoordinationService {
             "You are the selected Task coordinator for one bounded preparation turn. This execution is read-only and must not modify repository files, create WorkUnits, call provider APIs, or grant authority.\n\
 Return exactly one JSON object and no markdown fences. The object must match this schema:\n\
 {{\"schema_version\":1,\"request_id\":{request_id},\"task_id\":{task_id},\"task_version\":{task_version},\"authorization_version\":{authorization_version},\"team_digest\":{team_digest},\"envelope_digest\":{envelope_digest},\"objective_digest\":{objective_digest},\"work_units\":[{{\"key\":\"stable-key\",\"title\":\"...\",\"scope\":\"...\",\"role\":\"exact existing TaskRole role name\",\"assigned_actor\":{{\"kind\":\"agent|human\",\"id\":\"exact eligible member id\"}}|null,\"parent_key\":null,\"depends_on\":[],\"requires_integration\":false,\"execution_instructions\":null,\"review_subject_key\":null,\"acceptance\":[],\"artifact_inputs\":[]}}],\"delivery\":null,\"review\":null,\"limits\":null}}\n\
-Create at most {max_work_units} WorkUnits. Use only TaskRole names and active members listed in the team. A reviewer WorkUnit must use role `reviewer`, set review_subject_key to another planned key, and must be independent from that WorkUnit's assigned Actor. Do not create, rename, or grant TaskRoles, memberships, or capabilities. Do not request external actions or merge. A plan outside the envelope will wait for Human approval.\n\
+Create at most {max_work_units} WorkUnits. Use only TaskRole names and active members listed in the team. A formal review WorkUnit must use a TaskRole with the `formal_review` capability, set review_subject_key to another planned key, and must be independent from that WorkUnit's assigned Actor. The review role must also appear in the envelope's allowed_review_roles by its exact role name. Do not create, rename, or grant TaskRoles, memberships, or capabilities. Do not request external actions or merge. A plan outside the envelope will wait for Human approval.\n\
 Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {acceptance}\nContext: {context}\nEnvelope: {envelope_json}\nTeam: {team}\nCurrent Task context: {task_context}",
             request_id = serde_json::to_string(&request.id).unwrap(),
             task_id = serde_json::to_string(&request.task_id).unwrap(),
@@ -1785,7 +1848,32 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         user_id: &str,
         input: QualityRequestInput,
     ) -> Result<TaskQualityRequest> {
-        let source = CollaborationActorSource::Human(user_id.to_owned());
+        self.create_quality_request_as(
+            task_id,
+            CollaborationActorSource::Human(user_id.to_owned()),
+            user_id,
+            input,
+        )
+        .await
+    }
+
+    /// Reviewer Executions can open the same durable quality request as a
+    /// Human. The source Execution must have produced the exact ReviewReport
+    /// that justifies the request and must hold the formal_review capability;
+    /// the request is attributed to that Actor, not to its owner account.
+    pub async fn create_quality_request_as(
+        &self,
+        task_id: &str,
+        source: CollaborationActorSource,
+        _authority_user_id: &str,
+        input: QualityRequestInput,
+    ) -> Result<TaskQualityRequest> {
+        if matches!(source, CollaborationActorSource::ProjectCopilot(_)) {
+            return Err(coordination_error(
+                "coordination.not_authorized",
+                "Project Copilot cannot open Task quality requests",
+            ));
+        }
         let (task, actor) = self
             .collaboration
             .authorize_mutation_source(task_id, &source)
@@ -1809,28 +1897,69 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                 "quality resolution condition must contain 1 to 4096 bytes",
             ));
         }
-        let (source_kind, source_id, source_digest) =
-            if let Some(artifact_id) = input.source_artifact_id.as_deref() {
-                let artifact = CollaborationRepo::get_artifact(&*self.db, artifact_id)
-                    .await?
-                    .filter(|artifact| artifact.task_id == task.id)
-                    .ok_or_else(|| ServiceError::not_found("artifact", artifact_id.to_owned()))?;
-                if artifact.kind != ArtifactKind::ReviewReport {
-                    return Err(invalid_plan(
-                        "a quality request source must be an exact ReviewReport Artifact",
+        let (source_kind, source_id, source_digest) = if let Some(artifact_id) =
+            input.source_artifact_id.as_deref()
+        {
+            let artifact = CollaborationRepo::get_artifact(&*self.db, artifact_id)
+                .await?
+                .filter(|artifact| artifact.task_id == task.id)
+                .ok_or_else(|| ServiceError::not_found("artifact", artifact_id.to_owned()))?;
+            if artifact.kind != ArtifactKind::ReviewReport {
+                return Err(invalid_plan(
+                    "a quality request source must be an exact ReviewReport Artifact",
+                ));
+            }
+            match &source {
+                CollaborationActorSource::Execution(execution_id) => {
+                    let produced_by_source = artifact
+                        .execution_producer()
+                        .is_some_and(|(producer, _)| producer == execution_id);
+                    let execution_is_completed =
+                        db::ExecutionRepo::get_by_id(&*self.db, execution_id)
+                            .await?
+                            .is_some_and(|execution| {
+                                execution.task_id == task.id
+                                    && execution.status == db::ExecutionStatus::Completed
+                            });
+                    if !produced_by_source
+                        || !execution_is_completed
+                        || !crate::role_capabilities::execution_has_capability(
+                            &self.db,
+                            execution_id,
+                            api_types::TaskRoleCapability::FormalReview,
+                        )
+                        .await?
+                    {
+                        return Err(coordination_error(
+                            "coordination.not_authorized",
+                            "a reviewer quality request requires its own exact completed ReviewReport and formal_review authority",
+                        ));
+                    }
+                }
+                CollaborationActorSource::Human(_) => {}
+                CollaborationActorSource::ProjectCopilot(_) => {
+                    return Err(coordination_error(
+                        "coordination.not_authorized",
+                        "Project Copilot cannot open Task quality requests",
                     ));
                 }
-                let digest = artifact.digest.clone().unwrap_or_else(|| {
-                    sha256_hex(artifact.content.as_deref().unwrap_or_default().as_bytes())
-                });
-                ("review_report".to_owned(), artifact.id, digest)
-            } else {
-                (
-                    "human".to_owned(),
-                    user_id.to_owned(),
-                    sha256_hex(input.summary.as_bytes()),
-                )
-            };
+            }
+            let digest = artifact.digest.clone().unwrap_or_else(|| {
+                sha256_hex(artifact.content.as_deref().unwrap_or_default().as_bytes())
+            });
+            ("review_report".to_owned(), artifact.id, digest)
+        } else {
+            if matches!(source, CollaborationActorSource::Execution(_)) {
+                return Err(invalid_plan(
+                    "a reviewer quality request requires its exact ReviewReport source",
+                ));
+            }
+            (
+                "human".to_owned(),
+                actor.id().to_owned(),
+                sha256_hex(input.summary.as_bytes()),
+            )
+        };
         let findings_json = serde_json::to_string(&input.findings)
             .map_err(|_| invalid_plan("quality findings cannot be serialized"))?;
         let request_digest = sha256_hex(
@@ -1925,20 +2054,14 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                 return Err(invalid_plan("the target TaskRole has no active member"));
             }
         }
-        if !TaskCoordinationRepo::consume_quality_request_budget(&*self.db, &task.id).await? {
-            return Err(coordination_error(
-                "coordination.budget_exhausted",
-                "the Task quality-request budget is exhausted",
-            ));
-        }
         let request_id = new_uuid_v4();
         let now = now_rfc3339();
         let event = self.event(
             "task.quality_requested",
             "task_quality_request",
             &request_id,
-            "human",
-            Some(user_id),
+            &actor.kind().to_string(),
+            Some(actor.id()),
             &task.id,
             json!({
                 "task_id": task.id,
@@ -1949,74 +2072,108 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
             }),
             &now,
         );
-        let mut state = if input.category == TaskQualityCategory::HumanDecision {
+        let state = if input.category == TaskQualityCategory::HumanDecision {
             TaskQualityState::RequiresHuman
         } else {
             TaskQualityState::Requested
         };
-        let mut handoff_id = None;
-        if state != TaskQualityState::RequiresHuman {
-            let target = match (input.target_actor.clone(), target_role.as_ref()) {
-                (Some(actor), _) => db::CollaborationTarget::Actor(actor),
-                (None, Some(role)) => db::CollaborationTarget::Role(role.id.clone()),
-                _ => db::CollaborationTarget::Task,
-            };
-            let handoff = self
-                .collaboration
-                .create_handoff(
-                    source.clone(),
-                    CreateHandoffInput {
-                        task_id: task.id.clone(),
-                        source_role_id: None,
-                        target,
-                        work_unit_id: None,
-                        intent: match input.category {
-                            TaskQualityCategory::DeliveryCorrection => db::HandoffIntent::Rework,
-                            TaskQualityCategory::PlanRevision => db::HandoffIntent::Delegation,
-                            TaskQualityCategory::Specialist => db::HandoffIntent::Investigate,
-                            TaskQualityCategory::HumanDecision => {
-                                db::HandoffIntent::DecisionRequest
-                            }
-                        },
-                        parent_execution_id: None,
-                        expected_policy_ref: Some("forge.task-quality-request".to_owned()),
-                        artifact_ids: input.source_artifact_id.iter().cloned().collect(),
-                    },
-                )
-                .await?;
-            handoff_id = Some(handoff.id);
-            state = TaskQualityState::Notified;
-        }
         let write = TaskCoordinationRepo::create_task_quality_request(
             &*self.db,
             db::CreateTaskQualityRequestInput {
-                id: request_id,
-                task_id: task.id,
+                id: request_id.clone(),
+                task_id: task.id.clone(),
                 source_kind,
                 source_id,
                 category: input.category,
                 target_kind: input.target_kind,
-                target_task_role_id: input.target_task_role_id,
-                target_actor: input.target_actor,
-                summary: input.summary,
+                target_task_role_id: input.target_task_role_id.clone(),
+                target_actor: input.target_actor.clone(),
+                summary: input.summary.clone(),
                 findings_json,
-                resolution_condition: input.resolution_condition,
+                resolution_condition: input.resolution_condition.clone(),
                 state,
-                handoff_id,
+                handoff_id: None,
                 work_unit_id: None,
                 source_digest,
                 request_digest,
-                idempotency_key: input.idempotency_key,
-                created_by: actor,
-                created_at: now,
+                idempotency_key: input.idempotency_key.clone(),
+                created_by: actor.clone(),
+                created_at: now.clone(),
                 event,
             },
         )
         .await?;
+        if write.replayed {
+            return Ok(write.request);
+        }
         if let Some(event) = write.event.as_ref() {
             self.domain_events.publish_committed(event);
         }
-        Ok(write.request)
+        if state == TaskQualityState::RequiresHuman {
+            return Ok(write.request);
+        }
+        // The handoff is an informational notification, not the effect
+        // authority. Creating it with a deterministic ID after the request
+        // commits makes retries and concurrent consumers converge on one
+        // notification without consuming another budget round.
+        let target = match (input.target_actor.clone(), target_role.as_ref()) {
+            (Some(actor), _) => db::CollaborationTarget::Actor(actor),
+            (None, Some(role)) => db::CollaborationTarget::Role(role.id.clone()),
+            _ => db::CollaborationTarget::Task,
+        };
+        let handoff = self
+            .collaboration
+            .create_handoff_with_id(
+                source.clone(),
+                CreateHandoffInput {
+                    task_id: task.id.clone(),
+                    source_role_id: None,
+                    target,
+                    work_unit_id: None,
+                    intent: match input.category {
+                        TaskQualityCategory::DeliveryCorrection => db::HandoffIntent::Rework,
+                        TaskQualityCategory::PlanRevision => db::HandoffIntent::Delegation,
+                        TaskQualityCategory::Specialist => db::HandoffIntent::Investigate,
+                        TaskQualityCategory::HumanDecision => db::HandoffIntent::DecisionRequest,
+                    },
+                    parent_execution_id: None,
+                    expected_policy_ref: Some("forge.task-quality-request".to_owned()),
+                    artifact_ids: input.source_artifact_id.iter().cloned().collect(),
+                },
+                deterministic_quality_handoff_id(&write.request.id)?,
+            )
+            .await?;
+        let updated = TaskCoordinationRepo::update_task_quality_request_state(
+            &*self.db,
+            db::UpdateTaskQualityRequestState {
+                id: write.request.id.clone(),
+                expected_version: write.request.version,
+                state: TaskQualityState::Notified,
+                handoff_id: Some(Some(handoff.id)),
+                work_unit_id: None,
+                coordination_request_id: None,
+                resolution_kind: None,
+                resolution_ref: None,
+                resolution_digest: None,
+                updated_at: now_rfc3339(),
+                event: Some(self.event(
+                    "task.quality_request_notified",
+                    "task_quality_request",
+                    &write.request.id,
+                    "system",
+                    None,
+                    &task.id,
+                    json!({
+                        "task_id": task.id,
+                        "quality_request_id": write.request.id,
+                        "state": "notified",
+                    }),
+                    &now_rfc3339(),
+                )),
+            },
+        )
+        .await?;
+        Ok(updated)
     }
 
     pub async fn list_quality_requests(
@@ -2069,13 +2226,19 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         );
         Ok(TaskCoordinationRepo::update_task_quality_request_state(
             &*self.db,
-            &request.id,
-            expected_version,
-            state,
-            None,
-            None,
-            &now,
-            Some(event),
+            db::UpdateTaskQualityRequestState {
+                id: request.id,
+                expected_version,
+                state,
+                handoff_id: None,
+                work_unit_id: None,
+                coordination_request_id: None,
+                resolution_kind: None,
+                resolution_ref: None,
+                resolution_digest: None,
+                updated_at: now,
+                event: Some(event),
+            },
         )
         .await?)
     }
@@ -2189,13 +2352,15 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         )
         .await?;
         if write.replayed {
-            return Ok(write.intervention);
+            return self
+                .resume_recorded_intervention(&task, &source, user_id, &write.intervention, &input)
+                .await;
         }
         if let Some(event) = write.event.as_ref() {
             self.domain_events.publish_committed(event);
         }
         match self
-            .apply_intervention(&task, &source, user_id, &write.intervention, &input)
+            .apply_intervention(&task, &source, user_id, &write.intervention, &input, false)
             .await
         {
             Ok(()) => {
@@ -2230,6 +2395,62 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         }
     }
 
+    /// Replay of a durable intervention resumes its pending effect instead of
+    /// returning a `recorded` row with no effect. Every effect below is
+    /// idempotent by an intervention-derived identity or receipt, so a crash
+    /// before or after the effect converges to one applied intervention.
+    async fn resume_recorded_intervention(
+        &self,
+        task: &Task,
+        source: &CollaborationActorSource,
+        user_id: &str,
+        intervention: &TaskIntervention,
+        input: &InterventionInput,
+    ) -> Result<TaskIntervention> {
+        if matches!(
+            intervention.state,
+            TaskInterventionState::Applied
+                | TaskInterventionState::Rejected
+                | TaskInterventionState::RequiresHuman
+        ) {
+            return Ok(intervention.clone());
+        }
+        match self
+            .apply_intervention(task, source, user_id, intervention, input, true)
+            .await
+        {
+            Ok(()) => {
+                self.set_intervention_state(
+                    intervention,
+                    TaskInterventionState::Applied,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+            Err(error) => {
+                let (code, message) = match &error {
+                    ServiceError::Coordination { code, message } => (*code, message.clone()),
+                    other => ("coordination.intervention_failed", other.to_string()),
+                };
+                self.set_intervention_state(
+                    intervention,
+                    TaskInterventionState::Rejected,
+                    None,
+                    None,
+                    None,
+                    Some(code),
+                    Some(&message),
+                )
+                .await?;
+                Err(error)
+            }
+        }
+    }
+
     async fn apply_intervention(
         &self,
         task: &Task,
@@ -2237,14 +2458,17 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         user_id: &str,
         intervention: &TaskIntervention,
         input: &InterventionInput,
+        resuming: bool,
     ) -> Result<()> {
-        if let Some(expected_task_version) = input.expected_task_version {
-            if task.version != expected_task_version {
-                return Err(db::DbError::TaskVersionConflict {
-                    expected: expected_task_version,
-                    actual: task.version,
+        if !resuming {
+            if let Some(expected_task_version) = input.expected_task_version {
+                if task.version != expected_task_version {
+                    return Err(db::DbError::TaskVersionConflict {
+                        expected: expected_task_version,
+                        actual: task.version,
+                    }
+                    .into());
                 }
-                .into());
             }
         }
         match input.kind {
@@ -2255,7 +2479,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                     .filter(|value| bounded(value, MAX_INSTRUCTION_BYTES))
                     .ok_or_else(|| invalid_plan("instruction must contain 1 to 16384 bytes"))?;
                 self.collaboration
-                    .create_message(
+                    .create_message_with_id(
                         source.clone(),
                         CreateMessageInput {
                             task_id: task.id.clone(),
@@ -2264,6 +2488,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                             body: instruction.to_owned(),
                             artifact_ids: Vec::new(),
                         },
+                        deterministic_intervention_message_id(&intervention.id)?,
                     )
                     .await?;
                 Ok(())
@@ -2271,19 +2496,46 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
             TaskInterventionKind::Pause
             | TaskInterventionKind::Resume
             | TaskInterventionKind::Cancel => {
-                let expected_lifecycle_version =
+                let expected_lifecycle_version = if resuming {
+                    TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?
+                        .version
+                } else {
                     input.expected_lifecycle_version.ok_or_else(|| {
                         invalid_plan("intervention requires expected_lifecycle_version")
-                    })?;
+                    })?
+                };
+                let task_version = if resuming {
+                    TaskRepo::get_by_id(&*self.db, &task.id, false)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?
+                        .version
+                } else {
+                    task.version
+                };
                 let lifecycle =
                     TaskLifecycleService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
                 let requested_by = ApiActorRef::Human(user_id.to_owned());
+                if resuming {
+                    let dispatch_key = format!("intervention:{}", intervention.id);
+                    if TaskLifecycleRepo::get_task_dispatch_receipt(
+                        &*self.db,
+                        &task.id,
+                        &dispatch_key,
+                    )
+                    .await?
+                    .is_some()
+                    {
+                        return Ok(());
+                    }
+                }
                 match input.kind {
                     TaskInterventionKind::Pause => {
                         lifecycle
                             .pause_task(
                                 &task.id,
-                                task.version,
+                                task_version,
                                 expected_lifecycle_version,
                                 &requested_by,
                                 input.reason.clone(),
@@ -2295,7 +2547,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                         lifecycle
                             .resume_task(
                                 &task.id,
-                                task.version,
+                                task_version,
                                 expected_lifecycle_version,
                                 &requested_by,
                                 &format!("intervention:{}", intervention.id),
@@ -2303,32 +2555,39 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                             .await?;
                     }
                     TaskInterventionKind::Cancel => {
-                        lifecycle
-                            .transition_at_lifecycle_version(
-                                crate::task_lifecycle::TransitionLifecycleInput {
-                                    task_id: task.id.clone(),
-                                    expected_task_version: task.version,
-                                    to_state: TaskLifecycleState::Cancelled,
-                                    cause: crate::task_lifecycle::LifecycleCause::Actor(
-                                        api_types::Actor::User {
-                                            user_id: Some(user_id.to_owned()),
-                                            source: api_types::UserActionSource::Api,
-                                        },
-                                    ),
-                                    reason_kind: Some("intervention".to_owned()),
-                                    reason_ref: Some(intervention.id.clone()),
-                                    idempotency_key: format!(
-                                        "intervention-cancel:{}",
-                                        intervention.id
-                                    ),
-                                },
-                                expected_lifecycle_version,
+                        let lifecycle_key = format!("intervention-cancel:{}", intervention.id);
+                        let cancel_transition_exists = resuming
+                            && TaskLifecycleRepo::has_task_lifecycle_transition(
+                                &*self.db,
+                                &task.id,
+                                &lifecycle_key,
                             )
                             .await?;
+                        if !cancel_transition_exists {
+                            lifecycle
+                                .transition_at_lifecycle_version(
+                                    crate::task_lifecycle::TransitionLifecycleInput {
+                                        task_id: task.id.clone(),
+                                        expected_task_version: task_version,
+                                        to_state: TaskLifecycleState::Cancelled,
+                                        cause: crate::task_lifecycle::LifecycleCause::Actor(
+                                            api_types::Actor::User {
+                                                user_id: Some(user_id.to_owned()),
+                                                source: api_types::UserActionSource::Api,
+                                            },
+                                        ),
+                                        reason_kind: Some("intervention".to_owned()),
+                                        reason_ref: Some(intervention.id.clone()),
+                                        idempotency_key: lifecycle_key,
+                                    },
+                                    expected_lifecycle_version,
+                                )
+                                .await?;
+                        }
                         lifecycle
                             .record_cancelled_dispatch_after_cancel(
                                 &task.id,
-                                task.version,
+                                task_version,
                                 expected_lifecycle_version,
                                 &requested_by,
                                 input.reason.clone(),
@@ -2397,6 +2656,17 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                         "coordination.version_conflict",
                         "request_replan coordination version is inconsistent",
                     ));
+                }
+                if resuming
+                    && TaskCoordinationRepo::get_task_coordination_request_by_key(
+                        &*self.db,
+                        &task.id,
+                        &brief.idempotency_key,
+                    )
+                    .await?
+                    .is_some()
+                {
+                    return Ok(());
                 }
                 self.request_turn(&task.id, user_id, brief).await?;
                 Ok(())
@@ -2821,28 +3091,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                         "a review subject must name a different WorkUnit in this plan",
                     ));
                 }
-                if role.role != "reviewer" {
-                    return Err(invalid_plan(
-                        "a formal review WorkUnit must use the TaskRole named reviewer",
-                    ));
-                }
-                if !role
-                    .capabilities
-                    .contains(&TaskRoleCapability::FormalReview)
-                {
-                    return Err(invalid_plan(
-                        "the reviewer TaskRole lacks formal_review capability",
-                    ));
-                }
-                if !envelope
-                    .allowed_review_roles
-                    .iter()
-                    .any(|allowed| allowed == "reviewer")
-                {
-                    return Err(unsupported_item(
-                        "the envelope does not allow the reviewer TaskRole",
-                    ));
-                }
+                validate_review_role(role, envelope)?;
                 let reviewed = plan
                     .work_units
                     .iter()
@@ -2859,13 +3108,12 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                 if reviewed.review_subject_key.is_some() {
                     return Err(invalid_plan("review WorkUnits cannot review each other"));
                 }
-            } else if role.role == "reviewer"
-                && role
-                    .capabilities
-                    .contains(&TaskRoleCapability::FormalReview)
+            } else if role
+                .capabilities
+                .contains(&TaskRoleCapability::FormalReview)
             {
                 return Err(invalid_plan(
-                    "a reviewer WorkUnit requires an explicit review_subject_key",
+                    "a formal_review WorkUnit requires an explicit review_subject_key",
                 ));
             }
             for dependency in &unit.depends_on {
@@ -2901,17 +3149,8 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
             .iter()
             .map(|unit| (unit.key.as_str(), unit))
             .collect::<BTreeMap<_, _>>();
+        validate_dependency_graph(plan)?;
         for unit in &plan.work_units {
-            let mut seen = HashSet::new();
-            let mut stack = unit.depends_on.clone();
-            while let Some(key) = stack.pop() {
-                if !seen.insert(key.clone()) || key == unit.key {
-                    return Err(invalid_plan("the plan dependency graph contains a cycle"));
-                }
-                if let Some(next) = by_key.get(key.as_str()) {
-                    stack.extend(next.depends_on.iter().cloned());
-                }
-            }
             let mut parent = unit.parent_key.as_deref();
             let mut depth = 0;
             while let Some(key) = parent {
@@ -2934,7 +3173,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                         envelope
                             .allowed_review_roles
                             .iter()
-                            .any(|role| role == "reviewer")
+                            .any(|role| role == &unit.role)
                     })
             })
     }
@@ -3153,12 +3392,109 @@ impl DomainActorExt for ApiActorRef {
     }
 }
 
+/// A formal review is authorized by the TaskRole capability and its exact
+/// role name in the envelope, never by the literal `reviewer`.
+fn validate_review_role(role: &TeamRoleView, envelope: &CoordinationEnvelope) -> Result<()> {
+    if !role
+        .capabilities
+        .contains(&TaskRoleCapability::FormalReview)
+    {
+        return Err(invalid_plan(
+            "the review TaskRole lacks formal_review capability",
+        ));
+    }
+    if !envelope
+        .allowed_review_roles
+        .iter()
+        .any(|allowed| allowed == &role.role)
+    {
+        return Err(unsupported_item(
+            "the envelope does not allow the review TaskRole",
+        ));
+    }
+    Ok(())
+}
+
+/// Kahn's algorithm distinguishes a real back edge from a second path through
+/// an already-settled shared ancestor. A single per-root `seen` set rejects a
+/// valid diamond as a cycle.
+fn validate_dependency_graph(plan: &WorkUnitPlan) -> Result<()> {
+    let mut indegree = BTreeMap::new();
+    let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for unit in &plan.work_units {
+        indegree.insert(unit.key.as_str(), unit.depends_on.len());
+        for dependency in &unit.depends_on {
+            dependents
+                .entry(dependency.as_str())
+                .or_default()
+                .push(unit.key.as_str());
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(key, degree)| (*degree == 0).then_some(*key))
+        .collect::<Vec<_>>();
+    let mut ordered = 0;
+    while let Some(key) = ready.pop() {
+        ordered += 1;
+        if let Some(next) = dependents.get(key) {
+            for dependent in next {
+                let Some(degree) = indegree.get_mut(dependent) else {
+                    return Err(invalid_plan(
+                        "a WorkUnit dependency is not part of this plan",
+                    ));
+                };
+                *degree = degree
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid_plan("the plan dependency graph is inconsistent"))?;
+                if *degree == 0 {
+                    ready.push(dependent);
+                }
+            }
+        }
+    }
+    if ordered != plan.work_units.len() {
+        return Err(invalid_plan("the plan dependency graph contains a cycle"));
+    }
+    Ok(())
+}
+
 fn deterministic_work_unit_id(request_id: &str, key: &str) -> Result<String> {
     let digest = Sha256::digest(
         [
             b"forge.task-coordination.work-unit.v1".as_slice(),
             request_id.as_bytes(),
             key.as_bytes(),
+        ]
+        .concat(),
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(uuid::Uuid::from_bytes(bytes).to_string())
+}
+
+fn deterministic_intervention_message_id(intervention_id: &str) -> Result<String> {
+    let digest = Sha256::digest(
+        [
+            b"forge.task-coordination.intervention-message.v1".as_slice(),
+            intervention_id.as_bytes(),
+        ]
+        .concat(),
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(uuid::Uuid::from_bytes(bytes).to_string())
+}
+
+fn deterministic_quality_handoff_id(request_id: &str) -> Result<String> {
+    let digest = Sha256::digest(
+        [
+            b"forge.task-coordination.quality-handoff.v1".as_slice(),
+            request_id.as_bytes(),
         ]
         .concat(),
     );
@@ -3215,5 +3551,102 @@ mod tests {
         }
         .validate()
         .expect("bounded objective");
+    }
+
+    fn plan_with(dependencies: &[(&str, &[&str])]) -> WorkUnitPlan {
+        WorkUnitPlan {
+            schema_version: 1,
+            request_id: "request-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            task_version: 1,
+            authorization_version: 1,
+            team_digest: "team".to_owned(),
+            envelope_digest: "envelope".to_owned(),
+            objective_digest: "objective".to_owned(),
+            work_units: dependencies
+                .iter()
+                .map(|(key, depends_on)| PlanWorkUnit {
+                    key: (*key).to_owned(),
+                    title: (*key).to_owned(),
+                    scope: (*key).to_owned(),
+                    role: "implementer".to_owned(),
+                    assigned_actor: None,
+                    parent_key: None,
+                    depends_on: depends_on.iter().map(|key| (*key).to_owned()).collect(),
+                    requires_integration: false,
+                    execution_instructions: None,
+                    review_subject_key: None,
+                    acceptance: Vec::new(),
+                    artifact_inputs: Vec::new(),
+                })
+                .collect(),
+            delivery: None,
+            review: None,
+            limits: None,
+        }
+    }
+
+    #[test]
+    fn dependency_graph_accepts_a_diamond() {
+        let plan = plan_with(&[("a", &[]), ("b", &["a"]), ("c", &["a"]), ("d", &["b", "c"])]);
+        validate_dependency_graph(&plan).expect("a diamond is acyclic");
+    }
+
+    #[test]
+    fn dependency_graph_accepts_redundant_transitive_edges() {
+        let plan = plan_with(&[("a", &[]), ("b", &["a"]), ("c", &["a", "b"])]);
+        validate_dependency_graph(&plan).expect("redundant ancestor edge is acyclic");
+    }
+
+    #[test]
+    fn dependency_graph_rejects_a_real_cycle() {
+        let plan = plan_with(&[("a", &["b"]), ("b", &["a"])]);
+        let error = validate_dependency_graph(&plan).expect_err("cycle is rejected");
+        assert!(error.to_string().contains("cycle"));
+    }
+
+    fn review_role(name: &str, formal_review: bool) -> TeamRoleView {
+        TeamRoleView {
+            id: format!("role-{name}"),
+            role: name.to_owned(),
+            display_label: None,
+            coordination_mode: Some(db::CoordinationMode::Independent),
+            capabilities: if formal_review {
+                vec![TaskRoleCapability::FormalReview]
+            } else {
+                Vec::new()
+            },
+            configuration: TaskRoleConfiguration::default(),
+            version: 1,
+            members: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn formal_review_uses_capability_and_exact_envelope_name() {
+        let custom = review_role("revisor", true);
+        let mut envelope = CoordinationEnvelope::default();
+        assert!(validate_review_role(&custom, &envelope).is_err());
+        envelope.allowed_review_roles = vec!["revisor".to_owned()];
+        validate_review_role(&custom, &envelope).expect("custom review role is allowed");
+        let ordinary = review_role("implementer", false);
+        assert!(validate_review_role(&ordinary, &envelope).is_err());
+        assert!(validate_review_role(&review_role("reviewer", true), &envelope).is_err());
+    }
+
+    #[test]
+    fn intervention_messages_and_quality_handoffs_are_stable() {
+        assert_eq!(
+            deterministic_intervention_message_id("intervention-1").expect("id"),
+            deterministic_intervention_message_id("intervention-1").expect("id")
+        );
+        assert_ne!(
+            deterministic_intervention_message_id("intervention-1").expect("id"),
+            deterministic_intervention_message_id("intervention-2").expect("id")
+        );
+        assert_eq!(
+            deterministic_quality_handoff_id("request-1").expect("id"),
+            deterministic_quality_handoff_id("request-1").expect("id")
+        );
     }
 }

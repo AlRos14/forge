@@ -381,6 +381,12 @@ pub struct CreateTaskQualityRequest {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub source_artifact_id: Option<String>,
+    /// Reviewer Execution that produced the exact ReviewReport. When present,
+    /// the request is attributed to that Execution's Actor instead of the
+    /// calling Human account.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub source_execution_id: Option<String>,
     pub category: TaskQualityCategory,
     pub target_kind: TaskQualityTargetKind,
     pub target_task_role_id: Option<String>,
@@ -409,6 +415,7 @@ pub struct TaskQualityRequestResponse {
     pub state: TaskQualityState,
     pub handoff_id: Option<String>,
     pub work_unit_id: Option<String>,
+    pub coordination_request_id: Option<String>,
     #[ts(type = "number")]
     pub budget_round: i64,
     #[ts(type = "number")]
@@ -416,6 +423,9 @@ pub struct TaskQualityRequestResponse {
     pub created_at: String,
     pub updated_at: String,
     pub resolved_at: Option<String>,
+    pub resolution_kind: Option<String>,
+    pub resolution_ref: Option<String>,
+    pub resolution_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

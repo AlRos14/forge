@@ -2684,6 +2684,8 @@ pub struct TaskCoordination {
     pub authorization_version: i64,
     pub team_snapshot_json: String,
     pub team_digest: String,
+    pub team_stale: bool,
+    pub team_generation: i64,
     pub envelope_json: String,
     pub envelope_digest: String,
     pub requested_by: Option<String>,
@@ -2720,6 +2722,7 @@ pub struct TaskCoordinationWrite {
 pub struct AuthorizeTaskCoordinationInput {
     pub task_id: String,
     pub expected_coordination_version: i64,
+    pub expected_team_generation: i64,
     pub mode: TaskCoordinationMode,
     pub coordinator_task_role_id: Option<String>,
     pub coordinator_actor: Option<ActorRef>,
@@ -2934,6 +2937,7 @@ pub struct MaterializeTaskCoordinationPlanInput {
     pub plan_artifact_id: String,
     pub plan_digest: String,
     pub authorization_version: i64,
+    pub expected_team_digest: String,
     pub expected_plan_version: i64,
     pub task_version_before: i64,
     pub expected_request_version: i64,
@@ -3014,6 +3018,7 @@ pub struct TaskQualityRequest {
     pub state: TaskQualityState,
     pub handoff_id: Option<String>,
     pub work_unit_id: Option<String>,
+    pub coordination_request_id: Option<String>,
     pub budget_round: i64,
     pub source_digest: String,
     pub request_digest: String,
@@ -3023,6 +3028,9 @@ pub struct TaskQualityRequest {
     pub created_at: String,
     pub updated_at: String,
     pub resolved_at: Option<String>,
+    pub resolution_kind: Option<String>,
+    pub resolution_ref: Option<String>,
+    pub resolution_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3047,6 +3055,21 @@ pub struct CreateTaskQualityRequestInput {
     pub created_by: ActorRef,
     pub created_at: String,
     pub event: CreateDomainEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateTaskQualityRequestState {
+    pub id: String,
+    pub expected_version: i64,
+    pub state: TaskQualityState,
+    pub handoff_id: Option<Option<String>>,
+    pub work_unit_id: Option<Option<String>>,
+    pub coordination_request_id: Option<Option<String>>,
+    pub resolution_kind: Option<Option<String>>,
+    pub resolution_ref: Option<Option<String>>,
+    pub resolution_digest: Option<Option<String>>,
+    pub updated_at: String,
+    pub event: Option<CreateDomainEvent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -799,177 +799,22 @@ impl WorkUnitRepo for SqliteDb {
         input: TransitionWorkUnit,
         event_input: CreateDomainEvent,
     ) -> Result<CollaborationWrite<WorkUnit>> {
-        if input.status == WorkUnitStatus::Open {
-            return Err(DbError::InvalidTransition);
-        }
-        let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
-            "UPDATE work_unit SET status = ?, version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ? AND status = 'open'",
+        transition_work_unit_inner(self, input, None, event_input).await
+    }
+
+    async fn transition_with_coordination_fence(
+        &self,
+        input: TransitionWorkUnit,
+        expected_authorization_version: i64,
+        event_input: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnit>> {
+        transition_work_unit_inner(
+            self,
+            input,
+            Some(expected_authorization_version),
+            event_input,
         )
-        .bind(input.status.to_string())
-        .bind(&input.updated_at)
-        .bind(&input.id)
-        .bind(input.expected_version)
-        .execute(&mut *tx)
         .await
-        .map_err(work_unit_write_error)?;
-        if result.rows_affected() == 0 {
-            let exists: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_unit WHERE id = ?)")
-                    .bind(&input.id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            return if exists {
-                Err(DbError::VersionConflict)
-            } else {
-                Err(DbError::NotFound)
-            };
-        }
-        if let Some(reviewed_result) = input.reviewed_result.as_ref() {
-            let task_id: String = sqlx::query_scalar("SELECT task_id FROM work_unit WHERE id = ?")
-                .bind(&input.id)
-                .fetch_one(&mut *tx)
-                .await?;
-            match (
-                reviewed_result.result_artifact_id.as_deref(),
-                reviewed_result.result_artifact_digest.as_deref(),
-                reviewed_result.manifest_id.as_deref(),
-                reviewed_result.manifest_json.as_deref(),
-                reviewed_result.manifest_digest.as_deref(),
-            ) {
-                (
-                    Some(artifact_id),
-                    Some(artifact_digest),
-                    Some(manifest_id),
-                    Some(manifest_json),
-                    Some(manifest_digest),
-                ) => {
-                    sqlx::query(
-                        "INSERT INTO work_unit_artifact_manifest (
-                            id, task_id, work_unit_id, work_unit_version, execution_id,
-                            delivery_artifact_id, delivery_artifact_digest, manifest_json,
-                            manifest_digest, created_at
-                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .bind(manifest_id)
-                    .bind(&task_id)
-                    .bind(&input.id)
-                    .bind(input.expected_version)
-                    .bind(&reviewed_result.execution_id)
-                    .bind(artifact_id)
-                    .bind(artifact_digest)
-                    .bind(manifest_json)
-                    .bind(manifest_digest)
-                    .bind(&input.updated_at)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-                (None, None, None, None, None) => {}
-                _ => {
-                    return Err(DbError::Check(
-                        "completed reviewed result has incomplete Artifact manifest data"
-                            .to_owned(),
-                    ));
-                }
-            }
-            // The immutable V147 domain-event trigger freezes this exact result
-            // into every pending subject when the completion event is appended
-            // immediately below. The manifest must exist first so the V155
-            // review-line projection captures its identity in the same commit.
-        }
-        let event = append_event(self, &mut tx, &event_input).await?;
-        if let Some(reviewed_result) = input.reviewed_result.as_ref() {
-            // V147 freezes the subject from the completion event. Project that
-            // exact result directly as well, because SQLite does not run nested
-            // V155 subject-update triggers from the V147 event trigger.
-            sqlx::query(
-                "INSERT OR IGNORE INTO work_unit_review_line (
-                    id, task_id, root_work_unit_id, current_work_unit_id,
-                    current_work_unit_version, current_result_execution_id,
-                    current_result_artifact_id, current_commit_sha, current_workspace_id,
-                    current_snapshot_digest, current_manifest_id, latest_report_artifact_id,
-                    latest_verdict, revision, created_at, updated_at
-                 )
-                 SELECT lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4'
-                          || lower(substr(hex(randomblob(2)), 2, 3)) || '-'
-                          || substr('89ab', 1 + (abs(random()) % 4), 1)
-                          || lower(substr(hex(randomblob(2)), 2, 3)) || '-' || lower(hex(randomblob(6))),
-                        subject.task_id, subject.reviewed_work_unit_id,
-                        subject.reviewed_work_unit_id, subject.reviewed_work_unit_version,
-                        subject.result_execution_id, subject.result_artifact_id,
-                        subject.result_commit_sha, subject.result_workspace_id,
-                        subject.workspace_snapshot_digest, ?, NULL, NULL, 1,
-                        subject.created_at, ?
-                 FROM work_unit_review_subject subject
-                 WHERE subject.task_id = (SELECT task_id FROM work_unit WHERE id = ?)
-                   AND subject.reviewed_work_unit_id = ?
-                   AND subject.reviewed_work_unit_version = ?
-                   AND subject.result_execution_id = ?
-                   AND NOT EXISTS (
-                       SELECT 1 FROM task_rework_receipt receipt
-                       WHERE receipt.review_work_unit_id = subject.review_work_unit_id
-                   )",
-            )
-            .bind(reviewed_result.manifest_id.as_deref())
-            .bind(&input.updated_at)
-            .bind(&input.id)
-            .bind(&input.id)
-            .bind(input.expected_version)
-            .bind(&reviewed_result.execution_id)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "UPDATE work_unit_review_line
-                 SET current_work_unit_version = ?, current_result_execution_id = ?,
-                     current_result_artifact_id = ?, current_commit_sha = ?,
-                     current_workspace_id = ?, current_snapshot_digest = ?,
-                     current_manifest_id = ?, latest_report_artifact_id = NULL,
-                     latest_verdict = NULL, revision = revision + 1, updated_at = ?
-                 WHERE task_id = (SELECT task_id FROM work_unit WHERE id = ?)
-                   AND current_work_unit_id = ? AND current_result_execution_id IS NULL",
-            )
-            .bind(input.expected_version)
-            .bind(&reviewed_result.execution_id)
-            .bind(reviewed_result.result_artifact_id.as_deref())
-            .bind(reviewed_result.result_commit_sha.as_deref())
-            .bind(reviewed_result.result_workspace_id.as_deref())
-            .bind(reviewed_result.workspace_snapshot_digest.as_deref())
-            .bind(reviewed_result.manifest_id.as_deref())
-            .bind(&input.updated_at)
-            .bind(&input.id)
-            .bind(&input.id)
-            .execute(&mut *tx)
-            .await?;
-            let review_line_projected: bool = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM work_unit_review_line
-                    WHERE task_id = (SELECT task_id FROM work_unit WHERE id = ?)
-                      AND current_work_unit_id = ?
-                      AND current_result_execution_id = ?
-                      AND current_manifest_id IS ?
-                )",
-            )
-            .bind(&input.id)
-            .bind(&input.id)
-            .bind(&reviewed_result.execution_id)
-            .bind(reviewed_result.manifest_id.as_deref())
-            .fetch_one(&mut *tx)
-            .await?;
-            if !review_line_projected {
-                return Err(DbError::Check(
-                    "completed WorkUnit result was not frozen into its review line".to_owned(),
-                ));
-            }
-        }
-        let record = map_work_unit(
-            sqlx::query("SELECT * FROM work_unit WHERE id = ?")
-                .bind(&input.id)
-                .fetch_one(&mut *tx)
-                .await?,
-        )?;
-        tx.commit().await?;
-        Ok(CollaborationWrite { record, event })
     }
 
     async fn list_dependencies(&self, id: &str) -> Result<Vec<WorkUnitDependency>> {
@@ -2502,4 +2347,207 @@ impl WorkUnitWorkspaceRepo for SqliteDb {
             .map(map_workspace)
             .collect()
     }
+}
+
+async fn transition_work_unit_inner(
+    db: &SqliteDb,
+    input: TransitionWorkUnit,
+    expected_authorization_version: Option<i64>,
+    event_input: CreateDomainEvent,
+) -> Result<CollaborationWrite<WorkUnit>> {
+    if input.status == WorkUnitStatus::Open {
+        return Err(DbError::InvalidTransition);
+    }
+    let mut tx = if expected_authorization_version.is_some() {
+        db.pool.begin_with("BEGIN IMMEDIATE").await?
+    } else {
+        db.pool.begin().await?
+    };
+    if let Some(expected) = expected_authorization_version {
+        let authorized: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM work_unit current_unit
+                JOIN task_coordination coordination
+                  ON coordination.task_id = current_unit.task_id
+                WHERE current_unit.id = ?
+                  AND coordination.authorization_version = ?
+                  AND coordination.mode != 'manual'
+                  AND coordination.revoked_at IS NULL
+                  AND coordination.team_stale = 0
+            )",
+        )
+        .bind(&input.id)
+        .bind(expected)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !authorized {
+            return Err(DbError::VersionConflict);
+        }
+    }
+    let result = sqlx::query(
+        "UPDATE work_unit SET status = ?, version = version + 1, updated_at = ?
+         WHERE id = ? AND version = ? AND status = 'open'",
+    )
+    .bind(input.status.to_string())
+    .bind(&input.updated_at)
+    .bind(&input.id)
+    .bind(input.expected_version)
+    .execute(&mut *tx)
+    .await
+    .map_err(work_unit_write_error)?;
+    if result.rows_affected() == 0 {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_unit WHERE id = ?)")
+                .bind(&input.id)
+                .fetch_one(&mut *tx)
+                .await?;
+        return if exists {
+            Err(DbError::VersionConflict)
+        } else {
+            Err(DbError::NotFound)
+        };
+    }
+    if let Some(reviewed_result) = input.reviewed_result.as_ref() {
+        let task_id: String = sqlx::query_scalar("SELECT task_id FROM work_unit WHERE id = ?")
+            .bind(&input.id)
+            .fetch_one(&mut *tx)
+            .await?;
+        match (
+            reviewed_result.result_artifact_id.as_deref(),
+            reviewed_result.result_artifact_digest.as_deref(),
+            reviewed_result.manifest_id.as_deref(),
+            reviewed_result.manifest_json.as_deref(),
+            reviewed_result.manifest_digest.as_deref(),
+        ) {
+            (
+                Some(artifact_id),
+                Some(artifact_digest),
+                Some(manifest_id),
+                Some(manifest_json),
+                Some(manifest_digest),
+            ) => {
+                sqlx::query(
+                    "INSERT INTO work_unit_artifact_manifest (
+                        id, task_id, work_unit_id, work_unit_version, execution_id,
+                        delivery_artifact_id, delivery_artifact_digest, manifest_json,
+                        manifest_digest, created_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(manifest_id)
+                .bind(&task_id)
+                .bind(&input.id)
+                .bind(input.expected_version)
+                .bind(&reviewed_result.execution_id)
+                .bind(artifact_id)
+                .bind(artifact_digest)
+                .bind(manifest_json)
+                .bind(manifest_digest)
+                .bind(&input.updated_at)
+                .execute(&mut *tx)
+                .await?;
+            }
+            (None, None, None, None, None) => {}
+            _ => {
+                return Err(DbError::Check(
+                    "completed reviewed result has incomplete Artifact manifest data".to_owned(),
+                ));
+            }
+        }
+        // The immutable V147 domain-event trigger freezes this exact result
+        // into every pending subject when the completion event is appended
+        // immediately below. The manifest must exist first so the V155
+        // review-line projection captures its identity in the same commit.
+    }
+    let event = append_event(db, &mut tx, &event_input).await?;
+    if let Some(reviewed_result) = input.reviewed_result.as_ref() {
+        // V147 freezes the subject from the completion event. Project that
+        // exact result directly as well, because SQLite does not run nested
+        // V155 subject-update triggers from the V147 event trigger.
+        sqlx::query(
+            "INSERT OR IGNORE INTO work_unit_review_line (
+                id, task_id, root_work_unit_id, current_work_unit_id,
+                current_work_unit_version, current_result_execution_id,
+                current_result_artifact_id, current_commit_sha, current_workspace_id,
+                current_snapshot_digest, current_manifest_id, latest_report_artifact_id,
+                latest_verdict, revision, created_at, updated_at
+             )
+             SELECT lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4'
+                      || lower(substr(hex(randomblob(2)), 2, 3)) || '-'
+                      || substr('89ab', 1 + (abs(random()) % 4), 1)
+                      || lower(substr(hex(randomblob(2)), 2, 3)) || '-' || lower(hex(randomblob(6))),
+                    subject.task_id, subject.reviewed_work_unit_id,
+                    subject.reviewed_work_unit_id, subject.reviewed_work_unit_version,
+                    subject.result_execution_id, subject.result_artifact_id,
+                    subject.result_commit_sha, subject.result_workspace_id,
+                    subject.workspace_snapshot_digest, ?, NULL, NULL, 1,
+                    subject.created_at, ?
+             FROM work_unit_review_subject subject
+             WHERE subject.task_id = (SELECT task_id FROM work_unit WHERE id = ?)
+               AND subject.reviewed_work_unit_id = ?
+               AND subject.reviewed_work_unit_version = ?
+               AND subject.result_execution_id = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM task_rework_receipt receipt
+                   WHERE receipt.review_work_unit_id = subject.review_work_unit_id
+               )",
+        )
+        .bind(reviewed_result.manifest_id.as_deref())
+        .bind(&input.updated_at)
+        .bind(&input.id)
+        .bind(&input.id)
+        .bind(input.expected_version)
+        .bind(&reviewed_result.execution_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE work_unit_review_line
+             SET current_work_unit_version = ?, current_result_execution_id = ?,
+                 current_result_artifact_id = ?, current_commit_sha = ?,
+                 current_workspace_id = ?, current_snapshot_digest = ?,
+                 current_manifest_id = ?, latest_report_artifact_id = NULL,
+                 latest_verdict = NULL, revision = revision + 1, updated_at = ?
+             WHERE task_id = (SELECT task_id FROM work_unit WHERE id = ?)
+               AND current_work_unit_id = ? AND current_result_execution_id IS NULL",
+        )
+        .bind(input.expected_version)
+        .bind(&reviewed_result.execution_id)
+        .bind(reviewed_result.result_artifact_id.as_deref())
+        .bind(reviewed_result.result_commit_sha.as_deref())
+        .bind(reviewed_result.result_workspace_id.as_deref())
+        .bind(reviewed_result.workspace_snapshot_digest.as_deref())
+        .bind(reviewed_result.manifest_id.as_deref())
+        .bind(&input.updated_at)
+        .bind(&input.id)
+        .bind(&input.id)
+        .execute(&mut *tx)
+        .await?;
+        let review_line_projected: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM work_unit_review_line
+                WHERE task_id = (SELECT task_id FROM work_unit WHERE id = ?)
+                  AND current_work_unit_id = ?
+                  AND current_result_execution_id = ?
+                  AND current_manifest_id IS ?
+            )",
+        )
+        .bind(&input.id)
+        .bind(&input.id)
+        .bind(&reviewed_result.execution_id)
+        .bind(reviewed_result.manifest_id.as_deref())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !review_line_projected {
+            return Err(DbError::Check(
+                "completed WorkUnit result was not frozen into its review line".to_owned(),
+            ));
+        }
+    }
+    let record = map_work_unit(
+        sqlx::query("SELECT * FROM work_unit WHERE id = ?")
+            .bind(&input.id)
+            .fetch_one(&mut *tx)
+            .await?,
+    )?;
+    tx.commit().await?;
+    Ok(CollaborationWrite { record, event })
 }

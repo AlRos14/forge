@@ -3,4 +3,4 @@ import type { ActorRef } from "./ActorRef";
 import type { TaskQualityCategory } from "./TaskQualityCategory";
 import type { TaskQualityTargetKind } from "./TaskQualityTargetKind";
 
-export type CreateTaskQualityRequest = { source_artifact_id: string | null, category: TaskQualityCategory, target_kind: TaskQualityTargetKind, target_task_role_id: string | null, target_actor: ActorRef | null, summary: string, findings: Array<string>, resolution_condition: string, idempotency_key: string, };
+export type CreateTaskQualityRequest = { source_artifact_id: string | null, source_execution_id: string | null, category: TaskQualityCategory, target_kind: TaskQualityTargetKind, target_task_role_id: string | null, target_actor: ActorRef | null, summary: string, findings: Array<string>, resolution_condition: string, idempotency_key: string, };

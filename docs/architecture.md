@@ -60,10 +60,41 @@ event admits an exact-Actor workspace-free wake; its Execution returns one
 capabilities, WorkUnits, or worker Starts. Deterministic materialization validates
 the exact plan, envelope, team, Task version, and authorization version and
 creates WorkUnits, dependencies, review subjects, and Artifact input pins in one
-transaction with an idempotent receipt. `manual` remains the default for existing
-Tasks, and no coordination turn is triggered retrospectively. Quality requests
-and the versioned intervention circuit are separate durable records; they do not
-replace TaskLifecycle, review, Gate, or collaboration authority.
+transaction with an idempotent receipt. V160 marks the authorization stale on
+any TaskRole, capability, or membership mutation; materialization and Provider
+Start revalidate revocation, team state, dispatch, lifecycle, and the exact
+coordination request under their own write locks. `manual` remains the default
+for existing Tasks, and no coordination turn is triggered retrospectively.
+Quality requests and the versioned intervention circuit are separate durable
+records; they do not replace TaskLifecycle, review, Gate, or collaboration
+authority. A durable quality consumer follows the exact report/rework chain:
+delivery corrections only link the WorkUnit created by that exact ReviewReport,
+repeated rounds stay on the same chain, and resolution requires the independent
+review verdict to pass. Specialist requests create linked WorkUnits; plan
+revisions open a coordination turn. Quality-linked WorkUnits complete
+technically when their Execution finishes, but a delivery correction is never
+resolved by that completion alone.
+
+Materialization also creates a durable review line and a WorkUnit-scoped
+`review_approval` Gate for each formal review subject. Any materialized WorkUnit
+that directly depends on the review consumes that Gate and line, so it cannot
+start until the latest review verdict passes. Technical completion by the
+Orchestrator runtime is opt-in and fenced: it requires a current non-manual
+Task coordination authorization, no revocation or team staleness, and either a
+plan-materialized delivery, an exact quality-request-linked correction, or a
+completed automatic-rework intent. Historical/manual Tasks and arbitrary
+Artifact/review rows stay untouched. The exact authorization version, mode,
+revocation, and team staleness are revalidated again inside the same
+`BEGIN IMMEDIATE` transaction that completes the WorkUnit and freezes its
+result, so a revocation or mode change winning the race leaves zero automatic
+effect. Completion is not approval.
+
+The delivered coordination slice covers PR1–PR2, the PR4 quality-routing
+circuit, technical completion of plan deliveries, and automatic review Gate
+linkage. Remaining product scope is per-route quality budgets and ping-pong
+detection beyond the Task-global budget, plus PR6 joint UI and
+provider/host acceptance. The program must not be presented as PR1–PR6
+complete.
 
 Automatic Orchestrator execution requires the Agent owner and Task Project owner to be the same account, with a current Project owner/admin/member membership. Global Agent visibility supports discovery and TaskRole membership; it does not grant cross-account execution. Forge has no cross-account Agent execution grants, so a missing or mismatched owner or membership fails closed at Execution admission and the transactional Provider Start claim.
 
@@ -103,7 +134,7 @@ A Gate is a deterministic policy over exact durable records. Its immutable GateE
 
 ## Persistence and history
 
-SQLite is the current persistence layer. Numbered migrations V001–V157 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V159 add the Task coordination authorization, turn, plan, materialization, quality-request, and intervention records described by the PR0 contract.
+SQLite is the current persistence layer. Numbered migrations V001–V157 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add the Task coordination authorization, turn, plan, materialization, quality-request, intervention, team-staleness, and quality-resolution records described by the PR0 contract.
 
 Historical `agent_session_history`, immutable Execution records, ProjectRelease snapshots, Artifact and Evidence references, HarnessSession identities, cross-record IDs, migration decisions, ADRs, and upstream license attribution remain readable history. History does not regain runtime authority. ProjectRelease is a read-only historical snapshot and does not create a current Charter, milestone, readiness workflow, or release operation.
 

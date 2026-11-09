@@ -144,6 +144,7 @@ async fn authorization_receipts_are_idempotent_and_fence_conflicts() {
     let input = |receipt_id: String, digest: String| AuthorizeTaskCoordinationInput {
         task_id: task_id.clone(),
         expected_coordination_version: 1,
+        expected_team_generation: 0,
         mode: TaskCoordinationMode::Manual,
         coordinator_task_role_id: None,
         coordinator_actor: None,
@@ -302,6 +303,46 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
         .expect("membership");
     }
 
+    let team_snapshot_json = r#"{"memberships":[],"schema_version":1,"task_roles":[]}"#.to_owned();
+    let team_digest = hex::encode(sha2::Sha256::digest(team_snapshot_json.as_bytes()));
+    let envelope_json = "{}".to_owned();
+    let envelope_digest = hex::encode(sha2::Sha256::digest(envelope_json.as_bytes()));
+    let team_generation = TaskCoordinationRepo::get_task_coordination(&db, &task_id)
+        .await
+        .expect("coordination")
+        .expect("coordination row")
+        .team_generation;
+    TaskCoordinationRepo::authorize_task_coordination(
+        &db,
+        AuthorizeTaskCoordinationInput {
+            task_id: task_id.clone(),
+            expected_coordination_version: 1,
+            expected_team_generation: team_generation,
+            mode: TaskCoordinationMode::PrepareAndExecute,
+            coordinator_task_role_id: Some(implementer_role_id.clone()),
+            coordinator_actor: Some(db::ActorRef::Human(owner_id.clone())),
+            team_snapshot_json,
+            team_digest: team_digest.clone(),
+            envelope_json,
+            envelope_digest,
+            requested_by: owner_id.clone(),
+            idempotency_key: "materialize-test-authorize".to_owned(),
+            request_digest: hex::encode(sha2::Sha256::digest(b"authorize-materialize")),
+            receipt_id: new_uuid_v4(),
+            created_at: now.clone(),
+            event: event(
+                "task.coordination_authorized",
+                "task_coordination",
+                &task_id,
+                &task_id,
+                &owner_id,
+            ),
+        },
+        1,
+    )
+    .await
+    .expect("authorize coordination");
+
     let execution_id = new_uuid_v4();
     sqlx::query(
         "INSERT INTO execution (
@@ -357,7 +398,7 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
             id, task_id, authorization_version, mode, brief_json, objective_digest,
             request_digest, idempotency_key, state, plan_artifact_id, version,
             created_at, updated_at
-         ) VALUES (?, ?, 1, 'proposal', '{}', ?, ?, 'materialize-test', 'plan_ready', ?, 1, ?, ?)",
+         ) VALUES (?, ?, 2, 'prepare_and_execute', '{}', ?, ?, 'materialize-test', 'plan_ready', ?, 1, ?, ?)",
     )
     .bind(&request_id)
     .bind(&task_id)
@@ -373,7 +414,7 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
         "INSERT INTO task_coordination_plan (
             artifact_id, task_id, request_id, authorization_version, plan_digest,
             state, version, created_at, updated_at
-         ) VALUES (?, ?, ?, 1, ?, 'approved', 1, ?, ?)",
+         ) VALUES (?, ?, ?, 2, ?, 'approved', 1, ?, ?)",
     )
     .bind(&artifact_id)
     .bind(&task_id)
@@ -387,66 +428,143 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
 
     let implementer_work_unit_id = new_uuid_v4();
     let reviewer_work_unit_id = new_uuid_v4();
-    let receipt = TaskCoordinationRepo::materialize_task_coordination_plan(
+    let consumer_work_unit_id = new_uuid_v4();
+    let second_reviewer_work_unit_id = new_uuid_v4();
+    let pending_parent_work_unit_id = new_uuid_v4();
+    let pending_child_work_unit_id = new_uuid_v4();
+    let materialization_input = db::MaterializeTaskCoordinationPlanInput {
+        receipt_id: new_uuid_v4(),
+        task_id: task_id.clone(),
+        request_id: request_id.clone(),
+        plan_artifact_id: artifact_id.clone(),
+        plan_digest: plan_digest.clone(),
+        authorization_version: 2,
+        expected_team_digest: team_digest.clone(),
+        expected_plan_version: 1,
+        task_version_before: task.version,
+        expected_request_version: 1,
+        work_units: vec![
+            db::MaterializedWorkUnit {
+                id: pending_parent_work_unit_id.clone(),
+                key: "pending-parent".to_owned(),
+                title: "Parent waits for review".to_owned(),
+                scope: "Parent after review approval".to_owned(),
+                execution_instructions: None,
+                role: "implementer".to_owned(),
+                assigned_actor: Some(db::ActorRef::Human(owner_id.clone())),
+                parent_work_unit_id: None,
+                depends_on_work_unit_ids: vec![reviewer_work_unit_id.clone()],
+                requires_integration: false,
+                artifact_inputs: vec![],
+                review_subject_work_unit_id: None,
+            },
+            db::MaterializedWorkUnit {
+                id: pending_child_work_unit_id.clone(),
+                key: "pending-child".to_owned(),
+                title: "Child of deferred parent".to_owned(),
+                scope: "Child after parent".to_owned(),
+                execution_instructions: None,
+                role: "implementer".to_owned(),
+                assigned_actor: Some(db::ActorRef::Human(owner_id.clone())),
+                parent_work_unit_id: Some(pending_parent_work_unit_id.clone()),
+                depends_on_work_unit_ids: vec![],
+                requires_integration: false,
+                artifact_inputs: vec![],
+                review_subject_work_unit_id: None,
+            },
+            db::MaterializedWorkUnit {
+                id: implementer_work_unit_id.clone(),
+                key: "implementation".to_owned(),
+                title: "Implement".to_owned(),
+                scope: "Deliver the change".to_owned(),
+                execution_instructions: None,
+                role: "implementer".to_owned(),
+                assigned_actor: Some(db::ActorRef::Human(owner_id.clone())),
+                parent_work_unit_id: None,
+                depends_on_work_unit_ids: vec![],
+                requires_integration: false,
+                artifact_inputs: vec![],
+                review_subject_work_unit_id: None,
+            },
+            db::MaterializedWorkUnit {
+                id: reviewer_work_unit_id.clone(),
+                key: "review".to_owned(),
+                title: "Review".to_owned(),
+                scope: "Review the exact delivery".to_owned(),
+                execution_instructions: None,
+                role: "reviewer".to_owned(),
+                assigned_actor: Some(db::ActorRef::Human(reviewer_id.clone())),
+                parent_work_unit_id: None,
+                depends_on_work_unit_ids: vec![implementer_work_unit_id.clone()],
+                requires_integration: false,
+                artifact_inputs: vec![],
+                review_subject_work_unit_id: Some(implementer_work_unit_id.clone()),
+            },
+            db::MaterializedWorkUnit {
+                id: consumer_work_unit_id.clone(),
+                key: "consumer".to_owned(),
+                title: "Second implementation".to_owned(),
+                scope: "Proceed only after review approval".to_owned(),
+                execution_instructions: None,
+                role: "implementer".to_owned(),
+                assigned_actor: Some(db::ActorRef::Human(owner_id.clone())),
+                parent_work_unit_id: None,
+                depends_on_work_unit_ids: vec![reviewer_work_unit_id.clone()],
+                requires_integration: false,
+                artifact_inputs: vec![],
+                review_subject_work_unit_id: None,
+            },
+            db::MaterializedWorkUnit {
+                id: second_reviewer_work_unit_id.clone(),
+                key: "second-review".to_owned(),
+                title: "Review second implementation".to_owned(),
+                scope: "Review the approved second delivery".to_owned(),
+                execution_instructions: None,
+                role: "reviewer".to_owned(),
+                assigned_actor: Some(db::ActorRef::Human(reviewer_id.clone())),
+                parent_work_unit_id: None,
+                depends_on_work_unit_ids: vec![consumer_work_unit_id.clone()],
+                requires_integration: false,
+                artifact_inputs: vec![],
+                review_subject_work_unit_id: Some(consumer_work_unit_id.clone()),
+            },
+        ],
+        receipt_digest: hex::encode(sha2::Sha256::digest(b"receipt")),
+        created_by: owner_id.clone(),
+        created_at: now.clone(),
+        events: vec![],
+    };
+    sqlx::query("UPDATE task_coordination SET team_stale = 1 WHERE task_id = ?")
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .expect("mark stale");
+    let stale = TaskCoordinationRepo::materialize_task_coordination_plan(
         &db,
-        db::MaterializeTaskCoordinationPlanInput {
-            receipt_id: new_uuid_v4(),
-            task_id: task_id.clone(),
-            request_id: request_id.clone(),
-            plan_artifact_id: artifact_id.clone(),
-            plan_digest: plan_digest.clone(),
-            authorization_version: 1,
-            expected_plan_version: 1,
-            task_version_before: task.version,
-            expected_request_version: 1,
-            work_units: vec![
-                db::MaterializedWorkUnit {
-                    id: implementer_work_unit_id.clone(),
-                    key: "implementation".to_owned(),
-                    title: "Implement".to_owned(),
-                    scope: "Deliver the change".to_owned(),
-                    execution_instructions: None,
-                    role: "implementer".to_owned(),
-                    assigned_actor: Some(db::ActorRef::Human(owner_id.clone())),
-                    parent_work_unit_id: None,
-                    depends_on_work_unit_ids: vec![],
-                    requires_integration: false,
-                    artifact_inputs: vec![],
-                    review_subject_work_unit_id: None,
-                },
-                db::MaterializedWorkUnit {
-                    id: reviewer_work_unit_id.clone(),
-                    key: "review".to_owned(),
-                    title: "Review".to_owned(),
-                    scope: "Review the exact delivery".to_owned(),
-                    execution_instructions: None,
-                    role: "reviewer".to_owned(),
-                    assigned_actor: Some(db::ActorRef::Human(reviewer_id.clone())),
-                    parent_work_unit_id: None,
-                    depends_on_work_unit_ids: vec![implementer_work_unit_id.clone()],
-                    requires_integration: false,
-                    artifact_inputs: vec![],
-                    review_subject_work_unit_id: Some(implementer_work_unit_id.clone()),
-                },
-            ],
-            receipt_digest: hex::encode(sha2::Sha256::digest(b"receipt")),
-            created_by: owner_id.clone(),
-            created_at: now.clone(),
-            events: vec![],
-        },
+        materialization_input.clone(),
     )
     .await
-    .expect("atomic materialization");
+    .expect_err("a stale team must block materialization inside the transaction");
+    assert!(matches!(stale, db::DbError::VersionConflict));
+    sqlx::query("UPDATE task_coordination SET team_stale = 0 WHERE task_id = ?")
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .expect("clear stale marker");
+    let receipt =
+        TaskCoordinationRepo::materialize_task_coordination_plan(&db, materialization_input)
+            .await
+            .expect("atomic materialization");
     assert_eq!(
         serde_json::from_str::<Vec<String>>(&receipt.work_unit_ids_json)
             .expect("ids")
             .len(),
-        2
+        6
     );
     let units = WorkUnitRepo::list_by_task(&db, &task_id)
         .await
         .expect("work units");
-    assert_eq!(units.len(), 2);
+    assert_eq!(units.len(), 6);
     let subject: (String, Option<i64>) = sqlx::query_as(
         "SELECT reviewed_work_unit_id, reviewed_work_unit_version
          FROM work_unit_review_subject WHERE review_work_unit_id = ?",
@@ -457,6 +575,64 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
     .expect("review subject");
     assert_eq!(subject.0, implementer_work_unit_id);
     assert_eq!(subject.1, None);
+    let second_subject: String = sqlx::query_scalar(
+        "SELECT reviewed_work_unit_id FROM work_unit_review_subject
+         WHERE review_work_unit_id = ?",
+    )
+    .bind(&second_reviewer_work_unit_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("second review subject");
+    assert_eq!(second_subject, consumer_work_unit_id);
+    let line: (String, i64) = sqlx::query_as(
+        "SELECT id, revision FROM work_unit_review_line
+         WHERE task_id = ? AND root_work_unit_id = ?",
+    )
+    .bind(&task_id)
+    .bind(&implementer_work_unit_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("review line");
+    assert_eq!(line.1, 1);
+    let gate: (String, Option<i64>) = sqlx::query_as(
+        "SELECT id, active_policy_revision FROM gate
+         WHERE task_id = ? AND gate_kind LIKE 'review_approval:%'
+           AND scope_kind = 'work_unit' AND scope_id = ?",
+    )
+    .bind(&task_id)
+    .bind(&implementer_work_unit_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("review approval gate");
+    assert_eq!(gate.1, Some(1));
+    let consumer = units
+        .iter()
+        .find(|unit| unit.id == consumer_work_unit_id)
+        .expect("consumer");
+    assert_eq!(
+        consumer.review_approval_gate_id.as_deref(),
+        Some(gate.0.as_str())
+    );
+    assert_eq!(
+        consumer.review_approval_line_id.as_deref(),
+        Some(line.0.as_str())
+    );
+    let parent = units
+        .iter()
+        .find(|unit| unit.id == pending_parent_work_unit_id)
+        .expect("pending parent");
+    assert_eq!(
+        parent.review_approval_gate_id.as_deref(),
+        Some(gate.0.as_str())
+    );
+    let child = units
+        .iter()
+        .find(|unit| unit.id == pending_child_work_unit_id)
+        .expect("pending child");
+    assert_eq!(
+        child.parent_work_unit_id.as_deref(),
+        Some(pending_parent_work_unit_id.as_str())
+    );
     let replay = TaskCoordinationRepo::materialize_task_coordination_plan(
         &db,
         db::MaterializeTaskCoordinationPlanInput {
@@ -465,13 +641,14 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
             request_id,
             plan_artifact_id: artifact_id,
             plan_digest,
-            authorization_version: 1,
+            authorization_version: 2,
+            expected_team_digest: team_digest,
             expected_plan_version: 1,
             task_version_before: task.version,
             expected_request_version: 1,
             work_units: vec![],
             receipt_digest: hex::encode(sha2::Sha256::digest(b"other")),
-            created_by: owner_id,
+            created_by: owner_id.clone(),
             created_at: now,
             events: vec![],
         },
@@ -479,4 +656,85 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
     .await
     .expect("replay receipt");
     assert_eq!(replay.id, receipt.id);
+
+    let consumer = WorkUnitRepo::get_by_id(&db, &consumer_work_unit_id)
+        .await
+        .expect("consumer")
+        .expect("consumer row");
+    assert_eq!(consumer.status, db::WorkUnitStatus::Open);
+    let fence_input = || db::TransitionWorkUnit {
+        id: consumer_work_unit_id.clone(),
+        expected_version: consumer.version,
+        status: db::WorkUnitStatus::Completed,
+        updated_at: now_rfc3339(),
+        reviewed_result: None,
+    };
+    sqlx::query("UPDATE task_coordination SET revoked_at = ? WHERE task_id = ?")
+        .bind(now_rfc3339())
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .expect("revoke coordination");
+    let revoked = WorkUnitRepo::transition_with_coordination_fence(
+        &db,
+        fence_input(),
+        2,
+        event(
+            "work_unit.completed",
+            "work_unit",
+            &consumer_work_unit_id,
+            &task_id,
+            &owner_id,
+        ),
+    )
+    .await
+    .expect_err("revoked authorization must fence completion");
+    assert!(matches!(revoked, db::DbError::VersionConflict));
+    sqlx::query(
+        "UPDATE task_coordination SET revoked_at = NULL, mode = 'manual' WHERE task_id = ?",
+    )
+    .bind(&task_id)
+    .execute(db.pool())
+    .await
+    .expect("manual coordination");
+    let manual = WorkUnitRepo::transition_with_coordination_fence(
+        &db,
+        fence_input(),
+        2,
+        event(
+            "work_unit.completed",
+            "work_unit",
+            &consumer_work_unit_id,
+            &task_id,
+            &owner_id,
+        ),
+    )
+    .await
+    .expect_err("manual mode must fence completion");
+    assert!(matches!(manual, db::DbError::VersionConflict));
+    sqlx::query("UPDATE task_coordination SET mode = 'proposal', team_stale = 1 WHERE task_id = ?")
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .expect("stale team");
+    let stale = WorkUnitRepo::transition_with_coordination_fence(
+        &db,
+        fence_input(),
+        2,
+        event(
+            "work_unit.completed",
+            "work_unit",
+            &consumer_work_unit_id,
+            &task_id,
+            &owner_id,
+        ),
+    )
+    .await
+    .expect_err("stale team must fence completion");
+    assert!(matches!(stale, db::DbError::VersionConflict));
+    let still_open = WorkUnitRepo::get_by_id(&db, &consumer_work_unit_id)
+        .await
+        .expect("consumer")
+        .expect("consumer row");
+    assert_eq!(still_open.status, db::WorkUnitStatus::Open);
 }

@@ -2,10 +2,12 @@
 
 Fecha: 2026-11-07. Baseline inicial: `fd599647`. Baseline de PR0: `ae3b2287`;
 migración última verificada: V157.
-Estado: PR0 (contrato transversal) completado; PR1–PR6 pendientes de
-implementación. No hay despliegue, aceptación funcional ni autorización para
-lanzar FirePOS. El propietario ha aprobado las responsabilidades y el recorrido
-del [modelo operativo objetivo](../concepts/task-operating-model.md). Las
+Estado: PR0 (contrato transversal) completado; PR1–PR3 implementados, PR4 con
+el circuito de calidad y rework exacto implementado y límites por ruta/ping-pong
+pendientes, y el circuito de intervención de PR5 disponible; PR6 pendiente. No
+hay despliegue, aceptación funcional ni autorización para lanzar FirePOS. El
+propietario ha aprobado las responsabilidades y el recorrido del
+[modelo operativo objetivo](../concepts/task-operating-model.md). Las
 decisiones de esquema y endpoints están fijadas en el
 [contrato PR0](pr0-task-coordination-contract.md) y el
 [ADR 0016](../adr/0016-task-coordination-turn.md); los PR dependientes deben
@@ -106,14 +108,43 @@ PR4–PR6 conservan revisión, intervención y aceptación.
 ### Registro de implementación backend — 2026-11-07
 
 El backend de PR1–PR6 se implementa sobre el contrato PR0 con migraciones
-aditivas V158–V159: autorización de coordinación versionada y equipo resuelto,
+aditivas V158–V160: autorización de coordinación versionada y equipo resuelto,
 turno read-only sobre wakes existentes, plan `work_unit_plan` inspeccionable,
 aprobación por digest, materialización atómica idempotente, solicitudes de
-calidad con presupuesto global, y un único circuito de intervención para Humans
-y Project Copilot. TaskLifecycle, WorkUnit, review, Gate y WorkspaceLease
-conservan su autoridad. La validación de runtime y la aceptación conjunta con la
-UI se registran en el informe de cierre; las pruebas de Rust se ejecutan sólo en
-la fase de integración solicitada.
+calidad con presupuesto global y consumo atómico, y un único circuito de
+intervención para Humans y Project Copilot. TaskLifecycle, WorkUnit, review,
+Gate y WorkspaceLease conservan su autoridad.
+
+### Alcance real del corte — 2026-11-09
+
+La auditoría independiente del PR 23 identificó huecos de durabilidad y de
+alcance. Este corte corrige la revalidación transaccional, el vínculo atómico
+wake/solicitud, la reanudación de intervenciones —incluida la cancelación entre
+TaskLifecycle y dispatch—, el rol revisor literal, el falso ciclo del DAG y el
+replay de objetivos distintos. También incorpora el consumidor durable de
+solicitudes de calidad: sigue la cadena exacta informe→rework→nueva revisión,
+no cruza correcciones de informes distintos, solo enlaza correcciones de rework
+exactas y no resuelve un defecto por finalización técnica. La finalización
+técnica automática exige autorización de coordinación vigente y no revocada, sin
+equipo stale, y solo cubre entregas del plan, correcciones enlazadas a una
+solicitud de calidad exacta o intentos de rework automático completados. La
+versión exacta de autorización, el modo, la revocación y la staleness del equipo
+se revalidan dentro de la misma transacción `BEGIN IMMEDIATE` que completa y
+congela el resultado; una revocación o cambio a manual que gane la carrera deja
+cero efecto automático. Las Tasks históricas/manuales no se automatizan
+retroactivamente. La materialización crea la línea de revisión y el Gate de
+aprobación que consumen las WorkUnits dependientes de la revisión.
+
+No se declara PR1–PR6 completo. Siguen pendientes, con acuerdo de producto:
+
+- límites por ruta de calidad y detección de ping-pong más allá del presupuesto
+  global de la Task;
+- aceptación E2E conjunta, recorrido con host/proveedor real y evidencia visual
+  independiente (PR6).
+
+El PR 23 no debe mergearse presentando el programa completo. La validación de
+runtime y la aceptación conjunta con la UI se registran en el informe de cierre;
+las pruebas de Rust se ejecutan en la fase de integración solicitada.
 
 ## PR1 — Equipo reutilizable y entrada comprensible
 

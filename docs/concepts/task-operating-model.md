@@ -1,8 +1,9 @@
 # Modelo operativo de tareas y experiencia de usuario
 
 Decisión de producto aceptada por el propietario: 2026-11-07.
-Estado: contrato objetivo aprobado; backend PR1–PR6 implementado, integración y
-aceptación conjunta con la UI pendientes. No autoriza operaciones sobre la Task
+Estado: contrato objetivo aprobado; PR1–PR4 implementados y el circuito de
+intervención de PR5 disponible; la integración/aceptación conjunta con la UI
+sigue pendiente. No autoriza operaciones sobre la Task
 FirePOS real ni sustituye la validación de runtime diferida.
 Baseline de análisis: `fd599647`. El contrato de runtime actual sigue en
 [Architecture](../architecture.md). La transición se detalla en el

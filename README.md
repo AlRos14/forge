@@ -61,7 +61,7 @@ Authentication uses current durable account authority. Reusable JWT/PAT/OAuth cr
 ## Documentation
 
 - [Architecture after PR13](docs/architecture.md)
-- [Approved task operating model — coordination backend implemented, joint UI acceptance pending](docs/concepts/task-operating-model.md)
+- [Approved task operating model — coordination, quality routing, delivery completion, and review gates implemented; PR6 acceptance pending](docs/concepts/task-operating-model.md)
 - [Getting started](docs/getting-started.md)
 - [REST, MCP, and SSE reference](docs/api.md)
 - [`forge-ctl` reference](docs/cli.md)

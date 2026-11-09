@@ -564,11 +564,15 @@ fn quality_response(request: db::TaskQualityRequest) -> ApiResult<TaskQualityReq
         },
         handoff_id: request.handoff_id,
         work_unit_id: request.work_unit_id,
+        coordination_request_id: request.coordination_request_id,
         budget_round: request.budget_round,
         version: request.version,
         created_at: request.created_at,
         updated_at: request.updated_at,
         resolved_at: request.resolved_at,
+        resolution_kind: request.resolution_kind,
+        resolution_ref: request.resolution_ref,
+        resolution_digest: request.resolution_digest,
     })
 }
 
@@ -595,9 +599,16 @@ pub async fn create_quality_request(
     Json(request): Json<CreateTaskQualityRequest>,
 ) -> ApiResult<Json<TaskQualityRequestResponse>> {
     tasks::require_task_mutable(&state, &task_id, &user).await?;
+    let source = match request.source_execution_id.as_deref() {
+        Some(execution_id) => {
+            services::CollaborationActorSource::Execution(execution_id.to_owned())
+        }
+        None => services::CollaborationActorSource::Human(user.user_id.clone()),
+    };
     let request = service(&state)
-        .create_quality_request(
+        .create_quality_request_as(
             &task_id,
+            source,
             &user.user_id,
             QualityRequestInput {
                 source_artifact_id: request.source_artifact_id,

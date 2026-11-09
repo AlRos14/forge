@@ -116,6 +116,7 @@ export function TaskQualityRequestsPanel({
         taskId: task.id,
         body: {
           source_artifact_id: sourceArtifactId.trim() || null,
+          source_execution_id: null,
           category,
           target_kind: human
             ? 'human'

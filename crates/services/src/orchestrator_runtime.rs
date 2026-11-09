@@ -315,6 +315,12 @@ impl OrchestratorRuntime {
         )
         .process_pending_automatic_rework(100)
         .await?;
+        crate::task_quality::TaskQualityService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .process_pending(100)
+        .await?;
         let now = now_rfc3339();
         let events = DomainEventRepo::claim_event_batch(
             &*self.db,
@@ -344,6 +350,17 @@ impl OrchestratorRuntime {
             )
             .process_domain_event(&event)
             .await?;
+            crate::task_quality::TaskQualityService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .process_domain_event(&event)
+            .await?;
+            if event.event_type == "execution.completed" {
+                self.task_service
+                    .complete_coordination_delivery_for_execution(&event.entity_id)
+                    .await?;
+            }
             crate::task_failure_retry::TaskFailureRetryService::new(
                 Arc::clone(&self.db),
                 Arc::clone(&self.event_bus),
@@ -380,6 +397,12 @@ impl OrchestratorRuntime {
             Arc::clone(&self.event_bus),
         )
         .process_pending_automatic_rework(100)
+        .await?;
+        crate::task_quality::TaskQualityService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .process_pending(100)
         .await?;
 
         for _ in 0..16 {
@@ -983,7 +1006,6 @@ impl OrchestratorRuntime {
                     continue;
                 }
                 let id = new_uuid_v4();
-                let wake_id = id.clone();
                 if OrchestratorWakeRepo::admit_orchestrator_wake(
                     &*self.db,
                     CreateOrchestratorWake {
@@ -1004,6 +1026,12 @@ impl OrchestratorRuntime {
                         policy_digest: policy_digest.clone(),
                         task_role_version: role.version,
                         task_role_policy_json: role.policy_json.clone(),
+                        coordination_request_id: (event.event_type
+                            == "task.coordination_requested"
+                            && coordination_request
+                                .as_ref()
+                                .is_some_and(|request| request.id == event.entity_id))
+                        .then(|| event.entity_id.clone()),
                         available_at: now.clone(),
                         created_at: now.clone(),
                         updated_at: now.clone(),
@@ -1012,19 +1040,6 @@ impl OrchestratorRuntime {
                 .await?
                 {
                     admitted += 1;
-                    if event.event_type == "task.coordination_requested"
-                        && coordination_request
-                            .as_ref()
-                            .is_some_and(|request| request.id == event.entity_id)
-                    {
-                        TaskCoordinationRepo::link_task_coordination_request_wake(
-                            &*self.db,
-                            &event.entity_id,
-                            task_id,
-                            &wake_id,
-                        )
-                        .await?;
-                    }
                 }
             }
         }
@@ -1140,6 +1155,78 @@ impl OrchestratorRuntime {
             self.fail_wake(&wake, "durable wake WorkUnit context changed")
                 .await?;
             return Ok(DispatchOutcome::Retried);
+        }
+        let mut coordination_request = coordination_request;
+        if source_event.event_type == "task.coordination_requested" {
+            // A coordination wake must never degrade to generic orchestration.
+            // Recover a missing link from the durable event identity, and fail
+            // closed when the exact request is absent, terminal, or bound to a
+            // different wake.
+            let mut request = match coordination_request.take() {
+                Some(request) => Some(request),
+                None => {
+                    TaskCoordinationRepo::get_task_coordination_request(
+                        &*self.db,
+                        &source_event.entity_id,
+                    )
+                    .await?
+                }
+            };
+            let Some(mut current) = request.take() else {
+                self.fail_wake(&wake, "coordination wake has no durable request")
+                    .await?;
+                return Ok(DispatchOutcome::Retried);
+            };
+            if current.task_id != wake.task_id || current.id != source_event.entity_id {
+                self.fail_wake(&wake, "coordination wake request identity changed")
+                    .await?;
+                return Ok(DispatchOutcome::Retried);
+            }
+            match current.wake_id.as_deref() {
+                Some(linked) if linked == wake.id => {}
+                Some(_) => {
+                    self.fail_wake(&wake, "coordination request is linked to another wake")
+                        .await?;
+                    return Ok(DispatchOutcome::Retried);
+                }
+                None => {
+                    TaskCoordinationRepo::link_task_coordination_request_wake(
+                        &*self.db,
+                        &current.id,
+                        &wake.task_id,
+                        &wake.id,
+                    )
+                    .await?;
+                    let Some(linked) =
+                        TaskCoordinationRepo::get_task_coordination_request(&*self.db, &current.id)
+                            .await?
+                    else {
+                        self.fail_wake(&wake, "coordination request disappeared while repairing")
+                            .await?;
+                        return Ok(DispatchOutcome::Retried);
+                    };
+                    current = linked;
+                    if current.wake_id.as_deref() != Some(wake.id.as_str())
+                        || current.task_id != wake.task_id
+                    {
+                        self.fail_wake(
+                            &wake,
+                            "coordination request link changed under another writer",
+                        )
+                        .await?;
+                        return Ok(DispatchOutcome::Retried);
+                    }
+                }
+            }
+            if !matches!(
+                current.state,
+                TaskCoordinationRequestState::Requested | TaskCoordinationRequestState::Running
+            ) {
+                self.fail_wake(&wake, "coordination request is no longer runnable")
+                    .await?;
+                return Ok(DispatchOutcome::Retried);
+            }
+            coordination_request = Some(current);
         }
         let unit = match wake.work_unit_id.as_deref() {
             Some(id) => WorkUnitRepo::get_by_id(&*self.db, id).await?,

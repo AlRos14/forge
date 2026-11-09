@@ -1,4 +1,229 @@
 use super::*;
+use crate::{MaterializedWorkUnit, UpdateTaskQualityRequestState};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+
+fn deterministic_review_line_id(reviewed_work_unit_id: &str) -> String {
+    let digest = Sha256::digest(
+        [
+            b"forge.task-coordination.review-line.v1".as_slice(),
+            reviewed_work_unit_id.as_bytes(),
+        ]
+        .concat(),
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
+fn deterministic_review_gate_id(reviewed_work_unit_id: &str) -> String {
+    let digest = Sha256::digest(
+        [
+            b"forge.task-coordination.review-gate.v1".as_slice(),
+            reviewed_work_unit_id.as_bytes(),
+        ]
+        .concat(),
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
+struct MaterializedReviewControl {
+    reviewed_work_unit_id: String,
+    line_id: String,
+    gate_id: String,
+    gate_kind: String,
+}
+
+async fn insert_review_control(
+    db: &SqliteDb,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: &MaterializeTaskCoordinationPlanInput,
+    control: &MaterializedReviewControl,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO work_unit_review_line (
+            id, task_id, root_work_unit_id, current_work_unit_id,
+            current_work_unit_version, current_result_execution_id,
+            current_result_artifact_id, current_commit_sha,
+            current_workspace_id, current_snapshot_digest, current_manifest_id,
+            latest_report_artifact_id, latest_verdict, revision,
+            created_at, updated_at
+         ) VALUES (?, ?, ?, ?, 1, NULL, NULL, NULL, NULL, NULL, NULL,
+                   NULL, NULL, 1, ?, ?)",
+    )
+    .bind(&control.line_id)
+    .bind(&input.task_id)
+    .bind(&control.reviewed_work_unit_id)
+    .bind(&control.reviewed_work_unit_id)
+    .bind(&input.created_at)
+    .bind(&input.created_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(check_error)?;
+    let gate_inserted = sqlx::query(
+        "INSERT OR IGNORE INTO gate (
+            id, task_id, gate_kind, scope_kind, scope_id,
+            active_policy_revision, created_at
+         ) VALUES (?, ?, ?, 'work_unit', ?, NULL, ?)",
+    )
+    .bind(&control.gate_id)
+    .bind(&input.task_id)
+    .bind(&control.gate_kind)
+    .bind(&control.reviewed_work_unit_id)
+    .bind(&input.created_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(check_error)?
+    .rows_affected()
+        == 1;
+    if !gate_inserted {
+        return Ok(());
+    }
+    let policy_json = serde_json::json!({
+        "schema_version": 1,
+        "review": {
+            "mode": "one_acceptable",
+            "required_count": 1,
+            "human_required": false,
+            "review_line_id": control.line_id,
+        }
+    })
+    .to_string();
+    let policy_digest = hex::encode(Sha256::digest(policy_json.as_bytes()));
+    sqlx::query(
+        "INSERT INTO gate_policy_revision (
+            gate_id, revision, schema_version, policy_json,
+            policy_digest, created_at
+         ) VALUES (?, 1, 1, ?, ?, ?)",
+    )
+    .bind(&control.gate_id)
+    .bind(&policy_json)
+    .bind(&policy_digest)
+    .bind(&input.created_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(check_error)?;
+    sqlx::query(
+        "UPDATE gate SET active_policy_revision = 1
+         WHERE id = ? AND active_policy_revision IS NULL",
+    )
+    .bind(&control.gate_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(check_error)?;
+    for event in [
+        CreateDomainEvent {
+            id: crate::new_uuid_v4(),
+            event_type: "gate.created".to_owned(),
+            entity_type: "gate".to_owned(),
+            entity_id: control.gate_id.clone(),
+            actor_type: "human".to_owned(),
+            actor_id: Some(input.created_by.clone()),
+            scope_type: "task".to_owned(),
+            scope_id: input.task_id.clone(),
+            correlation_id: crate::new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("gate.created:{}", control.gate_id)),
+            payload_json: serde_json::json!({
+                "gate_id": control.gate_id,
+                "gate_kind": control.gate_kind,
+                "scope_kind": "work_unit",
+                "scope_id": control.reviewed_work_unit_id,
+            })
+            .to_string(),
+            created_at: input.created_at.clone(),
+        },
+        CreateDomainEvent {
+            id: crate::new_uuid_v4(),
+            event_type: "gate.policy_revised".to_owned(),
+            entity_type: "gate".to_owned(),
+            entity_id: format!("{}:policy:1", control.gate_id),
+            actor_type: "human".to_owned(),
+            actor_id: Some(input.created_by.clone()),
+            scope_type: "task".to_owned(),
+            scope_id: input.task_id.clone(),
+            correlation_id: crate::new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("gate.policy_revised:{}:1", control.gate_id)),
+            payload_json: serde_json::json!({
+                "gate_id": control.gate_id,
+                "revision": 1,
+                "policy_digest": policy_digest,
+            })
+            .to_string(),
+            created_at: input.created_at.clone(),
+        },
+    ] {
+        DomainEventRepo::append_event_in_tx(db, tx, &event).await?;
+    }
+    Ok(())
+}
+
+async fn insert_materialized_work_unit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: &MaterializeTaskCoordinationPlanInput,
+    unit: &MaterializedWorkUnit,
+    review_gate_id: Option<&str>,
+    review_line_id: Option<&str>,
+) -> Result<()> {
+    let (actor_kind, actor_id) = coordination_actor_columns(unit.assigned_actor.as_ref());
+    sqlx::query(
+        "INSERT INTO work_unit (
+            id, task_id, parent_work_unit_id, title, scope, status, role,
+            assigned_actor_kind, assigned_actor_id, requires_integration,
+            provenance_kind, provenance_id, provenance_actor_kind,
+            review_approval_gate_id, review_approval_line_id,
+            created_by_kind, created_by_id, version, created_at, updated_at,
+            execution_instructions
+         ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, 'artifact', ?, NULL,
+                   ?, ?, 'human', ?, 1, ?, ?, ?)",
+    )
+    .bind(&unit.id)
+    .bind(&input.task_id)
+    .bind(unit.parent_work_unit_id.as_deref())
+    .bind(&unit.title)
+    .bind(&unit.scope)
+    .bind(&unit.role)
+    .bind(actor_kind.as_deref())
+    .bind(actor_id.as_deref())
+    .bind(i64::from(unit.requires_integration))
+    .bind(&input.plan_artifact_id)
+    .bind(review_gate_id)
+    .bind(review_line_id)
+    .bind(&input.created_by)
+    .bind(&input.created_at)
+    .bind(&input.created_at)
+    .bind(unit.execution_instructions.as_deref())
+    .execute(&mut **tx)
+    .await
+    .map_err(check_error)?;
+    for artifact in &unit.artifact_inputs {
+        sqlx::query(
+            "INSERT INTO work_unit_artifact_input (
+                work_unit_id, task_id, artifact_id, artifact_digest,
+                producer_execution_id, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&unit.id)
+        .bind(&input.task_id)
+        .bind(&artifact.artifact_id)
+        .bind(&artifact.digest)
+        .bind(&artifact.producer_execution_id)
+        .bind(&input.created_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(check_error)?;
+    }
+    Ok(())
+}
 
 fn coordination_actor_columns(actor: Option<&ActorRef>) -> (Option<String>, Option<String>) {
     actor
@@ -34,6 +259,8 @@ fn map_task_coordination(row: SqliteRow) -> Result<TaskCoordination> {
         authorization_version: row.try_get("authorization_version")?,
         team_snapshot_json: row.try_get("team_snapshot_json")?,
         team_digest: row.try_get("team_digest")?,
+        team_stale: row.try_get::<i64, _>("team_stale")? != 0,
+        team_generation: row.try_get("team_generation")?,
         envelope_json: row.try_get("envelope_json")?,
         envelope_digest: row.try_get("envelope_digest")?,
         requested_by: row.try_get("requested_by")?,
@@ -156,6 +383,7 @@ fn map_quality_request(row: SqliteRow) -> Result<TaskQualityRequest> {
         state: parse_enum(row.try_get("state")?)?,
         handoff_id: row.try_get("handoff_id")?,
         work_unit_id: row.try_get("work_unit_id")?,
+        coordination_request_id: row.try_get("coordination_request_id")?,
         budget_round: row.try_get("budget_round")?,
         source_digest: row.try_get("source_digest")?,
         request_digest: row.try_get("request_digest")?,
@@ -165,6 +393,9 @@ fn map_quality_request(row: SqliteRow) -> Result<TaskQualityRequest> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         resolved_at: row.try_get("resolved_at")?,
+        resolution_kind: row.try_get("resolution_kind")?,
+        resolution_ref: row.try_get("resolution_ref")?,
+        resolution_digest: row.try_get("resolution_digest")?,
     })
 }
 
@@ -308,6 +539,9 @@ impl TaskCoordinationRepo for SqliteDb {
         if current.authorization_version != input.expected_coordination_version {
             return Err(DbError::VersionConflict);
         }
+        if current.team_generation != input.expected_team_generation {
+            return Err(DbError::VersionConflict);
+        }
         let (actor_kind, actor_id) = coordination_actor_columns(input.coordinator_actor.as_ref());
         sqlx::query(
             "INSERT INTO task_coordination_receipt (
@@ -330,7 +564,7 @@ impl TaskCoordinationRepo for SqliteDb {
                  coordinator_actor_id = ?, authorization_version = authorization_version + 1,
                  team_snapshot_json = ?, team_digest = ?, envelope_json = ?,
                  envelope_digest = ?, requested_by = ?, updated_at = ?,
-                 revoked_at = NULL, revoke_reason = NULL
+                 revoked_at = NULL, revoke_reason = NULL, team_stale = 0
              WHERE task_id = ? AND authorization_version = ?",
         )
         .bind(input.mode.to_string())
@@ -508,19 +742,6 @@ impl TaskCoordinationRepo for SqliteDb {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    async fn consume_quality_request_budget(&self, task_id: &str) -> Result<bool> {
-        let result = sqlx::query(
-            "UPDATE task_coordination
-             SET quality_request_count = quality_request_count + 1,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE task_id = ? AND quality_request_count < max_quality_requests",
-        )
-        .bind(task_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() == 1)
     }
 
     async fn create_task_coordination_request(
@@ -984,52 +1205,182 @@ impl TaskCoordinationRepo for SqliteDb {
                 actual: task_version,
             });
         }
-        for unit in &input.work_units {
-            let (actor_kind, actor_id) = coordination_actor_columns(unit.assigned_actor.as_ref());
-            sqlx::query(
-                "INSERT INTO work_unit (
-                    id, task_id, parent_work_unit_id, title, scope, status, role,
-                    assigned_actor_kind, assigned_actor_id, requires_integration,
-                    provenance_kind, provenance_id, provenance_actor_kind,
-                    review_approval_gate_id, review_approval_line_id,
-                    created_by_kind, created_by_id, version, created_at, updated_at,
-                    execution_instructions
-                 ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, 'artifact', ?, NULL,
-                           NULL, NULL, 'human', ?, 1, ?, ?, ?)",
-            )
-            .bind(&unit.id)
+        // Revalidate the authorization that protects this exact effect. The
+        // service preflight is not sufficient: another consumer may revoke,
+        // re-authorize, or mutate the team between that read and this
+        // BEGIN IMMEDIATE. The caller's Project write authority is rechecked
+        // under the same lock as the WorkUnit inserts.
+        let coordination = sqlx::query("SELECT * FROM task_coordination WHERE task_id = ?")
             .bind(&input.task_id)
-            .bind(unit.parent_work_unit_id.as_deref())
-            .bind(&unit.title)
-            .bind(&unit.scope)
-            .bind(&unit.role)
-            .bind(actor_kind.as_deref())
-            .bind(actor_id.as_deref())
-            .bind(i64::from(unit.requires_integration))
-            .bind(&input.plan_artifact_id)
-            .bind(&input.created_by)
-            .bind(&input.created_at)
-            .bind(&input.created_at)
-            .bind(unit.execution_instructions.as_deref())
-            .execute(&mut *tx)
-            .await
-            .map_err(check_error)?;
-            for artifact in &unit.artifact_inputs {
-                sqlx::query(
-                    "INSERT INTO work_unit_artifact_input (
-                        work_unit_id, task_id, artifact_id, artifact_digest,
-                        producer_execution_id, created_at
-                     ) VALUES (?, ?, ?, ?, ?, ?)",
-                )
-                .bind(&unit.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_task_coordination)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        if coordination.revoked_at.is_some()
+            || coordination.mode == crate::TaskCoordinationMode::Manual
+            || coordination.authorization_version != input.authorization_version
+            || coordination.team_digest != input.expected_team_digest
+            || coordination.team_stale
+            || coordination.coordinator_task_role_id.is_none()
+            || coordination.coordinator_actor.is_none()
+        {
+            return Err(DbError::VersionConflict);
+        }
+        let lifecycle_state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM task_lifecycle WHERE task_id = ?")
                 .bind(&input.task_id)
-                .bind(&artifact.artifact_id)
-                .bind(&artifact.digest)
-                .bind(&artifact.producer_execution_id)
-                .bind(&input.created_at)
-                .execute(&mut *tx)
-                .await
-                .map_err(check_error)?;
+                .fetch_optional(&mut *tx)
+                .await?;
+        let lifecycle_state = lifecycle_state.ok_or(DbError::NotFound)?;
+        if matches!(lifecycle_state.as_str(), "cancelled" | "done" | "merging") {
+            return Err(DbError::InvalidTransition);
+        }
+        let dispatch_state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM task_dispatch WHERE task_id = ?")
+                .bind(&input.task_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let dispatch_state = dispatch_state.ok_or(DbError::NotFound)?;
+        if dispatch_state == "paused" {
+            return Err(DbError::TaskDispatchPaused);
+        }
+        if dispatch_state == "cancelled" {
+            return Err(DbError::TaskDispatchCancelled);
+        }
+        let caller_can_write: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM task current_task
+                JOIN project_member member
+                  ON member.project_id = current_task.project_id
+                 AND member.user_id = ?
+                 AND member.role IN ('owner', 'admin', 'member')
+                WHERE current_task.id = ? AND current_task.deleted_at IS NULL
+            )",
+        )
+        .bind(&input.created_by)
+        .bind(&input.task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !caller_can_write {
+            return Err(DbError::ProjectWriteRequired);
+        }
+        // A formal review WorkUnit materializes its durable review line and a
+        // WorkUnit-scoped approval Gate. Any WU that directly depends on the
+        // review consumes that Gate, so it cannot start merely because the
+        // reviewer ran: the latest review-line verdict must pass.
+        let mut review_controls: BTreeMap<String, MaterializedReviewControl> = BTreeMap::new();
+        for unit in &input.work_units {
+            let Some(reviewed_work_unit_id) = unit.review_subject_work_unit_id.as_deref() else {
+                continue;
+            };
+            let line_id: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM work_unit_review_line
+                 WHERE task_id = ? AND root_work_unit_id = ?",
+            )
+            .bind(&input.task_id)
+            .bind(reviewed_work_unit_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let gate_kind = format!("review_approval:{reviewed_work_unit_id}");
+            let gate_id: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM gate
+                 WHERE task_id = ? AND gate_kind = ?
+                   AND scope_kind = 'work_unit' AND scope_id = ?",
+            )
+            .bind(&input.task_id)
+            .bind(&gate_kind)
+            .bind(reviewed_work_unit_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            review_controls.insert(
+                unit.id.clone(),
+                MaterializedReviewControl {
+                    reviewed_work_unit_id: reviewed_work_unit_id.to_owned(),
+                    line_id: line_id
+                        .unwrap_or_else(|| deterministic_review_line_id(reviewed_work_unit_id)),
+                    gate_id: gate_id
+                        .unwrap_or_else(|| deterministic_review_gate_id(reviewed_work_unit_id)),
+                    gate_kind,
+                },
+            );
+        }
+        let mut consumer_controls: BTreeMap<String, (String, String, String)> = BTreeMap::new();
+        for unit in &input.work_units {
+            let mut controls = unit
+                .depends_on_work_unit_ids
+                .iter()
+                .filter_map(|dependency| review_controls.get(dependency))
+                .map(|control| {
+                    (
+                        control.reviewed_work_unit_id.clone(),
+                        control.line_id.clone(),
+                        control.gate_id.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            controls.sort();
+            controls.dedup();
+            if controls.len() > 1 {
+                return Err(DbError::Check(
+                    "a WorkUnit cannot depend on multiple review approval lines".to_owned(),
+                ));
+            }
+            if let Some(control) = controls.first() {
+                consumer_controls.insert(unit.id.clone(), control.clone());
+            }
+        }
+        // Materialization has two edges per review: the reviewed WorkUnit must
+        // exist before its review line/Gate, and that control must exist before
+        // a consumer is inserted. Consecutive reviews (I1 -> R1 -> I2 -> R2)
+        // are a valid DAG and must be inserted in that dependency order.
+        let mut inserted: BTreeSet<String> = BTreeSet::new();
+        let mut created_controls: BTreeSet<String> = BTreeSet::new();
+        while inserted.len() < input.work_units.len() {
+            let mut progress = false;
+            for unit in &input.work_units {
+                if inserted.contains(&unit.id) {
+                    continue;
+                }
+                if let Some(parent_id) = unit.parent_work_unit_id.as_deref() {
+                    if !inserted.contains(parent_id) {
+                        continue;
+                    }
+                }
+                if let Some((reviewed_id, _, _)) = consumer_controls.get(&unit.id) {
+                    if !inserted.contains(reviewed_id) {
+                        continue;
+                    }
+                }
+                let (review_line_id, review_gate_id) = consumer_controls
+                    .get(&unit.id)
+                    .map(|(_, line, gate)| (Some(line.as_str()), Some(gate.as_str())))
+                    .unwrap_or((None, None));
+                insert_materialized_work_unit(
+                    &mut tx,
+                    &input,
+                    unit,
+                    review_gate_id,
+                    review_line_id,
+                )
+                .await?;
+                inserted.insert(unit.id.clone());
+                progress = true;
+                if !created_controls.contains(&unit.id) {
+                    for control in review_controls
+                        .values()
+                        .filter(|control| control.reviewed_work_unit_id == unit.id)
+                    {
+                        insert_review_control(self, &mut tx, &input, control).await?;
+                    }
+                    created_controls.insert(unit.id.clone());
+                }
+            }
+            if !progress {
+                return Err(DbError::Check(
+                    "review approval controls are cyclic or inconsistent".to_owned(),
+                ));
             }
         }
         for unit in &input.work_units {
@@ -1178,13 +1529,33 @@ impl TaskCoordinationRepo for SqliteDb {
                 replayed: true,
             });
         }
+        let consumed = sqlx::query(
+            "UPDATE task_coordination
+             SET quality_request_count = quality_request_count + 1, updated_at = ?
+             WHERE task_id = ? AND quality_request_count < max_quality_requests",
+        )
+        .bind(&input.created_at)
+        .bind(&input.task_id)
+        .execute(&mut *tx)
+        .await?;
+        if consumed.rows_affected() != 1 {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM task_coordination WHERE task_id = ?)",
+            )
+            .bind(&input.task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !exists {
+                return Err(DbError::NotFound);
+            }
+            return Err(DbError::QualityRequestBudgetExhausted);
+        }
         let budget_round: i64 = sqlx::query_scalar(
-            "SELECT quality_request_count + 1 FROM task_coordination WHERE task_id = ?",
+            "SELECT quality_request_count FROM task_coordination WHERE task_id = ?",
         )
         .bind(&input.task_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(DbError::NotFound)?;
+        .fetch_one(&mut *tx)
+        .await?;
         let (actor_kind, actor_id) = coordination_actor_columns(input.target_actor.as_ref());
         sqlx::query(
             "INSERT INTO task_quality_request (
@@ -1282,46 +1653,60 @@ impl TaskCoordinationRepo for SqliteDb {
 
     async fn update_task_quality_request_state(
         &self,
-        id: &str,
-        expected_version: i64,
-        state: TaskQualityState,
-        handoff_id: Option<Option<String>>,
-        work_unit_id: Option<Option<String>>,
-        updated_at: &str,
-        event: Option<CreateDomainEvent>,
+        input: UpdateTaskQualityRequestState,
     ) -> Result<TaskQualityRequest> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut query =
             sqlx::QueryBuilder::<Sqlite>::new("UPDATE task_quality_request SET state = ");
-        query.push_bind(state.to_string());
+        query.push_bind(input.state.to_string());
         query
             .push(", version = version + 1, updated_at = ")
-            .push_bind(updated_at);
-        if state == TaskQualityState::Resolved {
-            query.push(", resolved_at = ").push_bind(updated_at);
+            .push_bind(&input.updated_at);
+        if input.state == TaskQualityState::Resolved {
+            query.push(", resolved_at = ").push_bind(&input.updated_at);
         }
-        if let Some(handoff_id) = handoff_id.as_ref() {
+        if let Some(handoff_id) = input.handoff_id.as_ref() {
             query
                 .push(", handoff_id = ")
                 .push_bind(handoff_id.as_deref());
         }
-        if let Some(work_unit_id) = work_unit_id.as_ref() {
+        if let Some(work_unit_id) = input.work_unit_id.as_ref() {
             query
                 .push(", work_unit_id = ")
                 .push_bind(work_unit_id.as_deref());
         }
+        if let Some(coordination_request_id) = input.coordination_request_id.as_ref() {
+            query
+                .push(", coordination_request_id = ")
+                .push_bind(coordination_request_id.as_deref());
+        }
+        if let Some(resolution_kind) = input.resolution_kind.as_ref() {
+            query
+                .push(", resolution_kind = ")
+                .push_bind(resolution_kind.as_deref());
+        }
+        if let Some(resolution_ref) = input.resolution_ref.as_ref() {
+            query
+                .push(", resolution_ref = ")
+                .push_bind(resolution_ref.as_deref());
+        }
+        if let Some(resolution_digest) = input.resolution_digest.as_ref() {
+            query
+                .push(", resolution_digest = ")
+                .push_bind(resolution_digest.as_deref());
+        }
         query
             .push(" WHERE id = ")
-            .push_bind(id)
+            .push_bind(&input.id)
             .push(" AND version = ")
-            .push_bind(expected_version);
+            .push_bind(input.expected_version);
         let result = query.build().execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(DbError::VersionConflict);
         }
-        append_optional_event(self, &mut tx, event.as_ref()).await?;
+        append_optional_event(self, &mut tx, input.event.as_ref()).await?;
         let request = sqlx::query("SELECT * FROM task_quality_request WHERE id = ?")
-            .bind(id)
+            .bind(&input.id)
             .fetch_one(&mut *tx)
             .await
             .map_err(DbError::from)

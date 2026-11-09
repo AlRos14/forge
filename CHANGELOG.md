@@ -163,6 +163,62 @@ PR14 audit on 2026-10-16.
 
 ### Fixed
 
+- Coordination materialization now revalidates the current authorization,
+  revocation, team staleness, TaskLifecycle, dispatch pause/cancel, Project
+  write authority, and expected team digest inside the same `BEGIN IMMEDIATE`
+  transaction as the WorkUnit inserts. V160 marks the coordination authorization
+  stale on every TaskRole, capability, or membership mutation, and Provider
+  Start rechecks the exact coordination request, coordinator, revocation, and
+  team state under its own write lock.
+- A coordination wake and its `task_coordination_request` now commit in one
+  transaction. Replay repairs a missing link from the durable event identity and
+  the dispatcher fails closed instead of degrading a coordination turn to
+  generic orchestration.
+- Replaying a recorded intervention resumes its effect instead of returning a
+  `recorded` row. Instruction messages use a deterministic intervention-derived
+  ID, and all other effects keep their intervention-derived receipt, so a crash
+  before or after the effect converges to one applied intervention. A cancel
+  interrupted between the TaskLifecycle transition and its dispatch receipt
+  skips the already-committed transition and records the pending receipt with
+  the current versions instead of conflicting with the original receipt.
+- Quality requests now have a durable consumer: delivery corrections follow the
+  exact ReviewReport → rework receipt → next review chain, never another
+  report's correction, and only exact rework corrections are linked. A
+  correction is resolved only by an independent review `pass`, never by
+  technical completion alone. Specialists receive linked WorkUnits; plan
+  revisions open a coordination turn; resolution records exact evidence.
+  Quality-linked WorkUnits complete technically after their Execution finishes
+  without converting that completion into review approval. A reviewer Execution
+  can open the same request through `create_quality_request_as`, and REST/MCP
+  accept an optional `source_execution_id` that attributes a ReviewReport
+  request to that exact Execution with `formal_review` authority.
+- Coordination materialization creates a durable review line and a
+  WorkUnit-scoped `review_approval` Gate for each formal review subject. A
+  materialized WorkUnit that depends on the review consumes the Gate and line,
+  so it cannot start before the latest review verdict passes. Consecutive
+  reviews (implementation → review → implementation → review) materialize in a
+  valid dependency order instead of being rejected as a cycle, and a child waits
+  for its deferred parent before insert. Automatic technical completion is
+  fenced by a current non-manual coordination authorization without revocation
+  or team staleness and only covers plan deliveries, exact quality-request
+  corrections, or completed automatic-rework intents; historical/manual Tasks
+  are unchanged. The exact authorization version, mode, revocation, and team
+  staleness are revalidated inside the same `BEGIN IMMEDIATE` transaction that
+  completes the WorkUnit and freezes its result, so a winning revocation or
+  mode change leaves zero automatic effect. Completion freezes the exact result
+  and advances the review line when the WorkUnit is a review subject.
+- Quality-request budget consumption and request insertion are one transaction;
+  replays and concurrent consumers consume no extra round. Handoffs use a
+  deterministic request-derived identity and are no longer the effect authority.
+- Formal review routing resolves the exact TaskRole and its `formal_review`
+  capability instead of the literal `reviewer` name. Custom roles listed in the
+  envelope's `allowed_review_roles` work in the guided flow.
+- The plan dependency validator accepts a valid diamond and redundant transitive
+  edges while still rejecting a real cycle.
+- Replaying a coordination turn with the same idempotency key now compares the
+  received brief digest, so a new objective under an old key returns the typed
+  conflict instead of silently returning the previous request.
+
 - V157 advances a correction's review line from the exact reviewed result even
   when another reviewer has since reported on that same result. Existing
   reports and review-line revisions remain immutable.

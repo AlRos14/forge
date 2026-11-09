@@ -6,10 +6,11 @@ use db::{
     new_uuid_v4, now_rfc3339, ActorRef, AddWorkUnitDependency, AgentRepo, AllocateWorkUnit,
     CreateDomainEvent, CreateExecution, CreateWorkUnit, CreateWorkUnitExecution,
     CreateWorkUnitIntegration, CreateWorkUnitReviewSubject, Execution, ExecutionRepo,
-    ExecutionStatus, RecordWorkUnitIntegration, RepoRepo, SqliteDb, Task, TransitionWorkUnit,
-    UpdateWorkUnit, WorkUnit, WorkUnitDependency, WorkUnitExecutionRepo, WorkUnitIntegration,
-    WorkUnitIntegrationOutcome, WorkUnitProvenance, WorkUnitRepo, WorkUnitStatus,
-    WorkUnitWorkspaceRepo, Workspace, WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
+    ExecutionStatus, RecordWorkUnitIntegration, RepoRepo, SqliteDb, Task, TaskRepo,
+    TransitionWorkUnit, UpdateWorkUnit, WorkUnit, WorkUnitDependency, WorkUnitExecutionRepo,
+    WorkUnitIntegration, WorkUnitIntegrationOutcome, WorkUnitProvenance, WorkUnitRepo,
+    WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceRepo, WorkspaceScopeKind,
+    WorkspaceStatus,
 };
 use events::EventBus;
 use sha2::{Digest, Sha256};
@@ -910,6 +911,54 @@ impl WorkUnitService {
         status: WorkUnitStatus,
     ) -> Result<WorkUnit> {
         let (task, actor) = self.authorize_work_unit(&source, id).await?;
+        self.transition_inner(
+            id,
+            expected_version,
+            status,
+            task,
+            Some((source, actor)),
+            None,
+        )
+        .await
+    }
+
+    /// Complete or cancel a WorkUnit from a deterministic system consumer.
+    /// The caller must have already established exact Task and WorkUnit
+    /// identity; this path records a `system` event and never invents a Human
+    /// authority.
+    pub(crate) async fn transition_system(
+        &self,
+        id: &str,
+        expected_version: i64,
+        status: WorkUnitStatus,
+        coordination_authorization_version: Option<i64>,
+    ) -> Result<WorkUnit> {
+        let task_id = WorkUnitRepo::get_task_id(&*self.db, id)
+            .await?
+            .ok_or_else(|| not_found("work_unit", id))?;
+        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+            .await?
+            .ok_or_else(|| not_found("task", task_id))?;
+        self.transition_inner(
+            id,
+            expected_version,
+            status,
+            task,
+            None,
+            coordination_authorization_version,
+        )
+        .await
+    }
+
+    async fn transition_inner(
+        &self,
+        id: &str,
+        expected_version: i64,
+        status: WorkUnitStatus,
+        task: Task,
+        authority: Option<(CollaborationActorSource, ActorRef)>,
+        coordination_authorization_version: Option<i64>,
+    ) -> Result<WorkUnit> {
         let unit = WorkUnitRepo::get_by_id(&*self.db, id)
             .await?
             .ok_or_else(|| not_found("work_unit", id))?;
@@ -1116,28 +1165,64 @@ impl WorkUnitService {
                 "workspace_snapshot_digest": reviewed_result.workspace_snapshot_digest,
             });
         }
-        let event = self.event(
-            event_name,
-            "work_unit",
-            id,
-            &task,
-            &actor,
-            event_payload,
-            &now,
-            &source,
-        );
-        let write = WorkUnitRepo::transition(
-            &*self.db,
-            TransitionWorkUnit {
-                id: id.to_owned(),
-                expected_version,
-                status,
-                updated_at: now,
-                reviewed_result,
-            },
-            event,
-        )
-        .await?;
+        let event = if let Some((source, actor)) = authority.as_ref() {
+            self.event(
+                event_name,
+                "work_unit",
+                id,
+                &task,
+                actor,
+                event_payload,
+                &now,
+                source,
+            )
+        } else {
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: event_name.to_owned(),
+                entity_type: "work_unit".to_owned(),
+                entity_id: id.to_owned(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: task.id.clone(),
+                correlation_id: new_uuid_v4(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!("{event_name}:{id}")),
+                payload_json: event_payload.to_string(),
+                created_at: now.clone(),
+            }
+        };
+        let write = if let Some(expected_authorization_version) = coordination_authorization_version
+        {
+            WorkUnitRepo::transition_with_coordination_fence(
+                &*self.db,
+                TransitionWorkUnit {
+                    id: id.to_owned(),
+                    expected_version,
+                    status,
+                    updated_at: now,
+                    reviewed_result,
+                },
+                expected_authorization_version,
+                event,
+            )
+            .await?
+        } else {
+            WorkUnitRepo::transition(
+                &*self.db,
+                TransitionWorkUnit {
+                    id: id.to_owned(),
+                    expected_version,
+                    status,
+                    updated_at: now,
+                    reviewed_result,
+                },
+                event,
+            )
+            .await?
+        };
         self.domain_events.publish_committed(&write.event);
         Ok(write.record)
     }

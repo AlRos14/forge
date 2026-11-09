@@ -44,6 +44,7 @@ pub mod task_dispatcher;
 pub mod task_failure_retry;
 mod task_integration_operation;
 pub mod task_lifecycle;
+pub mod task_quality;
 pub mod task_rework;
 pub mod task_role_configuration;
 pub mod task_service;
@@ -102,6 +103,7 @@ pub use task_coordination::{
     TeamMemberView, TeamRoleView, TurnRequestInput, WorkUnitPlan,
 };
 pub use task_dispatcher::{DispatchOutcome, TaskDispatcher};
+pub use task_quality::TaskQualityService;
 pub use task_rework::{
     RequestReworkInput, RequestReworkResult, TaskReworkService, WorkUnitReviewSubject,
 };
@@ -249,6 +251,10 @@ impl From<db::DbError> for ServiceError {
         match error {
             db::DbError::DependencyGate => Self::DependencyGate,
             db::DbError::AgentPaused { agent_id } => Self::AgentPaused { agent_id },
+            db::DbError::QualityRequestBudgetExhausted => Self::Coordination {
+                code: "coordination.budget_exhausted",
+                message: "the Task quality-request budget is exhausted".to_owned(),
+            },
             error => Self::Db(error),
         }
     }
