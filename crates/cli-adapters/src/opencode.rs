@@ -1719,6 +1719,26 @@ mod tests {
     }
 
     #[test]
+    fn saved_profile_effort_reaches_native_model_variant() {
+        let normalized = OpencodeAdapter::new().normalize_config(
+            &serde_json::json!({"model":"opencode-go/deepseek-v4.1-flash","model_reasoning_effort":"max"}),
+            &executors::ExecutionOverrides::default(),
+        ).unwrap();
+        let config: OpencodeConfig = serde_json::from_value(normalized).unwrap();
+        assert_eq!(config.variant.as_deref(), Some("max"));
+        let command = OpencodeAdapter::build_command(&config, "implement");
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--model", "opencode-go/deepseek-v4.1-flash#max"])
+        );
+    }
+
+    #[test]
     fn independent_review_policy_has_no_mutation_or_mcp_authority() {
         let policy = opencode_independent_review_policy();
         let permissions = policy["permissions"].as_array().unwrap();
