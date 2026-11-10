@@ -177,6 +177,18 @@ async fn project_coordinator_preference_is_copied_without_starting_provider_work
         )
         .await;
     }
+    for role in ["build", "quality"] {
+        let _: Value = json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/tasks/{}/task-roles/{role}/members", task.id),
+            json!({"actor_ref":{"kind":"human","id":"test-user-id"}}),
+            StatusCode::OK,
+        )
+        .await;
+    }
+    let human_source:Value=json_request(&harness.app,Method::POST,&format!("/api/v1/tasks/{}/work-units",task.id),json!({"title":"Human implementation","scope":"Produce the result","role":"build","assigned_actor":{"kind":"human","id":"test-user-id"},"requires_integration":false}),StatusCode::CREATED).await;
+    let _:Value=json_request(&harness.app,Method::POST,&format!("/api/v1/tasks/{}/work-units",task.id),json!({"title":"Human self-review","scope":"Must be refused","role":"quality","assigned_actor":{"kind":"human","id":"test-user-id"},"requires_integration":false,"review_subject":{"reviewed_work_unit_id":human_source["id"]}}),StatusCode::BAD_REQUEST).await;
     let implementation:Value=json_request(&harness.app,Method::POST,&format!("/api/v1/tasks/{}/work-units",task.id),json!({"title":"Implementation","scope":"Produce an exact result","role":"build","assigned_actor":{"kind":"agent","id":agent},"requires_integration":false}),StatusCode::CREATED).await;
     let review:Value=json_request(&harness.app,Method::POST,&format!("/api/v1/tasks/{}/work-units",task.id),json!({"title":"Independent review","scope":"Inspect the exact implementation result","role":"quality","assigned_actor":{"kind":"agent","id":agent},"requires_integration":false,"review_subject":{"reviewed_work_unit_id":implementation["id"]}}),StatusCode::CREATED).await;
     assert_eq!(

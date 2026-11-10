@@ -680,7 +680,7 @@ async fn request_changes_creates_replay_safe_correction_and_review_round() {
     assert_eq!(replay.review_work_unit.id, first.review_work_unit.id);
     assert_eq!(replay.rounds_remaining, 15);
 
-    let independence_rejected = common::raw_json_request(
+    let shared_profile_review: WorkUnitResponse = json_request(
         &harness.app,
         Method::POST,
         &format!(
@@ -692,9 +692,13 @@ async fn request_changes_creates_replay_safe_correction_and_review_round() {
             "role": "reviewer",
             "assigned_actor": {"kind": "agent", "id": agent_id},
         }),
+        StatusCode::OK,
     )
     .await;
-    assert_eq!(independence_rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        shared_profile_review.assigned_actor, first.correction_work_unit.assigned_actor,
+        "Agent independence is a session boundary, not a different saved identity"
+    );
 
     let roles: Value = json_request(
         &harness.app,
