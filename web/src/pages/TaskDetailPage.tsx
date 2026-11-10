@@ -788,8 +788,8 @@ export function TaskDetailPage({
               <div className="rounded-md border border-dashed p-4">
                 <h3 className="text-sm font-medium">No work items prepared</h3>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  This is a valid empty Task. Describe the objective in Plan and next step to prepare
-                  a proposal, or use Advanced work for manual roles and WorkUnits.
+                  This is a valid empty Task. Describe the objective in Plan and next step to
+                  prepare a proposal, or use Advanced work for manual roles and WorkUnits.
                 </p>
               </div>
             ) : (
@@ -865,6 +865,12 @@ export function TaskDetailPage({
               ) : null}
               {gatesQuery.data?.map(({ gate, active_policy: policy }) => {
                 const evaluation = evaluations[gate.id]
+                const isMergeReadiness =
+                  gate.gate_kind === 'merge_readiness' &&
+                  gate.scope_kind === 'task' &&
+                  gate.scope_id === task.id &&
+                  gate.active_policy_revision != null &&
+                  gate.active_policy_revision === evaluation?.policy_revision
                 const evaluationIssues = Array.isArray(evaluation?.result.issues)
                   ? evaluation.result.issues.filter(
                       (issue): issue is string => typeof issue === 'string',
@@ -894,9 +900,7 @@ export function TaskDetailPage({
                       <div className="space-y-2">
                         <div className="flex flex-wrap items-center gap-2 text-xs">
                           <Badge
-                            variant={
-                              evaluation.outcome === 'satisfied' ? 'outline' : 'destructive'
-                            }
+                            variant={evaluation.outcome === 'satisfied' ? 'outline' : 'destructive'}
                           >
                             {evaluation.outcome === 'satisfied'
                               ? 'Exact inputs satisfy this check'
@@ -930,8 +934,9 @@ export function TaskDetailPage({
                         Evaluate the current immutable inputs before using this check for delivery.
                       </p>
                     )}
-                    {evaluation?.outcome === 'satisfied' &&
-                    ['active', 'ready', 'blocked'].includes(task.lifecycle.state) ? (
+                    {isMergeReadiness &&
+                    evaluation?.outcome === 'satisfied' &&
+                    task.lifecycle.state === 'active' ? (
                       <Button
                         size="sm"
                         disabled={transition.isPending}
@@ -940,7 +945,8 @@ export function TaskDetailPage({
                         Mark ready for integration
                       </Button>
                     ) : null}
-                    {task.lifecycle.state === 'ready_to_merge' &&
+                    {isMergeReadiness &&
+                    task.lifecycle.state === 'ready_to_merge' &&
                     evaluation?.outcome === 'satisfied' ? (
                       <Button
                         size="sm"
@@ -983,9 +989,7 @@ export function TaskDetailPage({
                     disabled={creatingMergeGate}
                     onClick={() => void createMergeReadinessGate()}
                   >
-                    {creatingMergeGate
-                      ? 'Creating check…'
-                      : 'Create merge-readiness check'}
+                    {creatingMergeGate ? 'Creating check…' : 'Create merge-readiness check'}
                   </Button>
                 </div>
               ) : null}
@@ -1361,9 +1365,7 @@ export function ReviewExecutionCard({
     <article className="space-y-3 rounded-lg border p-4">
       <div className="flex flex-wrap items-center gap-2">
         <Badge variant="outline">{execution.status}</Badge>
-        <Badge variant="outline">
-          {roleLabel ?? execution.role.replaceAll('_', ' ')}
-        </Badge>
+        <Badge variant="outline">{roleLabel ?? execution.role.replaceAll('_', ' ')}</Badge>
       </div>
       {report ? (
         <div className="space-y-2 rounded bg-muted/40 p-3">
