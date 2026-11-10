@@ -565,6 +565,23 @@ impl ExecutionRepo for SqliteDb {
         if admitted == 0 {
             return Err(DbError::VersionConflict);
         }
+        let charge_turn: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM task_coordination c JOIN orchestrator_wake w ON w.task_id=c.task_id
+                WHERE w.id=? AND w.coordination_request_id IS NULL AND c.mode!='manual'
+                  AND c.coordinator_task_role_id=w.task_role_id AND c.coordinator_actor_kind=w.actor_kind
+                  AND c.coordinator_actor_id=w.actor_id)"
+        ).bind(wake_id).fetch_one(&mut *transaction).await?;
+        if charge_turn {
+            let receipt = sqlx::query("INSERT OR IGNORE INTO task_orchestration_turn_receipt(wake_id,task_id,created_at) VALUES(?,?,?)")
+                .bind(wake_id).bind(&input.task_id).bind(&input.created_at).execute(&mut *transaction).await?;
+            if receipt.rows_affected() == 1 {
+                let charged = sqlx::query("UPDATE task_coordination SET turn_count=turn_count+1,updated_at=? WHERE task_id=? AND revoked_at IS NULL AND team_stale=0 AND turn_count<max_turns")
+                    .bind(&input.created_at).bind(&input.task_id).execute(&mut *transaction).await?;
+                if charged.rows_affected() != 1 {
+                    return Err(DbError::CoordinationTurnBudgetExhausted);
+                }
+            }
+        }
         let execution = Self::create_execution_in_tx(&mut transaction, &input, None).await?;
         let event = DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
         transaction.commit().await?;

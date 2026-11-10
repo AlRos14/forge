@@ -9,7 +9,7 @@ import { getApiErrorMessage } from '@/lib/api-error'
 import type { TaskAutonomyLimits, UpdateTaskAutonomyLimitsRequest } from '@/types/generated'
 
 const fields = [
-  ['max_turns', 'Coordinator turns and review decisions'],
+  ['max_turns', 'Coordinator turns'],
   ['max_rework_rounds', 'Correction rounds'],
   ['max_quality_requests', 'Quality requests in the Task'],
   ['max_route_requests', 'Quality requests per chain'],

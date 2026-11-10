@@ -378,7 +378,7 @@ impl HarnessAdapter for OpencodeAdapter {
         let mut config = Self::resolve_config(&ctx);
         let independent_review = ctx
             .task_role_capabilities
-            .contains(&api_types::TaskRoleCapability::FormalReview);
+            .contains(&executors::TaskRoleCapability::FormalReview);
         if independent_review {
             config.auto_approve = Some(false);
             config.permission_policy = Some(PermissionPolicy::Supervised);

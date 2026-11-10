@@ -92,7 +92,7 @@ impl CodexAdapter {
         }
         if ctx
             .task_role_capabilities
-            .contains(&api_types::TaskRoleCapability::FormalReview)
+            .contains(&executors::TaskRoleCapability::FormalReview)
         {
             config.sandbox = Some("read-only".to_owned());
             config.ask_for_approval = Some("never".to_owned());
@@ -1072,7 +1072,7 @@ mod tests {
             executors::HarnessInvocation::Start,
             serde_json::json!({"sandbox":"danger-full-access","ask_for_approval":"on-request","base_command_override":"unsafe","additional_params":["--yolo"]}),
         );
-        context.task_role_capabilities = vec![api_types::TaskRoleCapability::FormalReview];
+        context.task_role_capabilities = vec![executors::TaskRoleCapability::FormalReview];
         let config = CodexAdapter::resolve_config(&context);
         assert_eq!(config.sandbox.as_deref(), Some("read-only"));
         assert_eq!(config.ask_for_approval.as_deref(), Some("never"));

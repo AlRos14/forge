@@ -43,3 +43,31 @@ WHEN NEW.id IS NOT OLD.id
 BEGIN
     SELECT RAISE(ABORT, 'automatic rework intent identity is immutable and state transitions are terminal');
 END;
+
+-- Preparation requests reserve a turn when requested. Other automatic guided
+-- wakes consume one turn atomically with their first admitted Execution.
+CREATE TABLE task_orchestration_turn_receipt (
+    wake_id TEXT PRIMARY KEY REFERENCES orchestrator_wake(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL
+);
+CREATE TRIGGER task_orchestration_turn_receipt_immutable_update
+BEFORE UPDATE ON task_orchestration_turn_receipt
+BEGIN
+    SELECT RAISE(ABORT, 'Coordinator turn receipts are immutable');
+END;
+CREATE TRIGGER task_autonomy_limit_receipt_immutable_update
+BEFORE UPDATE ON task_autonomy_limit_receipt
+BEGIN
+    SELECT RAISE(ABORT, 'Human autonomy limit receipts are immutable');
+END;
+CREATE TRIGGER task_autonomy_retry_grant_immutable_update
+BEFORE UPDATE ON task_autonomy_retry_grant
+BEGIN
+    SELECT RAISE(ABORT, 'Human autonomy grants are immutable');
+END;
+CREATE TRIGGER task_quality_retry_grant_immutable_update
+BEFORE UPDATE ON task_quality_retry_grant
+BEGIN
+    SELECT RAISE(ABORT, 'Human quality grants are immutable');
+END;

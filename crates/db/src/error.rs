@@ -88,6 +88,9 @@ pub enum DbError {
     #[error("WorkUnit already has a Running Execution")]
     WorkUnitExecutionAlreadyRunning,
 
+    #[error("Coordinator turn budget exhausted; a Human may authorize extra rounds")]
+    CoordinationTurnBudgetExhausted,
+
     #[error("Task quality-request budget is exhausted")]
     QualityRequestBudgetExhausted,
 

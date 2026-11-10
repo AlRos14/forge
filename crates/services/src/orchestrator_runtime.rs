@@ -48,7 +48,7 @@ const MAX_CONTEXT_BYTES: usize = 512 * 1024;
 const MAX_ACTION_RESPONSE_BYTES: usize = 64 * 1024;
 const POLICY_REF: &str = "forge.orchestrator.wake-policy";
 const POLICY_VERSION: i64 = 2;
-const POLICY_TEXT: &str = "v2: exact-task-role; active-members-only; mode-aware targeting; read-only installed Codex or Claude CLI; context<=524288B; response<=65536B; actions<=16; work_units<=64; title<=512B; scope<=4096B; role<=128B; message<=8192B; proposal rationale<=8192B; exact-report review triage correct/recheck/human; protected actions only as proposals; no verdict waiver";
+const POLICY_TEXT: &str = "v2: exact-task-role; active-members-only; mode-aware targeting; read-only installed Codex or Claude CLI; context<=524288B; response<=65536B; actions<=16; direct_work_units<=4; planned_work_units<=64; title<=512B; scope<=4096B; role<=128B; message<=8192B; proposal rationale<=8192B; exact-report review triage correct/recheck/human; protected actions only as proposals; no verdict waiver";
 const MAX_POLICY_ACTIONS: usize = 16;
 const MAX_POLICY_WORK_UNITS: usize = 4;
 
@@ -464,6 +464,11 @@ impl OrchestratorRuntime {
                     return Ok(None);
                 }
             }
+            if c.mode != db::TaskCoordinationMode::Manual && event.event_type == "execution.started"
+            {
+                // Starting a worker does not require a cognitive coordinator turn.
+                return Ok(None);
+            }
             if c.mode != db::TaskCoordinationMode::Manual
                 && matches!(
                     event.event_type.as_str(),
@@ -735,6 +740,14 @@ impl OrchestratorRuntime {
                     return Ok(None);
                 };
                 if report.task_id != task_id || report.kind != db::ArtifactKind::ReviewReport {
+                    return Ok(None);
+                }
+                if report
+                    .execution_producer()
+                    .is_some_and(|(_, actor)| matches!(actor, ActorRef::Agent(_)))
+                {
+                    // The completed Agent Execution owns the single wake. A
+                    // report may be written before that Execution terminates.
                     return Ok(None);
                 }
                 let Some(coordination) =
@@ -1533,6 +1546,9 @@ impl OrchestratorRuntime {
                 Err(error) => {
                     let reason = error.to_string();
                     match error {
+                        ServiceError::Db(db::DbError::CoordinationTurnBudgetExhausted) => {
+                            self.fail_wake(&wake, &reason).await?;
+                        }
                         ServiceError::InvalidOperation { .. }
                         | ServiceError::AuthorizationDenied { .. }
                         | ServiceError::NotFound { .. }

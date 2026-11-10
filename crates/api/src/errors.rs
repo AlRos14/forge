@@ -546,6 +546,10 @@ impl From<DbError> for ApiError {
                 message: "invalid status transition".to_owned(),
                 details: None,
             },
+            DbError::CoordinationTurnBudgetExhausted => Self::conflict_with_code(
+                "coordination.budget_exhausted",
+                "Coordinator turn budget exhausted; a Human may authorize extra rounds",
+            ),
             DbError::AgentAtCapacity => Self {
                 status: StatusCode::CONFLICT,
                 code: "agent_at_capacity",

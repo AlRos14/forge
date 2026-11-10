@@ -214,7 +214,7 @@ authorizes preparation/execution and requests the first coordinator plan in one
 action; the plan still passes deterministic allocation and authority checks.
 Editing a Project template does not rewrite existing Tasks.
 
-New Task defaults allow 32 coordinator turns (including review decisions), 64
+New Task defaults allow 32 coordinator turns (preparation and automatic wakes), 64
 quality requests, 16 correction/reassessment rounds, 16 requests per route, and
 16 planned WorkUnits (configurable up to 64). Existing Task budgets are preserved.
 Owners/admins can adjust limits from the Task panel or authorize eight extra

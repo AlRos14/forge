@@ -139,12 +139,6 @@ impl TaskReworkService {
             .ok_or_else(||ServiceError::invalid_operation("The exact report, current coordinator, wake, team or Task authority is no longer valid"))?;
         let task_id: String = row.try_get("task_id")?;
         let authorization_version: i64 = row.try_get("authorization_version")?;
-        let turns: i64 = row.try_get("turn_count")?;
-        if turns >= row.try_get::<i64, _>("max_turns")? {
-            return Err(ServiceError::conflict(
-                "Coordinator turn budget exhausted; a Human may authorize extra rounds",
-            ));
-        }
         let now = now_rfc3339();
         let actor = actor_ref_from_parts(
             &row.try_get::<String, _>("actor_kind")?,
@@ -193,13 +187,6 @@ impl TaskReworkService {
         };
         sqlx::query("INSERT INTO task_review_triage(review_report_artifact_id,task_id,report_digest,execution_id,authorization_version,disposition,rationale,instructions,decision_digest,review_work_unit_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&input.review_report_artifact_id).bind(&task_id).bind(&input.report_digest).bind(execution_id).bind(authorization_version).bind(disposition).bind(&input.rationale).bind(&input.instructions).bind(&decision_digest).bind(review_id.as_deref()).bind(&now).execute(&mut *tx).await?;
-        sqlx::query(
-            "UPDATE task_coordination SET turn_count=turn_count+1,updated_at=? WHERE task_id=?",
-        )
-        .bind(&now)
-        .bind(&task_id)
-        .execute(&mut *tx)
-        .await?;
         let event=DomainEventRepo::append_event_in_tx(&*self.db,&mut tx,&CreateDomainEvent {
             id:new_uuid_v4(),event_type:"task.review_triaged".to_owned(),entity_type:"artifact".to_owned(),entity_id:input.review_report_artifact_id.clone(),
             actor_type:match &actor {ActorRef::Agent(_)=>"agent",ActorRef::Human(_)=>"human"}.to_owned(),

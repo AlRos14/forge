@@ -194,10 +194,10 @@ impl ClaudeCodeAdapter {
         }
         if ctx
             .task_role_capabilities
-            .contains(&api_types::TaskRoleCapability::FormalReview)
+            .contains(&executors::TaskRoleCapability::FormalReview)
             || (ctx
                 .task_role_capabilities
-                .contains(&api_types::TaskRoleCapability::Orchestration)
+                .contains(&executors::TaskRoleCapability::Orchestration)
                 && !ctx.has_repository_workspace)
         {
             config.forge_task_read_only = Some(true);
@@ -374,7 +374,7 @@ impl ClaudeCodeAdapter {
         ctx: ExecutionContext,
         cancel: CancellationToken,
     ) -> Result<ExecutionResult, ExecutorError> {
-        let mut config = Self::resolve_config(&ctx);
+        let config = Self::resolve_config(&ctx);
         if config.forge_task_read_only == Some(true) {
             ensure_project_copilot_cli_supported().await?;
         }
@@ -1459,7 +1459,7 @@ mod tests {
             executors::HarnessInvocation::Start,
             serde_json::json!({"dangerously_skip_permissions":true,"base_command_override":"unsafe","additional_params":["--tools","Bash,Write"]}),
         );
-        context.task_role_capabilities = vec![api_types::TaskRoleCapability::FormalReview];
+        context.task_role_capabilities = vec![executors::TaskRoleCapability::FormalReview];
         let config = ClaudeCodeAdapter::resolve_config(&context);
         assert!(config.command_overrides.base_command_override.is_none());
         assert!(config.command_overrides.additional_params.is_none());
