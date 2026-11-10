@@ -51,7 +51,7 @@ An Agent wake creates a fresh Execution under the exact orchestration-capable
 TaskRole and uses a read-only Harness Start. PR6 does not infer or resume a previous session. A
 Human wake stays durable as pending Human work and creates no HarnessSession.
 The current typed output set is Message, Handoff, bounded WorkUnit creation,
-and Proposal. A `create_work_unit` action targeting a TaskRole with
+Proposal, and exact-report review findings triage (described below). A `create_work_unit` action targeting a TaskRole with
 `formal_review` supplies
 `review_subject: { "reviewed_work_unit_id": "..." }`. The service verifies the
 same-Task source and freezes its accepted result; the orchestrator does not

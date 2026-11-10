@@ -191,6 +191,15 @@ impl TaskReworkService {
         };
         sqlx::query("INSERT INTO task_review_triage(review_report_artifact_id,task_id,report_digest,execution_id,authorization_version,disposition,rationale,instructions,decision_digest,review_work_unit_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&input.review_report_artifact_id).bind(&task_id).bind(&input.report_digest).bind(execution_id).bind(authorization_version).bind(disposition).bind(&input.rationale).bind(&input.instructions).bind(&decision_digest).bind(review_id.as_deref()).bind(&now).execute(&mut *tx).await?;
+        let work_event = if let Some(id) = review_id.as_ref() {
+            Some(DomainEventRepo::append_event_in_tx(&*self.db, &mut tx, &CreateDomainEvent {
+                id:new_uuid_v4(),event_type:"work_unit.created".to_owned(),entity_type:"work_unit".to_owned(),entity_id:id.clone(),
+                actor_type:created_by.kind().to_string(),actor_id:Some(created_by.id().to_owned()),scope_type:"task".to_owned(),scope_id:task_id.clone(),correlation_id:task_id.clone(),causation_id:None,causation_depth:0,dedupe_key:Some(format!("work_unit.created:{id}")),
+                payload_json:serde_json::json!({"task_id":task_id,"work_unit_id":id,"version":1,"status":"open","review_report_artifact_id":input.review_report_artifact_id}).to_string(),created_at:now.clone(),
+            }).await?)
+        } else {
+            None
+        };
         let event=DomainEventRepo::append_event_in_tx(&*self.db,&mut tx,&CreateDomainEvent {
             id:new_uuid_v4(),event_type:"task.review_triaged".to_owned(),entity_type:"artifact".to_owned(),entity_id:input.review_report_artifact_id.clone(),
             actor_type:match &actor {ActorRef::Agent(_)=>"agent",ActorRef::Human(_)=>"human"}.to_owned(),
@@ -198,6 +207,12 @@ impl TaskReworkService {
             payload_json:serde_json::json!({"task_id":task_id,"review_report_artifact_id":input.review_report_artifact_id,"disposition":disposition,"review_work_unit_id":review_id}).to_string(),created_at:now,
         }).await?;
         tx.commit().await?;
+        if let Some(event) = work_event.as_ref() {
+            crate::domain_event_service::DomainEventService::publish_committed_hint(
+                &self.event_bus,
+                event,
+            );
+        }
         crate::domain_event_service::DomainEventService::publish_committed_hint(
             &self.event_bus,
             &event,

@@ -1361,6 +1361,43 @@ async fn quality_route_budget_is_atomic_and_does_not_reset_with_category_or_role
     .expect("route counters");
     assert_eq!(counts, (5, 4));
     assert_eq!(quality.process_pending(10).await.expect("recovery scan"), 4);
+    let autonomy = services::task_autonomy::TaskAutonomyService::new(
+        fixture.db.clone(),
+        Arc::new(EventBus::new(32)),
+    );
+    let mut limits = autonomy
+        .get(&fixture.task_id, &fixture.user_id)
+        .await
+        .unwrap();
+    let version = limits.version;
+    limits.max_route_requests = 12;
+    let grant = api_types::UpdateTaskAutonomyLimitsRequest {
+        expected_version: version,
+        limits,
+        reason: "Human authorized more quality rounds".into(),
+        idempotency_key: "extend-route".into(),
+    };
+    autonomy
+        .update(&fixture.task_id, &fixture.user_id, grant.clone())
+        .await
+        .unwrap();
+    autonomy
+        .update(&fixture.task_id, &fixture.user_id, grant)
+        .await
+        .unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM task_quality_request WHERE id=?")
+        .bind(&exhausted.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "requested");
+    let counts:(i64,i64,i64)=sqlx::query_as("SELECT request_count,budget_used,max_requests FROM task_quality_route WHERE task_id=? AND route_id=?")
+        .bind(&fixture.task_id).bind(&exhausted.route_id).fetch_one(fixture.db.pool()).await.unwrap();
+    assert_eq!(
+        counts,
+        (5, 5, 12),
+        "extension and exact replay preserve consumed rounds and request identity"
+    );
 }
 
 #[tokio::test]
