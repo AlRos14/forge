@@ -5516,18 +5516,18 @@ mod tests {
         assert_eq!(executions, 0);
     }
 
-    struct Pr6CompletedExecutionFixture {
-        database: Arc<db::SqliteDb>,
-        event_bus: Arc<EventBus>,
-        runtime: OrchestratorRuntime,
-        wake: db::OrchestratorWake,
-        execution: db::Execution,
-        task_id: String,
-        task_role_id: String,
-        terminal_event: db::DomainEvent,
+    pub(super) struct Pr6CompletedExecutionFixture {
+        pub(super) database: Arc<db::SqliteDb>,
+        pub(super) event_bus: Arc<EventBus>,
+        pub(super) runtime: OrchestratorRuntime,
+        pub(super) wake: db::OrchestratorWake,
+        pub(super) execution: db::Execution,
+        pub(super) task_id: String,
+        pub(super) task_role_id: String,
+        pub(super) terminal_event: db::DomainEvent,
     }
 
-    async fn completed_pr6_execution_fixture(
+    pub(super) async fn completed_pr6_execution_fixture(
         actions: Vec<OrchestratorAction>,
     ) -> Pr6CompletedExecutionFixture {
         use db::{
@@ -7462,3 +7462,7 @@ mod tests {
         .is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "orchestrator_review_tests.rs"]
+mod review_triage_tests;

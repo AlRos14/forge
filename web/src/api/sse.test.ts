@@ -3,10 +3,7 @@ import type { QueryClient } from '@tanstack/react-query'
 import type { ForgeEvent, PublicEventType } from '@/types/generated'
 import { routeSsePayload } from './sse'
 
-function event(
-  event_type: string,
-  fields: Partial<ForgeEvent> = {},
-): ForgeEvent {
+function event(event_type: string, fields: Partial<ForgeEvent> = {}): ForgeEvent {
   return {
     event_type: event_type as PublicEventType,
     entity_id: 'entity-1',
@@ -97,13 +94,13 @@ describe('routeSsePayload', () => {
   })
 
   it('keeps retired status, Agent Chat, and legacy Review events out of UI projections', () => {
-    for (const event_type of ['task.status_changed', 'agent_chat.message_created', 'review.passed']) {
+    for (const event_type of [
+      'task.status_changed',
+      'agent_chat.message_created',
+      'review.passed',
+    ]) {
       const { queryClient, invalidateQueries, dispatch } = createMocks()
-      routeSsePayload(
-        event(event_type, { entity_id: 'legacy-1' }),
-        queryClient,
-        { dispatch },
-      )
+      routeSsePayload(event(event_type, { entity_id: 'legacy-1' }), queryClient, { dispatch })
       expect(invalidateQueries).not.toHaveBeenCalled()
       expect(dispatch).not.toHaveBeenCalled()
     }
@@ -111,6 +108,11 @@ describe('routeSsePayload', () => {
 
   it('refreshes coordination, quality, and intervention projections from Task events', () => {
     const cases: Array<[string, string[]]> = [
+      ['task.review_triaged', ['tasks::task-1::coordination', 'tasks::task-1::work-units']],
+      [
+        'task.autonomy_limits_changed',
+        ['task-autonomy-limits::task-1', 'tasks::task-1::coordination'],
+      ],
       [
         'task.coordination_plan_proposed',
         [
@@ -122,7 +124,11 @@ describe('routeSsePayload', () => {
       ],
       [
         'task.quality_requested',
-        ['tasks::task-1::quality-requests', 'tasks::task-1::coordination', 'tasks::task-1::work-units'],
+        [
+          'tasks::task-1::quality-requests',
+          'tasks::task-1::coordination',
+          'tasks::task-1::work-units',
+        ],
       ],
       [
         'task.intervention_recorded',

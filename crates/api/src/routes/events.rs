@@ -523,6 +523,21 @@ mod tests {
     }
 
     #[test]
+    fn review_triage_event_omits_private_coordinator_brief() {
+        let event = domain_event(
+            "task.review_triaged",
+            r#"{"task_id":"task-1","review_report_artifact_id":"report-1","disposition":"recheck","review_work_unit_id":"review-2","rationale":"private evaluation","instructions":"private brief"}"#,
+        );
+        let projected = project_domain_event(&event).expect("triage event is public");
+        assert_eq!(projected.event_type, PublicEventType::TaskReviewTriaged);
+        let payload = projected.payload.unwrap();
+        assert_eq!(payload["disposition"], "recheck");
+        assert_eq!(payload["review_work_unit_id"], "review-2");
+        assert!(payload.get("rationale").is_none());
+        assert!(payload.get("instructions").is_none());
+    }
+
+    #[test]
     fn legacy_review_and_agent_chat_events_are_not_public() {
         assert!(project_domain_event(&domain_event("review.status_changed", "{}")).is_none());
         assert!(project_domain_event(&domain_event("agent_chat.message_created", "{}")).is_none());
