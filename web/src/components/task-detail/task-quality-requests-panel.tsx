@@ -15,6 +15,7 @@ import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { getApiErrorMessage } from '@/lib/api-error'
+import { isQualityBudgetExhausted } from './task-coordination-status'
 import type {
   AgentResponse,
   DaemonResponse,
@@ -76,6 +77,10 @@ export function TaskQualityRequestsPanel({
   const [resolutionCondition, setResolutionCondition] = useState('')
   const [sourceArtifactId, setSourceArtifactId] = useState('')
   const [actionError, setActionError] = useState<string | null>(null)
+  const qualityExhausted = isQualityBudgetExhausted(coordination)
+  const escalatedRequests = (query.data?.items ?? []).filter(
+    (item) => item.state === 'requires_human',
+  )
 
   const roleOptions = useMemo(() => {
     const activeRoles = coordination.team.filter((role) =>
@@ -179,14 +184,46 @@ export function TaskQualityRequestsPanel({
             Review and quality requests
           </h3>
           <p className="mt-1 text-sm text-muted-foreground">
-            Route a delivery correction, plan revision, specialist request, or human decision. A
-            handoff does not by itself create or start a WorkUnit.
+            Route a delivery correction, plan revision, specialist request, or human decision. The
+            Task-global count is shown here; each exact quality route reports its own round limit.
+            A handoff does not by itself create or start a WorkUnit.
           </p>
         </div>
-        <Badge variant="outline">
+        <Badge variant={qualityExhausted ? 'destructive' : 'outline'}>
           {coordination.quality_request_count} / {coordination.max_quality_requests} requests
         </Badge>
       </div>
+
+      {qualityExhausted ? (
+        <div
+          role="status"
+          className="rounded-md border border-amber-400/60 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100"
+        >
+          <p className="font-medium">Quality request budget is exhausted</p>
+          <p className="mt-1">
+            Forge recorded {coordination.quality_request_count} of{' '}
+            {coordination.max_quality_requests} quality requests for this Task. New requests are not
+            accepted. Existing work and findings remain available; a Project owner must decide how to
+            continue.
+          </p>
+        </div>
+      ) : null}
+
+      {escalatedRequests.length ? (
+        <div
+          role="status"
+          className="rounded-md border border-primary/40 bg-primary/5 p-3 text-sm"
+        >
+          <p className="font-medium">
+            {escalatedRequests.length} quality request
+            {escalatedRequests.length === 1 ? ' needs' : 's need'} a human decision
+          </p>
+          <p className="mt-1 text-muted-foreground">
+            Review the recorded findings and resolution condition below. Continuing does not happen
+            automatically while the request is escalated.
+          </p>
+        </div>
+      ) : null}
 
       {query.isLoading ? (
         <p className="text-sm text-muted-foreground">Loading quality requests…</p>
@@ -208,6 +245,14 @@ export function TaskQualityRequestsPanel({
             const targetRole = coordination.team.find(
               (role) => role.id === item.target_task_role_id,
             )
+            const route = item.quality_route as
+              | TaskQualityRequestResponse['quality_route']
+              | undefined
+            const escalation = route?.escalation
+            const cycleRoleLabels = (escalation?.cycle_task_role_ids ?? []).map((roleId) => {
+              const role = coordination.team.find((candidate) => candidate.id === roleId)
+              return role ? roleLabel(role) : roleId
+            })
             return (
               <li key={item.id} className="min-w-0 space-y-3 rounded-md border p-3">
                 <div className="flex flex-wrap items-start justify-between gap-2">
@@ -224,9 +269,18 @@ export function TaskQualityRequestsPanel({
                           : 'Destination unavailable'}
                     </p>
                   </div>
-                  <Badge variant={item.state === 'requires_human' ? 'secondary' : 'outline'}>
-                    {stateLabels[item.state]}
-                  </Badge>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant={item.state === 'requires_human' ? 'secondary' : 'outline'}>
+                      {stateLabels[item.state]}
+                    </Badge>
+                    {route ? (
+                      <Badge variant="outline">
+                        Route {route.round} / {route.limit}
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline">Route limits unavailable</Badge>
+                    )}
+                  </div>
                 </div>
                 {item.target_actor ? (
                   <ActorIdentity
@@ -252,6 +306,35 @@ export function TaskQualityRequestsPanel({
                   <span className="font-medium text-foreground">Resolution condition:</span>{' '}
                   {item.resolution_condition}
                 </p>
+                {item.state === 'requires_human' ? (
+                  <div className="rounded-md border border-primary/30 bg-primary/5 p-2 text-sm">
+                    <p className="font-medium">
+                      {escalation
+                        ? 'Forge escalated this quality route to a human'
+                        : 'Forge escalated this request. A human decision is required.'}
+                    </p>
+                    {escalation ? (
+                      <>
+                        <p className="mt-1 break-words">{escalation.reason}</p>
+                        {cycleRoleLabels.length ? (
+                          <p className="mt-1 break-words text-xs">
+                            Pending role chain: {cycleRoleLabels.join(' → ')}
+                          </p>
+                        ) : null}
+                        <details className="mt-1 text-xs text-muted-foreground">
+                          <summary className="w-fit cursor-pointer">Exact escalation references</summary>
+                          <p className="mt-1 break-all">Reason code: {escalation.reason_code}</p>
+                          <p className="break-all">
+                            Cycle requests: {escalation.cycle_request_ids.join(', ') || 'none'}
+                          </p>
+                          <p className="break-all">
+                            Cycle TaskRoles: {escalation.cycle_task_role_ids.join(', ') || 'none'}
+                          </p>
+                        </details>
+                      </>
+                    ) : null}
+                  </div>
+                ) : null}
                 {item.state === 'notified' && !item.work_unit_id ? (
                   <p className="text-xs text-muted-foreground">
                     A Handoff was recorded. No WorkUnit link was returned.
@@ -274,7 +357,9 @@ export function TaskQualityRequestsPanel({
                   </details>
                 ) : null}
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-xs text-muted-foreground">Round {item.budget_round}</span>
+                  <span className="text-xs text-muted-foreground">
+                    Task-global round {item.budget_round}
+                  </span>
                   {!isTerminal(item.state) ? (
                     <div className="flex flex-wrap gap-2">
                       <Button
@@ -307,9 +392,29 @@ export function TaskQualityRequestsPanel({
                   ) : null}
                   <details className="text-xs text-muted-foreground">
                     <summary className="w-fit cursor-pointer">Request reference</summary>
-                    <div className="mt-1 flex min-w-0 items-center gap-1">
-                      <code className="min-w-0 break-all">{item.id}</code>
-                      <CopyReferenceButton value={item.id} label="Quality request ID" />
+                    <div className="mt-1 space-y-1">
+                      <div className="flex min-w-0 items-center gap-1">
+                        <code className="min-w-0 break-all">{item.id}</code>
+                        <CopyReferenceButton value={item.id} label="Quality request ID" />
+                      </div>
+                      {item.resolution_kind ? (
+                        <p>Resolution kind: {item.resolution_kind.replaceAll('_', ' ')}</p>
+                      ) : null}
+                      {item.resolution_ref ? (
+                        <p className="break-all">Resolution reference: {item.resolution_ref}</p>
+                      ) : null}
+                      {item.resolution_digest ? (
+                        <p className="break-all">Resolution digest: {item.resolution_digest}</p>
+                      ) : null}
+                      {route ? <p className="break-all">Route: {route.id}</p> : null}
+                      {route?.source_task_role_id ? (
+                        <p>
+                          Source role:{' '}
+                          {coordination.team.find(
+                            (role) => role.id === route.source_task_role_id,
+                          )?.display_label ?? route.source_task_role_id}
+                        </p>
+                      ) : null}
                     </div>
                   </details>
                 </div>
@@ -325,16 +430,38 @@ export function TaskQualityRequestsPanel({
 
       <CollapsibleSection
         title="Create a quality request"
-        badge={coordination.max_quality_requests - coordination.quality_request_count}
+        badge={Math.max(
+          0,
+          coordination.max_quality_requests - coordination.quality_request_count,
+        )}
       >
         {actionError ? (
-          <p role="alert" className="text-sm text-destructive">
-            {actionError}
+          <div
+            role="alert"
+            className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/40 p-2 text-sm text-destructive"
+          >
+            <span className="min-w-0 break-words">{actionError}</span>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                setActionError(null)
+                void query.refetch()
+              }}
+            >
+              Refresh state
+            </Button>
+          </div>
+        ) : null}
+        {qualityExhausted ? (
+          <p className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
+            New quality requests are disabled because the Task budget is exhausted. Existing
+            requests, findings, and resolution references remain available above.
           </p>
         ) : null}
         <form
           onSubmit={(event) => void submit(event)}
-          className="space-y-4 rounded-md bg-muted/20 p-3"
+          className={`space-y-4 rounded-md bg-muted/20 p-3 ${qualityExhausted ? 'hidden' : ''}`}
         >
           <div className="space-y-2">
             <Label htmlFor="quality-category">Route</Label>

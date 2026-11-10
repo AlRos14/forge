@@ -241,9 +241,22 @@ export function TaskInterventionsPanel({
       ) : null}
 
       {actionError ? (
-        <p role="alert" className="text-sm text-destructive">
-          {actionError}
-        </p>
+        <div
+          role="alert"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/40 p-2 text-sm text-destructive"
+        >
+          <span className="min-w-0 break-words">{actionError}</span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              setActionError(null)
+              void query.refetch()
+            }}
+          >
+            Refresh state
+          </Button>
+        </div>
       ) : null}
       <CollapsibleSection title="Record an instruction" contentClassName="pt-3">
         <form

@@ -109,6 +109,49 @@ describe('routeSsePayload', () => {
     }
   })
 
+  it('refreshes coordination, quality, and intervention projections from Task events', () => {
+    const cases: Array<[string, string[]]> = [
+      [
+        'task.coordination_plan_proposed',
+        [
+          'tasks::task-1::coordination',
+          'tasks::task-1',
+          'task-dispatch::task-1',
+          'tasks::task-1::work-units',
+        ],
+      ],
+      [
+        'task.quality_requested',
+        ['tasks::task-1::quality-requests', 'tasks::task-1::coordination', 'tasks::task-1::work-units'],
+      ],
+      [
+        'task.intervention_recorded',
+        ['tasks::task-1::interventions', 'tasks::task-1::coordination', 'task-dispatch::task-1'],
+      ],
+    ]
+    for (const [eventType, expected] of cases) {
+      const { queryClient, invalidateQueries } = createMocks()
+      routeSsePayload(
+        event(eventType, {
+          entity_id: 'entity-1',
+          scope_type: 'task',
+          scope_id: 'task-1',
+          payload: { task_id: 'task-1' },
+        }),
+        queryClient,
+        { dispatch: vi.fn() },
+      )
+      const serialized = invalidateQueries.mock.calls.map(([call]) =>
+        JSON.stringify((call as { queryKey: unknown[] }).queryKey),
+      )
+      for (const suffix of expected) {
+        expect(serialized, `${eventType} should refresh ${suffix}`).toContain(
+          JSON.stringify(suffix.split('::')),
+        )
+      }
+    }
+  })
+
   it('resynchronizes active queries when the public stream reports lag', () => {
     const { queryClient, invalidateQueries } = createMocks()
     routeSsePayload(

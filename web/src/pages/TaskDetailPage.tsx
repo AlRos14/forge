@@ -10,6 +10,7 @@ import {
   useLaunchTask,
   useReviewsQuery,
   useTaskDispatchQuery,
+  useTaskCoordinationQuery,
   useTaskGatesQuery,
   useTaskLifecycleTransitionsQuery,
   useTaskReviewLinesQuery,
@@ -47,6 +48,7 @@ import { WorkUnitHumanReviewPanel } from '@/components/task-detail/work-unit-rev
 import { ActorIdentity } from '@/features/task-roles/ActorIdentity'
 import { CopyReferenceButton } from '@/components/ui/copy-reference-button'
 import { TaskCoordinationPanel } from '@/components/task-detail/task-coordination-panel'
+import { TaskJourneyPanel } from '@/components/task-detail/task-journey-panel'
 import type {
   GateEvaluationResponse,
   MergeAfterGateResponse,
@@ -151,6 +153,7 @@ export function TaskDetailPage({
   const gatesQuery = useTaskGatesQuery(taskId)
   const workUnitsQuery = useTaskWorkUnitsQuery(taskId)
   const dispatchQuery = useTaskDispatchQuery(taskId)
+  const coordinationQuery = useTaskCoordinationQuery(taskId)
   const transition = useTransitionTaskLifecycle()
   const updateTask = useUpdateTask()
   const evaluateGate = useEvaluateGate()
@@ -158,6 +161,7 @@ export function TaskDetailPage({
   const createIntervention = useCreateTaskIntervention()
   const userId = useAuthStore((state) => state.user?.id)
   const [evaluations, setEvaluations] = useState<Record<string, GateEvaluationResponse>>({})
+  const [creatingMergeGate, setCreatingMergeGate] = useState(false)
   const [editTaskOpen, setEditTaskOpen] = useState(false)
   const [editTitle, setEditTitle] = useState('')
   const [editDescription, setEditDescription] = useState('')
@@ -176,6 +180,11 @@ export function TaskDetailPage({
   const executions = executionsQuery.data?.items ?? []
   const workUnits = workUnitsQuery.data ?? []
   const dispatch = dispatchQuery.data
+  const hasMergeReadinessGate =
+    gatesQuery.data?.some((entry) => entry.gate.gate_kind === 'merge_readiness') ?? false
+  const mergeGateReviewLine =
+    reviewLinesQuery.data?.find((candidate) => candidate.latest_verdict === 'pass') ??
+    reviewLinesQuery.data?.[0]
   const agents = (agentsQuery.data?.pages.flatMap((page) => page.items) ?? []).filter(
     (agent) => projectQuery.data?.owner_id != null && agent.owner_id === projectQuery.data.owner_id,
   )
@@ -199,7 +208,7 @@ export function TaskDetailPage({
     }
   }, [activeTab])
 
-  async function transitionTo(toState: TaskLifecycleState) {
+  async function transitionTo(toState: TaskLifecycleState, gateEvaluationId?: string) {
     if (!task) return
     try {
       await transition.mutateAsync({
@@ -207,6 +216,13 @@ export function TaskDetailPage({
         toState,
         expectedLifecycleVersion: task.lifecycle.version,
         idempotencyKey: crypto.randomUUID(),
+        ...(gateEvaluationId
+          ? {
+              gateEvaluationId,
+              reasonKind: 'gate_evaluation',
+              reasonRef: gateEvaluationId,
+            }
+          : {}),
       })
     } catch (error) {
       toast.error(getApiErrorMessage(error, 'Task lifecycle transition failed'))
@@ -245,6 +261,36 @@ export function TaskDetailPage({
       setEvaluations((current) => ({ ...current, [gateId]: result }))
     } catch (error) {
       toast.error(getApiErrorMessage(error, 'Gate evaluation failed'))
+    }
+  }
+
+  async function createMergeReadinessGate() {
+    if (!task) return
+    const line = mergeGateReviewLine
+    if (!line) return
+    setCreatingMergeGate(true)
+    try {
+      await apiFetch(`/tasks/${task.id}/gates`, {
+        method: 'POST',
+        body: JSON.stringify({
+          gate_kind: 'merge_readiness',
+          policy: {
+            schema_version: 1,
+            review: {
+              mode: 'one_acceptable',
+              required_count: 1,
+              human_required: false,
+              review_line_id: line.id,
+            },
+          },
+        }),
+      })
+      await gatesQuery.refetch()
+      toast.success('Merge-readiness check created from the exact review line')
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, 'Merge-readiness check could not be created'))
+    } finally {
+      setCreatingMergeGate(false)
     }
   }
 
@@ -590,6 +636,32 @@ export function TaskDetailPage({
       {activeTab === 'overview' ? (
         <div className="grid min-w-0 gap-4 lg:grid-cols-2">
           <div className="min-w-0 lg:col-span-2">
+            {coordinationQuery.data ? (
+              <TaskJourneyPanel
+                task={task}
+                coordination={coordinationQuery.data}
+                dispatch={dispatch}
+                workUnits={workUnits}
+                reviewLines={reviewLinesQuery.data ?? []}
+                gates={gatesQuery.data ?? []}
+                agents={agents}
+                members={members}
+                daemons={daemons}
+                onOpenAdvancedWork={() => setActiveTab('work')}
+                onOpenReview={() => setActiveTab('review')}
+                onOpenResults={() => setActiveTab('artifacts')}
+              />
+            ) : coordinationQuery.isError ? (
+              <p className="rounded-lg border border-destructive/40 p-4 text-sm text-destructive">
+                The guided Task flow could not be loaded. Manual Task controls remain available.
+              </p>
+            ) : (
+              <p className="rounded-lg border p-4 text-sm text-muted-foreground">
+                Loading the guided Task flow…
+              </p>
+            )}
+          </div>
+          <div className="min-w-0 lg:col-span-2">
             <TaskCoordinationPanel
               task={task}
               agents={agents}
@@ -623,7 +695,21 @@ export function TaskDetailPage({
             ) : null}
           </section>
           <section className="min-w-0 space-y-3 rounded-lg border p-4">
-            <h2 className="font-semibold">Team</h2>
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0">
+                <h2 className="font-semibold">Team</h2>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Roles, eligible Actors, and the coordinator saved on this Task.
+                </p>
+              </div>
+              <Link
+                to="/projects/$projectId/settings/$tab"
+                params={{ projectId: task.project_id, tab: 'workers' }}
+                className="inline-flex h-8 items-center justify-center rounded-md border border-input bg-card px-[9px] text-xs font-medium hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                Team &amp; templates
+              </Link>
+            </div>
             {task.task_roles.length ? (
               task.task_roles.map((role) => (
                 <article key={role.id} className="min-w-0 rounded-md border p-3">
@@ -702,8 +788,8 @@ export function TaskDetailPage({
               <div className="rounded-md border border-dashed p-4">
                 <h3 className="text-sm font-medium">No work items prepared</h3>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  This is a valid empty Task. Current manual planning tools are available under
-                  Advanced work.
+                  This is a valid empty Task. Describe the objective in Plan and next step to
+                  prepare a proposal, or use Advanced work for manual roles and WorkUnits.
                 </p>
               </div>
             ) : (
@@ -779,6 +865,17 @@ export function TaskDetailPage({
               ) : null}
               {gatesQuery.data?.map(({ gate, active_policy: policy }) => {
                 const evaluation = evaluations[gate.id]
+                const isMergeReadiness =
+                  gate.gate_kind === 'merge_readiness' &&
+                  gate.scope_kind === 'task' &&
+                  gate.scope_id === task.id &&
+                  gate.active_policy_revision != null &&
+                  gate.active_policy_revision === evaluation?.policy_revision
+                const evaluationIssues = Array.isArray(evaluation?.result.issues)
+                  ? evaluation.result.issues.filter(
+                      (issue): issue is string => typeof issue === 'string',
+                    )
+                  : []
                 return (
                   <article key={gate.id} className="mt-3 space-y-3 rounded-md border p-3">
                     <div className="flex flex-wrap items-center gap-2">
@@ -800,12 +897,56 @@ export function TaskDetailPage({
                       </details>
                     </div>
                     {evaluation ? (
-                      <p className="break-all text-xs">
-                        {evaluation.outcome} · GateEvaluation {evaluation.id} · input digest{' '}
-                        {evaluation.input_digest}
+                      <div className="space-y-2">
+                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                          <Badge
+                            variant={evaluation.outcome === 'satisfied' ? 'outline' : 'destructive'}
+                          >
+                            {evaluation.outcome === 'satisfied'
+                              ? 'Exact inputs satisfy this check'
+                              : 'Exact inputs do not satisfy this check'}
+                          </Badge>
+                          {!evaluationIssues.length ? null : (
+                            <span className="text-muted-foreground">
+                              {evaluationIssues.length} recorded issue
+                              {evaluationIssues.length === 1 ? '' : 's'}
+                            </span>
+                          )}
+                        </div>
+                        <details className="text-xs text-muted-foreground">
+                          <summary className="w-fit cursor-pointer">Evaluation reference</summary>
+                          <p className="mt-1 break-all">
+                            GateEvaluation {evaluation.id} · input digest {evaluation.input_digest}
+                          </p>
+                          {evaluationIssues.length ? (
+                            <ul className="mt-1 list-disc space-y-1 pl-5">
+                              {evaluationIssues.map((issue) => (
+                                <li key={issue} className="break-words">
+                                  {issue.replaceAll('_', ' ')}
+                                </li>
+                              ))}
+                            </ul>
+                          ) : null}
+                        </details>
+                      </div>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">
+                        Evaluate the current immutable inputs before using this check for delivery.
                       </p>
+                    )}
+                    {isMergeReadiness &&
+                    evaluation?.outcome === 'satisfied' &&
+                    task.lifecycle.state === 'active' ? (
+                      <Button
+                        size="sm"
+                        disabled={transition.isPending}
+                        onClick={() => void transitionTo('ready_to_merge', evaluation.id)}
+                      >
+                        Mark ready for integration
+                      </Button>
                     ) : null}
-                    {task.lifecycle.state === 'ready_to_merge' &&
+                    {isMergeReadiness &&
+                    task.lifecycle.state === 'ready_to_merge' &&
                     evaluation?.outcome === 'satisfied' ? (
                       <Button
                         size="sm"
@@ -822,6 +963,35 @@ export function TaskDetailPage({
                 <p className="mt-3 text-sm text-muted-foreground">
                   No active review or integration check is recorded.
                 </p>
+              ) : null}
+              {!hasMergeReadinessGate &&
+              reviewLinesQuery.data?.length &&
+              task.lifecycle.state !== 'done' &&
+              task.lifecycle.state !== 'cancelled' ? (
+                <div className="mt-3 space-y-2 rounded-md border border-dashed p-3">
+                  <p className="text-sm">
+                    No <strong>merge readiness</strong> check exists for this Task. A correction can
+                    advance the review line, so the old work-item Gate may no longer cover the
+                    current result.
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    This creates a Task-scoped Gate over review line revision{' '}
+                    {String(mergeGateReviewLine?.revision ?? 0)}
+                    {mergeGateReviewLine?.latest_verdict
+                      ? ` (${mergeGateReviewLine.latest_verdict.replaceAll('_', ' ')})`
+                      : ' (no verdict yet)'}
+                    . It evaluates exact review inputs; it does not run tests, review code,
+                    integrate, or merge.
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={creatingMergeGate}
+                    onClick={() => void createMergeReadinessGate()}
+                  >
+                    {creatingMergeGate ? 'Creating check…' : 'Create merge-readiness check'}
+                  </Button>
+                </div>
               ) : null}
             </CollapsibleSection>
           </section>
@@ -943,7 +1113,10 @@ export function TaskDetailPage({
             <article key={execution.id} className="space-y-1 rounded-md border p-3 text-sm">
               <div className="flex flex-wrap items-center gap-2">
                 <Badge variant="outline">{execution.status}</Badge>
-                <span>{execution.role.replaceAll('_', ' ')}</span>
+                <span>
+                  {task.task_roles.find((role) => role.role === execution.role)?.configuration
+                    .display_label ?? execution.role.replaceAll('_', ' ')}
+                </span>
                 <details className="ml-auto text-xs text-muted-foreground">
                   <summary className="cursor-pointer">Technical references</summary>
                   <div className="mt-1 space-y-1 break-all">
@@ -1069,6 +1242,7 @@ export function TaskDetailPage({
                     task={task}
                     unit={unit}
                     currentUserId={userId}
+                    workUnits={workUnits}
                   />
                 ))}
             </section>
@@ -1078,10 +1252,20 @@ export function TaskDetailPage({
           ) : null}
           {reviews.map(({ execution, report }) => (
             <div key={execution.id} className="space-y-2">
-              <ReviewExecutionCard review={{ execution, report }} />
+              <ReviewExecutionCard
+                review={{ execution, report }}
+                roleLabel={
+                  task.task_roles.find((role) => role.role === execution.role)?.configuration
+                    .display_label ?? undefined
+                }
+              />
               <TaskReworkPanel
                 task={task}
                 review={{ execution, report }}
+                agents={agents}
+                members={members}
+                daemons={daemons}
+                workUnits={workUnits}
                 onChanged={async () => {
                   await Promise.all([
                     taskQuery.refetch(),
@@ -1168,14 +1352,20 @@ export function TaskDetailPage({
   )
 }
 
-export function ReviewExecutionCard({ review }: { review: ReviewExecutionResponse }) {
+export function ReviewExecutionCard({
+  review,
+  roleLabel,
+}: {
+  review: ReviewExecutionResponse
+  roleLabel?: string
+}) {
   const { execution, report } = review
 
   return (
     <article className="space-y-3 rounded-lg border p-4">
       <div className="flex flex-wrap items-center gap-2">
         <Badge variant="outline">{execution.status}</Badge>
-        <Badge variant="outline">{execution.role.replaceAll('_', ' ')}</Badge>
+        <Badge variant="outline">{roleLabel ?? execution.role.replaceAll('_', ' ')}</Badge>
       </div>
       {report ? (
         <div className="space-y-2 rounded bg-muted/40 p-3">

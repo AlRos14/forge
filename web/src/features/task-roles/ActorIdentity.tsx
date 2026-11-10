@@ -56,10 +56,10 @@ export function ActorIdentity({
       <div className="flex min-w-0 items-center gap-2">
         <ActorIcon size={17} className="shrink-0 text-muted-foreground" aria-hidden="true" />
         <div className="min-w-0">
-          <p className="truncate text-sm font-medium text-foreground" title={identity.name}>
+          <p className="break-words text-sm font-medium text-foreground" title={identity.name}>
             {identity.name}
           </p>
-          <p className="truncate text-xs text-muted-foreground" title={identity.context}>
+          <p className="break-words text-xs text-muted-foreground" title={identity.context}>
             {identity.kind} · {identity.context}
           </p>
         </div>
