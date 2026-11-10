@@ -47,10 +47,21 @@ impl TaskReworkService {
         &self,
         task_id: &str,
     ) -> Result<Vec<serde_json::Value>> {
-        let rows=sqlx::query("SELECT report.id,report.digest,report.content,intent.reviewed_work_unit_id,intent.reviewed_work_unit_version
+        let rows=sqlx::query("SELECT report.id,report.digest,report.content,intent.reviewed_work_unit_id,intent.reviewed_work_unit_version,
+                reviewed.scope AS original_scope,subject.result_execution_id,subject.result_commit_sha,
+                result.summary AS result_summary,workspace.worktree_path AS result_path,
+                delivery.id AS delivery_artifact_id,delivery.digest AS delivery_digest,
+                delivery.content AS delivery_content,delivery.content_ref AS delivery_content_ref
             FROM task_rework_automation_intent intent JOIN artifact report ON report.id=intent.review_report_artifact_id
             JOIN task_coordination c ON c.task_id=intent.task_id
-            WHERE intent.task_id=? AND intent.state='pending' AND c.mode!='manual' AND c.revoked_at IS NULL
+            JOIN artifact_execution_producer producer ON producer.artifact_id=report.id
+            JOIN execution review ON review.id=producer.execution_id
+            JOIN work_unit_review_subject subject ON subject.review_work_unit_id=review.work_unit_id
+            JOIN work_unit reviewed ON reviewed.id=subject.reviewed_work_unit_id
+            JOIN execution result ON result.id=subject.result_execution_id
+            LEFT JOIN workspace ON workspace.id=subject.result_workspace_id
+            LEFT JOIN artifact delivery ON delivery.id=subject.result_artifact_id
+            WHERE intent.task_id=? AND intent.state='pending' AND c.mode!='manual' AND c.revoked_at IS NULL AND c.team_stale=0
               AND COALESCE(json_extract(c.envelope_json,'$.orchestrator_reviews_findings'),0)=1
               AND NOT EXISTS(SELECT 1 FROM task_review_triage t WHERE t.review_report_artifact_id=report.id)
             ORDER BY intent.created_at,intent.id LIMIT 8")
@@ -59,7 +70,9 @@ impl TaskReworkService {
             let content:String=r.try_get("content")?;
             if content.len()>64*1024 { return Err(ServiceError::invalid_operation("Review report exceeds the coordinator context limit; explicit Human intervention is required")); }
             Ok(serde_json::json!({"report_artifact_id":r.try_get::<String,_>("id")?,"report_digest":r.try_get::<String,_>("digest")?,"report":content,
-                "reviewed_work_unit_id":r.try_get::<String,_>("reviewed_work_unit_id")?,"reviewed_work_unit_version":r.try_get::<i64,_>("reviewed_work_unit_version")?}))
+                "reviewed_work_unit_id":r.try_get::<String,_>("reviewed_work_unit_id")?,"reviewed_work_unit_version":r.try_get::<i64,_>("reviewed_work_unit_version")?,
+                "reviewed_result":{"original_scope":r.try_get::<String,_>("original_scope")?,"execution_id":r.try_get::<String,_>("result_execution_id")?,"commit_sha":r.try_get::<Option<String>,_>("result_commit_sha")?,"workspace_path":r.try_get::<Option<String>,_>("result_path")?,"summary":r.try_get::<Option<String>,_>("result_summary")?,
+                    "delivery_artifact":{"id":r.try_get::<Option<String>,_>("delivery_artifact_id")?,"digest":r.try_get::<Option<String>,_>("delivery_digest")?,"content":r.try_get::<Option<String>,_>("delivery_content")?,"content_ref":r.try_get::<Option<String>,_>("delivery_content_ref")?}}}))
         }).collect()
     }
 

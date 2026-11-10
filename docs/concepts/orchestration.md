@@ -204,3 +204,9 @@ Runtime policy version 2 covers these guided-delivery outputs and read-only
 harness policies. Pending wakes admitted under an unsupported earlier runtime
 policy fail closed and require a fresh explicit turn; completed receipts remain
 historical evidence and provider starts are never replayed to migrate a wake.
+
+Task-scoped triage context includes the exact original scope, result Execution,
+commit, workspace path and complete pinned delivery Artifact, plus recent
+coordinator decisions. The context byte limit applies before Provider Start;
+evidence is not silently truncated. WorkUnit-scoped wakes do not receive sibling
+review findings or Task-wide triage history.

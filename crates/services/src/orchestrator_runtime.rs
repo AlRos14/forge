@@ -1863,10 +1863,22 @@ impl OrchestratorRuntime {
             });
         }
         let event_payload = parse_payload(&event);
-        let pending_review_findings =
-            crate::task_rework::TaskReworkService::new(self.db.clone(), self.event_bus.clone())
-                .pending_triage_context(&task.id)
-                .await?;
+        let rework =
+            crate::task_rework::TaskReworkService::new(self.db.clone(), self.event_bus.clone());
+        let (pending_review_findings, previous_review_decisions) = if wake.work_unit_id.is_none() {
+            (
+                rework.pending_triage_context(&task.id).await?,
+                rework
+                    .list_review_triage(&task.id)
+                    .await?
+                    .into_iter()
+                    .take(8)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            // A WorkUnit-scoped wake cannot inspect sibling review evidence.
+            (Vec::new(), Vec::new())
+        };
         let coordination = TaskCoordinationRepo::get_task_coordination(&*self.db, &task.id).await?;
         let repository = if let Some(id) = task.repo_id.as_deref() {
             db::RepoRepo::get_by_id(&*self.db, id).await?
@@ -1876,6 +1888,7 @@ impl OrchestratorRuntime {
         Ok(json!({
             "repository": repository.as_ref().map(|repo| json!({"name":repo.name,"local_path":repo.local_path,"default_branch":repo.default_branch})),
             "pending_review_findings": pending_review_findings,
+            "previous_review_decisions": previous_review_decisions,
             "coordination_authorization_version": coordination.as_ref().map(|c|c.authorization_version),
             "task": {
                 "id": task.id,

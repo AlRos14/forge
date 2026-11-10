@@ -170,6 +170,30 @@ async fn triage_fixture(disposition: api_types::TaskReviewDisposition, extra_rec
         )
         .await
         .unwrap();
+    let pending = rework.pending_triage_context(&task.id).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["reviewed_result"]["execution_id"], delivery_id);
+    assert_eq!(
+        pending[0]["reviewed_result"]["original_scope"],
+        implementation.scope
+    );
+    let role = TaskRoleRepo::get_by_id(&**db, &fixture.task_role_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let members = RoleMembershipRepo::list_by_role(&**db, &role.id, false)
+        .await
+        .unwrap();
+    let policy = TaskRoleOrchestratorPolicy::parse(&role.policy_json).unwrap();
+    let mut scoped_wake = fixture.wake.clone();
+    scoped_wake.work_unit_id = Some(implementation.id.clone());
+    let scoped = fixture
+        .runtime
+        .build_context(&scoped_wake, &role, &members, &policy)
+        .await
+        .unwrap();
+    assert_eq!(scoped["pending_review_findings"], json!([]));
+    assert_eq!(scoped["previous_review_decisions"], json!([]));
     for _ in 0..extra_rechecks {
         rework
             .record_review_triage(
@@ -285,6 +309,18 @@ async fn triage_fixture(disposition: api_types::TaskReviewDisposition, extra_rec
             assert_eq!(exact, delivery_id);
         }
     }
+    let next_context = fixture
+        .runtime
+        .build_context(&fixture.wake, &role, &members, &policy)
+        .await
+        .unwrap();
+    assert_eq!(
+        next_context["previous_review_decisions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        (extra_rechecks + 1).min(8)
+    );
     let original = CollaborationRepo::get_artifact(&**db, &report.id)
         .await
         .unwrap()
