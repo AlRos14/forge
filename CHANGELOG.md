@@ -181,6 +181,9 @@ PR14 audit on 2026-10-16.
 
 ### Fixed
 
+- Backported the upstream SQLx SQLite dependency-range fix to 0.8.6 and updated
+  the bundled SQLite binding to `libsqlite3-sys 0.39.1`, resolving
+  `RUSTSEC-2026-0459`.
 - Coordination materialization now revalidates the current authorization,
   revocation, team staleness, TaskLifecycle, dispatch pause/cancel, Project
   write authority, and expected team digest inside the same `BEGIN IMMEDIATE`

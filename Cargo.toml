@@ -32,3 +32,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[patch.crates-io]
+# Backport SQLx PR #4502 until a sqlx-sqlite 0.8.x release includes the range.
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }
