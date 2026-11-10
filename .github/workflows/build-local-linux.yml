@@ -1,0 +1,47 @@
+name: Build local Linux bundle
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build web
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: Build binaries
+        env:
+          FORGE_SKIP_WEB_BUILD: '1'
+        run: cargo build --locked -p forge-cli -p forge-client
+      - name: Package
+        run: |
+          mkdir -p bundle/web
+          cp target/debug/forge target/debug/forge-ctl bundle/
+          cp -R web/dist bundle/web/dist
+          git rev-parse HEAD > bundle/SOURCE_REVISION
+          tar -czf forge-linux-x86_64.tar.gz -C bundle .
+          sha256sum forge-linux-x86_64.tar.gz > forge-linux-x86_64.tar.gz.sha256
+      - uses: actions/upload-artifact@v6
+        with:
+          name: forge-linux-x86_64
+          path: |
+            forge-linux-x86_64.tar.gz
+            forge-linux-x86_64.tar.gz.sha256
+          retention-days: 7
