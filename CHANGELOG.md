@@ -66,6 +66,9 @@ PR14 audit on 2026-10-16.
   TaskRole IDs in `TaskQualityRequestResponse.quality_route`. V161 backfills
   route accounting without changing historical request states; the separate
   eight-round exact rework limit is unchanged.
+- Make coordination authorization event deduplication version-specific and
+  preserve a quality request's advanced state when its informational Handoff
+  is attached after a concurrent consumer update.
 - Add REST, MCP, CLI, and SSE coordination contracts, including
   `forge_get_task_coordination` and the `forge-ctl task coordination` commands.
 - Add `GET/POST /tasks/{id}/dispatch*` Task launch, pause, resume, and cancel

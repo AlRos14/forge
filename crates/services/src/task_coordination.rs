@@ -564,7 +564,7 @@ impl TaskCoordinationService {
             .as_bytes(),
         );
         let now = now_rfc3339();
-        let event = self.event(
+        let mut event = self.event(
             "task.coordination_authorized",
             "task_coordination",
             &task.id,
@@ -580,6 +580,11 @@ impl TaskCoordinationService {
             }),
             &now,
         );
+        event.dedupe_key = Some(format!(
+            "task.coordination_authorized:{}:{}",
+            task.id,
+            input.expected_coordination_version + 1
+        ));
         let write = TaskCoordinationRepo::authorize_task_coordination(
             &*self.db,
             db::AuthorizeTaskCoordinationInput {
@@ -633,7 +638,7 @@ impl TaskCoordinationService {
             .as_bytes(),
         );
         let now = now_rfc3339();
-        let event = self.event(
+        let mut event = self.event(
             "task.coordination_revoked",
             "task_coordination",
             &task.id,
@@ -646,6 +651,11 @@ impl TaskCoordinationService {
             }),
             &now,
         );
+        event.dedupe_key = Some(format!(
+            "task.coordination_revoked:{}:{}",
+            task.id,
+            expected_coordination_version + 1
+        ));
         let write: TaskCoordinationWrite = TaskCoordinationRepo::revoke_task_coordination(
             &*self.db,
             db::RevokeTaskCoordinationInput {
@@ -2210,39 +2220,90 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                 deterministic_quality_handoff_id(&write.request.id)?,
             )
             .await?;
-        let updated = TaskCoordinationRepo::update_task_quality_request_state(
-            &*self.db,
-            db::UpdateTaskQualityRequestState {
-                id: write.request.id.clone(),
-                expected_version: write.request.version,
-                state: TaskQualityState::Notified,
-                handoff_id: Some(Some(handoff.id)),
-                work_unit_id: None,
-                coordination_request_id: None,
-                resolution_kind: None,
-                resolution_ref: None,
-                resolution_digest: None,
-                requires_human_reason_code: None,
-                requires_human_reason: None,
-                updated_at: now_rfc3339(),
-                event: Some(self.event(
-                    "task.quality_request_notified",
-                    "task_quality_request",
-                    &write.request.id,
-                    "system",
-                    None,
-                    &task.id,
-                    json!({
-                        "task_id": task.id,
-                        "quality_request_id": write.request.id,
-                        "state": "notified",
-                    }),
-                    &now_rfc3339(),
-                )),
-            },
-        )
-        .await?;
-        Ok(updated)
+        self.attach_quality_handoff(&task.id, &write.request.id, &handoff.id)
+            .await
+    }
+
+    async fn attach_quality_handoff(
+        &self,
+        task_id: &str,
+        request_id: &str,
+        handoff_id: &str,
+    ) -> Result<db::TaskQualityRequest> {
+        // A durable consumer may advance this request after creation commits
+        // and before the informational Handoff is attached. Retry against the
+        // current row and preserve any state the consumer has already reached.
+        for _ in 0..8 {
+            let request = TaskCoordinationRepo::get_task_quality_request(&*self.db, request_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("quality request", request_id))?;
+            if request.task_id != task_id {
+                return Err(ServiceError::not_found("quality request", request_id));
+            }
+            if let Some(existing_handoff_id) = request.handoff_id.as_deref() {
+                if existing_handoff_id == handoff_id {
+                    return Ok(request);
+                }
+                return Err(coordination_error(
+                    "coordination.handoff_conflict",
+                    "the quality request already links a different Handoff",
+                ));
+            }
+
+            let state = if request.state == TaskQualityState::Requested {
+                TaskQualityState::Notified
+            } else {
+                request.state
+            };
+            let state_label = state.to_string();
+            let now = now_rfc3339();
+            let update = TaskCoordinationRepo::update_task_quality_request_state(
+                &*self.db,
+                db::UpdateTaskQualityRequestState {
+                    id: request.id.clone(),
+                    expected_version: request.version,
+                    state,
+                    handoff_id: Some(Some(handoff_id.to_owned())),
+                    work_unit_id: None,
+                    coordination_request_id: None,
+                    resolution_kind: None,
+                    resolution_ref: None,
+                    resolution_digest: None,
+                    requires_human_reason_code: None,
+                    requires_human_reason: None,
+                    updated_at: now.clone(),
+                    event: Some(self.event(
+                        "task.quality_request_notified",
+                        "task_quality_request",
+                        request_id,
+                        "system",
+                        None,
+                        task_id,
+                        json!({
+                            "task_id": task_id,
+                            "quality_request_id": request_id,
+                            "handoff_id": handoff_id,
+                            "state": state_label,
+                        }),
+                        &now,
+                    )),
+                },
+            )
+            .await;
+            match update {
+                Ok(updated) => return Ok(updated),
+                Err(db::DbError::VersionConflict) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let request = TaskCoordinationRepo::get_task_quality_request(&*self.db, request_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("quality request", request_id))?;
+        if request.handoff_id.as_deref() == Some(handoff_id) {
+            return Ok(request);
+        }
+        Err(ServiceError::Db(db::DbError::VersionConflict))
     }
 
     pub async fn list_quality_requests(
