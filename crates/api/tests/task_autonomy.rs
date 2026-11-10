@@ -166,6 +166,24 @@ async fn project_coordinator_preference_is_copied_without_starting_provider_work
         count, 0,
         "copying a coordinator preference never launches a provider"
     );
+    for (role, capabilities) in [("build", json!([])), ("quality", json!(["formal_review"]))] {
+        let _:Value=json_request(&harness.app,Method::POST,&format!("/api/v1/tasks/{}/task-roles",task.id),json!({"role":role,"coordination_mode":"independent","policy":{},"configuration":{"capabilities":capabilities}}),StatusCode::OK).await;
+        let _: Value = json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/tasks/{}/task-roles/{role}/members", task.id),
+            json!({"actor_ref":{"kind":"agent","id":agent}}),
+            StatusCode::OK,
+        )
+        .await;
+    }
+    let implementation:Value=json_request(&harness.app,Method::POST,&format!("/api/v1/tasks/{}/work-units",task.id),json!({"title":"Implementation","scope":"Produce an exact result","role":"build","assigned_actor":{"kind":"agent","id":agent},"requires_integration":false}),StatusCode::CREATED).await;
+    let review:Value=json_request(&harness.app,Method::POST,&format!("/api/v1/tasks/{}/work-units",task.id),json!({"title":"Independent review","scope":"Inspect the exact implementation result","role":"quality","assigned_actor":{"kind":"agent","id":agent},"requires_integration":false,"review_subject":{"reviewed_work_unit_id":implementation["id"]}}),StatusCode::CREATED).await;
+    assert_eq!(
+        review["assigned_actor"], implementation["assigned_actor"],
+        "one saved Agent profile may be prepared for implementation and formal review"
+    );
+    assert_eq!(runtime.run_once(100).await.unwrap().admitted_wakes, 0);
     let without_preference:Value=json_request(&harness.app,Method::PUT,&defaults_uri,json!({"expected_version":saved["version"],"roles":[{"role":"delivery-lead","coordination_mode":"independent","members":[{"kind":"agent","id":agent}],"configuration":{"capabilities":["orchestration"]}}]}),StatusCode::OK).await;
     let manual: TaskResponse = json_request(
         &harness.app,
