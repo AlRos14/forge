@@ -100,5 +100,89 @@ async fn limits_are_versioned_replay_safe_and_preserve_consumption() {
     .await
     .unwrap();
     let denied = common::raw_json_request_with_bearer(&harness.app, Method::PUT, &uri, &common::test_jwt_for_user("outsider","outsider@example.com",false), json!({"expected_version":first.version,"limits":first,"reason":"Not authorized","idempotency_key":"outsider"})).await;
+    assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+    let now = db::now_rfc3339();
+    db::ProjectMemberRepo::add_member(
+        &*harness.state.db,
+        db::CreateProjectMember {
+            id: db::new_uuid_v4(),
+            project_id,
+            user_id: "outsider".into(),
+            role: "member".into(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let denied = common::raw_json_request_with_bearer(&harness.app, Method::PUT, &uri, &common::test_jwt_for_user("outsider","outsider@example.com",false), json!({"expected_version":first.version,"limits":first,"reason":"Not an administrator","idempotency_key":"ordinary-member"})).await;
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn project_coordinator_preference_is_copied_without_starting_provider_work() {
+    let repo = TestDir::new("coordinator-default-repo");
+    let path = setup_git_repo(repo.path());
+    let workspaces = TestDir::new("coordinator-default-workspaces");
+    let harness = test_app(workspaces.path(), "coordinator-default").await;
+    let (project_id, _) = create_project_and_repo(&harness.app, "Default coordinator", &path).await;
+    let (agent, _) =
+        common::create_shell_agents(&harness.app, workspaces.path(), "coordinator-default").await;
+    let defaults_uri = format!("/api/v1/projects/{project_id}/task-role-defaults");
+    let defaults: Value = json_request(
+        &harness.app,
+        Method::GET,
+        &defaults_uri,
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    let saved: Value = json_request(&harness.app, Method::PUT, &defaults_uri, json!({
+        "expected_version":defaults["version"],"roles":[{"role":"delivery-lead","coordination_mode":"independent","members":[{"kind":"agent","id":agent}],"configuration":{"capabilities":["orchestration"],"coordinator_actor":{"kind":"agent","id":agent}}}]
+    }), StatusCode::OK).await;
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({"title":"Wait for explicit Start"}),
+        StatusCode::OK,
+    )
+    .await;
+    let preference:(String,Option<String>,i64)=sqlx::query_as("SELECT mode,coordinator_actor_id,authorization_version FROM task_coordination WHERE task_id=?").bind(&task.id).fetch_one(harness.state.db.pool()).await.unwrap();
+    assert_eq!(preference, ("manual".into(), Some(agent.clone()), 1));
+    let runtime = services::orchestrator_runtime::OrchestratorRuntime::new(
+        harness.state.db.clone(),
+        harness.state.event_bus.clone(),
+        harness.state.task_service.clone(),
+    );
+    let result = runtime.run_once(100).await.unwrap();
+    assert_eq!(result.admitted_wakes, 0);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM execution WHERE task_id=?")
+        .bind(&task.id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "copying a coordinator preference never launches a provider"
+    );
+    let _: Value = json_request(
+        &harness.app,
+        Method::PUT,
+        &defaults_uri,
+        json!({"expected_version":saved["version"],"roles":[]}),
+        StatusCode::OK,
+    )
+    .await;
+    let still: Option<String> =
+        sqlx::query_scalar("SELECT coordinator_actor_id FROM task_coordination WHERE task_id=?")
+            .bind(&task.id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        still,
+        Some(agent),
+        "later Project changes preserve existing Task defaults"
+    );
 }

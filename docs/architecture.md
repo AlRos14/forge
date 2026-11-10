@@ -253,3 +253,9 @@ this mediation; historical envelopes retain their stored behavior. Autonomy
 limits, human extensions and triage receipts are durable and versioned. See
 [orchestration](concepts/orchestration.md), [sessions](concepts/sessions.md) and
 [the Task operating model](concepts/task-operating-model.md).
+
+These extensions touch INV-003/006/010 (harness-bound Agent identity and explicit
+role-isolated sessions), INV-019/020/029/031 (Agent-owned coordination and review
+feedback without coordinator verdict authority), and INV-030/033 (deterministic
+authority and immutable audit history). INV-017 workspace isolation and separate
+integration authority remain enforced. See the [invariants contract](migration/architecture-v2.md).

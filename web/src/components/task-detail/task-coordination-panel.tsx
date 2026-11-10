@@ -1390,7 +1390,7 @@ export function TaskCoordinationPanel({
 
       {overview.review_triage?.length ? (
         <section className="space-y-3 rounded-lg border p-4">
-          <h3 className="font-medium">Coordinator review decisions</h3>
+          <h3 className="font-medium">Coordinator review decision history</h3>
           {overview.review_triage.map((triage) => (
             <article
               key={triage.review_report_artifact_id}
@@ -1398,10 +1398,10 @@ export function TaskCoordinationPanel({
             >
               <p className="font-medium">
                 {triage.disposition === 'correct'
-                  ? 'Confirmed findings sent for correction'
+                  ? 'Findings confirmed for correction'
                   : triage.disposition === 'recheck'
                     ? 'Fresh independent review requested'
-                    : 'Human decision required'}
+                    : 'Human decision requested'}
               </p>
               <p className="mt-2 whitespace-pre-wrap">{triage.rationale}</p>
               <p className="mt-2 whitespace-pre-wrap text-muted-foreground">

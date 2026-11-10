@@ -666,3 +666,7 @@ Execution ID, disposition (`correct`, `recheck`, `human`), rationale, instructio
 optional reassessment WorkUnit ID, and timestamp. The SSE events
 `task.review_triaged` and `task.autonomy_limits_changed` expose IDs, disposition
 and limits; private instructions, rationale and reasons are excluded.
+
+`quality_route.limit` remains the immutable admission-time ceiling on each
+request. Extending autonomy changes the current Task/route budget returned by
+the limits endpoint, without rewriting that historical snapshot.

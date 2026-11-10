@@ -392,12 +392,12 @@ export function ProjectWorkersTab({ projectId }: { projectId: string }) {
             checked={automaticWorkflow}
             onChange={(event) => setAutomaticWorkflow(event.target.checked)}
           />
-          Coordinator-led automation (recommended)
+          Apply recommended workflow settings
         </label>
         <p className="text-sm text-muted-foreground">
-          After you start a new Task, the coordinator prepares and assigns work, evaluates review
-          findings, and routes corrections and fresh reviews. Saving this team does not start any
-          Task.
+          {automaticWorkflow
+            ? 'New Tasks use automatic correction routes and your selected coordinator. After you start a Task, the coordinator prepares work and evaluates review findings. Saving the team does not start a Task.'
+            : 'Edit routing and permissions in each role below. Save team defaults applies those settings to new Tasks.'}
         </p>
         {automaticWorkflow ? (
           <div className="grid gap-3 sm:grid-cols-2">

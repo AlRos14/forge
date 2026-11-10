@@ -199,3 +199,8 @@ its native read-only sandbox. Claude uses a native Read/Glob/Grep tool allowlist
 no inherited hooks or MCP servers, and no permission bypass; this is a tool policy,
 not an operating-system sandbox. Formal review uses read-only native tools and
 explicit pinned evidence rather than another role's private conversation.
+
+Runtime policy version 2 covers these guided-delivery outputs and read-only
+harness policies. Pending wakes admitted under an unsupported earlier runtime
+policy fail closed and require a fresh explicit turn; completed receipts remain
+historical evidence and provider starts are never replayed to migrate a wake.

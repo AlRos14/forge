@@ -25,7 +25,7 @@ PR14 audit on 2026-10-16.
   resetting consumption. Historical Task limits remain unchanged (V162–V166).
 - OpenCode reasoning effort uses the installed CLI's `provider/model#variant`
   syntax and automatic permission mode uses `--auto`. Formal Agent review is
-  read-only; Claude coordination is supported with an explicit native tool
+  read-only with Codex, Claude Code and OpenCode; Claude coordination uses a native tool
   allowlist. Ordinary WorkUnit assistant output is captured as a Summary Artifact
   and exact pinned delivery evidence is passed to downstream work.
 

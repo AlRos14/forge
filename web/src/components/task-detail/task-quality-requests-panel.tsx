@@ -274,7 +274,10 @@ export function TaskQualityRequestsPanel({
                       {stateLabels[item.state]}
                     </Badge>
                     {route ? (
-                      <Badge variant="outline">
+                      <Badge
+                        variant="outline"
+                        title="Limit recorded when this request was admitted. Current limits are shown in Autonomy limits and extra rounds."
+                      >
                         Route {route.round} / {route.limit}
                       </Badge>
                     ) : (
