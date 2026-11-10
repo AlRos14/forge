@@ -78,5 +78,6 @@ jobs:
       - run: cargo test --locked -p services --lib task_coordination
       - run: cargo test --locked -p services --lib coordination_auto_completion
       - run: cargo test --locked -p services --test task_coordination
+      - run: cargo test --locked -p db --lib pr6_
       - run: cargo test --locked -p db --test pr2_execution_session --test pr5_workunit --test task_coordination_schema --test file_backed_migration --test task_delete_integrity
       - run: cargo test --locked -p api --test task_rework --test task_autonomy --test task_dispatch --test work_unit_reviews --test work_unit_artifact_package --test happy_path

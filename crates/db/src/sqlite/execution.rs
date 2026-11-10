@@ -567,7 +567,7 @@ impl ExecutionRepo for SqliteDb {
         }
         let charge_turn: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM task_coordination c JOIN orchestrator_wake w ON w.task_id=c.task_id
-                WHERE w.id=? AND w.coordination_request_id IS NULL AND c.mode!='manual'
+                WHERE w.id=? AND NOT EXISTS(SELECT 1 FROM task_coordination_request request WHERE request.wake_id=w.id) AND c.mode!='manual'
                   AND c.coordinator_task_role_id=w.task_role_id AND c.coordinator_actor_kind=w.actor_kind
                   AND c.coordinator_actor_id=w.actor_id)"
         ).bind(wake_id).fetch_one(&mut *transaction).await?;
