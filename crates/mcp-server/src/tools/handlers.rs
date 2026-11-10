@@ -1720,6 +1720,7 @@ fn coordination_service(state: &AppState) -> services::task_coordination::TaskCo
         Arc::clone(&state.db),
         Arc::clone(&state.event_bus),
     )
+    .with_work_unit_service(Arc::clone(&state.work_unit_service))
 }
 
 fn coordination_arg_str(params: &Value, name: &str) -> Result<String, McpToolError> {

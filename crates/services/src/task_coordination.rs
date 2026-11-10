@@ -379,6 +379,7 @@ pub struct TaskCoordinationService {
     event_bus: Arc<EventBus>,
     collaboration: CollaborationService,
     domain_events: DomainEventService,
+    work_unit_service: Option<Arc<crate::WorkUnitService>>,
 }
 
 impl TaskCoordinationService {
@@ -388,7 +389,13 @@ impl TaskCoordinationService {
             domain_events: DomainEventService::new(Arc::clone(&db), Arc::clone(&event_bus)),
             db,
             event_bus,
+            work_unit_service: None,
         }
+    }
+
+    pub fn with_work_unit_service(mut self, service: Arc<crate::WorkUnitService>) -> Self {
+        self.work_unit_service = Some(service);
+        self
     }
 
     pub async fn overview(&self, task_id: &str, user_id: &str) -> Result<Overview> {
@@ -1052,13 +1059,16 @@ impl TaskCoordinationService {
             .ok_or_else(|| {
                 ServiceError::not_found("task_coordination_request", existing.request_id.clone())
             })?;
+            let (launch_intent_accepted, launch_blockers) = self
+                .launch_materialized_work(&task.id, user_id, existing.authorization_version)
+                .await?;
             return Ok(MaterializeOutcome {
                 plan: self.plan_view(plan).await?,
                 request,
                 materialization: existing,
                 replayed: true,
-                launch_intent_accepted: false,
-                launch_blockers: Vec::new(),
+                launch_intent_accepted,
+                launch_blockers,
             });
         }
         let plan = TaskCoordinationRepo::get_task_coordination_plan(&*self.db, artifact_id)
@@ -1305,8 +1315,9 @@ impl TaskCoordinationService {
         } else {
             request
         };
-        let (launch_intent_accepted, launch_blockers) =
-            self.launch_materialized_work(&task.id, user_id).await?;
+        let (launch_intent_accepted, launch_blockers) = self
+            .launch_materialized_work(&task.id, user_id, materialization.authorization_version)
+            .await?;
         Ok(MaterializeOutcome {
             plan: self.plan_view(plan).await?,
             request,
@@ -1321,12 +1332,14 @@ impl TaskCoordinationService {
         &self,
         task_id: &str,
         user_id: &str,
+        authorization_version: i64,
     ) -> Result<(bool, Vec<String>)> {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
         let coordination = self.require_coordination(task_id).await?;
-        if coordination.revoked_at.is_some()
+        if coordination.authorization_version != authorization_version
+            || coordination.revoked_at.is_some()
             || coordination.team_stale
             || coordination.mode == TaskCoordinationMode::Manual
         {
@@ -1353,12 +1366,20 @@ impl TaskCoordinationService {
             .ok_or_else(|| ServiceError::not_found("task lifecycle", task_id.to_owned()))?;
         let lifecycle_service =
             TaskLifecycleService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+        let preparation_blockers = if let Some(service) = self.work_unit_service.as_ref() {
+            service
+                .prepare_coordination_workspaces(task_id, user_id, authorization_version)
+                .await?
+        } else {
+            Vec::new()
+        };
         let preflight = lifecycle_service.launch_preflight(task_id).await?;
-        let blockers = preflight
+        let mut blockers = preflight
             .blockers
             .iter()
             .map(|blocker| format!("{}: {}", blocker.code, blocker.message))
             .collect::<Vec<_>>();
+        blockers.extend(preparation_blockers);
         if !preflight.can_launch {
             return Ok((false, blockers));
         }

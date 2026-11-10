@@ -1947,6 +1947,9 @@ impl OrchestratorRuntime {
                     Arc::clone(&self.db),
                     Arc::clone(&self.event_bus),
                 )
+                .with_work_unit_service(Arc::new(
+                    self.task_service.orchestrator_work_unit_service(),
+                ))
                 .complete_turn(request, &execution)
                 .await
             } else {
@@ -3035,9 +3038,52 @@ fn truncate(value: &str, max_chars: usize) -> String {
 }
 
 fn render_orchestrator_prompt(wake: &OrchestratorWake, context: &Value) -> String {
+    // Describe the existing typed output, rather than asking the harness to
+    // guess required fields from action names alone.
+    let action_examples = OrchestratorResponse {
+        actions: vec![
+            OrchestratorAction::Message {
+                target: ActionTarget::Task,
+                work_unit_id: None,
+                body: "A concise coordination message".to_owned(),
+            },
+            OrchestratorAction::Handoff {
+                target: ActionTarget::Role {
+                    task_role_id: "exact-task-role-id".to_owned(),
+                },
+                work_unit_id: None,
+                intent: HandoffIntent::Delegation,
+            },
+            OrchestratorAction::CreateWorkUnit {
+                title: "Bounded deliverable".to_owned(),
+                scope: "Exact executable scope and acceptance criteria".to_owned(),
+                role: "exact-existing-role-name".to_owned(),
+                parent_work_unit_id: None,
+                assigned_actor: Some(ActionActorRef {
+                    actor_kind: "agent".to_owned(),
+                    actor_id: "exact-active-member-id".to_owned(),
+                }),
+                requires_integration: false,
+                review_subject: None,
+            },
+            OrchestratorAction::Proposal {
+                target: ProposalTarget {
+                    kind: ProposalTargetKind::Task,
+                    id: wake.task_id.clone(),
+                },
+                action: "Describe the proposed operation".to_owned(),
+                reason: "Explain why a decision is needed".to_owned(),
+                target_version: None,
+                target_digest: None,
+            },
+        ],
+    };
+    let examples =
+        serde_json::to_string(&action_examples).expect("typed action examples serialize");
     format!(
         "You are the Actor holding TaskRole `orchestrator` for this exact Task. Direct work through collaboration records. This execution has a read-only isolated context and must not modify repository files.\n\
          Return exactly one JSON object with an `actions` array. Supported action types are `message`, `handoff`, `create_work_unit`, and `proposal`. WorkUnit creation is limited to four bounded records per Execution and never starts work by itself. A WorkUnit-scoped wake may only reference that exact WorkUnit and may create a child under it. A Handoff expresses work intent and never changes RoleMembership. A Proposal never executes its action. Do not claim that stop, cancel, reassign, discard, invalidate, merge, or override occurred. If no action is needed, return `{{\"actions\":[]}}`.\n\
+         Action shape examples (not a request to execute these actions): {examples}. Replace placeholder values with exact identities from context; do not invent fields or emit every example. For Actor targets use {{\"kind\":\"actor\",\"actor_kind\":\"human|agent\",\"actor_id\":\"exact-id\"}}.\n\
          Wake {} was caused by durable event {}. Runtime policy {} version {} digest {}; TaskRole policy version {} digest {}.\n\
          Task-scoped context follows as JSON:\n{}",
         wake.id,

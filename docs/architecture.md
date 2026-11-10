@@ -88,6 +88,14 @@ The existing eight-round rework receipt limit remains separate. Migration V161
 backfills route accounting for existing quality requests without changing their
 states or replaying them.
 
+Materialization prepares runnable, assigned Agent repository scopes through the
+existing WorkUnit workspace service before requesting launch. The running
+dispatcher prepares later dependent plan scopes and exact quality/rework
+corrections when they become ready. Manual Tasks and unassigned or Human scopes
+are not automatically prepared. A materialization replay reuses its receipt and
+can retry preparation and launch; it never duplicates WorkUnits. Workspace
+preparation does not itself grant an Execution or provider Start.
+
 Materialization also creates a durable review line and a WorkUnit-scoped
 `review_approval` Gate for each formal review subject. Any materialized WorkUnit
 that directly depends on the review consumes that Gate and line, so it cannot
@@ -124,7 +132,7 @@ authority continue to use the contracts below.
 
 A Human Execution has no HarnessSession. An Agent Execution references a HarnessSession explicitly when continuity is used. Resume never selects a session by Task, Role, Agent model label, or latest Execution.
 
-Execution admission and external provider Start are separate durable boundaries. Forge commits the Running Execution, its exact WorkspaceLease when required, the `execution.started` event, and a pending Provider Start receipt together. Before sending Start, it atomically records that one attempt has been claimed. An accepted or rejected result is replayed from the receipt. An uncertain result is exposed as `execution_start_uncertain` and does not authorize another provider Start.
+Execution admission and external provider Start are separate durable boundaries. Forge commits the Running Execution, its exact WorkspaceLease when required, the `execution.started` event, and a pending Provider Start receipt together. Before sending Start, it atomically records that one attempt has been claimed. An accepted or rejected result is replayed from the receipt. An uncertain result is exposed as `execution_start_uncertain` and does not authorize another provider Start. Execution updates, exact review-subject freezing, HarnessSession result binding, durable event checkpoints, and Orchestrator attempt reservation acquire the SQLite writer before reading the state they will mutate. This prevents WAL read-to-write upgrade failures while preserving the same authority and version checks.
 
 ## Workspaces and integration
 
@@ -230,5 +238,5 @@ The [PR0 contract](plans/pr0-task-coordination-contract.md) and
 [ADR 0016](adr/0016-task-coordination-turn.md) fix the coordination start,
 authority matrix, durable records, recovery rules, and UX states. The backend
 vertical slice (V158–V161, services, REST/MCP/CLI/SSE, generated types) is
-implemented. The guided UI and joint acceptance remain outstanding; see the
+implemented. The guided UI is integrated; joint acceptance remains in progress. See the
 [system review and implementation sequence](plans/task-coordination-and-guided-experience.md).

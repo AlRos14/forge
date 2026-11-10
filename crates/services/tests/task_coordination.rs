@@ -217,6 +217,135 @@ async fn add_quality_role(fixture: &Fixture, role_id: &str, role_label: &str) {
 }
 
 #[tokio::test]
+async fn authorization_can_be_revoked_and_restored_repeatedly_with_exact_replay() {
+    let fixture = fixture("reauthorization").await;
+    for round in 0..3 {
+        let current =
+            db::TaskCoordinationRepo::get_task_coordination(&*fixture.db, &fixture.task_id)
+                .await
+                .expect("coordination")
+                .expect("row");
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task_id, false)
+            .await
+            .expect("task")
+            .expect("row");
+        let revoked = fixture
+            .service
+            .revoke(
+                &fixture.task_id,
+                &fixture.user_id,
+                task.version,
+                current.authorization_version,
+                Some("Review pause".to_owned()),
+                &format!("revoke-{round}"),
+            )
+            .await
+            .expect("repeated revocation");
+        let input = services::AuthorizationInput {
+            expected_task_version: revoked.task.version,
+            expected_coordination_version: revoked.coordination.authorization_version,
+            mode: TaskCoordinationMode::Proposal,
+            coordinator_task_role_id: Some(fixture.role_id.clone()),
+            coordinator_actor: Some(db::ActorRef::Agent(
+                "quality-agent-reauthorization".to_owned(),
+            )),
+            envelope: None,
+            idempotency_key: format!("restore-{round}"),
+        };
+        let restored = fixture
+            .service
+            .authorize(&fixture.task_id, &fixture.user_id, input.clone())
+            .await
+            .expect("restore authorization");
+        let replay = fixture
+            .service
+            .authorize(&fixture.task_id, &fixture.user_id, input)
+            .await
+            .expect("replay authorization");
+        assert!(restored.coordination.revoked_at.is_none());
+        assert_eq!(
+            restored.coordination.authorization_version,
+            current.authorization_version + 2
+        );
+        assert_eq!(
+            replay.coordination.authorization_version,
+            restored.coordination.authorization_version
+        );
+    }
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE scope_id = ?
+         AND event_type IN ('task.coordination_authorized', 'task.coordination_revoked')",
+    )
+    .bind(&fixture.task_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("events");
+    assert_eq!(events, 7, "replays must not create authorization events");
+}
+
+#[tokio::test]
+async fn quality_handoff_preserves_a_consumer_advance_and_replay_budget() {
+    let fixture = fixture("handoff-race").await;
+    add_quality_role(&fixture, "quality-race-target", "custom-worker").await;
+    // Advance the request exactly at the notification persistence boundary,
+    // after the creator has read its original version. This deterministically
+    // models a durable consumer winning the race without timing assumptions.
+    sqlx::query(
+        "CREATE TRIGGER review_consumer_wins_handoff AFTER INSERT ON handoff
+         BEGIN
+           UPDATE task_quality_request SET state = 'requires_human', version = version + 1,
+             requires_human_reason_code = 'coordination.target_missing',
+             requires_human_reason = 'Consumer requires an exact correction'
+           WHERE task_id = NEW.task_id AND state = 'requested';
+         END",
+    )
+    .execute(fixture.db.pool())
+    .await
+    .expect("race barrier");
+    let input = services::QualityRequestInput {
+        source_artifact_id: None,
+        category: db::TaskQualityCategory::DeliveryCorrection,
+        target_kind: db::TaskQualityTargetKind::Implementation,
+        target_task_role_id: Some("quality-race-target".to_owned()),
+        target_actor: None,
+        summary: "Correct the exact delivery".to_owned(),
+        findings: vec!["Independent review finding".to_owned()],
+        resolution_condition: "Exact correction is independently reviewed".to_owned(),
+        idempotency_key: "quality-handoff-race".to_owned(),
+    };
+    let created = fixture
+        .service
+        .create_quality_request(&fixture.task_id, &fixture.user_id, input.clone())
+        .await
+        .expect("creation succeeds after consumer advance");
+    let replay = fixture
+        .service
+        .create_quality_request(&fixture.task_id, &fixture.user_id, input)
+        .await
+        .expect("replay");
+    assert_eq!(created.state, db::TaskQualityState::RequiresHuman);
+    assert_eq!(
+        created.requires_human_reason_code.as_deref(),
+        Some("coordination.target_missing")
+    );
+    assert!(created.handoff_id.is_some());
+    assert_eq!(created.handoff_id, replay.handoff_id);
+    assert_eq!(created.id, replay.id);
+    let coordination =
+        db::TaskCoordinationRepo::get_task_coordination(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("coordination")
+            .expect("row");
+    assert_eq!(coordination.quality_request_count, 1);
+    let handoffs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM handoff WHERE task_id = ?")
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("handoffs");
+    assert_eq!(handoffs, 1);
+}
+
+#[tokio::test]
 async fn request_turn_replay_compares_the_received_brief() {
     let fixture = fixture("replay").await;
     let first = fixture

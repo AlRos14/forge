@@ -66,6 +66,15 @@ PR14 audit on 2026-10-16.
   TaskRole IDs in `TaskQualityRequestResponse.quality_route`. V161 backfills
   route accounting without changing historical request states; the separate
   eight-round exact rework limit is unchanged.
+- Prepare ready repository workspaces for already assigned, authorized plan and
+  quality scopes through the existing WorkUnit service. Materialization replay
+  retries preparation and launch without duplicating WorkUnits; the UI exposes
+  recovery for a materialized plan whose dispatch is still idle.
+- Supply typed action shapes to event-driven Orchestrator turns so the harness
+  does not have to guess the existing output contract.
+- Acquire SQLite write locks before reading mutable Execution, review-subject,
+  harness-session binding, event checkpoints, and Orchestrator attempt state, preventing WAL
+  read-to-write upgrade failures during concurrent dispatch and recovery.
 - Make coordination authorization event deduplication version-specific and
   preserve a quality request's advanced state when its informational Handoff
   is attached after a concurrent consumer update.

@@ -535,7 +535,7 @@ impl HarnessAdapter for GeminiAdapter {
             )
         };
 
-        let after_sha = if outcome == ExecutionOutcome::Completed {
+        let after_sha = if outcome == ExecutionOutcome::Completed && ctx.has_repository_workspace {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
             match crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
                 .await

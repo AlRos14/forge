@@ -1,11 +1,16 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
 import type { ReviewExecutionResponse } from '@/types/generated'
 
 const pageMocks = vi.hoisted(() => ({
   launch: vi.fn(),
   intervention: vi.fn(),
+  gateKind: null as string | null,
+  gateScope: 'task',
+  gateTask: 'task-1',
+  gatePolicyRevision: 2,
+  lifecycleState: 'blocked',
 }))
 
 vi.mock('@/api/hooks', async () => {
@@ -47,7 +52,12 @@ vi.mock('@/api/hooks', async () => {
     useAgentsInfiniteQuery: () => ({ data: { pages: [] }, isLoading: false, isError: false }),
     useDaemonsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false }),
     useTaskCoordinationQuery: () => ({ data: undefined, isError: false }),
-    useTaskQuery: () => ({ data: task, isLoading: false, isError: false, refetch: vi.fn() }),
+    useTaskQuery: () => ({
+      data: { ...task, lifecycle: { ...task.lifecycle, state: pageMocks.lifecycleState } },
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    }),
     useTaskLifecycleTransitionsQuery: () => ({ data: [], isLoading: false }),
     useExecutionsQuery: () => ({ data: { items: [] }, refetch: vi.fn() }),
     useReviewsQuery: () => ({ data: [], isLoading: false }),
@@ -58,7 +68,23 @@ vi.mock('@/api/hooks', async () => {
       refetch: vi.fn(),
     }),
     useValidationsQuery: () => ({ data: [], isLoading: false }),
-    useTaskGatesQuery: () => ({ data: [], isLoading: false }),
+    useTaskGatesQuery: () => ({
+      data: pageMocks.gateKind
+        ? [
+            {
+              gate: {
+                id: 'gate-1',
+                gate_kind: pageMocks.gateKind,
+                scope_kind: pageMocks.gateScope,
+                scope_id: pageMocks.gateTask,
+                active_policy_revision: pageMocks.gatePolicyRevision,
+              },
+              active_policy: { revision: pageMocks.gatePolicyRevision },
+            },
+          ]
+        : [],
+      isLoading: false,
+    }),
     useTaskWorkUnitsQuery: () => ({ data: [], refetch: vi.fn() }),
     useTaskDispatchQuery: () => {
       const [isReady, setIsReady] = React.useState(false)
@@ -72,7 +98,16 @@ vi.mock('@/api/hooks', async () => {
     },
     useTransitionTaskLifecycle: () => noMutation,
     useUpdateTask: () => noMutation,
-    useEvaluateGate: () => noMutation,
+    useEvaluateGate: () => ({
+      isPending: false,
+      mutateAsync: vi.fn().mockResolvedValue({
+        id: 'evaluation-1',
+        policy_revision: 2,
+        outcome: 'satisfied',
+        input_digest: 'exact-input-digest',
+        result: { issues: [] },
+      }),
+    }),
     useLaunchTask: () => ({
       isPending: false,
       mutateAsync: pageMocks.launch.mockResolvedValue({
@@ -224,4 +259,40 @@ describe('Task WorkUnit preparation and launch', () => {
       }),
     )
   })
+})
+
+describe('Gate integration action authority', () => {
+  afterEach(() => {
+    pageMocks.gateKind = null
+    pageMocks.gateScope = 'task'
+    pageMocks.gateTask = 'task-1'
+    pageMocks.gatePolicyRevision = 2
+    pageMocks.lifecycleState = 'blocked'
+  })
+
+  it.each([
+    ['merge_readiness', 'task', 'task-1', 2, 'active', true],
+    ['review_approval', 'task', 'task-1', 2, 'active', false],
+    ['merge_readiness', 'work_unit', 'task-1', 2, 'active', false],
+    ['merge_readiness', 'task', 'other-task', 2, 'active', false],
+    ['merge_readiness', 'task', 'task-1', 3, 'active', false],
+    ['merge_readiness', 'task', 'task-1', 2, 'blocked', false],
+    ['merge_readiness', 'task', 'task-1', 2, 'ready', false],
+  ] as const)(
+    'offers readiness only for an exact supported Gate: %s / %s / %s / %s / %s',
+    async (kind, scope, taskId, policyRevision, lifecycle, allowed) => {
+      pageMocks.gateKind = kind
+      pageMocks.gateScope = scope
+      pageMocks.gateTask = taskId
+      pageMocks.gatePolicyRevision = policyRevision
+      pageMocks.lifecycleState = lifecycle
+      render(<TaskDetailPage taskId="task-1" />)
+      fireEvent.click(screen.getByRole('button', { name: /Review and integration checks/ }))
+      fireEvent.click(screen.getByRole('button', { name: 'Evaluate current inputs' }))
+      await screen.findByText('Exact inputs satisfy this check')
+      expect(Boolean(screen.queryByRole('button', { name: 'Mark ready for integration' }))).toBe(
+        allowed,
+      )
+    },
+  )
 })

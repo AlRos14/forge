@@ -102,17 +102,15 @@ function roleLabel(role: TaskCoordinationOverviewResponse['team'][number]) {
   return coordinationRoleLabel(role)
 }
 
-const nextActionToneClass: Record<
-  ReturnType<typeof deriveCoordinationNextAction>['tone'],
-  string
-> = {
-  action: 'border-primary/40 bg-primary/5',
-  wait: 'border-border-subtle bg-muted/20',
-  blocked:
-    'border-amber-400/60 bg-amber-50 text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100',
-  done: 'border-emerald-700/30 bg-emerald-50 text-emerald-950 dark:border-emerald-400/30 dark:bg-emerald-950/20 dark:text-emerald-100',
-  info: 'border-border-subtle bg-muted/20',
-}
+const nextActionToneClass: Record<ReturnType<typeof deriveCoordinationNextAction>['tone'], string> =
+  {
+    action: 'border-primary/40 bg-primary/5',
+    wait: 'border-border-subtle bg-muted/20',
+    blocked:
+      'border-amber-400/60 bg-amber-50 text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100',
+    done: 'border-emerald-700/30 bg-emerald-50 text-emerald-950 dark:border-emerald-400/30 dark:bg-emerald-950/20 dark:text-emerald-100',
+    info: 'border-border-subtle bg-muted/20',
+  }
 
 function shortDigest(value: string) {
   return value.length > 16 ? `${value.slice(0, 12)}…${value.slice(-4)}` : value
@@ -228,8 +226,7 @@ export function TaskCoordinationPanel({
       ? displayedCoordinatorAgent.actor_ref.id
       : null
   const coordinatorAvailability = useAgentAvailability(coordinatorAgentId)
-  const supportedCoordinator =
-    displayedCoordinatorAgent?.harness?.toLowerCase() === 'codex'
+  const supportedCoordinator = displayedCoordinatorAgent?.harness?.toLowerCase() === 'codex'
   const coordinatorAvailable = Boolean(
     supportedCoordinator && coordinatorAvailability.data?.available,
   )
@@ -240,9 +237,7 @@ export function TaskCoordinationPanel({
   const coordinatorRole = overview?.team.find(
     (role) => role.id === overview.coordinator?.task_role_id,
   )
-  const baseNextAction = overview
-    ? deriveCoordinationNextAction(overview, request, plan)
-    : null
+  const baseNextAction = overview ? deriveCoordinationNextAction(overview, request, plan) : null
   const nextAction = baseNextAction
     ? baseNextAction.kind === 'request' && coordinatorAvailability.isLoading
       ? {
@@ -308,12 +303,7 @@ export function TaskCoordinationPanel({
 
   async function requestPlan(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (
-      !overview?.can_request ||
-      turnBudgetExhausted ||
-      !coordinatorAvailable ||
-      !objective.trim()
-    )
+    if (!overview?.can_request || turnBudgetExhausted || !coordinatorAvailable || !objective.trim())
       return
     setActionError(null)
     try {
@@ -380,7 +370,7 @@ export function TaskCoordinationPanel({
   }
 
   async function materializePlan() {
-    if (!overview || !plan || !request || plan.state !== 'approved' || plan.materialization) return
+    if (!overview || !plan || !request || !['approved', 'materialized'].includes(plan.state)) return
     setActionError(null)
     try {
       const result = await materialize.mutateAsync({
@@ -399,7 +389,11 @@ export function TaskCoordinationPanel({
         launch_intent_accepted: result.launch_intent_accepted,
         launch_blockers: result.launch_blockers,
       })
-      toast.success('WorkUnits were materialized from the approved plan')
+      toast.success(
+        result.replayed
+          ? 'Work preparation retried from the existing plan receipt'
+          : 'WorkUnits were materialized from the approved plan',
+      )
     } catch (error) {
       const message = getApiErrorMessage(error, 'Approved plan could not be materialized')
       setActionError(message)
@@ -441,12 +435,7 @@ export function TaskCoordinationPanel({
   }
 
   async function revokeAuthorization() {
-    if (
-      !overview ||
-      overview.mode === 'manual' ||
-      overview.revoked_at ||
-      !overview.can_authorize
-    )
+    if (!overview || overview.mode === 'manual' || overview.revoked_at || !overview.can_authorize)
       return
     setActionError(null)
     try {
@@ -583,8 +572,8 @@ export function TaskCoordinationPanel({
       {overview.mode !== 'manual' && !overview.revoked_at && overview.can_authorize ? (
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border-subtle bg-muted/20 p-3">
           <p className="min-w-0 text-sm text-muted-foreground">
-            Revoking stops automatic preparation and task dispatch under this authorization. Existing
-            plans, WorkUnits, reviews, and running Executions are preserved.
+            Revoking stops automatic preparation and task dispatch under this authorization.
+            Existing plans, WorkUnits, reviews, and running Executions are preserved.
           </p>
           <Button
             size="sm"
@@ -649,7 +638,8 @@ export function TaskCoordinationPanel({
                     {blockerRole ? <p>TaskRole: {roleLabel(blockerRole)}</p> : null}
                     {blocker.task_role_id ? (
                       <p>
-                        TaskRole reference: <code className="break-all">{blocker.task_role_id}</code>
+                        TaskRole reference:{' '}
+                        <code className="break-all">{blocker.task_role_id}</code>
                       </p>
                     ) : null}
                   </details>
@@ -1199,6 +1189,20 @@ export function TaskCoordinationPanel({
                 {plan.materialization.work_unit_ids.length === 1 ? '' : 's'} recorded. Current
                 dispatch: {dispatchStateLabel(overview.dispatch.state)}.
               </p>
+              {overview.dispatch.state === 'idle' &&
+              plannedModeIsAuthorized &&
+              overview.can_authorize ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={
+                    !request || materialize.isPending || planQuery.isError || requestQuery.isError
+                  }
+                  onClick={() => void materializePlan()}
+                >
+                  {materialize.isPending ? 'Preparing assigned work…' : 'Retry work preparation'}
+                </Button>
+              ) : null}
               <details className="text-xs">
                 <summary className="w-fit cursor-pointer">Receipt and WorkUnit references</summary>
                 <div className="mt-2 space-y-2">
@@ -1336,8 +1340,8 @@ export function TaskCoordinationPanel({
             <DialogTitle>Revoke coordination authorization?</DialogTitle>
             <DialogDescription>
               Forge stops automatic preparation and task dispatch under this authorization. Existing
-              plans, WorkUnits, reviews, and running Executions are preserved. Running Executions are
-              not silently stopped. You can authorize coordination again later.
+              plans, WorkUnits, reviews, and running Executions are preserved. Running Executions
+              are not silently stopped. You can authorize coordination again later.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2">

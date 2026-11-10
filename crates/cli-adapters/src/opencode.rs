@@ -616,7 +616,7 @@ impl HarnessAdapter for OpencodeAdapter {
             stream.agent_session_id.as_deref(),
         )?;
 
-        let after_sha = if ctx.role == "project_copilot" {
+        let after_sha = if !ctx.has_repository_workspace || ctx.role == "project_copilot" {
             None
         } else if let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
@@ -630,7 +630,7 @@ impl HarnessAdapter for OpencodeAdapter {
         } else {
             None
         };
-        let after_sha = if ctx.role == "project_copilot" {
+        let after_sha = if !ctx.has_repository_workspace || ctx.role == "project_copilot" {
             None
         } else {
             match after_sha {
@@ -1955,6 +1955,7 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
                 execution_id: "execution".to_owned(),
                 role: "implementer".to_owned(),
                 task_role_capabilities: vec![],
+                has_repository_workspace: false,
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),
                 agent_config: serde_json::json!({
@@ -2074,6 +2075,7 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
             execution_id: "execution-tree".to_owned(),
             role: "coder".to_owned(),
             task_role_capabilities: vec![],
+            has_repository_workspace: false,
             worktree_path: dir.path().to_string_lossy().to_string(),
             description: "tree test".to_owned(),
             agent_config: serde_json::json!({
@@ -2178,6 +2180,7 @@ printf '%s\n' '{"type":"error","sessionID":"ses_test","error":{"data":{"message"
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
+                has_repository_workspace: false,
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),
                 agent_config: serde_json::json!({
@@ -2224,6 +2227,7 @@ printf '%s\n' '{"type":"step_start","sessionID":"ses_test","part":{"type":"step-
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
+                has_repository_workspace: false,
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),
                 agent_config: serde_json::json!({

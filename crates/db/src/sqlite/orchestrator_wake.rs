@@ -192,7 +192,7 @@ impl OrchestratorWakeRepo for SqliteDb {
         &self,
         input: ReserveOrchestratorWakeExecution,
     ) -> Result<OrchestratorWakeExecution> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let wake = sqlx::query("SELECT * FROM orchestrator_wake WHERE id = ?")
             .bind(&input.wake_id)
             .fetch_optional(&mut *transaction)

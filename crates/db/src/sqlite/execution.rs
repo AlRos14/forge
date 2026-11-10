@@ -317,7 +317,7 @@ impl ExecutionRepo for SqliteDb {
                 "Review subject event must identify its exact Execution and Task".to_owned(),
             ));
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
             .bind(&subject.execution_id)
             .fetch_optional(&mut *tx)
@@ -1568,7 +1568,7 @@ impl ExecutionRepo for SqliteDb {
     }
 
     async fn update(&self, input: UpdateExecution) -> Result<Execution> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let updated = update_execution_in_tx(&mut transaction, input).await?;
         transaction.commit().await?;
         Ok(updated)
@@ -1579,7 +1579,7 @@ impl ExecutionRepo for SqliteDb {
         input: UpdateExecution,
         event: CreateDomainEvent,
     ) -> Result<(Execution, DomainEvent)> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let updated = update_execution_in_tx(&mut transaction, input).await?;
         let event = DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
         transaction.commit().await?;
@@ -1730,7 +1730,7 @@ impl ExecutionRepo for SqliteDb {
         external_session_id: &str,
         updated_at: &str,
     ) -> Result<Execution> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         bind_external_session_in_tx(
             &mut transaction,
             execution_id,

@@ -686,8 +686,8 @@ impl HarnessAdapter for CursorAdapter {
             stream.agent_session_id.as_deref(),
         )?;
 
-        let after_sha = if let Ok(false) =
-            git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
+        let after_sha = if ctx.has_repository_workspace
+            && let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
         {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
             crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
@@ -696,11 +696,15 @@ impl HarnessAdapter for CursorAdapter {
         } else {
             None
         };
-        let after_sha = match after_sha {
-            Some(sha) => Some(sha),
-            None => git::get_current_sha(Path::new(&ctx.worktree_path))
-                .await
-                .ok(),
+        let after_sha = if ctx.has_repository_workspace {
+            match after_sha {
+                Some(sha) => Some(sha),
+                None => git::get_current_sha(Path::new(&ctx.worktree_path))
+                    .await
+                    .ok(),
+            }
+        } else {
+            None
         };
 
         let account_usage = self.cached_account_usage(&config).await;
@@ -2028,6 +2032,7 @@ mod tests {
                 execution_id,
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
+                has_repository_workspace: false,
                 worktree_path: worktree.path().display().to_string(),
                 description: "x".repeat(MAX_DIRECT_PROMPT_BYTES + 1),
                 agent_config: serde_json::json!({
@@ -2089,6 +2094,7 @@ mod tests {
                 execution_id,
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
+                has_repository_workspace: false,
                 worktree_path: worktree.path().display().to_string(),
                 description: prompt.clone(),
                 agent_config: serde_json::json!({

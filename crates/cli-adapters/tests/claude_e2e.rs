@@ -35,6 +35,7 @@ async fn claude_adapter_writes_file_in_live_repo() -> TestResult {
         execution_id: "smoke-exec".to_owned(),
         role: "coder".to_owned(),
         task_role_capabilities: vec![],
+        has_repository_workspace: false,
         description: "Create a file called HELLO.md in the repo root with the single word banana."
             .to_owned(),
         agent_config: json!({

@@ -405,8 +405,8 @@ impl HarnessAdapter for SmithAdapter {
             stream.agent_session_id.as_deref(),
         )?;
 
-        let after_sha = if let Ok(false) =
-            git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
+        let after_sha = if ctx.has_repository_workspace
+            && let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
         {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
             crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)

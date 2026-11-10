@@ -1530,6 +1530,61 @@ impl WorkUnitService {
         Ok(write.record)
     }
 
+    /// Prepare only already allocated Agent scopes from an exact, currently
+    /// authorized plan or its durable quality/rework circuit. This never creates or assigns WorkUnits.
+    pub(crate) async fn prepare_coordination_workspaces(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        authorization_version: i64,
+    ) -> Result<Vec<String>> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT unit.id FROM work_unit unit
+             JOIN task_coordination coordination ON coordination.task_id = unit.task_id
+             WHERE unit.task_id = ? AND unit.status = 'open'
+               AND unit.requires_integration = 1 AND unit.assigned_actor_kind = 'agent'
+               AND coordination.mode != 'manual' AND coordination.revoked_at IS NULL
+               AND coordination.team_stale = 0 AND coordination.authorization_version = ?
+               AND (
+                   EXISTS (SELECT 1 FROM task_coordination_materialization materialization
+                           JOIN json_each(materialization.work_unit_ids_json) member ON member.value = unit.id
+                           WHERE materialization.task_id = unit.task_id
+                             AND materialization.authorization_version = coordination.authorization_version)
+                   OR EXISTS (SELECT 1 FROM task_quality_request quality
+                              WHERE quality.task_id = unit.task_id AND quality.work_unit_id = unit.id
+                                AND quality.state IN ('work_created', 'running'))
+                   OR EXISTS (SELECT 1 FROM task_rework_automation_intent rework
+                              WHERE rework.task_id = unit.task_id AND rework.correction_work_unit_id = unit.id
+                                AND rework.state = 'completed')
+               )
+               AND NOT EXISTS (SELECT 1 FROM task_dispatch WHERE task_id = unit.task_id AND state IN ('paused', 'cancelled'))
+               AND NOT EXISTS (SELECT 1 FROM task_lifecycle WHERE task_id = unit.task_id AND state IN ('cancelled', 'done', 'merging'))
+             ORDER BY unit.id",
+        ).bind(task_id).bind(authorization_version).fetch_all(self.db.pool()).await?;
+        let source = CollaborationActorSource::Human(user_id.to_owned());
+        let mut blockers = Vec::new();
+        for id in ids {
+            if WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, &id)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            match self.readiness(source.clone(), &id).await {
+                Ok(readiness) if readiness.runnable => {}
+                Ok(_) => continue,
+                Err(error) => {
+                    blockers.push(format!("workspace_preparation_failed: {id}: {error}"));
+                    continue;
+                }
+            }
+            if let Err(error) = self.prepare_workspace(source.clone(), &id).await {
+                blockers.push(format!("workspace_preparation_failed: {id}: {error}"));
+            }
+        }
+        Ok(blockers)
+    }
+
     pub async fn prepare_workspace(
         &self,
         source: CollaborationActorSource,
@@ -2428,6 +2483,376 @@ mod tests {
             args.join(" "),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn guided_workspace_preparation_requires_current_authority_and_exact_quality_scope() {
+        let temp = TempDir::new().expect("temporary directory");
+        let database_path = temp.path().join("pr5-integration.db");
+        let database_url = format!("sqlite://{}", database_path.display());
+        let pool = create_sqlite_pool(&database_url).await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let db = Arc::new(SqliteDb::new(pool));
+        let event_bus = Arc::new(EventBus::new(16));
+        let repository_path = temp.path().join("repository");
+        std::fs::create_dir_all(&repository_path).expect("repository directory");
+        git::init(&repository_path).await.expect("git init");
+        run_git(&repository_path, &["checkout", "-B", "main"]).await;
+        std::fs::write(repository_path.join("base.txt"), "base\n").expect("base file");
+        let base_sha = git::commit_all(&repository_path, "initial")
+            .await
+            .expect("base commit");
+
+        let now = now_rfc3339();
+        let project_id = new_uuid_v4();
+        let task_id = new_uuid_v4();
+        let repo_id = new_uuid_v4();
+        let human_id = new_uuid_v4();
+        let agent_id = new_uuid_v4();
+        let task_role_id = new_uuid_v4();
+        db::UserRepo::create_user(
+            &*db,
+            &db::User {
+                id: human_id.clone(),
+                email: "pr5-integration@example.invalid".to_owned(),
+                password_hash: "unused".to_owned(),
+                display_name: None,
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Human");
+        ProjectRepo::create(
+            &*db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "PR5 integration".to_owned(),
+                settings: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: Some(human_id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Project");
+        let daemon_id = new_uuid_v4();
+        DaemonRepo::upsert_by_machine_id(
+            &*db,
+            UpsertDaemon {
+                id: daemon_id.clone(),
+                machine_id: format!("pr5-integration-machine-{daemon_id}"),
+                hostname: "pr5-integration-daemon".to_owned(),
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                agent_version: Some("fixture".to_owned()),
+                labels_json: "{}".to_owned(),
+                status: DaemonStatus::Online,
+                registration_token_hash: Some(format!("pr5-integration-token-{daemon_id}")),
+                owner_id: Some(human_id.clone()),
+                visibility: "account".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("authorized external daemon creates");
+        DaemonRepo::update_report(
+            &*db,
+            UpdateDaemonReport {
+                id: daemon_id.clone(),
+                last_report_at: now.clone(),
+                status: DaemonStatus::Online,
+                detected_clis_json: r#"[{"kind":"codex","availability":"authenticated"}]"#
+                    .to_owned(),
+                labels_json: None,
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("external daemon reports authenticated codex CLI");
+        db::AgentRepo::create_identity_with_profile(
+            &*db,
+            CreateAgentIdentity {
+                id: agent_id.clone(),
+                name: "WorkUnit worker".to_owned(),
+                description: None,
+                max_concurrent_tasks: 4,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: Some(human_id.clone()),
+                visibility: "account".to_owned(),
+                account_permission_ceiling: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            CreateAgentProfile {
+                id: new_uuid_v4(),
+                identity_id: agent_id.clone(),
+                backend_kind: "cli".to_owned(),
+                executor_type: "codex".to_owned(),
+                provider: None,
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                tool_policy_json: "{}".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: Some(daemon_id),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Agent");
+        RepoRepo::create(
+            &*db,
+            CreateRepo {
+                id: repo_id.clone(),
+                project_id: project_id.clone(),
+                name: "repository".to_owned(),
+                remote_url: repository_path.to_string_lossy().into_owned(),
+                local_path: Some(repository_path.to_string_lossy().into_owned()),
+                work_mode: WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Repo");
+        TaskRepo::create(
+            &*db,
+            CreateTask {
+                id: task_id.clone(),
+                project_id: project_id.clone(),
+                repo_id: Some(repo_id.clone()),
+                parent_task_id: None,
+                title: "Task".to_owned(),
+                description: None,
+                lifecycle_state: db::TaskLifecycleState::Ready,
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Task");
+        let coordinator_role_id = new_uuid_v4();
+        for (id, role, configuration) in [
+            (
+                &task_role_id,
+                "implementer",
+                r#"{"schema_version":1,"capabilities":[],"rework":null}"#,
+            ),
+            (
+                &coordinator_role_id,
+                "coordinator",
+                r#"{"schema_version":1,"capabilities":["orchestration"],"rework":null}"#,
+            ),
+        ] {
+            TaskRoleRepo::create_with_configuration(
+                &*db,
+                CreateTaskRole {
+                    id: id.clone(),
+                    task_id: task_id.clone(),
+                    role: role.to_owned(),
+                    coordination_mode: Some(CoordinationMode::Independent),
+                    policy_json: "{}".to_owned(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                configuration,
+            )
+            .await
+            .expect("role");
+            RoleMembershipRepo::add(
+                &*db,
+                CreateRoleMembership {
+                    id: new_uuid_v4(),
+                    task_role_id: id.clone(),
+                    actor_kind: ActorKind::Agent,
+                    actor_id: agent_id.clone(),
+                    status: RoleMembershipStatus::Active,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("membership");
+        }
+        let source = CollaborationActorSource::Human(human_id.clone());
+        let service = WorkUnitService::new(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+            temp.path().join("workspaces"),
+            Arc::new(RepoCacheLockManager::new()),
+            Arc::new(WorkspaceExecutionLockManager::new()),
+        );
+        let mut units = Vec::new();
+        for title in ["Quality correction", "Unrelated manual scope"] {
+            let unit = service
+                .create(
+                    source.clone(),
+                    CreateWorkUnitInput {
+                        task_id: task_id.clone(),
+                        title: title.to_owned(),
+                        scope: title.to_owned(),
+                        execution_instructions: None,
+                        role: "implementer".to_owned(),
+                        parent_work_unit_id: None,
+                        assigned_actor: Some(ActorRef::Agent(agent_id.clone())),
+                        requires_integration: true,
+                        provenance: None,
+                        review_subject: None,
+                        artifact_inputs: Vec::new(),
+                        review_approval: None,
+                    },
+                )
+                .await
+                .expect("assigned repository WorkUnit");
+            units.push(unit);
+        }
+        service
+            .prepare_coordination_workspaces(&task_id, &human_id, 1)
+            .await
+            .expect("manual mode remains manual");
+        assert!(
+            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+                .await
+                .expect("workspace")
+                .is_none()
+        );
+        let task = TaskRepo::get_by_id(&*db, &task_id, false)
+            .await
+            .expect("task")
+            .expect("row");
+        let coordination =
+            crate::TaskCoordinationService::new(Arc::clone(&db), Arc::clone(&event_bus));
+        coordination
+            .authorize(
+                &task_id,
+                &human_id,
+                crate::task_coordination::AuthorizationInput {
+                    expected_task_version: task.version,
+                    expected_coordination_version: 1,
+                    mode: db::TaskCoordinationMode::Proposal,
+                    coordinator_task_role_id: Some(coordinator_role_id),
+                    coordinator_actor: Some(ActorRef::Agent(agent_id)),
+                    envelope: None,
+                    idempotency_key: "authorize-workspace-preparation".to_owned(),
+                },
+            )
+            .await
+            .expect("authorization");
+        service
+            .prepare_coordination_workspaces(&task_id, &human_id, 2)
+            .await
+            .expect("unlinked work remains manual");
+        assert!(
+            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+                .await
+                .expect("workspace")
+                .is_none()
+        );
+        let quality = coordination
+            .create_quality_request(
+                &task_id,
+                &human_id,
+                crate::task_coordination::QualityRequestInput {
+                    source_artifact_id: None,
+                    category: db::TaskQualityCategory::Specialist,
+                    target_kind: db::TaskQualityTargetKind::Specialist,
+                    target_task_role_id: Some(task_role_id),
+                    target_actor: None,
+                    summary: "Inspect a bounded quality correction".to_owned(),
+                    findings: Vec::new(),
+                    resolution_condition: "Exact result is inspected".to_owned(),
+                    idempotency_key: "quality-preparation".to_owned(),
+                },
+            )
+            .await
+            .expect("quality request");
+        db::TaskCoordinationRepo::update_task_quality_request_state(
+            &*db,
+            db::UpdateTaskQualityRequestState {
+                id: quality.id,
+                expected_version: quality.version,
+                state: db::TaskQualityState::WorkCreated,
+                handoff_id: None,
+                work_unit_id: Some(Some(units[0].id.clone())),
+                coordination_request_id: None,
+                resolution_kind: None,
+                resolution_ref: None,
+                resolution_digest: None,
+                requires_human_reason_code: None,
+                requires_human_reason: None,
+                updated_at: now.clone(),
+                event: None,
+            },
+        )
+        .await
+        .expect("durable quality consumer links exact scope");
+        for (stale, revoked, version) in [(1, false, 2), (0, true, 2), (0, false, 3)] {
+            sqlx::query(
+                "UPDATE task_coordination SET team_stale = ?, revoked_at = ? WHERE task_id = ?",
+            )
+            .bind(stale)
+            .bind(if revoked { Some(now.as_str()) } else { None })
+            .bind(&task_id)
+            .execute(db.pool())
+            .await
+            .expect("authority change");
+            service
+                .prepare_coordination_workspaces(&task_id, &human_id, version)
+                .await
+                .expect("closed authority fence");
+            assert!(
+                WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+                    .await
+                    .expect("workspace")
+                    .is_none()
+            );
+        }
+        let blockers = service
+            .prepare_coordination_workspaces(&task_id, &human_id, 2)
+            .await
+            .expect("authorized preparation");
+        assert!(blockers.is_empty(), "{blockers:?}");
+        let workspace = WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+            .await
+            .expect("workspace")
+            .expect("prepared exact scope");
+        assert_eq!(workspace.before_sha.as_deref(), Some(base_sha.as_str()));
+        assert!(
+            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[1].id)
+                .await
+                .expect("workspace")
+                .is_none()
+        );
+        service
+            .prepare_coordination_workspaces(&task_id, &human_id, 2)
+            .await
+            .expect("idempotent preparation");
+        assert_eq!(
+            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+                .await
+                .expect("workspace")
+                .expect("row")
+                .id,
+            workspace.id
         );
     }
 

@@ -502,7 +502,9 @@ impl ClaudeCodeAdapter {
             resume_session_id.as_deref(),
             agent_session_id.as_deref(),
         )?;
-        let after_sha = if status == ExecutionOutcome::Completed && ctx.role == "project_copilot" {
+        let after_sha = if status == ExecutionOutcome::Completed
+            && (!ctx.has_repository_workspace || ctx.role == "project_copilot")
+        {
             None
         } else if status == ExecutionOutcome::Completed {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);

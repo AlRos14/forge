@@ -237,6 +237,15 @@ are in [the PR0 contract](plans/pr0-task-coordination-contract.md).
 | `POST /tasks/{id}/coordination/quality-requests/{request_id}/resolve` | Resolve, cancel, or escalate one exact request using its version. |
 | `GET/POST /tasks/{id}/coordination/interventions` | Read or create one versioned Human/Copilot intervention. Kinds are `instruction`, `decision`, `pause`, `resume`, `cancel`, `revoke_authorization`, and `request_replan`. Project Copilot may record an instruction through this same circuit; it cannot request a replan, pause, cancel, revoke, approve, or decide. |
 
+After atomic materialization commits, ready assigned Agent repository scopes
+are prepared through the existing WorkUnit workspace service before launch.
+Preparation failures are returned in `launch_blockers`; the plan receipt and
+WorkUnits remain durable. Replaying materialization reuses that receipt and
+retries preparation/launch under its exact current authorization. It creates no
+duplicate WorkUnits. The running dispatcher prepares later dependent plan and
+exact quality/rework scopes when ready. Manual Tasks and Human/unassigned
+scopes retain their existing preparation path.
+
 Typed coordination errors use `403 coordination.not_authorized`,
 `409 coordination.version_conflict`, `409 coordination.authorization_stale`,
 `409 coordination.plan_digest_mismatch`, `409 coordination.idempotency_conflict`,
