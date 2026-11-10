@@ -144,6 +144,10 @@ impl TaskReworkService {
             &row.try_get::<String, _>("actor_kind")?,
             row.try_get::<String, _>("actor_id")?,
         )?;
+        let created_by = match &actor {
+            ActorRef::Agent(id) => db::ActorRef::Agent(id.clone()),
+            ActorRef::Human(id) => db::ActorRef::Human(id.clone()),
+        };
         let review_id = if matches!(input.disposition, ReviewFindingsDisposition::Recheck) {
             let consumed:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM task_rework_receipt WHERE task_id=?)+(SELECT count(*) FROM task_review_triage WHERE task_id=? AND disposition='recheck')")
                 .bind(&task_id).bind(&task_id).fetch_one(&mut *tx).await?;
@@ -170,7 +174,7 @@ impl TaskReworkService {
                 ));
             }
             let id = new_uuid_v4();
-            insert_work_unit_in_tx(&mut tx,&task_id,&id,"Reassess disputed review findings",&format!("Independently reassess the exact reviewed result. The coordinator disputes or needs clarification of these findings; do not accept the coordinator's conclusion without examining the result.\n\nRationale: {}\nInstructions: {}\nOriginal exact ReviewReport: {}",input.rationale,input.instructions,input.review_report_artifact_id),&role,Some(&reviewer),false,Some(("artifact",&input.review_report_artifact_id,None)),&actor,&now).await?;
+            insert_work_unit_in_tx(&mut tx,&task_id,&id,"Reassess disputed review findings",&format!("Independently reassess the exact reviewed result. The coordinator disputes or needs clarification of these findings; do not accept the coordinator's conclusion without examining the result.\n\nRationale: {}\nInstructions: {}\nOriginal exact ReviewReport: {}",input.rationale,input.instructions,input.review_report_artifact_id),&role,Some(&reviewer),false,Some(("artifact",&input.review_report_artifact_id,None)),&created_by,&now).await?;
             sqlx::query("INSERT INTO work_unit_review_subject(review_work_unit_id,task_id,reviewed_work_unit_id,reviewed_work_unit_version,result_execution_id,result_artifact_id,result_commit_sha,result_workspace_id,workspace_snapshot_digest,created_at)
                 SELECT ?,task_id,reviewed_work_unit_id,reviewed_work_unit_version,result_execution_id,result_artifact_id,result_commit_sha,result_workspace_id,workspace_snapshot_digest,? FROM work_unit_review_subject WHERE review_work_unit_id=?")
                 .bind(&id).bind(&now).bind(row.try_get::<String,_>("review_work_unit_id")?).execute(&mut *tx).await?;
