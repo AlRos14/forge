@@ -37,6 +37,16 @@ use crate::{
     WorkspaceRepo, WorkspaceScope, WorkspaceStatus,
 };
 use crate::{
+    AuthorizeTaskCoordinationInput, CompleteTaskCoordinationTurnInput,
+    CreateTaskCoordinationRequestInput, CreateTaskInterventionInput, CreateTaskQualityRequestInput,
+    MaterializeTaskCoordinationPlanInput, RevokeTaskCoordinationInput, TaskCoordination,
+    TaskCoordinationMaterialization, TaskCoordinationOperation, TaskCoordinationPlan,
+    TaskCoordinationPlanState, TaskCoordinationPlanWrite, TaskCoordinationReceipt,
+    TaskCoordinationRepo, TaskCoordinationRequest, TaskCoordinationRequestState,
+    TaskCoordinationWrite, TaskIntervention, TaskInterventionState, TaskInterventionWrite,
+    TaskQualityRequest, TaskQualityState, TaskQualityWrite, UpdateTaskCoordinationRequestState,
+};
+use crate::{
     ClaimOrchestratorWake, CoordinationMode, CreateOrchestratorWake, OrchestratorActionRecord,
     OrchestratorWake, OrchestratorWakeExecution, OrchestratorWakeRepo, OrchestratorWakeState,
     ReserveOrchestratorAction, ReserveOrchestratorWakeExecution, ResolveOrchestratorStart,
@@ -81,6 +91,7 @@ mod skill;
 mod system_setting;
 mod task;
 mod task_comment;
+mod task_coordination;
 mod task_dependency;
 mod task_integration_operation;
 mod task_media;

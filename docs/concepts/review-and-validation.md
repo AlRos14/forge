@@ -1,5 +1,11 @@
 # Review and validation
 
+> Diseño objetivo aprobado, todavía pendiente de implementación:
+> [modelo operativo de tareas y UX](task-operating-model.md). Define la
+> separación Copilot/Orquestador, preparación desde objetivo y rutas de calidad.
+> El resto de este documento describe el contrato actual salvo indicación expresa.
+
+
 Validation and review are separate kinds of work and separate sources of
 truth.
 
@@ -113,3 +119,9 @@ assignment, unresolved disagreement, or expanded scope produces an explicit
 human decision instead of an automatic approval. Rework receipts do not release
 blocks owned by unrelated causes. Historical reviewer and implementer
 Executions remain unchanged.
+
+Quality requests are durable routing records, not ReviewReports. A
+`delivery_correction` request names an exact ReviewReport source and the
+responsible implementation route; it does not fabricate a reviewer verdict or
+a ValidationRun. Review independence remains enforced by the existing review
+line and the plan-level reviewer-Actor check.

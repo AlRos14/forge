@@ -1715,6 +1715,591 @@ pub(crate) async fn require_task_access(
     Ok(task)
 }
 
+fn coordination_service(state: &AppState) -> services::task_coordination::TaskCoordinationService {
+    services::task_coordination::TaskCoordinationService::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+    )
+    .with_work_unit_service(Arc::clone(&state.work_unit_service))
+}
+
+fn coordination_arg_str(params: &Value, name: &str) -> Result<String, McpToolError> {
+    params
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| McpToolError::new(-32602, format!("{name} must be a string")))
+}
+fn coordination_arg_i64(params: &Value, name: &str) -> Result<i64, McpToolError> {
+    params
+        .get(name)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| McpToolError::new(-32602, format!("{name} must be an integer")))
+}
+fn coordination_opt_str(params: &Value, name: &str) -> Option<String> {
+    params.get(name).and_then(Value::as_str).map(str::to_owned)
+}
+fn coordination_actor(params: &Value, name: &str) -> Result<Option<db::ActorRef>, McpToolError> {
+    let Some(value) = params.get(name).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let id = value.get("id").and_then(Value::as_str).unwrap_or_default();
+    if id.is_empty() {
+        return Err(McpToolError::new(
+            -32602,
+            format!("{name}.id must not be empty"),
+        ));
+    }
+    match kind {
+        "human" => Ok(Some(db::ActorRef::Human(id.to_owned()))),
+        "agent" => Ok(Some(db::ActorRef::Agent(id.to_owned()))),
+        _ => Err(McpToolError::new(
+            -32602,
+            format!("{name}.kind must be human or agent"),
+        )),
+    }
+}
+fn coordination_mode(value: &str) -> Result<db::TaskCoordinationMode, McpToolError> {
+    match value {
+        "manual" => Ok(db::TaskCoordinationMode::Manual),
+        "proposal" => Ok(db::TaskCoordinationMode::Proposal),
+        "prepare_and_execute" => Ok(db::TaskCoordinationMode::PrepareAndExecute),
+        _ => Err(McpToolError::new(-32602, "mode is unsupported")),
+    }
+}
+fn coordination_actor_value(actor: &db::ActorRef) -> Value {
+    match actor {
+        db::ActorRef::Human(id) => json!({"kind":"human","id":id}),
+        db::ActorRef::Agent(id) => json!({"kind":"agent","id":id}),
+    }
+}
+fn coordination_request_value(request: &db::TaskCoordinationRequest) -> Value {
+    json!({
+        "id": request.id,
+        "task_id": request.task_id,
+        "mode": request.mode.to_string(),
+        "state": request.state.to_string(),
+        "authorization_version": request.authorization_version,
+        "objective_digest": request.objective_digest,
+        "request_digest": request.request_digest,
+        "wake_id": request.wake_id,
+        "execution_id": request.execution_id,
+        "plan_artifact_id": request.plan_artifact_id,
+        "failure_code": request.failure_code,
+        "failure_message": request.failure_message,
+        "version": request.version,
+        "created_at": request.created_at,
+        "updated_at": request.updated_at,
+        "completed_at": request.completed_at,
+    })
+}
+fn coordination_plan_value(plan: &services::task_coordination::PlanView) -> Value {
+    json!({
+        "artifact_id": plan.plan.artifact_id,
+        "task_id": plan.plan.task_id,
+        "request_id": plan.plan.request_id,
+        "mode": plan.mode.to_string(),
+        "state": plan.plan.state.to_string(),
+        "authorization_version": plan.plan.authorization_version,
+        "task_version": plan.parsed.task_version,
+        "digest": plan.plan.plan_digest,
+        "team_digest": plan.parsed.team_digest,
+        "envelope_digest": plan.parsed.envelope_digest,
+        "objective_digest": plan.parsed.objective_digest,
+        "work_units": plan.parsed.work_units,
+        "proposal_id": plan.plan.proposal_id,
+        "decision_id": plan.plan.decision_id,
+        "materialization": plan.materialization.as_ref().map(|receipt| json!({
+            "id": receipt.id,
+            "plan_artifact_id": receipt.plan_artifact_id,
+            "plan_digest": receipt.plan_digest,
+            "work_unit_ids_json": receipt.work_unit_ids_json,
+            "receipt_digest": receipt.receipt_digest,
+            "created_by": receipt.created_by,
+            "created_at": receipt.created_at,
+        })),
+        "version": plan.plan.version,
+        "created_at": plan.plan.created_at,
+        "updated_at": plan.plan.updated_at,
+    })
+}
+async fn coordination_overview_value(
+    state: &AppState,
+    overview: services::task_coordination::Overview,
+) -> Result<Value, McpToolError> {
+    let preflight = dispatch_service(state)
+        .launch_preflight(&overview.task.id)
+        .await?;
+    let team = overview
+        .team
+        .into_iter()
+        .map(|role| {
+            json!({
+                "id": role.id,
+                "role": role.role,
+                "display_label": role.display_label,
+                "coordination_mode": role.coordination_mode.map(|mode| mode.to_string()),
+                "capabilities": role.capabilities,
+                "configuration": role.configuration,
+                "version": role.version,
+                "members": role.members.into_iter().map(|member| json!({
+                    "id": member.id,
+                    "actor": coordination_actor_value(&member.actor_ref),
+                    "display_name": member.display_name,
+                    "harness": member.harness,
+                    "status": member.status,
+                    "version": member.version,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let latest_request = overview.latest_request.map(|(request, brief)| {
+        let mut value = coordination_request_value(&request);
+        value["brief"] = json!(brief);
+        value
+    });
+    let latest_plan = overview.latest_plan.as_ref().map(coordination_plan_value);
+    Ok(json!({
+        "task_id": overview.task.id,
+        "task_version": overview.task.version,
+        "mode": overview.coordination.mode.to_string(),
+        "authorization_version": overview.coordination.authorization_version,
+        "revoked_at": overview.coordination.revoked_at,
+        "revoke_reason": overview.coordination.revoke_reason,
+        "requested_by": overview.coordination.requested_by.map(|id| json!({"kind":"human","id":id})),
+        "coordinator": overview.coordinator.map(|coordinator| json!({
+            "task_role_id": coordinator.task_role_id,
+            "role": coordinator.role,
+            "actor": coordination_actor_value(&coordinator.actor_ref),
+            "display_name": coordinator.display_name,
+            "harness": coordinator.harness,
+        })),
+        "team": team,
+        "team_digest": overview.coordination.team_digest,
+        "envelope": overview.envelope,
+        "envelope_digest": overview.coordination.envelope_digest,
+        "turn_count": overview.coordination.turn_count,
+        "max_turns": overview.coordination.max_turns,
+        "quality_request_count": overview.coordination.quality_request_count,
+        "max_quality_requests": overview.coordination.max_quality_requests,
+        "can_authorize": overview.can_authorize,
+        "can_request": overview.can_request,
+        "blockers": overview.blockers.into_iter().map(|blocker| json!({
+            "code": blocker.code,
+            "message": blocker.message,
+            "task_role_id": blocker.task_role_id,
+            "actor": blocker.actor_ref.as_ref().map(coordination_actor_value),
+        })).collect::<Vec<_>>(),
+        "latest_request": latest_request,
+        "latest_plan": latest_plan,
+        "lifecycle": preflight.lifecycle,
+        "dispatch": preflight.dispatch,
+    }))
+}
+fn quality_value(request: db::TaskQualityRequest) -> Value {
+    json!({
+        "id": request.id,
+        "task_id": request.task_id,
+        "source_kind": request.source_kind,
+        "source_id": request.source_id,
+        "category": request.category.to_string(),
+        "target_kind": request.target_kind.to_string(),
+        "target_task_role_id": request.target_task_role_id,
+        "target_actor": request.target_actor.as_ref().map(coordination_actor_value),
+        "summary": request.summary,
+        "findings": serde_json::from_str::<Value>(&request.findings_json).unwrap_or(Value::Null),
+        "resolution_condition": request.resolution_condition,
+        "state": request.state.to_string(),
+        "handoff_id": request.handoff_id,
+        "work_unit_id": request.work_unit_id,
+        "coordination_request_id": request.coordination_request_id,
+        "budget_round": request.budget_round,
+        "version": request.version,
+        "created_at": request.created_at,
+        "updated_at": request.updated_at,
+        "resolved_at": request.resolved_at,
+        "resolution_kind": request.resolution_kind,
+        "resolution_ref": request.resolution_ref,
+        "resolution_digest": request.resolution_digest,
+    })
+}
+fn intervention_value(intervention: db::TaskIntervention) -> Value {
+    json!({
+        "id": intervention.id,
+        "task_id": intervention.task_id,
+        "kind": intervention.kind.to_string(),
+        "state": intervention.state.to_string(),
+        "source_kind": intervention.source_kind,
+        "source_id": intervention.source_id,
+        "expected_task_version": intervention.expected_task_version,
+        "expected_coordination_version": intervention.expected_coordination_version,
+        "proposal_id": intervention.proposal_id,
+        "decision_id": intervention.decision_id,
+        "coordination_request_id": intervention.coordination_request_id,
+        "failure_code": intervention.failure_code,
+        "failure_message": intervention.failure_message,
+        "version": intervention.version,
+        "created_at": intervention.created_at,
+        "updated_at": intervention.updated_at,
+    })
+}
+
+pub(super) async fn forge_get_task_coordination(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: GetTaskParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    require_task_access(state, &params.task_id, user_id).await?;
+    let overview = coordination_service(state)
+        .overview(&params.task_id, user_id)
+        .await?;
+    coordination_overview_value(state, overview).await
+}
+
+pub(super) async fn forge_authorize_task_coordination(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    let task_id = coordination_arg_str(&params, "task_id")?;
+    let task = require_task_access(state, &task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let overview = coordination_service(state)
+        .authorize(
+            &task.id,
+            user_id,
+            services::task_coordination::AuthorizationInput {
+                expected_task_version: coordination_arg_i64(&params, "expected_task_version")?,
+                expected_coordination_version: coordination_arg_i64(
+                    &params,
+                    "expected_coordination_version",
+                )?,
+                mode: coordination_mode(&coordination_arg_str(&params, "mode")?)?,
+                coordinator_task_role_id: coordination_opt_str(&params, "coordinator_task_role_id"),
+                coordinator_actor: coordination_actor(&params, "coordinator_actor")?,
+                envelope: params.get("envelope").cloned(),
+                idempotency_key: coordination_arg_str(&params, "idempotency_key")?,
+            },
+        )
+        .await?;
+    coordination_overview_value(state, overview).await
+}
+
+pub(super) async fn forge_revoke_task_coordination(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    let task_id = coordination_arg_str(&params, "task_id")?;
+    let task = require_task_access(state, &task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let overview = coordination_service(state)
+        .revoke(
+            &task.id,
+            user_id,
+            coordination_arg_i64(&params, "expected_task_version")?,
+            coordination_arg_i64(&params, "expected_coordination_version")?,
+            coordination_opt_str(&params, "reason"),
+            &coordination_arg_str(&params, "idempotency_key")?,
+        )
+        .await?;
+    coordination_overview_value(state, overview).await
+}
+
+pub(super) async fn forge_request_task_coordination(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    let task_id = coordination_arg_str(&params, "task_id")?;
+    let task = require_task_access(state, &task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let (turn, accepted) = coordination_service(state)
+        .request_turn(
+            &task.id,
+            user_id,
+            services::task_coordination::TurnRequestInput {
+                expected_task_version: coordination_arg_i64(&params, "expected_task_version")?,
+                expected_coordination_version: coordination_arg_i64(
+                    &params,
+                    "expected_coordination_version",
+                )?,
+                brief: services::task_coordination::CoordinationBrief {
+                    objective: coordination_arg_str(&params, "objective")?,
+                    constraints: coordination_opt_str(&params, "constraints"),
+                    acceptance_criteria: params
+                        .get("acceptance_criteria")
+                        .and_then(Value::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    context: coordination_opt_str(&params, "context"),
+                },
+                idempotency_key: coordination_arg_str(&params, "idempotency_key")?,
+            },
+        )
+        .await?;
+    Ok(json!({"accepted": accepted, "request": coordination_request_value(&turn)}))
+}
+
+pub(super) async fn forge_approve_task_coordination_plan(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    let task_id = coordination_arg_str(&params, "task_id")?;
+    let task = require_task_access(state, &task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let plan = coordination_service(state)
+        .approve_plan(
+            &task.id,
+            &coordination_arg_str(&params, "plan_artifact_id")?,
+            user_id,
+            services::task_coordination::PlanDecisionInput {
+                expected_coordination_version: coordination_arg_i64(
+                    &params,
+                    "expected_coordination_version",
+                )?,
+                expected_plan_digest: coordination_arg_str(&params, "expected_plan_digest")?,
+                approve: coordination_arg_str(&params, "decision")? == "approve",
+                rationale: coordination_opt_str(&params, "rationale"),
+                idempotency_key: coordination_arg_str(&params, "idempotency_key")?,
+            },
+        )
+        .await?;
+    Ok(coordination_plan_value(&plan))
+}
+
+pub(super) async fn forge_materialize_task_coordination_plan(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    let task_id = coordination_arg_str(&params, "task_id")?;
+    let task = require_task_access(state, &task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let outcome = coordination_service(state)
+        .materialize(
+            &task.id,
+            &coordination_arg_str(&params, "plan_artifact_id")?,
+            user_id,
+            services::task_coordination::MaterializeInput {
+                expected_task_version: coordination_arg_i64(&params, "expected_task_version")?,
+                expected_coordination_version: coordination_arg_i64(
+                    &params,
+                    "expected_coordination_version",
+                )?,
+                expected_plan_digest: coordination_arg_str(&params, "expected_plan_digest")?,
+                expected_plan_version: coordination_arg_i64(&params, "expected_plan_version")?,
+                expected_request_version: coordination_arg_i64(
+                    &params,
+                    "expected_request_version",
+                )?,
+                idempotency_key: coordination_arg_str(&params, "idempotency_key")?,
+            },
+        )
+        .await?;
+    Ok(json!({
+        "replayed": outcome.replayed,
+        "launch_intent_accepted": outcome.launch_intent_accepted,
+        "launch_blockers": outcome.launch_blockers,
+        "plan": coordination_plan_value(&outcome.plan),
+        "request": coordination_request_value(&outcome.request),
+        "materialization": {
+            "id": outcome.materialization.id,
+            "plan_artifact_id": outcome.materialization.plan_artifact_id,
+            "plan_digest": outcome.materialization.plan_digest,
+            "work_unit_ids_json": outcome.materialization.work_unit_ids_json,
+            "receipt_digest": outcome.materialization.receipt_digest,
+            "created_at": outcome.materialization.created_at,
+        },
+    }))
+}
+
+pub(super) async fn forge_list_task_quality_requests(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: GetTaskParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    require_task_access(state, &params.task_id, user_id).await?;
+    let items = coordination_service(state)
+        .list_quality_requests(&params.task_id, user_id)
+        .await?;
+    Ok(json!({"items": items.into_iter().map(quality_value).collect::<Vec<_>>()}))
+}
+
+pub(super) async fn forge_create_task_quality_request(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    let task_id = coordination_arg_str(&params, "task_id")?;
+    let task = require_task_access(state, &task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let category = match coordination_arg_str(&params, "category")?.as_str() {
+        "delivery_correction" => db::TaskQualityCategory::DeliveryCorrection,
+        "plan_revision" => db::TaskQualityCategory::PlanRevision,
+        "specialist" => db::TaskQualityCategory::Specialist,
+        "human_decision" => db::TaskQualityCategory::HumanDecision,
+        _ => return Err(McpToolError::new(-32602, "quality category is unsupported")),
+    };
+    let target_kind = match coordination_arg_str(&params, "target_kind")?.as_str() {
+        "implementation" => db::TaskQualityTargetKind::Implementation,
+        "orchestrator" => db::TaskQualityTargetKind::Orchestrator,
+        "specialist" => db::TaskQualityTargetKind::Specialist,
+        "human" => db::TaskQualityTargetKind::Human,
+        _ => return Err(McpToolError::new(-32602, "quality target is unsupported")),
+    };
+    let source = match coordination_opt_str(&params, "source_execution_id") {
+        Some(execution_id) => CollaborationActorSource::Execution(execution_id),
+        None => CollaborationActorSource::Human(user_id.to_owned()),
+    };
+    let request = coordination_service(state)
+        .create_quality_request_as(
+            &task.id,
+            source,
+            user_id,
+            services::task_coordination::QualityRequestInput {
+                source_artifact_id: coordination_opt_str(&params, "source_artifact_id"),
+                category,
+                target_kind,
+                target_task_role_id: coordination_opt_str(&params, "target_task_role_id"),
+                target_actor: coordination_actor(&params, "target_actor")?,
+                summary: coordination_arg_str(&params, "summary")?,
+                findings: params
+                    .get("findings")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                resolution_condition: coordination_arg_str(&params, "resolution_condition")?,
+                idempotency_key: coordination_arg_str(&params, "idempotency_key")?,
+            },
+        )
+        .await?;
+    Ok(quality_value(request))
+}
+
+pub(super) async fn forge_resolve_task_quality_request(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    let task_id = coordination_arg_str(&params, "task_id")?;
+    let task = require_task_access(state, &task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let state_value = match coordination_arg_str(&params, "resolution")?.as_str() {
+        "resolved" => db::TaskQualityState::Resolved,
+        "cancelled" => db::TaskQualityState::Cancelled,
+        "requires_human" => db::TaskQualityState::RequiresHuman,
+        _ => return Err(McpToolError::new(-32602, "resolution is unsupported")),
+    };
+    let request = coordination_service(state)
+        .resolve_quality_request(
+            &task.id,
+            &coordination_arg_str(&params, "quality_request_id")?,
+            user_id,
+            coordination_arg_i64(&params, "expected_version")?,
+            state_value,
+        )
+        .await?;
+    Ok(quality_value(request))
+}
+
+pub(super) async fn forge_list_task_interventions(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: GetTaskParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    require_task_access(state, &params.task_id, user_id).await?;
+    let items = coordination_service(state)
+        .list_interventions(&params.task_id, user_id)
+        .await?;
+    Ok(json!({"items": items.into_iter().map(intervention_value).collect::<Vec<_>>()}))
+}
+
+pub(super) async fn forge_create_task_intervention(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    let task_id = coordination_arg_str(&params, "task_id")?;
+    let task = require_task_access(state, &task_id, user_id).await?;
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let kind = match coordination_arg_str(&params, "kind")?.as_str() {
+        "instruction" => db::TaskInterventionKind::Instruction,
+        "decision" => db::TaskInterventionKind::Decision,
+        "pause" => db::TaskInterventionKind::Pause,
+        "resume" => db::TaskInterventionKind::Resume,
+        "cancel" => db::TaskInterventionKind::Cancel,
+        "revoke_authorization" => db::TaskInterventionKind::RevokeAuthorization,
+        "request_replan" => db::TaskInterventionKind::RequestReplan,
+        _ => {
+            return Err(McpToolError::new(
+                -32602,
+                "intervention kind is unsupported",
+            ))
+        }
+    };
+    let source = match context.copilot_run_id.as_deref() {
+        Some(run_id) => CollaborationActorSource::ProjectCopilot(run_id.to_owned()),
+        None => CollaborationActorSource::Human(user_id.to_owned()),
+    };
+    let intervention = coordination_service(state)
+        .create_intervention_as(
+            &task.id,
+            source,
+            user_id,
+            services::task_coordination::InterventionInput {
+                kind,
+                expected_task_version: params.get("expected_task_version").and_then(Value::as_i64),
+                expected_coordination_version: params
+                    .get("expected_coordination_version")
+                    .and_then(Value::as_i64),
+                expected_lifecycle_version: params
+                    .get("expected_lifecycle_version")
+                    .and_then(Value::as_i64),
+                instruction: coordination_opt_str(&params, "instruction"),
+                plan_artifact_id: coordination_opt_str(&params, "plan_artifact_id"),
+                approve: coordination_opt_str(&params, "decision").map(|value| value == "approve"),
+                rationale: coordination_opt_str(&params, "rationale"),
+                reason: coordination_opt_str(&params, "reason"),
+                brief: None,
+                idempotency_key: coordination_arg_str(&params, "idempotency_key")?,
+            },
+        )
+        .await?;
+    Ok(intervention_value(intervention))
+}
+
 fn dispatch_service(state: &AppState) -> services::task_lifecycle::TaskLifecycleService {
     services::task_lifecycle::TaskLifecycleService::new(
         Arc::clone(&state.db),

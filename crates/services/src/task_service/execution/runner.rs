@@ -937,6 +937,7 @@ impl TaskService {
                         &execution.id,
                     )
                     .await?,
+                    has_repository_workspace: execution.workspace_id.is_some(),
                     worktree_path: worktree_path.clone(),
                     description,
                     agent_config,

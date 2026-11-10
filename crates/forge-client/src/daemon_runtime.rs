@@ -382,6 +382,9 @@ impl DaemonRuntime {
             execution_id: params.execution_id.clone(),
             role: params.role.clone(),
             task_role_capabilities: params.task_role_capabilities.clone(),
+            // The daemon ExecutionStart contract supplies an exact workspace
+            // path; non-repository WorkUnits are admitted only on the local host.
+            has_repository_workspace: true,
             worktree_path: worktree_path.to_string_lossy().into_owned(),
             description,
             agent_config: params.executor_config,

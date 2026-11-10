@@ -49,6 +49,37 @@ PR14 audit on 2026-10-16.
 
 ### Added
 
+- Add the Task coordination model: versioned Task authorization (`manual`,
+  `proposal`, `prepare_and_execute`), a read-only Agent coordination turn over
+  the existing Orchestrator wake/receipt machinery, inspectable
+  `work_unit_plan` Artifacts, exact-digest Human approval, and atomic idempotent
+  materialization of WorkUnits, dependencies, review subjects, and Artifact
+  inputs. V158 preserves every existing Task as `manual` and adds no
+  retrospective turn.
+- Add structured Task quality requests (`delivery_correction`, `plan_revision`,
+  `specialist`, `human_decision`) with category-specific targets, global
+  budgets, versioned resolution, and a single durable intervention circuit for
+  Humans and live Project Copilot runs. V159 adds the additive records.
+- Add a durable quality budget of four requests per exact source
+  chain, shared across category and target-role changes. Detect pending-role
+  A→B→A cycles and persist the Human escalation reason, request IDs, and exact
+  TaskRole IDs in `TaskQualityRequestResponse.quality_route`. V161 backfills
+  route accounting without changing historical request states; the separate
+  eight-round exact rework limit is unchanged.
+- Prepare ready repository workspaces for already assigned, authorized plan and
+  quality scopes through the existing WorkUnit service. Materialization replay
+  retries preparation and launch without duplicating WorkUnits; the UI exposes
+  recovery for a materialized plan whose dispatch is still idle.
+- Supply typed action shapes to event-driven Orchestrator turns so the harness
+  does not have to guess the existing output contract.
+- Acquire SQLite write locks before reading mutable Execution, review-subject,
+  harness-session binding, event checkpoints, and Orchestrator attempt state, preventing WAL
+  read-to-write upgrade failures during concurrent dispatch and recovery.
+- Make coordination authorization event deduplication version-specific and
+  preserve a quality request's advanced state when its informational Handoff
+  is attached after a concurrent consumer update.
+- Add REST, MCP, CLI, and SSE coordination contracts, including
+  `forge_get_task_coordination` and the `forge-ctl task coordination` commands.
 - Add `GET/POST /tasks/{id}/dispatch*` Task launch, pause, resume, and cancel
   operations, a read-only preflight with per-WorkUnit blockers, and
   `POST /work-units/{id}/workspace` for explicit repository preparation.
@@ -149,6 +180,65 @@ PR14 audit on 2026-10-16.
   verified release. No product rename was selected or applied.
 
 ### Fixed
+
+- Backported the upstream SQLx SQLite dependency-range fix to 0.8.6 and updated
+  the bundled SQLite binding to `libsqlite3-sys 0.39.1`, resolving
+  `RUSTSEC-2026-0459`.
+- Coordination materialization now revalidates the current authorization,
+  revocation, team staleness, TaskLifecycle, dispatch pause/cancel, Project
+  write authority, and expected team digest inside the same `BEGIN IMMEDIATE`
+  transaction as the WorkUnit inserts. V160 marks the coordination authorization
+  stale on every TaskRole, capability, or membership mutation, and Provider
+  Start rechecks the exact coordination request, coordinator, revocation, and
+  team state under its own write lock.
+- A coordination wake and its `task_coordination_request` now commit in one
+  transaction. Replay repairs a missing link from the durable event identity and
+  the dispatcher fails closed instead of degrading a coordination turn to
+  generic orchestration.
+- Replaying a recorded intervention resumes its effect instead of returning a
+  `recorded` row. Instruction messages use a deterministic intervention-derived
+  ID, and all other effects keep their intervention-derived receipt, so a crash
+  before or after the effect converges to one applied intervention. A cancel
+  interrupted between the TaskLifecycle transition and its dispatch receipt
+  skips the already-committed transition and records the pending receipt with
+  the current versions instead of conflicting with the original receipt.
+- Quality requests now have a durable consumer: delivery corrections follow the
+  exact ReviewReport → rework receipt → next review chain, never another
+  report's correction, and only exact rework corrections are linked. A
+  correction is resolved only by an independent review `pass`, never by
+  technical completion alone. Specialists receive linked WorkUnits; plan
+  revisions open a coordination turn; resolution records exact evidence.
+  Quality-linked WorkUnits complete technically after their Execution finishes
+  without converting that completion into review approval. A reviewer Execution
+  can open the same request through `create_quality_request_as`, and REST/MCP
+  accept an optional `source_execution_id` that attributes a ReviewReport
+  request to that exact Execution with `formal_review` authority.
+- Coordination materialization creates a durable review line and a
+  WorkUnit-scoped `review_approval` Gate for each formal review subject. A
+  materialized WorkUnit that depends on the review consumes the Gate and line,
+  so it cannot start before the latest review verdict passes. Consecutive
+  reviews (implementation → review → implementation → review) materialize in a
+  valid dependency order instead of being rejected as a cycle, and a child waits
+  for its deferred parent before insert. Automatic technical completion is
+  fenced by a current non-manual coordination authorization without revocation
+  or team staleness and only covers plan deliveries, exact quality-request
+  corrections, or completed automatic-rework intents; historical/manual Tasks
+  are unchanged. The exact authorization version, mode, revocation, and team
+  staleness are revalidated inside the same `BEGIN IMMEDIATE` transaction that
+  completes the WorkUnit and freezes its result, so a winning revocation or
+  mode change leaves zero automatic effect. Completion freezes the exact result
+  and advances the review line when the WorkUnit is a review subject.
+- Quality-request budget consumption and request insertion are one transaction;
+  replays and concurrent consumers consume no extra round. Handoffs use a
+  deterministic request-derived identity and are no longer the effect authority.
+- Formal review routing resolves the exact TaskRole and its `formal_review`
+  capability instead of the literal `reviewer` name. Custom roles listed in the
+  envelope's `allowed_review_roles` work in the guided flow.
+- The plan dependency validator accepts a valid diamond and redundant transitive
+  edges while still rejecting a real cycle.
+- Replaying a coordination turn with the same idempotency key now compares the
+  received brief digest, so a new objective under an old key returns the typed
+  conflict instead of silently returning the previous request.
 
 - V157 advances a correction's review line from the exact reviewed result even
   when another reviewer has since reported on that same result. Existing

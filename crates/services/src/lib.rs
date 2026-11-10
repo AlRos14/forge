@@ -39,10 +39,12 @@ pub mod release_history;
 pub mod role_capabilities;
 pub mod shared_media_cleanup;
 pub mod shutdown;
+pub mod task_coordination;
 pub mod task_dispatcher;
 pub mod task_failure_retry;
 mod task_integration_operation;
 pub mod task_lifecycle;
+pub mod task_quality;
 pub mod task_rework;
 pub mod task_role_configuration;
 pub mod task_service;
@@ -94,7 +96,14 @@ pub use recovery::{CrashRecovery, HeartbeatMonitor};
 pub use release_history::HistoricalReleaseReader;
 pub use shared_media_cleanup::SharedMediaCleanupScheduler;
 pub use shutdown::GracefulShutdown;
+pub use task_coordination::{
+    AuthorizationInput, CoordinationBlocker, CoordinationBrief, CoordinationEnvelope,
+    CoordinatorView, InterventionInput, MaterializeInput, MaterializeOutcome, Overview,
+    PlanDecisionInput, PlanView, PlanWorkUnit, QualityRequestInput, TaskCoordinationService,
+    TeamMemberView, TeamRoleView, TurnRequestInput, WorkUnitPlan,
+};
 pub use task_dispatcher::{DispatchOutcome, TaskDispatcher};
+pub use task_quality::TaskQualityService;
 pub use task_rework::{
     RequestReworkInput, RequestReworkResult, TaskReworkService, WorkUnitReviewSubject,
 };
@@ -139,6 +148,9 @@ pub enum ServiceError {
 
     #[error("conflict: {0}")]
     Conflict(String),
+
+    #[error("coordination {code}: {message}")]
+    Coordination { code: &'static str, message: String },
 
     #[error("daemon unavailable: {daemon_id}")]
     DaemonUnavailable { daemon_id: String },
@@ -239,6 +251,10 @@ impl From<db::DbError> for ServiceError {
         match error {
             db::DbError::DependencyGate => Self::DependencyGate,
             db::DbError::AgentPaused { agent_id } => Self::AgentPaused { agent_id },
+            db::DbError::QualityRequestBudgetExhausted => Self::Coordination {
+                code: "coordination.budget_exhausted",
+                message: "the Task quality-request budget is exhausted".to_owned(),
+            },
             error => Self::Db(error),
         }
     }

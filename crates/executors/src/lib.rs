@@ -45,6 +45,9 @@ pub struct ExecutionContext {
     /// does not represent a persisted TaskRole or Task Execution.
     pub role: String,
     pub task_role_capabilities: Vec<api_types::TaskRoleCapability>,
+    /// Whether this exact Execution has a repository Workspace. CLI adapters
+    /// must not run Git operations for isolated non-repository contexts.
+    pub has_repository_workspace: bool,
     pub worktree_path: String,
     pub description: String,
     pub agent_config: serde_json::Value,

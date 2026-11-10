@@ -317,7 +317,7 @@ impl ExecutionRepo for SqliteDb {
                 "Review subject event must identify its exact Execution and Task".to_owned(),
             ));
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let execution = sqlx::query("SELECT * FROM execution WHERE id = ?")
             .bind(&subject.execution_id)
             .fetch_optional(&mut *tx)
@@ -1208,6 +1208,31 @@ impl ExecutionRepo for SqliteDb {
                       )
                       AND role.policy_json = wake.task_role_policy_json
                       AND role.coordination_mode IS wake.coordination_mode
+                      AND (
+                          NOT EXISTS (
+                              SELECT 1 FROM task_coordination_request linked
+                              WHERE linked.wake_id = wake.id
+                          )
+                          OR EXISTS (
+                              SELECT 1
+                              FROM task_coordination_request request
+                              JOIN task_coordination coordination
+                                ON coordination.task_id = request.task_id
+                              WHERE request.wake_id = wake.id
+                                AND request.task_id = wake.task_id
+                                AND request.execution_id = current_execution.id
+                                AND request.state = 'running'
+                                AND request.mode = coordination.mode
+                                AND coordination.revoked_at IS NULL
+                                AND coordination.team_stale = 0
+                                AND coordination.mode != 'manual'
+                                AND coordination.authorization_version
+                                    = request.authorization_version
+                                AND coordination.coordinator_task_role_id = wake.task_role_id
+                                AND coordination.coordinator_actor_kind = wake.actor_kind
+                                AND coordination.coordinator_actor_id = wake.actor_id
+                          )
+                      )
                       AND json_valid(role.policy_json)
                       AND json_type(role.policy_json) = 'object'
                       AND COALESCE(json_extract(role.policy_json, '$.schema_version'), 1) = 1
@@ -1337,6 +1362,23 @@ impl ExecutionRepo for SqliteDb {
                                 ORDER BY latest.evaluated_at DESC, latest.id DESC LIMIT 1
                             )
                       ))
+                      AND (
+                          NOT EXISTS (
+                              SELECT 1 FROM work_unit planned
+                              JOIN artifact plan_artifact
+                                ON plan_artifact.id = planned.provenance_id
+                               AND plan_artifact.task_id = planned.task_id
+                               AND plan_artifact.kind = 'work_unit_plan'
+                              WHERE planned.id = w.id
+                                AND planned.provenance_kind = 'artifact'
+                          )
+                          OR EXISTS (
+                              SELECT 1 FROM task_coordination coordination
+                              WHERE coordination.task_id = w.task_id
+                                AND coordination.revoked_at IS NULL
+                                AND coordination.team_stale = 0
+                          )
+                      )
                       AND ((w.requires_integration = 1 AND ? IS NOT NULL)
                            OR (w.requires_integration = 0 AND ? IS NULL))
                 )",
@@ -1526,7 +1568,7 @@ impl ExecutionRepo for SqliteDb {
     }
 
     async fn update(&self, input: UpdateExecution) -> Result<Execution> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let updated = update_execution_in_tx(&mut transaction, input).await?;
         transaction.commit().await?;
         Ok(updated)
@@ -1537,7 +1579,7 @@ impl ExecutionRepo for SqliteDb {
         input: UpdateExecution,
         event: CreateDomainEvent,
     ) -> Result<(Execution, DomainEvent)> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let updated = update_execution_in_tx(&mut transaction, input).await?;
         let event = DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
         transaction.commit().await?;
@@ -1688,7 +1730,7 @@ impl ExecutionRepo for SqliteDb {
         external_session_id: &str,
         updated_at: &str,
     ) -> Result<Execution> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         bind_external_session_in_tx(
             &mut transaction,
             execution_id,

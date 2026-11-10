@@ -5,6 +5,13 @@ export const qk = {
     ['projects', projectId, 'tasks', filterKey] as const,
   task: (taskId: string) => ['tasks', taskId] as const,
   taskDispatch: (taskId: string) => ['task-dispatch', taskId] as const,
+  taskCoordination: (taskId: string) => ['tasks', taskId, 'coordination'] as const,
+  taskCoordinationRequest: (taskId: string, requestId: string) =>
+    ['tasks', taskId, 'coordination', 'requests', requestId] as const,
+  taskCoordinationPlan: (taskId: string, artifactId: string) =>
+    ['tasks', taskId, 'coordination', 'plans', artifactId] as const,
+  taskQualityRequests: (taskId: string) => ['tasks', taskId, 'quality-requests'] as const,
+  taskInterventions: (taskId: string) => ['tasks', taskId, 'interventions'] as const,
   taskDiff: (taskId: string) => ['tasks', taskId, 'diff'] as const,
   taskDetail: (taskId: string) => ['tasks', taskId, 'detail'] as const,
   taskArtifacts: (taskId: string) => ['tasks', taskId, 'artifacts'] as const,

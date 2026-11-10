@@ -141,7 +141,45 @@ absolute path from the execution host. Forge prepares the exact WorkUnit
 Workspace and lease for a repository WorkUnit that requires integration. Do
 not copy a Workspace path from another Task or daemon.
 
-## 5. Create a Task, TaskRole, and RoleMembership
+## 5. Guided Task flow in the web UI
+
+For ordinary work, start with the Project team and the outcome instead of
+creating WorkUnits by hand:
+
+1. Open **Team & workflow** in the Project. Add the roles the work needs, choose
+   a team template, and select the Actors who are allowed to serve each role.
+   Role capabilities and coordination settings stay under advanced settings.
+2. Create a Task with its objective and useful context. Forge copies the saved
+   Project team into the new Task; later Project default changes do not rewrite
+   an active Task.
+3. In the Task overview, check the copied team and the server's coordination
+   state. When Forge reports that authorization is available, select an active
+   Codex CLI Agent in a role with orchestration capability, then choose
+   **Prepare a proposal** or **Prepare and execute**. Forge revalidates the
+   exact Actor and host before admitting a coordination turn.
+4. A proposal shows its exact work plan, roles, assignments, dependencies, and
+   acceptance criteria. Approve or reject that plan from the Task screen. An
+   approved proposal still requires explicit materialization before it creates
+   WorkUnits. **Prepare and execute** can materialize an in-limit plan and
+   record the Task dispatch intent; a plan outside the saved limits returns for
+   approval. Dispatch intent does not by itself prove a provider start.
+5. Follow TaskLifecycle, WorkUnit readiness, review, results, and the next
+   action as separate server facts. Quality requests show their destination and
+   whether a Handoff or WorkUnit link exists. Pause, resume, cancellation,
+   plan decisions, and authorization revocation are recorded in the Task
+   intervention inbox. Project Copilot instructions appear there too; Copilot
+   cannot authorize or decide for a Human.
+
+If the Task has no eligible coordinator, the overview names the missing team
+requirement and links to **Advanced work**. That path also keeps manual role,
+membership, and WorkUnit editing available. The initial coordination runtime
+supports the Codex CLI path only; other harnesses are not offered as working
+coordinators by this walkthrough.
+
+## 6. REST fallback: create a TaskRole and RoleMembership
+
+The shell walkthrough below creates a Task team directly. In the web UI, prefer
+the saved Project team and the guided flow above.
 
 ```bash
 TASK="$(request POST "/projects/$PROJECT_ID/tasks" \
@@ -158,7 +196,55 @@ request POST "/tasks/$TASK_ID/task-roles/implementer/members" \
 TaskRole defines the responsibility. RoleMembership admits the Agent to that
 role. Neither record by itself assigns executable scope.
 
-## 6. Create the WorkUnit explicitly
+## 7. REST alternative: prepare from the objective
+
+A Task with an eligible team does not require manual WorkUnits before it can
+start coordination. This example assumes the Task already has an active Agent
+member in a TaskRole with orchestration capability and that the Agent uses the
+supported Codex CLI read-only path. The shell Agent registered above is a
+literal command runner and is not a coordinator. Authorize the exact coordinator
+and use the returned authorization version for the request:
+
+```bash
+TASK_VERSION="$(request GET "/tasks/$TASK_ID" | jq -er '.version')"
+COORDINATION_VERSION="$(request GET "/tasks/$TASK_ID/coordination" | jq -er '.authorization_version')"
+COORDINATOR_ROLE_ID="$(request GET "/tasks/$TASK_ID/task-roles" \
+  | jq -er '.[] | select(.role == "orchestrator") | .id')"
+COORDINATOR_AGENT_ID="<CODEX_AGENT_ID_WITH_READ_ONLY_ORCHESTRATION_PATH>"
+
+AUTHORIZED="$(request POST "/tasks/$TASK_ID/coordination/authorize" "$(jq -cn \
+  --argjson task_version "$TASK_VERSION" \
+  --argjson coordination_version "$COORDINATION_VERSION" \
+  --arg role_id "$COORDINATOR_ROLE_ID" \
+  --arg agent_id "$COORDINATOR_AGENT_ID" \
+  '{expected_task_version:$task_version,
+    expected_coordination_version:$coordination_version,
+    mode:"proposal",
+    coordinator_task_role_id:$role_id,
+    coordinator_actor:{kind:"agent",id:$agent_id},
+    idempotency_key:"guided-authorize-1"}')")
+COORDINATION_VERSION="$(jq -er '.authorization_version' <<<"$AUTHORIZED")"
+
+request POST "/tasks/$TASK_ID/coordination/requests" "$(jq -cn \
+  --argjson task_version "$TASK_VERSION" \
+  --argjson coordination_version "$COORDINATION_VERSION" \
+  '{expected_task_version:$task_version,
+    expected_coordination_version:$coordination_version,
+    objective:"Deliver the requested outcome",
+    constraints:"Read-only repository access",
+    acceptance_criteria:["The contract and tests are present"],
+    idempotency_key:"guided-turn-1"}')"
+```
+
+Poll the returned request, then inspect
+`GET /tasks/$TASK_ID/coordination/plans/<artifact_id>`. `proposal` creates no
+WorkUnit until a Human approves the exact digest. `prepare_and_execute` can
+materialize only a plan inside the authorization envelope. Materialization is
+atomic and idempotent; the dispatcher still revalidates every WorkUnit, Actor,
+capability, and lease. Use the manual WorkUnit path below when explicit scope
+editing is intended.
+
+## 8. Create the WorkUnit explicitly
 
 The CLI currently has no WorkUnit creation command, so create it through the
 implemented REST route. This repository WorkUnit names its Agent and requires
@@ -191,7 +277,7 @@ Agent executions require the online embedded host and a supported local CLI
 adapter. An unsupported remote daemon/provider combination is rejected before
 the Execution enters `running`.
 
-## 7. Launch the Task with prepared WorkUnits
+## 9. Launch the Task with prepared WorkUnits
 
 The Human prepares the WorkUnit and then launches the Task. There is no manual
 Execution form and no Execution purpose. Optional `execution_instructions` are
@@ -253,7 +339,7 @@ do not retry it automatically. Inspect the exact Execution and follow the
 explicit recovery path in
 [the API reference](api.md#executions-and-harnesssessions).
 
-## 8. Review, validation, gates, integration, and closure
+## 10. Review, validation, gates, integration, and closure
 
 Execution completion does not complete its WorkUnit, advance TaskLifecycle, or
 satisfy a Gate.

@@ -658,7 +658,9 @@ impl CodexAdapter {
             let _ = client.cancel_turn(thread_id.clone(), turn_id).await;
         }
 
-        let auto_commit = config.auto_commit.unwrap_or(true) && ctx.role != "project_copilot";
+        let auto_commit = config.auto_commit.unwrap_or(true)
+            && ctx.has_repository_workspace
+            && ctx.role != "project_copilot";
         // Commit reminder: if completed but worktree is dirty, nudge Codex once
         if auto_commit
             && outcome == ExecutionOutcome::Completed
@@ -721,7 +723,7 @@ impl CodexAdapter {
         if !auto_commit {
             return Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,
-                after_sha: if ctx.role == "project_copilot" {
+                after_sha: if !ctx.has_repository_workspace || ctx.role == "project_copilot" {
                     None
                 } else {
                     git::get_current_sha(Path::new(&ctx.worktree_path))
@@ -1304,6 +1306,7 @@ mod tests {
             execution_id: "exec-1".to_owned(),
             role: "reviewer".to_owned(),
             task_role_capabilities: vec![],
+            has_repository_workspace: false,
             worktree_path: "/tmp/forge-codex-worktree".to_owned(),
             description: "Review the changes".to_owned(),
             agent_config: json!({}),
@@ -1347,6 +1350,7 @@ mod tests {
             execution_id: "message-1".to_owned(),
             role: "interactive".to_owned(),
             task_role_capabilities: vec![],
+            has_repository_workspace: false,
             worktree_path: "/tmp/forge-codex-worktree".to_owned(),
             description: "Continue the conversation".to_owned(),
             agent_config: json!({}),
@@ -1400,6 +1404,7 @@ mod tests {
             execution_id: "message-1".to_owned(),
             role: "interactive".to_owned(),
             task_role_capabilities: vec![],
+            has_repository_workspace: false,
             worktree_path: "/tmp/forge-codex-worktree".to_owned(),
             description: "Continue the conversation".to_owned(),
             agent_config: json!({}),
@@ -1472,6 +1477,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
                 execution_id: "exec-1".to_owned(),
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
+                has_repository_workspace: false,
                 worktree_path: dir.path().display().to_string(),
                 description: "Do the task".to_owned(),
                 agent_config: json!({
@@ -1531,6 +1537,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
                 execution_id: "exec-1".to_owned(),
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
+                has_repository_workspace: false,
                 worktree_path: dir.path().display().to_string(),
                 description: "Plan the task".to_owned(),
                 agent_config: json!({

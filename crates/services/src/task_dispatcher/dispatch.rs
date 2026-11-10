@@ -71,6 +71,27 @@ impl TaskDispatcher {
             std::sync::Arc::clone(&self.db),
             std::sync::Arc::clone(&self.event_bus),
         );
+        let preparation_user = dispatch
+            .requested_by_id
+            .as_deref()
+            .filter(|_| dispatch.requested_by_kind == "human");
+        if let (Some(user_id), Some(coordination)) = (
+            preparation_user,
+            db::TaskCoordinationRepo::get_task_coordination(&*self.db, &task.id).await?,
+        ) {
+            let blockers = self
+                .task_service
+                .orchestrator_work_unit_service()
+                .prepare_coordination_workspaces(
+                    &task.id,
+                    user_id,
+                    coordination.authorization_version,
+                )
+                .await?;
+            for blocker in blockers {
+                tracing::warn!(task_id = %task.id, %blocker, "guided workspace preparation deferred");
+            }
+        }
         let preflight = lifecycle_service.launch_preflight(&task.id).await?;
         let mut outcome = DispatchOutcome::default();
         for candidate in preflight

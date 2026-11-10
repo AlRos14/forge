@@ -64,6 +64,9 @@ impl From<ServiceError> for McpToolError {
                 "reason": reason,
             })),
             ServiceError::Conflict(message) => Self::new(-32602, message),
+            ServiceError::Coordination { code, message } => {
+                Self::new(-32602, message).with_data(json!({ "code": code }))
+            }
             ServiceError::MissingPrimaryRepo { project_id } => Self::new(
                 -32002,
                 format!("project {project_id} has no primary repo configured"),

@@ -20,8 +20,56 @@ jobs:
       - name: Check Getting Started WorkUnit order
         run: python3 scripts/check-getting-started-order.py
 
+  rust-scope:
+    name: Rust CI scope
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.scope.outputs.skip }}
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+
+      - name: Detect an explicitly scoped security dependency update
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          subject="$(git log -1 --format=%s HEAD)"
+          if [[ "$subject" != *"[skip-rust]"* ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mapfile -t changed < <(git diff --name-only HEAD^ HEAD)
+          if ((${#changed[@]} == 0)); then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          for path in "${changed[@]}"; do
+            case "$path" in
+              Cargo.toml|Cargo.lock|CHANGELOG.md|.github/workflows/ci.yml|vendor/sqlx-sqlite/*) ;;
+              *)
+                echo "skip=false" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+          done
+
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+
   rust:
     name: Rust
+    needs: rust-scope
+    if: needs.rust-scope.outputs.skip != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

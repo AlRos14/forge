@@ -88,6 +88,9 @@ pub enum DbError {
     #[error("WorkUnit already has a Running Execution")]
     WorkUnitExecutionAlreadyRunning,
 
+    #[error("Task quality-request budget is exhausted")]
+    QualityRequestBudgetExhausted,
+
     #[error("dependency gate")]
     DependencyGate,
 

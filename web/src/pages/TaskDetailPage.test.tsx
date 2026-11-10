@@ -1,10 +1,16 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
 import type { ReviewExecutionResponse } from '@/types/generated'
 
 const pageMocks = vi.hoisted(() => ({
   launch: vi.fn(),
+  intervention: vi.fn(),
+  gateKind: null as string | null,
+  gateScope: 'task',
+  gateTask: 'task-1',
+  gatePolicyRevision: 2,
+  lifecycleState: 'blocked',
 }))
 
 vi.mock('@/api/hooks', async () => {
@@ -31,7 +37,7 @@ vi.mock('@/api/hooks', async () => {
   }
   const staleDispatch = {
     can_launch: false,
-    can_pause: false,
+    can_pause: true,
     can_resume: false,
     can_cancel: false,
     blockers: [{ code: 'task_blocked', message: 'blocked', work_unit_id: null }],
@@ -41,13 +47,44 @@ vi.mock('@/api/hooks', async () => {
   const readyDispatch = { ...staleDispatch, can_launch: true, blockers: [] }
   const noMutation = { isPending: false, mutateAsync: vi.fn().mockResolvedValue({}) }
   return {
-    useTaskQuery: () => ({ data: task, isLoading: false, isError: false, refetch: vi.fn() }),
+    useProjectQuery: () => ({ data: { owner_id: 'owner-1' } }),
+    useMembersQuery: () => ({ data: [], isLoading: false, isError: false }),
+    useAgentsInfiniteQuery: () => ({ data: { pages: [] }, isLoading: false, isError: false }),
+    useDaemonsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false }),
+    useTaskCoordinationQuery: () => ({ data: undefined, isError: false }),
+    useTaskQuery: () => ({
+      data: { ...task, lifecycle: { ...task.lifecycle, state: pageMocks.lifecycleState } },
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    }),
     useTaskLifecycleTransitionsQuery: () => ({ data: [], isLoading: false }),
     useExecutionsQuery: () => ({ data: { items: [] }, refetch: vi.fn() }),
     useReviewsQuery: () => ({ data: [], isLoading: false }),
-    useTaskReviewLinesQuery: () => ({ data: [], isLoading: false, isError: false, refetch: vi.fn() }),
+    useTaskReviewLinesQuery: () => ({
+      data: [],
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    }),
     useValidationsQuery: () => ({ data: [], isLoading: false }),
-    useTaskGatesQuery: () => ({ data: [], isLoading: false }),
+    useTaskGatesQuery: () => ({
+      data: pageMocks.gateKind
+        ? [
+            {
+              gate: {
+                id: 'gate-1',
+                gate_kind: pageMocks.gateKind,
+                scope_kind: pageMocks.gateScope,
+                scope_id: pageMocks.gateTask,
+                active_policy_revision: pageMocks.gatePolicyRevision,
+              },
+              active_policy: { revision: pageMocks.gatePolicyRevision },
+            },
+          ]
+        : [],
+      isLoading: false,
+    }),
     useTaskWorkUnitsQuery: () => ({ data: [], refetch: vi.fn() }),
     useTaskDispatchQuery: () => {
       const [isReady, setIsReady] = React.useState(false)
@@ -61,7 +98,16 @@ vi.mock('@/api/hooks', async () => {
     },
     useTransitionTaskLifecycle: () => noMutation,
     useUpdateTask: () => noMutation,
-    useEvaluateGate: () => noMutation,
+    useEvaluateGate: () => ({
+      isPending: false,
+      mutateAsync: vi.fn().mockResolvedValue({
+        id: 'evaluation-1',
+        policy_revision: 2,
+        outcome: 'satisfied',
+        input_digest: 'exact-input-digest',
+        result: { issues: [] },
+      }),
+    }),
     useLaunchTask: () => ({
       isPending: false,
       mutateAsync: pageMocks.launch.mockResolvedValue({
@@ -69,11 +115,16 @@ vi.mock('@/api/hooks', async () => {
         started_execution_ids: [],
       }),
     }),
-    usePauseTask: () => noMutation,
-    useResumeTask: () => noMutation,
-    useCancelTask: () => noMutation,
+    useCreateTaskIntervention: () => ({
+      isPending: false,
+      mutateAsync: pageMocks.intervention.mockResolvedValue({ state: 'applied' }),
+    }),
   }
 })
+
+vi.mock('@/components/task-detail/task-coordination-panel', () => ({
+  TaskCoordinationPanel: () => <section>Task coordination</section>,
+}))
 
 vi.mock('@/components/task-detail/task-work-management', () => ({
   TaskWorkManagement: ({ onChanged }: { onChanged: () => Promise<unknown> }) => (
@@ -112,30 +163,48 @@ function renderCard(review: ReviewExecutionResponse) {
   return render(<ReviewExecutionCard review={review} />)
 }
 
+function expectTechnicalParagraphContaining(content: string) {
+  expect(
+    screen.getByText(
+      (_, element) => element?.tagName === 'P' && element.textContent?.includes(content) === true,
+    ),
+  ).toBeTruthy()
+}
+
 describe('ReviewExecutionCard authorization', () => {
   it('keeps a running Human Execution as history without a manual submit form', () => {
     renderCard(makeReview({ kind: 'human', id: 'user-1' }))
 
     expect(screen.getByText('Execution execution-1')).toBeTruthy()
     expect(screen.queryByLabelText('Review summary')).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' })).toBeNull()
+    expect(
+      screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' }),
+    ).toBeNull()
   })
 
   it('keeps another Human Execution visible as history without a submit action', () => {
     renderCard(makeReview({ kind: 'human', id: 'user-2' }))
 
     expect(screen.getByText('Execution execution-1')).toBeTruthy()
-    expect(screen.getByText('Actor human:user-2 · Workspace none · base none · head none')).toBeTruthy()
+    fireEvent.click(screen.getByText('Technical references'))
+    expectTechnicalParagraphContaining('Actor human:user-2')
+    expectTechnicalParagraphContaining('Base none · head none')
     expect(screen.queryByLabelText('Review summary')).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' })).toBeNull()
+    expect(
+      screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' }),
+    ).toBeNull()
   })
 
   it('never offers Human submission for an Agent Review Execution', () => {
     renderCard(makeReview({ kind: 'agent', id: 'agent-1' }))
 
     expect(screen.getByText('Execution execution-1')).toBeTruthy()
-    expect(screen.getByText('Actor agent:agent-1 · Workspace none · base none · head none')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' })).toBeNull()
+    fireEvent.click(screen.getByText('Technical references'))
+    expectTechnicalParagraphContaining('Actor agent:agent-1')
+    expectTechnicalParagraphContaining('Base none · head none')
+    expect(
+      screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' }),
+    ).toBeNull()
   })
 
   it('keeps a completed ReviewReport visible without a submit action', () => {
@@ -146,20 +215,84 @@ describe('ReviewExecutionCard authorization', () => {
 
     expect(screen.getByText('Review passed.')).toBeTruthy()
     expect(screen.queryByLabelText('Review summary')).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' })).toBeNull()
+    expect(
+      screen.queryByRole('button', { name: 'Submit ReviewReport for this Execution' }),
+    ).toBeNull()
   })
 })
 
 describe('Task WorkUnit preparation and launch', () => {
-  it('refreshes dispatch after WorkUnit setup so Launch Task becomes available', async () => {
+  it('refreshes dispatch after WorkUnit setup so ready work can be started', async () => {
     pageMocks.launch.mockClear()
     render(<TaskDetailPage taskId="task-1" initialTab="work" />)
 
-    expect(screen.queryByRole('button', { name: 'Launch Task' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Start ready work' })).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Create prepared WorkUnit' }))
-    const launch = await screen.findByRole('button', { name: 'Launch Task' })
+    const launch = await screen.findByRole('button', { name: 'Start ready work' })
     fireEvent.click(launch)
 
     await waitFor(() => expect(pageMocks.launch).toHaveBeenCalledTimes(1))
   })
+
+  it('records pause as a versioned Task intervention', async () => {
+    render(<TaskDetailPage taskId="task-1" />)
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Pause new work' })[0]!)
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Pause new work' })).at(-1)!)
+
+    await waitFor(() =>
+      expect(pageMocks.intervention).toHaveBeenCalledWith({
+        taskId: 'task-1',
+        body: {
+          kind: 'pause',
+          expected_task_version: 3,
+          expected_coordination_version: null,
+          expected_lifecycle_version: 2,
+          instruction: null,
+          plan_artifact_id: null,
+          decision: null,
+          rationale: null,
+          reason: 'requested from Task detail',
+          brief: null,
+          idempotency_key: expect.any(String),
+        },
+      }),
+    )
+  })
+})
+
+describe('Gate integration action authority', () => {
+  afterEach(() => {
+    pageMocks.gateKind = null
+    pageMocks.gateScope = 'task'
+    pageMocks.gateTask = 'task-1'
+    pageMocks.gatePolicyRevision = 2
+    pageMocks.lifecycleState = 'blocked'
+  })
+
+  it.each([
+    ['merge_readiness', 'task', 'task-1', 2, 'active', true],
+    ['review_approval', 'task', 'task-1', 2, 'active', false],
+    ['merge_readiness', 'work_unit', 'task-1', 2, 'active', false],
+    ['merge_readiness', 'task', 'other-task', 2, 'active', false],
+    ['merge_readiness', 'task', 'task-1', 3, 'active', false],
+    ['merge_readiness', 'task', 'task-1', 2, 'blocked', false],
+    ['merge_readiness', 'task', 'task-1', 2, 'ready', false],
+  ] as const)(
+    'offers readiness only for an exact supported Gate: %s / %s / %s / %s / %s',
+    async (kind, scope, taskId, policyRevision, lifecycle, allowed) => {
+      pageMocks.gateKind = kind
+      pageMocks.gateScope = scope
+      pageMocks.gateTask = taskId
+      pageMocks.gatePolicyRevision = policyRevision
+      pageMocks.lifecycleState = lifecycle
+      render(<TaskDetailPage taskId="task-1" />)
+      fireEvent.click(screen.getByRole('button', { name: /Review and integration checks/ }))
+      fireEvent.click(screen.getByRole('button', { name: 'Evaluate current inputs' }))
+      await screen.findByText('Exact inputs satisfy this check')
+      expect(Boolean(screen.queryByRole('button', { name: 'Mark ready for integration' }))).toBe(
+        allowed,
+      )
+    },
+  )
 })

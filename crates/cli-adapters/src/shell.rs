@@ -141,6 +141,7 @@ mod tests {
                 execution_id: "execution".to_owned(),
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
+                has_repository_workspace: false,
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "printf shell-adapter-ok".to_owned(),
                 agent_config: serde_json::json!({}),

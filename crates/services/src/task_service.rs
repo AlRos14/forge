@@ -2,6 +2,7 @@ use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
     merge_service::MergeService,
     terminal_service::TerminalActivityTracker,
+    work_unit_service::WorkUnitService,
     workspace_cleanup::WorkspaceCleanupScheduler,
     workspace_execution_lock::WorkspaceExecutionLockManager,
     Result, ServiceError,
@@ -14,8 +15,8 @@ use db::{
     Execution, ExecutionRepo, ExecutionStatus, ExecutionUsageRepo, HarnessSession,
     HarnessSessionRepo, HarnessSessionStatus, PageRequest, ProjectRepo, RepoRepo, SoftDeleteTask,
     SortBy, SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo, TaskMetadata, TaskRepo,
-    TaskRoleRepo, UpsertExecutionUsage, WorkUnitRepo, WorkUnitWorkspaceRepo, Workspace,
-    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    TaskRoleRepo, UpsertExecutionUsage, WorkUnit, WorkUnitProvenance, WorkUnitRepo, WorkUnitStatus,
+    WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
@@ -90,6 +91,161 @@ pub struct TaskService {
     provider_start_claim_barrier: Option<Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
     execution_provider_override: Option<Arc<dyn crate::daemon_transport::ExecutionProvider>>,
+    #[cfg(test)]
+    auto_completion_precommit_barrier: Option<Arc<tokio::sync::Barrier>>,
+}
+
+impl TaskService {
+    /// Complete a coordination-materialized delivery after its exact
+    /// Execution produced a result. This is technical completion, not review
+    /// approval; reviewed WorkUnits keep their independent review subject and
+    /// review-line advance through `WorkUnitService::transition_system`.
+    pub async fn complete_coordination_delivery_for_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<WorkUnit>> {
+        let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? else {
+            return Ok(None);
+        };
+        if execution.status != ExecutionStatus::Completed {
+            return Ok(None);
+        }
+        let Some(work_unit_id) = execution.work_unit_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(unit) = WorkUnitRepo::get_by_id(&*self.db, work_unit_id).await? else {
+            return Ok(None);
+        };
+        if unit.task_id != execution.task_id
+            || unit.status != WorkUnitStatus::Open
+            || execution.work_unit_version != Some(unit.version)
+        {
+            return Ok(None);
+        }
+        let coordination_authorization_version: Option<i64> = sqlx::query_scalar(
+            "SELECT authorization_version FROM task_coordination
+             WHERE task_id = ? AND mode != 'manual'
+               AND revoked_at IS NULL AND team_stale = 0",
+        )
+        .bind(&unit.task_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let Some(expected_authorization_version) = coordination_authorization_version else {
+            return Ok(None);
+        };
+        let provenance_eligible = match unit.provenance.as_ref() {
+            Some(WorkUnitProvenance::Artifact(artifact_id)) => {
+                let is_plan: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM artifact
+                        WHERE id = ? AND task_id = ? AND kind = 'work_unit_plan'
+                    )",
+                )
+                .bind(artifact_id)
+                .bind(&unit.task_id)
+                .fetch_one(self.db.pool())
+                .await?;
+                if is_plan {
+                    true
+                } else {
+                    // A reviewed delivery or rework correction completes only
+                    // when a durable, opt-in circuit owns this advance: an
+                    // exact quality request linked to the WorkUnit, or a
+                    // completed automatic-rework intent. Historical/manual
+                    // Tasks and arbitrary Artifact provenance stay untouched.
+                    sqlx::query_scalar(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM task_quality_request
+                            WHERE task_id = ? AND work_unit_id = ?
+                            UNION ALL
+                            SELECT 1 FROM task_rework_automation_intent
+                            WHERE task_id = ? AND correction_work_unit_id = ?
+                              AND state = 'completed'
+                        )",
+                    )
+                    .bind(&unit.task_id)
+                    .bind(&unit.id)
+                    .bind(&unit.task_id)
+                    .bind(&unit.id)
+                    .fetch_one(self.db.pool())
+                    .await?
+                }
+            }
+            _ => false,
+        };
+        if !provenance_eligible {
+            return Ok(None);
+        }
+        let has_exact_result: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM execution
+                WHERE id = ? AND task_id = ? AND work_unit_id = ?
+                  AND work_unit_version = ? AND status = 'completed'
+                  AND (
+                      after_sha IS NOT NULL
+                      OR EXISTS (
+                          SELECT 1 FROM execution_artifact_output output
+                          WHERE output.execution_id = execution.id
+                            AND output.task_id = execution.task_id
+                      )
+                  )
+            )",
+        )
+        .bind(&execution.id)
+        .bind(&unit.task_id)
+        .bind(&unit.id)
+        .bind(unit.version)
+        .fetch_one(self.db.pool())
+        .await?;
+        if !has_exact_result {
+            return Ok(None);
+        }
+        let task_terminal: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_lifecycle
+                WHERE task_id = ? AND state IN ('cancelled', 'done', 'merging')
+            )",
+        )
+        .bind(&unit.task_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if task_terminal {
+            return Ok(None);
+        }
+        let (Some(repo_cache_locks), Some(workspace_exec_locks)) = (
+            self.repo_cache_locks.clone(),
+            self.workspace_exec_locks.clone(),
+        ) else {
+            return Ok(None);
+        };
+        let service = WorkUnitService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+            self.workspace_root.clone(),
+            repo_cache_locks,
+            workspace_exec_locks,
+        );
+        #[cfg(test)]
+        if let Some(barrier) = self.auto_completion_precommit_barrier.as_ref() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        match service
+            .transition_system(
+                &unit.id,
+                unit.version,
+                WorkUnitStatus::Completed,
+                Some(expected_authorization_version),
+            )
+            .await
+        {
+            Ok(unit) => Ok(Some(unit)),
+            Err(ServiceError::Db(db::DbError::VersionConflict))
+            | Err(ServiceError::Db(db::DbError::InvalidTransition))
+            | Err(ServiceError::InvalidOperation { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 pub(crate) struct WorkUnitAdmissionLifecyclePlan {
@@ -473,6 +629,8 @@ impl TaskService {
             provider_start_claim_barrier: None,
             #[cfg(test)]
             execution_provider_override: None,
+            #[cfg(test)]
+            auto_completion_precommit_barrier: None,
         }
     }
 
@@ -491,6 +649,15 @@ impl TaskService {
         barrier: Arc<tokio::sync::Barrier>,
     ) -> Self {
         self.provider_start_claim_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_auto_completion_precommit_barrier(
+        mut self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.auto_completion_precommit_barrier = Some(barrier);
         self
     }
 

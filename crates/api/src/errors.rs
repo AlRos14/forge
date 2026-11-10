@@ -262,6 +262,23 @@ impl From<ServiceError> for ApiError {
                 }),
             ),
             ServiceError::Conflict(message) => Self::conflict_with_code("conflict", message),
+            ServiceError::Coordination { code, message } => {
+                let status = if code.ends_with("not_authorized") {
+                    StatusCode::FORBIDDEN
+                } else if code.ends_with("host_unavailable") {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else if code.ends_with("invalid_plan")
+                    || code.ends_with("unsupported_plan_item")
+                    || code.ends_with("human_turn_unsupported")
+                {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                } else if code.ends_with("budget_exhausted") {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::CONFLICT
+                };
+                Self { status, code, message, details: None }
+            }
             ServiceError::DaemonUnavailable { daemon_id } => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "daemon_unavailable",

@@ -8,11 +8,16 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { getApiErrorMessage } from '@/lib/api-error'
+import { resolveActorIdentity } from '@/features/task-roles/ActorIdentity'
 import type {
   ActorRef,
+  AgentResponse,
+  DaemonResponse,
+  ProjectMemberResponse,
   ReviewExecutionResponse,
   Task,
   TaskRoleResponse,
+  WorkUnitResponse,
 } from '@/types/generated'
 
 type ReworkSubject = {
@@ -71,10 +76,18 @@ export function TaskReworkPanel({
   task,
   review,
   onChanged,
+  agents = [],
+  members = [],
+  daemons = [],
+  workUnits = [],
 }: {
   task: Task
   review: ReviewExecutionResponse
   onChanged: () => Promise<unknown>
+  agents?: AgentResponse[]
+  members?: ProjectMemberResponse[]
+  daemons?: DaemonResponse[]
+  workUnits?: WorkUnitResponse[]
 }) {
   const subject = useMemo(() => parseReworkSubject(review), [review])
   const requestRework = useRequestRework()
@@ -121,6 +134,11 @@ export function TaskReworkPanel({
   const configuredCorrectionActor = reworkPolicy?.correction_actor
   const correctionActorRequired = !configuredCorrectionActor
   const configuredReviewActor = reworkPolicy?.review_actor
+  const reviewedUnit = workUnits.find((unit) => unit.id === subject.reviewedWorkUnitId)
+  const actorDisplay = (actor: ActorRef) => {
+    const identity = resolveActorIdentity(actor, agents, members, daemons)
+    return `${identity.name} · ${identity.context}`
+  }
 
   async function submit() {
     if (!review.report || !subject) return
@@ -181,9 +199,12 @@ export function TaskReworkPanel({
       <div>
         <h4 className="text-sm font-semibold">Request correction and new review</h4>
         <p className="text-xs text-muted-foreground">
-          The reviewed WorkUnit {subject.reviewedWorkUnitId} v
-          {String(subject.reviewedWorkUnitVersion)} stays unchanged. This creates a
-          correction WorkUnit and a new reviewer WorkUnit with an exact result subject.
+          The reviewed WorkUnit{' '}
+          <span className="font-medium text-foreground">
+            {reviewedUnit?.title ?? subject.reviewedWorkUnitId}
+          </span>{' '}
+          v{String(subject.reviewedWorkUnitVersion)} stays unchanged. This creates a correction
+          WorkUnit and a new reviewer WorkUnit with an exact result subject.
         </p>
       </div>
       {automationIntent?.state === 'pending' ? (
@@ -254,7 +275,7 @@ export function TaskReworkPanel({
             <option value="">Choose an active member of the correction role</option>
             {correctionMembers.map((actor) => (
               <option key={actorKey(actor)} value={actorKey(actor)}>
-                {actor.kind}:{actor.id}
+                {actorDisplay(actor)}
               </option>
             ))}
           </select>
@@ -284,7 +305,7 @@ export function TaskReworkPanel({
             <option value="">Choose an active member of the next review role</option>
             {reviewerMembers.map((actor) => (
               <option key={actorKey(actor)} value={actorKey(actor)}>
-                {actor.kind}:{actor.id}
+                {actorDisplay(actor)}
               </option>
             ))}
           </select>

@@ -52,6 +52,70 @@ TaskRole and RoleMembership govern eligibility. WorkUnit allocation names the ex
 
 Forge's Orchestrator reacts to durable domain events. Its implemented output set is bounded to Messages, Handoffs, limited WorkUnit creation, and Proposals. It does not directly steer or stop a harness, reassign work, merge repositories, or execute a Proposal or Decision. Human and Agent actions remain subject to the same domain authority.
 
+Task coordination adds a bounded preparation turn over the same durable wake and
+Execution machinery. A Human authorizes a mode, exact coordinator TaskRole and
+Actor, current team digest, and envelope. The `task.coordination_requested`
+event admits an exact-Actor workspace-free wake; its Execution returns one
+`work_unit_plan` Artifact. The model cannot create TaskRoles, memberships,
+capabilities, WorkUnits, or worker Starts. Deterministic materialization validates
+the exact plan, envelope, team, Task version, and authorization version and
+creates WorkUnits, dependencies, review subjects, and Artifact input pins in one
+transaction with an idempotent receipt. V160 marks the authorization stale on
+any TaskRole, capability, or membership mutation; materialization and Provider
+Start revalidate revocation, team state, dispatch, lifecycle, and the exact
+coordination request under their own write locks. `manual` remains the default
+for existing Tasks, and no coordination turn is triggered retrospectively.
+Quality requests and the versioned intervention circuit are separate durable
+records; they do not replace TaskLifecycle, review, Gate, or collaboration
+authority. A durable quality consumer follows the exact report/rework chain:
+delivery corrections only link the WorkUnit created by that exact ReviewReport,
+repeated rounds stay on the same chain, and resolution requires the independent
+review verdict to pass. Specialist requests create linked WorkUnits; plan
+revisions open a coordination turn. Quality-linked WorkUnits complete
+technically when their Execution finishes, but a delivery correction is never
+resolved by that completion alone.
+
+Each quality chain also has a persisted four-request quality-routing budget.
+Review requests on one `work_unit_review_line` share the same route identity
+across new reports, corrections, category changes, and destination-role
+changes. When three unresolved requests target roles A, B, A in order, Forge
+records a durable `requires_human` escalation with the exact request and
+TaskRole IDs. Budget exhaustion, a pending escalation, and failures discovered
+by the durable quality consumer also persist a concrete reason on the request.
+Replays do not consume another
+global or route round; `BEGIN IMMEDIATE` serializes concurrent admissions.
+The existing eight-round rework receipt limit remains separate. Migration V161
+backfills route accounting for existing quality requests without changing their
+states or replaying them.
+
+Materialization prepares runnable, assigned Agent repository scopes through the
+existing WorkUnit workspace service before requesting launch. The running
+dispatcher prepares later dependent plan scopes and exact quality/rework
+corrections when they become ready. Manual Tasks and unassigned or Human scopes
+are not automatically prepared. A materialization replay reuses its receipt and
+can retry preparation and launch; it never duplicates WorkUnits. Workspace
+preparation does not itself grant an Execution or provider Start.
+
+Materialization also creates a durable review line and a WorkUnit-scoped
+`review_approval` Gate for each formal review subject. Any materialized WorkUnit
+that directly depends on the review consumes that Gate and line, so it cannot
+start until the latest review verdict passes. Technical completion by the
+Orchestrator runtime is opt-in and fenced: it requires a current non-manual
+Task coordination authorization, no revocation or team staleness, and either a
+plan-materialized delivery, an exact quality-request-linked correction, or a
+completed automatic-rework intent. Historical/manual Tasks and arbitrary
+Artifact/review rows stay untouched. The exact authorization version, mode,
+revocation, and team staleness are revalidated again inside the same
+`BEGIN IMMEDIATE` transaction that completes the WorkUnit and freezes its
+result, so a revocation or mode change winning the race leaves zero automatic
+effect. Completion is not approval.
+
+The delivered coordination slice covers PR1–PR2, the PR4 quality-routing
+circuit with per-route budgets and pending-role cycle escalation, technical
+completion of plan deliveries, and automatic review Gate linkage. Remaining
+product scope is PR6 joint UI and provider/host acceptance. The program must not
+be presented as PR1–PR6 complete.
+
 Automatic Orchestrator execution requires the Agent owner and Task Project owner to be the same account, with a current Project owner/admin/member membership. Global Agent visibility supports discovery and TaskRole membership; it does not grant cross-account execution. Forge has no cross-account Agent execution grants, so a missing or mismatched owner or membership fails closed at Execution admission and the transactional Provider Start claim.
 
 ## Harnesses and Executions
@@ -68,7 +132,7 @@ authority continue to use the contracts below.
 
 A Human Execution has no HarnessSession. An Agent Execution references a HarnessSession explicitly when continuity is used. Resume never selects a session by Task, Role, Agent model label, or latest Execution.
 
-Execution admission and external provider Start are separate durable boundaries. Forge commits the Running Execution, its exact WorkspaceLease when required, the `execution.started` event, and a pending Provider Start receipt together. Before sending Start, it atomically records that one attempt has been claimed. An accepted or rejected result is replayed from the receipt. An uncertain result is exposed as `execution_start_uncertain` and does not authorize another provider Start.
+Execution admission and external provider Start are separate durable boundaries. Forge commits the Running Execution, its exact WorkspaceLease when required, the `execution.started` event, and a pending Provider Start receipt together. Before sending Start, it atomically records that one attempt has been claimed. An accepted or rejected result is replayed from the receipt. An uncertain result is exposed as `execution_start_uncertain` and does not authorize another provider Start. Execution updates, exact review-subject freezing, HarnessSession result binding, durable event checkpoints, and Orchestrator attempt reservation acquire the SQLite writer before reading the state they will mutate. This prevents WAL read-to-write upgrade failures while preserving the same authority and version checks.
 
 ## Workspaces and integration
 
@@ -90,7 +154,7 @@ A Gate is a deterministic policy over exact durable records. Its immutable GateE
 
 ## Persistence and history
 
-SQLite is the current persistence layer. Numbered migrations V001–V156 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt.
+SQLite is the current persistence layer. Numbered migrations V001–V161 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add the Task coordination authorization, turn, plan, materialization, quality-request, intervention, team-staleness, and quality-resolution records described by the PR0 contract. V161 adds persisted quality-route counters, exact cycle evidence, and inspectable Human-escalation reasons; it preserves historical request states.
 
 Historical `agent_session_history`, immutable Execution records, ProjectRelease snapshots, Artifact and Evidence references, HarnessSession identities, cross-record IDs, migration decisions, ADRs, and upstream license attribution remain readable history. History does not regain runtime authority. ProjectRelease is a read-only historical snapshot and does not create a current Charter, milestone, readiness workflow, or release operation.
 
@@ -162,3 +226,17 @@ ownership for historical records during a container migration.
 ## Upstream
 
 Forge originated from [ForgeAILab/forge](upstream.md). The origin and MIT attribution remain. This repository is independently maintained and does not promise architectural or release compatibility with upstream. See [upstream relationship](upstream.md).
+
+## Task operating model — backend implemented, UI acceptance pending
+
+The owner-approved [task operating model](concepts/task-operating-model.md)
+separates Project Copilot assistance from end-to-end Task coordination and makes
+objective, team, and authorization the primary user journey. Worker WorkUnits,
+leases, exact evidence, and TaskLifecycle authority remain mandatory. This is a
+target contract, not a claim that the current runtime supports the whole journey.
+The [PR0 contract](plans/pr0-task-coordination-contract.md) and
+[ADR 0016](adr/0016-task-coordination-turn.md) fix the coordination start,
+authority matrix, durable records, recovery rules, and UX states. The backend
+vertical slice (V158–V161, services, REST/MCP/CLI/SSE, generated types) is
+implemented. The guided UI is integrated; joint acceptance remains in progress. See the
+[system review and implementation sequence](plans/task-coordination-and-guided-experience.md).

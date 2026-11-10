@@ -31,10 +31,12 @@ export function WorkUnitHumanReviewPanel({
   task,
   unit,
   currentUserId,
+  workUnits = [],
 }: {
   task: Task
   unit: WorkUnitResponse
   currentUserId: string | undefined
+  workUnits?: WorkUnitResponse[]
 }) {
   const subject = unit.review_subject
   const [report, setReport] = useState<SubmitReviewReportRequest | null>(() =>
@@ -47,6 +49,9 @@ export function WorkUnitHumanReviewPanel({
   }, [subject])
   const submitReview = useSubmitWorkUnitReviewReport()
   const reviewerRole = task.task_roles.find((role) => role.role === unit.role)
+  const reviewedUnit = subject
+    ? workUnits.find((candidate) => candidate.id === subject.reviewed_work_unit_id)
+    : undefined
   const hasFormalReview = reviewerRole?.configuration.capabilities.includes('formal_review') ?? false
   const isAssignedReviewer = Boolean(
     hasFormalReview && currentUserId &&
@@ -79,7 +84,8 @@ export function WorkUnitHumanReviewPanel({
       <article className="rounded-lg border p-4 text-sm">
         <h3 className="font-semibold">{unit.title}</h3>
         <p className="mt-1 text-muted-foreground">
-          Waiting for the exact result of WorkUnit {subject.reviewed_work_unit_id}
+          Waiting for the exact result of WorkUnit{' '}
+          {reviewedUnit?.title ?? subject.reviewed_work_unit_id}
           {subject.reviewed_work_unit_version == null
             ? ''
             : ` v${String(subject.reviewed_work_unit_version)}`}.
@@ -125,7 +131,7 @@ export function WorkUnitHumanReviewPanel({
       <div>
         <h3 className="font-semibold">Human review · {unit.title}</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          Exact subject: WorkUnit {subject.reviewed_work_unit_id} v
+          Exact subject: {reviewedUnit?.title ?? `WorkUnit ${subject.reviewed_work_unit_id}`} v
           {String(subject.reviewed_work_unit_version)}
           {subject.result_execution_id ? ` · Execution ${subject.result_execution_id}` : ''}
           {subject.result_artifact_id ? ` · Artifact ${subject.result_artifact_id}` : ''}

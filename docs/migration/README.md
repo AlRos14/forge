@@ -31,3 +31,15 @@ These are implementation proposals, not current runtime contracts:
 
 Each plan includes a separate agent brief, file ownership, acceptance criteria,
 and a final integration boundary. Neither authorizes changing live Tasks.
+
+## Accepted follow-up product direction — implementation pending
+
+- [Task operating model](../concepts/task-operating-model.md): owner-approved
+  responsibility and UX contract, distinct from current runtime behavior.
+- [Task coordination and guided experience](../plans/task-coordination-and-guided-experience.md):
+  whole-system boundary review, bootstrap decision, implementation slices and
+  shared backend/UI acceptance.
+- [PR0 — Task coordination contract](../plans/pr0-task-coordination-contract.md)
+  and [ADR 0016](../adr/0016-task-coordination-turn.md): the accepted
+  coordination-start contract, authority matrix, record shapes, recovery rules
+  and UX states. PR1–PR6 remain implementation work.

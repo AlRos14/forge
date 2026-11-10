@@ -1105,6 +1105,7 @@ async fn orchestrator_execution_admission_rechecks_project_account() {
             policy_digest: "digest-v1".to_owned(),
             task_role_version: 2,
             task_role_policy_json: "{}".to_owned(),
+            coordination_request_id: None,
             available_at: now.clone(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1391,6 +1392,7 @@ async fn pr6_action_effect_guard_is_atomic_for_each_typed_result_mapping() {
             policy_digest: "digest-v1".to_owned(),
             task_role_version: 2,
             task_role_policy_json: "{}".to_owned(),
+            coordination_request_id: None,
             available_at: now.clone(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1813,6 +1815,7 @@ async fn pr6_wake_admission_is_deduplicated_and_lease_expiry_is_retryable() {
         policy_digest: "digest-v1".to_owned(),
         task_role_version: 2,
         task_role_policy_json: "{}".to_owned(),
+        coordination_request_id: None,
         available_at: now.to_owned(),
         created_at: now.to_owned(),
         updated_at: now.to_owned(),
@@ -1940,6 +1943,7 @@ async fn pr6_cross_task_event_cannot_admit_an_orchestrator_wake() {
             policy_digest: "digest-v1".to_owned(),
             task_role_version: 2,
             task_role_policy_json: "{}".to_owned(),
+            coordination_request_id: None,
             available_at: now_rfc3339(),
             created_at: now_rfc3339(),
             updated_at: now_rfc3339(),
@@ -2032,6 +2036,7 @@ async fn pr6_two_sqlite_pools_compete_for_event_and_wake_authority() {
             policy_digest: "digest-v1".to_owned(),
             task_role_version: 2,
             task_role_policy_json: "{}".to_owned(),
+            coordination_request_id: None,
             available_at: now.to_owned(),
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
@@ -2087,6 +2092,7 @@ async fn pr6_action_reservation_reuses_one_uuid_and_rejects_changed_replay() {
             policy_digest: "digest-v1".to_owned(),
             task_role_version: 2,
             task_role_policy_json: "{}".to_owned(),
+            coordination_request_id: None,
             available_at: now.clone(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -5367,6 +5373,124 @@ async fn sqlite_repo_create_rejects_missing_remote_url() {
         .map_err(crate::DbError::from);
 
     assert!(matches!(result, Err(DbError::Sqlx(_))));
+}
+
+#[tokio::test]
+async fn execution_read_write_updates_wait_for_a_concurrent_sqlite_writer() {
+    let directory = tempfile::tempdir().expect("database directory");
+    let url = format!(
+        "sqlite://{}",
+        directory.path().join("dispatch.sqlite").display()
+    );
+    let pool = create_sqlite_pool(&url).await.expect("pool");
+    run_migrations(&pool).await.expect("migrations");
+    let db = std::sync::Arc::new(SqliteDb::new(pool));
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        Some(&agent_id),
+        "review".to_owned(),
+        "Dispatch contention",
+    )
+    .await;
+    let now = now_rfc3339();
+    let execution_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &*db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id),
+            actor_ref: None,
+            harness_session_id: None,
+            role: "auditor".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("execution");
+    for with_event in [false, true] {
+        let mut writer = db
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("writer lock");
+        sqlx::query("UPDATE task SET updated_at = updated_at WHERE id = ?")
+            .bind(&task_id)
+            .execute(&mut *writer)
+            .await
+            .expect("concurrent durable write");
+        let pending_db = std::sync::Arc::clone(&db);
+        let input = UpdateExecution {
+            id: execution_id.clone(),
+            status: None,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            external_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: Some(Some("dispatch.jsonl".to_owned())),
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now.clone(),
+        };
+        let event = CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "execution.activity_recorded".to_owned(),
+            entity_type: "execution".to_owned(),
+            entity_id: execution_id.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: task_id.clone(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".to_owned(),
+            created_at: now.clone(),
+        };
+        let mut pending = tokio::spawn(async move {
+            if with_event {
+                ExecutionRepo::update_with_event(&*pending_db, input, event)
+                    .await
+                    .map(|(execution, _)| execution)
+            } else {
+                ExecutionRepo::update(&*pending_db, input).await
+            }
+        });
+        let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut pending).await;
+        assert!(early.is_err(), "a write must wait for the writer instead of failing a deferred read-to-write upgrade: {early:?}");
+        writer.commit().await.expect("release writer");
+        let result = pending
+            .await
+            .expect("update task")
+            .expect("update succeeds after lock release");
+        assert_eq!(result.logs_path.as_deref(), Some("dispatch.jsonl"));
+    }
 }
 
 #[tokio::test]

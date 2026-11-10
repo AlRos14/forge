@@ -44,6 +44,7 @@ pub mod providers;
 pub mod repos;
 pub mod reviews;
 pub mod settings;
+pub mod task_coordination;
 pub mod task_dispatch;
 pub mod task_rework;
 pub mod tasks;

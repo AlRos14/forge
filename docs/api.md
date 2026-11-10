@@ -207,6 +207,106 @@ barrier compatibility columns after archiving their exact values. Workflow
 templates, transition logs, and legacy GateConfig do not advance TaskLifecycle;
 their source records remain only in migration history where preserved.
 
+## Task coordination
+
+Task coordination prepares work from a Task objective without requiring the
+Human to create implementation WorkUnits first. It is separate from worker
+Execution. `manual` keeps the existing flow; `proposal` produces an
+inspectable `work_unit_plan` and waits for Human approval; `prepare_and_execute`
+materializes an in-envelope plan and records the normal Task launch intent. The
+coordinator turn is a workspace-free, read-only Execution admitted through the
+existing Orchestrator wake machinery. It is not a WorkUnit and does not grant
+repository, worker, Gate, review, merge, or TaskLifecycle authority.
+TaskLifecycle remains the sole aggregate Task state authority.
+
+All routes require Task visibility; mutations require current Project write
+authority and exact expected versions. Record shapes and the authority matrix
+are in [the PR0 contract](plans/pr0-task-coordination-contract.md).
+
+| Method and route | Effect |
+|---|---|
+| `GET /tasks/{id}/coordination` | Read the current authorization version, resolved team (names, harness/host, capabilities), envelope, blockers, latest turn, latest plan, lifecycle, and dispatch intent. `0 WorkUnits` is a valid starting state. |
+| `POST /tasks/{id}/coordination/authorize` | Create or replace the versioned authorization. Body: `expected_task_version`, `expected_coordination_version`, `mode`, optional exact `coordinator_task_role_id` and `coordinator_actor`, optional `envelope`, `idempotency_key`. The coordinator TaskRole must currently have `orchestration` capability and the Actor must be an active member. |
+| `POST /tasks/{id}/coordination/revoke` | Revoke the authorization, advance its version, and preserve existing WorkUnits, plans, and history. Running Executions are not silently stopped. |
+| `POST /tasks/{id}/coordination/requests` | Request one bounded turn. Body: expected Task/coordination versions, `objective`, optional `constraints`/`context`, `acceptance_criteria`, idempotency key. A Human coordinator returns `422 coordination.human_turn_unsupported`; use manual editing. Replays return the same request. |
+| `GET /tasks/{id}/coordination/requests/{request_id}` | Read the exact turn state, wake, Execution, failure reason, plan Artifact, and brief. |
+| `GET /tasks/{id}/coordination/plans/{artifact_id}` | Read the inspectable plan and its parsed WorkUnits, roles, Actors, dependencies, review subjects, proposal/decision, and materialization receipt. |
+| `POST /tasks/{id}/coordination/plans/{artifact_id}/approve` | Approve or reject one exact plan by digest. Approval records a `Decision` on the exact open Proposal; a changed digest or Proposal version returns a typed conflict. |
+| `POST /tasks/{id}/coordination/plans/{artifact_id}/materialize` | Atomically create WorkUnits, dependencies, review subjects, and Artifact input pins from one approved plan, with a deterministic replay receipt. The operation also records the normal launch intent; dispatch still revalidates every worker assignment, capability, and lease. A paused Task returns `409 coordination.paused`. |
+| `GET/POST /tasks/{id}/coordination/quality-requests` | List or create structured quality requests. Categories are `delivery_correction`, `plan_revision`, `specialist`, and `human_decision`; targets are `implementation`, `orchestrator`, `specialist`, or `human`. Creation records routing facts and consumes the Task-global and exact-route budgets atomically; a deterministic Handoff is informational. An optional `source_execution_id` attributes a ReviewReport-sourced request to the exact reviewer Execution instead of the calling Human. The durable consumer creates or links a correction/specialist WorkUnit or opens a plan-revision turn. Responses include `work_unit_id`, `coordination_request_id`, exact resolution evidence, and `quality_route` with stable `id`, `round`, `limit`, and source TaskRole. Review reports on the same review line share a route even when category or destination role changes. |
+| `POST /tasks/{id}/coordination/quality-requests/{request_id}/resolve` | Resolve, cancel, or escalate one exact request using its version. |
+| `GET/POST /tasks/{id}/coordination/interventions` | Read or create one versioned Human/Copilot intervention. Kinds are `instruction`, `decision`, `pause`, `resume`, `cancel`, `revoke_authorization`, and `request_replan`. Project Copilot may record an instruction through this same circuit; it cannot request a replan, pause, cancel, revoke, approve, or decide. |
+
+After atomic materialization commits, ready assigned Agent repository scopes
+are prepared through the existing WorkUnit workspace service before launch.
+Preparation failures are returned in `launch_blockers`; the plan receipt and
+WorkUnits remain durable. Replaying materialization reuses that receipt and
+retries preparation/launch under its exact current authorization. It creates no
+duplicate WorkUnits. The running dispatcher prepares later dependent plan and
+exact quality/rework scopes when ready. Manual Tasks and Human/unassigned
+scopes retain their existing preparation path.
+
+Typed coordination errors use `403 coordination.not_authorized`,
+`409 coordination.version_conflict`, `409 coordination.authorization_stale`,
+`409 coordination.plan_digest_mismatch`, `409 coordination.idempotency_conflict`,
+`409 coordination.already_materialized`, `409 coordination.plan_not_approved`,
+`409 coordination.paused`, `422 coordination.invalid_plan`,
+`422 coordination.unsupported_plan_item`, `422 coordination.human_turn_unsupported`,
+`429 coordination.budget_exhausted`, and `503 coordination.host_unavailable`.
+
+The coordinator turn output is one JSON `work_unit_plan` object with
+`schema_version: 1`, exact request/authorization/team/envelope/objective
+digests, and at most four WorkUnits. WorkUnit IDs are generated by Forge during
+materialization; the model cannot choose IDs, create TaskRoles, change
+memberships or capabilities, request merge, or grant worker authority.
+
+Public SSE events are `task.coordination_authorized`,
+`task.coordination_revoked`, `task.coordination_requested`,
+`task.coordination_turn_started`, `task.coordination_request_state_changed`,
+`task.coordination_plan_proposed`, `task.coordination_plan_approved`,
+`task.coordination_plan_rejected`, `task.coordination_plan_materialized`,
+`task.quality_requested`, `task.quality_request_resolved`,
+`task.intervention_recorded`, and `task.intervention_state_changed`. They carry
+IDs, states, versions, digests, route counters, and safe escalation codes; never
+plan content, prompts, briefs, free-form escalation text, credentials, or paths.
+`task.quality_requested` carries `state`, `route_id`, `route_round`,
+`route_limit`, the safe escalation code, and exact cycle request/TaskRole IDs
+when present. The free-form reason remains available on the durable request
+response only.
+
+Quality requests are limited to four admissions per durable source chain,
+in addition to the existing Task-global budget. The eight-round exact rework
+receipt limit remains independent. If unresolved route requests target roles
+A, B, then A, the third request is persisted as `requires_human` with
+`quality_route.escalation.reason_code = "coordination.quality_route_ping_pong"`.
+The escalation includes the exact cycle request IDs and TaskRole IDs. Route or
+global budget exhaustion, and failures discovered by the durable quality
+consumer, also return a durable `requires_human` state with an inspectable
+reason; these conditions do not create an unlinked WorkUnit or replace review
+evidence. V161 marks older `requires_human` requests with an explicit
+`coordination.legacy_reason_unavailable` reason when no original reason was
+stored, without changing their state.
+
+Example response fragment:
+
+```json
+{
+  "state": "requires_human",
+  "quality_route": {
+    "id": "review_line:line_123",
+    "round": 3,
+    "limit": 4,
+    "source_task_role_id": "role_reviewer",
+    "escalation": {
+      "reason_code": "coordination.quality_route_ping_pong",
+      "reason": "pending quality targets alternate between TaskRoles ...",
+      "cycle_request_ids": ["quality_1", "quality_2", "quality_3"],
+      "cycle_task_role_ids": ["role_a", "role_b", "role_a"]
+    }
+  }
+}
+```
+
 ## Task dispatch
 
 Task dispatch is the durable intent to admit prepared WorkUnits. It is owned by
@@ -496,6 +596,17 @@ The MCP server advertises only registered tools. The current tool names are:
   `forge_list_agent_profiles`, `forge_list_task_messages`,
   `forge_list_task_handoffs`, `forge_list_task_proposals`,
   `forge_list_task_decisions`.
+- Task coordination: `forge_get_task_coordination`,
+  `forge_authorize_task_coordination`, `forge_revoke_task_coordination`,
+  `forge_request_task_coordination`, `forge_approve_task_coordination_plan`,
+  `forge_materialize_task_coordination_plan`,
+  `forge_list_task_quality_requests`, `forge_create_task_quality_request`,
+  `forge_resolve_task_quality_request`, `forge_list_task_interventions`,
+  `forge_create_task_intervention`. They call the same service and authorization
+  boundaries as REST. The Project Copilot delegation exposes only
+  `forge_get_task_coordination`, `forge_list_task_interventions`, and
+  `forge_create_task_intervention`; the last accepts only an instruction for a
+  live Task-scoped run.
 
 `forge_launch_task` requires the Task ID, expected Task and TaskLifecycle
 versions, and an idempotency key. It records dispatch intent; the dispatcher

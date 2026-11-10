@@ -1,14 +1,38 @@
 import { fireEvent, render, screen } from '@testing-library/react'
+import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useCreateTask, useTasksQuery, useTransitionTaskLifecycle } from '@/api/hooks'
 import { BoardPage } from '@/features/board/BoardPage'
 import type { Task } from '@/types/generated'
 
-vi.mock('@tanstack/react-router', () => ({ useNavigate: () => vi.fn() }))
+vi.mock('@tanstack/react-router', () => ({
+  useNavigate: () => vi.fn(),
+  Link: ({ children }: { children: ReactNode }) => <a>{children}</a>,
+}))
 vi.mock('@/api/hooks', () => ({
   useCreateTask: vi.fn(),
   useTasksQuery: vi.fn(),
   useTransitionTaskLifecycle: vi.fn(),
+  useProjectQuery: () => ({ data: { owner_id: 'owner-1' }, isError: false, isLoading: false }),
+  useProjectTaskRoleDefaultsQuery: () => ({
+    data: { roles: [] },
+    isError: false,
+    isLoading: false,
+    refetch: vi.fn(),
+  }),
+  useMembersQuery: () => ({ data: [], isError: false, isLoading: false, refetch: vi.fn() }),
+  useAgentsInfiniteQuery: () => ({
+    data: { pages: [] },
+    isError: false,
+    isLoading: false,
+    refetch: vi.fn(),
+  }),
+  useDaemonsQuery: () => ({
+    data: { items: [] },
+    isError: false,
+    isLoading: false,
+    refetch: vi.fn(),
+  }),
 }))
 
 describe('BoardPage TaskLifecycle authority', () => {

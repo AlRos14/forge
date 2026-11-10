@@ -1,5 +1,11 @@
 # Orchestration
 
+> Diseño objetivo aprobado, todavía pendiente de implementación:
+> [modelo operativo de tareas y UX](task-operating-model.md). Define la
+> separación Copilot/Orquestador, preparación desde objetivo y rutas de calidad.
+> El resto de este documento describe el contrato actual salvo indicación expresa.
+
+
 An orchestrator is an Actor admitted under a TaskRole with the `orchestration`
 capability. The capability directs active work across Actors; it is not a
 super-agent runtime and not a continuous reviewer. The TaskRole name is an
@@ -154,3 +160,19 @@ steering is native, emulated, queued for a later turn, or unsupported. A
 successful queue is not reported as native live steering. Stop/resume fallback
 requires explicit policy. PR6 does not expose a direct steering operation;
 Messages and Handoffs remain durable communication records only.
+
+## Task coordination turns
+
+A Task may authorize a bounded coordination turn through the versioned Task
+coordination record. The turn reuses the Orchestrator wake, attempt, Execution,
+and provider-Start receipt machinery but has its own JSON output contract: one
+`work_unit_plan` Artifact. It is workspace-free and read-only, creates no
+WorkUnits, and cannot grant TaskRole, membership, capability, worker, Gate,
+review, merge, or TaskLifecycle authority.
+
+The plan is inspectable and immutable. A separate deterministic materialization
+validates the exact plan digest, authorization version, team digest, envelope,
+Task version, roles, Actors, dependency/parent graph, review independence, and
+Artifact inputs before creating WorkUnits in one transaction with an idempotent
+receipt. `manual` remains the default. See the
+[PR0 contract](../plans/pr0-task-coordination-contract.md).

@@ -147,6 +147,95 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
         | "proposal.created"
         | "proposal.withdrawn"
         | "decision.recorded" => json!({}),
+        "task.coordination_authorized" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "mode",
+                "authorization_version",
+                "team_digest",
+                "envelope_digest",
+            ],
+        ),
+        "task.coordination_revoked" => {
+            project_fields(&source, &["task_id", "authorization_version"])
+        }
+        "task.coordination_requested" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "request_id",
+                "mode",
+                "authorization_version",
+                "objective_digest",
+            ],
+        ),
+        "task.coordination_turn_started" => project_fields(
+            &source,
+            &["task_id", "request_id", "wake_id", "execution_id"],
+        ),
+        "task.coordination_request_state_changed" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "request_id",
+                "state",
+                "failure_code",
+                "proposal_id",
+            ],
+        ),
+        "task.coordination_plan_proposed"
+        | "task.coordination_plan_approved"
+        | "task.coordination_plan_rejected" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "plan_artifact_id",
+                "request_id",
+                "plan_digest",
+                "state",
+                "proposal_id",
+                "decision_id",
+            ],
+        ),
+        "task.coordination_plan_materialized" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "plan_artifact_id",
+                "request_id",
+                "plan_digest",
+                "receipt_id",
+                "work_unit_ids",
+            ],
+        ),
+        "task.quality_requested" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "quality_request_id",
+                "category",
+                "target_kind",
+                "source_kind",
+                "state",
+                "route_id",
+                "route_round",
+                "route_limit",
+                "requires_human_reason_code",
+                "cycle_request_ids",
+                "cycle_task_role_ids",
+            ],
+        ),
+        "task.quality_request_resolved" => {
+            project_fields(&source, &["task_id", "quality_request_id", "state"])
+        }
+        "task.intervention_recorded" => {
+            project_fields(&source, &["task_id", "intervention_id", "kind"])
+        }
+        "task.intervention_state_changed" => project_fields(
+            &source,
+            &["task_id", "intervention_id", "state", "failure_code"],
+        ),
         // In particular, legacy Review-row events are not current Review
         // authority and never enter the public stream.
         _ => return None,
@@ -224,6 +313,21 @@ fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
         "proposal.created" => PublicEventType::ProposalCreated,
         "proposal.withdrawn" => PublicEventType::ProposalWithdrawn,
         "decision.recorded" => PublicEventType::DecisionRecorded,
+        "task.coordination_authorized" => PublicEventType::TaskCoordinationAuthorized,
+        "task.coordination_revoked" => PublicEventType::TaskCoordinationRevoked,
+        "task.coordination_requested" => PublicEventType::TaskCoordinationRequested,
+        "task.coordination_turn_started" => PublicEventType::TaskCoordinationTurnStarted,
+        "task.coordination_request_state_changed" => {
+            PublicEventType::TaskCoordinationRequestStateChanged
+        }
+        "task.coordination_plan_proposed" => PublicEventType::TaskCoordinationPlanProposed,
+        "task.coordination_plan_approved" => PublicEventType::TaskCoordinationPlanApproved,
+        "task.coordination_plan_rejected" => PublicEventType::TaskCoordinationPlanRejected,
+        "task.coordination_plan_materialized" => PublicEventType::TaskCoordinationPlanMaterialized,
+        "task.quality_requested" => PublicEventType::TaskQualityRequested,
+        "task.quality_request_resolved" => PublicEventType::TaskQualityRequestResolved,
+        "task.intervention_recorded" => PublicEventType::TaskInterventionRecorded,
+        "task.intervention_state_changed" => PublicEventType::TaskInterventionStateChanged,
         _ => return None,
     })
 }
@@ -366,6 +470,44 @@ mod tests {
         assert_eq!(projected.event_type, PublicEventType::TaskLifecycleChanged);
         assert_eq!(projected.payload.as_ref().unwrap()["to_state"], "active");
         assert!(projected.payload.as_ref().unwrap().get("prompt").is_none());
+    }
+
+    #[test]
+    fn coordination_plan_event_projection_excludes_content_and_prompts() {
+        let event = domain_event(
+            "task.coordination_plan_proposed",
+            r#"{"task_id":"task-1","plan_artifact_id":"artifact-1","request_id":"request-1","plan_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"proposed","proposal_id":"proposal-1","objective":"private objective","content":"private plan"}"#,
+        );
+        let projected = project_domain_event(&event).expect("coordination plan event");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::TaskCoordinationPlanProposed
+        );
+        let payload = projected.payload.expect("payload");
+        assert_eq!(payload["plan_artifact_id"], "artifact-1");
+        assert!(payload.get("content").is_none());
+        assert!(payload.get("objective").is_none());
+    }
+
+    #[test]
+    fn quality_route_event_exposes_safe_cycle_evidence_without_reason_text() {
+        let event = domain_event(
+            "task.quality_requested",
+            r#"{"task_id":"task-1","quality_request_id":"quality-3","category":"specialist","target_kind":"specialist","source_kind":"review_report","state":"requires_human","route_id":"review_line:line-1","route_round":3,"route_limit":4,"requires_human_reason_code":"coordination.quality_route_ping_pong","requires_human_reason":"private free-form detail","cycle_request_ids":["quality-1","quality-2","quality-3"],"cycle_task_role_ids":["role-a","role-b","role-a"],"summary":"private summary"}"#,
+        );
+        let projected = project_domain_event(&event).expect("quality route event");
+        let payload = projected.payload.expect("payload");
+        assert_eq!(payload["state"], "requires_human");
+        assert_eq!(payload["route_round"], 3);
+        assert_eq!(payload["route_limit"], 4);
+        assert_eq!(
+            payload["requires_human_reason_code"],
+            "coordination.quality_route_ping_pong"
+        );
+        assert_eq!(payload["cycle_request_ids"][0], "quality-1");
+        assert_eq!(payload["cycle_task_role_ids"][1], "role-b");
+        assert!(payload.get("requires_human_reason").is_none());
+        assert!(payload.get("summary").is_none());
     }
 
     #[test]

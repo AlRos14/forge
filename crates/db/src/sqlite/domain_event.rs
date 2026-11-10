@@ -248,7 +248,7 @@ impl DomainEventRepo for SqliteDb {
     }
 
     async fn complete_claimed_event(&self, input: CompleteDomainEvent) -> Result<bool> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let cursor = sqlx::query_scalar::<_, i64>(
             "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = ?",
         )
