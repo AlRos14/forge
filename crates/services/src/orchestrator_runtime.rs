@@ -458,7 +458,17 @@ impl OrchestratorRuntime {
         }
         let coordination = TaskCoordinationRepo::get_task_coordination(&*self.db, task_id).await?;
         if let Some(c) = coordination.as_ref() {
-            if c.coordinator_actor.is_some() && c.mode == db::TaskCoordinationMode::Manual {
+            let guided_defaults = serde_json::from_str::<Value>(&c.envelope_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("orchestrator_reviews_findings")
+                        .and_then(Value::as_bool)
+                })
+                .unwrap_or(false);
+            if (c.coordinator_actor.is_some() || guided_defaults)
+                && c.mode == db::TaskCoordinationMode::Manual
+            {
                 let dispatch = TaskLifecycleRepo::get_task_dispatch(&*self.db, task_id).await?;
                 if dispatch.is_none_or(|d| d.state != db::TaskDispatchState::Running) {
                     return Ok(None);

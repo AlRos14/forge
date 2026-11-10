@@ -166,11 +166,32 @@ async fn project_coordinator_preference_is_copied_without_starting_provider_work
         count, 0,
         "copying a coordinator preference never launches a provider"
     );
+    let without_preference:Value=json_request(&harness.app,Method::PUT,&defaults_uri,json!({"expected_version":saved["version"],"roles":[{"role":"delivery-lead","coordination_mode":"independent","members":[{"kind":"agent","id":agent}],"configuration":{"capabilities":["orchestration"]}}]}),StatusCode::OK).await;
+    let manual: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({"title":"Template without preferred coordinator"}),
+        StatusCode::OK,
+    )
+    .await;
+    let preference: Option<String> =
+        sqlx::query_scalar("SELECT coordinator_actor_id FROM task_coordination WHERE task_id=?")
+            .bind(&manual.id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .unwrap();
+    assert!(preference.is_none());
+    assert_eq!(
+        runtime.run_once(100).await.unwrap().admitted_wakes,
+        0,
+        "new Tasks wait for Start even with older templates that have no preferred coordinator"
+    );
     let _: Value = json_request(
         &harness.app,
         Method::PUT,
         &defaults_uri,
-        json!({"expected_version":saved["version"],"roles":[]}),
+        json!({"expected_version":without_preference["version"],"roles":[]}),
         StatusCode::OK,
     )
     .await;
