@@ -39,6 +39,12 @@ jobs:
         run: |
           pnpm lint
           pnpm test
+      - name: Browser smoke
+        if: inputs.run_checks
+        working-directory: web
+        run: |
+          pnpm exec playwright install --with-deps chromium
+          pnpm run e2e
       - name: Build binaries
         env:
           FORGE_SKIP_WEB_BUILD: '1'
@@ -68,11 +74,13 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
       - run: cargo fmt --all -- --check
+      - if: ${{ !cancelled() }}
+        run: cargo clippy --locked -p services -p db -p cli-adapters -p api -p api-types -p executors --all-targets -- -D warnings
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p cli-adapters --lib
       - if: ${{ !cancelled() }}
