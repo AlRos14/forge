@@ -113,8 +113,9 @@ the line's previous approval while preserving every historical revision.
 
 The previous implementation and review units are not reopened or rewritten.
 A later review sees the correction result, not the earlier version. An
-independent reviewer cannot be an Actor that contributed to the reviewed
-result, even if it uses another Role or model label. Exhaustion, missing
+independent Human reviewer cannot have contributed to the reviewed result. An
+Agent may reuse the same saved profile with a fresh Task/role-isolated native
+session; contributor session history and forks cannot cross into review. Exhaustion, missing
 assignment, unresolved disagreement, or expanded scope produces an explicit
 human decision instead of an automatic approval. Rework receipts do not release
 blocks owned by unrelated causes. Historical reviewer and implementer
@@ -124,4 +125,4 @@ Quality requests are durable routing records, not ReviewReports. A
 `delivery_correction` request names an exact ReviewReport source and the
 responsible implementation route; it does not fabricate a reviewer verdict or
 a ValidationRun. Review independence remains enforced by the existing review
-line and the plan-level reviewer-Actor check.
+line, Human contributor checks, and Agent role-session isolation.

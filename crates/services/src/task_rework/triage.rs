@@ -103,7 +103,10 @@ impl TaskReworkService {
                 review.actor_kind AS reviewer_kind,review.actor_id AS reviewer_actor_id,
                 s.review_work_unit_id,s.reviewed_work_unit_id
             FROM task_coordination c JOIN task task ON task.id=c.task_id
+            JOIN project project ON project.id=task.project_id
             JOIN execution e ON e.id=? AND e.task_id=c.task_id
+            JOIN agent_current agent ON agent.id=e.actor_id AND e.actor_kind='agent' AND agent.owner_id=project.owner_id
+            JOIN project_member owner_member ON owner_member.project_id=project.id AND owner_member.user_id=agent.owner_id AND owner_member.role IN ('owner','admin','member')
             JOIN execution_task_role_authority a ON a.execution_id=e.id
             JOIN task_role role ON role.id=a.task_role_id
             JOIN task_role_capability_configuration config ON config.task_role_id=role.id
@@ -111,6 +114,7 @@ impl TaskReworkService {
             JOIN orchestrator_wake_execution attempt ON attempt.execution_id=e.id
             JOIN orchestrator_wake wake ON wake.id=attempt.wake_id
             JOIN artifact report ON report.id=? AND report.task_id=c.task_id
+            JOIN task_rework_automation_intent intent ON intent.task_id=c.task_id AND intent.review_report_artifact_id=report.id AND intent.state='pending'
             JOIN artifact_execution_producer producer ON producer.artifact_id=report.id
             JOIN execution review ON review.id=producer.execution_id
             JOIN work_unit_review_subject s ON s.review_work_unit_id=review.work_unit_id

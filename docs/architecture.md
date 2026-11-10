@@ -75,7 +75,8 @@ revisions open a coordination turn. Quality-linked WorkUnits complete
 technically when their Execution finishes, but a delivery correction is never
 resolved by that completion alone.
 
-Each quality chain also has a persisted four-request quality-routing budget.
+Each quality chain also has a persisted quality-routing budget (four for
+historical Tasks, sixteen by default for new Tasks).
 Review requests on one `work_unit_review_line` share the same route identity
 across new reports, corrections, category changes, and destination-role
 changes. When three unresolved requests target roles A, B, A in order, Forge
@@ -84,7 +85,8 @@ TaskRole IDs. Budget exhaustion, a pending escalation, and failures discovered
 by the durable quality consumer also persist a concrete reason on the request.
 Replays do not consume another
 global or route round; `BEGIN IMMEDIATE` serializes concurrent admissions.
-The existing eight-round rework receipt limit remains separate. Migration V161
+The rework/reassessment round limit remains separate (eight for historical
+Tasks, sixteen by default for new Tasks). Migration V161
 backfills route accounting for existing quality requests without changing their
 states or replaying them.
 

@@ -283,7 +283,7 @@ pub struct TaskCoordinationPlanResponse {
 pub struct TaskCoordinationOverviewResponse {
     #[serde(default)]
     #[ts(optional)]
-    pub review_triage: Vec<TaskReviewTriageResponse>,
+    pub review_triage: Option<Vec<TaskReviewTriageResponse>>,
     pub task_id: String,
     #[ts(type = "number")]
     pub task_version: i64,

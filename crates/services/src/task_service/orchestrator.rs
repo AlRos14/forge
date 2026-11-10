@@ -161,9 +161,9 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", wake.actor_id.clone()))?;
         ensure_orchestrator_agent_project_authority(&self.db, &project, &agent).await?;
-        // The current safe automatic profile is a Codex CLI with an explicit
-        // read-only sandbox. Other adapters stay durable and fail closed until
-        // they expose an equally strong, verified sandbox capability.
+        // Automatic coordination requires an installed supported read-only
+        // harness policy: Codex native sandbox or Claude native tool allowlist.
+        // Unsupported adapters fail closed.
         if agent.backend_kind == "native"
             || !matches!(agent.executor_type.as_str(), "codex" | "claude_code")
         {
@@ -206,7 +206,9 @@ impl TaskService {
         let config = snapshot_value
             .get_mut("config")
             .and_then(Value::as_object_mut)
-            .ok_or_else(|| ServiceError::invalid_operation("Codex config snapshot is invalid"))?;
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("Coordinator config snapshot is invalid")
+            })?;
         config.insert("sandbox".to_owned(), Value::String("read-only".to_owned()));
         config.insert(
             "ask_for_approval".to_owned(),

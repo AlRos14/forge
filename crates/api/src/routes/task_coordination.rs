@@ -343,12 +343,14 @@ async fn overview_response(
         None => None,
     };
     Ok(TaskCoordinationOverviewResponse {
-        review_triage: services::task_rework::TaskReworkService::new(
-            state.db.clone(),
-            state.event_bus.clone(),
-        )
-        .list_review_triage(&overview.task.id)
-        .await?,
+        review_triage: Some(
+            services::task_rework::TaskReworkService::new(
+                state.db.clone(),
+                state.event_bus.clone(),
+            )
+            .list_review_triage(&overview.task.id)
+            .await?,
+        ),
         task_id: overview.task.id,
         task_version: overview.task.version,
         lifecycle,

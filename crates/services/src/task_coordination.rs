@@ -508,7 +508,7 @@ impl TaskCoordinationService {
         if input.idempotency_key.trim().is_empty() || input.idempotency_key.len() > 256 {
             return Err(invalid_plan("idempotency key must contain 1 to 256 bytes"));
         }
-        let envelope = match input.envelope.as_ref() {
+        let mut envelope = match input.envelope.as_ref() {
             Some(value) => {
                 serde_json::from_value::<CoordinationEnvelope>(value.clone()).map_err(|error| {
                     unsupported_item(format!("invalid coordination envelope: {error}"))
@@ -526,6 +526,16 @@ impl TaskCoordinationService {
         }
         let coordination_before = self.require_coordination(&task.id).await?;
         let team = self.current_team(&task.id).await?;
+        if input.envelope.is_none() {
+            envelope.allowed_review_roles = team
+                .iter()
+                .filter(|role| {
+                    role.capabilities
+                        .contains(&TaskRoleCapability::FormalReview)
+                })
+                .map(|role| role.role.clone())
+                .collect();
+        }
         let team_snapshot_json = self.team_snapshot_json(&team)?;
         let team_digest = sha256_hex(team_snapshot_json.as_bytes());
         let coordinator = match (
