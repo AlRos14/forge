@@ -228,9 +228,14 @@ async fn work_unit_consumption_context(
             ));
         }
     } else {
-        let requirement: Option<(String,i64,String,Option<String>,Option<String>)>=sqlx::query_as("SELECT source_work_unit_id,source_work_unit_version,result_execution_id,result_commit_sha,result_workspace_id FROM work_unit_result_requirement WHERE work_unit_id=?")
+        let requirement=sqlx::query("SELECT source_work_unit_id,source_work_unit_version,result_execution_id,result_commit_sha,result_workspace_id FROM work_unit_result_requirement WHERE work_unit_id=?")
             .bind(&work_unit.id).fetch_optional(db.pool()).await?;
-        if let Some((id, version, execution, commit, workspace)) = requirement {
+        if let Some(requirement) = requirement {
+            let id: String = requirement.try_get("source_work_unit_id")?;
+            let version: i64 = requirement.try_get("source_work_unit_version")?;
+            let execution: String = requirement.try_get("result_execution_id")?;
+            let commit: Option<String> = requirement.try_get("result_commit_sha")?;
+            let workspace: Option<String> = requirement.try_get("result_workspace_id")?;
             sections.push(format!("Exact consumed result: WorkUnit {id} v{version}, result Execution {execution}, commit {}, Workspace {}. Start from this exact result; do not modify sibling WorkUnits.",commit.as_deref().unwrap_or("none"),workspace.as_deref().unwrap_or("none")));
         }
     }
