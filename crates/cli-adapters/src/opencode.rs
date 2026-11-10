@@ -423,7 +423,7 @@ impl HarnessAdapter for OpencodeAdapter {
                 .expect("isolated review directory exists");
             Self::write_project_copilot_policy(
                 dir.path(),
-                &opencode_independent_review_policy().to_string(),
+                &opencode_independent_review_policy(&ctx.review_read_paths)?.to_string(),
             )?;
         }
         let copilot_server =
@@ -1067,18 +1067,41 @@ fn opencode_project_copilot_policy(mcp: &ProjectCopilotMcp) -> Result<String, Ex
     })
 }
 
-fn opencode_independent_review_policy() -> serde_json::Value {
+fn opencode_independent_review_policy(
+    read_paths: &[String],
+) -> Result<serde_json::Value, ExecutorError> {
     let mut permissions = vec![serde_json::json!({"action":"*","resource":"*","effect":"deny"})];
     for action in ["read", "glob", "grep", "list"] {
         permissions.push(serde_json::json!({"action":action,"resource":"*","effect":"allow"}));
     }
-    serde_json::json!({
+    // V2 checks this separate gate before read. Only the exact result roots
+    // supplied by Forge's persisted review subject may cross the fresh CWD.
+    // No profile, prompt text, repository default or global wildcard grants it.
+    for path in read_paths {
+        if !std::path::Path::new(path).is_absolute() {
+            return Err(ExecutorError::Other(
+                "Exact review read root must be absolute".to_owned(),
+            ));
+        }
+        let canonical = std::fs::canonicalize(path).map_err(|_| {
+            ExecutorError::Other("Exact review read root is unavailable".to_owned())
+        })?;
+        let root = canonical.to_string_lossy();
+        if !canonical.is_dir() || canonical.parent().is_none() || root.contains(['*', '?']) {
+            return Err(ExecutorError::Other(
+                "Review read root must be an exact non-root directory without glob characters"
+                    .to_owned(),
+            ));
+        }
+        permissions.push(serde_json::json!({"action":"external_directory","resource":format!("{}/*",root.trim_end_matches('/')),"effect":"allow"}));
+    }
+    Ok(serde_json::json!({
         "$schema":"https://opencode.ai/config.json",
         "default_agent":"forge-independent-review",
         "permissions":permissions.clone(),
         "agents":{"forge-independent-review":{"description":"Independent review of an exact Forge result", "mode":"primary", "hidden":true, "permissions":permissions}},
         "mcp":{"servers":{}}
-    })
+    }))
 }
 
 async fn ensure_opencode_project_copilot_cli_supported() -> Result<(), ExecutorError> {
@@ -1740,7 +1763,7 @@ mod tests {
 
     #[test]
     fn independent_review_policy_has_no_mutation_or_mcp_authority() {
-        let policy = opencode_independent_review_policy();
+        let policy = opencode_independent_review_policy(&[]).unwrap();
         let permissions = policy["permissions"].as_array().unwrap();
         assert_eq!(
             permissions[0],
@@ -1756,6 +1779,37 @@ mod tests {
         assert_eq!(
             policy["agents"]["forge-independent-review"]["permissions"],
             policy["permissions"]
+        );
+    }
+
+    #[test]
+    fn review_external_directory_gate_is_limited_to_the_exact_root() {
+        let root = tempfile::tempdir().unwrap();
+        let policy =
+            opencode_independent_review_policy(&[root.path().to_string_lossy().into_owned()])
+                .unwrap();
+        let gates: Vec<_> = policy["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["action"] == "external_directory")
+            .collect();
+        assert_eq!(gates.len(), 1);
+        assert_eq!(
+            gates[0]["resource"],
+            format!("{}/*", root.path().canonicalize().unwrap().display())
+        );
+        assert_ne!(gates[0]["resource"], "*");
+        assert!(
+            !policy["permissions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["effect"] == "allow"
+                    && matches!(p["action"].as_str(), Some("edit" | "shell" | "subagent")))
+        );
+        assert!(
+            opencode_independent_review_policy(&[std::path::MAIN_SEPARATOR.to_string()]).is_err()
         );
     }
 
@@ -2068,6 +2122,7 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
                 role: "implementer".to_owned(),
                 task_role_capabilities: vec![],
                 has_repository_workspace: false,
+                review_read_paths: Vec::new(),
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),
                 agent_config: serde_json::json!({
@@ -2188,6 +2243,7 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
             role: "coder".to_owned(),
             task_role_capabilities: vec![],
             has_repository_workspace: false,
+            review_read_paths: Vec::new(),
             worktree_path: dir.path().to_string_lossy().to_string(),
             description: "tree test".to_owned(),
             agent_config: serde_json::json!({
@@ -2293,6 +2349,7 @@ printf '%s\n' '{"type":"error","sessionID":"ses_test","error":{"data":{"message"
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
                 has_repository_workspace: false,
+                review_read_paths: Vec::new(),
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),
                 agent_config: serde_json::json!({
@@ -2340,6 +2397,7 @@ printf '%s\n' '{"type":"step_start","sessionID":"ses_test","part":{"type":"step-
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
                 has_repository_workspace: false,
+                review_read_paths: Vec::new(),
                 worktree_path: dir.path().to_string_lossy().to_string(),
                 description: "hello".to_owned(),
                 agent_config: serde_json::json!({

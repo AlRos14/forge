@@ -670,3 +670,12 @@ and limits; private instructions, rationale and reasons are excluded.
 `quality_route.limit` remains the immutable admission-time ceiling on each
 request. Extending autonomy changes the current Task/route budget returned by
 the limits endpoint, without rewriting that historical snapshot.
+
+Daemon `execution.start` adds `review_read_paths` (default empty, omitted when
+empty). Forge derives it from the exact Review WorkUnit subject and/or the
+Execution's explicit review Workspace; profile settings and prompt text cannot
+provide these grants. A daemon accepts nonempty paths only for `formal_review`
+and resolves each within its registered filesystem root. OpenCode's separate
+`external_directory` gate is limited to those exact roots; edit, shell and MCP
+permissions remain denied. Server and daemon must be updated together for this
+review capability.

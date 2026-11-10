@@ -210,3 +210,9 @@ commit, workspace path and complete pinned delivery Artifact, plus recent
 coordinator decisions. The context byte limit applies before Provider Start;
 evidence is not silently truncated. WorkUnit-scoped wakes do not receive sibling
 review findings or Task-wide triage history.
+
+OpenCode V2 checks `external_directory` before reading an accepted result outside
+the isolated runtime. Forge passes only the exact result/review Workspace roots
+through `review_read_paths`, and the daemon checks its registered root again.
+There is no global external-directory allow rule. Missing, root, or wildcard
+paths fail closed. See [OpenCode permissions](https://opencode.ai/docs/permissions).

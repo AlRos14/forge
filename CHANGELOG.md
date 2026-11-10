@@ -23,6 +23,10 @@ PR14 audit on 2026-10-16.
   16 correction/reassessment rounds, 16 requests per quality route, and 16 planned
   WorkUnits. Owners/admins can change limits or grant extra rounds without
   resetting consumption. Historical Task limits remain unchanged (V162–V166).
+- Daemon `execution.start` carries optional `review_read_paths`, derived only
+  from the exact persisted result/workspace. OpenCode external reads are limited
+  to those roots; the daemon rechecks its registered filesystem root. Missing
+  paths grant no external access. Update the daemon alongside the server.
 - OpenCode reasoning effort uses the installed CLI's `provider/model#variant`
   syntax and automatic permission mode uses `--auto`. Formal Agent review is
   read-only with Codex, Claude Code and OpenCode; Claude coordination uses a native tool

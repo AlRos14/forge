@@ -36,6 +36,7 @@ async fn claude_adapter_writes_file_in_live_repo() -> TestResult {
         role: "coder".to_owned(),
         task_role_capabilities: vec![],
         has_repository_workspace: false,
+        review_read_paths: Vec::new(),
         description: "Create a file called HELLO.md in the repo root with the single word banana."
             .to_owned(),
         agent_config: json!({

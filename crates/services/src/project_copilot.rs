@@ -598,6 +598,7 @@ impl ProjectCopilotService {
             role: "project_copilot".to_owned(),
             task_role_capabilities: vec![],
             has_repository_workspace: false,
+            review_read_paths: Vec::new(),
             worktree_path: context_dir.to_string_lossy().into_owned(),
             description,
             agent_config: runtime_snapshot.clone(),

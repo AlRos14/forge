@@ -2033,6 +2033,7 @@ mod tests {
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
                 has_repository_workspace: false,
+                review_read_paths: Vec::new(),
                 worktree_path: worktree.path().display().to_string(),
                 description: "x".repeat(MAX_DIRECT_PROMPT_BYTES + 1),
                 agent_config: serde_json::json!({
@@ -2095,6 +2096,7 @@ mod tests {
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
                 has_repository_workspace: false,
+                review_read_paths: Vec::new(),
                 worktree_path: worktree.path().display().to_string(),
                 description: prompt.clone(),
                 agent_config: serde_json::json!({

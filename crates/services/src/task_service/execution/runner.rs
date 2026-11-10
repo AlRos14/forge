@@ -938,6 +938,7 @@ impl TaskService {
                     )
                     .await?,
                     has_repository_workspace: execution.workspace_id.is_some(),
+                    review_read_paths: self.review_read_paths_for_execution(&execution).await?,
                     worktree_path: worktree_path.clone(),
                     description,
                     agent_config,
@@ -1471,6 +1472,59 @@ impl TaskService {
         ))
     }
 
+    /// Review may read only explicitly bound result/workspace records. No
+    /// Agent profile, Task repository default, or latest Execution selects it.
+    pub(crate) async fn review_read_paths_for_execution(
+        &self,
+        execution: &Execution,
+    ) -> Result<Vec<String>> {
+        if !crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
+        {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::new();
+        if let Some(id) = execution.work_unit_id.as_deref() {
+            let subject = crate::task_rework::get_review_subject(&self.db, id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Formal WorkUnit review requires its exact persisted subject",
+                    )
+                })?;
+            if subject.task_id != execution.task_id {
+                return Err(ServiceError::invalid_operation(
+                    "Review subject belongs to another Task",
+                ));
+            }
+            if let Some(id) = subject.result_workspace_id {
+                ids.push(id);
+            }
+        }
+        if let Some(id) = execution.workspace_id.as_ref() {
+            ids.push(id.clone());
+        }
+        ids.sort();
+        ids.dedup();
+        let mut paths = Vec::new();
+        for id in ids {
+            let workspace = WorkspaceRepo::get_by_id(&*self.db, &id)
+                .await?
+                .filter(|workspace| workspace.task_id == execution.task_id)
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation("Exact review Workspace is unavailable")
+                })?;
+            paths.push(workspace.worktree_path);
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     async fn execution_start_params(
         &self,
         execution: &Execution,
@@ -1517,6 +1571,7 @@ impl TaskService {
                 &execution.id,
             )
             .await?,
+            review_read_paths: self.review_read_paths_for_execution(execution).await?,
             workspace_path,
             executor_type,
             executor_config,

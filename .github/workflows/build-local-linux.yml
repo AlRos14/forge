@@ -82,6 +82,10 @@ jobs:
       - if: ${{ !cancelled() }}
         run: cargo clippy --locked -p services -p db -p cli-adapters -p api -p api-types -p executors --all-targets -- -D warnings
       - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api-types --lib
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p forge-client --lib daemon_runtime
+      - if: ${{ !cancelled() }}
         run: cargo test --locked -p cli-adapters --lib
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib orchestrator_runtime

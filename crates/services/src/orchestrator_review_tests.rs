@@ -152,6 +152,19 @@ async fn triage_fixture(disposition: api_types::TaskReviewDisposition, extra_rec
         .unwrap()
         .unwrap();
     rework.process_domain_event(&event).await.unwrap();
+    let review_execution = ExecutionRepo::get_by_id(&**db, report.execution_producer().unwrap().0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        task_service
+            .review_read_paths_for_execution(&review_execution)
+            .await
+            .unwrap()
+            .is_empty(),
+        "artifact-only review has no implicit repository read grant"
+    );
+
     let coordination = crate::TaskCoordinationService::new(db.clone(), fixture.event_bus.clone());
     let overview = coordination.overview(&task.id, &owner).await.unwrap();
     let authorized = coordination

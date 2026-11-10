@@ -89,6 +89,7 @@ mod tests {
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
                 has_repository_workspace: false,
+                review_read_paths: Vec::new(),
                 worktree_path: ".".to_owned(),
                 description: "test".to_owned(),
                 agent_config: serde_json::json!({"delay_seconds": 1}),
