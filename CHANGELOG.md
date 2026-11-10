@@ -22,7 +22,7 @@ PR14 audit on 2026-10-16.
 - New Task autonomy defaults are 32 coordinator turns, 64 quality requests,
   16 correction/reassessment rounds, 16 requests per quality route, and 16 planned
   WorkUnits. Owners/admins can change limits or grant extra rounds without
-  resetting consumption. Historical Task limits remain unchanged (V162–V165).
+  resetting consumption. Historical Task limits remain unchanged (V162–V166).
 - OpenCode reasoning effort uses the installed CLI's `provider/model#variant`
   syntax and automatic permission mode uses `--auto`. Formal Agent review is
   read-only; Claude coordination is supported with an explicit native tool

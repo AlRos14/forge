@@ -146,7 +146,7 @@ impl TaskReworkService {
             if dispatch_state == "paused" {
                 continue;
             }
-            let triage_required: bool = sqlx::query_scalar("SELECT mode != 'manual' AND revoked_at IS NULL AND COALESCE(json_extract(envelope_json,'$.orchestrator_reviews_findings'),0)=1 FROM task_coordination WHERE task_id=?")
+            let triage_required: bool = sqlx::query_scalar("SELECT mode != 'manual' AND COALESCE(json_extract(envelope_json,'$.orchestrator_reviews_findings'),0)=1 FROM task_coordination WHERE task_id=?")
                 .bind(&task_id).fetch_optional(self.db.pool()).await?.unwrap_or(false);
             let triage: Option<(String,String)> = sqlx::query_as("SELECT disposition,instructions FROM task_review_triage WHERE review_report_artifact_id=?")
                 .bind(&report_id).fetch_optional(self.db.pool()).await?;
@@ -1166,6 +1166,22 @@ impl TaskReworkService {
                         "rework receipt could not be resolved after concurrent commit",
                     )
                 });
+        }
+        if input.expected_source_configuration_json.is_some() {
+            let current_triage_authority: bool = sqlx::query_scalar(
+                "SELECT NOT EXISTS(SELECT 1 FROM task_coordination c WHERE c.task_id=? AND c.mode!='manual'
+                    AND COALESCE(json_extract(c.envelope_json,'$.orchestrator_reviews_findings'),0)=1
+                    AND (c.revoked_at IS NOT NULL OR c.team_stale=1 OR NOT EXISTS(
+                        SELECT 1 FROM task_review_triage triage JOIN execution coordinator ON coordinator.id=triage.execution_id
+                        JOIN execution_task_role_authority authority ON authority.execution_id=coordinator.id
+                        WHERE triage.task_id=c.task_id AND triage.review_report_artifact_id=? AND triage.disposition='correct'
+                          AND triage.authorization_version=c.authorization_version
+                          AND authority.task_role_id=c.coordinator_task_role_id
+                          AND coordinator.actor_kind=c.coordinator_actor_kind AND coordinator.actor_id=c.coordinator_actor_id)))"
+            ).bind(&task.id).bind(&input.review_report_artifact_id).fetch_one(&mut *tx).await?;
+            if !current_triage_authority {
+                return Err(ServiceError::invalid_operation("Current guided authorization and an exact confirmed coordinator triage are required for automatic correction"));
+            }
         }
         let current_task_version: i64 =
             sqlx::query_scalar("SELECT version FROM task WHERE id = ? AND deleted_at IS NULL")

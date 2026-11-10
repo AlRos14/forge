@@ -243,7 +243,7 @@ vertical slice (V158–V161, services, REST/MCP/CLI/SSE, generated types) is
 implemented. The guided UI is integrated; joint acceptance remains in progress. See the
 [system review and implementation sequence](plans/task-coordination-and-guided-experience.md).
 
-### Guided delivery extensions (V162–V165)
+### Guided delivery extensions (V162–V166)
 
 Review independence is Task/role HarnessSession isolation for Agents; Human
 self-review remains forbidden. Same saved Agent profiles can fill several roles.

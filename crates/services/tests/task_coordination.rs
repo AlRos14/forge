@@ -1254,6 +1254,12 @@ async fn rework_correction_completion_freezes_result_for_its_review() {
 #[tokio::test]
 async fn quality_route_budget_is_atomic_and_does_not_reset_with_category_or_role() {
     let fixture = fixture("quality-route-budget").await;
+    sqlx::query("UPDATE task_autonomy_limits SET max_route_requests=4 WHERE task_id=?")
+        .bind(&fixture.task_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+
     let role_a = "quality-route-role-a";
     add_quality_role(&fixture, role_a, "specialist-alpha").await;
     let quality = TaskQualityService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)));
@@ -1360,6 +1366,12 @@ async fn quality_route_budget_is_atomic_and_does_not_reset_with_category_or_role
 #[tokio::test]
 async fn concurrent_quality_route_requests_consume_one_round_each_and_replay_once() {
     let fixture = fixture("quality-route-concurrency").await;
+    sqlx::query("UPDATE task_autonomy_limits SET max_route_requests=4 WHERE task_id=?")
+        .bind(&fixture.task_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+
     let role_id = "quality-route-concurrent-role";
     add_quality_role(&fixture, role_id, "custom-specialist").await;
     for round in 1..=3 {

@@ -3678,6 +3678,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn historical_envelopes_keep_direct_routing_and_new_defaults_mediate_findings() {
+        let mut historical = serde_json::to_value(CoordinationEnvelope::default()).unwrap();
+        historical
+            .as_object_mut()
+            .unwrap()
+            .remove("orchestrator_reviews_findings");
+        let parsed: CoordinationEnvelope = serde_json::from_value(historical).unwrap();
+        assert!(!parsed.orchestrator_reviews_findings);
+        assert!(CoordinationEnvelope::default().orchestrator_reviews_findings);
+    }
+
+    #[test]
     fn default_envelope_is_structurally_safe() {
         let envelope = CoordinationEnvelope::default();
         envelope.validate().expect("default envelope");
