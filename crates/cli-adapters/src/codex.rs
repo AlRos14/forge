@@ -90,6 +90,16 @@ impl CodexAdapter {
             config.resume_thread_in_place = None;
             config.resume_fallback_prompt = None;
         }
+        if ctx
+            .task_role_capabilities
+            .contains(&api_types::TaskRoleCapability::FormalReview)
+        {
+            config.sandbox = Some("read-only".to_owned());
+            config.ask_for_approval = Some("never".to_owned());
+            config.permission_policy = Some(executors::PermissionPolicy::Plan);
+            config.command_overrides.base_command_override = None;
+            config.command_overrides.additional_params = None;
+        }
         config
     }
 
@@ -1055,6 +1065,20 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn formal_review_overrides_unsafe_profile_permissions() {
+        let mut context = crate::test_execution_context(
+            executors::HarnessInvocation::Start,
+            serde_json::json!({"sandbox":"danger-full-access","ask_for_approval":"on-request","base_command_override":"unsafe","additional_params":["--yolo"]}),
+        );
+        context.task_role_capabilities = vec![api_types::TaskRoleCapability::FormalReview];
+        let config = CodexAdapter::resolve_config(&context);
+        assert_eq!(config.sandbox.as_deref(), Some("read-only"));
+        assert_eq!(config.ask_for_approval.as_deref(), Some("never"));
+        assert!(config.command_overrides.base_command_override.is_none());
+        assert!(config.command_overrides.additional_params.is_none());
+    }
 
     #[test]
     fn generic_resume_uses_exact_thread_and_start_clears_stale_thread_fields() {

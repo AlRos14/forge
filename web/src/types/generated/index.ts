@@ -1,5 +1,9 @@
 // Public TypeScript surface generated from the explicit api-types export set.
 export * from './api'
+export type { TaskReviewDisposition } from './bindings/TaskReviewDisposition'
+export type { TaskReviewTriageResponse } from './bindings/TaskReviewTriageResponse'
+export type { TaskAutonomyLimits } from './bindings/TaskAutonomyLimits'
+export type { UpdateTaskAutonomyLimitsRequest } from './bindings/UpdateTaskAutonomyLimitsRequest'
 export type { WorkMode } from './bindings/WorkMode'
 export type { AgentStatus } from './bindings/AgentStatus'
 export type { ExecutionStatus } from './bindings/ExecutionStatus'

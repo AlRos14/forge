@@ -49,3 +49,12 @@ mechanism. V124 removes `execution.agent_session_id` after copying its exact
 values to immutable `pr13_execution_session_projection_history`. Those rows
 are audit provenance only; only an explicitly linked reusable `HarnessSession`
 authorizes Resume.
+
+## Role-isolated review sessions
+
+An Agent profile is reusable across implementation and formal review. Independence
+is established by explicit HarnessSessions: a session or its predecessor context
+cannot cross Task or role boundaries. Fresh Start clears copied native resume
+arguments. Same-profile review must produce a native session identity before its
+ReviewReport is accepted; a sessionless harness fails closed. Human contributors
+remain ineligible to review their own result. V162 preserves historical records.

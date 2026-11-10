@@ -85,22 +85,24 @@ impl OpencodeAdapter {
         ]);
         if let Some(ref model) = config.model {
             adapter_args.push("--model".into());
-            adapter_args.push(normalize_opencode_model_id(model));
+            let model = normalize_opencode_model_id(model);
+            let model = if let Some(variant) = config.variant.as_deref() {
+                format!("{}#{variant}", model.split('#').next().unwrap_or(&model))
+            } else {
+                model
+            };
+            adapter_args.push(model);
         }
         if let Some(ref agent) = config.agent {
             adapter_args.push("--agent".into());
             adapter_args.push(agent.clone());
-        }
-        if let Some(ref variant) = config.variant {
-            adapter_args.push("--variant".into());
-            adapter_args.push(variant.clone());
         }
         if let Some(ref session_id) = config.resume_session_id {
             adapter_args.push("--session".into());
             adapter_args.push(session_id.clone());
         }
         if should_skip_permissions(config) {
-            adapter_args.push("--dangerously-skip-permissions".into());
+            adapter_args.push("--auto".into());
         }
 
         let builder = crate::command::CommandBuilder::new("opencode")
@@ -246,14 +248,6 @@ impl OpencodeAdapter {
         safe_config.agent = Some(OPENCODE_COPILOT_AGENT.to_owned());
         safe_config.auto_approve = Some(false);
         safe_config.permission_policy = Some(PermissionPolicy::Supervised);
-        // OpenCode v2 selects a variant with model#variant; its current CLI no
-        // longer advertises the v1 --variant option.
-        if let (Some(model), Some(variant)) =
-            (safe_config.model.clone(), safe_config.variant.clone())
-        {
-            safe_config.model = Some(format!("{}#{variant}", normalize_opencode_model_id(&model)));
-            safe_config.variant = None;
-        }
         // OpenCode v2 keeps a background server whose configuration is not
         // reloaded per invocation. The Project Copilot agent and MCP policy
         // run against a private server with a real config file so
@@ -381,7 +375,17 @@ impl HarnessAdapter for OpencodeAdapter {
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
-        let config = Self::resolve_config(&ctx);
+        let mut config = Self::resolve_config(&ctx);
+        let independent_review = ctx
+            .task_role_capabilities
+            .contains(&api_types::TaskRoleCapability::FormalReview);
+        if independent_review {
+            config.auto_approve = Some(false);
+            config.permission_policy = Some(PermissionPolicy::Supervised);
+            config.agent = Some("forge-independent-review".to_owned());
+            config.command_overrides.base_command_override = None;
+            config.command_overrides.additional_params = None;
+        }
         let project_copilot = ctx.role == "project_copilot";
         let project_copilot_mcp = if project_copilot {
             Some(validate_project_copilot_config(&config)?.clone())
@@ -395,7 +399,7 @@ impl HarnessAdapter for OpencodeAdapter {
         };
 
         let copilot_runtime_dir =
-            if project_copilot {
+            if project_copilot || independent_review {
                 Some(tempfile::Builder::new()
                 .prefix("forge-opencode-copilot-")
                 .tempdir()
@@ -413,11 +417,21 @@ impl HarnessAdapter for OpencodeAdapter {
             let policy = opencode_project_copilot_policy(mcp)?;
             Self::write_project_copilot_policy(runtime_dir.path(), &policy)?;
         }
-        let copilot_server = if let Some(runtime_dir) = copilot_runtime_dir.as_ref() {
-            Some(Self::start_project_copilot_server(&config, runtime_dir.path()).await?)
-        } else {
-            None
-        };
+        if independent_review {
+            let dir = copilot_runtime_dir
+                .as_ref()
+                .expect("isolated review directory exists");
+            Self::write_project_copilot_policy(
+                dir.path(),
+                &opencode_independent_review_policy().to_string(),
+            )?;
+        }
+        let copilot_server =
+            if let Some(runtime_dir) = copilot_runtime_dir.as_ref().filter(|_| project_copilot) {
+                Some(Self::start_project_copilot_server(&config, runtime_dir.path()).await?)
+            } else {
+                None
+            };
         let mut cmd = if let (Some(runtime_dir), Some(server)) =
             (copilot_runtime_dir.as_ref(), copilot_server.as_ref())
         {
@@ -429,6 +443,17 @@ impl HarnessAdapter for OpencodeAdapter {
                 &server.url,
             )?;
             command.env("OPENCODE_SERVER_PASSWORD", &server.password);
+            command
+        } else if independent_review {
+            ensure_opencode_project_copilot_cli_supported().await?;
+            let mut command = Self::build_command_with_prefix(&config, &prompt, &["--standalone"]);
+            command.env(
+                "OPENCODE_CONFIG_DIR",
+                copilot_runtime_dir
+                    .as_ref()
+                    .expect("review policy exists")
+                    .path(),
+            );
             command
         } else {
             Self::build_command(&config, &prompt)
@@ -1042,6 +1067,20 @@ fn opencode_project_copilot_policy(mcp: &ProjectCopilotMcp) -> Result<String, Ex
     })
 }
 
+fn opencode_independent_review_policy() -> serde_json::Value {
+    let mut permissions = vec![serde_json::json!({"action":"*","resource":"*","effect":"deny"})];
+    for action in ["read", "glob", "grep", "list"] {
+        permissions.push(serde_json::json!({"action":action,"resource":"*","effect":"allow"}));
+    }
+    serde_json::json!({
+        "$schema":"https://opencode.ai/config.json",
+        "default_agent":"forge-independent-review",
+        "permissions":permissions.clone(),
+        "agents":{"forge-independent-review":{"description":"Independent review of an exact Forge result", "mode":"primary", "hidden":true, "permissions":permissions}},
+        "mcp":{"servers":{}}
+    })
+}
+
 async fn ensure_opencode_project_copilot_cli_supported() -> Result<(), ExecutorError> {
     let output = crate::command::output_with_timeout(
         {
@@ -1075,9 +1114,16 @@ async fn ensure_opencode_project_copilot_cli_supported() -> Result<(), ExecutorE
 }
 
 fn opencode_project_copilot_cli_supports_policy(help: &str) -> bool {
-    ["--server", "--agent", "--format", "--model", "--session"]
-        .iter()
-        .all(|option| help.contains(option))
+    [
+        "--server",
+        "--agent",
+        "--format",
+        "--model",
+        "--session",
+        "--standalone",
+    ]
+    .iter()
+    .all(|option| help.contains(option))
 }
 
 fn should_skip_permissions(config: &OpencodeConfig) -> bool {
@@ -1649,6 +1695,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reasoning_variant_uses_one_native_model_suffix() {
+        let config = OpencodeConfig {
+            model: Some("opencode-go/deepseek-v4.1-flash#medium".to_owned()),
+            variant: Some("max".to_owned()),
+            ..OpencodeConfig::default()
+        };
+        let command = OpencodeAdapter::build_command(&config, "review");
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|a| a == ["--model", "opencode-go/deepseek-v4.1-flash#max"])
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--variant" || a == "--dangerously-skip-permissions")
+        );
+    }
+
+    #[test]
+    fn independent_review_policy_has_no_mutation_or_mcp_authority() {
+        let policy = opencode_independent_review_policy();
+        let permissions = policy["permissions"].as_array().unwrap();
+        assert_eq!(
+            permissions[0],
+            serde_json::json!({"action":"*","resource":"*","effect":"deny"})
+        );
+        let allowed: Vec<_> = permissions
+            .iter()
+            .filter(|p| p["effect"] == "allow")
+            .map(|p| p["action"].as_str().unwrap())
+            .collect();
+        assert_eq!(allowed, ["read", "glob", "grep", "list"]);
+        assert_eq!(policy["mcp"]["servers"], serde_json::json!({}));
+        assert_eq!(
+            policy["agents"]["forge-independent-review"]["permissions"],
+            policy["permissions"]
+        );
+    }
+
+    #[test]
     fn generic_resume_uses_exact_session_and_start_clears_stale_session() {
         let stale = serde_json::json!({
             "resume_session_id":"old-session",
@@ -1703,7 +1794,8 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--model", "anthropic/claude-sonnet-4-6"])
         );
-        assert!(args.contains(&"--dangerously-skip-permissions".to_owned()));
+        assert!(args.contains(&"--auto".to_owned()));
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_owned()));
         assert_eq!(args.last(), Some(&"hello".to_owned()));
 
         let envs: HashMap<_, _> = cmd

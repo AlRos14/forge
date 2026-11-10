@@ -98,6 +98,54 @@ pub enum TaskInterventionState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct TaskAutonomyLimits {
+    #[ts(type = "number")]
+    pub version: i64,
+    #[ts(type = "number")]
+    pub max_turns: i64,
+    #[ts(type = "number")]
+    pub max_quality_requests: i64,
+    #[ts(type = "number")]
+    pub max_rework_rounds: i64,
+    #[ts(type = "number")]
+    pub max_route_requests: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct UpdateTaskAutonomyLimitsRequest {
+    #[ts(type = "number")]
+    pub expected_version: i64,
+    pub limits: TaskAutonomyLimits,
+    pub reason: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TaskReviewDisposition {
+    Correct,
+    Recheck,
+    Human,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TaskReviewTriageResponse {
+    pub review_report_artifact_id: String,
+    pub execution_id: String,
+    pub disposition: TaskReviewDisposition,
+    pub rationale: String,
+    pub instructions: String,
+    pub review_work_unit_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct TaskCoordinationCoordinatorResponse {
     pub task_role_id: String,
@@ -233,6 +281,9 @@ pub struct TaskCoordinationPlanResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct TaskCoordinationOverviewResponse {
+    #[serde(default)]
+    #[ts(optional)]
+    pub review_triage: Vec<TaskReviewTriageResponse>,
     pub task_id: String,
     #[ts(type = "number")]
     pub task_version: i64,

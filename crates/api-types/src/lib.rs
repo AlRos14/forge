@@ -76,6 +76,10 @@ fn export_typescript() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/src/types/generated");
     std::fs::create_dir_all(&out_dir).expect("create types output directory");
     std::env::set_current_dir(&out_dir).expect("switch to types output directory");
+    TaskAutonomyLimits::export().expect("export TaskAutonomyLimits");
+    TaskReviewDisposition::export().expect("export TaskReviewDisposition");
+    TaskReviewTriageResponse::export().expect("export TaskReviewTriageResponse");
+    UpdateTaskAutonomyLimitsRequest::export().expect("export UpdateTaskAutonomyLimitsRequest");
 
     // These are current target-domain wire contracts. Historical release
     // references are exported only through ProjectRelease's exact dependency

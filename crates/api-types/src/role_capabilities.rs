@@ -96,6 +96,9 @@ pub struct ProjectTaskRoleConfiguration {
     pub display_label: Option<String>,
     pub capabilities: Vec<TaskRoleCapability>,
     pub rework: Option<ProjectTaskRoleReworkConfiguration>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub coordinator_actor: Option<ActorRef>,
 }
 
 impl Default for ProjectTaskRoleConfiguration {
@@ -105,6 +108,7 @@ impl Default for ProjectTaskRoleConfiguration {
             display_label: None,
             capabilities: Vec::new(),
             rework: None,
+            coordinator_actor: None,
         }
     }
 }

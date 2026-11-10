@@ -654,7 +654,7 @@ async fn request_changes_creates_replay_safe_correction_and_review_round() {
         first.review_work_unit.status,
         api_types::WorkUnitStatus::Open
     );
-    assert_eq!(first.rounds_remaining, 7);
+    assert_eq!(first.rounds_remaining, 15);
     assert!(!first.replayed);
     assert_eq!(
         first
@@ -678,7 +678,7 @@ async fn request_changes_creates_replay_safe_correction_and_review_round() {
         first.correction_work_unit.id
     );
     assert_eq!(replay.review_work_unit.id, first.review_work_unit.id);
-    assert_eq!(replay.rounds_remaining, 7);
+    assert_eq!(replay.rounds_remaining, 15);
 
     let independence_rejected = common::raw_json_request(
         &harness.app,

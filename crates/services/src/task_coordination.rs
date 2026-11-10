@@ -30,7 +30,7 @@ use crate::{
 
 const MAX_PLAN_BYTES: usize = 256 * 1024;
 const MAX_BRIEF_BYTES: usize = 64 * 1024;
-const MAX_PLAN_WORK_UNITS: usize = 4;
+const MAX_PLAN_WORK_UNITS: usize = 64;
 const MAX_TITLE_BYTES: usize = 512;
 const MAX_SCOPE_BYTES: usize = 4096;
 const MAX_INSTRUCTIONS_BYTES: usize = 64 * 1024;
@@ -85,13 +85,16 @@ pub struct CoordinationEnvelope {
     pub allow_merge: bool,
     pub allowed_review_roles: Vec<String>,
     pub require_independent_review: bool,
+    /// Missing on historical envelopes means the previously authorized direct route.
+    #[serde(default)]
+    pub orchestrator_reviews_findings: bool,
 }
 
 impl Default for CoordinationEnvelope {
     fn default() -> Self {
         Self {
             schema_version: 1,
-            max_work_units: MAX_PLAN_WORK_UNITS,
+            max_work_units: 16,
             allow_new_task_roles: false,
             allow_membership_changes: false,
             allow_capability_changes: false,
@@ -101,6 +104,7 @@ impl Default for CoordinationEnvelope {
             allow_merge: false,
             allowed_review_roles: vec!["reviewer".to_owned()],
             require_independent_review: true,
+            orchestrator_reviews_findings: true,
         }
     }
 }
@@ -1853,7 +1857,7 @@ impl TaskCoordinationService {
             "You are the selected Task coordinator for one bounded preparation turn. This execution is read-only and must not modify repository files, create WorkUnits, call provider APIs, or grant authority.\n\
 Return exactly one JSON object and no markdown fences. The object must match this schema:\n\
 {{\"schema_version\":1,\"request_id\":{request_id},\"task_id\":{task_id},\"task_version\":{task_version},\"authorization_version\":{authorization_version},\"team_digest\":{team_digest},\"envelope_digest\":{envelope_digest},\"objective_digest\":{objective_digest},\"work_units\":[{{\"key\":\"stable-key\",\"title\":\"...\",\"scope\":\"...\",\"role\":\"exact existing TaskRole role name\",\"assigned_actor\":{{\"kind\":\"agent|human\",\"id\":\"exact eligible member id\"}}|null,\"parent_key\":null,\"depends_on\":[],\"requires_integration\":false,\"execution_instructions\":null,\"review_subject_key\":null,\"acceptance\":[],\"artifact_inputs\":[]}}],\"delivery\":null,\"review\":null,\"limits\":null}}\n\
-Create at most {max_work_units} WorkUnits. Use only TaskRole names and active members listed in the team. A formal review WorkUnit must use a TaskRole with the `formal_review` capability, set review_subject_key to another planned key, and must be independent from that WorkUnit's assigned Actor. The review role must also appear in the envelope's allowed_review_roles by its exact role name. Do not create, rename, or grant TaskRoles, memberships, or capabilities. Do not request external actions or merge. A plan outside the envelope will wait for Human approval.\n\
+Create at most {max_work_units} WorkUnits. Use only TaskRole names and active members listed in the team. A formal review WorkUnit must use a TaskRole with the `formal_review` capability, set review_subject_key to another planned key, and must use a fresh role-isolated native session; the same Agent profile is allowed, but a Human contributor cannot review their own result. The review role must also appear in the envelope's allowed_review_roles by its exact role name. Do not create, rename, or grant TaskRoles, memberships, or capabilities. Do not request external actions or merge. A plan outside the envelope will wait for Human approval.\n\
 Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {acceptance}\nContext: {context}\nEnvelope: {envelope_json}\nTeam: {team}\nCurrent Task context: {task_context}",
             request_id = serde_json::to_string(&request.id).unwrap(),
             task_id = serde_json::to_string(&request.task_id).unwrap(),
@@ -2912,7 +2916,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         }
         if plan.work_units.is_empty() || plan.work_units.len() > MAX_PLAN_WORK_UNITS {
             return Err(invalid_plan(
-                "the plan must contain between 1 and 4 WorkUnits",
+                "the plan must contain between 1 and 64 WorkUnits",
             ));
         }
         Ok(plan)
@@ -3252,10 +3256,11 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                     .ok_or_else(|| invalid_plan("review subject key is missing"))?;
                 if unit.assigned_actor.is_some()
                     && unit.assigned_actor == reviewed.assigned_actor
+                    && matches!(unit.assigned_actor.as_ref(), Some(ApiActorRef::Human(_)))
                     && envelope.require_independent_review
                 {
                     return Err(invalid_plan(
-                        "review must be performed by an independent Actor",
+                        "a Human contributor cannot review their own result",
                     ));
                 }
                 if reviewed.review_subject_key.is_some() {
@@ -3666,7 +3671,7 @@ mod tests {
     fn default_envelope_is_structurally_safe() {
         let envelope = CoordinationEnvelope::default();
         envelope.validate().expect("default envelope");
-        assert_eq!(envelope.max_work_units, 4);
+        assert_eq!(envelope.max_work_units, 16);
         assert!(!envelope.allow_new_task_roles);
         assert!(!envelope.allow_merge);
     }

@@ -44,6 +44,39 @@ fn service(state: &AppState) -> TaskCoordinationService {
         .with_work_unit_service(Arc::clone(&state.work_unit_service))
 }
 
+pub async fn get_autonomy_limits(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    user: AuthenticatedUser,
+) -> ApiResult<Json<api_types::TaskAutonomyLimits>> {
+    tasks::require_task_visible(&state, &task_id, &user).await?;
+    Ok(Json(
+        services::task_autonomy::TaskAutonomyService::new(
+            state.db.clone(),
+            state.event_bus.clone(),
+        )
+        .get(&task_id, &user.user_id)
+        .await?,
+    ))
+}
+
+pub async fn update_autonomy_limits(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    user: AuthenticatedUser,
+    Json(request): Json<api_types::UpdateTaskAutonomyLimitsRequest>,
+) -> ApiResult<Json<api_types::TaskAutonomyLimits>> {
+    tasks::require_task_mutable(&state, &task_id, &user).await?;
+    Ok(Json(
+        services::task_autonomy::TaskAutonomyService::new(
+            state.db.clone(),
+            state.event_bus.clone(),
+        )
+        .update(&task_id, &user.user_id, request)
+        .await?,
+    ))
+}
+
 fn db_mode(mode: TaskCoordinationMode) -> db::TaskCoordinationMode {
     match mode {
         TaskCoordinationMode::Manual => db::TaskCoordinationMode::Manual,
@@ -310,6 +343,12 @@ async fn overview_response(
         None => None,
     };
     Ok(TaskCoordinationOverviewResponse {
+        review_triage: services::task_rework::TaskReworkService::new(
+            state.db.clone(),
+            state.event_bus.clone(),
+        )
+        .list_review_triage(&overview.task.id)
+        .await?,
         task_id: overview.task.id,
         task_version: overview.task.version,
         lifecycle,

@@ -1558,12 +1558,14 @@ impl TaskCoordinationRepo for SqliteDb {
                 "INSERT INTO task_quality_route (
                     task_id, route_id, route_kind, route_ref, request_count,
                     budget_used, max_requests, created_at, updated_at
-                 ) VALUES (?, ?, ?, ?, 0, 0, 4, ?, ?)",
+                 ) VALUES (?, ?, ?, ?, 0, 0,
+                    COALESCE((SELECT max_route_requests FROM task_autonomy_limits WHERE task_id=?), 4), ?, ?)",
             )
             .bind(&input.task_id)
             .bind(&input.route_id)
             .bind(&input.route_kind)
             .bind(&input.route_ref)
+            .bind(&input.task_id)
             .bind(&input.created_at)
             .bind(&input.created_at)
             .execute(&mut *tx)

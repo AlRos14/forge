@@ -39,6 +39,7 @@ pub mod release_history;
 pub mod role_capabilities;
 pub mod shared_media_cleanup;
 pub mod shutdown;
+pub mod task_autonomy;
 pub mod task_coordination;
 pub mod task_dispatcher;
 pub mod task_failure_retry;

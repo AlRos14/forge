@@ -36,6 +36,7 @@ impl TaskService {
             .map(|default| (default.role.clone(), new_uuid_v4()))
             .collect::<HashMap<_, _>>();
 
+        let mut preferred_coordinator: Option<(String, api_types::ActorRef)> = None;
         for default in defaults.roles {
             let role = canonical_task_role_name(&default.role).ok_or_else(|| {
                 ServiceError::invalid_operation("Project default role is not a TaskRole")
@@ -51,6 +52,14 @@ impl TaskService {
                         "Project TaskRole configuration is invalid: {error}"
                     ))
                 })?;
+            if let Some(actor) = project_configuration.coordinator_actor.as_ref() {
+                if preferred_coordinator.is_some() {
+                    return Err(ServiceError::invalid_operation(
+                        "Project defaults name multiple primary coordinators",
+                    ));
+                }
+                preferred_coordinator = Some((task_role_ids[&role].clone(), actor.clone()));
+            }
             let configuration = crate::task_role_configuration::project_configuration_to_task_role(
                 &project_configuration,
                 &task_role_ids,
@@ -121,6 +130,18 @@ impl TaskService {
                 )
                 .await?;
             }
+        }
+        let envelope =
+            serde_json::to_string(&crate::task_coordination::CoordinationEnvelope::default())
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(envelope.as_bytes());
+        sqlx::query("UPDATE task_coordination SET envelope_json=?,envelope_digest=? WHERE task_id=? AND mode='manual' AND authorization_version=1")
+            .bind(envelope).bind(hex::encode(digest)).bind(task_id).execute(&mut **transaction).await?;
+        if let Some((role_id, api_types::ActorRef::Agent(actor_id))) = preferred_coordinator {
+            // Preference only: authorization remains manual until the Human
+            // starts this Task. Later Project edits do not rewrite the hint.
+            sqlx::query("UPDATE task_coordination SET coordinator_task_role_id=?,coordinator_actor_kind='agent',coordinator_actor_id=? WHERE task_id=? AND mode='manual' AND authorization_version=1")
+                .bind(role_id).bind(actor_id).bind(task_id).execute(&mut **transaction).await?;
         }
         Ok(())
     }

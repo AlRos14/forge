@@ -1070,6 +1070,23 @@ impl TaskService {
             return Ok(current_execution);
         }
 
+        if is_review_execution && result.status == ExecutionOutcome::Completed {
+            if let Some(session_id) = result.agent_session_id.as_deref() {
+                if let Err(error) = ExecutionRepo::record_harness_session_result(
+                    &*self.db,
+                    &current_execution.id,
+                    session_id,
+                    &now_rfc3339(),
+                )
+                .await
+                {
+                    result.status = ExecutionOutcome::Failed;
+                    result.error = Some(format!(
+                        "Review native session isolation could not be established: {error}"
+                    ));
+                }
+            }
+        }
         if current_execution.role == "planner"
             && result.status == ExecutionOutcome::Completed
             && existing_plan_output.is_none()
@@ -1103,6 +1120,27 @@ impl TaskService {
             }
         }
 
+        if current_execution.work_unit_id.is_some()
+            && current_execution.role != "planner"
+            && !is_review_execution
+            && result.status == ExecutionOutcome::Completed
+        {
+            if let Some(output) = result
+                .assistant_output
+                .as_deref()
+                .filter(|output| !output.trim().is_empty())
+            {
+                if let Err(error) =
+                    crate::CollaborationService::new(self.db.clone(), self.event_bus.clone())
+                        .create_delivery_artifact_from_execution(&current_execution.id, output)
+                        .await
+                {
+                    result.status = ExecutionOutcome::Failed;
+                    result.error =
+                        Some(format!("WorkUnit delivery could not be recorded: {error}"));
+                }
+            }
+        }
         if crate::role_capabilities::execution_has_capability(
             &self.db,
             &current_execution.id,

@@ -107,7 +107,17 @@ export function routeSsePayload(
     })
   }
 
-  if (['artifact.created', 'message.created', 'handoff.created', 'handoff.status_changed', 'proposal.created', 'proposal.withdrawn', 'decision.recorded'].includes(eventType)) {
+  if (
+    [
+      'artifact.created',
+      'message.created',
+      'handoff.created',
+      'handoff.status_changed',
+      'proposal.created',
+      'proposal.withdrawn',
+      'decision.recorded',
+    ].includes(eventType)
+  ) {
     const taskId = payload.scope_type === 'task' ? payload.scope_id : undefined
     if (taskId) void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
   }
@@ -119,14 +129,19 @@ export function routeSsePayload(
     browserEvents.dispatch('forge:notification-created', { ...payload, ...facts })
   }
 
-  if (eventType.startsWith('task.coordination_')) {
+  if (
+    eventType.startsWith('task.coordination_') ||
+    eventType === 'task.review_triaged' ||
+    eventType === 'task.autonomy_limits_changed'
+  ) {
     const taskId =
       typeof facts.task_id === 'string'
         ? facts.task_id
         : payload.scope_type === 'task'
-          ? payload.scope_id ?? undefined
+          ? (payload.scope_id ?? undefined)
           : undefined
     if (taskId) {
+      void queryClient.invalidateQueries({ queryKey: ['task-autonomy-limits', taskId] })
       void queryClient.invalidateQueries({ queryKey: qk.taskCoordination(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
@@ -144,7 +159,7 @@ export function routeSsePayload(
       typeof facts.task_id === 'string'
         ? facts.task_id
         : payload.scope_type === 'task'
-          ? payload.scope_id ?? undefined
+          ? (payload.scope_id ?? undefined)
           : undefined
     if (taskId) {
       void queryClient.invalidateQueries({ queryKey: qk.taskQualityRequests(taskId) })
@@ -164,7 +179,7 @@ export function routeSsePayload(
       typeof facts.task_id === 'string'
         ? facts.task_id
         : payload.scope_type === 'task'
-          ? payload.scope_id ?? undefined
+          ? (payload.scope_id ?? undefined)
           : undefined
     if (taskId) {
       void queryClient.invalidateQueries({ queryKey: qk.taskInterventions(taskId) })
@@ -252,6 +267,8 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
             'task.coordination_plan_approved',
             'task.coordination_plan_rejected',
             'task.coordination_plan_materialized',
+            'task.review_triaged',
+            'task.autonomy_limits_changed',
             'task.quality_requested',
             'task.quality_request_resolved',
             'task.intervention_recorded',

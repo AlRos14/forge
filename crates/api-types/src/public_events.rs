@@ -90,6 +90,12 @@ pub enum PublicEventType {
     #[serde(rename = "task.coordination_plan_materialized")]
     #[ts(rename = "task.coordination_plan_materialized")]
     TaskCoordinationPlanMaterialized,
+    #[serde(rename = "task.review_triaged")]
+    #[ts(rename = "task.review_triaged")]
+    TaskReviewTriaged,
+    #[serde(rename = "task.autonomy_limits_changed")]
+    #[ts(rename = "task.autonomy_limits_changed")]
+    TaskAutonomyLimitsChanged,
     #[serde(rename = "task.quality_requested")]
     #[ts(rename = "task.quality_requested")]
     TaskQualityRequested,
@@ -162,6 +168,8 @@ impl PublicEventType {
             Self::TaskCoordinationPlanApproved => "task.coordination_plan_approved",
             Self::TaskCoordinationPlanRejected => "task.coordination_plan_rejected",
             Self::TaskCoordinationPlanMaterialized => "task.coordination_plan_materialized",
+            Self::TaskReviewTriaged => "task.review_triaged",
+            Self::TaskAutonomyLimitsChanged => "task.autonomy_limits_changed",
             Self::TaskQualityRequested => "task.quality_requested",
             Self::TaskQualityRequestResolved => "task.quality_request_resolved",
             Self::TaskInterventionRecorded => "task.intervention_recorded",

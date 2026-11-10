@@ -611,6 +611,11 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::task_coordination::get_coordination),
         )
         .route(
+            "/api/v1/tasks/{id}/coordination/limits",
+            get(routes::task_coordination::get_autonomy_limits)
+                .put(routes::task_coordination::update_autonomy_limits),
+        )
+        .route(
             "/api/v1/tasks/{id}/coordination/authorize",
             post(routes::task_coordination::authorize),
         )

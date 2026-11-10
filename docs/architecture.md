@@ -240,3 +240,14 @@ authority matrix, durable records, recovery rules, and UX states. The backend
 vertical slice (V158–V161, services, REST/MCP/CLI/SSE, generated types) is
 implemented. The guided UI is integrated; joint acceptance remains in progress. See the
 [system review and implementation sequence](plans/task-coordination-and-guided-experience.md).
+
+### Guided delivery extensions (V162–V165)
+
+Review independence is Task/role HarnessSession isolation for Agents; Human
+self-review remains forbidden. Same saved Agent profiles can fill several roles.
+The current coordinator may triage exact immutable findings through bounded typed
+outputs, without becoming the approval authority. New guided authorizations use
+this mediation; historical envelopes retain their stored behavior. Autonomy
+limits, human extensions and triage receipts are durable and versioned. See
+[orchestration](concepts/orchestration.md), [sessions](concepts/sessions.md) and
+[the Task operating model](concepts/task-operating-model.md).

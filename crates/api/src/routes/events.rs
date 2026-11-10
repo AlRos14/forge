@@ -209,6 +209,16 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "work_unit_ids",
             ],
         ),
+        "task.review_triaged" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "review_report_artifact_id",
+                "disposition",
+                "review_work_unit_id",
+            ],
+        ),
+        "task.autonomy_limits_changed" => project_fields(&source, &["task_id", "limits"]),
         "task.quality_requested" => project_fields(
             &source,
             &[
@@ -324,6 +334,8 @@ fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
         "task.coordination_plan_approved" => PublicEventType::TaskCoordinationPlanApproved,
         "task.coordination_plan_rejected" => PublicEventType::TaskCoordinationPlanRejected,
         "task.coordination_plan_materialized" => PublicEventType::TaskCoordinationPlanMaterialized,
+        "task.review_triaged" => PublicEventType::TaskReviewTriaged,
+        "task.autonomy_limits_changed" => PublicEventType::TaskAutonomyLimitsChanged,
         "task.quality_requested" => PublicEventType::TaskQualityRequested,
         "task.quality_request_resolved" => PublicEventType::TaskQualityRequestResolved,
         "task.intervention_recorded" => PublicEventType::TaskInterventionRecorded,

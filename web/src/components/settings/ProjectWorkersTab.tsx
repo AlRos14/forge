@@ -16,6 +16,7 @@ import { apiFetch } from '@/api/client'
 import { ProjectTaskRoleConfigurationForm } from '@/features/task-roles/TaskRoleConfigurationForm'
 import { ActorIdentity, resolveActorIdentity } from '@/features/task-roles/ActorIdentity'
 import { settingsErrorMessage } from '@/components/settings/project-settings-utils'
+import { recommendedWorkflowRoles } from '@/features/task-roles/recommended-workflow'
 import { useAuthStore } from '@/stores/auth'
 import type {
   ActorRef,
@@ -63,6 +64,10 @@ export function ProjectWorkersTab({ projectId }: { projectId: string }) {
   const [newRole, setNewRole] = useState('')
   const [newRoleTemplate, setNewRoleTemplate] = useState('custom')
   const [selectedActors, setSelectedActors] = useState<Record<string, string>>({})
+  const [automaticWorkflow, setAutomaticWorkflow] = useState(true)
+  const [implementationRole, setImplementationRole] = useState('implementer')
+  const [primaryCoordinator, setPrimaryCoordinator] = useState('')
+  const [reviewActors, setReviewActors] = useState<Record<string, ActorRef>>({})
 
   useEffect(() => {
     if (!defaultsQuery.data) return
@@ -81,7 +86,56 @@ export function ProjectWorkersTab({ projectId }: { projectId: string }) {
     currentMember?.role === 'admin' ||
     (currentMember?.role === 'owner' && project?.owner_id === user?.id)
   const defaults = defaultsQuery.data
-  const isDirty = JSON.stringify(roles) !== JSON.stringify(defaults?.roles ?? [])
+  const coordinatorChoices = roles.flatMap((role) =>
+    role.configuration.capabilities.includes('orchestration')
+      ? role.members
+          .filter((actor) => actor.kind === 'agent')
+          .map((actor) => ({ role: role.role, actor, value: `${role.role}:${actorKey(actor)}` }))
+      : [],
+  )
+  const savedCoordinator = coordinatorChoices.find((choice) =>
+    roles.some(
+      (role) =>
+        role.role === choice.role &&
+        role.configuration.coordinator_actor &&
+        actorKey(role.configuration.coordinator_actor) === actorKey(choice.actor),
+    ),
+  )
+  const coordinatorChoice =
+    coordinatorChoices.find((choice) => choice.value === primaryCoordinator) ??
+    savedCoordinator ??
+    (coordinatorChoices.length === 1 ? coordinatorChoices[0] : undefined)
+  const implementationChoices = roles.filter(
+    (role) =>
+      !role.configuration.capabilities.includes('formal_review') &&
+      !role.configuration.capabilities.includes('orchestration'),
+  )
+  const selectedImplementation =
+    implementationChoices.find((role) => role.role === implementationRole)?.role ??
+    (implementationChoices.length === 1 ? implementationChoices[0]?.role : '') ??
+    ''
+  const effectiveRoles =
+    automaticWorkflow && selectedImplementation
+      ? recommendedWorkflowRoles(
+          roles,
+          selectedImplementation,
+          coordinatorChoice
+            ? { role: coordinatorChoice.role, actor: coordinatorChoice.actor }
+            : null,
+          reviewActors,
+        )
+      : roles
+  const workflowIncomplete =
+    automaticWorkflow &&
+    (!coordinatorChoice ||
+      !selectedImplementation ||
+      !effectiveRoles.some((role) => role.configuration.capabilities.includes('formal_review')) ||
+      effectiveRoles.some(
+        (role) =>
+          role.configuration.capabilities.includes('formal_review') &&
+          !role.configuration.rework?.review_actor,
+      ))
+  const isDirty = JSON.stringify(effectiveRoles) !== JSON.stringify(defaults?.roles ?? [])
   const isLoading =
     projectQuery.isLoading ||
     membersQuery.isLoading ||
@@ -137,13 +191,14 @@ export function ProjectWorkersTab({ projectId }: { projectId: string }) {
   )
 
   const save = () => {
-    if (!defaults || !canManage || !isDirty || updateDefaults.isPending) return
+    if (!defaults || !canManage || !isDirty || workflowIncomplete || updateDefaults.isPending)
+      return
     updateDefaults.mutate(
       {
         projectId,
         body: {
           expected_version: defaults.version,
-          roles,
+          roles: effectiveRoles,
         },
       },
       {
@@ -168,7 +223,10 @@ export function ProjectWorkersTab({ projectId }: { projectId: string }) {
               copies these defaults; later Project changes do not rewrite active work.
             </p>
           </div>
-          <Button disabled={!canManage || !isDirty || updateDefaults.isPending} onClick={save}>
+          <Button
+            disabled={!canManage || !isDirty || workflowIncomplete || updateDefaults.isPending}
+            onClick={save}
+          >
             {updateDefaults.isPending ? 'Saving…' : 'Save team defaults'}
           </Button>
         </div>
@@ -326,6 +384,102 @@ export function ProjectWorkersTab({ projectId }: { projectId: string }) {
         </p>
       ) : null}
 
+      <section className="mb-5 space-y-3 rounded-lg border bg-card p-4">
+        <label className="flex items-center gap-2 font-medium">
+          <input
+            type="checkbox"
+            disabled={!canManage}
+            checked={automaticWorkflow}
+            onChange={(event) => setAutomaticWorkflow(event.target.checked)}
+          />
+          Coordinator-led automation (recommended)
+        </label>
+        <p className="text-sm text-muted-foreground">
+          After you start a new Task, the coordinator prepares and assigns work, evaluates review
+          findings, and routes corrections and fresh reviews. Saving this team does not start any
+          Task.
+        </p>
+        {automaticWorkflow ? (
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="space-y-1 text-sm">
+              <span>Default Task coordinator</span>
+              <select
+                className="h-10 w-full rounded-md border bg-background px-2"
+                disabled={!canManage}
+                value={coordinatorChoice?.value ?? ''}
+                onChange={(event) => setPrimaryCoordinator(event.target.value)}
+              >
+                <option value="">Choose a coordinator</option>
+                {coordinatorChoices.map((choice) => (
+                  <option key={choice.value} value={choice.value}>
+                    {actorOptionLabel(choice.actor)} · {choice.role}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="space-y-1 text-sm">
+              <span>Correction destination</span>
+              <select
+                className="h-10 w-full rounded-md border bg-background px-2"
+                disabled={!canManage}
+                value={selectedImplementation}
+                onChange={(event) => setImplementationRole(event.target.value)}
+              >
+                <option value="">Choose an implementation role</option>
+                {implementationChoices.map((role) => (
+                  <option key={role.role} value={role.role}>
+                    {role.configuration.display_label || role.role}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {roles
+              .filter((role) => role.configuration.capabilities.includes('formal_review'))
+              .map((role) => {
+                const selected =
+                  reviewActors[role.role] ??
+                  role.configuration.rework?.review_actor ??
+                  role.members.find((actor) => actor.kind === 'agent')
+                return (
+                  <label key={role.role} className="space-y-1 text-sm">
+                    <span>
+                      Independent reviewer · {role.configuration.display_label || role.role}
+                    </span>
+                    <select
+                      className="h-10 w-full rounded-md border bg-background px-2"
+                      disabled={!canManage}
+                      value={selected ? actorKey(selected) : ''}
+                      onChange={(event) => {
+                        const actor = actorFromKey(event.target.value)
+                        if (actor)
+                          setReviewActors((current) => ({ ...current, [role.role]: actor }))
+                      }}
+                    >
+                      <option value="">Choose a reviewer</option>
+                      {role.members
+                        .filter((actor) => actor.kind === 'agent')
+                        .map((actor) => (
+                          <option key={actorKey(actor)} value={actorKey(actor)}>
+                            {actorOptionLabel(actor)}
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                )
+              })}
+            <p className="text-xs text-muted-foreground sm:col-span-2">
+              The same Agent profile may implement and review using isolated role sessions. Defaults
+              affect new Tasks; existing Tasks retain their own team and authorization.
+            </p>
+            {workflowIncomplete ? (
+              <p role="status" className="text-sm text-amber-700 sm:col-span-2">
+                Add the coordinator, implementation role and reviewer above, then choose their
+                defaults here.
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
       <div className="space-y-3">
         {!isLoading && roles.length === 0 ? (
           <div className="rounded-lg border border-dashed p-6 text-center">

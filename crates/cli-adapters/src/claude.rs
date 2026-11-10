@@ -192,6 +192,20 @@ impl ClaudeCodeAdapter {
         if ctx.invocation.is_planning() {
             config.plan = Some(true);
         }
+        if ctx
+            .task_role_capabilities
+            .contains(&api_types::TaskRoleCapability::FormalReview)
+            || (ctx
+                .task_role_capabilities
+                .contains(&api_types::TaskRoleCapability::Orchestration)
+                && !ctx.has_repository_workspace)
+        {
+            config.forge_task_read_only = Some(true);
+            config.dangerously_skip_permissions = Some(false);
+            config.claude_code_router = Some(false);
+            config.command_overrides.base_command_override = None;
+            config.command_overrides.additional_params = None;
+        }
         config
     }
 
@@ -249,6 +263,23 @@ impl ClaudeCodeAdapter {
                 "dontAsk".to_owned(),
                 "--allowedTools".to_owned(),
                 "mcp__forge_project__*".to_owned(),
+            ]);
+        } else if config.forge_task_read_only == Some(true) {
+            adapter_args.extend([
+                "--setting-sources".to_owned(),
+                String::new(),
+                "--settings".to_owned(),
+                r#"{"disableAllHooks":true}"#.to_owned(),
+                "--disable-slash-commands".to_owned(),
+                "--tools".to_owned(),
+                "Read,Glob,Grep".to_owned(),
+                "--strict-mcp-config".to_owned(),
+                "--mcp-config".to_owned(),
+                r#"{"mcpServers":{}}"#.to_owned(),
+                "--permission-mode".to_owned(),
+                "dontAsk".to_owned(),
+                "--allowedTools".to_owned(),
+                "Read,Glob,Grep".to_owned(),
             ]);
         } else if config.dangerously_skip_permissions.unwrap_or(false) {
             adapter_args.push("--dangerously-skip-permissions".to_owned());
@@ -343,7 +374,10 @@ impl ClaudeCodeAdapter {
         ctx: ExecutionContext,
         cancel: CancellationToken,
     ) -> Result<ExecutionResult, ExecutorError> {
-        let config = Self::resolve_config(&ctx);
+        let mut config = Self::resolve_config(&ctx);
+        if config.forge_task_read_only == Some(true) {
+            ensure_project_copilot_cli_supported().await?;
+        }
         let project_copilot = ctx.role == "project_copilot";
         if project_copilot {
             validate_project_copilot_config(&config)?;
@@ -1418,6 +1452,27 @@ mod tests {
     use super::*;
     use executors::CommandOverrides;
     use std::time::Duration;
+
+    #[test]
+    fn formal_review_uses_read_only_native_tools_and_no_inherited_mcp() {
+        let mut context = crate::test_execution_context(
+            executors::HarnessInvocation::Start,
+            serde_json::json!({"dangerously_skip_permissions":true,"base_command_override":"unsafe","additional_params":["--tools","Bash,Write"]}),
+        );
+        context.task_role_capabilities = vec![api_types::TaskRoleCapability::FormalReview];
+        let config = ClaudeCodeAdapter::resolve_config(&context);
+        assert!(config.command_overrides.base_command_override.is_none());
+        assert!(config.command_overrides.additional_params.is_none());
+        let command = ClaudeCodeAdapter::build_command(&config, None);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|a| a == ["--tools", "Read,Glob,Grep"]));
+        assert!(args.contains(&"--strict-mcp-config".to_owned()));
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_owned()));
+    }
 
     #[test]
     fn generic_resume_uses_exact_session_and_start_clears_stale_session() {

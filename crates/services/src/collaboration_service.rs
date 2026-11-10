@@ -559,6 +559,35 @@ impl CollaborationService {
         execution_id: &str,
         markdown: &str,
     ) -> Result<Artifact> {
+        self.create_inline_execution_output(execution_id, markdown, ArtifactKind::Plan)
+            .await
+    }
+
+    /// Preserve the complete delivered result independently from private
+    /// harness history, so downstream WorkUnits can consume an exact pin.
+    pub(crate) async fn create_delivery_artifact_from_execution(
+        &self,
+        execution_id: &str,
+        content: &str,
+    ) -> Result<Artifact> {
+        let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .ok_or_else(|| not_found("execution", execution_id.to_owned()))?;
+        if execution.work_unit_id.is_none() || content.len() > 1024 * 1024 {
+            return Err(invalid(
+                "A bounded delivery Artifact requires an exact WorkUnit Execution",
+            ));
+        }
+        self.create_inline_execution_output(execution_id, content, ArtifactKind::Summary)
+            .await
+    }
+
+    async fn create_inline_execution_output(
+        &self,
+        execution_id: &str,
+        markdown: &str,
+        kind: ArtifactKind,
+    ) -> Result<Artifact> {
         if markdown.trim().is_empty() {
             return Err(invalid("Plan Execution result must contain content"));
         }
@@ -608,7 +637,7 @@ impl CollaborationService {
                 serde_json::json!({
                     "artifact_id": id,
                     "task_id": execution.task_id,
-                    "kind": "plan",
+                    "kind": kind.to_string(),
                 }),
                 &now,
             )
@@ -618,7 +647,7 @@ impl CollaborationService {
             CreateArtifact {
                 id,
                 task_id: execution.task_id,
-                kind: ArtifactKind::Plan,
+                kind,
                 storage_kind: ArtifactStorageKind::Inline,
                 content: Some(markdown.to_owned()),
                 content_ref: None,
@@ -708,6 +737,17 @@ impl CollaborationService {
         let actor = execution
             .actor_ref()
             .ok_or_else(|| invalid("Review Execution has no persisted ActorRef"))?;
+        if matches!(actor, ActorRef::Agent(_)) {
+            let same_profile_contributed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_unit_review_subject s JOIN execution contributor ON contributor.work_unit_id=s.reviewed_work_unit_id WHERE s.review_work_unit_id=? AND contributor.actor_kind='agent' AND contributor.actor_id=?)")
+                .bind(execution.work_unit_id.as_deref()).bind(execution.actor_id.as_deref()).fetch_one(self.db.pool()).await?;
+            if same_profile_contributed {
+                let isolated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM harness_session s WHERE s.id=? AND s.status='active' AND s.external_session_id IS NOT NULL)")
+                    .bind(execution.harness_session_id.as_deref()).fetch_one(self.db.pool()).await?;
+                if !isolated {
+                    return Err(invalid("Independent review by the same profile requires a proven separate native session"));
+                }
+            }
+        }
         let structured = parse_review_result(assistant_output)?;
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?

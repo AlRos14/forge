@@ -173,40 +173,96 @@ impl TaskDispatcher {
     }
 }
 
-#[allow(clippy::type_complexity)]
 async fn work_unit_consumption_context(
     db: &db::SqliteDb,
     work_unit: &db::WorkUnit,
 ) -> Result<Option<String>> {
+    use db::{CollaborationRepo, ExecutionRepo, WorkspaceRepo};
+    use sqlx::Row;
+    let mut sections = Vec::new();
     if let Some(subject) = crate::task_rework::get_review_subject(db, &work_unit.id).await? {
-        return Ok(Some(format!(
-            "Exact review subject: reviewed WorkUnit {} v{}, result Execution {}, commit {}, Workspace {}, snapshot digest {}. The reviewed implementation is not integrated into your own workspace. Inspect those exact records and artifacts through Forge; do not rewrite the reviewed WorkUnit.",
+        sections.push("You are performing formal independent review. Inspect the exact result against its scope and acceptance criteria. Do not edit files, implement fixes, approve your own reasoning as evidence, or contact external providers. Report only concrete findings with reproduction/evidence; distinguish unavailable checks from passes. End your assistant output with exactly one final line in this contract: FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass|fail|needs_human\",\"summary\":\"nonempty factual summary\",\"criteria\":[\"criterion checked\"],\"findings\":[\"concrete defect with location and evidence\"],\"questions\":[],\"evidence_considered\":[]}. Choose one verdict. Use fail for confirmed defects, pass only when the required criteria are met, and needs_human for an unresolved decision or missing essential evidence. findings and questions must be JSON arrays; findings must be concrete strings, not instructions to silently change scope.".to_owned());
+        sections.push(format!(
+            "Exact review subject: WorkUnit {} v{}, result Execution {}, commit {}, Workspace {}, snapshot digest {}. Review this immutable result independently. Your current directory is an isolated review context; the implementation has not been copied into it. Do not edit the result or reuse its native session.",
             subject.reviewed_work_unit_id,
-            subject.reviewed_work_unit_version.map(|version| version.to_string()).unwrap_or_else(|| "pending".to_owned()),
-            subject.result_execution_id.as_deref().unwrap_or("none"),
-            subject.result_commit_sha.as_deref().unwrap_or("none"),
-            subject.result_workspace_id.as_deref().unwrap_or("none"),
-            subject.workspace_snapshot_digest.as_deref().unwrap_or("none"),
-        )));
+            subject.reviewed_work_unit_version.map(|v|v.to_string()).unwrap_or_else(||"pending".to_owned()),
+            subject.result_execution_id.as_deref().unwrap_or("none"),subject.result_commit_sha.as_deref().unwrap_or("none"),
+            subject.result_workspace_id.as_deref().unwrap_or("none"),subject.workspace_snapshot_digest.as_deref().unwrap_or("none")));
+        if let Some(unit) = WorkUnitRepo::get_by_id(db, &subject.reviewed_work_unit_id).await? {
+            sections.push(format!("Reviewed scope and acceptance:\n{}", unit.scope));
+        }
+        if let Some(id) = subject.result_execution_id.as_deref() {
+            if let Some(result) = ExecutionRepo::get_by_id(db, id).await? {
+                sections.push(format!(
+                    "Delivery summary from exact result Execution {id}:\n{}",
+                    result.summary.as_deref().unwrap_or("No summary recorded")
+                ));
+            }
+        }
+        if let Some(id) = subject.result_workspace_id.as_deref() {
+            if let Some(workspace) = WorkspaceRepo::get_by_id(db, id).await? {
+                if workspace.task_id != work_unit.task_id {
+                    return Err(crate::ServiceError::invalid_operation(
+                        "Review workspace belongs to another Task",
+                    ));
+                }
+                sections.push(format!("Read the exact implementation at {} (commit {}). Read access does not grant a WorkspaceLease or write permission.",workspace.worktree_path,subject.result_commit_sha.as_deref().unwrap_or("none")));
+            }
+        }
+        if let Some(id) = subject.result_artifact_id.as_deref() {
+            let artifact = CollaborationRepo::get_artifact(db, id)
+                .await?
+                .filter(|a| a.task_id == work_unit.task_id)
+                .ok_or_else(|| {
+                    crate::ServiceError::invalid_operation(
+                        "Exact review delivery Artifact is unavailable",
+                    )
+                })?;
+            sections.push(format!(
+                "Exact delivery Artifact {id}, digest {}:\n{}",
+                artifact.digest.as_deref().unwrap_or("none"),
+                artifact
+                    .content
+                    .as_deref()
+                    .unwrap_or("External Artifact: inspect its explicit storage reference")
+            ));
+        }
+    } else {
+        let requirement: Option<(String,i64,String,Option<String>,Option<String>)>=sqlx::query_as("SELECT source_work_unit_id,source_work_unit_version,result_execution_id,result_commit_sha,result_workspace_id FROM work_unit_result_requirement WHERE work_unit_id=?")
+            .bind(&work_unit.id).fetch_optional(db.pool()).await?;
+        if let Some((id, version, execution, commit, workspace)) = requirement {
+            sections.push(format!("Exact consumed result: WorkUnit {id} v{version}, result Execution {execution}, commit {}, Workspace {}. Start from this exact result; do not modify sibling WorkUnits.",commit.as_deref().unwrap_or("none"),workspace.as_deref().unwrap_or("none")));
+        }
     }
-    let requirement: Option<(String, i64, String, Option<String>, Option<String>)> =
-        sqlx::query_as(
-            "SELECT source_work_unit_id, source_work_unit_version, result_execution_id,
-                    result_commit_sha, result_workspace_id
-             FROM work_unit_result_requirement WHERE work_unit_id = ?",
-        )
-        .bind(&work_unit.id)
-        .fetch_optional(db.pool())
-        .await?;
-    Ok(requirement.map(
-        |(source_id, source_version, execution_id, commit_sha, workspace_id)| {
-            format!(
-                "Exact consumed result: source WorkUnit {source_id} v{source_version}, result Execution {execution_id}, commit {}, Workspace {}. Start from that exact result and do not modify sibling WorkUnits.",
-                commit_sha.as_deref().unwrap_or("none"),
-                workspace_id.as_deref().unwrap_or("none"),
-            )
-        },
-    ))
+    let inputs=sqlx::query("SELECT pin.artifact_id,pin.artifact_digest,pin.producer_execution_id,a.digest,a.content,a.content_ref,producer.execution_id AS actual_producer FROM work_unit_artifact_input pin LEFT JOIN artifact a ON a.id=pin.artifact_id AND a.task_id=pin.task_id LEFT JOIN artifact_execution_producer producer ON producer.artifact_id=a.id WHERE pin.work_unit_id=? ORDER BY pin.artifact_id")
+        .bind(&work_unit.id).fetch_all(db.pool()).await?;
+    for row in inputs {
+        let id: String = row.try_get("artifact_id")?;
+        let expected: String = row.try_get("artifact_digest")?;
+        if row.try_get::<Option<String>, _>("digest")?.as_deref() != Some(expected.as_str())
+            || row
+                .try_get::<Option<String>, _>("actual_producer")?
+                .as_deref()
+                != Some(row.try_get::<String, _>("producer_execution_id")?.as_str())
+        {
+            return Err(crate::ServiceError::invalid_operation(
+                "A pinned input Artifact or its producer no longer matches the accepted package",
+            ));
+        }
+        let content: Option<String> = row.try_get("content")?;
+        let reference: Option<String> = row.try_get("content_ref")?;
+        sections.push(format!(
+            "Explicit input Artifact {id}, digest {expected}:\n{}",
+            content
+                .or(reference.map(|r| format!("External content reference: {r}")))
+                .unwrap_or_default()
+        ));
+    }
+    let context = sections.join("\n\n");
+    if context.len() > 128 * 1024 {
+        return Err(crate::ServiceError::invalid_operation("WorkUnit handoff exceeds the explicit context budget; narrow its Artifact package instead of silently truncating evidence"));
+    }
+    Ok((!context.is_empty()).then_some(context))
 }
 
 fn automatic_work_unit_prompt(task: &db::Task, work_unit: &db::WorkUnit) -> String {

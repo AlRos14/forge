@@ -648,3 +648,21 @@ forms use the same TaskService structural transaction as REST.
 - [Architecture](architecture.md)
 - [Architecture V2 migration register](migration/architecture-v2.md)
 - [Plan PR12 public-surface ledger](migration/plan-pr12-public-surface-alignment.md)
+
+### Task autonomy and review triage
+
+`GET /api/v1/tasks/{id}/coordination/limits` returns `version`, `max_turns`,
+`max_quality_requests`, `max_rework_rounds`, and `max_route_requests`.
+`PUT` on the same route accepts `{ expected_version, limits, reason,
+idempotency_key }`; `limits.version` must equal `expected_version`. Values must
+be integers in 1–1000. A current Project owner/admin is required, including on
+replay. Conflicting versions or idempotency payloads return 409. Counters and
+history are preserved; budget-only blocked routes may resume with a durable grant.
+
+Project role configuration adds optional `coordinator_actor` (an active Agent
+member of an orchestration-capable role). Coordination overview adds
+`review_triage`, the latest 30 immutable coordinator decisions: report ID,
+Execution ID, disposition (`correct`, `recheck`, `human`), rationale, instructions,
+optional reassessment WorkUnit ID, and timestamp. The SSE events
+`task.review_triaged` and `task.autonomy_limits_changed` expose IDs, disposition
+and limits; private instructions, rationale and reasons are excluded.

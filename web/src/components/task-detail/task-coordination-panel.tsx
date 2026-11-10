@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { Link } from '@tanstack/react-router'
 import { toast } from 'sonner'
+import { useAuthStore } from '@/stores/auth'
 import {
   useAgentAvailability,
   useAuthorizeTaskCoordination,
@@ -47,6 +48,7 @@ import {
   readableCoordinationCode,
 } from './task-coordination-status'
 import { TaskInterventionsPanel } from './task-interventions-panel'
+import { TaskAutonomyLimitsPanel } from './task-autonomy-limits'
 import { TaskQualityRequestsPanel } from './task-quality-requests-panel'
 
 type CoordinatorChoice = {
@@ -128,7 +130,7 @@ function getCoordinatorChoices(
       if (
         member.status !== 'active' ||
         member.actor_ref.kind !== 'agent' ||
-        member.harness?.toLowerCase() !== 'codex'
+        !['codex', 'claude_code'].includes(member.harness?.toLowerCase() ?? '')
       ) {
         return []
       }
@@ -158,6 +160,10 @@ export function TaskCoordinationPanel({
   daemons: DaemonResponse[]
   onOpenAdvancedWork: () => void
 }) {
+  const user = useAuthStore((state) => state.user)
+  const canManageLimits = members.some(
+    (member) => member.user_id === user?.id && ['owner', 'admin'].includes(member.role),
+  )
   const query = useTaskCoordinationQuery(task.id)
   const overview = query.data
   const planQuery = useTaskCoordinationPlanQuery(
@@ -180,7 +186,7 @@ export function TaskCoordinationPanel({
   const currentCoordinatorValue = overview?.coordinator
     ? `${overview.coordinator.task_role_id}:${overview.coordinator.actor_ref.kind}:${overview.coordinator.actor_ref.id}`
     : ''
-  const [mode, setMode] = useState<Exclude<TaskCoordinationMode, 'manual'>>('proposal')
+  const [mode, setMode] = useState<Exclude<TaskCoordinationMode, 'manual'>>('prepare_and_execute')
   const [coordinatorKey, setCoordinatorKey] = useState('')
   const [objective, setObjective] = useState(task.title)
   const [constraints, setConstraints] = useState('')
@@ -226,7 +232,9 @@ export function TaskCoordinationPanel({
       ? displayedCoordinatorAgent.actor_ref.id
       : null
   const coordinatorAvailability = useAgentAvailability(coordinatorAgentId)
-  const supportedCoordinator = displayedCoordinatorAgent?.harness?.toLowerCase() === 'codex'
+  const supportedCoordinator = ['codex', 'claude_code'].includes(
+    displayedCoordinatorAgent?.harness?.toLowerCase() ?? '',
+  )
   const coordinatorAvailable = Boolean(
     supportedCoordinator && coordinatorAvailability.data?.available,
   )
@@ -237,7 +245,18 @@ export function TaskCoordinationPanel({
   const coordinatorRole = overview?.team.find(
     (role) => role.id === overview.coordinator?.task_role_id,
   )
-  const baseNextAction = overview ? deriveCoordinationNextAction(overview, request, plan) : null
+  const derivedNextAction = overview ? deriveCoordinationNextAction(overview, request, plan) : null
+  const baseNextAction =
+    overview?.mode === 'manual' && overview.can_authorize && selectedCoordinator
+      ? {
+          kind: 'request' as const,
+          tone: 'action' as const,
+          owner: 'You',
+          summary: 'Ready to start with the selected coordinator.',
+          detail:
+            'Start authorizes the selected mode for this Task. The coordinator prepares the WorkUnits and the team can proceed within the saved boundaries.',
+        }
+      : derivedNextAction
   const nextAction = baseNextAction
     ? baseNextAction.kind === 'request' && coordinatorAvailability.isLoading
       ? {
@@ -301,17 +320,42 @@ export function TaskCoordinationPanel({
     }
   }
 
-  async function requestPlan(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    if (!overview?.can_request || turnBudgetExhausted || !coordinatorAvailable || !objective.trim())
+  async function requestPlan(event?: FormEvent<HTMLFormElement>) {
+    event?.preventDefault()
+    if (
+      !overview ||
+      (!overview.can_request && !overview.can_authorize) ||
+      turnBudgetExhausted ||
+      !coordinatorAvailable ||
+      !selectedCoordinator ||
+      !objective.trim()
+    )
       return
     setActionError(null)
     try {
+      const authorization =
+        !plannedModeIsAuthorized ||
+        overview.blockers.some((blocker) => blocker.code === 'coordination.authorization_stale') ||
+        overview.mode !== mode ||
+        selectedCoordinator.value !== currentCoordinatorValue
+          ? await authorize.mutateAsync({
+              taskId: task.id,
+              body: {
+                expected_task_version: overview.task_version,
+                expected_coordination_version: overview.authorization_version,
+                mode,
+                coordinator_task_role_id: selectedCoordinator.role.id,
+                coordinator_actor: selectedCoordinator.member.actor_ref,
+                envelope: null,
+                idempotency_key: newIdempotencyKey(),
+              },
+            })
+          : overview
       const response = await requestTurn.mutateAsync({
         taskId: task.id,
         body: {
-          expected_task_version: overview.task_version,
-          expected_coordination_version: overview.authorization_version,
+          expected_task_version: authorization.task_version,
+          expected_coordination_version: authorization.authorization_version,
           objective: objective.trim(),
           constraints: constraints.trim() || null,
           acceptance_criteria: acceptanceCriteria
@@ -547,6 +591,19 @@ export function TaskCoordinationPanel({
             <p className="mt-1 break-words text-sm font-semibold">{nextAction.summary}</p>
             <p className="mt-1 break-words text-sm opacity-90">{nextAction.detail}</p>
             <div className="mt-3 flex flex-wrap gap-2">
+              {nextAction.kind === 'request' && coordinatorAvailable ? (
+                <Button
+                  size="sm"
+                  disabled={authorize.isPending || requestTurn.isPending || !objective.trim()}
+                  onClick={() => void requestPlan()}
+                >
+                  {authorize.isPending || requestTurn.isPending
+                    ? 'Starting coordinator…'
+                    : mode === 'proposal'
+                      ? 'Prepare proposal'
+                      : 'Start task'}
+                </Button>
+              ) : null}
               {nextAction.kind === 'resume' ? (
                 <Button
                   size="sm"
@@ -760,9 +817,9 @@ export function TaskCoordinationPanel({
                 No eligible coordinator is available in this Task team.
               </p>
               <p className="mt-1 text-sm text-muted-foreground">
-                The current automatic turn requires an active Codex CLI Agent in a Task role with
-                orchestration capability. You can change this Task&apos;s roles in Advanced work, or
-                reuse a Project team template so new Tasks start with eligible members.
+                Automatic coordination requires an active Codex or Claude Code Agent in a Task role
+                with orchestration capability. You can change this Task&apos;s roles in Advanced
+                work, or reuse a Project team template so new Tasks start with eligible members.
               </p>
               <div className="mt-3 flex flex-wrap gap-2">
                 <Button size="sm" variant="outline" onClick={onOpenAdvancedWork}>
@@ -826,6 +883,7 @@ export function TaskCoordinationPanel({
             size="sm"
             onClick={() => void authorizeCoordination()}
             disabled={!selectedCoordinator || authorize.isPending}
+            className={overview.mode === 'manual' ? 'hidden' : undefined}
           >
             {authorize.isPending ? 'Saving authorization…' : 'Save authorization'}
           </Button>
@@ -849,19 +907,20 @@ export function TaskCoordinationPanel({
         </div>
       ) : null}
 
-      {plannedModeIsAuthorized &&
-      overview.can_request &&
+      {(overview.can_request || (overview.can_authorize && selectedCoordinator)) &&
       !turnBudgetExhausted &&
       coordinatorAvailable ? (
         <form
+          id="coordination-start-form"
           onSubmit={(event) => void requestPlan(event)}
           className="space-y-4 rounded-md border p-3"
         >
           <div>
-            <h3 className="font-medium">Prepare from the Task objective</h3>
+            <h3 className="font-medium">Start from the Task objective</h3>
             <p className="mt-1 text-sm text-muted-foreground">
-              The request uses the saved authorization and current Task team. It does not require
-              manual WorkUnit setup.
+              Starting authorizes this coordinator and the selected mode for this Task. The
+              coordinator creates the work breakdown and assigns the team; WorkUnits are prepared
+              automatically within these boundaries.
             </p>
           </div>
           <div className="space-y-2">
@@ -903,12 +962,16 @@ export function TaskCoordinationPanel({
               onChange={(event) => setContext(event.target.value)}
             />
           </div>
-          <Button size="sm" type="submit" disabled={!objective.trim() || requestTurn.isPending}>
-            {requestTurn.isPending
-              ? 'Recording request…'
-              : modeOptions.find((option) => option.value === overview.mode)?.value === 'proposal'
+          <Button
+            size="sm"
+            type="submit"
+            disabled={!objective.trim() || requestTurn.isPending || authorize.isPending}
+          >
+            {requestTurn.isPending || authorize.isPending
+              ? 'Starting coordinator…'
+              : mode === 'proposal'
                 ? 'Prepare proposal'
-                : 'Prepare and execute'}
+                : 'Start task'}
           </Button>
         </form>
       ) : null}
@@ -1325,6 +1388,37 @@ export function TaskCoordinationPanel({
         </article>
       ) : null}
 
+      {overview.review_triage?.length ? (
+        <section className="space-y-3 rounded-lg border p-4">
+          <h3 className="font-medium">Coordinator review decisions</h3>
+          {overview.review_triage.map((triage) => (
+            <article
+              key={triage.review_report_artifact_id}
+              className="rounded-md border p-3 text-sm"
+            >
+              <p className="font-medium">
+                {triage.disposition === 'correct'
+                  ? 'Confirmed findings sent for correction'
+                  : triage.disposition === 'recheck'
+                    ? 'Fresh independent review requested'
+                    : 'Human decision required'}
+              </p>
+              <p className="mt-2 whitespace-pre-wrap">{triage.rationale}</p>
+              <p className="mt-2 whitespace-pre-wrap text-muted-foreground">
+                {triage.instructions}
+              </p>
+              <details className="mt-2 text-xs text-muted-foreground">
+                <summary className="cursor-pointer">Exact report and decision provenance</summary>
+                <p className="mt-1 break-all">Report: {triage.review_report_artifact_id}</p>
+                <p className="break-all">Coordinator Execution: {triage.execution_id}</p>
+                {triage.review_work_unit_id ? (
+                  <p className="break-all">New review WorkUnit: {triage.review_work_unit_id}</p>
+                ) : null}
+              </details>
+            </article>
+          ))}
+        </section>
+      ) : null}
       <TaskQualityRequestsPanel
         task={task}
         coordination={overview}
@@ -1333,6 +1427,7 @@ export function TaskCoordinationPanel({
         daemons={daemons}
       />
       <TaskInterventionsPanel task={task} coordination={overview} />
+      <TaskAutonomyLimitsPanel taskId={task.id} canManage={canManageLimits} />
 
       <Dialog open={revokeOpen} onOpenChange={setRevokeOpen}>
         <DialogContent>

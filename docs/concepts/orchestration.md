@@ -176,3 +176,26 @@ Task version, roles, Actors, dependency/parent graph, review independence, and
 Artifact inputs before creating WorkUnits in one transaction with an idempotent
 receipt. `manual` remains the default. See the
 [PR0 contract](../plans/pr0-task-coordination-contract.md).
+
+## Coordinator mediation of review findings
+
+New guided authorizations set `orchestrator_reviews_findings: true`. Previously
+stored envelopes without the field retain their prior routing behavior. Worker
+result events wake the exact authorized coordinator, including when its saved
+Agent profile also fills another role. No provider work starts on Task creation.
+
+The typed response may contain `review_findings`, alongside `actions`. Each item
+pins `authorization_version`, `review_report_artifact_id`, `report_digest`,
+`disposition`, `rationale`, and `instructions`. `correct` releases the configured
+correction route with the coordinator's actionable brief; `recheck` creates a fresh
+review WorkUnit for the same immutable result and the disputed findings; `human`
+stops automatic correction for that report. Decisions are immutable and replay
+safe. A coordinator never rewrites a ReviewReport or supplies approval evidence.
+Current team, role policy, wake lease, exact report and authorization are checked
+inside the writer transaction. Revoked, stale, paused or terminal work is rejected.
+
+Codex and Claude Code can coordinate without a repository workspace. Codex uses
+its native read-only sandbox. Claude uses a native Read/Glob/Grep tool allowlist,
+no inherited hooks or MCP servers, and no permission bypass; this is a tool policy,
+not an operating-system sandbox. Formal review uses read-only native tools and
+explicit pinned evidence rather than another role's private conversation.

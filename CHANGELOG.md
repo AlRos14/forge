@@ -10,6 +10,25 @@ PR14 audit on 2026-10-16.
 
 ### Breaking
 
+- Review independence for Agents now requires isolated Task/role HarnessSessions
+  rather than different saved Agent identities. Reusing or forking a contributor
+  session across roles is rejected. Human contributors still cannot self-review.
+- The recommended Project workflow configures automatic correction routes and an
+  explicit primary coordinator. New Tasks copy that preference; Start explicitly
+  authorizes preparation and execution. Existing Tasks and saved Project teams are
+  preserved until edited. New authorizations mediate review findings through the
+  coordinator, who can request correction, independent reassessment, or Human help;
+  the coordinator cannot change a review verdict or bypass a Gate.
+- New Task autonomy defaults are 32 coordinator turns, 64 quality requests,
+  16 correction/reassessment rounds, 16 requests per quality route, and 16 planned
+  WorkUnits. Owners/admins can change limits or grant extra rounds without
+  resetting consumption. Historical Task limits remain unchanged (V162–V165).
+- OpenCode reasoning effort uses the installed CLI's `provider/model#variant`
+  syntax and automatic permission mode uses `--auto`. Formal Agent review is
+  read-only; Claude coordination is supported with an explicit native tool
+  allowlist. Ordinary WorkUnit assistant output is captured as a Summary Artifact
+  and exact pinned delivery evidence is passed to downstream work.
+
 - TaskRole names no longer define formal review, orchestration, or rework
   authority. Use typed `configuration` with the capability catalog and exact
   TaskRole version. `GET /api/v1/task-role-capabilities` returns the closed

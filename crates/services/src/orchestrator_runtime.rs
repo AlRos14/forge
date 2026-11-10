@@ -13,8 +13,9 @@ use db::{
     DomainEvent, DomainEventRepo, ExecutionRepo, ExecutionStatus, GateRepo, OrchestratorWake,
     OrchestratorWakeExecution, OrchestratorWakeRepo, OrchestratorWakeState, PageRequest,
     ProposalTarget, ProposalTargetKind, RoleMembership, RoleMembershipRepo, RoleMembershipStatus,
-    SortBy, SortOrder, TaskCoordinationRepo, TaskCoordinationRequestState, TaskRepo, TaskRole,
-    TaskRoleRepo, WorkUnit, WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo,
+    SortBy, SortOrder, TaskCoordinationRepo, TaskCoordinationRequestState, TaskLifecycleRepo,
+    TaskRepo, TaskRole, TaskRoleRepo, WorkUnit, WorkUnitRepo, WorkUnitStatus,
+    WorkUnitWorkspaceRepo, WorkspaceRepo,
 };
 use events::{EventBus, ForgeEvent};
 use serde_json::{json, Value};
@@ -46,8 +47,8 @@ const MAX_CONTEXT_ROWS: i64 = 30;
 const MAX_CONTEXT_BYTES: usize = 512 * 1024;
 const MAX_ACTION_RESPONSE_BYTES: usize = 64 * 1024;
 const POLICY_REF: &str = "forge.orchestrator.wake-policy";
-const POLICY_VERSION: i64 = 1;
-const POLICY_TEXT: &str = "v1: exact-task-role; active-members-only; mode-aware targeting; read-only Codex CLI; context<=524288B; response<=65536B; actions<=16; work_units<=4; title<=512B; scope<=4096B; role<=128B; message<=8192B; proposal rationale<=8192B; protected actions only as proposals; no decision side effects";
+const POLICY_VERSION: i64 = 2;
+const POLICY_TEXT: &str = "v2: exact-task-role; active-members-only; mode-aware targeting; read-only installed Codex or Claude CLI; context<=524288B; response<=65536B; actions<=16; work_units<=64; title<=512B; scope<=4096B; role<=128B; message<=8192B; proposal rationale<=8192B; exact-report review triage correct/recheck/human; protected actions only as proposals; no verdict waiver";
 const MAX_POLICY_ACTIONS: usize = 16;
 const MAX_POLICY_WORK_UNITS: usize = 4;
 
@@ -84,6 +85,8 @@ struct WakeSignal {
 #[serde(deny_unknown_fields)]
 struct OrchestratorResponse {
     actions: Vec<OrchestratorAction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    review_findings: Vec<crate::task_rework::ReviewFindingsDecision>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -125,6 +128,7 @@ enum OrchestratorActionKind {
     Handoff,
     CreateWorkUnit,
     Proposal,
+    ReviewFindings,
 }
 
 /// The only TaskRole policy understood by PR6. An empty object deliberately
@@ -452,6 +456,27 @@ impl OrchestratorRuntime {
         if task.id != event.scope_id {
             return Ok(None);
         }
+        let coordination = TaskCoordinationRepo::get_task_coordination(&*self.db, task_id).await?;
+        if let Some(c) = coordination.as_ref() {
+            if c.coordinator_actor.is_some() && c.mode == db::TaskCoordinationMode::Manual {
+                let dispatch = TaskLifecycleRepo::get_task_dispatch(&*self.db, task_id).await?;
+                if dispatch.is_none_or(|d| d.state != db::TaskDispatchState::Running) {
+                    return Ok(None);
+                }
+            }
+            if c.mode != db::TaskCoordinationMode::Manual
+                && matches!(
+                    event.event_type.as_str(),
+                    "orchestrator.task_role_changed"
+                        | "orchestrator.membership_changed"
+                        | "orchestrator.bootstrap_reconciled"
+                )
+            {
+                // A guided Task captures its team at explicit authorization.
+                // Do not replay earlier default-copy events as extra turns.
+                return Ok(None);
+            }
+        }
         let signal = match event.event_type.as_str() {
             "execution.started"
             | "execution.completed"
@@ -681,6 +706,62 @@ impl OrchestratorRuntime {
                 WakeSignal {
                     work_unit_id,
                     target: WakeTarget::Actor(proposal.proposer),
+                }
+            }
+            "task.autonomy_limits_changed" => {
+                let Some(coordination) =
+                    TaskCoordinationRepo::get_task_coordination(&*self.db, task_id).await?
+                else {
+                    return Ok(None);
+                };
+                if coordination.mode == db::TaskCoordinationMode::Manual
+                    || coordination.revoked_at.is_some()
+                    || coordination.team_stale
+                {
+                    return Ok(None);
+                }
+                let Some(actor) = coordination.coordinator_actor else {
+                    return Ok(None);
+                };
+                WakeSignal {
+                    work_unit_id: None,
+                    target: WakeTarget::Actor(actor),
+                }
+            }
+            "artifact.created" => {
+                let Some(report) =
+                    CollaborationRepo::get_artifact(&*self.db, &event.entity_id).await?
+                else {
+                    return Ok(None);
+                };
+                if report.task_id != task_id || report.kind != db::ArtifactKind::ReviewReport {
+                    return Ok(None);
+                }
+                let Some(coordination) =
+                    TaskCoordinationRepo::get_task_coordination(&*self.db, task_id).await?
+                else {
+                    return Ok(None);
+                };
+                let enabled = serde_json::from_str::<Value>(&coordination.envelope_json)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("orchestrator_reviews_findings")
+                            .and_then(Value::as_bool)
+                    })
+                    .unwrap_or(false);
+                if !enabled
+                    || coordination.mode == db::TaskCoordinationMode::Manual
+                    || coordination.revoked_at.is_some()
+                    || coordination.team_stale
+                {
+                    return Ok(None);
+                }
+                let Some(actor) = coordination.coordinator_actor else {
+                    return Ok(None);
+                };
+                WakeSignal {
+                    work_unit_id: None,
+                    target: WakeTarget::Actor(actor),
                 }
             }
             "task.coordination_requested" => {
@@ -914,6 +995,24 @@ impl OrchestratorRuntime {
             }
             _ => return Ok(None),
         };
+        let signal = if let Some(c) = coordination.filter(|c| {
+            c.mode != db::TaskCoordinationMode::Manual && c.revoked_at.is_none() && !c.team_stale
+        }) {
+            if matches!(signal.target, WakeTarget::Task) {
+                if let Some(actor) = c.coordinator_actor {
+                    WakeSignal {
+                        work_unit_id: None,
+                        target: WakeTarget::Actor(actor),
+                    }
+                } else {
+                    signal
+                }
+            } else {
+                signal
+            }
+        } else {
+            signal
+        };
         Ok(Some(signal))
     }
 
@@ -949,7 +1048,20 @@ impl OrchestratorRuntime {
         } else {
             None
         };
-        let coordination_role_id = if let Some(request) = coordination_request.as_ref() {
+        let current_coordination =
+            TaskCoordinationRepo::get_task_coordination(&*self.db, task_id).await?;
+        let guided_role_id=current_coordination.filter(|c|c.mode != db::TaskCoordinationMode::Manual && c.revoked_at.is_none() && !c.team_stale)
+            .filter(|c|matches!(&signal.target,WakeTarget::Actor(actor) if Some(actor)==c.coordinator_actor.as_ref())).and_then(|c|c.coordinator_task_role_id);
+        let coordination_role_id = if guided_role_id.is_some() {
+            guided_role_id
+        } else if matches!(
+            event.event_type.as_str(),
+            "artifact.created" | "task.autonomy_limits_changed"
+        ) {
+            TaskCoordinationRepo::get_task_coordination(&*self.db, task_id)
+                .await?
+                .and_then(|c| c.coordinator_task_role_id)
+        } else if let Some(request) = coordination_request.as_ref() {
             TaskCoordinationRepo::get_task_coordination(&*self.db, task_id)
                 .await?
                 .and_then(|coordination| coordination.coordinator_task_role_id)
@@ -997,7 +1109,15 @@ impl OrchestratorRuntime {
                 &signal.target,
             );
             for membership in targets {
-                if event_is_authored_by_member(event, membership)
+                if (event_is_authored_by_member(event, membership)
+                    && !matches!(
+                        event.event_type.as_str(),
+                        "artifact.created"
+                            | "execution.started"
+                            | "execution.completed"
+                            | "execution.failed"
+                            | "execution.stalled"
+                    ))
                     || (membership.actor_kind == ActorKind::Agent
                         && role_policy
                             .as_ref()
@@ -1727,7 +1847,20 @@ impl OrchestratorRuntime {
             });
         }
         let event_payload = parse_payload(&event);
+        let pending_review_findings =
+            crate::task_rework::TaskReworkService::new(self.db.clone(), self.event_bus.clone())
+                .pending_triage_context(&task.id)
+                .await?;
+        let coordination = TaskCoordinationRepo::get_task_coordination(&*self.db, &task.id).await?;
+        let repository = if let Some(id) = task.repo_id.as_deref() {
+            db::RepoRepo::get_by_id(&*self.db, id).await?
+        } else {
+            None
+        };
         Ok(json!({
+            "repository": repository.as_ref().map(|repo| json!({"name":repo.name,"local_path":repo.local_path,"default_branch":repo.default_branch})),
+            "pending_review_findings": pending_review_findings,
+            "coordination_authorization_version": coordination.as_ref().map(|c|c.authorization_version),
             "task": {
                 "id": task.id,
                 "project_id": task.project_id,
@@ -1759,12 +1892,14 @@ impl OrchestratorRuntime {
                     "status": format!("{:?}", workspace.status),
                     "branch": workspace.branch,
                     "before_sha": workspace.before_sha,
+                    "worktree_path": workspace.worktree_path,
                 })),
                 "work_unit": work_unit_workspace.map(|workspace| json!({
                     "workspace_id": workspace.id,
                     "status": format!("{:?}", workspace.status),
                     "branch": workspace.branch,
                     "before_sha": workspace.before_sha,
+                    "worktree_path": workspace.worktree_path,
                 })),
             },
             "executions": executions.iter().map(|execution| json!({
@@ -2158,6 +2293,34 @@ impl OrchestratorRuntime {
         let snapshot_policy = TaskRoleOrchestratorPolicy::parse(&wake.task_role_policy_json)
             .map_err(invalid_action)?;
         validate_action_policy(&snapshot_policy, &response.actions)?;
+        if response.actions.len() + response.review_findings.len() > snapshot_policy.action_limit()
+            || (!response.review_findings.is_empty()
+                && snapshot_policy
+                    .allowed_actions
+                    .as_ref()
+                    .is_some_and(|allowed| {
+                        !allowed.contains(&OrchestratorActionKind::ReviewFindings)
+                    }))
+        {
+            return Err(invalid_action(
+                "Review triage exceeds or is excluded by the admitted TaskRole policy",
+            ));
+        }
+        for decision in response.review_findings {
+            let current = self.validate_current_role_policy(wake).await?;
+            if current
+                .allowed_actions
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&OrchestratorActionKind::ReviewFindings))
+            {
+                return Err(invalid_action(
+                    "Current TaskRole policy excludes review triage",
+                ));
+            }
+            crate::task_rework::TaskReworkService::new(self.db.clone(), self.event_bus.clone())
+                .record_review_triage(&execution.id, decision)
+                .await?;
+        }
         let collaboration =
             CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
         let work_units = self.task_service.orchestrator_work_unit_service();
@@ -3041,6 +3204,7 @@ fn render_orchestrator_prompt(wake: &OrchestratorWake, context: &Value) -> Strin
     // Describe the existing typed output, rather than asking the harness to
     // guess required fields from action names alone.
     let action_examples = OrchestratorResponse {
+        review_findings: Vec::new(),
         actions: vec![
             OrchestratorAction::Message {
                 target: ActionTarget::Task,
@@ -3081,8 +3245,9 @@ fn render_orchestrator_prompt(wake: &OrchestratorWake, context: &Value) -> Strin
     let examples =
         serde_json::to_string(&action_examples).expect("typed action examples serialize");
     format!(
-        "You are the Actor holding TaskRole `orchestrator` for this exact Task. Direct work through collaboration records. This execution has a read-only isolated context and must not modify repository files.\n\
+        "You are the Actor holding the exact admitted orchestration-capable TaskRole for this Task. Direct work through collaboration records. This execution has a read-only isolated context and must not modify repository files.\n\
          Return exactly one JSON object with an `actions` array. Supported action types are `message`, `handoff`, `create_work_unit`, and `proposal`. WorkUnit creation is limited to four bounded records per Execution and never starts work by itself. A WorkUnit-scoped wake may only reference that exact WorkUnit and may create a child under it. A Handoff expresses work intent and never changes RoleMembership. A Proposal never executes its action. Do not claim that stop, cancel, reassign, discard, invalidate, merge, or override occurred. If no action is needed, return `{{\"actions\":[]}}`.\n\
+         When `pending_review_findings` is nonempty, evaluate each exact report critically against scope and evidence. Return an additional `review_findings` array with objects containing `authorization_version` (from `coordination_authorization_version`), `review_report_artifact_id`, `report_digest`, `disposition` (`correct`, `recheck`, or `human`), `rationale`, and `instructions`. Confirm only reproducible defects: `correct` sends a bounded correction to the authorized implementer, `recheck` asks a fresh independent review to examine your objections without changing the implementation, and `human` requests a decision outside your authority. Triage never changes the reviewer verdict or satisfies an approval Gate. Do not blindly relay findings, silently approve a failed review, or widen scope. If a report is disputed, explain the evidence and use `recheck` rather than treating your opinion as approval.\n\
          Action shape examples (not a request to execute these actions): {examples}. Replace placeholder values with exact identities from context; do not invent fields or emit every example. For Actor targets use {{\"kind\":\"actor\",\"actor_kind\":\"human|agent\",\"actor_id\":\"exact-id\"}}.\n\
          Wake {} was caused by durable event {}. Runtime policy {} version {} digest {}; TaskRole policy version {} digest {}.\n\
          Task-scoped context follows as JSON:\n{}",
