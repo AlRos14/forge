@@ -389,7 +389,9 @@ describe('ProjectPlanPage', () => {
         'This proposal is based on an older graph version. Refresh or ask Copilot for an updated proposal before applying it.',
       ),
     ).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Apply proposal' }).disabled).toBe(true)
+    expect(
+      (screen.getByRole('button', { name: 'Apply proposal' }) as HTMLButtonElement).disabled,
+    ).toBe(true)
   })
 
   it('keeps the apply key stable when the page is reopened after a partial import', () => {
@@ -468,7 +470,11 @@ describe('ProjectPlanPage', () => {
       ),
     ).toBeTruthy()
     expect(
-      screen.getByRole('checkbox', { name: 'Select Task Task B for batch authorization' }).disabled,
+      (
+        screen.getByRole('checkbox', {
+          name: 'Select Task Task B for batch authorization',
+        }) as HTMLInputElement
+      ).disabled,
     ).toBe(false)
     fireEvent.click(screen.getByRole('button', { name: 'Select or clear visible Tasks' }))
     fireEvent.click(screen.getByRole('button', { name: 'Authorize 2 selected' }))
@@ -503,9 +509,11 @@ describe('ProjectPlanPage', () => {
     )
 
     expect(
-      screen.getByRole('checkbox', {
-        name: 'Select Task Lifecycle blocked for batch authorization',
-      }).disabled,
+      (
+        screen.getByRole('checkbox', {
+          name: 'Select Task Lifecycle blocked for batch authorization',
+        }) as HTMLInputElement
+      ).disabled,
     ).toBe(false)
     for (const title of [
       'Active Task',
@@ -515,8 +523,11 @@ describe('ProjectPlanPage', () => {
       'Cancelled Task',
     ]) {
       expect(
-        screen.getByRole('checkbox', { name: `Select Task ${title} for batch authorization` })
-          .disabled,
+        (
+          screen.getByRole('checkbox', {
+            name: `Select Task ${title} for batch authorization`,
+          }) as HTMLInputElement
+        ).disabled,
       ).toBe(true)
     }
     fireEvent.click(screen.getByRole('button', { name: 'Select or clear visible Tasks' }))

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{MaterializedWorkUnit, UpdateTaskQualityRequestState};
+use crate::{MaterializedWorkUnit, TaskCoordinationMode, UpdateTaskQualityRequestState};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -808,6 +808,7 @@ export function ProjectPlanPage({ projectId }: { projectId: string }) {
             <Link
               to="/projects/$projectId/tasks"
               params={{ projectId }}
+              search={{ sort_by: 'updated_at', sort_order: 'desc' }}
               className="inline-flex w-fit items-center rounded-md border border-input px-3 py-2 text-xs font-medium text-primary hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               {t('projectPlan.openTasks')}
