@@ -37,6 +37,7 @@ pub mod oauth;
 pub mod operations;
 pub mod project_copilot;
 pub mod project_media;
+pub mod project_plan;
 pub mod project_releases;
 pub mod projects;
 pub mod provider_authorizations;

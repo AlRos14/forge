@@ -10,6 +10,28 @@ PR14 audit on 2026-10-16.
 
 ### Breaking
 
+- Direct Task dependency mutations now use the versioned Project DAG service.
+  `POST /tasks/{id}/dependencies` and the Project DAG MCP add/remove tools require
+  `expected_graph_version` and `idempotency_key`; `DELETE` also requires a JSON
+  body with those fields. Update clients before using the new contract.
+
+- TaskCoordination versions minted by a Project batch require their exact batch
+  origin. `POST /tasks/{id}/coordination/requests` returns
+  `409 project_plan_batch_inactive` for those versions, including after batch
+  revocation or completion. The generic `POST /tasks/{id}/coordination/authorize`
+  also returns `409 project_plan_batch_inactive` while the batch is running or
+  paused. Explicitly revoke the Task authorization or revoke/complete the batch
+  before creating a fresh Human TaskCoordination authorization; the old batch
+  grant becomes stale and the standalone grant does not revive it.
+
+- Human Replan continuations from a Project batch now bind the explicitly
+  supplied plan Artifact to the active authorization and batch. Materialized
+  plans require their exact Task/request/digest/authorization receipt; several
+  plans may remain approved in one authorization, and authority is not selected
+  by latest timestamp. Batch authorization refreshes only the untouched manual
+  default TaskCoordination using the exact coordinator and current team
+  generation; customized Human configuration stays strict.
+
 - Review independence for Agents now requires isolated Task/role HarnessSessions
   rather than different saved Agent identities. Reusing or forking a contributor
   session across roles is rejected. Human contributors still cannot self-review.
@@ -73,6 +95,26 @@ PR14 audit on 2026-10-16.
   `awaiting_acceptance` and receives no automatic retry.
 
 ### Added
+
+- Add an optional Project DAG for work packets, typed proposals with source
+  provenance, explicit owner/admin batch authorization, deterministic dependency
+  admission, and bounded Project Copilot tools for free-form interpretation and
+  commit-pinned repository text. Applying a proposal creates or maps Tasks but
+  does not authorize their dispatch. `project.plan_changed` SSE notifications
+  expose only the Project ID and trigger an authorized graph refresh. Partial
+  Task imports remain blocked with `plan:apply_incomplete`; retries retain the
+  proposal's original graph version and idempotency key, and stale proposals
+  require refresh and review. Task coordination grants minted for a batch stay
+  scoped to it; the generic Task turn route returns
+  `409 project_plan_batch_inactive` for those grants, including after batch
+  revocation or completion. A fresh explicit Task coordination authorization
+  restores the standalone request path. The coordination overview exposes the
+  exact batch scope and suppresses generic `can_request` for batch-bound grants.
+  Increasing `max_turns` does not mint a generic turn or change authorization
+  version: the scheduler retries only the exact budget-exhausted Task in a
+  running batch after revalidating its grant, team, budget, and prerequisites.
+  The Task detail quick action adds eight coordinator turns only; quality and
+  rework limits remain separate and individually editable.
 
 - Add the Task coordination model: versioned Task authorization (`manual`,
   `proposal`, `prepare_and_execute`), a read-only Agent coordination turn over

@@ -1,106 +1,172 @@
 use super::*;
 
-#[async_trait]
-impl OrchestratorWakeRepo for SqliteDb {
-    async fn admit_orchestrator_wake(&self, input: CreateOrchestratorWake) -> Result<bool> {
-        // A coordination wake and its request identity are one durable fact.
-        // Linking them in a separate call leaves a crash window where the
-        // dispatcher sees a wake with no request and falls back to generic
-        // orchestration. The INSERT, conflict resolution, and request link all
-        // commit under the same immediate write lock.
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let result = sqlx::query(
-            "INSERT INTO orchestrator_wake (
-                id, event_id, event_sequence, task_id, task_role_id,
-                coordination_mode, actor_kind, actor_id, work_unit_id, correlation_id, causation_id,
-                causation_depth, policy_ref, policy_version, policy_digest,
-                task_role_version, task_role_policy_json, state,
-                available_at, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-             ON CONFLICT(event_id, task_id, actor_kind, actor_id) DO NOTHING",
+async fn admit_orchestrator_wake_with_autonomy_fence(
+    db: &SqliteDb,
+    input: CreateOrchestratorWake,
+    expected_authorization_version: Option<i64>,
+) -> Result<bool> {
+    // The special autonomy event path is fenced under the same immediate
+    // writer lock as wake insertion. A preceding classification read is not
+    // enough: a batch grant may win before this transaction starts.
+    let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await?;
+    if let Some(expected_version) = expected_authorization_version {
+        let current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM domain_event event
+                JOIN task_coordination coordination ON coordination.task_id=?
+                WHERE event.id=? AND event.sequence=?
+                  AND event.event_type='task.autonomy_limits_changed'
+                  AND event.entity_type='task'
+                  AND event.scope_type='task' AND event.scope_id=?
+                  AND json_valid(event.payload_json)
+                  AND json_type(event.payload_json,'$.authorization_version')='integer'
+                  AND json_extract(event.payload_json,'$.authorization_version')=?
+                  AND coordination.authorization_version=?
+                  AND coordination.mode!='manual'
+                  AND coordination.revoked_at IS NULL AND coordination.team_stale=0
+                  AND coordination.coordinator_task_role_id=?
+                  AND coordination.coordinator_actor_kind=?
+                  AND coordination.coordinator_actor_id=?
+                  AND NOT EXISTS(
+                    SELECT 1 FROM project_plan_batch_coordination_authorization origin
+                    WHERE origin.task_id=coordination.task_id
+                      AND origin.authorization_version=coordination.authorization_version
+                  )
+            )",
         )
-        .bind(&input.id)
+        .bind(&input.task_id)
         .bind(&input.event_id)
         .bind(input.event_sequence)
         .bind(&input.task_id)
+        .bind(expected_version)
+        .bind(expected_version)
         .bind(&input.task_role_id)
-        .bind(input.coordination_mode.map(|mode| mode.to_string()))
         .bind(input.actor_kind.to_string())
         .bind(&input.actor_id)
-        .bind(input.work_unit_id.as_deref())
-        .bind(&input.correlation_id)
-        .bind(input.causation_id.as_deref())
-        .bind(input.causation_depth)
-        .bind(&input.policy_ref)
-        .bind(input.policy_version)
-        .bind(&input.policy_digest)
-        .bind(input.task_role_version)
-        .bind(&input.task_role_policy_json)
-        .bind(&input.available_at)
-        .bind(&input.created_at)
-        .bind(&input.updated_at)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
-        let inserted = result.rows_affected() == 1;
+        if !current {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+    }
 
-        if let Some(request_id) = input.coordination_request_id.as_deref() {
-            let wake_id: String = if inserted {
-                input.id.clone()
-            } else {
-                sqlx::query_scalar(
-                    "SELECT id FROM orchestrator_wake
-                     WHERE event_id = ? AND task_id = ?
-                       AND actor_kind = ? AND actor_id = ?",
-                )
-                .bind(&input.event_id)
-                .bind(&input.task_id)
-                .bind(input.actor_kind.to_string())
-                .bind(&input.actor_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(DbError::NotFound)?
-            };
-            let request = sqlx::query(
-                "SELECT state, wake_id FROM task_coordination_request
-                 WHERE id = ? AND task_id = ?",
+    // A coordination wake and its request identity are one durable fact.
+    // Linking them in a separate call leaves a crash window where the
+    // dispatcher sees a wake with no request and falls back to generic
+    // orchestration. The INSERT, conflict resolution, and request link all
+    // commit under the same immediate write lock.
+    let result = sqlx::query(
+        "INSERT INTO orchestrator_wake (
+            id, event_id, event_sequence, task_id, task_role_id,
+            coordination_mode, actor_kind, actor_id, work_unit_id, correlation_id, causation_id,
+            causation_depth, policy_ref, policy_version, policy_digest,
+            task_role_version, task_role_policy_json, state,
+            available_at, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+         ON CONFLICT(event_id, task_id, actor_kind, actor_id) DO NOTHING",
+    )
+    .bind(&input.id)
+    .bind(&input.event_id)
+    .bind(input.event_sequence)
+    .bind(&input.task_id)
+    .bind(&input.task_role_id)
+    .bind(input.coordination_mode.map(|mode| mode.to_string()))
+    .bind(input.actor_kind.to_string())
+    .bind(&input.actor_id)
+    .bind(input.work_unit_id.as_deref())
+    .bind(&input.correlation_id)
+    .bind(input.causation_id.as_deref())
+    .bind(input.causation_depth)
+    .bind(&input.policy_ref)
+    .bind(input.policy_version)
+    .bind(&input.policy_digest)
+    .bind(input.task_role_version)
+    .bind(&input.task_role_policy_json)
+    .bind(&input.available_at)
+    .bind(&input.created_at)
+    .bind(&input.updated_at)
+    .execute(&mut *tx)
+    .await?;
+    let inserted = result.rows_affected() == 1;
+
+    if let Some(request_id) = input.coordination_request_id.as_deref() {
+        let wake_id: String = if inserted {
+            input.id.clone()
+        } else {
+            sqlx::query_scalar(
+                "SELECT id FROM orchestrator_wake
+                 WHERE event_id = ? AND task_id = ?
+                   AND actor_kind = ? AND actor_id = ?",
             )
-            .bind(request_id)
+            .bind(&input.event_id)
             .bind(&input.task_id)
+            .bind(input.actor_kind.to_string())
+            .bind(&input.actor_id)
             .fetch_optional(&mut *tx)
             .await?
-            .ok_or(DbError::NotFound)?;
-            let state: String = request.try_get("state")?;
-            let linked_wake_id: Option<String> = request.try_get("wake_id")?;
-            if !matches!(state.as_str(), "requested" | "running") {
+            .ok_or(DbError::NotFound)?
+        };
+        let request = sqlx::query(
+            "SELECT state, wake_id FROM task_coordination_request
+             WHERE id = ? AND task_id = ?",
+        )
+        .bind(request_id)
+        .bind(&input.task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        let state: String = request.try_get("state")?;
+        let linked_wake_id: Option<String> = request.try_get("wake_id")?;
+        if !matches!(state.as_str(), "requested" | "running") {
+            tx.rollback().await?;
+            return Err(DbError::VersionConflict);
+        }
+        if let Some(linked_wake_id) = linked_wake_id {
+            if linked_wake_id != wake_id {
+                tx.rollback().await?;
+                return Err(DbError::IdempotencyConflict);
+            }
+        } else {
+            let linked = sqlx::query(
+                "UPDATE task_coordination_request
+                 SET wake_id = ?, version = version + 1, updated_at = ?
+                 WHERE id = ? AND task_id = ? AND wake_id IS NULL",
+            )
+            .bind(&wake_id)
+            .bind(&input.updated_at)
+            .bind(request_id)
+            .bind(&input.task_id)
+            .execute(&mut *tx)
+            .await?;
+            if linked.rows_affected() != 1 {
                 tx.rollback().await?;
                 return Err(DbError::VersionConflict);
             }
-            if let Some(linked_wake_id) = linked_wake_id {
-                if linked_wake_id != wake_id {
-                    tx.rollback().await?;
-                    return Err(DbError::IdempotencyConflict);
-                }
-            } else {
-                let linked = sqlx::query(
-                    "UPDATE task_coordination_request
-                     SET wake_id = ?, version = version + 1, updated_at = ?
-                     WHERE id = ? AND task_id = ? AND wake_id IS NULL",
-                )
-                .bind(&wake_id)
-                .bind(&input.updated_at)
-                .bind(request_id)
-                .bind(&input.task_id)
-                .execute(&mut *tx)
-                .await?;
-                if linked.rows_affected() != 1 {
-                    tx.rollback().await?;
-                    return Err(DbError::VersionConflict);
-                }
-            }
         }
+    }
 
-        tx.commit().await?;
-        Ok(inserted)
+    tx.commit().await?;
+    Ok(inserted)
+}
+
+#[async_trait]
+impl OrchestratorWakeRepo for SqliteDb {
+    async fn admit_orchestrator_wake(&self, input: CreateOrchestratorWake) -> Result<bool> {
+        admit_orchestrator_wake_with_autonomy_fence(self, input, None).await
+    }
+
+    async fn admit_task_autonomy_orchestrator_wake(
+        &self,
+        input: CreateOrchestratorWake,
+        expected_authorization_version: i64,
+    ) -> Result<bool> {
+        admit_orchestrator_wake_with_autonomy_fence(
+            self,
+            input,
+            Some(expected_authorization_version),
+        )
+        .await
     }
 
     async fn claim_orchestrator_wake(

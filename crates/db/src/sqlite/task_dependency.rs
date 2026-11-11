@@ -3,6 +3,7 @@ use super::*;
 #[async_trait]
 impl TaskDependencyRepo for SqliteDb {
     async fn add_dependency(&self, task_id: &str, depends_on_id: &str, now: &str) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if task_id == depends_on_id {
             return Err(DbError::CycleDetected);
         }
@@ -17,7 +18,7 @@ impl TaskDependencyRepo for SqliteDb {
         )
         .bind(depends_on_id)
         .bind(task_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
         if cycle_count > 0 {
             return Err(DbError::CycleDetected);
@@ -29,8 +30,10 @@ impl TaskDependencyRepo for SqliteDb {
         .bind(task_id)
         .bind(depends_on_id)
         .bind(now)
-        .execute(&self.pool)
-        .await?;
+        .execute(&mut *tx)
+        .await
+        .map_err(project_dependency_error)?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -63,10 +66,23 @@ impl TaskDependencyRepo for SqliteDb {
 
     async fn unsatisfied_dependencies(&self, task_id: &str) -> Result<Vec<String>> {
         Ok(sqlx::query_scalar::<_, String>(
-            "SELECT task_dependency.depends_on_id FROM task_dependency JOIN task_lifecycle ON task_lifecycle.task_id = task_dependency.depends_on_id WHERE task_dependency.task_id = ? AND task_lifecycle.state != 'done'",
+            "SELECT depends_on_id FROM project_task_dependency_readiness WHERE task_id = ? AND satisfied = 0",
         )
         .bind(task_id)
         .fetch_all(&self.pool)
         .await?)
     }
+}
+
+fn project_dependency_error(error: sqlx::Error) -> DbError {
+    if let sqlx::Error::Database(db) = &error {
+        return match db.message() {
+            "FORGE_PROJECT_DEPENDENCY_CYCLE" => DbError::CycleDetected,
+            "FORGE_PROJECT_DEPENDENCY_INVALID" | "FORGE_PROJECT_DEPENDENCY_IMMUTABLE" => {
+                DbError::Check(db.message().to_owned())
+            }
+            _ => error.into(),
+        };
+    }
+    error.into()
 }

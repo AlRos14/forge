@@ -93,6 +93,28 @@ describe('routeSsePayload', () => {
     )
   })
 
+  it('invalidates the Project DAG projection for named plan-change events', () => {
+    const { queryClient, invalidateQueries } = createMocks()
+    routeSsePayload(
+      event('project.plan_changed', {
+        entity_id: 'batch-1',
+        entity_type: 'project_plan_batch',
+        scope_type: 'project',
+        scope_id: 'project-1',
+        payload: { project_id: 'project-1', batch_id: 'batch-1', version: 3, state: 'running' },
+      }),
+      queryClient,
+      { dispatch: vi.fn() },
+    )
+    expect(invalidateQueries.mock.calls).toEqual(
+      expect.arrayContaining([
+        [{ queryKey: ['projects', 'project-1', 'plan'] }],
+        [{ queryKey: ['projects', 'project-1', 'tasks'] }],
+        [{ queryKey: ['projects', 'project-1'] }],
+      ]),
+    )
+  })
+
   it('keeps retired status, Agent Chat, and legacy Review events out of UI projections', () => {
     for (const event_type of [
       'task.status_changed',
@@ -111,7 +133,11 @@ describe('routeSsePayload', () => {
       ['task.review_triaged', ['tasks::task-1::coordination', 'tasks::task-1::work-units']],
       [
         'task.autonomy_limits_changed',
-        ['task-autonomy-limits::task-1', 'tasks::task-1::coordination'],
+        [
+          'task-autonomy-limits::task-1',
+          'tasks::task-1::coordination',
+          'tasks::task-1::quality-requests',
+        ],
       ],
       [
         'task.coordination_plan_proposed',
@@ -156,6 +182,26 @@ describe('routeSsePayload', () => {
         )
       }
     }
+  })
+
+  it('refreshes Project DAG projections when an autonomy change can resume a batch Task', () => {
+    const { queryClient, invalidateQueries } = createMocks()
+    routeSsePayload(
+      event('task.autonomy_limits_changed', {
+        entity_id: 'task-1',
+        scope_type: 'task',
+        scope_id: 'task-1',
+        payload: { task_id: 'task-1' },
+      }),
+      queryClient,
+      { dispatch: vi.fn() },
+    )
+    const predicate = invalidateQueries.mock.calls
+      .map(([filters]) => filters)
+      .find((filters) => typeof filters?.predicate === 'function')?.predicate
+
+    expect(predicate?.({ queryKey: ['projects', 'project-1', 'plan'] } as never)).toBe(true)
+    expect(predicate?.({ queryKey: ['projects', 'project-1', 'tasks'] } as never)).toBe(false)
   })
 
   it('resynchronizes active queries when the public stream reports lag', () => {

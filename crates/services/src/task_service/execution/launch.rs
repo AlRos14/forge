@@ -438,6 +438,14 @@ impl TaskService {
             }
             None
         };
+        if let Some(workspace) = workspace.as_ref() {
+            crate::project_plan::ProjectPlanService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .verify_handoff_workspace_base(&task.id, &work_unit.id, Some(workspace))
+            .await?;
+        }
         self.ensure_task_runnable(&task).await?;
         let lifecycle_service = crate::task_lifecycle::TaskLifecycleService::new(
             Arc::clone(&self.db),

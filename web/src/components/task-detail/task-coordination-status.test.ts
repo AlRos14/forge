@@ -5,6 +5,7 @@ import type {
   TaskCoordinationRequestResponse,
 } from '@/types/generated'
 import {
+  canEditTaskCoordinationAuthorization,
   deriveCoordinationNextAction,
   isQualityBudgetExhausted,
   isTurnBudgetExhausted,
@@ -17,8 +18,24 @@ function overview(
   return {
     task_id: 'task-1',
     task_version: 4,
-    lifecycle: { task_id: 'task-1', state: 'active', version: 2, reason_kind: null, reason_ref: null, created_at: '', updated_at: '' },
-    dispatch: { task_id: 'task-1', state: 'idle', version: 1, requested_by: null, reason: null, created_at: '', updated_at: '' },
+    lifecycle: {
+      task_id: 'task-1',
+      state: 'active',
+      version: 2,
+      reason_kind: null,
+      reason_ref: null,
+      created_at: '',
+      updated_at: '',
+    },
+    dispatch: {
+      task_id: 'task-1',
+      state: 'idle',
+      version: 1,
+      requested_by: null,
+      reason: null,
+      created_at: '',
+      updated_at: '',
+    },
     mode: 'proposal',
     authorization_version: 2,
     revoked_at: null,
@@ -38,7 +55,12 @@ function overview(
         display_label: 'Coordinator',
         coordination_mode: 'collaborative',
         capabilities: ['orchestration'],
-        configuration: { schema_version: 1, display_label: 'Coordinator', capabilities: ['orchestration'], rework: null },
+        configuration: {
+          schema_version: 1,
+          display_label: 'Coordinator',
+          capabilities: ['orchestration'],
+          rework: null,
+        },
         version: 1,
         members: [
           {
@@ -61,6 +83,7 @@ function overview(
     max_quality_requests: 8,
     can_authorize: true,
     can_request: true,
+    project_plan_batch_scope: null,
     blockers: [],
     latest_request: null,
     latest_plan: null,
@@ -118,6 +141,39 @@ function plan(overrides: Partial<TaskCoordinationPlanResponse> = {}): TaskCoordi
 }
 
 describe('coordination next action', () => {
+  it('keeps batch authorization edits closed until the batch is revoked or completed', () => {
+    for (const batch_state of ['running', 'paused'] as const) {
+      expect(
+        canEditTaskCoordinationAuthorization(
+          overview({
+            can_authorize: true,
+            project_plan_batch_scope: {
+              batch_id: 'batch-1',
+              batch_state,
+              task_state: 'blocked',
+              blocker: null,
+            },
+          }),
+        ),
+      ).toBe(false)
+    }
+    for (const batch_state of ['revoked', 'completed'] as const) {
+      expect(
+        canEditTaskCoordinationAuthorization(
+          overview({
+            can_authorize: true,
+            project_plan_batch_scope: {
+              batch_id: 'batch-1',
+              batch_state,
+              task_state: 'blocked',
+              blocker: null,
+            },
+          }),
+        ),
+      ).toBe(true)
+    }
+  })
+
   it('shows a proposed plan as the primary action even though the caller may still reauthorize', () => {
     const next = deriveCoordinationNextAction(overview({ can_authorize: true }), null, plan())
     expect(next.kind).toBe('approve')
@@ -130,6 +186,108 @@ describe('coordination next action', () => {
     const next = deriveCoordinationNextAction(value, null, null)
     expect(next.kind).toBe('blocked')
     expect(next.summary).toMatch(/limit/i)
+  })
+
+  it('routes a batch budget increase through the scheduler instead of a generic turn', () => {
+    const next = deriveCoordinationNextAction(
+      overview({
+        turn_count: 8,
+        max_turns: 8,
+        can_request: false,
+        project_plan_batch_scope: {
+          batch_id: 'batch-1',
+          batch_state: 'running',
+          task_state: 'blocked',
+          blocker: 'coordination:coordination.budget_exhausted',
+        },
+      }),
+      null,
+      null,
+    )
+    expect(next.kind).toBe('blocked')
+    expect(next.detail).toMatch(/increase max_turns/i)
+    expect(next.detail).toMatch(/scheduler retries this Task on its next tick/i)
+    expect(next.detail).toMatch(/same batch is running/i)
+  })
+
+  it('does not promise a budget retry for a paused batch', () => {
+    const next = deriveCoordinationNextAction(
+      overview({
+        turn_count: 8,
+        max_turns: 8,
+        can_request: false,
+        project_plan_batch_scope: {
+          batch_id: 'batch-1',
+          batch_state: 'paused',
+          task_state: 'blocked',
+          blocker: 'coordination:coordination.budget_exhausted',
+        },
+      }),
+      null,
+      null,
+    )
+    expect(next.kind).toBe('blocked')
+    expect(next.summary).toMatch(/paused/i)
+    expect(next.detail).toMatch(/will not restart/i)
+  })
+
+  it('does not promise scheduler progress for a paused or completed batch with another blocker', () => {
+    for (const batch_state of ['paused', 'completed'] as const) {
+      const next = deriveCoordinationNextAction(
+        overview({
+          can_request: false,
+          project_plan_batch_scope: {
+            batch_id: 'batch-1',
+            batch_state,
+            task_state: 'blocked',
+            blocker: 'capacity:project_parallel_limit',
+          },
+        }),
+        null,
+        null,
+      )
+      expect(next.kind).toBe('blocked')
+      expect(next.summary).toContain(batch_state)
+      expect(next.detail).not.toMatch(/retries on its next tick/i)
+    }
+  })
+
+  it('does not expose a generic request for a batch-scoped authorization', () => {
+    const next = deriveCoordinationNextAction(
+      overview({
+        can_request: false,
+        project_plan_batch_scope: {
+          batch_id: 'batch-1',
+          batch_state: 'running',
+          task_state: 'blocked',
+          blocker: 'capacity:project_parallel_limit',
+        },
+      }),
+      null,
+      plan({ state: 'rejected' }),
+    )
+    expect(next.kind).not.toBe('request')
+    expect(next.detail).toMatch(/does not accept a generic coordination turn/i)
+  })
+
+  it('does not suggest retrying an uncertain batch turn through the generic route', () => {
+    const next = deriveCoordinationNextAction(
+      overview({
+        can_request: false,
+        project_plan_batch_scope: {
+          batch_id: 'batch-1',
+          batch_state: 'running',
+          task_state: 'blocked',
+          blocker: 'coordination:coordination.start_uncertain',
+        },
+      }),
+      request({ state: 'uncertain' }),
+      null,
+    )
+    expect(next.kind).toBe('blocked')
+    expect(next.detail).toMatch(/inspect the exact Task request/i)
+    expect(next.detail).toMatch(/do not start a duplicate turn/i)
+    expect(next.detail).not.toMatch(/request a new bounded turn/i)
   })
 
   it('asks a human to reauthorize after revocation without deleting existing work', () => {
@@ -175,7 +333,11 @@ describe('coordination next action', () => {
   })
 
   it('keeps manual planning explicit', () => {
-    const next = deriveCoordinationNextAction(overview({ mode: 'manual', can_request: false }), null, null)
+    const next = deriveCoordinationNextAction(
+      overview({ mode: 'manual', can_request: false }),
+      null,
+      null,
+    )
     expect(next.kind).toBe('manual')
     expect(next.detail).toMatch(/Advanced work/)
   })
@@ -183,7 +345,15 @@ describe('coordination next action', () => {
   it('prioritizes resume over materialization when the Task is paused', () => {
     const next = deriveCoordinationNextAction(
       overview({
-        dispatch: { task_id: 'task-1', state: 'paused', version: 2, requested_by: null, reason: null, created_at: '', updated_at: '' },
+        dispatch: {
+          task_id: 'task-1',
+          state: 'paused',
+          version: 2,
+          requested_by: null,
+          reason: null,
+          created_at: '',
+          updated_at: '',
+        },
       }),
       null,
       plan({ state: 'approved' }),
@@ -194,7 +364,15 @@ describe('coordination next action', () => {
   it('turns a materialized ready-to-merge Task toward the exact Gate review', () => {
     const next = deriveCoordinationNextAction(
       overview({
-        lifecycle: { task_id: 'task-1', state: 'ready_to_merge', version: 4, reason_kind: null, reason_ref: null, created_at: '', updated_at: '' },
+        lifecycle: {
+          task_id: 'task-1',
+          state: 'ready_to_merge',
+          version: 4,
+          reason_kind: null,
+          reason_ref: null,
+          created_at: '',
+          updated_at: '',
+        },
       }),
       null,
       plan({

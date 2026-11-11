@@ -16,15 +16,15 @@ Forge is a local platform for coordinating programming work with agents that kee
 
 ## Work model
 
-| Record | Purpose |
-|---|---|
-| **Actor** | A human or a harness-bound Agent. |
-| **TaskRole / RoleMembership** | Defines a Task responsibility and the Actors eligible to participate. Membership does not allocate executable work. |
-| **WorkUnit** | Defines executable scope, Role, optional Actor assignment, and optional harness instructions. The guided Task flow can prepare WorkUnits from an objective; manual creation remains available as an advanced path. |
-| **Workspace** | Isolates a repository WorkUnit that requires integration. A non-repository WorkUnit can run without a Workspace or WorkspaceLease under the supported local-host constraints. |
-| **Execution / HarnessSession** | Records one Actor, Role, and WorkUnit attempt. Task launch and dispatch create attempts; users do not create them manually. Session continuity follows an explicit HarnessSession reference. |
-| **Artifact, Message, Handoff, Proposal, Decision** | Stores outputs and collaboration as separate durable records. A Proposal or Decision does not execute a protected action. |
-| **ReviewReport, ValidationRun, Gate** | Keeps reviewer judgment, deterministic validation evidence, and policy evaluation distinct. A Gate evaluates exact records; it does not run tests or a review. |
+| Record                                             | Purpose                                                                                                                                                                                                            |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Actor**                                          | A human or a harness-bound Agent.                                                                                                                                                                                  |
+| **TaskRole / RoleMembership**                      | Defines a Task responsibility and the Actors eligible to participate. Membership does not allocate executable work.                                                                                                |
+| **WorkUnit**                                       | Defines executable scope, Role, optional Actor assignment, and optional harness instructions. The guided Task flow can prepare WorkUnits from an objective; manual creation remains available as an advanced path. |
+| **Workspace**                                      | Isolates a repository WorkUnit that requires integration. A non-repository WorkUnit can run without a Workspace or WorkspaceLease under the supported local-host constraints.                                      |
+| **Execution / HarnessSession**                     | Records one Actor, Role, and WorkUnit attempt. Task launch and dispatch create attempts; users do not create them manually. Session continuity follows an explicit HarnessSession reference.                       |
+| **Artifact, Message, Handoff, Proposal, Decision** | Stores outputs and collaboration as separate durable records. A Proposal or Decision does not execute a protected action.                                                                                          |
+| **ReviewReport, ValidationRun, Gate**              | Keeps reviewer judgment, deterministic validation evidence, and policy evaluation distinct. A Gate evaluates exact records; it does not run tests or a review.                                                     |
 
 WorkUnits can run concurrently when their dependencies, Actor capacity, and workspace authority allow it. Repository integration is an explicit serialized operation. The normal web journey starts with a Task objective, the saved Project team, and an explicit coordination mode. Proposal mode waits for review before WorkUnits are materialized; prepare-and-execute can materialize only within its saved limits. Dispatch intent, provider starts, review, and TaskLifecycle remain separate facts. Manual planning is still available under Advanced work.
 
@@ -61,6 +61,7 @@ Authentication uses current durable account authority. Reusable JWT/PAT/OAuth cr
 ## Documentation
 
 - [Architecture after PR13](docs/architecture.md)
+- [Optional Project work-packet plans](docs/concepts/project-plan.md)
 - [Approved task operating model — coordination, quality routing, delivery completion, and review gates implemented; PR6 acceptance pending](docs/concepts/task-operating-model.md)
 - [Getting started](docs/getting-started.md)
 - [REST, MCP, and SSE reference](docs/api.md)

@@ -92,9 +92,23 @@ pub struct TaskDependency {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
 pub struct AddDependencyRequest {
     pub depends_on_id: String,
+    #[ts(type = "number")]
+    pub expected_graph_version: i64,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct RemoveDependencyRequest {
+    #[ts(type = "number")]
+    pub expected_graph_version: i64,
+    pub idempotency_key: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]

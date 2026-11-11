@@ -4,6 +4,7 @@ import type { TaskCoordinationBlockerResponse } from './TaskCoordinationBlockerR
 import type { TaskCoordinationCoordinatorResponse } from './TaskCoordinationCoordinatorResponse'
 import type { TaskCoordinationMode } from './TaskCoordinationMode'
 import type { TaskCoordinationPlanResponse } from './TaskCoordinationPlanResponse'
+import type { TaskCoordinationProjectBatchScopeResponse } from './TaskCoordinationProjectBatchScopeResponse'
 import type { TaskCoordinationRequestResponse } from './TaskCoordinationRequestResponse'
 import type { TaskCoordinationTeamRoleResponse } from './TaskCoordinationTeamRoleResponse'
 import type { TaskDispatchIntentResponse } from './TaskDispatchIntentResponse'
@@ -31,6 +32,7 @@ export type TaskCoordinationOverviewResponse = {
   max_quality_requests: number
   can_authorize: boolean
   can_request: boolean
+  project_plan_batch_scope: TaskCoordinationProjectBatchScopeResponse | null
   blockers: Array<TaskCoordinationBlockerResponse>
   latest_request: TaskCoordinationRequestResponse | null
   latest_plan: TaskCoordinationPlanResponse | null

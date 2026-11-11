@@ -7,7 +7,14 @@ pub async fn add_dependency(
     Json(request): Json<AddDependencyRequest>,
 ) -> ApiResult<StatusCode> {
     require_same_project_tasks(&state, &id, &request.depends_on_id, &user, true).await?;
-    TaskDependencyRepo::add_dependency(&*state.db, &id, &request.depends_on_id, &now_rfc3339())
+    services::project_plan::ProjectPlanService::new(state.db.clone(), state.event_bus.clone())
+        .add_dependency_versioned(
+            &id,
+            &request.depends_on_id,
+            &user.user_id,
+            request.expected_graph_version,
+            &request.idempotency_key,
+        )
         .await?;
     Ok(StatusCode::CREATED)
 }
@@ -16,9 +23,18 @@ pub async fn remove_dependency(
     State(state): State<AppState>,
     Path((id, dep_id)): Path<(String, String)>,
     user: AuthenticatedUser,
+    Json(request): Json<RemoveDependencyRequest>,
 ) -> ApiResult<StatusCode> {
     require_same_project_tasks(&state, &id, &dep_id, &user, true).await?;
-    TaskDependencyRepo::remove_dependency(&*state.db, &id, &dep_id).await?;
+    services::project_plan::ProjectPlanService::new(state.db.clone(), state.event_bus.clone())
+        .remove_dependency_versioned(
+            &id,
+            &dep_id,
+            &user.user_id,
+            request.expected_graph_version,
+            &request.idempotency_key,
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

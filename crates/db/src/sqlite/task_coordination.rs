@@ -40,6 +40,790 @@ struct MaterializedReviewControl {
     gate_kind: String,
 }
 
+async fn authorize_task_coordination_write(
+    db: &SqliteDb,
+    input: AuthorizeTaskCoordinationInput,
+    expected_task_version: i64,
+    batch_binding: Option<ProjectPlanBatchAuthorizationBinding>,
+) -> Result<TaskCoordinationWrite> {
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await?;
+    if let Some(existing) = sqlx::query(
+        "SELECT * FROM task_coordination_receipt
+         WHERE task_id = ? AND idempotency_key = ?",
+    )
+    .bind(&input.task_id)
+    .bind(&input.idempotency_key)
+    .fetch_optional(&mut *tx)
+    .await?
+    .map(map_task_coordination_receipt)
+    .transpose()?
+    {
+        if existing.request_digest != input.request_digest
+            || existing.operation != TaskCoordinationOperation::Authorize
+        {
+            return Err(DbError::IdempotencyConflict);
+        }
+        if let Some(binding) = batch_binding.as_ref() {
+            let bound: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM project_plan_batch_coordination_authorization a
+                    JOIN project_plan_batch b ON b.id=a.batch_id
+                    JOIN project_plan p ON p.project_id=b.project_id
+                    WHERE a.batch_id=? AND a.project_id=? AND a.task_id=?
+                      AND a.authorization_version=? AND a.authorized_by=?
+                      AND a.expected_batch_version=? AND a.expected_graph_version=?
+                      AND b.authorized_by=? AND b.version=?
+                      AND b.graph_version=? AND p.version=b.graph_version
+                      AND ((b.state IN ('paused','running') AND b.preparation_complete=0)
+                        OR (b.state='running' AND b.preparation_complete=1
+                            AND EXISTS(SELECT 1 FROM project_plan_batch_task bt
+                                WHERE bt.batch_id=b.id AND bt.task_id=a.task_id
+                                  AND bt.state='blocked'
+                                  AND bt.blocker='lifecycle:blocked')))
+                )",
+            )
+            .bind(&binding.batch_id)
+            .bind(&binding.project_id)
+            .bind(&input.task_id)
+            .bind(existing.authorization_version)
+            .bind(&binding.authorized_by)
+            .bind(binding.expected_batch_version)
+            .bind(binding.expected_graph_version)
+            .bind(&binding.authorized_by)
+            .bind(binding.expected_batch_version)
+            .bind(binding.expected_graph_version)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !bound {
+                return Err(DbError::ProjectPlanBatchInactive);
+            }
+        }
+        let coordination = sqlx::query("SELECT * FROM task_coordination WHERE task_id = ?")
+            .bind(&input.task_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_task_coordination)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        tx.commit().await?;
+        return Ok(TaskCoordinationWrite {
+            coordination,
+            receipt: existing,
+            replayed: true,
+            event: None,
+        });
+    }
+    let task = sqlx::query(
+        "SELECT id,project_id,version,title,description,repo_id,parent_task_id
+         FROM task WHERE id=? AND deleted_at IS NULL",
+    )
+    .bind(&input.task_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(DbError::NotFound)?;
+    let actual_task_version: i64 = task.try_get("version")?;
+    if actual_task_version != expected_task_version {
+        return Err(DbError::TaskVersionConflict {
+            expected: expected_task_version,
+            actual: actual_task_version,
+        });
+    }
+    let (actor_kind, actor_id) = coordination_actor_columns(input.coordinator_actor.as_ref());
+    if let Some(binding) = batch_binding.as_ref() {
+        let project_id: String = task.try_get("project_id")?;
+        if binding.project_id != project_id
+            || binding.authorized_by != input.requested_by
+            || binding.expected_team_generation != input.expected_team_generation
+            || input.mode != TaskCoordinationMode::PrepareAndExecute
+            || !matches!(input.coordinator_actor.as_ref(), Some(ActorRef::Agent(_)))
+        {
+            return Err(DbError::ProjectPlanBatchInactive);
+        }
+        let eligible: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM project_plan_batch b
+                JOIN project_plan p ON p.project_id=b.project_id
+                JOIN project_plan_batch_task bt ON bt.batch_id=b.id AND bt.task_id=?
+                JOIN task t ON t.id=bt.task_id AND t.project_id=b.project_id
+                  AND t.deleted_at IS NULL AND t.version=?
+                JOIN task_coordination c ON c.task_id=t.id
+                JOIN project_member m ON m.project_id=b.project_id
+                  AND m.user_id=? AND m.role IN ('owner','admin')
+                JOIN project owner_project ON owner_project.id=b.project_id
+                JOIN project_member owner_membership ON owner_membership.project_id=b.project_id
+                  AND owner_membership.user_id=owner_project.owner_id
+                  AND owner_membership.role='owner'
+                WHERE b.id=? AND b.project_id=? AND b.authorized_by=?
+                  AND b.version=? AND b.graph_version=? AND p.version=b.graph_version
+                  AND ((b.state IN ('paused','running') AND b.preparation_complete=0
+                        AND json_extract(bt.authorization_baseline_json,'$.task_version')=?
+                        AND json_extract(bt.authorization_baseline_json,'$.lifecycle_state') IN ('backlog','ready'))
+                    OR (b.state='running' AND b.preparation_complete=1
+                        AND bt.state='blocked' AND bt.blocker='lifecycle:blocked'
+                        AND json_extract(bt.authorization_baseline_json,'$.lifecycle_state')='blocked'
+                        AND json_extract(bt.authorization_baseline_json,'$.task_version')+1=?))
+                  AND json_extract(bt.authorization_baseline_json,'$.authorization_version')=?
+                  AND json_extract(bt.authorization_baseline_json,'$.team_generation')=?
+                  AND json_extract(bt.authorization_baseline_json,'$.unconfigured_manual_default')=?
+                  AND (json_extract(bt.authorization_baseline_json,'$.team_digest') IS ?
+                    OR (?=1
+                        AND json_extract(bt.authorization_baseline_json,'$.unconfigured_manual_default')=1
+                        AND json_extract(bt.authorization_baseline_json,'$.mode')='manual'
+                        AND json_extract(bt.authorization_baseline_json,'$.requested_by') IS NULL
+                        AND json_extract(bt.authorization_baseline_json,'$.revoked_at') IS NULL))
+                  AND (json_extract(bt.authorization_baseline_json,'$.envelope_digest') IS ?
+                    OR (?=1
+                        AND json_extract(bt.authorization_baseline_json,'$.unconfigured_manual_default')=1
+                        AND json_extract(bt.authorization_baseline_json,'$.mode')='manual'
+                        AND json_extract(bt.authorization_baseline_json,'$.requested_by') IS NULL
+                        AND json_extract(bt.authorization_baseline_json,'$.revoked_at') IS NULL))
+                  AND json_extract(bt.authorization_baseline_json,'$.role_id') IS ?
+                  AND json_extract(bt.authorization_baseline_json,'$.actor_kind') IS ?
+                  AND json_extract(bt.authorization_baseline_json,'$.actor_id') IS ?
+                  AND json_extract(bt.authorization_baseline_json,'$.task_objective_digest') IS NOT NULL
+                  AND c.authorization_version=json_extract(bt.authorization_baseline_json,'$.authorization_version')
+                  AND c.team_generation=json_extract(bt.authorization_baseline_json,'$.team_generation')
+                  AND c.team_digest IS json_extract(bt.authorization_baseline_json,'$.team_digest')
+                  AND c.envelope_digest IS json_extract(bt.authorization_baseline_json,'$.envelope_digest')
+                  AND c.mode IS json_extract(bt.authorization_baseline_json,'$.mode')
+                  AND c.coordinator_task_role_id IS json_extract(bt.authorization_baseline_json,'$.role_id')
+                  AND c.coordinator_actor_kind IS json_extract(bt.authorization_baseline_json,'$.actor_kind')
+                  AND c.coordinator_actor_id IS json_extract(bt.authorization_baseline_json,'$.actor_id')
+                  AND c.requested_by IS json_extract(bt.authorization_baseline_json,'$.requested_by')
+                  AND c.revoked_at IS json_extract(bt.authorization_baseline_json,'$.revoked_at')
+                  AND c.team_stale=json_extract(bt.authorization_baseline_json,'$.team_stale')
+                  AND NOT EXISTS(SELECT 1 FROM work_unit w
+                                 WHERE w.task_id=t.id AND w.status!='cancelled')
+                  AND NOT EXISTS(SELECT 1 FROM task_coordination_plan plan
+                                 WHERE plan.task_id=t.id
+                                   AND plan.state IN ('approved','materialized'))
+            )",
+        )
+        .bind(&input.task_id)
+        .bind(expected_task_version)
+        .bind(&binding.authorized_by)
+        .bind(&binding.batch_id)
+        .bind(&binding.project_id)
+        .bind(&binding.authorized_by)
+        .bind(binding.expected_batch_version)
+        .bind(binding.expected_graph_version)
+        .bind(expected_task_version)
+        .bind(expected_task_version)
+        .bind(input.expected_coordination_version)
+        .bind(input.expected_team_generation)
+        .bind(input.unconfigured_default_refresh)
+        .bind(&input.team_digest)
+        .bind(input.unconfigured_default_refresh)
+        .bind(&input.envelope_digest)
+        .bind(input.unconfigured_default_refresh)
+        .bind(input.coordinator_task_role_id.as_deref())
+        .bind(actor_kind.as_deref())
+        .bind(actor_id.as_deref())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !eligible {
+            return Err(DbError::ProjectPlanBatchInactive);
+        }
+    }
+    let current = sqlx::query("SELECT * FROM task_coordination WHERE task_id = ?")
+        .bind(&input.task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(map_task_coordination)
+        .transpose()?
+        .ok_or(DbError::NotFound)?;
+    if current.authorization_version != input.expected_coordination_version
+        || current.team_generation != input.expected_team_generation
+    {
+        return Err(DbError::VersionConflict);
+    }
+    if batch_binding.is_none() {
+        let active_batch_origin: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM project_plan_batch_coordination_authorization origin
+                JOIN project_plan_batch batch ON batch.id=origin.batch_id
+                 AND batch.project_id=origin.project_id
+                WHERE origin.task_id=? AND origin.authorization_version=?
+                  AND batch.state IN ('running','paused')
+            )",
+        )
+        .bind(&input.task_id)
+        .bind(current.authorization_version)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_batch_origin {
+            return Err(DbError::ProjectPlanBatchInactive);
+        }
+    }
+    sqlx::query(
+        "INSERT INTO task_coordination_receipt (
+            id, task_id, operation, idempotency_key, request_digest,
+            authorization_version, created_at
+         ) VALUES (?, ?, 'authorize', ?, ?, ?, ?)",
+    )
+    .bind(&input.receipt_id)
+    .bind(&input.task_id)
+    .bind(&input.idempotency_key)
+    .bind(&input.request_digest)
+    .bind(current.authorization_version + 1)
+    .bind(&input.created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(check_error)?;
+    sqlx::query(
+        "UPDATE task_coordination
+         SET mode = ?, coordinator_task_role_id = ?, coordinator_actor_kind = ?,
+             coordinator_actor_id = ?, authorization_version = authorization_version + 1,
+             team_snapshot_json = ?, team_digest = ?, envelope_json = ?,
+             envelope_digest = ?, requested_by = ?, updated_at = ?,
+             revoked_at = NULL, revoke_reason = NULL, team_stale = 0
+         WHERE task_id = ? AND authorization_version = ?",
+    )
+    .bind(input.mode.to_string())
+    .bind(input.coordinator_task_role_id.as_deref())
+    .bind(actor_kind.as_deref())
+    .bind(actor_id.as_deref())
+    .bind(&input.team_snapshot_json)
+    .bind(&input.team_digest)
+    .bind(&input.envelope_json)
+    .bind(&input.envelope_digest)
+    .bind(&input.requested_by)
+    .bind(&input.created_at)
+    .bind(&input.task_id)
+    .bind(input.expected_coordination_version)
+    .execute(&mut *tx)
+    .await
+    .map_err(check_error)?;
+    let coordination = sqlx::query("SELECT * FROM task_coordination WHERE task_id = ?")
+        .bind(&input.task_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(DbError::from)
+        .and_then(map_task_coordination)?;
+    if let Some(binding) = batch_binding {
+        let task_version: i64 = task.try_get("version")?;
+        let task_title: String = task.try_get("title")?;
+        let task_description: Option<String> = task.try_get("description")?;
+        let task_repo_id: Option<String> = task.try_get("repo_id")?;
+        let task_parent_task_id: Option<String> = task.try_get("parent_task_id")?;
+        sqlx::query(
+            "INSERT INTO project_plan_batch_coordination_authorization(
+                batch_id,project_id,task_id,authorization_version,authorized_by,
+                expected_batch_version,expected_graph_version,task_version,
+                task_objective_digest,task_title,task_description,task_repo_id,
+                task_parent_task_id,team_generation,team_digest,envelope_digest,
+                unconfigured_default_refresh,mode,role_id,actor_kind,actor_id,created_at
+             ) VALUES(?,?,?,?,?,?,?,?,json_extract((SELECT authorization_baseline_json
+                 FROM project_plan_batch_task WHERE batch_id=? AND task_id=?),
+                 '$.task_objective_digest'),?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&binding.batch_id)
+        .bind(&binding.project_id)
+        .bind(&input.task_id)
+        .bind(coordination.authorization_version)
+        .bind(&binding.authorized_by)
+        .bind(binding.expected_batch_version)
+        .bind(binding.expected_graph_version)
+        .bind(task_version)
+        .bind(&binding.batch_id)
+        .bind(&input.task_id)
+        .bind(&task_title)
+        .bind(task_description.as_deref())
+        .bind(task_repo_id.as_deref())
+        .bind(task_parent_task_id.as_deref())
+        .bind(coordination.team_generation)
+        .bind(&coordination.team_digest)
+        .bind(&coordination.envelope_digest)
+        .bind(input.unconfigured_default_refresh)
+        .bind(coordination.mode.to_string())
+        .bind(coordination.coordinator_task_role_id.as_deref())
+        .bind(
+            coordination
+                .coordinator_actor
+                .as_ref()
+                .map(ActorRef::kind)
+                .map(|v| v.to_string()),
+        )
+        .bind(coordination.coordinator_actor.as_ref().map(ActorRef::id))
+        .bind(&input.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(check_error)?;
+    }
+    let event = DomainEventRepo::append_event_in_tx(db, &mut tx, &input.event).await?;
+    tx.commit().await?;
+    Ok(TaskCoordinationWrite {
+        coordination,
+        receipt: TaskCoordinationReceipt {
+            id: input.receipt_id,
+            task_id: input.task_id,
+            operation: TaskCoordinationOperation::Authorize,
+            idempotency_key: input.idempotency_key,
+            request_digest: input.request_digest,
+            authorization_version: input.expected_coordination_version + 1,
+            created_at: input.created_at,
+        },
+        replayed: false,
+        event: Some(event),
+    })
+}
+
+async fn create_task_coordination_request_write(
+    db: &SqliteDb,
+    input: CreateTaskCoordinationRequestInput,
+    batch_binding: Option<ProjectPlanBatchRequestBinding>,
+) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)> {
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await?;
+    if let Some(existing) = sqlx::query(
+        "SELECT * FROM task_coordination_request
+         WHERE task_id=? AND idempotency_key=?",
+    )
+    .bind(&input.task_id)
+    .bind(&input.idempotency_key)
+    .fetch_optional(&mut *tx)
+    .await?
+    .map(map_task_coordination_request)
+    .transpose()?
+    {
+        if existing.request_digest != input.request_digest {
+            return Err(DbError::IdempotencyConflict);
+        }
+        let existing_is_batch_bound: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM project_plan_batch_coordination_request
+                           WHERE request_id=?)",
+        )
+        .bind(&existing.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        match batch_binding.as_ref() {
+            None if existing_is_batch_bound => return Err(DbError::ProjectPlanBatchInactive),
+            Some(binding) => {
+                let expected_origin = match &binding.origin {
+                    ProjectPlanBatchRequestOrigin::Scheduler { claim_token } => {
+                        ("scheduler", Some(claim_token.as_str()), None, None, None)
+                    }
+                    ProjectPlanBatchRequestOrigin::QualityReplan {
+                        source_artifact_id,
+                        producer_execution_id,
+                    } => (
+                        "quality_replan",
+                        None,
+                        Some(source_artifact_id.as_str()),
+                        Some(producer_execution_id.as_str()),
+                        None,
+                    ),
+                    ProjectPlanBatchRequestOrigin::HumanReplan {
+                        approved_plan_artifact_id,
+                    } => (
+                        "human_replan",
+                        None,
+                        None,
+                        None,
+                        Some(approved_plan_artifact_id.as_str()),
+                    ),
+                };
+                let matching: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM project_plan_batch_coordination_request scope
+                        JOIN project_plan_batch b ON b.id=scope.batch_id
+                        JOIN project_plan p ON p.project_id=b.project_id
+                        WHERE scope.request_id=? AND scope.project_id=?
+                          AND scope.batch_id=? AND scope.task_id=?
+                          AND scope.authorization_version=? AND scope.authorized_by=?
+                          AND scope.expected_batch_version=?
+                          AND scope.expected_graph_version=?
+                          AND scope.expected_task_version=?
+                          AND scope.coordination_snapshot_digest=?
+                          AND scope.origin_kind=? AND scope.claim_token IS ?
+                          AND scope.source_artifact_id IS ?
+                          AND scope.producer_execution_id IS ?
+                          AND scope.approved_plan_artifact_id IS ?
+                          AND b.project_id=scope.project_id AND b.authorized_by=scope.authorized_by
+                          AND b.state='running' AND b.version=scope.expected_batch_version
+                          AND b.graph_version=scope.expected_graph_version
+                          AND p.version=b.graph_version
+                    )",
+                )
+                .bind(&existing.id)
+                .bind(&binding.project_id)
+                .bind(&binding.batch_id)
+                .bind(&input.task_id)
+                .bind(binding.expected_coordination_version)
+                .bind(&binding.authorized_by)
+                .bind(binding.expected_batch_version)
+                .bind(binding.expected_graph_version)
+                .bind(binding.expected_task_version)
+                .bind(&binding.coordination_snapshot_digest)
+                .bind(expected_origin.0)
+                .bind(expected_origin.1)
+                .bind(expected_origin.2)
+                .bind(expected_origin.3)
+                .bind(expected_origin.4)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !matching {
+                    return Err(DbError::ProjectPlanBatchInactive);
+                }
+            }
+            None => {}
+        }
+        tx.commit().await?;
+        return Ok((existing, None));
+    }
+
+    let task: Option<(i64, String)> =
+        sqlx::query_as("SELECT version,project_id FROM task WHERE id=? AND deleted_at IS NULL")
+            .bind(&input.task_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((actual_task_version, project_id)) = task else {
+        return Err(DbError::NotFound);
+    };
+    if actual_task_version != input.expected_task_version {
+        return Err(DbError::TaskVersionConflict {
+            expected: input.expected_task_version,
+            actual: actual_task_version,
+        });
+    }
+    let current = sqlx::query("SELECT * FROM task_coordination WHERE task_id=?")
+        .bind(&input.task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(map_task_coordination)
+        .transpose()?
+        .ok_or(DbError::NotFound)?;
+    if current.authorization_version != input.authorization_version
+        || current.mode != input.mode
+        || current.requested_by.as_deref() != Some(input.requested_by.as_str())
+        || current.revoked_at.is_some()
+        || current.team_stale
+    {
+        return Err(DbError::VersionConflict);
+    }
+
+    if let Some(binding) = batch_binding.as_ref() {
+        if binding.project_id != project_id
+            || binding.authorized_by != input.requested_by
+            || binding.expected_task_version != input.expected_task_version
+            || binding.expected_coordination_version != input.authorization_version
+            || binding.expected_coordination_version != current.authorization_version
+            || binding.coordination_snapshot_digest.trim().is_empty()
+            || binding.coordination_snapshot_digest.len() != 64
+            || input.mode != TaskCoordinationMode::PrepareAndExecute
+        {
+            return Err(DbError::ProjectPlanBatchInactive);
+        }
+        validate_project_batch_request_binding_in_tx(&mut tx, &input, binding).await?;
+        let origin = match &binding.origin {
+            ProjectPlanBatchRequestOrigin::Scheduler { claim_token } => {
+                ("scheduler", Some(claim_token.as_str()), None, None, None)
+            }
+            ProjectPlanBatchRequestOrigin::QualityReplan {
+                source_artifact_id,
+                producer_execution_id,
+            } => (
+                "quality_replan",
+                None,
+                Some(source_artifact_id.as_str()),
+                Some(producer_execution_id.as_str()),
+                None,
+            ),
+            ProjectPlanBatchRequestOrigin::HumanReplan {
+                approved_plan_artifact_id,
+            } => (
+                "human_replan",
+                None,
+                None,
+                None,
+                Some(approved_plan_artifact_id.as_str()),
+            ),
+        };
+        sqlx::query(
+            "INSERT INTO project_plan_batch_coordination_request(
+                request_id,project_id,batch_id,task_id,authorization_version,authorized_by,
+                expected_batch_version,expected_graph_version,expected_task_version,
+                coordination_snapshot_digest,origin_kind,claim_token,source_artifact_id,
+                producer_execution_id,approved_plan_artifact_id,created_at
+             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&input.id)
+        .bind(&binding.project_id)
+        .bind(&binding.batch_id)
+        .bind(&input.task_id)
+        .bind(binding.expected_coordination_version)
+        .bind(&binding.authorized_by)
+        .bind(binding.expected_batch_version)
+        .bind(binding.expected_graph_version)
+        .bind(binding.expected_task_version)
+        .bind(&binding.coordination_snapshot_digest)
+        .bind(origin.0)
+        .bind(origin.1)
+        .bind(origin.2)
+        .bind(origin.3)
+        .bind(origin.4)
+        .bind(&input.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(check_error)?;
+    } else {
+        let batch_scoped: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM project_plan_batch_coordination_authorization a
+                WHERE a.task_id=? AND a.authorization_version=?
+            ) OR EXISTS(
+                SELECT 1 FROM project_plan_batch_task bt
+                JOIN project_plan_batch b ON b.id=bt.batch_id
+                WHERE bt.task_id=? AND b.state IN ('running','paused')
+            )",
+        )
+        .bind(&input.task_id)
+        .bind(input.authorization_version)
+        .bind(&input.task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if batch_scoped {
+            return Err(DbError::ProjectPlanBatchInactive);
+        }
+    }
+
+    let budget = sqlx::query(
+        "UPDATE task_coordination SET turn_count=turn_count+1,updated_at=?
+         WHERE task_id=? AND authorization_version=? AND mode=? AND requested_by=?
+          AND revoked_at IS NULL AND team_stale=0 AND turn_count<max_turns",
+    )
+    .bind(&input.created_at)
+    .bind(&input.task_id)
+    .bind(input.authorization_version)
+    .bind(input.mode.to_string())
+    .bind(&input.requested_by)
+    .execute(&mut *tx)
+    .await?;
+    if budget.rows_affected() != 1 {
+        let current: Option<(i64, i64)> =
+            sqlx::query_as("SELECT turn_count,max_turns FROM task_coordination WHERE task_id=?")
+                .bind(&input.task_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if current.is_some_and(|(turn_count, max_turns)| turn_count >= max_turns) {
+            return Err(DbError::CoordinationTurnBudgetExhausted);
+        }
+        return Err(DbError::VersionConflict);
+    }
+    sqlx::query(
+        "INSERT INTO task_coordination_request (
+            id, task_id, authorization_version, mode, brief_json,
+            objective_digest, request_digest, idempotency_key, state,
+            version, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', 1, ?, ?)",
+    )
+    .bind(&input.id)
+    .bind(&input.task_id)
+    .bind(input.authorization_version)
+    .bind(input.mode.to_string())
+    .bind(&input.brief_json)
+    .bind(&input.objective_digest)
+    .bind(&input.request_digest)
+    .bind(&input.idempotency_key)
+    .bind(&input.created_at)
+    .bind(&input.created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(check_error)?;
+    if let Some(binding) = batch_binding.as_ref() {
+        let update = match &binding.origin {
+            ProjectPlanBatchRequestOrigin::Scheduler { claim_token } => {
+                sqlx::query(
+                    "UPDATE project_plan_batch_task SET state='started',
+                        coordination_request_id=COALESCE(coordination_request_id,?),
+                        claim_expires_at=NULL,claim_token=NULL,blocker=NULL
+                     WHERE batch_id=? AND task_id=? AND state='claimed' AND claim_token=?",
+                )
+                .bind(&input.id)
+                .bind(&binding.batch_id)
+                .bind(&input.task_id)
+                .bind(claim_token)
+                .execute(&mut *tx)
+                .await?
+            }
+            ProjectPlanBatchRequestOrigin::QualityReplan { .. }
+            | ProjectPlanBatchRequestOrigin::HumanReplan { .. } => {
+                sqlx::query(
+                    "UPDATE project_plan_batch_task SET
+                        coordination_request_id=COALESCE(coordination_request_id,?)
+                     WHERE batch_id=? AND task_id=? AND state='started'",
+                )
+                .bind(&input.id)
+                .bind(&binding.batch_id)
+                .bind(&input.task_id)
+                .execute(&mut *tx)
+                .await?
+            }
+        };
+        if update.rows_affected() != 1 {
+            return Err(DbError::ProjectPlanBatchInactive);
+        }
+    }
+    let event = DomainEventRepo::append_event_in_tx(db, &mut tx, &input.event).await?;
+    let request = sqlx::query("SELECT * FROM task_coordination_request WHERE id=?")
+        .bind(&input.id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(DbError::from)
+        .and_then(map_task_coordination_request)?;
+    tx.commit().await?;
+    Ok((request, Some(event)))
+}
+
+async fn validate_project_batch_request_binding_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    input: &CreateTaskCoordinationRequestInput,
+    binding: &ProjectPlanBatchRequestBinding,
+) -> Result<()> {
+    let origin_ok: bool = match &binding.origin {
+        ProjectPlanBatchRequestOrigin::Scheduler { claim_token } => {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM project_plan_batch_task bt
+             WHERE bt.batch_id=? AND bt.task_id=? AND bt.state='claimed'
+              AND bt.claim_token=? AND bt.claim_expires_at IS NOT NULL
+              AND bt.claim_expires_at>=strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            )
+            .bind(&binding.batch_id)
+            .bind(&input.task_id)
+            .bind(claim_token)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        ProjectPlanBatchRequestOrigin::QualityReplan {
+            source_artifact_id,
+            producer_execution_id,
+        } => {
+            sqlx::query_scalar(
+                "SELECT EXISTS(
+                SELECT 1 FROM project_plan_batch_task bt
+                WHERE bt.batch_id=? AND bt.task_id=? AND bt.state='started'
+                  AND bt.coordination_snapshot_digest=?
+            ) AND EXISTS(
+                SELECT 1 FROM artifact_execution_producer producer
+                JOIN project_plan_batch_execution exec_link
+                  ON exec_link.execution_id=producer.execution_id
+                 AND exec_link.batch_id=? AND exec_link.task_id=producer.task_id
+                WHERE producer.artifact_id=? AND producer.execution_id=?
+                  AND producer.task_id=? AND exec_link.authorization_version=?
+            )",
+            )
+            .bind(&binding.batch_id)
+            .bind(&input.task_id)
+            .bind(&binding.coordination_snapshot_digest)
+            .bind(&binding.batch_id)
+            .bind(source_artifact_id)
+            .bind(producer_execution_id)
+            .bind(&input.task_id)
+            .bind(binding.expected_coordination_version)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        ProjectPlanBatchRequestOrigin::HumanReplan {
+            approved_plan_artifact_id,
+        } => {
+            sqlx::query_scalar(
+                "SELECT EXISTS(
+                SELECT 1 FROM project_plan_batch_task bt
+                WHERE bt.batch_id=? AND bt.task_id=? AND bt.state='started'
+                  AND bt.coordination_snapshot_digest=?
+            ) AND EXISTS(
+                SELECT 1 FROM task_coordination_plan plan
+                JOIN project_plan_batch_coordination_request previous
+                  ON previous.request_id=plan.request_id AND previous.batch_id=?
+                 AND previous.task_id=plan.task_id
+                 AND previous.authorization_version=?
+                JOIN artifact plan_artifact
+                  ON plan_artifact.id=plan.artifact_id AND plan_artifact.task_id=plan.task_id
+                   AND plan_artifact.digest=plan.plan_digest
+                WHERE plan.artifact_id=? AND plan.task_id=?
+                  AND plan.authorization_version=previous.authorization_version
+                  AND ((plan.state='approved' AND NOT EXISTS(
+                        SELECT 1 FROM task_coordination_materialization receipt
+                        WHERE receipt.plan_artifact_id=plan.artifact_id))
+                    OR (plan.state='materialized' AND EXISTS(
+                        SELECT 1 FROM task_coordination_materialization receipt
+                        WHERE receipt.plan_artifact_id=plan.artifact_id
+                          AND receipt.task_id=plan.task_id
+                          AND receipt.request_id=plan.request_id
+                          AND receipt.plan_digest=plan.plan_digest
+                          AND receipt.authorization_version=plan.authorization_version)))
+            )",
+            )
+            .bind(&binding.batch_id)
+            .bind(&input.task_id)
+            .bind(&binding.coordination_snapshot_digest)
+            .bind(&binding.batch_id)
+            .bind(binding.expected_coordination_version)
+            .bind(approved_plan_artifact_id)
+            .bind(&input.task_id)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+    };
+    if !origin_ok {
+        return Err(DbError::ProjectPlanBatchInactive);
+    }
+    let current: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM project_plan_batch b
+            JOIN project_plan p ON p.project_id=b.project_id
+            JOIN project_plan_batch_task bt ON bt.batch_id=b.id AND bt.task_id=?
+            JOIN task t ON t.id=bt.task_id AND t.project_id=b.project_id
+              AND t.deleted_at IS NULL AND t.version=?
+            JOIN task_coordination c ON c.task_id=t.id
+            JOIN project_plan_batch_coordination_authorization a
+              ON a.batch_id=b.id AND a.task_id=t.id
+               AND a.authorization_version=c.authorization_version
+            JOIN project_member m ON m.project_id=b.project_id
+              AND m.user_id=b.authorized_by AND m.role IN ('owner','admin')
+            JOIN project owner_project ON owner_project.id=b.project_id
+            JOIN project_member owner_membership ON owner_membership.project_id=b.project_id
+              AND owner_membership.user_id=owner_project.owner_id
+              AND owner_membership.role='owner'
+            WHERE b.id=? AND b.project_id=? AND b.authorized_by=?
+              AND b.state='running' AND b.preparation_complete=1
+              AND b.version=? AND b.graph_version=? AND p.version=b.graph_version
+              AND bt.coordination_snapshot_digest=?
+              AND c.authorization_version=? AND c.mode=? AND c.requested_by=?
+              AND c.revoked_at IS NULL AND c.team_stale=0
+              AND c.team_generation=a.team_generation AND c.team_digest=a.team_digest
+              AND c.envelope_digest=a.envelope_digest
+              AND c.coordinator_task_role_id=a.role_id
+              AND c.coordinator_actor_kind=a.actor_kind AND c.coordinator_actor_id=a.actor_id
+              AND a.project_id=b.project_id AND a.authorized_by=b.authorized_by
+              AND a.expected_graph_version=b.graph_version
+              AND a.mode=c.mode AND a.task_title=t.title
+              AND a.task_description IS t.description AND a.task_repo_id IS t.repo_id
+              AND a.task_parent_task_id IS t.parent_task_id
+              AND EXISTS(SELECT 1 FROM task_lifecycle l WHERE l.task_id=t.id
+                         AND l.state NOT IN ('done','cancelled','merging'))
+              AND NOT EXISTS(SELECT 1 FROM task_dispatch d
+                             WHERE d.task_id=t.id AND d.state='cancelled')
+        )",
+    )
+    .bind(&input.task_id)
+    .bind(binding.expected_task_version)
+    .bind(&binding.batch_id)
+    .bind(&binding.project_id)
+    .bind(&binding.authorized_by)
+    .bind(binding.expected_batch_version)
+    .bind(binding.expected_graph_version)
+    .bind(&binding.coordination_snapshot_digest)
+    .bind(binding.expected_coordination_version)
+    .bind(input.mode.to_string())
+    .bind(&input.requested_by)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !current {
+        return Err(DbError::ProjectPlanBatchInactive);
+    }
+    Ok(())
+}
+
 async fn insert_review_control(
     db: &SqliteDb,
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -445,6 +1229,9 @@ async fn append_optional_event(
 }
 
 fn check_error(error: sqlx::Error) -> DbError {
+    if let Some(mapped) = project_plan_batch_write_error(&error) {
+        return mapped;
+    }
     if let sqlx::Error::Database(database_error) = &error {
         let message = database_error.message().to_ascii_lowercase();
         if message.contains("unique constraint failed") {
@@ -493,125 +1280,40 @@ impl TaskCoordinationRepo for SqliteDb {
         input: AuthorizeTaskCoordinationInput,
         expected_task_version: i64,
     ) -> Result<TaskCoordinationWrite> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(existing) = sqlx::query(
-            "SELECT * FROM task_coordination_receipt
-             WHERE task_id = ? AND idempotency_key = ?",
+        authorize_task_coordination_write(self, input, expected_task_version, None).await
+    }
+
+    async fn authorize_project_plan_batch_task_coordination(
+        &self,
+        input: AuthorizeTaskCoordinationInput,
+        expected_task_version: i64,
+        binding: ProjectPlanBatchAuthorizationBinding,
+    ) -> Result<TaskCoordinationWrite> {
+        authorize_task_coordination_write(self, input, expected_task_version, Some(binding)).await
+    }
+
+    async fn has_project_plan_batch_coordination_authorization(
+        &self,
+        batch_id: &str,
+        task_id: &str,
+        authorization_version: i64,
+        expected_batch_version: i64,
+        expected_graph_version: i64,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM project_plan_batch_coordination_authorization
+                WHERE batch_id=? AND task_id=? AND authorization_version=?
+                  AND expected_batch_version=? AND expected_graph_version=?
+            )",
         )
-        .bind(&input.task_id)
-        .bind(&input.idempotency_key)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(map_task_coordination_receipt)
-        .transpose()?
-        {
-            if existing.request_digest != input.request_digest
-                || existing.operation != TaskCoordinationOperation::Authorize
-            {
-                return Err(DbError::IdempotencyConflict);
-            }
-            let coordination = sqlx::query("SELECT * FROM task_coordination WHERE task_id = ?")
-                .bind(&input.task_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .map(map_task_coordination)
-                .transpose()?
-                .ok_or(DbError::NotFound)?;
-            tx.commit().await?;
-            return Ok(TaskCoordinationWrite {
-                coordination,
-                receipt: existing,
-                replayed: true,
-                event: None,
-            });
-        }
-        let task = sqlx::query("SELECT version FROM task WHERE id = ? AND deleted_at IS NULL")
-            .bind(&input.task_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        let actual_task_version: i64 = task.try_get("version")?;
-        if actual_task_version != expected_task_version {
-            return Err(DbError::TaskVersionConflict {
-                expected: expected_task_version,
-                actual: actual_task_version,
-            });
-        }
-        let current = sqlx::query("SELECT * FROM task_coordination WHERE task_id = ?")
-            .bind(&input.task_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .map(map_task_coordination)
-            .transpose()?
-            .ok_or(DbError::NotFound)?;
-        if current.authorization_version != input.expected_coordination_version {
-            return Err(DbError::VersionConflict);
-        }
-        if current.team_generation != input.expected_team_generation {
-            return Err(DbError::VersionConflict);
-        }
-        let (actor_kind, actor_id) = coordination_actor_columns(input.coordinator_actor.as_ref());
-        sqlx::query(
-            "INSERT INTO task_coordination_receipt (
-                id, task_id, operation, idempotency_key, request_digest,
-                authorization_version, created_at
-             ) VALUES (?, ?, 'authorize', ?, ?, ?, ?)",
-        )
-        .bind(&input.receipt_id)
-        .bind(&input.task_id)
-        .bind(&input.idempotency_key)
-        .bind(&input.request_digest)
-        .bind(current.authorization_version + 1)
-        .bind(&input.created_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
-        sqlx::query(
-            "UPDATE task_coordination
-             SET mode = ?, coordinator_task_role_id = ?, coordinator_actor_kind = ?,
-                 coordinator_actor_id = ?, authorization_version = authorization_version + 1,
-                 team_snapshot_json = ?, team_digest = ?, envelope_json = ?,
-                 envelope_digest = ?, requested_by = ?, updated_at = ?,
-                 revoked_at = NULL, revoke_reason = NULL, team_stale = 0
-             WHERE task_id = ? AND authorization_version = ?",
-        )
-        .bind(input.mode.to_string())
-        .bind(input.coordinator_task_role_id.as_deref())
-        .bind(actor_kind.as_deref())
-        .bind(actor_id.as_deref())
-        .bind(&input.team_snapshot_json)
-        .bind(&input.team_digest)
-        .bind(&input.envelope_json)
-        .bind(&input.envelope_digest)
-        .bind(&input.requested_by)
-        .bind(&input.created_at)
-        .bind(&input.task_id)
-        .bind(input.expected_coordination_version)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
-        let coordination = sqlx::query("SELECT * FROM task_coordination WHERE task_id = ?")
-            .bind(&input.task_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(DbError::from)
-            .and_then(map_task_coordination)?;
-        let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &input.event).await?;
-        tx.commit().await?;
-        Ok(TaskCoordinationWrite {
-            coordination,
-            receipt: TaskCoordinationReceipt {
-                id: input.receipt_id,
-                task_id: input.task_id,
-                operation: TaskCoordinationOperation::Authorize,
-                idempotency_key: input.idempotency_key,
-                request_digest: input.request_digest,
-                authorization_version: input.expected_coordination_version + 1,
-                created_at: input.created_at,
-            },
-            replayed: false,
-            event: Some(event),
-        })
+        .bind(batch_id)
+        .bind(task_id)
+        .bind(authorization_version)
+        .bind(expected_batch_version)
+        .bind(expected_graph_version)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     async fn revoke_task_coordination(
@@ -756,53 +1458,15 @@ impl TaskCoordinationRepo for SqliteDb {
         &self,
         input: CreateTaskCoordinationRequestInput,
     ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(existing) = sqlx::query(
-            "SELECT * FROM task_coordination_request
-             WHERE task_id = ? AND idempotency_key = ?",
-        )
-        .bind(&input.task_id)
-        .bind(&input.idempotency_key)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(map_task_coordination_request)
-        .transpose()?
-        {
-            if existing.request_digest != input.request_digest {
-                return Err(DbError::IdempotencyConflict);
-            }
-            tx.commit().await?;
-            return Ok((existing, None));
-        }
-        sqlx::query(
-            "INSERT INTO task_coordination_request (
-                id, task_id, authorization_version, mode, brief_json,
-                objective_digest, request_digest, idempotency_key, state,
-                version, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', 1, ?, ?)",
-        )
-        .bind(&input.id)
-        .bind(&input.task_id)
-        .bind(input.authorization_version)
-        .bind(input.mode.to_string())
-        .bind(&input.brief_json)
-        .bind(&input.objective_digest)
-        .bind(&input.request_digest)
-        .bind(&input.idempotency_key)
-        .bind(&input.created_at)
-        .bind(&input.created_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
-        let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &input.event).await?;
-        let request = sqlx::query("SELECT * FROM task_coordination_request WHERE id = ?")
-            .bind(&input.id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(DbError::from)
-            .and_then(map_task_coordination_request)?;
-        tx.commit().await?;
-        Ok((request, Some(event)))
+        create_task_coordination_request_write(self, input, None).await
+    }
+
+    async fn create_project_plan_batch_coordination_request(
+        &self,
+        input: CreateTaskCoordinationRequestInput,
+        binding: ProjectPlanBatchRequestBinding,
+    ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)> {
+        create_task_coordination_request_write(self, input, Some(binding)).await
     }
 
     async fn get_task_coordination_request(
@@ -832,6 +1496,101 @@ impl TaskCoordinationRepo for SqliteDb {
         .await?
         .map(map_task_coordination_request)
         .transpose()
+    }
+
+    async fn is_project_plan_batch_coordination_request(&self, request_id: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM project_plan_batch_coordination_request
+                           WHERE request_id=?)",
+        )
+        .bind(request_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    async fn project_plan_batch_coordination_request_state(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<String>> {
+        let Some(scope) = sqlx::query(
+            "SELECT scope.batch_id,scope.project_id,scope.task_id,scope.authorization_version,
+                    scope.authorized_by,scope.expected_graph_version,
+                    scope.coordination_snapshot_digest,b.state
+             FROM project_plan_batch_coordination_request scope
+             JOIN project_plan_batch b ON b.id=scope.batch_id
+             WHERE scope.request_id=?",
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let batch_id: String = scope.try_get("batch_id")?;
+        let project_id: String = scope.try_get("project_id")?;
+        let task_id: String = scope.try_get("task_id")?;
+        let authorization_version: i64 = scope.try_get("authorization_version")?;
+        let authorized_by: String = scope.try_get("authorized_by")?;
+        let expected_graph_version: i64 = scope.try_get("expected_graph_version")?;
+        let snapshot_digest: String = scope.try_get("coordination_snapshot_digest")?;
+        let batch_state: String = scope.try_get("state")?;
+        let current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM project_plan_batch b
+                JOIN project_plan p ON p.project_id=b.project_id
+                JOIN project_plan_batch_task bt ON bt.batch_id=b.id AND bt.task_id=?
+                JOIN task t ON t.id=bt.task_id AND t.project_id=b.project_id AND t.deleted_at IS NULL
+                JOIN task_coordination c ON c.task_id=t.id
+                JOIN project_plan_batch_coordination_authorization a
+                  ON a.batch_id=b.id AND a.task_id=t.id
+                   AND a.authorization_version=?
+                JOIN project_member m ON m.project_id=b.project_id
+                  AND m.user_id=b.authorized_by AND m.role IN ('owner','admin')
+                JOIN project owner_project ON owner_project.id=b.project_id
+                JOIN project_member owner_membership ON owner_membership.project_id=b.project_id
+                  AND owner_membership.user_id=owner_project.owner_id
+                  AND owner_membership.role='owner'
+                WHERE b.id=? AND b.project_id=? AND b.authorized_by=?
+                  AND b.state IN ('running','paused') AND b.preparation_complete=1
+                  AND b.graph_version=? AND p.version=b.graph_version
+                  AND bt.state='started' AND bt.coordination_snapshot_digest=?
+                  AND c.authorization_version=? AND c.mode='prepare_and_execute'
+                  AND c.requested_by=b.authorized_by AND c.revoked_at IS NULL
+                  AND c.team_stale=0 AND c.team_generation=a.team_generation
+                  AND c.team_digest=a.team_digest AND c.envelope_digest=a.envelope_digest
+                  AND c.coordinator_task_role_id=a.role_id
+                  AND c.coordinator_actor_kind=a.actor_kind
+                  AND c.coordinator_actor_id=a.actor_id
+                  AND a.project_id=b.project_id AND a.authorized_by=b.authorized_by
+                  AND a.expected_graph_version=b.graph_version AND a.mode=c.mode
+                  AND a.task_title=t.title AND a.task_description IS t.description
+                  AND a.task_repo_id IS t.repo_id AND a.task_parent_task_id IS t.parent_task_id
+                  AND EXISTS(SELECT 1 FROM project_plan_batch_coordination_request request
+                             WHERE request.request_id=? AND request.batch_id=b.id
+                              AND request.task_id=t.id
+                              AND request.authorization_version=c.authorization_version
+                              AND request.coordination_snapshot_digest=bt.coordination_snapshot_digest)
+            )",
+        )
+        .bind(&task_id)
+        .bind(authorization_version)
+        .bind(&batch_id)
+        .bind(&project_id)
+        .bind(&authorized_by)
+        .bind(expected_graph_version)
+        .bind(&snapshot_digest)
+        .bind(authorization_version)
+        .bind(request_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if !current {
+            return Ok(Some("inactive".to_owned()));
+        }
+        Ok(Some(if batch_state == "paused" {
+            "paused".to_owned()
+        } else {
+            "running".to_owned()
+        }))
     }
 
     async fn link_task_coordination_request_wake(

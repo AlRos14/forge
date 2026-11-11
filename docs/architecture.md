@@ -8,7 +8,7 @@ Forge coordinates durable programming work performed by human and Agent Actors. 
 
 ## Current domain
 
-~~~text
+```text
 Project
 ├── Repo*
 └── Task*
@@ -26,7 +26,7 @@ Project
     ├── ValidationRun / Evidence*
     ├── Gate / GateEvaluation*
     └── Message* / Handoff* / Proposal* / Decision*
-~~~
+```
 
 An Actor is a Human or Agent. An Agent has a harness identity and selectable profile. A TaskRole defines responsibility for one Task; its versioned configuration can grant the closed capabilities `formal_review`, `orchestration`, and `request_rework`. RoleMembership records which Actors may participate. Neither membership, role name, nor a legacy Task field assigns executable scope. A WorkUnit names the Role and, when allocated, the Actor for that scope.
 
@@ -146,6 +146,25 @@ Dependencies form a same-Task directed acyclic graph. Readiness is derived from 
 
 Task dispatch is a durable intent owned by TaskLifecycle authority. An authenticated launch binds the exact Task and TaskLifecycle versions and an idempotency key. The TaskDispatcher admits exact assigned Agent WorkUnits while the intent is `running`; pause blocks new admissions and provider starts, and resume dispatches currently ready units. A Human-assigned WorkUnit is pending human work with no synthetic Execution. A bounded rework operation over an exact request-changes ReviewReport creates correction plus new review units and consumes one per-Task round atomically. Automatic routes are explicit, durable, replay-safe, and revalidated after pause or configuration changes.
 
+The optional [Project plan](concepts/project-plan.md) organizes ordinary Tasks
+as versioned work packets with canonical dependency edges, proposals, and
+provenance. It does not replace the WorkUnit DAG inside a Task or TaskLifecycle.
+Applying a proposal can create or map Tasks but does not authorize work. A
+separate owner/admin batch authorization grants bounded scheduling; readiness,
+dispatch, and batch state remain distinct projections.
+
+TaskCoordination authorizations minted by a Project batch retain an immutable
+binding to that exact batch. The generic Task coordination request route rejects
+such a version with `409 project_plan_batch_inactive`, including after the batch
+is revoked or completed; a fresh explicit TaskCoordination authorization
+restores the standalone request path. Scheduler, Quality Replan, and Human
+Replan continuations retain their exact claim token or source Artifact,
+producer Execution, or explicitly selected plan Artifact. Human Replan requires
+approval valid in the active authorization/batch and an exact materialization
+receipt when the plan is materialized. Multiple plans may remain valid in one
+authorization; authority is never selected by latest timestamp. The origin is
+recorded directly and is never inferred from an authorization-version change.
+
 ## Review, validation, and Gates
 
 Formal review is an Execution admitted under a TaskRole snapshot with `formal_review`. Its ReviewReport is an Artifact with exact Execution provenance. Review judgment remains distinct from deterministic checks. A durable review line follows the source result and each correction; a typed approval requirement is satisfied only by a favorable report for the line's latest result.
@@ -156,26 +175,33 @@ A Gate is a deterministic policy over exact durable records. Its immutable GateE
 
 ## Persistence and history
 
-SQLite is the current persistence layer. Numbered migrations V001–V161 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add the Task coordination authorization, turn, plan, materialization, quality-request, intervention, team-staleness, and quality-resolution records described by the PR0 contract. V161 adds persisted quality-route counters, exact cycle evidence, and inspectable Human-escalation reasons; it preserves historical request states.
+SQLite is the current persistence layer. Numbered migrations V001–V167 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add the Task coordination authorization, turn, plan, materialization, quality-request, intervention, team-staleness, and quality-resolution records described by the PR0 contract. V161 adds persisted quality-route counters, exact cycle evidence, and inspectable Human-escalation reasons; it preserves historical request states. V167 adds optional Project plan versions and proposals, source and Task identity provenance, batch authorization, delivery readiness, and fail-closed guards for incomplete imports and provider starts.
 
 Historical `agent_session_history`, immutable Execution records, ProjectRelease snapshots, Artifact and Evidence references, HarnessSession identities, cross-record IDs, migration decisions, ADRs, and upstream license attribution remain readable history. History does not regain runtime authority. ProjectRelease is a read-only historical snapshot and does not create a current Charter, milestone, readiness workflow, or release operation.
+
+V167 stores immutable source bindings for TaskCoordination grants and batch
+requests. A grant records the exact Project, batch, Task, authorized Human,
+versions, Task objective, team/envelope snapshot, and coordinator Role/Actor in
+the same write as the authorization change. Each batch request additionally
+records whether it came from a scheduler claim, a Quality Replan Artifact and
+producer Execution, or an approved Human Replan Artifact.
 
 Configuration or data path changes can affect installed users. The current local identifiers include the `forge` brand, `FORGE_*` variables, `~/.forge`, `forge.yaml`, `forge.db`, `jwt_secret.bin`, `server.json`, workspace roots, and log locations. Changing them requires a separately reviewed discovery and preservation strategy; no such rename has been authorized.
 
 ## Runtime topology
 
-| Part | Current responsibility |
-|---|---|
-| `forge-cli` (`forge`) | Local server, web assets, REST and optional MCP endpoint, and embedded daemon startup. |
-| `api` and `api-types` | REST routes, permissions, serialization contracts, and public request/response types. |
-| `services` and `db` | Domain authority and SQLite persistence. `TaskLifecycleService` owns Task lifecycle decisions. |
-| `events` | Event delivery and wake hints; durable domain records remain authoritative. |
-| `mcp-server` | MCP tools over the same domain services and permissions. |
-| `forge-client` (`forge-ctl`) | Command-line client for the REST API. It currently has no WorkUnit creation command. |
-| `forge-daemon`, `cli-adapters`, `executors` | External host transport, process supervision, and harness translation. |
-| `workspace`, `git` | Repository isolation, path guards, workspace leases, and serialized Git integration. |
-| `config` | Local settings, data paths, credentials, and defaults. |
-| `web/` | React interface for Projects, Tasks, Executions, Agents, daemons, operations, settings, and historical ProjectRelease snapshots. |
+| Part                                        | Current responsibility                                                                                                           |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `forge-cli` (`forge`)                       | Local server, web assets, REST and optional MCP endpoint, and embedded daemon startup.                                           |
+| `api` and `api-types`                       | REST routes, permissions, serialization contracts, and public request/response types.                                            |
+| `services` and `db`                         | Domain authority and SQLite persistence. `TaskLifecycleService` owns Task lifecycle decisions.                                   |
+| `events`                                    | Event delivery and wake hints; durable domain records remain authoritative.                                                      |
+| `mcp-server`                                | MCP tools over the same domain services and permissions.                                                                         |
+| `forge-client` (`forge-ctl`)                | Command-line client for the REST API. It currently has no WorkUnit creation command.                                             |
+| `forge-daemon`, `cli-adapters`, `executors` | External host transport, process supervision, and harness translation.                                                           |
+| `workspace`, `git`                          | Repository isolation, path guards, workspace leases, and serialized Git integration.                                             |
+| `config`                                    | Local settings, data paths, credentials, and defaults.                                                                           |
+| `web/`                                      | React interface for Projects, Tasks, Executions, Agents, daemons, operations, settings, and historical ProjectRelease snapshots. |
 
 ## Public and local surfaces
 
@@ -195,19 +221,19 @@ The API and UI do not expose the retired Main Agent, Project Agent, Agent Chat, 
 
 ## Configuration defaults
 
-| Setting | Default |
-|---|---|
-| Server bind | `127.0.0.1:0`; a free loopback port is selected and saved. |
-| Data directory | `~/.forge` (or `.forge` when no home directory is available). |
-| Config file | `<data-dir>/forge.yaml`. |
-| Database | `<data-dir>/forge.db`. |
-| JWT secret file | `<data-dir>/jwt_secret.bin`, created with restricted permissions when no configured secret is present. |
-| Server state | `<data-dir>/server.json`. |
-| Workspace root | system temporary directory + `/forge/worktrees`. |
-| Web assets | `web/dist` in a checkout, then installed `share/forge/web/dist`; `FORGE_WEB_DIST_DIR` overrides the lookup. |
-| Default agent concurrency | `1`. |
-| Default missed heartbeat limit | `3` intervals. |
-| Default heartbeat interval | `30` seconds. |
+| Setting                        | Default                                                                                                     |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| Server bind                    | `127.0.0.1:0`; a free loopback port is selected and saved.                                                  |
+| Data directory                 | `~/.forge` (or `.forge` when no home directory is available).                                               |
+| Config file                    | `<data-dir>/forge.yaml`.                                                                                    |
+| Database                       | `<data-dir>/forge.db`.                                                                                      |
+| JWT secret file                | `<data-dir>/jwt_secret.bin`, created with restricted permissions when no configured secret is present.      |
+| Server state                   | `<data-dir>/server.json`.                                                                                   |
+| Workspace root                 | system temporary directory + `/forge/worktrees`.                                                            |
+| Web assets                     | `web/dist` in a checkout, then installed `share/forge/web/dist`; `FORGE_WEB_DIST_DIR` overrides the lookup. |
+| Default agent concurrency      | `1`.                                                                                                        |
+| Default missed heartbeat limit | `3` intervals.                                                                                              |
+| Default heartbeat interval     | `30` seconds.                                                                                               |
 
 Supported settings are defined in `crates/config/`. Common environment variables include `FORGE_SERVER_BIND`, `FORGE_PUBLIC_BASE_URL`, `FORGE_DATA_DIR`, `FORGE_WORKSPACE_ROOT`, `FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_AGENT_MAX_CONCURRENT_TASKS`, `FORGE_AGENT_HEARTBEAT_INTERVAL_SECONDS`, `FORGE_AGENT_MAX_MISSED_HEARTBEATS`, `FORGE_JWT_SECRET`, `FORGE_BCRYPT_COST`, `FORGE_CORS_ORIGINS`, and `FORGE_MEDIA_UPLOAD_LIMIT_BYTES`. `RUST_LOG` and `FORGE_LOG_FORMAT` configure logging.
 

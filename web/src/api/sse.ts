@@ -100,11 +100,27 @@ export function routeSsePayload(
   }
 
   if (eventType.startsWith('project.')) {
-    void queryClient.invalidateQueries({ queryKey: qk.project(payload.entity_id) })
+    const projectId =
+      eventType === 'project.plan_changed'
+        ? typeof facts.project_id === 'string'
+          ? facts.project_id
+          : payload.scope_type === 'project'
+            ? (payload.scope_id ?? undefined)
+            : undefined
+        : payload.entity_id
+    if (projectId) {
+      void queryClient.invalidateQueries({ queryKey: qk.project(projectId) })
+      if (eventType === 'project.plan_changed') {
+        void queryClient.invalidateQueries({ queryKey: ['projects', projectId, 'plan'] })
+        void queryClient.invalidateQueries({ queryKey: qk.projectTasks(projectId) })
+      }
+      void queryClient.invalidateQueries({
+        queryKey: qk.projectTaskRoleDefaults(projectId),
+      })
+    } else if (eventType === 'project.plan_changed') {
+      invalidateAllActiveQueries(queryClient)
+    }
     void queryClient.invalidateQueries({ queryKey: qk.projects })
-    void queryClient.invalidateQueries({
-      queryKey: qk.projectTaskRoleDefaults(payload.entity_id),
-    })
   }
 
   if (
@@ -143,12 +159,18 @@ export function routeSsePayload(
     if (taskId) {
       void queryClient.invalidateQueries({ queryKey: ['task-autonomy-limits', taskId] })
       void queryClient.invalidateQueries({ queryKey: qk.taskCoordination(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskQualityRequests(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.workUnits(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.lifecycleTransitions(taskId) })
       invalidateProjectTaskLists(queryClient)
+      if (eventType === 'task.autonomy_limits_changed') {
+        void queryClient.invalidateQueries({
+          predicate: (query) => query.queryKey[0] === 'projects' && query.queryKey[2] === 'plan',
+        })
+      }
     } else {
       invalidateAllActiveQueries(queryClient)
     }
@@ -278,6 +300,7 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
             'project.deleted',
             'project.paused',
             'project.resumed',
+            'project.plan_changed',
             'project_hook.run_changed',
             'notification.created',
             'events.resync_required',

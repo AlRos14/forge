@@ -279,6 +279,16 @@ pub struct TaskCoordinationPlanResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct TaskCoordinationProjectBatchScopeResponse {
+    pub batch_id: String,
+    pub batch_state: String,
+    pub task_state: String,
+    pub blocker: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct TaskCoordinationOverviewResponse {
     #[serde(default)]
@@ -311,6 +321,7 @@ pub struct TaskCoordinationOverviewResponse {
     pub max_quality_requests: i64,
     pub can_authorize: bool,
     pub can_request: bool,
+    pub project_plan_batch_scope: Option<TaskCoordinationProjectBatchScopeResponse>,
     pub blockers: Vec<TaskCoordinationBlockerResponse>,
     pub latest_request: Option<TaskCoordinationRequestResponse>,
     pub latest_plan: Option<TaskCoordinationPlanResponse>,

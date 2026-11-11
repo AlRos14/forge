@@ -41,9 +41,11 @@ import type {
   TaskCoordinationPlanDecision,
 } from '@/types/generated'
 import {
+  canEditTaskCoordinationAuthorization,
   coordinationRoleLabel,
   deriveCoordinationNextAction,
   dispatchStateLabel,
+  isProjectBatchScopedCoordination,
   isTurnBudgetExhausted,
   readableCoordinationCode,
 } from './task-coordination-status'
@@ -242,12 +244,23 @@ export function TaskCoordinationPanel({
     overview && overview.mode !== 'manual' && !overview.revoked_at,
   )
   const turnBudgetExhausted = overview ? isTurnBudgetExhausted(overview) : false
+  const batchScopedCoordination = overview ? isProjectBatchScopedCoordination(overview) : false
+  const canEditCoordinationAuthorization = overview
+    ? canEditTaskCoordinationAuthorization(overview)
+    : false
+  const batchOwnsActiveAuthorization = Boolean(
+    overview?.project_plan_batch_scope &&
+    ['running', 'paused'].includes(overview.project_plan_batch_scope.batch_state),
+  )
   const coordinatorRole = overview?.team.find(
     (role) => role.id === overview.coordinator?.task_role_id,
   )
   const derivedNextAction = overview ? deriveCoordinationNextAction(overview, request, plan) : null
   const baseNextAction =
-    overview?.mode === 'manual' && overview.can_authorize && selectedCoordinator
+    overview?.mode === 'manual' &&
+    canEditCoordinationAuthorization &&
+    !batchScopedCoordination &&
+    selectedCoordinator
       ? {
           kind: 'request' as const,
           tone: 'action' as const,
@@ -297,7 +310,7 @@ export function TaskCoordinationPanel({
     : null
 
   async function authorizeCoordination() {
-    if (!overview || !overview.can_authorize || !selectedCoordinator) return
+    if (!overview || !canEditCoordinationAuthorization || !selectedCoordinator) return
     setActionError(null)
     try {
       await authorize.mutateAsync({
@@ -324,6 +337,7 @@ export function TaskCoordinationPanel({
     event?.preventDefault()
     if (
       !overview ||
+      batchScopedCoordination ||
       (!overview.can_request && !overview.can_authorize) ||
       turnBudgetExhausted ||
       !coordinatorAvailable ||
@@ -591,7 +605,7 @@ export function TaskCoordinationPanel({
             <p className="mt-1 break-words text-sm font-semibold">{nextAction.summary}</p>
             <p className="mt-1 break-words text-sm opacity-90">{nextAction.detail}</p>
             <div className="mt-3 flex flex-wrap gap-2">
-              {nextAction.kind === 'request' && coordinatorAvailable ? (
+              {nextAction.kind === 'request' && coordinatorAvailable && !batchScopedCoordination ? (
                 <Button
                   size="sm"
                   disabled={authorize.isPending || requestTurn.isPending || !objective.trim()}
@@ -754,7 +768,28 @@ export function TaskCoordinationPanel({
         </p>
       ) : null}
 
-      {overview.can_authorize ? (
+      {batchOwnsActiveAuthorization ? (
+        <div
+          role="status"
+          className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border-subtle bg-muted/20 p-3"
+        >
+          <p className="min-w-0 text-sm text-muted-foreground">
+            The Project batch owns this Task coordination authorization while it is running or
+            paused. To switch to standalone coordination, explicitly revoke this Task authorization
+            or revoke/complete the batch, then authorize again here. The old batch grant becomes
+            stale and admits no more work.
+          </p>
+          <Link
+            to="/projects/$projectId/plan"
+            params={{ projectId: task.project_id }}
+            className="inline-flex h-8 items-center justify-center rounded-md px-[9px] text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Open Project plan
+          </Link>
+        </div>
+      ) : null}
+
+      {canEditCoordinationAuthorization ? (
         <div className="space-y-4 rounded-md border p-3">
           <div>
             <h3 className="font-medium">
@@ -897,9 +932,17 @@ export function TaskCoordinationPanel({
         >
           <p className="font-medium">Preparation-turn limit reached</p>
           <p className="mt-1">
-            Forge recorded {overview.turn_count} of {overview.max_turns} preparation turns. No
-            further automatic turn will be admitted. Existing plans and WorkUnits are preserved;
-            continue through Advanced work or ask a Project owner to decide a new Task budget.
+            {batchScopedCoordination &&
+            overview.project_plan_batch_scope?.blocker ===
+              'coordination:coordination.budget_exhausted' ? (
+              nextAction?.detail
+            ) : (
+              <>
+                Forge recorded {overview.turn_count} of {overview.max_turns} preparation turns. No
+                further automatic turn will be admitted. Existing plans and WorkUnits are preserved;
+                continue through Advanced work or ask a Project owner to decide a new Task budget.
+              </>
+            )}
           </p>
           <Button size="sm" variant="outline" className="mt-3" onClick={onOpenAdvancedWork}>
             Continue with Advanced work
@@ -908,6 +951,7 @@ export function TaskCoordinationPanel({
       ) : null}
 
       {(overview.can_request || (overview.can_authorize && selectedCoordinator)) &&
+      !batchScopedCoordination &&
       !turnBudgetExhausted &&
       coordinatorAvailable ? (
         <form
@@ -978,6 +1022,7 @@ export function TaskCoordinationPanel({
 
       {plannedModeIsAuthorized &&
       overview.can_request &&
+      !batchScopedCoordination &&
       !turnBudgetExhausted &&
       !coordinatorAvailable ? (
         <div

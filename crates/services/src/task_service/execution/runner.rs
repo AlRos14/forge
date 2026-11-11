@@ -255,6 +255,12 @@ impl TaskService {
                     .await?;
             }
             let execution = self.freeze_review_subject_and_inputs(execution).await?;
+            crate::project_plan::ProjectPlanService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .verify_execution_handoff_workspace_base(&execution)
+            .await?;
             let provider = self.execution_provider_for_execution(&execution).await?;
             let params = self.execution_start_params(&execution).await?;
             if snapshot_credential_ref(&params.executor_config)?.is_some() {
@@ -298,7 +304,25 @@ impl TaskService {
             &execution.id,
             provider_start_receipt_event(&execution, "execution.provider_start_attempted"),
         )
-        .await?;
+        .await;
+        let claim = match claim {
+            Ok(claim) => claim,
+            Err(
+                error @ ServiceError::Db(
+                    db::DbError::ProjectPlanBatchInactive
+                    | db::DbError::ProjectDependencyUnsatisfied
+                    | db::DbError::ProjectPlanApplyIncomplete,
+                ),
+            ) => {
+                self.fail_execution_before_dispatch(
+                    &execution.id,
+                    "Project plan batch authority or exact prerequisite evidence became invalid before provider Start".to_owned(),
+                )
+                .await?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         match claim {
             db::ProviderStartClaim::Accepted => {
                 return Ok(api_types::ExecutionStartResult {
@@ -345,6 +369,12 @@ impl TaskService {
                 });
             }
             db::ProviderStartClaim::TaskPaused => {
+                return Ok(api_types::ExecutionStartResult {
+                    execution_id: execution.id,
+                    accepted: false,
+                });
+            }
+            db::ProviderStartClaim::ProjectPlanBatchPaused => {
                 return Ok(api_types::ExecutionStartResult {
                     execution_id: execution.id,
                     accepted: false,

@@ -6,6 +6,7 @@ describe('application shell navigation contract', () => {
     expect(navigationItemsForSection('main')).toEqual([])
     expect(navigationItemsForSection('project').map(({ key, to }) => [key, to])).toEqual([
       ['board', '/projects/$projectId/board'],
+      ['plan', '/projects/$projectId/plan'],
       ['tasks', '/projects/$projectId/tasks'],
       ['settings', '/projects/$projectId/settings'],
     ])

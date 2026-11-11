@@ -118,6 +118,12 @@ impl TaskAutonomyService {
             .bind(task_id)
             .execute(&mut *tx)
             .await?;
+        let authorization_version: i64 = sqlx::query_scalar(
+            "SELECT authorization_version FROM task_coordination WHERE task_id=?",
+        )
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?;
         let result = TaskAutonomyLimits {
             version: input.expected_version + 1,
             ..input.limits
@@ -163,9 +169,13 @@ impl TaskAutonomyService {
                 causation_id: None,
                 causation_depth: 0,
                 dedupe_key: None,
-                payload_json:
-                    serde_json::json!({"task_id":task_id,"limits":result,"reason":input.reason})
-                        .to_string(),
+                payload_json: serde_json::json!({
+                    "task_id":task_id,
+                    "limits":result,
+                    "reason":input.reason,
+                    "authorization_version":authorization_version
+                })
+                .to_string(),
                 created_at: now,
             },
         )

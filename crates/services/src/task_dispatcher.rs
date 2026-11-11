@@ -10,7 +10,7 @@ use events::EventBus;
 use tokio::sync::Notify;
 use tracing::Instrument;
 
-use crate::{Result, TaskService};
+use crate::{project_plan::ProjectPlanService, Result, TaskService};
 
 mod active_recovery;
 mod dispatch;
@@ -119,11 +119,15 @@ impl TaskDispatcher {
     pub async fn check_once(&self) -> Result<u64> {
         let pending_starts = self.recover_pending_provider_starts().await?;
         let auto_recovered = self.recover_auto_cancelled_work_unit_executions().await?;
+        let plan_service =
+            ProjectPlanService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+        let project_plan_requests = plan_service.check_once().await?;
         let dispatched_units = self.dispatch_eligible_work_units().await?;
-        let dispatched = pending_starts + dispatched_units + auto_recovered;
+        let dispatched = pending_starts + dispatched_units + auto_recovered + project_plan_requests;
 
         tracing::info!(
             dispatched_tasks = dispatched,
+            project_plan_requests,
             "task dispatcher check completed"
         );
         Ok(dispatched)

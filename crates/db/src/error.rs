@@ -97,6 +97,15 @@ pub enum DbError {
     #[error("dependency gate")]
     DependencyGate,
 
+    #[error("a Project Task dependency is not accepted and integrated")]
+    ProjectDependencyUnsatisfied,
+
+    #[error("the Project plan batch is paused, revoked, stale, or no longer authorized")]
+    ProjectPlanBatchInactive,
+
+    #[error("the Project plan proposal import is incomplete")]
+    ProjectPlanApplyIncomplete,
+
     #[error("cycle detected")]
     CycleDetected,
 

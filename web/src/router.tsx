@@ -62,6 +62,11 @@ const ProjectReleasePage = lazy(() =>
     default: module.ProjectReleasePage,
   })),
 )
+const ProjectPlanPage = lazy(() =>
+  import('@/features/project-plan/ProjectPlanPage').then((module) => ({
+    default: module.ProjectPlanPage,
+  })),
+)
 const RegisterPage = lazy(() =>
   import('@/pages/RegisterPage').then((module) => ({ default: module.RegisterPage })),
 )
@@ -176,6 +181,17 @@ const boardRoute = createRoute({
   component: BoardRouteComponent,
 })
 
+const projectPlanRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/projects/$projectId/plan',
+  component: ProjectPlanRouteComponent,
+})
+
+function ProjectPlanRouteComponent() {
+  const { projectId } = projectPlanRoute.useParams()
+  return <ProjectPlanPage projectId={projectId} />
+}
+
 function BoardRouteComponent() {
   const { projectId } = boardRoute.useParams()
   useHotkeys('c', () => window.dispatchEvent(new CustomEvent('forge:create-task')), {
@@ -203,7 +219,14 @@ const taskListSortByValues = new Set<TaskListSortBy>([
 ])
 
 const taskLifecycleStates = new Set<TaskLifecycleState>([
-  'backlog', 'ready', 'active', 'blocked', 'ready_to_merge', 'merging', 'done', 'cancelled',
+  'backlog',
+  'ready',
+  'active',
+  'blocked',
+  'ready_to_merge',
+  'merging',
+  'done',
+  'cancelled',
 ])
 
 const taskListRoute = createRoute({
@@ -216,9 +239,11 @@ const taskListRoute = createRoute({
         ? (search.sort_by as TaskListSortBy)
         : 'updated_at',
     sort_order: search.sort_order === 'asc' ? 'asc' : 'desc',
-    lifecycle_state: typeof search.lifecycle_state === 'string' && taskLifecycleStates.has(search.lifecycle_state as TaskLifecycleState)
-      ? search.lifecycle_state as TaskLifecycleState
-      : undefined,
+    lifecycle_state:
+      typeof search.lifecycle_state === 'string' &&
+      taskLifecycleStates.has(search.lifecycle_state as TaskLifecycleState)
+        ? (search.lifecycle_state as TaskLifecycleState)
+        : undefined,
   }),
   component: TaskListRouteComponent,
 })
@@ -327,8 +352,7 @@ const agentsRoute = createRoute({
     project: typeof search.project === 'string' ? search.project : undefined,
     provider: typeof search.provider === 'string' ? search.provider : undefined,
     status: typeof search.status === 'string' ? search.status : undefined,
-    authorization:
-      typeof search.authorization === 'string' ? search.authorization : undefined,
+    authorization: typeof search.authorization === 'string' ? search.authorization : undefined,
     identity: typeof search.identity === 'string' ? search.identity : undefined,
   }),
   component: AgentsRouteComponent,
@@ -502,6 +526,7 @@ const routeTree = rootRoute.addChildren([
   registerRoute,
   indexRoute,
   boardRoute,
+  projectPlanRoute,
   taskListRoute,
   taskDetailRoute,
   taskDetailTabRoute,

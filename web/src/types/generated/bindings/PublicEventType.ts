@@ -43,6 +43,7 @@ export type PublicEventType =
   | 'project.deleted'
   | 'project.paused'
   | 'project.resumed'
+  | 'project.plan_changed'
   | 'project_hook.run_changed'
   | 'notification.created'
   | 'operations.status_changed'

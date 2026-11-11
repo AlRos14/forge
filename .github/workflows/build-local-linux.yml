@@ -80,7 +80,7 @@ jobs:
           cache-on-failure: true
       - run: cargo fmt --all -- --check
       - if: ${{ !cancelled() }}
-        run: cargo clippy --locked -p services -p db -p cli-adapters -p api -p api-types -p executors --all-targets -- -D warnings
+        run: cargo clippy --locked -p services -p db -p cli-adapters -p api -p api-types -p mcp-server -p executors --all-targets -- -D warnings
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p api-types --lib
       - if: ${{ !cancelled() }}
@@ -92,6 +92,8 @@ jobs:
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib task_coordination
       - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib task_quality
+      - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib coordination_auto_completion
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --test task_coordination
@@ -99,5 +101,21 @@ jobs:
         run: cargo test --locked -p db --lib pr6_
       - if: ${{ !cancelled() }}
         run: cargo test --locked --no-fail-fast -p db --test pr2_execution_session --test pr5_workunit --test task_coordination_schema --test file_backed_migration --test task_delete_integrity
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib project_plan
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib project_wide_plain_text_instruction_needs_no_dag_format_or_parser
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --lib project_plan_apply_incomplete_has_a_typed_conflict_code
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib project_plan
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib mcp_project_copilot_lists_only_delegated_management_tools
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test project_plan --test copilot_mcp_authority
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test e2e
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test pr12_public_surface
       - if: ${{ !cancelled() }}
         run: cargo test --locked --no-fail-fast -p api --test task_rework --test task_autonomy --test task_dispatch --test work_unit_reviews --test work_unit_artifact_package --test happy_path

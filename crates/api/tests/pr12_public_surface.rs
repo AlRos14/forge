@@ -455,6 +455,15 @@ async fn task_and_execution_routes_enforce_project_visibility() {
     .await
     .expect("create execution fixture");
 
+    let graph: api_types::ProjectPlanGraphResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}/plan", project_a.id),
+        &token_a,
+        StatusCode::OK,
+    )
+    .await;
+
     for (method, path, body) in [
         (Method::GET, format!("/api/v1/tasks/{}", task_a.id), None),
         (
@@ -476,7 +485,11 @@ async fn task_and_execution_routes_enforce_project_visibility() {
         (
             Method::POST,
             format!("/api/v1/tasks/{}/dependencies", task_a.id),
-            Some(json!({"depends_on_id": task_b.id})),
+            Some(json!({
+                "depends_on_id": task_b.id,
+                "expected_graph_version": graph.version,
+                "idempotency_key": "denied-task-dependency"
+            })),
         ),
         (
             Method::GET,

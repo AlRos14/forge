@@ -1465,7 +1465,12 @@ export function useTaskDependentsQuery(taskId: string) {
 export function useAddDependency(taskId: string) {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (dependsOnId: string) => addDependency(taskId, dependsOnId),
+    mutationFn: (input: {
+      dependsOnId: string
+      expectedGraphVersion: number
+      idempotencyKey: string
+    }) =>
+      addDependency(taskId, input.dependsOnId, input.expectedGraphVersion, input.idempotencyKey),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.taskDependencies(taskId) })
     },
@@ -1475,7 +1480,12 @@ export function useAddDependency(taskId: string) {
 export function useRemoveDependency(taskId: string) {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (dependsOnId: string) => removeDependency(taskId, dependsOnId),
+    mutationFn: (input: {
+      dependsOnId: string
+      expectedGraphVersion: number
+      idempotencyKey: string
+    }) =>
+      removeDependency(taskId, input.dependsOnId, input.expectedGraphVersion, input.idempotencyKey),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.taskDependencies(taskId) })
     },

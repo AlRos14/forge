@@ -286,7 +286,12 @@ function ProjectCopilotSession({
     const nextTaskId = task?.id ?? null
     if (activeTaskIdRef.current !== nextTaskId) {
       if (!pinned) setOpen(false)
-      if (!draft.trim()) setDraftTaskContext(task ? { id: task.id, title: task.title } : null)
+      // A Project route (including the plan page) always drafts with Project-only
+      // authority. Keep draft text if the user already typed, but detach the
+      // prior Task so opening Copilot from the Project cannot target stale scope.
+      if (nextTaskId === null || !draft.trim()) {
+        setDraftTaskContext(task ? { id: task.id, title: task.title } : null)
+      }
       activeTaskIdRef.current = nextTaskId
     }
   }, [draft, pinned, task?.id, task?.title])

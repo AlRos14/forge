@@ -340,7 +340,10 @@ async fn apply_project_scope(
 }
 
 fn project_mutation_tool(tool_name: &str) -> bool {
-    tool_name == "forge_create_task"
+    matches!(
+        tool_name,
+        "forge_create_task" | "forge_propose_project_plan" | "forge_apply_project_plan"
+    )
 }
 
 fn project_admin_tool(tool_name: &str) -> bool {
@@ -389,6 +392,11 @@ fn tool_accepts_project_id(tool_name: &str) -> bool {
         "forge_create_task"
             | "forge_list_tasks"
             | "forge_get_project"
+            | "forge_get_project_plan"
+            | "forge_propose_project_plan"
+            | "forge_apply_project_plan"
+            | "forge_list_project_repo_tree"
+            | "forge_read_project_repo_file"
             | "forge_update_project"
             | "forge_update_project_hooks"
     )
@@ -540,6 +548,18 @@ fn handle_tools_list(context: &McpContext) -> Result<Value, McpToolError> {
 
 fn copilot_tool_allowed(name: &str, task_scoped: bool) -> bool {
     if task_scoped && name == "forge_list_tasks" {
+        return false;
+    }
+    if task_scoped
+        && matches!(
+            name,
+            "forge_get_project_plan"
+                | "forge_propose_project_plan"
+                | "forge_apply_project_plan"
+                | "forge_list_project_repo_tree"
+                | "forge_read_project_repo_file"
+        )
+    {
         return false;
     }
     api_types::PROJECT_COPILOT_MCP_TOOLS.contains(&name)

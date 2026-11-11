@@ -1,5 +1,6 @@
 mod descriptors;
 mod handlers;
+mod project_plan;
 
 use serde_json::Value;
 
@@ -20,9 +21,24 @@ pub(crate) async fn dispatch_tool(
     match name {
         "forge_create_task" => handlers::forge_create_task(state, arguments).await,
         "forge_create_sub_tasks" => handlers::forge_create_sub_tasks(state, arguments).await,
-        "forge_add_task_dependency" => handlers::forge_add_task_dependency(state, arguments).await,
+        "forge_add_task_dependency" => {
+            handlers::forge_add_task_dependency(state, arguments, context).await
+        }
         "forge_remove_task_dependency" => {
-            handlers::forge_remove_task_dependency(state, arguments).await
+            handlers::forge_remove_task_dependency(state, arguments, context).await
+        }
+        "forge_get_project_plan" => project_plan::get_project_plan(state, arguments, context).await,
+        "forge_propose_project_plan" => {
+            project_plan::propose_project_plan(state, arguments, context).await
+        }
+        "forge_apply_project_plan" => {
+            project_plan::apply_project_plan(state, arguments, context).await
+        }
+        "forge_list_project_repo_tree" => {
+            project_plan::list_project_repo_tree(state, arguments, context).await
+        }
+        "forge_read_project_repo_file" => {
+            project_plan::read_project_repo_file(state, arguments, context).await
         }
         "forge_list_task_dependencies" => {
             handlers::forge_list_task_dependencies(state, arguments).await

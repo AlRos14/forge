@@ -420,6 +420,9 @@ fn work_unit_write_error(error: sqlx::Error) -> DbError {
     if let Some(error) = super::work_unit_execution_admission_error(&error) {
         return error;
     }
+    if let Some(error) = super::project_plan_batch_write_error(&error) {
+        return error;
+    }
     if let sqlx::Error::Database(database_error) = &error {
         let message = database_error.message().to_ascii_lowercase();
         if message.contains("dependency would create a cycle")

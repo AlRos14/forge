@@ -799,6 +799,11 @@ fn tools_list_returns_descriptors() {
             "forge_get_gate",
             "forge_get_gate_evaluation",
             "forge_get_project",
+            "forge_get_project_plan",
+            "forge_propose_project_plan",
+            "forge_apply_project_plan",
+            "forge_list_project_repo_tree",
+            "forge_read_project_repo_file",
             "forge_get_review_execution",
             "forge_get_task",
             "forge_get_task_diff",
@@ -1421,6 +1426,91 @@ fn forge_create_sub_tasks_rejects_malformed_subtasks() {
             .as_str()
             .expect("details string")
             .contains("title"));
+    });
+}
+
+#[test]
+fn direct_task_dependency_mcp_uses_project_graph_version_and_idempotency() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        let successor = seed_task_in_project(&state, project_id.clone()).await;
+        let prerequisite = seed_task_in_project(&state, project_id.clone()).await;
+        let context = user_mcp_context("test-user");
+        let initial = services::project_plan::ProjectPlanService::new(
+            Arc::clone(&state.db),
+            Arc::clone(&state.event_bus),
+        )
+        .graph(&project_id)
+        .await
+        .expect("initial graph loads");
+
+        let add_arguments = json!({
+            "task_id":successor.id,
+            "depends_on_id":prerequisite.id,
+            "expected_graph_version":initial.version,
+            "idempotency_key":"mcp-task-dependency-add"
+        });
+        let added = call_tool_as(
+            &state,
+            &context,
+            "forge_add_task_dependency",
+            add_arguments.clone(),
+        )
+        .await;
+        assert_eq!(added["task_id"], successor.id);
+        let replay =
+            call_tool_as(&state, &context, "forge_add_task_dependency", add_arguments).await;
+        assert_eq!(replay, added);
+
+        let changed = services::project_plan::ProjectPlanService::new(
+            Arc::clone(&state.db),
+            Arc::clone(&state.event_bus),
+        )
+        .graph(&project_id)
+        .await
+        .expect("graph after dependency mutation loads");
+        assert!(changed.version > initial.version);
+        assert_eq!(changed.edges.len(), 1);
+
+        let stale = call_tool_error_as(
+            &state,
+            &context,
+            "forge_remove_task_dependency",
+            json!({
+                "task_id":successor.id,
+                "depends_on_id":prerequisite.id,
+                "expected_graph_version":initial.version,
+                "idempotency_key":"mcp-stale-dependency-remove"
+            }),
+        )
+        .await;
+        assert_eq!(
+            stale.code, -32009,
+            "stale graph version is a typed conflict"
+        );
+
+        let removed = call_tool_as(
+            &state,
+            &context,
+            "forge_remove_task_dependency",
+            json!({
+                "task_id":successor.id,
+                "depends_on_id":prerequisite.id,
+                "expected_graph_version":changed.version,
+                "idempotency_key":"mcp-task-dependency-remove"
+            }),
+        )
+        .await;
+        assert_eq!(removed["task_id"], successor.id);
+        let final_graph = services::project_plan::ProjectPlanService::new(
+            Arc::clone(&state.db),
+            Arc::clone(&state.event_bus),
+        )
+        .graph(&project_id)
+        .await
+        .expect("graph after dependency removal loads");
+        assert!(final_graph.edges.is_empty());
     });
 }
 
@@ -2773,6 +2863,11 @@ fn mcp_project_copilot_lists_only_delegated_management_tools() {
         assert!(names.contains(&"forge_list_tasks"));
         for name in [
             "forge_get_task",
+            "forge_get_project_plan",
+            "forge_propose_project_plan",
+            "forge_apply_project_plan",
+            "forge_list_project_repo_tree",
+            "forge_read_project_repo_file",
             "forge_list_task_roles",
             "forge_list_work_units",
             "forge_get_work_unit",
@@ -2787,6 +2882,8 @@ fn mcp_project_copilot_lists_only_delegated_management_tools() {
         }
         for name in [
             "forge_get_task_dispatch",
+            "forge_authorize_project_plan_batch",
+            "forge_create_task",
             "forge_launch_task",
             "forge_pause_task",
             "forge_resume_task",
@@ -2819,6 +2916,11 @@ fn mcp_project_copilot_lists_only_delegated_management_tools() {
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
         assert!(!names.contains(&"forge_list_tasks"));
+        assert!(!names.contains(&"forge_get_project_plan"));
+        assert!(!names.contains(&"forge_propose_project_plan"));
+        assert!(!names.contains(&"forge_apply_project_plan"));
+        assert!(!names.contains(&"forge_list_project_repo_tree"));
+        assert!(!names.contains(&"forge_read_project_repo_file"));
 
         let error = dispatch_with_context(
             &state,
@@ -2858,6 +2960,15 @@ fn mcp_project_copilot_lists_only_delegated_management_tools() {
 
         for (name, arguments) in [
             ("forge_launch_task", json!({"task_id":"task-1"})),
+            ("forge_get_project_plan", json!({"project_id":"project-1"})),
+            (
+                "forge_propose_project_plan",
+                json!({"project_id":"project-1"}),
+            ),
+            (
+                "forge_apply_project_plan",
+                json!({"project_id":"project-1"}),
+            ),
             ("forge_list_agents", json!({"limit":10})),
             (
                 "forge_list_agent_profiles",

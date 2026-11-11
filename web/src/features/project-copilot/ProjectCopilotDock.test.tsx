@@ -574,6 +574,35 @@ describe('ProjectCopilotDock', () => {
     expect(sentBodies[0]?.body).toMatchObject({ task_id: 'task-a' })
   })
 
+  it('clears Task context when a pinned Copilot draft moves from a Task to its Project plan', async () => {
+    const view = renderDock({ taskId: 'task-b' })
+    await waitFor(() => {
+      expect(
+        (screen.getByRole('button', { name: 'Open Project Copilot' }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false)
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Open Project Copilot' }))
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Keep Copilot open while you navigate' }),
+    )
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Message to Project Copilot' }), {
+      target: { value: 'Propose the project dependency plan.' },
+    })
+
+    view.rerender(<ProjectCopilotDock projectId="project-b" />)
+
+    expect(await screen.findByText('Draft context: this Project only')).toBeTruthy()
+    expect(sentBodies).toHaveLength(0)
+    expect(screen.getByRole('textbox', { name: 'Message to Project Copilot' })).toHaveProperty(
+      'value',
+      'Propose the project dependency plan.',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() => expect(sentBodies).toHaveLength(1))
+    expect(sentBodies[0]?.body).toMatchObject({ task_id: null })
+  })
+
   it('organizes a Task with a scoped request that stops before worker execution', async () => {
     renderDock({ taskId: 'task-b' })
     await waitFor(() => {

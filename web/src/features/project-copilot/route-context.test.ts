@@ -18,6 +18,12 @@ describe('Project Copilot route scope', () => {
         taskId: 'task-a',
       }),
     ).toEqual({ projectId: 'project-b' })
+    expect(
+      projectCopilotRouteScope('/projects/project-b/plan', {
+        projectId: 'project-b',
+        taskId: 'task-a',
+      }),
+    ).toEqual({ projectId: 'project-b' })
   })
 
   it('does not expose the Project Copilot outside Project and Task routes', () => {

@@ -123,6 +123,9 @@ pub enum PublicEventType {
     #[serde(rename = "project.resumed")]
     #[ts(rename = "project.resumed")]
     ProjectResumed,
+    #[serde(rename = "project.plan_changed")]
+    #[ts(rename = "project.plan_changed")]
+    ProjectPlanChanged,
     #[serde(rename = "project_hook.run_changed")]
     #[ts(rename = "project_hook.run_changed")]
     ProjectHookRunChanged,
@@ -179,6 +182,7 @@ impl PublicEventType {
             Self::ProjectDeleted => "project.deleted",
             Self::ProjectPaused => "project.paused",
             Self::ProjectResumed => "project.resumed",
+            Self::ProjectPlanChanged => "project.plan_changed",
             Self::ProjectHookRunChanged => "project_hook.run_changed",
             Self::NotificationCreated => "notification.created",
             Self::OperationsStatusChanged => "operations.status_changed",

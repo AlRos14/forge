@@ -6,8 +6,9 @@ use std::{
 use api_types::{ActorRef as ApiActorRef, TaskRoleCapability, TaskRoleConfiguration};
 use db::{
     new_uuid_v4, now_rfc3339, ActorRef, AgentRepo, ArtifactKind, CollaborationRepo,
-    CreateDomainEvent, RoleMembershipRepo, RoleMembershipStatus, SqliteDb, Task, TaskCoordination,
-    TaskCoordinationMaterialization, TaskCoordinationMode, TaskCoordinationPlan,
+    CreateDomainEvent, ProjectPlanBatchAuthorizationBinding, ProjectPlanBatchRequestBinding,
+    ProjectPlanBatchRequestOrigin, RoleMembershipRepo, RoleMembershipStatus, SqliteDb, Task,
+    TaskCoordination, TaskCoordinationMaterialization, TaskCoordinationMode, TaskCoordinationPlan,
     TaskCoordinationPlanState, TaskCoordinationRepo, TaskCoordinationRequest,
     TaskCoordinationRequestState, TaskCoordinationWrite, TaskIntervention, TaskInterventionKind,
     TaskInterventionState, TaskLifecycleRepo, TaskLifecycleState, TaskQualityCategory,
@@ -24,6 +25,7 @@ use crate::{
         CreateMessageInput, CreateProposalInput,
     },
     domain_event_service::DomainEventService,
+    project_plan::ProjectPlanService,
     task_lifecycle::TaskLifecycleService,
     Result, ServiceError,
 };
@@ -297,6 +299,7 @@ pub struct Overview {
     pub blockers: Vec<CoordinationBlocker>,
     pub can_authorize: bool,
     pub can_request: bool,
+    pub project_plan_batch_scope: Option<api_types::TaskCoordinationProjectBatchScopeResponse>,
     pub latest_request: Option<(TaskCoordinationRequest, CoordinationBrief)>,
     pub latest_plan: Option<PlanView>,
 }
@@ -409,6 +412,38 @@ impl TaskCoordinationService {
             .authorize_source(task_id, &source)
             .await?;
         let coordination = self.require_coordination(&task.id).await?;
+        let batch_scope_rows = sqlx::query(
+            "SELECT b.id AS batch_id,b.state AS batch_state,bt.state AS task_state,bt.blocker
+             FROM project_plan_batch_coordination_authorization a
+             JOIN project_plan_batch b
+               ON b.id=a.batch_id AND b.project_id=a.project_id
+             JOIN project_plan_batch_task bt
+               ON bt.batch_id=a.batch_id AND bt.task_id=a.task_id
+             WHERE a.project_id=? AND a.task_id=? AND a.authorization_version=?
+             ORDER BY b.id",
+        )
+        .bind(&task.project_id)
+        .bind(&task.id)
+        .bind(coordination.authorization_version)
+        .fetch_all(self.db.pool())
+        .await?;
+        if batch_scope_rows.len() > 1 {
+            return Err(ServiceError::Conflict(
+                "Task coordination authorization has multiple Project batch origins".into(),
+            ));
+        }
+        let project_plan_batch_scope = batch_scope_rows
+            .into_iter()
+            .next()
+            .map(|row| -> std::result::Result<_, sqlx::Error> {
+                Ok(api_types::TaskCoordinationProjectBatchScopeResponse {
+                    batch_id: row.try_get("batch_id")?,
+                    batch_state: row.try_get("batch_state")?,
+                    task_state: row.try_get("task_state")?,
+                    blocker: row.try_get("blocker")?,
+                })
+            })
+            .transpose()?;
         let envelope = self.envelope(&coordination)?;
         let team = self.current_team(&task.id).await?;
         let team_digest = self.team_digest(&team)?;
@@ -480,6 +515,7 @@ impl TaskCoordinationService {
                 )
             })
             && coordination.turn_count < coordination.max_turns;
+        let can_request = can_request && project_plan_batch_scope.is_none();
         Ok(Overview {
             task,
             coordination,
@@ -489,6 +525,7 @@ impl TaskCoordinationService {
             blockers,
             can_authorize: mutable,
             can_request,
+            project_plan_batch_scope,
             latest_request,
             latest_plan,
         })
@@ -500,6 +537,62 @@ impl TaskCoordinationService {
         user_id: &str,
         input: AuthorizationInput,
     ) -> Result<Overview> {
+        self.authorize_inner(task_id, user_id, input, None, None)
+            .await
+    }
+
+    pub async fn authorize_with_expected_team_generation(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        input: AuthorizationInput,
+        expected_team_generation: i64,
+    ) -> Result<Overview> {
+        self.authorize_inner(
+            task_id,
+            user_id,
+            input,
+            Some(expected_team_generation),
+            None,
+        )
+        .await
+    }
+
+    /// Mints a TaskCoordination authorization that is durably scoped to one
+    /// current Project batch. The exact grant receipt is written in the same
+    /// database transaction as the authorization version change.
+    pub async fn authorize_for_project_plan_batch(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        input: AuthorizationInput,
+        binding: ProjectPlanBatchAuthorizationBinding,
+    ) -> Result<Overview> {
+        if binding.authorized_by != user_id {
+            return Err(ServiceError::AuthorizationDenied {
+                message: "Project batch authorization must be issued by its current human approver"
+                    .into(),
+            });
+        }
+        self.authorize_inner(
+            task_id,
+            user_id,
+            input,
+            Some(binding.expected_team_generation),
+            Some(binding),
+        )
+        .await
+    }
+
+    async fn authorize_inner(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        input: AuthorizationInput,
+        expected_team_generation: Option<i64>,
+        batch_binding: Option<ProjectPlanBatchAuthorizationBinding>,
+    ) -> Result<Overview> {
+        let unconfigured_default_refresh = batch_binding.is_some() && input.envelope.is_none();
         let source = CollaborationActorSource::Human(user_id.to_owned());
         let (task, _) = self
             .collaboration
@@ -525,6 +618,11 @@ impl TaskCoordinationService {
             ));
         }
         let coordination_before = self.require_coordination(&task.id).await?;
+        if expected_team_generation
+            .is_some_and(|expected| coordination_before.team_generation != expected)
+        {
+            return Err(db::DbError::VersionConflict.into());
+        }
         let team = self.current_team(&task.id).await?;
         if input.envelope.is_none() {
             envelope.allowed_review_roles = team
@@ -580,7 +678,15 @@ impl TaskCoordinationService {
                 "coordinator_actor": coordinator,
                 "team_digest": team_digest,
                 "envelope_digest": envelope_digest,
+                "unconfigured_default_refresh": unconfigured_default_refresh,
                 "requested_by": user_id,
+                "batch_scope": batch_binding.as_ref().map(|binding| (
+                    binding.project_id.as_str(),
+                    binding.batch_id.as_str(),
+                    binding.expected_batch_version,
+                    binding.expected_graph_version,
+                    binding.expected_team_generation,
+                )),
             }))?
             .as_bytes(),
         );
@@ -606,29 +712,41 @@ impl TaskCoordinationService {
             task.id,
             input.expected_coordination_version + 1
         ));
-        let write = TaskCoordinationRepo::authorize_task_coordination(
-            &*self.db,
-            db::AuthorizeTaskCoordinationInput {
-                task_id: task.id.clone(),
-                expected_coordination_version: input.expected_coordination_version,
-                expected_team_generation: coordination_before.team_generation,
-                mode: input.mode,
-                coordinator_task_role_id: input.coordinator_task_role_id,
-                coordinator_actor: coordinator,
-                team_snapshot_json,
-                team_digest,
-                envelope_json,
-                envelope_digest,
-                requested_by: user_id.to_owned(),
-                idempotency_key: input.idempotency_key,
-                request_digest,
-                receipt_id: new_uuid_v4(),
-                created_at: now,
-                event,
-            },
-            input.expected_task_version,
-        )
-        .await?;
+        let write_input = db::AuthorizeTaskCoordinationInput {
+            task_id: task.id.clone(),
+            expected_coordination_version: input.expected_coordination_version,
+            expected_team_generation: coordination_before.team_generation,
+            mode: input.mode,
+            coordinator_task_role_id: input.coordinator_task_role_id,
+            coordinator_actor: coordinator,
+            team_snapshot_json,
+            team_digest,
+            envelope_json,
+            envelope_digest,
+            unconfigured_default_refresh,
+            requested_by: user_id.to_owned(),
+            idempotency_key: input.idempotency_key,
+            request_digest,
+            receipt_id: new_uuid_v4(),
+            created_at: now,
+            event,
+        };
+        let write = if let Some(binding) = batch_binding {
+            TaskCoordinationRepo::authorize_project_plan_batch_task_coordination(
+                &*self.db,
+                write_input,
+                input.expected_task_version,
+                binding,
+            )
+            .await?
+        } else {
+            TaskCoordinationRepo::authorize_task_coordination(
+                &*self.db,
+                write_input,
+                input.expected_task_version,
+            )
+            .await?
+        };
         if let Some(event) = write.event.as_ref() {
             self.domain_events.publish_committed(event);
         }
@@ -705,6 +823,31 @@ impl TaskCoordinationService {
         user_id: &str,
         input: TurnRequestInput,
     ) -> Result<(TaskCoordinationRequest, bool)> {
+        self.request_turn_inner(task_id, user_id, input, None).await
+    }
+
+    /// Requests a continuation that is attached to one exact active Project
+    /// batch origin. The repository atomically validates the origin, charges
+    /// the turn budget, creates the request, links it to the batch Task, and
+    /// appends the event.
+    pub async fn request_project_batch_turn(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        input: TurnRequestInput,
+        binding: ProjectPlanBatchRequestBinding,
+    ) -> Result<(TaskCoordinationRequest, bool)> {
+        self.request_turn_inner(task_id, user_id, input, Some(binding))
+            .await
+    }
+
+    async fn request_turn_inner(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        input: TurnRequestInput,
+        batch_binding: Option<ProjectPlanBatchRequestBinding>,
+    ) -> Result<(TaskCoordinationRequest, bool)> {
         input.brief.validate()?;
         if input.idempotency_key.trim().is_empty() || input.idempotency_key.len() > 256 {
             return Err(invalid_plan("idempotency key must contain 1 to 256 bytes"));
@@ -754,7 +897,18 @@ impl TaskCoordinationService {
                     "idempotency key already identifies a different coordination request",
                 ));
             }
-            return Ok((request, false));
+            if batch_binding.is_none()
+                && TaskCoordinationRepo::is_project_plan_batch_coordination_request(
+                    &*self.db,
+                    &request.id,
+                )
+                .await?
+            {
+                return Err(db::DbError::ProjectPlanBatchInactive.into());
+            }
+            if batch_binding.is_none() {
+                return Ok((request, false));
+            }
         }
         let team = self.current_team(&task.id).await?;
         if coordination.team_stale || self.team_digest(&team)? != coordination.team_digest {
@@ -799,11 +953,13 @@ impl TaskCoordinationService {
                 "Task dispatch is cancelled",
             ));
         }
-        if !TaskCoordinationRepo::consume_coordination_turn_budget(&*self.db, &task.id).await? {
-            return Err(coordination_error(
-                "coordination.budget_exhausted",
-                "the Task coordination turn budget is exhausted",
-            ));
+        if let Some(binding) = batch_binding.as_ref() {
+            if binding.authorized_by != user_id
+                || binding.expected_task_version != input.expected_task_version
+                || binding.expected_coordination_version != input.expected_coordination_version
+            {
+                return Err(db::DbError::ProjectPlanBatchInactive.into());
+            }
         }
         let brief_json = canonical_json(&input.brief)?;
         let objective_digest = sha256_hex(brief_json.as_bytes());
@@ -826,28 +982,249 @@ impl TaskCoordinationService {
             }),
             &now,
         );
-        let (request, committed) = TaskCoordinationRepo::create_task_coordination_request(
-            &*self.db,
-            db::CreateTaskCoordinationRequestInput {
-                id: request_id,
-                task_id: task.id.clone(),
-                authorization_version: coordination.authorization_version,
-                mode: coordination.mode,
-                brief_json,
-                objective_digest,
-                request_digest,
-                idempotency_key: input.idempotency_key,
-                created_at: now,
-                event,
-            },
-        )
-        .await?;
-        if committed.is_none() {
-            TaskCoordinationRepo::refund_coordination_turn_budget(&*self.db, &task.id).await?;
-        } else if let Some(event) = committed.as_ref() {
+        let create_input = db::CreateTaskCoordinationRequestInput {
+            id: request_id,
+            task_id: task.id.clone(),
+            requested_by: user_id.to_owned(),
+            expected_task_version: input.expected_task_version,
+            authorization_version: coordination.authorization_version,
+            mode: coordination.mode,
+            brief_json,
+            objective_digest,
+            request_digest,
+            idempotency_key: input.idempotency_key,
+            created_at: now,
+            event,
+        };
+        let write = if let Some(binding) = batch_binding {
+            TaskCoordinationRepo::create_project_plan_batch_coordination_request(
+                &*self.db,
+                create_input,
+                binding,
+            )
+            .await
+        } else {
+            TaskCoordinationRepo::create_task_coordination_request(&*self.db, create_input).await
+        };
+        let (request, committed) = match write {
+            Ok(write) => write,
+            Err(db::DbError::CoordinationTurnBudgetExhausted) => {
+                return Err(coordination_error(
+                    "coordination.budget_exhausted",
+                    "the Task coordination turn budget is exhausted",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(event) = committed.as_ref() {
             self.domain_events.publish_committed(event);
         }
         Ok((request, committed.is_some()))
+    }
+
+    /// Resolves the exact producer Execution for a quality source Artifact into
+    /// the still-active Project batch scope that admitted it. No latest
+    /// Execution or Task-only inference is used.
+    pub async fn project_batch_binding_for_quality_source(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        source_artifact_id: &str,
+        expected_task_version: i64,
+        expected_coordination_version: i64,
+    ) -> Result<Option<ProjectPlanBatchRequestBinding>> {
+        let rows: Vec<(String, String, String, i64, i64, String, String)> = sqlx::query_as(
+            "SELECT b.id,b.project_id,b.authorized_by,b.version,b.graph_version,
+                    bt.coordination_snapshot_digest,producer.execution_id
+             FROM artifact_execution_producer producer
+             JOIN project_plan_batch_execution exec_link
+               ON exec_link.execution_id=producer.execution_id
+              AND exec_link.task_id=producer.task_id
+              AND exec_link.authorization_version=?
+             JOIN project_plan_batch b ON b.id=exec_link.batch_id
+             JOIN project_plan p ON p.project_id=b.project_id
+             JOIN project_plan_batch_task bt
+               ON bt.batch_id=b.id AND bt.task_id=producer.task_id
+             JOIN task t ON t.id=producer.task_id AND t.project_id=b.project_id
+              AND t.version=? AND t.deleted_at IS NULL
+             JOIN task_coordination c ON c.task_id=t.id
+             JOIN project_plan_batch_coordination_authorization a
+               ON a.batch_id=b.id AND a.task_id=t.id
+              AND a.authorization_version=c.authorization_version
+             JOIN project_member m ON m.project_id=b.project_id
+              AND m.user_id=b.authorized_by AND m.role IN ('owner','admin')
+             JOIN project owner_project ON owner_project.id=b.project_id
+             JOIN project_member owner_membership ON owner_membership.project_id=b.project_id
+              AND owner_membership.user_id=owner_project.owner_id AND owner_membership.role='owner'
+             WHERE producer.artifact_id=? AND producer.task_id=?
+              AND b.state='running' AND b.preparation_complete=1
+              AND b.graph_version=p.version AND bt.state='started'
+              AND b.authorized_by=? AND c.requested_by=b.authorized_by
+              AND c.authorization_version=? AND c.mode='prepare_and_execute'
+              AND c.revoked_at IS NULL AND c.team_stale=0
+              AND bt.coordination_snapshot_json IS NOT NULL
+              AND bt.coordination_snapshot_digest IS NOT NULL
+              AND c.authorization_version=json_extract(bt.coordination_snapshot_json,'$.authorization_version')
+              AND c.team_generation=json_extract(bt.coordination_snapshot_json,'$.team_generation')
+              AND c.team_digest=json_extract(bt.coordination_snapshot_json,'$.team_digest')
+              AND c.envelope_digest=json_extract(bt.coordination_snapshot_json,'$.envelope_digest')
+              AND c.coordinator_task_role_id=json_extract(bt.coordination_snapshot_json,'$.role_id')
+              AND c.coordinator_actor_kind=json_extract(bt.coordination_snapshot_json,'$.actor_kind')
+              AND c.coordinator_actor_id=json_extract(bt.coordination_snapshot_json,'$.actor_id')
+              AND a.project_id=b.project_id AND a.authorized_by=b.authorized_by
+              AND a.expected_graph_version=b.graph_version
+              AND a.task_title=t.title AND a.task_description IS t.description
+              AND a.task_repo_id IS t.repo_id AND a.task_parent_task_id IS t.parent_task_id
+              AND EXISTS(SELECT 1 FROM project_plan_batch_coordination_request scope
+                         WHERE scope.batch_id=b.id AND scope.task_id=t.id
+                          AND scope.authorization_version=c.authorization_version)
+              AND EXISTS(SELECT 1 FROM task_lifecycle l WHERE l.task_id=t.id
+                         AND l.state NOT IN ('done','cancelled','merging'))
+              AND NOT EXISTS(SELECT 1 FROM task_dispatch d
+                             WHERE d.task_id=t.id AND d.state='cancelled')",
+        )
+        .bind(expected_coordination_version)
+        .bind(expected_task_version)
+        .bind(source_artifact_id)
+        .bind(task_id)
+        .bind(user_id)
+        .bind(expected_coordination_version)
+        .fetch_all(self.db.pool())
+        .await?;
+        if rows.len() > 1 {
+            return Err(db::DbError::ProjectPlanBatchInactive.into());
+        }
+        Ok(rows.into_iter().next().map(
+            |(
+                batch_id,
+                project_id,
+                authorized_by,
+                batch_version,
+                graph_version,
+                snapshot_digest,
+                producer_execution_id,
+            )| {
+                ProjectPlanBatchRequestBinding {
+                    project_id,
+                    batch_id,
+                    authorized_by,
+                    expected_batch_version: batch_version,
+                    expected_graph_version: graph_version,
+                    expected_task_version,
+                    expected_coordination_version,
+                    coordination_snapshot_digest: snapshot_digest,
+                    origin: ProjectPlanBatchRequestOrigin::QualityReplan {
+                        source_artifact_id: source_artifact_id.to_owned(),
+                        producer_execution_id,
+                    },
+                }
+            },
+        ))
+    }
+
+    /// Resolves a Human-requested plan revision only from an exact approved
+    /// plan Artifact, pending materialization or materialized with its durable
+    /// receipt, whose originating request belongs to this running batch.
+    pub async fn project_batch_binding_for_approved_plan(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        approved_plan_artifact_id: &str,
+        expected_task_version: i64,
+        expected_coordination_version: i64,
+    ) -> Result<Option<ProjectPlanBatchRequestBinding>> {
+        let rows: Vec<(String, String, String, i64, i64, String)> = sqlx::query_as(
+            "SELECT b.id,b.project_id,b.authorized_by,b.version,b.graph_version,
+                    bt.coordination_snapshot_digest
+             FROM task_coordination_plan plan
+             JOIN project_plan_batch_coordination_request origin
+               ON origin.request_id=plan.request_id AND origin.task_id=plan.task_id
+             JOIN artifact plan_artifact
+               ON plan_artifact.id=plan.artifact_id AND plan_artifact.task_id=plan.task_id
+                AND plan_artifact.digest=plan.plan_digest
+             JOIN project_plan_batch b ON b.id=origin.batch_id
+             JOIN project_plan p ON p.project_id=b.project_id
+             JOIN project_plan_batch_task bt ON bt.batch_id=b.id AND bt.task_id=plan.task_id
+             JOIN task t ON t.id=plan.task_id AND t.project_id=b.project_id
+              AND t.version=? AND t.deleted_at IS NULL
+             JOIN task_coordination c ON c.task_id=t.id
+             JOIN project_plan_batch_coordination_authorization a
+               ON a.batch_id=b.id AND a.task_id=t.id
+              AND a.authorization_version=c.authorization_version
+             JOIN project_member m ON m.project_id=b.project_id
+              AND m.user_id=b.authorized_by AND m.role IN ('owner','admin')
+             JOIN project owner_project ON owner_project.id=b.project_id
+             JOIN project_member owner_membership ON owner_membership.project_id=b.project_id
+              AND owner_membership.user_id=owner_project.owner_id AND owner_membership.role='owner'
+             WHERE plan.artifact_id=? AND plan.task_id=?
+              AND plan.authorization_version=c.authorization_version
+              AND ((plan.state='approved' AND NOT EXISTS(
+                    SELECT 1 FROM task_coordination_materialization receipt
+                    WHERE receipt.plan_artifact_id=plan.artifact_id))
+                OR (plan.state='materialized' AND EXISTS(
+                    SELECT 1 FROM task_coordination_materialization receipt
+                    WHERE receipt.plan_artifact_id=plan.artifact_id
+                      AND receipt.task_id=plan.task_id
+                      AND receipt.request_id=plan.request_id
+                      AND receipt.plan_digest=plan.plan_digest
+                      AND receipt.authorization_version=plan.authorization_version)))
+              AND b.authorized_by=? AND b.state='running' AND b.preparation_complete=1
+              AND b.graph_version=p.version AND bt.state='started'
+              AND origin.authorization_version=c.authorization_version
+              AND c.requested_by=b.authorized_by AND c.authorization_version=?
+              AND c.mode='prepare_and_execute' AND c.revoked_at IS NULL AND c.team_stale=0
+              AND bt.coordination_snapshot_json IS NOT NULL
+              AND bt.coordination_snapshot_digest IS NOT NULL
+              AND c.authorization_version=json_extract(bt.coordination_snapshot_json,'$.authorization_version')
+              AND c.team_generation=json_extract(bt.coordination_snapshot_json,'$.team_generation')
+              AND c.team_digest=json_extract(bt.coordination_snapshot_json,'$.team_digest')
+              AND c.envelope_digest=json_extract(bt.coordination_snapshot_json,'$.envelope_digest')
+              AND c.coordinator_task_role_id=json_extract(bt.coordination_snapshot_json,'$.role_id')
+              AND c.coordinator_actor_kind=json_extract(bt.coordination_snapshot_json,'$.actor_kind')
+              AND c.coordinator_actor_id=json_extract(bt.coordination_snapshot_json,'$.actor_id')
+              AND a.project_id=b.project_id AND a.authorized_by=b.authorized_by
+              AND a.expected_graph_version=b.graph_version
+              AND a.task_title=t.title AND a.task_description IS t.description
+              AND a.task_repo_id IS t.repo_id AND a.task_parent_task_id IS t.parent_task_id
+              AND EXISTS(SELECT 1 FROM task_lifecycle l WHERE l.task_id=t.id
+                         AND l.state NOT IN ('done','cancelled','merging'))
+              AND NOT EXISTS(SELECT 1 FROM task_dispatch d
+                             WHERE d.task_id=t.id AND d.state='cancelled')",
+        )
+        .bind(expected_task_version)
+        .bind(approved_plan_artifact_id)
+        .bind(task_id)
+        .bind(user_id)
+        .bind(expected_coordination_version)
+        .fetch_all(self.db.pool())
+        .await?;
+        if rows.len() > 1 {
+            return Err(db::DbError::ProjectPlanBatchInactive.into());
+        }
+        Ok(rows.into_iter().next().map(
+            |(
+                batch_id,
+                project_id,
+                authorized_by,
+                batch_version,
+                graph_version,
+                snapshot_digest,
+            )| {
+                ProjectPlanBatchRequestBinding {
+                    project_id,
+                    batch_id,
+                    authorized_by,
+                    expected_batch_version: batch_version,
+                    expected_graph_version: graph_version,
+                    expected_task_version,
+                    expected_coordination_version,
+                    coordination_snapshot_digest: snapshot_digest,
+                    origin: ProjectPlanBatchRequestOrigin::HumanReplan {
+                        approved_plan_artifact_id: approved_plan_artifact_id.to_owned(),
+                    },
+                }
+            },
+        ))
     }
 
     pub async fn get_request(
@@ -2824,18 +3201,46 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                         "request_replan coordination version is inconsistent",
                     ));
                 }
-                if resuming
-                    && TaskCoordinationRepo::get_task_coordination_request_by_key(
-                        &*self.db,
-                        &task.id,
-                        &brief.idempotency_key,
-                    )
-                    .await?
-                    .is_some()
-                {
-                    return Ok(());
+                let batch_binding =
+                    if let Some(approved_plan_artifact_id) = input.plan_artifact_id.as_deref() {
+                        ProjectPlanService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+                            .project_batch_binding_for_approved_plan(
+                                &task.id,
+                                user_id,
+                                approved_plan_artifact_id,
+                                brief.expected_task_version,
+                                brief.expected_coordination_version,
+                            )
+                            .await?
+                    } else {
+                        None
+                    };
+                if resuming {
+                    if let Some(existing) =
+                        TaskCoordinationRepo::get_task_coordination_request_by_key(
+                            &*self.db,
+                            &task.id,
+                            &brief.idempotency_key,
+                        )
+                        .await?
+                    {
+                        let batch_bound =
+                            TaskCoordinationRepo::is_project_plan_batch_coordination_request(
+                                &*self.db,
+                                &existing.id,
+                            )
+                            .await?;
+                        if !batch_bound && batch_binding.is_none() {
+                            return Ok(());
+                        }
+                    }
                 }
-                self.request_turn(&task.id, user_id, brief).await?;
+                if let Some(binding) = batch_binding {
+                    self.request_project_batch_turn(&task.id, user_id, brief, binding)
+                        .await?;
+                } else {
+                    self.request_turn(&task.id, user_id, brief).await?;
+                }
                 Ok(())
             }
         }

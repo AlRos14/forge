@@ -137,6 +137,26 @@ pub fn api_router(state: AppState) -> Router {
                 .put(routes::projects::update_task_role_defaults),
         )
         .route(
+            "/api/v1/projects/{id}/plan",
+            get(routes::project_plan::graph),
+        )
+        .route(
+            "/api/v1/projects/{id}/plan/proposals",
+            post(routes::project_plan::propose),
+        )
+        .route(
+            "/api/v1/projects/{id}/plan/proposals/{proposal_id}/apply",
+            post(routes::project_plan::apply),
+        )
+        .route(
+            "/api/v1/projects/{id}/plan/batches",
+            post(routes::project_plan::authorize_batch),
+        )
+        .route(
+            "/api/v1/projects/{id}/plan/batches/{batch_id}",
+            post(routes::project_plan::update_batch),
+        )
+        .route(
             "/api/v1/projects/{id}/copilot",
             get(routes::project_copilot::get).put(routes::project_copilot::update),
         )

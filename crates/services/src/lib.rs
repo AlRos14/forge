@@ -33,6 +33,7 @@ pub mod project_copilot;
 pub mod project_deletion;
 pub mod project_hooks;
 pub mod project_member_service;
+pub mod project_plan;
 pub mod provider_authorization;
 pub mod recovery;
 pub mod release_history;

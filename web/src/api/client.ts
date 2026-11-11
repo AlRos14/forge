@@ -157,17 +157,38 @@ export function listDependents(taskId: string): Promise<TaskDependency[]> {
   return apiFetch<TaskDependency[]>(`/tasks/${taskId}/dependents`)
 }
 
-export function addDependency(taskId: string, dependsOnId: string): Promise<void> {
-  return apiFetch<void>(`/tasks/${taskId}/dependencies`, {
+export function addDependency(
+  taskId: string,
+  dependsOnId: string,
+  expectedGraphVersion: number,
+  idempotencyKey: string,
+): Promise<void> {
+  return apiFetch<void>(`/tasks/${encodeURIComponent(taskId)}/dependencies`, {
     method: 'POST',
-    body: JSON.stringify({ depends_on_id: dependsOnId }),
+    body: JSON.stringify({
+      depends_on_id: dependsOnId,
+      expected_graph_version: expectedGraphVersion,
+      idempotency_key: idempotencyKey,
+    }),
   })
 }
 
-export function removeDependency(taskId: string, dependsOnId: string): Promise<void> {
-  return apiFetch<void>(`/tasks/${taskId}/dependencies/${dependsOnId}`, {
-    method: 'DELETE',
-  })
+export function removeDependency(
+  taskId: string,
+  dependsOnId: string,
+  expectedGraphVersion: number,
+  idempotencyKey: string,
+): Promise<void> {
+  return apiFetch<void>(
+    `/tasks/${encodeURIComponent(taskId)}/dependencies/${encodeURIComponent(dependsOnId)}`,
+    {
+      method: 'DELETE',
+      body: JSON.stringify({
+        expected_graph_version: expectedGraphVersion,
+        idempotency_key: idempotencyKey,
+      }),
+    },
+  )
 }
 
 export function listNotifications(params?: {

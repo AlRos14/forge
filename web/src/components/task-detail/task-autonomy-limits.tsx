@@ -45,11 +45,16 @@ export function TaskAutonomyLimitsPanel({
     },
     onSuccess: async (result) => {
       client.setQueryData(['task-autonomy-limits', taskId], result)
-      await client.invalidateQueries({ queryKey: qk.taskCoordination(taskId) })
+      await Promise.all([
+        client.invalidateQueries({ queryKey: qk.taskCoordination(taskId) }),
+        client.invalidateQueries({ queryKey: qk.taskQualityRequests(taskId) }),
+      ])
       toast.success('Autonomy limits saved. Consumed rounds are preserved.')
     },
-    onError: (error) =>
-      toast.error(getApiErrorMessage(error, 'Autonomy limits could not be saved')),
+    onError: async (error) => {
+      await client.invalidateQueries({ queryKey: ['task-autonomy-limits', taskId] })
+      toast.error(getApiErrorMessage(error, 'Autonomy limits could not be saved'))
+    },
   })
   if (query.isLoading)
     return <p className="text-sm text-muted-foreground">Loading autonomy limits…</p>
@@ -63,8 +68,14 @@ export function TaskAutonomyLimitsPanel({
     <details className="rounded-lg border p-4">
       <summary className="cursor-pointer font-medium">Autonomy limits and extra rounds</summary>
       <p className="my-3 text-sm text-muted-foreground">
-        A Project owner or administrator can adjust these limits. Additional rounds preserve the
-        work history and existing permissions.
+        A Project owner or administrator can adjust these separate limits. Increasing quality or
+        route limits can re-admit requests blocked only by those budgets; increasing rework rounds
+        can resume matching blocked rework intents. Increasing coordinator turns does not change
+        those other limits. When the exact blocker is preparation-turn exhaustion, a higher limit
+        lets the scheduler retry this Task in its running Project batch on the next tick. The
+        scheduler rechecks batch state, Task team, authority, and prerequisites; paused, revoked, or
+        completed batches and other blockers remain. This preserves the work history and does not
+        add permissions.
       </p>
       <div className="grid gap-3 sm:grid-cols-2">
         {fields.map(([key, label]) => (
@@ -107,18 +118,10 @@ export function TaskAutonomyLimitsPanel({
         <Button
           type="button"
           variant="outline"
-          disabled={!canManage || update.isPending || fields.some(([key]) => limits[key] > 992)}
-          onClick={() =>
-            update.mutate({
-              ...limits,
-              max_turns: limits.max_turns + 8,
-              max_rework_rounds: limits.max_rework_rounds + 8,
-              max_quality_requests: limits.max_quality_requests + 8,
-              max_route_requests: limits.max_route_requests + 8,
-            })
-          }
+          disabled={!canManage || update.isPending || limits.max_turns > 992}
+          onClick={() => update.mutate({ ...query.data!, max_turns: query.data!.max_turns + 8 })}
         >
-          Authorize 8 extra rounds
+          Authorize 8 extra coordinator turns
         </Button>
       </div>
     </details>

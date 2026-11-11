@@ -318,28 +318,51 @@ impl TaskQualityService {
                     .map(|task| task.version)
                     .unwrap_or_default();
                 let brief = revision_brief(request);
-                let turn = match self
-                    .coordination
-                    .request_turn(
-                        &request.task_id,
-                        authorizer,
-                        TurnRequestInput {
-                            expected_task_version: task_version,
-                            expected_coordination_version: coordination.authorization_version,
-                            brief,
-                            idempotency_key: format!("task-quality:{}", request.id),
-                        },
-                    )
-                    .await
-                {
+                let input = TurnRequestInput {
+                    expected_task_version: task_version,
+                    expected_coordination_version: coordination.authorization_version,
+                    brief,
+                    idempotency_key: format!("task-quality:{}", request.id),
+                };
+                // A ReviewReport can be produced by a coordinator, reviewer,
+                // or correction WorkUnit. Resolve its exact producer lineage
+                // before asking for a batch-scoped continuation; never infer
+                // batch membership from the Task's latest Execution.
+                let batch_binding = if request.source_kind == "review_report" {
+                    self.coordination
+                        .project_batch_binding_for_quality_source(
+                            &request.task_id,
+                            authorizer,
+                            &request.source_id,
+                            task_version,
+                            coordination.authorization_version,
+                        )
+                        .await
+                } else {
+                    Ok(None)
+                };
+                let turn_result = match batch_binding {
+                    Ok(Some(binding)) => {
+                        self.coordination
+                            .request_project_batch_turn(
+                                &request.task_id,
+                                authorizer,
+                                input,
+                                binding,
+                            )
+                            .await
+                    }
+                    Ok(None) => {
+                        self.coordination
+                            .request_turn(&request.task_id, authorizer, input)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                let turn = match turn_result {
                     Ok((turn, _)) => turn,
                     Err(error) => {
-                        let (code, message) = match &error {
-                            ServiceError::Coordination { code, message } => {
-                                (*code, message.clone())
-                            }
-                            other => ("coordination.plan_request_failed", other.to_string()),
-                        };
+                        let (code, message) = plan_revision_failure(&error);
                         self.transition(
                             request,
                             TaskQualityState::RequiresHuman,
@@ -1217,6 +1240,42 @@ impl TaskQualityService {
             ))
             .await?;
         Ok(())
+    }
+}
+
+fn plan_revision_failure(error: &ServiceError) -> (&'static str, String) {
+    match error {
+        ServiceError::Coordination { code, message } => (*code, message.clone()),
+        ServiceError::Db(DbError::ProjectPlanBatchInactive) => (
+            "project_plan_batch_inactive",
+            "the exact quality source is no longer authorized by its Project batch; an owner or admin must review it".to_owned(),
+        ),
+        other => ("coordination.plan_request_failed", other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_revision_reports_stale_batch_scope_as_a_human_blocker() {
+        let error = ServiceError::Db(DbError::ProjectPlanBatchInactive);
+        let (code, message) = plan_revision_failure(&error);
+        assert_eq!(code, "project_plan_batch_inactive");
+        assert!(message.contains("exact quality source"));
+        assert!(message.contains("owner or admin"));
+    }
+
+    #[test]
+    fn plan_revision_preserves_coordination_failure_codes() {
+        let error = ServiceError::Coordination {
+            code: "coordination.authorization_revoked",
+            message: "the authorization was revoked".to_owned(),
+        };
+        let (code, message) = plan_revision_failure(&error);
+        assert_eq!(code, "coordination.authorization_revoked");
+        assert_eq!(message, "the authorization was revoked");
     }
 }
 

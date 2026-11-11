@@ -1133,6 +1133,26 @@ impl ExecutionRepo for SqliteDb {
             tx.commit().await?;
             return Ok(ProviderStartClaim::TaskCancelled);
         }
+
+        let plan_apply_incomplete: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM project_plan_import_task i
+                WHERE i.task_id=? AND NOT EXISTS(
+                    SELECT 1 FROM project_plan_proposal_task pt
+                    JOIN project_plan_proposal p ON p.id=pt.proposal_id
+                    WHERE pt.project_id=i.project_id AND pt.task_id=i.task_id
+                      AND pt.import_key=i.import_key AND p.state='applied'
+                      AND p.applied_version IS NOT NULL
+                      AND i.import_key='proposal:'||p.id||':node:'||pt.node_key
+                )
+            )",
+        )
+        .bind(&execution.task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if plan_apply_incomplete {
+            return Err(DbError::ProjectPlanApplyIncomplete);
+        }
         let task_dispatch_state: Option<String> =
             sqlx::query_scalar("SELECT state FROM task_dispatch WHERE task_id = ?")
                 .bind(&execution.task_id)
@@ -1141,6 +1161,138 @@ impl ExecutionRepo for SqliteDb {
         if matches!(task_dispatch_state.as_deref(), Some("paused" | "cancelled")) {
             tx.commit().await?;
             return Ok(ProviderStartClaim::TaskPaused);
+        }
+
+        let project_dependency_unsatisfied: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM project_task_dependency_readiness WHERE task_id=? AND satisfied=0)",
+        )
+        .bind(&execution.task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if project_dependency_unsatisfied {
+            return Err(DbError::ProjectDependencyUnsatisfied);
+        }
+
+        let project_batch = sqlx::query(
+            "SELECT b.state,p.version=b.graph_version AS graph_current,
+                    EXISTS(SELECT 1 FROM project_member m WHERE m.project_id=b.project_id
+                        AND m.user_id=b.authorized_by AND m.role IN ('owner','admin')) AS author_current,
+                    EXISTS(SELECT 1 FROM project_member owner_membership
+                        JOIN project project_row ON project_row.id=owner_membership.project_id
+                        WHERE owner_membership.project_id=b.project_id
+                          AND owner_membership.user_id=project_row.owner_id
+                          AND owner_membership.role='owner') AS owner_current,
+                    bt.state AS task_state,
+                    EXISTS(SELECT 1 FROM task_coordination c
+                     WHERE c.task_id=bt.task_id AND bt.coordination_snapshot_json IS NOT NULL
+                       AND EXISTS(SELECT 1 FROM task t WHERE t.id=bt.task_id AND t.project_id=b.project_id
+                         AND t.title=json_extract(bt.coordination_snapshot_json,'$.task_title')
+                         AND t.description IS json_extract(bt.coordination_snapshot_json,'$.task_description')
+                         AND t.repo_id IS json_extract(bt.coordination_snapshot_json,'$.task_repo_id')
+                         AND t.parent_task_id IS json_extract(bt.coordination_snapshot_json,'$.task_parent_task_id'))
+                       AND c.mode='prepare_and_execute' AND c.revoked_at IS NULL AND c.team_stale=0
+                       AND c.authorization_version=json_extract(bt.coordination_snapshot_json,'$.authorization_version')
+                       AND c.team_generation=json_extract(bt.coordination_snapshot_json,'$.team_generation')
+                       AND c.team_digest=json_extract(bt.coordination_snapshot_json,'$.team_digest')
+                       AND c.envelope_digest=json_extract(bt.coordination_snapshot_json,'$.envelope_digest')
+                       AND c.coordinator_task_role_id=json_extract(bt.coordination_snapshot_json,'$.role_id')
+                       AND c.coordinator_actor_kind=json_extract(bt.coordination_snapshot_json,'$.actor_kind')
+                       AND c.coordinator_actor_id=json_extract(bt.coordination_snapshot_json,'$.actor_id')
+                       AND c.authorization_version=link.authorization_version
+                       AND EXISTS(SELECT 1 FROM project_plan_batch_coordination_authorization a
+                         WHERE a.batch_id=link.batch_id AND a.task_id=link.task_id
+                          AND a.authorization_version=link.authorization_version
+                          AND a.expected_graph_version=b.graph_version)
+                       AND c.requested_by=b.authorized_by) AS coordinator_current
+             FROM project_plan_batch_execution link
+             JOIN project_plan_batch b ON b.id=link.batch_id
+             JOIN project_plan p ON p.project_id=b.project_id
+             JOIN project_plan_batch_task bt ON bt.batch_id=link.batch_id AND bt.task_id=link.task_id
+             WHERE link.execution_id=?",
+        )
+        .bind(&execution.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let has_batch_link = project_batch.is_some();
+        if let Some(batch) = project_batch {
+            let state: String = batch.try_get("state")?;
+            let graph_current: bool = batch.try_get("graph_current")?;
+            let author_current: bool = batch.try_get("author_current")?;
+            let owner_current: bool = batch.try_get("owner_current")?;
+            let task_state: String = batch.try_get("task_state")?;
+            let coordinator_current: bool = batch.try_get("coordinator_current")?;
+            if state == "paused" {
+                tx.commit().await?;
+                return Ok(ProviderStartClaim::ProjectPlanBatchPaused);
+            }
+            if state != "running"
+                || !graph_current
+                || !author_current
+                || !owner_current
+                || !coordinator_current
+                || !matches!(task_state.as_str(), "claimed" | "started")
+            {
+                return Err(DbError::ProjectPlanBatchInactive);
+            }
+        }
+
+        // A missing execution link must fail closed when this Execution still
+        // has an exact batch origin. This covers a wake/request race, an old
+        // TaskCoordination grant after revocation, and WorkUnit descendants
+        // whose exact producer is a batch-scoped plan or result Artifact.
+        let unlinked_batch_origin: bool = sqlx::query_scalar(
+            "WITH RECURSIVE work_unit_lineage(id,task_id,parent_work_unit_id,provenance_kind,provenance_id) AS (
+                SELECT w.id,w.task_id,w.parent_work_unit_id,w.provenance_kind,w.provenance_id
+                FROM work_unit w JOIN execution e ON e.work_unit_id=w.id WHERE e.id=?
+                UNION
+                SELECT parent.id,parent.task_id,parent.parent_work_unit_id,
+                       parent.provenance_kind,parent.provenance_id
+                FROM work_unit parent JOIN work_unit_lineage child
+                  ON child.task_id=parent.task_id
+                 AND (child.parent_work_unit_id=parent.id
+                   OR (child.provenance_kind='work_unit' AND child.provenance_id=parent.id))
+            )
+            SELECT EXISTS(
+                SELECT 1 FROM task_coordination c
+                JOIN project_plan_batch_coordination_authorization a
+                  ON a.task_id=c.task_id AND a.authorization_version=c.authorization_version
+                WHERE c.task_id=?
+            ) OR EXISTS(
+                SELECT 1 FROM task_coordination_request request
+                JOIN project_plan_batch_coordination_request scope ON scope.request_id=request.id
+                WHERE request.execution_id=?
+            ) OR EXISTS(
+                SELECT 1 FROM orchestrator_wake_execution attempt
+                JOIN orchestrator_wake wake ON wake.id=attempt.wake_id
+                JOIN domain_event event ON event.id=wake.event_id
+                JOIN project_plan_batch_coordination_request scope
+                  ON scope.request_id=event.entity_id AND event.entity_type='task_coordination_request'
+                WHERE attempt.execution_id=?
+            ) OR EXISTS(
+                SELECT 1 FROM work_unit_lineage lineage
+                JOIN task_coordination_plan plan
+                  ON lineage.provenance_kind='artifact' AND plan.artifact_id=lineage.provenance_id
+                   AND plan.task_id=lineage.task_id
+                JOIN project_plan_batch_coordination_request scope ON scope.request_id=plan.request_id
+                 AND scope.task_id=lineage.task_id
+            ) OR EXISTS(
+                SELECT 1 FROM work_unit_lineage lineage
+                JOIN artifact_execution_producer producer
+                  ON lineage.provenance_kind='artifact'
+                   AND producer.artifact_id=lineage.provenance_id
+                   AND producer.task_id=lineage.task_id
+                JOIN project_plan_batch_execution link
+                  ON link.execution_id=producer.execution_id AND link.task_id=producer.task_id
+            )",
+        )
+        .bind(&execution.id)
+        .bind(&execution.task_id)
+        .bind(&execution.id)
+        .bind(&execution.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !has_batch_link && unlinked_batch_origin {
+            return Err(DbError::ProjectPlanBatchInactive);
         }
 
         let is_orchestrator =

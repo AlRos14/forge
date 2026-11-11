@@ -95,6 +95,11 @@ the maximum is 100.
 | `GET /projects/{id}/copilot/messages`, `POST /projects/{id}/copilot/messages` | Read the durable Project conversation using an opaque cursor, or send `{content, idempotency_key, task_id?}`. Sending requires Project write authority and enabled MCP, returns HTTP 202 with the durable run and user message. An optional Task must belong to the same Project. |
 | `GET /projects/{id}/copilot/runs/{run_id}`, `DELETE /projects/{id}/copilot/runs/{run_id}` | Poll the exact run and its response, or cancel it. Cancellation revokes delegation; an uncertain or interrupted turn is not automatically replayed. |
 | `GET /projects/{id}/copilot/activity` | Read the Project's Copilot tool outcomes and domain mutations, newest first, with `limit` and an opaque keyset `cursor`. Includes the run, exact entity and optional Task reference; excludes tool argument bodies and credentials. |
+| `GET /projects/{id}/plan` | Read the optional Project work-packet DAG, its proposal/batch history and forecast. The initial graph version is `1`, including before a plan exists; the graph always includes every Project Task and canonical dependency edge. |
+| `POST /projects/{id}/plan/proposals` | A Project writer submits `{ expected_version, document, idempotency_key }`. The typed document preserves sources and distinguishes inferred edges. A proposal does not authorize execution. |
+| `POST /projects/{id}/plan/proposals/{proposal_id}/apply` | A Project writer applies an exact proposal with `{ expected_version, idempotency_key }`. It creates or maps Tasks and records graph history; it does not create worker Executions or authorize a batch. |
+| `POST /projects/{id}/plan/batches` | A current Project owner/admin explicitly authorizes `{ expected_version, task_ids, max_parallel_tasks, idempotency_key }`. The service revalidates membership and canonical owner authority inside its transaction. |
+| `POST /projects/{id}/plan/batches/{batch_id}` | A Project owner/admin sends `{ expected_version, action, idempotency_key }`, where `action` is `pause`, `resume`, or `revoke`. Copilot cannot authorize or change a batch. |
 | `DELETE /projects/{id}` | Delete a Project under the existing workspace cleanup contract. |
 | `POST /projects/{id}/pause`, `POST /projects/{id}/resume` | Pause or resume the Project. |
 | `GET /projects/{id}/repos`, `POST /projects/{id}/repos` | List or add repositories. |
@@ -105,6 +110,24 @@ the maximum is 100.
 | `POST /projects/{id}/media/{asset_id}/redact`, `.../purge` | Record the existing media redaction or purge action. |
 | `GET /projects/{id}/integration`, `POST /projects/{id}/integration`, `PATCH /projects/{id}/integration`, `POST /projects/{id}/integration/sync` | Manage the Project's external issue integration. Create accepts and GET/PATCH return `credential_env_var`, the environment variable name Forge reads during sync; the credential value is never returned or stored. Optional `default_implementer` is an exact `ActorRef`; imported issues create ordinary Tasks and add that Actor to the copied `implementer` TaskRole, creating the role only when the Project has no default for it. Sync fails closed if the configured Actor is not valid for the Project. Lifecycle begins at the normal Task creation state; legacy `default_task_state` and singular assignment fields are rejected. |
 | `GET /projects/{id}/members`, `POST /projects/{id}/members`, `PATCH /projects/{id}/members/{user_id}`, `DELETE /projects/{id}/members/{user_id}` | Manage Project membership. |
+
+An untouched default manual TaskCoordination may have a stale placeholder team
+snapshot after Project TaskRole defaults are copied. Batch authorization may
+refresh only that unconfigured manual default, using its exact coordinator
+Role/Actor and the current team generation under compare-and-swap. A Human-
+customized envelope or team snapshot stays strict. This default is identified
+by its semantic values, not by `authorization_version=1`.
+
+The Project graph version covers Tasks and canonical dependencies even when no
+plan has been applied. A partially imported plan Task remains visible with
+`plan:apply_incomplete` and cannot be admitted or prepared until application
+completes. A retry of the same proposal apply must keep its original
+`expected_version` and `idempotency_key`; the stable proposal/node import keys
+resume the Task import while the graph remains at the proposal's base version.
+If another graph mutation advances the version, the retry returns
+`409 version_conflict`; refresh and review the proposal instead of rebasing it
+or changing the retry key. A `409 project_plan_apply_incomplete` from an attempt
+to prepare a staged Task identifies this same fail-closed condition.
 
 Project reads require an exact `project_member` row for a Project with a
 canonical owner; every membership role, including `viewer`, can read. Ownerless
@@ -177,7 +200,9 @@ provenance and active defaults use an exact `default_implementer` ActorRef.
 | `GET /projects/{project_id}/tasks` | List Tasks. Filter with `lifecycle_state`, `priority`, and `q`; order with the supported Task sort fields. Task classification is not a filter. `status`, `include_cancelled`, and `include_archived` are rejected. |
 | `GET /tasks/{id}`, `PATCH /tasks/{id}`, `DELETE /tasks/{id}` | Read, update, or delete a Task. Updates require the Task `version`. |
 | `POST /tasks/{id}/subtasks/reorder` | Reorder exact child Task IDs. |
-| `GET /tasks/{id}/dependencies`, `POST /tasks/{id}/dependencies`, `DELETE /tasks/{id}/dependencies/{dep_id}`, `GET /tasks/{id}/dependents` | Read and update Task dependencies. |
+| `GET /tasks/{id}/dependencies`, `GET /tasks/{id}/dependents` | Read same-Project Task dependencies. |
+| `POST /tasks/{id}/dependencies` | Add a same-Project dependency using `{ depends_on_id, expected_graph_version, idempotency_key }`. Writes pass through the Project DAG service. |
+| `DELETE /tasks/{id}/dependencies/{dep_id}` | Remove a dependency using JSON body `{ expected_graph_version, idempotency_key }`. Writes pass through the Project DAG service. |
 | `GET /tasks/{id}/workspace`, `GET /tasks/{id}/diff` | Read the Task integration workspace or inspect its current diff. Workspace mutation and recovery require an exact WorkUnit and Workspace identity. |
 | `GET /tasks/{id}/lifecycle` | Read the authoritative aggregate TaskLifecycle and its version. |
 | `POST /tasks/{id}/lifecycle` | Request a deterministic TaskLifecycle edge with `to_state`, `expected_lifecycle_version`, and `idempotency_key`; use `gate_evaluation_id` for an edge admitted by that exact evaluation. `reason_kind` and `reason_ref` must be supplied together, with non-empty values, or both omitted. |
@@ -225,10 +250,10 @@ are in [the PR0 contract](plans/pr0-task-coordination-contract.md).
 
 | Method and route | Effect |
 |---|---|
-| `GET /tasks/{id}/coordination` | Read the current authorization version, resolved team (names, harness/host, capabilities), envelope, blockers, latest turn, latest plan, lifecycle, and dispatch intent. `0 WorkUnits` is a valid starting state. |
-| `POST /tasks/{id}/coordination/authorize` | Create or replace the versioned authorization. Body: `expected_task_version`, `expected_coordination_version`, `mode`, optional exact `coordinator_task_role_id` and `coordinator_actor`, optional `envelope`, `idempotency_key`. The coordinator TaskRole must currently have `orchestration` capability and the Actor must be an active member. |
+| `GET /tasks/{id}/coordination` | Read the current authorization version, resolved team (names, harness/host, capabilities), envelope, blockers, latest turn, latest plan, lifecycle, dispatch intent, and `project_plan_batch_scope` (`null` or `{ batch_id, batch_state, task_state, blocker }`) from the exact current authorization binding. Batch-scoped versions expose `can_request: false` because the generic turn route rejects their origin. `can_authorize` reports caller eligibility; it does not bypass a batch binding or its active-state preconditions. `0 WorkUnits` is a valid starting state. |
+| `POST /tasks/{id}/coordination/authorize` | Create or replace the versioned authorization. Body: `expected_task_version`, `expected_coordination_version`, `mode`, optional exact `coordinator_task_role_id` and `coordinator_actor`, optional `envelope`, `idempotency_key`. The coordinator TaskRole must currently have `orchestration` capability and the Actor must be an active member. If the current authorization is bound to a running or paused Project batch, the generic route returns `409 project_plan_batch_inactive`. Explicitly revoke the Task authorization or revoke/complete the Project batch before creating a fresh standalone Human authorization. The old batch grant then becomes stale and admits no further work; the new authorization does not revive it. |
 | `POST /tasks/{id}/coordination/revoke` | Revoke the authorization, advance its version, and preserve existing WorkUnits, plans, and history. Running Executions are not silently stopped. |
-| `POST /tasks/{id}/coordination/requests` | Request one bounded turn. Body: expected Task/coordination versions, `objective`, optional `constraints`/`context`, `acceptance_criteria`, idempotency key. A Human coordinator returns `422 coordination.human_turn_unsupported`; use manual editing. Replays return the same request. |
+| `POST /tasks/{id}/coordination/requests` | Request one bounded turn. Body: expected Task/coordination versions, `objective`, optional `constraints`/`context`, `acceptance_criteria`, idempotency key. A Human coordinator returns `422 coordination.human_turn_unsupported`; use manual editing. Replays return the same request. A version minted by a Project batch is scoped to that batch and returns `409 project_plan_batch_inactive` through this generic route, even after batch revocation or completion; create a fresh explicit TaskCoordination authorization to restore the standalone request flow. |
 | `GET /tasks/{id}/coordination/requests/{request_id}` | Read the exact turn state, wake, Execution, failure reason, plan Artifact, and brief. |
 | `GET /tasks/{id}/coordination/plans/{artifact_id}` | Read the inspectable plan and its parsed WorkUnits, roles, Actors, dependencies, review subjects, proposal/decision, and materialization receipt. |
 | `POST /tasks/{id}/coordination/plans/{artifact_id}/approve` | Approve or reject one exact plan by digest. Approval records a `Decision` on the exact open Proposal; a changed digest or Proposal version returns a typed conflict. |
@@ -253,6 +278,17 @@ Typed coordination errors use `403 coordination.not_authorized`,
 `409 coordination.paused`, `422 coordination.invalid_plan`,
 `422 coordination.unsupported_plan_item`, `422 coordination.human_turn_unsupported`,
 `429 coordination.budget_exhausted`, and `503 coordination.host_unavailable`.
+The generic coordination request route can also return
+`409 project_plan_batch_inactive` when the supplied authorization version belongs to
+a Project batch; batch continuations must retain their exact scheduler, quality,
+or approved-plan origin binding.
+
+Every batch continuation records its origin directly. A Human `request_replan`
+must supply the exact plan Artifact ID; it qualifies only while approval is
+valid in the active authorization and batch. If already materialized, its
+receipt must bind that exact Artifact, Task, request, digest, and authorization
+version. Several plans can remain approved in one authorization; the resolver
+uses the supplied ID, never the latest-plan projection or timestamp ordering.
 
 The coordinator turn output is one JSON `work_unit_plan` object with
 `schema_version: 1`, exact request/authorization/team/envelope/objective
@@ -503,6 +539,9 @@ Public durable event types are:
   `execution.cancelled`, and `execution.stalled`;
 - `validation_run.started`, `validation_run.completed`, `evidence.created`,
   and `artifact.created`;
+- `project.plan_changed` for plan proposals, applies, dependency mutations, and
+  batch changes. It contains only a Project ID so clients refetch the authorized
+  graph rather than receiving source excerpts or instructions over SSE.
 - generic collaboration events `message.created`, `handoff.created`,
   `handoff.status_changed`, `proposal.created`, `proposal.withdrawn`, and
   `decision.recorded`.
@@ -542,9 +581,17 @@ fixed by the authenticated delegation rather than client arguments. The
 redacted harness JSONL trace with opaque sequence paging (`tail`, `limit`) for
 Project viewers. It includes reasoning, tool, session, stdout/stderr, output,
 and error events and does not expose runtime secrets.
-The Copilot's `tools/list` exposes context reads and WorkUnit create/update/allocate
-and dependency management only; execution start, WorkUnit completion, lifecycle,
-Gates, global administration and membership changes are outside its tool set.
+The project-wide Copilot's `tools/list` exposes plan read/propose/apply and
+bounded Git-object reads from exact Project repository commits, along with its
+scoped WorkUnit tools. Repository tools require a full commit ID, return bounded
+UTF-8 blobs of any extension, reject binary data and known credential
+paths/content, and exclude symlinks and submodules. They cannot access arbitrary
+filesystem paths or network sources. No DAG syntax or file extension is
+required; conversation and pseudodag text work without repository access. A
+Task-linked Copilot run omits the project-plan and repository-source tools.
+Copilot cannot authorize, pause, resume, or revoke a Project batch. Execution
+start, WorkUnit completion, lifecycle, Gates, TaskRole configuration, global
+administration, and membership changes remain outside its tool set.
 An attached Task also removes Project-wide Task listing and fences Task reads
 and mutations to that exact Task. The management runner uses only registered
 harness adapters that disable native tools and configure the exact Forge MCP
@@ -564,13 +611,18 @@ administrator degradation applies immediately. OAuth MCP tokens carry
 The MCP server advertises only registered tools. The current tool names are:
 
 - Projects: `forge_create_project`, `forge_list_projects`, `forge_get_project`,
-  `forge_update_project`, `forge_update_project_hooks`.
+  `forge_update_project`, `forge_update_project_hooks`,
+  `forge_get_project_plan`, `forge_propose_project_plan`,
+  `forge_apply_project_plan`, `forge_list_project_repo_tree`,
+  `forge_read_project_repo_file`.
 - Tasks and lifecycle: `forge_create_task`, `forge_create_sub_tasks`,
   `forge_list_tasks`, `forge_get_task`, `forge_update_task`,
   `forge_get_task_diff`, `forge_get_task_lifecycle`,
   `forge_list_task_lifecycle_transitions`, `forge_transition_task_lifecycle`,
   `forge_add_task_dependency`, `forge_remove_task_dependency`,
-  `forge_list_task_dependencies`.
+  `forge_list_task_dependencies`. Direct dependency mutations require
+  `expected_graph_version` and `idempotency_key` and call the Project DAG
+  service. There is no MCP tool for authorizing a Project batch.
 - Executions and roles: `forge_list_executions`, `forge_get_task_dispatch`,
   `forge_launch_task`, `forge_pause_task`, `forge_resume_task`,
   `forge_cancel_task`, `forge_request_rework`, `forge_follow_up_execution`,
@@ -657,7 +709,15 @@ forms use the same TaskService structural transaction as REST.
 idempotency_key }`; `limits.version` must equal `expected_version`. Values must
 be integers in 1–1000. A current Project owner/admin is required, including on
 replay. Conflicting versions or idempotency payloads return 409. Counters and
-history are preserved; budget-only blocked routes may resume with a durable grant.
+history are preserved. These budgets are independent. Raising quality or route
+limits can re-admit only quality requests blocked for those exhausted budgets;
+raising rework rounds can resume matching blocked rework intents. Raising
+`max_turns` does not create a generic RequestTurn or change the TaskCoordination
+authorization version. For a batch-scoped Task, the scheduler retries only the
+exact `coordination:coordination.budget_exhausted` blocker on its next tick, and
+only while the same batch is running and the exact authorization, Task team,
+and prerequisites remain current. Paused, revoked, completed, and differently
+blocked batch Tasks are not resumed by that turn-budget increase.
 
 Project role configuration adds optional `coordinator_actor` (an active Agent
 member of an orchestration-capable role). Coordination overview adds

@@ -129,6 +129,20 @@ pub trait TaskCoordinationRepo: Send + Sync {
         input: AuthorizeTaskCoordinationInput,
         expected_task_version: i64,
     ) -> Result<TaskCoordinationWrite>;
+    async fn authorize_project_plan_batch_task_coordination(
+        &self,
+        input: AuthorizeTaskCoordinationInput,
+        expected_task_version: i64,
+        binding: ProjectPlanBatchAuthorizationBinding,
+    ) -> Result<TaskCoordinationWrite>;
+    async fn has_project_plan_batch_coordination_authorization(
+        &self,
+        batch_id: &str,
+        task_id: &str,
+        authorization_version: i64,
+        expected_batch_version: i64,
+        expected_graph_version: i64,
+    ) -> Result<bool>;
     async fn revoke_task_coordination(
         &self,
         input: RevokeTaskCoordinationInput,
@@ -140,6 +154,11 @@ pub trait TaskCoordinationRepo: Send + Sync {
         &self,
         input: CreateTaskCoordinationRequestInput,
     ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)>;
+    async fn create_project_plan_batch_coordination_request(
+        &self,
+        input: CreateTaskCoordinationRequestInput,
+        binding: ProjectPlanBatchRequestBinding,
+    ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)>;
     async fn get_task_coordination_request(
         &self,
         id: &str,
@@ -149,6 +168,13 @@ pub trait TaskCoordinationRepo: Send + Sync {
         task_id: &str,
         idempotency_key: &str,
     ) -> Result<Option<TaskCoordinationRequest>>;
+    async fn is_project_plan_batch_coordination_request(&self, request_id: &str) -> Result<bool>;
+    /// Returns None for a manual request, otherwise running, paused, or
+    /// inactive after revalidating the durable batch/request/authorization link.
+    async fn project_plan_batch_coordination_request_state(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<String>>;
     async fn link_task_coordination_request_wake(
         &self,
         request_id: &str,
@@ -417,6 +443,13 @@ pub trait OrchestratorWakeRepo: Send + Sync {
     /// Insert one obligation for the exact source event, TaskRole, and Actor.
     /// A uniqueness hit is an idempotent replay and returns `false`.
     async fn admit_orchestrator_wake(&self, input: CreateOrchestratorWake) -> Result<bool>;
+    /// Insert an autonomy-limit wake only while its exact coordination
+    /// authorization remains current and is not owned by a Project batch.
+    async fn admit_task_autonomy_orchestrator_wake(
+        &self,
+        input: CreateOrchestratorWake,
+        expected_authorization_version: i64,
+    ) -> Result<bool>;
     async fn claim_orchestrator_wake(
         &self,
         input: ClaimOrchestratorWake,
@@ -1081,6 +1114,7 @@ pub enum ProviderStartClaim {
     AuthorityLost,
     TaskCancelled,
     TaskPaused,
+    ProjectPlanBatchPaused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

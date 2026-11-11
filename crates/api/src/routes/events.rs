@@ -117,6 +117,11 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "reason_ref",
             ],
         ),
+        "project.plan_proposed"
+        | "project.plan_applied"
+        | "project.plan_dependencies_changed"
+        | "project.plan_batch_authorized"
+        | "project.plan_batch_updated" => json!({ "project_id": event.scope_id.as_str() }),
         "gate.created" => {
             project_fields(&source, &["gate_id", "gate_kind", "scope_kind", "scope_id"])
         }
@@ -323,6 +328,11 @@ fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
         "proposal.created" => PublicEventType::ProposalCreated,
         "proposal.withdrawn" => PublicEventType::ProposalWithdrawn,
         "decision.recorded" => PublicEventType::DecisionRecorded,
+        "project.plan_proposed"
+        | "project.plan_applied"
+        | "project.plan_dependencies_changed"
+        | "project.plan_batch_authorized"
+        | "project.plan_batch_updated" => PublicEventType::ProjectPlanChanged,
         "task.coordination_authorized" => PublicEventType::TaskCoordinationAuthorized,
         "task.coordination_revoked" => PublicEventType::TaskCoordinationRevoked,
         "task.coordination_requested" => PublicEventType::TaskCoordinationRequested,
@@ -499,6 +509,26 @@ mod tests {
         assert_eq!(payload["plan_artifact_id"], "artifact-1");
         assert!(payload.get("content").is_none());
         assert!(payload.get("objective").is_none());
+    }
+
+    #[test]
+    fn project_plan_event_projection_exposes_only_project_id() {
+        let mut event = domain_event(
+            "project.plan_proposed",
+            r#"{"project_id":"project-1","excerpt":"private source","instructions":"private instructions"}"#,
+        );
+        event.entity_type = "project_plan".to_owned();
+        event.entity_id = "proposal-1".to_owned();
+        event.scope_type = "project".to_owned();
+        event.scope_id = "project-1".to_owned();
+
+        let projected = project_domain_event(&event).expect("Project plan event is public");
+        assert_eq!(projected.event_type, PublicEventType::ProjectPlanChanged);
+        assert_eq!(projected.entity_id, "proposal-1");
+        assert_eq!(projected.payload, Some(json!({"project_id":"project-1"})));
+        let encoded = serde_json::to_string(&projected).expect("event serializes");
+        assert!(!encoded.contains("private source"));
+        assert!(!encoded.contains("private instructions"));
     }
 
     #[test]

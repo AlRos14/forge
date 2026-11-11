@@ -375,6 +375,7 @@ async fn overview_response(
         max_quality_requests: overview.coordination.max_quality_requests,
         can_authorize: overview.can_authorize,
         can_request: overview.can_request,
+        project_plan_batch_scope: overview.project_plan_batch_scope,
         blockers: overview
             .blockers
             .into_iter()

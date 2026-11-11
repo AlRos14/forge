@@ -2730,6 +2730,7 @@ pub struct AuthorizeTaskCoordinationInput {
     pub team_digest: String,
     pub envelope_json: String,
     pub envelope_digest: String,
+    pub unconfigured_default_refresh: bool,
     pub requested_by: String,
     pub idempotency_key: String,
     pub request_digest: String,
@@ -2807,6 +2808,8 @@ pub struct TaskCoordinationRequest {
 pub struct CreateTaskCoordinationRequestInput {
     pub id: String,
     pub task_id: String,
+    pub requested_by: String,
+    pub expected_task_version: i64,
     pub authorization_version: i64,
     pub mode: TaskCoordinationMode,
     pub brief_json: String,
@@ -2815,6 +2818,51 @@ pub struct CreateTaskCoordinationRequestInput {
     pub idempotency_key: String,
     pub created_at: String,
     pub event: CreateDomainEvent,
+}
+
+/// Exact Project batch claim that is allowed to create and attach one
+/// coordinator request. The repository consumes the coordination turn budget,
+/// links the request to the batch Task row, and appends the request event in
+/// the same serialized transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectPlanBatchRequestBinding {
+    pub project_id: String,
+    pub batch_id: String,
+    pub authorized_by: String,
+    pub expected_batch_version: i64,
+    pub expected_graph_version: i64,
+    pub expected_task_version: i64,
+    pub expected_coordination_version: i64,
+    pub coordination_snapshot_digest: String,
+    pub origin: ProjectPlanBatchRequestOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectPlanBatchRequestOrigin {
+    Scheduler {
+        claim_token: String,
+    },
+    QualityReplan {
+        source_artifact_id: String,
+        producer_execution_id: String,
+    },
+    HumanReplan {
+        approved_plan_artifact_id: String,
+    },
+}
+
+/// Typed binding used while minting TaskCoordination authority from a
+/// Project batch. It is persisted in the same transaction as the new
+/// authorization version, so a later pin failure or batch revocation cannot
+/// turn that grant into a generic Task authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectPlanBatchAuthorizationBinding {
+    pub project_id: String,
+    pub batch_id: String,
+    pub authorized_by: String,
+    pub expected_batch_version: i64,
+    pub expected_graph_version: i64,
+    pub expected_team_generation: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

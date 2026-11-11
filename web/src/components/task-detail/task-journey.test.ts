@@ -14,8 +14,24 @@ function overview(
   return {
     task_id: 'task-1',
     task_version: 4,
-    lifecycle: { task_id: 'task-1', state: 'active', version: 2, reason_kind: null, reason_ref: null, created_at: '', updated_at: '' },
-    dispatch: { task_id: 'task-1', state: 'idle', version: 1, requested_by: null, reason: null, created_at: '', updated_at: '' },
+    lifecycle: {
+      task_id: 'task-1',
+      state: 'active',
+      version: 2,
+      reason_kind: null,
+      reason_ref: null,
+      created_at: '',
+      updated_at: '',
+    },
+    dispatch: {
+      task_id: 'task-1',
+      state: 'idle',
+      version: 1,
+      requested_by: null,
+      reason: null,
+      created_at: '',
+      updated_at: '',
+    },
     mode: 'proposal',
     authorization_version: 2,
     revoked_at: null,
@@ -32,6 +48,7 @@ function overview(
     max_quality_requests: 8,
     can_authorize: true,
     can_request: false,
+    project_plan_batch_scope: null,
     blockers: [],
     latest_request: null,
     latest_plan: null,
@@ -47,7 +64,15 @@ function task(state: Task['lifecycle']['state'] = 'active'): Task {
     parent_task_id: null,
     title: 'Deliver',
     description: null,
-    lifecycle: { task_id: 'task-1', state, version: 2, reason_kind: null, reason_ref: null, created_at: '', updated_at: '' },
+    lifecycle: {
+      task_id: 'task-1',
+      state,
+      version: 2,
+      reason_kind: null,
+      reason_ref: null,
+      created_at: '',
+      updated_at: '',
+    },
     priority: 0,
     board_position: 0,
     subtask_order: null,
@@ -95,9 +120,7 @@ function workUnit(overrides: Partial<WorkUnitResponse> = {}): WorkUnitResponse {
   }
 }
 
-function quality(
-  overrides: Partial<TaskQualityRequestResponse> = {},
-): TaskQualityRequestResponse {
+function quality(overrides: Partial<TaskQualityRequestResponse> = {}): TaskQualityRequestResponse {
   return {
     id: 'quality-1',
     task_id: 'task-1',
@@ -227,7 +250,8 @@ describe('guided journey projection', () => {
             source_task_role_id: 'role-reviewer',
             escalation: {
               reason_code: 'coordination.quality_route_ping_pong',
-              reason: 'pending quality targets alternate between TaskRoles reviewer and implementer',
+              reason:
+                'pending quality targets alternate between TaskRoles reviewer and implementer',
               cycle_request_ids: ['q1', 'q2', 'q3'],
               cycle_task_role_ids: ['role-a', 'role-b', 'role-a'],
             },
@@ -247,7 +271,15 @@ describe('guided journey projection', () => {
       ...empty,
       task: task(),
       coordination: overview({
-        dispatch: { task_id: 'task-1', state: 'paused', version: 2, requested_by: null, reason: null, created_at: '', updated_at: '' },
+        dispatch: {
+          task_id: 'task-1',
+          state: 'paused',
+          version: 2,
+          requested_by: null,
+          reason: null,
+          created_at: '',
+          updated_at: '',
+        },
       }),
       workUnits: [workUnit()],
     })

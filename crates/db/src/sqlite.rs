@@ -39,12 +39,14 @@ use crate::{
 use crate::{
     AuthorizeTaskCoordinationInput, CompleteTaskCoordinationTurnInput,
     CreateTaskCoordinationRequestInput, CreateTaskInterventionInput, CreateTaskQualityRequestInput,
-    MaterializeTaskCoordinationPlanInput, RevokeTaskCoordinationInput, TaskCoordination,
-    TaskCoordinationMaterialization, TaskCoordinationOperation, TaskCoordinationPlan,
-    TaskCoordinationPlanState, TaskCoordinationPlanWrite, TaskCoordinationReceipt,
-    TaskCoordinationRepo, TaskCoordinationRequest, TaskCoordinationRequestState,
-    TaskCoordinationWrite, TaskIntervention, TaskInterventionState, TaskInterventionWrite,
-    TaskQualityRequest, TaskQualityState, TaskQualityWrite, UpdateTaskCoordinationRequestState,
+    MaterializeTaskCoordinationPlanInput, ProjectPlanBatchAuthorizationBinding,
+    ProjectPlanBatchRequestBinding, ProjectPlanBatchRequestOrigin, RevokeTaskCoordinationInput,
+    TaskCoordination, TaskCoordinationMaterialization, TaskCoordinationOperation,
+    TaskCoordinationPlan, TaskCoordinationPlanState, TaskCoordinationPlanWrite,
+    TaskCoordinationReceipt, TaskCoordinationRepo, TaskCoordinationRequest,
+    TaskCoordinationRequestState, TaskCoordinationWrite, TaskIntervention, TaskInterventionState,
+    TaskInterventionWrite, TaskQualityRequest, TaskQualityState, TaskQualityWrite,
+    UpdateTaskCoordinationRequestState,
 };
 use crate::{
     ClaimOrchestratorWake, CoordinationMode, CreateOrchestratorWake, OrchestratorActionRecord,
@@ -259,10 +261,28 @@ pub(super) fn work_unit_execution_admission_error(error: &sqlx::Error) -> Option
         "FORGE_WU_ADMISSION_WORKSPACE_UNAVAILABLE" => Some(DbError::WorkUnitWorkspaceUnavailable),
         "FORGE_WU_ADMISSION_ALREADY_RUNNING" => Some(DbError::WorkUnitExecutionAlreadyRunning),
         "FORGE_WU_ADMISSION_DEPENDENCY_UNSATISFIED" => Some(DbError::DependencyGate),
+        "FORGE_WU_ADMISSION_PROJECT_DEPENDENCY_UNSATISFIED" => {
+            Some(DbError::ProjectDependencyUnsatisfied)
+        }
+        "FORGE_WU_ADMISSION_PROJECT_BATCH_INACTIVE" | "FORGE_PROJECT_PLAN_BATCH_INACTIVE" => {
+            Some(DbError::ProjectPlanBatchInactive)
+        }
+        "FORGE_PROJECT_PLAN_APPLY_INCOMPLETE" => Some(DbError::ProjectPlanApplyIncomplete),
         "FORGE_WU_ADMISSION_VERSION_CONFLICT" => Some(DbError::VersionConflict),
         "FORGE_WU_ADMISSION_INVALID" => Some(DbError::Check(
             "WorkUnit Execution admission has invalid required fields".to_owned(),
         )),
+        _ => None,
+    }
+}
+
+pub(super) fn project_plan_batch_write_error(error: &sqlx::Error) -> Option<DbError> {
+    let sqlx::Error::Database(database_error) = error else {
+        return None;
+    };
+    match database_error.message() {
+        "FORGE_PROJECT_PLAN_BATCH_INACTIVE" => Some(DbError::ProjectPlanBatchInactive),
+        "FORGE_PROJECT_PLAN_APPLY_INCOMPLETE" => Some(DbError::ProjectPlanApplyIncomplete),
         _ => None,
     }
 }

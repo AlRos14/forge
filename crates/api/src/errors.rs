@@ -277,7 +277,12 @@ impl From<ServiceError> for ApiError {
                 } else {
                     StatusCode::CONFLICT
                 };
-                Self { status, code, message, details: None }
+                Self {
+                    status,
+                    code,
+                    message,
+                    details: None,
+                }
             }
             ServiceError::DaemonUnavailable { daemon_id } => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
@@ -510,6 +515,18 @@ impl From<DbError> for ApiError {
                 "copilot_authority_lost",
                 "The Project Copilot delegation is no longer valid",
             ),
+            DbError::ProjectDependencyUnsatisfied => Self::conflict_with_code(
+                "project_dependency_unsatisfied",
+                "A prerequisite Task has not reached accepted, integrated completion",
+            ),
+            DbError::ProjectPlanBatchInactive => Self::conflict_with_code(
+                "project_plan_batch_inactive",
+                "The Project plan batch is not active",
+            ),
+            DbError::ProjectPlanApplyIncomplete => Self::conflict_with_code(
+                "project_plan_apply_incomplete",
+                "Project plan apply is incomplete; retry the same request with its idempotency key",
+            ),
             DbError::VersionConflict => Self {
                 status: StatusCode::CONFLICT,
                 code: "version_conflict",
@@ -651,6 +668,13 @@ mod tests {
     use services::ServiceError;
 
     #[test]
+    fn project_plan_apply_incomplete_has_a_typed_conflict_code() {
+        let error = ApiError::from(DbError::ProjectPlanApplyIncomplete);
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "project_plan_apply_incomplete");
+    }
+
+    #[test]
     fn work_unit_admission_failures_keep_stable_api_codes() {
         let cases = [
             (
@@ -693,6 +717,25 @@ mod tests {
         let dependency = ApiError::from(ServiceError::from(DbError::DependencyGate));
         assert_eq!(dependency.status, StatusCode::CONFLICT);
         assert_eq!(dependency.code, "dependency_gate");
+
+        for (db_error, code) in [
+            (
+                DbError::ProjectDependencyUnsatisfied,
+                "project_dependency_unsatisfied",
+            ),
+            (
+                DbError::ProjectPlanBatchInactive,
+                "project_plan_batch_inactive",
+            ),
+            (
+                DbError::ProjectPlanApplyIncomplete,
+                "project_plan_apply_incomplete",
+            ),
+        ] {
+            let error = ApiError::from(db_error);
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert_eq!(error.code, code);
+        }
 
         let uncertain = ApiError::from(ServiceError::ExecutionStartUncertain {
             execution_id: "execution-1".to_owned(),
