@@ -433,7 +433,10 @@ fn work_unit_write_error(error: sqlx::Error) -> DbError {
         if message.contains("version") || message.contains("immutable") {
             return DbError::VersionConflict;
         }
-        if message.contains("constraint failed") || message.contains("invalid") {
+        if message.contains("constraint failed")
+            || message.contains("invalid")
+            || message == "review subject must name an exact same-task result and independent formal reviewer"
+        {
             return DbError::Check(database_error.message().to_owned());
         }
     }

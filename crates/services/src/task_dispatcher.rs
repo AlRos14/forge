@@ -14,6 +14,7 @@ use crate::{Result, TaskService};
 
 mod active_recovery;
 mod dispatch;
+pub(crate) use dispatch::work_unit_consumption_context;
 
 pub use dispatch::DispatchOutcome;
 

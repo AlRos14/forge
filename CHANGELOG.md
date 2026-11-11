@@ -31,7 +31,9 @@ PR14 audit on 2026-10-16.
   syntax and automatic permission mode uses `--auto`. Formal Agent review is
   read-only with Codex, Claude Code and OpenCode; Claude coordination uses a native tool
   allowlist. Ordinary WorkUnit assistant output is captured as a Summary Artifact
-  and exact pinned delivery evidence is passed to downstream work.
+  and exact pinned delivery evidence is passed to downstream work. Shell launches
+  validate the same exact inputs while preserving literal command instructions;
+  cognitive handoff prose is never appended to executable Shell commands.
 
 - TaskRole names no longer define formal review, orchestration, or rework
   authority. Use typed `configuration` with the capability catalog and exact

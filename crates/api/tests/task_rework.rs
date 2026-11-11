@@ -767,7 +767,7 @@ async fn request_changes_creates_replay_safe_correction_and_review_round() {
         serde_json::to_value(conflicting).expect("rework serializes"),
     )
     .await;
-    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]

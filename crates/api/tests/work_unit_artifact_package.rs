@@ -202,6 +202,11 @@ async fn package_work_unit_pins_five_exact_artifacts_and_exposes_manifest() {
         Some("printf 'compiled package\\n'"),
     )
     .await;
+    assert_eq!(
+        package_execution.prompt.as_deref(),
+        Some("printf 'compiled package\\n'"),
+        "pinned Artifact context must not become executable Shell instructions"
+    );
     wait_for_execution_completed(&harness.app, &task.id, &package_execution.id).await;
     let delivery_content = "D1-D5 review package\n";
     let delivery_digest = hex::encode(sha2::Sha256::digest(delivery_content.as_bytes()));

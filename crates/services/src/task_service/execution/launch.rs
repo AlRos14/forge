@@ -470,6 +470,27 @@ impl TaskService {
             self.adapter_registry.as_deref(),
         )
         .await?;
+        // Validate exact inputs for every harness, but never append cognitive prose
+        // to a Shell program. Use the frozen route, not a mutable Agent profile;
+        // same-Agent fallbacks cannot change harness kind.
+        let context =
+            crate::task_dispatcher::work_unit_consumption_context(&self.db, &work_unit).await?;
+        let snapshot: serde_json::Value =
+            serde_json::from_str(executor_config_snapshot_json.as_deref().ok_or_else(|| {
+                ServiceError::invalid_operation("WorkUnit launch requires an executor snapshot")
+            })?)
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let prompt = if snapshot
+            .get("executor_type")
+            .and_then(serde_json::Value::as_str)
+            == Some("shell")
+        {
+            prompt
+        } else if let Some(context) = context {
+            format!("{prompt}\n\n{context}")
+        } else {
+            prompt
+        };
         let now = now_rfc3339();
         let (task, execution, _) = self
             .admit_running_work_unit_execution_with_artifact_inputs(

@@ -179,7 +179,10 @@ completion. The Human does not select an Execution or a HarnessSession.
 A review WorkUnit may record `work_unit_review_subject`: the exact reviewed
 WorkUnit version, result Execution, commit, Workspace, and snapshot digest. A
 correction WorkUnit may record `work_unit_result_requirement`: the exact source
-result it consumes. These are minimal relations, not a workflow DSL.
+result it consumes. These are minimal relations, not a workflow DSL. Cognitive
+harnesses receive the exact pinned input context at launch. Shell launches
+validate the same inputs but preserve literal execution instructions, without
+appending that context as executable code.
 
 For multiple deliverables, prepare one package WorkUnit that consumes the exact
 source Artifacts and records an immutable manifest for its package result. A

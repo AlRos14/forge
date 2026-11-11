@@ -108,15 +108,11 @@ impl TaskDispatcher {
             else {
                 continue;
             };
-            let mut prompt = work_unit
+            let prompt = work_unit
                 .execution_instructions
                 .clone()
                 .filter(|instructions| !instructions.trim().is_empty())
                 .unwrap_or_else(|| automatic_work_unit_prompt(&task, &work_unit));
-            if let Some(context) = work_unit_consumption_context(&self.db, &work_unit).await? {
-                prompt.push_str("\n\n");
-                prompt.push_str(&context);
-            }
             let launch = self
                 .task_service
                 .launch_work_unit_execution(
@@ -173,7 +169,7 @@ impl TaskDispatcher {
     }
 }
 
-async fn work_unit_consumption_context(
+pub(crate) async fn work_unit_consumption_context(
     db: &db::SqliteDb,
     work_unit: &db::WorkUnit,
 ) -> Result<Option<String>> {
