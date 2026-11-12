@@ -18,6 +18,7 @@ use events::EventBus;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 
 use crate::{
     collaboration_service::{
@@ -25,7 +26,6 @@ use crate::{
         CreateMessageInput, CreateProposalInput,
     },
     domain_event_service::DomainEventService,
-    project_plan::ProjectPlanService,
     task_lifecycle::TaskLifecycleService,
     Result, ServiceError,
 };
@@ -3203,15 +3203,14 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                 }
                 let batch_binding =
                     if let Some(approved_plan_artifact_id) = input.plan_artifact_id.as_deref() {
-                        ProjectPlanService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
-                            .project_batch_binding_for_approved_plan(
-                                &task.id,
-                                user_id,
-                                approved_plan_artifact_id,
-                                brief.expected_task_version,
-                                brief.expected_coordination_version,
-                            )
-                            .await?
+                        self.project_batch_binding_for_approved_plan(
+                            &task.id,
+                            user_id,
+                            approved_plan_artifact_id,
+                            brief.expected_task_version,
+                            brief.expected_coordination_version,
+                        )
+                        .await?
                     } else {
                         None
                     };

@@ -37,7 +37,7 @@ async fn fixture() -> Fixture {
     let now = now_rfc3339();
     let owner_id = new_uuid_v4();
     UserRepo::create_user(
-        &db,
+        db.as_ref(),
         &User {
             id: owner_id.clone(),
             email: format!("{owner_id}@example.test"),
@@ -52,7 +52,7 @@ async fn fixture() -> Fixture {
     .expect("owner user creates");
     let project_id = new_uuid_v4();
     ProjectRepo::create(
-        &db,
+        db.as_ref(),
         CreateProject {
             id: project_id.clone(),
             name: "Project plan fixture".to_owned(),
@@ -348,7 +348,7 @@ async fn seed_project(fixture: &Fixture, owner_id: &str, name: &str) -> String {
     let now = now_rfc3339();
     let project_id = new_uuid_v4();
     ProjectRepo::create(
-        &fixture.db,
+        fixture.db.as_ref(),
         CreateProject {
             id: project_id.clone(),
             name: name.to_owned(),
@@ -2797,7 +2797,7 @@ async fn authorized_successor_waits_for_accepted_git_handoff_and_provider_start_
         .expect("successor Agent loads")
         .expect("successor Agent exists");
     let executor_snapshot = crate::task_service::config::build_executor_config_snapshot(
-        &fixture.db,
+        fixture.db.as_ref(),
         &task,
         &agent,
         None,

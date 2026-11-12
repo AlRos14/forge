@@ -308,20 +308,18 @@ impl TaskService {
         let claim = match claim {
             Ok(claim) => claim,
             Err(
-                error @ ServiceError::Db(
-                    db::DbError::ProjectPlanBatchInactive
-                    | db::DbError::ProjectDependencyUnsatisfied
-                    | db::DbError::ProjectPlanApplyIncomplete,
-                ),
+                error @ (db::DbError::ProjectPlanBatchInactive
+                | db::DbError::ProjectDependencyUnsatisfied
+                | db::DbError::ProjectPlanApplyIncomplete),
             ) => {
                 self.fail_execution_before_dispatch(
                     &execution.id,
                     "Project plan batch authority or exact prerequisite evidence became invalid before provider Start".to_owned(),
                 )
                 .await?;
-                return Err(error);
+                return Err(error.into());
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         match claim {
             db::ProviderStartClaim::Accepted => {

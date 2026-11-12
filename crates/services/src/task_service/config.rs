@@ -158,7 +158,7 @@ pub(super) fn executor_snapshot_with_sticky_candidate(
     }
 }
 
-pub(super) async fn build_executor_config_snapshot(
+pub(crate) async fn build_executor_config_snapshot(
     db: &SqliteDb,
     _task: &Task,
     agent: &Agent,

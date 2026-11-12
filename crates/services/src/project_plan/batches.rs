@@ -1,17 +1,18 @@
 use std::sync::Arc;
 
 use db::{
-    ActorRef, ProjectPlanBatch, TaskCoordinationMode, TaskCoordinationRepo, TaskLifecycleRepo,
-    TaskLifecycleState, TaskRepo,
+    ActorRef, TaskCoordinationMode, TaskCoordinationRepo, TaskLifecycleRepo, TaskLifecycleState,
+    TaskRepo,
 };
 use serde_json::{json, Value};
 
 use super::scheduler::{
-    batch_projection_by_id_in_tx, coordination_blocker, project_admin_current_in_tx,
+    batch_projection_by_id_in_tx, batch_projection_in_tx, coordination_blocker,
+    project_admin_current_in_tx,
 };
 use super::{
-    authorize_project_admin_in_tx, digest, ensure_task_in_tx, invalid, put_receipt, receipt,
-    types::BatchProjection, ProjectPlanService,
+    authorize_project_admin_in_tx, decode, digest, ensure_task_in_tx, invalid, put_receipt,
+    receipt, types::BatchProjection, ProjectPlanBatch, ProjectPlanService,
 };
 use crate::{
     task_coordination::{AuthorizationInput, CoordinationEnvelope, TaskCoordinationService},
@@ -86,6 +87,7 @@ impl ProjectPlanService {
             if stored != request_digest {
                 return Err(db::DbError::IdempotencyConflict.into());
             }
+            let result: Value = decode(&result)?;
             let batch_id = result
                 .get("batch_id")
                 .and_then(Value::as_str)
@@ -172,6 +174,7 @@ impl ProjectPlanService {
             if stored != request_digest {
                 return Err(db::DbError::IdempotencyConflict.into());
             }
+            let result: Value = decode(&result)?;
             if result.get("batch_id").and_then(Value::as_str) != Some(batch_id) {
                 return Err(db::DbError::IdempotencyConflict.into());
             }
@@ -584,7 +587,7 @@ impl ProjectPlanService {
         let Some(expected_team_generation) = baseline.team_generation else {
             return Err("coordination:unconfigured".to_owned());
         };
-        let unconfigured_default = batch_baseline_is_unconfigured_default(baseline);
+        let unconfigured_default = batch_baseline_is_unconfigured_default(&baseline);
         if (baseline.team_stale != Some(false) && !unconfigured_default)
             || baseline.revoked_at.is_some()
         {
@@ -732,6 +735,23 @@ pub(super) fn batch_baseline_is_unconfigured_default(
             baseline.revoked_at.as_deref(),
             baseline.envelope_json.as_deref(),
         )
+}
+
+fn batch_envelope_input(
+    baseline: &super::types::BatchCoordinatorBaseline,
+) -> Result<Option<Value>> {
+    if batch_baseline_is_unconfigured_default(baseline) {
+        return Ok(None);
+    }
+    let envelope_json = baseline
+        .envelope_json
+        .as_deref()
+        .ok_or_else(|| invalid("Project batch coordination baseline has no envelope"))?;
+    let envelope: CoordinationEnvelope = super::decode(envelope_json)?;
+    envelope.validate()?;
+    serde_json::to_value(envelope)
+        .map(Some)
+        .map_err(|error| invalid(error.to_string()))
 }
 
 pub(super) fn semantic_unconfigured_manual_default(

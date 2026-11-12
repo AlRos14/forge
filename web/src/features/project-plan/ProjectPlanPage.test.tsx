@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { fireEvent, render, screen, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   ProjectPlanBatchResponse,
@@ -264,7 +264,7 @@ describe('ProjectPlanPage', () => {
       screen.getByText('Tasks with running Executions · Executions').parentElement?.textContent,
     ).toContain('2 · 3')
     expect(screen.getByText('30–60 min')).toBeTruthy()
-    expect(screen.getByText('Critical path Tasks')).toBeTruthy()
+    expect(screen.getByText(/Critical path Tasks:/)).toBeTruthy()
 
     fireEvent.change(screen.getByRole('combobox', { name: 'Filter by phase' }), {
       target: { value: 'build' },
@@ -375,15 +375,17 @@ describe('ProjectPlanPage', () => {
     const retryOptions = page.apply.mutate.mock.calls[1]?.[1] as {
       onError: (error: unknown) => void
     }
-    retryOptions.onError(
-      new ApiError(
-        JSON.stringify({
-          code: 'version_conflict',
-          message: 'Graph changed since the partial apply',
-        }),
-        409,
-      ),
-    )
+    act(() => {
+      retryOptions.onError(
+        new ApiError(
+          JSON.stringify({
+            code: 'version_conflict',
+            message: 'Graph changed since the partial apply',
+          }),
+          409,
+        ),
+      )
+    })
     expect(
       screen.getByText(
         'This proposal is based on an older graph version. Refresh or ask Copilot for an updated proposal before applying it.',

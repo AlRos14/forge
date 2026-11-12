@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 use db::{
-    ActorRef, ProjectPlanBatch, ProjectPlanBatchRequestBinding, ProjectPlanBatchRequestOrigin,
-    TaskCoordinationMode, TaskCoordinationRepo, TaskLifecycleRepo, TaskLifecycleState, TaskRepo,
+    ActorRef, ProjectPlanBatchRequestBinding, ProjectPlanBatchRequestOrigin, TaskCoordinationMode,
+    TaskCoordinationRepo, TaskLifecycleRepo, TaskLifecycleState, TaskRepo,
 };
 use serde_json::{json, Value};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, Transaction};
@@ -10,12 +10,10 @@ use sqlx::{sqlite::SqliteRow, Row, Sqlite, Transaction};
 use super::{
     authorize_project_admin_in_tx, decode, digest, json_text,
     types::{BatchCoordinatorBaseline, BatchCoordinatorSnapshot, BatchProjection},
-    ProjectPlanDocument, ProjectPlanService,
+    ProjectPlanBatch, ProjectPlanDocument, ProjectPlanService,
 };
 use crate::{
-    task_coordination::{
-        AuthorizationInput, CoordinationBrief, TaskCoordinationService, TurnRequestInput,
-    },
+    task_coordination::{CoordinationBrief, TaskCoordinationService, TurnRequestInput},
     Result, ServiceError,
 };
 
@@ -1390,7 +1388,7 @@ async fn accepted_task_context_in_tx(
             let result_sha: Option<String> = execution.try_get("after_sha")?;
             let workspace_id: Option<String> = execution.try_get("workspace_id")?;
             let artifacts=sqlx::query("SELECT a.id,a.digest FROM artifact a JOIN artifact_execution_producer p ON p.artifact_id=a.id AND p.task_id=a.task_id WHERE p.execution_id=? AND a.task_id=? ORDER BY a.id")
-                .bind(&execution_id).bind(task_id).fetch_all(&mut **tx).await?.into_iter().map(|row|Ok(json!({"artifact_id":row.try_get::<String,_>("id")?,"digest":row.try_get::<Option<String>,_>("digest")}))).collect::<std::result::Result<Vec<_>,sqlx::Error>>()?;
+                .bind(&execution_id).bind(task_id).fetch_all(&mut **tx).await?.into_iter().map(|row|Ok(json!({"artifact_id":row.try_get::<String,_>("id")?,"digest":row.try_get::<Option<String>,_>("digest")?}))).collect::<std::result::Result<Vec<_>,sqlx::Error>>()?;
             Some((execution_id, result_sha, workspace_id, artifacts))
         } else {
             None

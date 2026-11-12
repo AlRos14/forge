@@ -184,6 +184,7 @@ export function ProjectCopilotDock({ projectId, taskId }: { projectId?: string; 
       <ProjectCopilotSession
         key={sessionProjectId}
         projectId={sessionProjectId}
+        taskId={taskId}
         active={Boolean(resolvedProjectId)}
         task={task}
         taskContextReady={!taskId || Boolean(task && !taskQuery.error)}
@@ -207,6 +208,7 @@ export function ProjectCopilotDock({ projectId, taskId }: { projectId?: string; 
 
 function ProjectCopilotSession({
   projectId,
+  taskId,
   active,
   task,
   taskContextReady,
@@ -215,6 +217,7 @@ function ProjectCopilotSession({
   retryTask,
 }: {
   projectId: string
+  taskId?: string
   active: boolean
   task?: Task
   taskContextReady: boolean
@@ -247,7 +250,7 @@ function ProjectCopilotSession({
   const [configError, setConfigError] = useState<unknown>(null)
   const messageListRef = useRef<HTMLDivElement>(null)
   const historyScrollHeightRef = useRef<number | null>(null)
-  const activeTaskIdRef = useRef<string | null>(task?.id ?? null)
+  const activeTaskIdRef = useRef<string | null>(taskId ?? null)
   const processedTerminalRunRef = useRef<string | null>(null)
 
   const configQuery = useProjectCopilotQuery(projectId, open && active)
@@ -283,18 +286,23 @@ function ProjectCopilotSession({
   }, [config?.project_id, config?.agent_id, config?.version])
 
   useEffect(() => {
-    const nextTaskId = task?.id ?? null
+    const nextTaskId = taskId ?? null
     if (activeTaskIdRef.current !== nextTaskId) {
       if (!pinned) setOpen(false)
       // A Project route (including the plan page) always drafts with Project-only
       // authority. Keep draft text if the user already typed, but detach the
       // prior Task so opening Copilot from the Project cannot target stale scope.
-      if (nextTaskId === null || !draft.trim()) {
-        setDraftTaskContext(task ? { id: task.id, title: task.title } : null)
-      }
+      if (nextTaskId === null) setDraftTaskContext(null)
+      else if (!draft.trim()) setDraftTaskContext(null)
       activeTaskIdRef.current = nextTaskId
     }
-  }, [draft, pinned, task?.id, task?.title])
+    // Route Task IDs change before their query resolves. Keep a nonempty draft
+    // bound to its original Task across that loading gap; when the draft is
+    // empty, bind it to the newly resolved Task as soon as it is available.
+    if (nextTaskId && task?.id === nextTaskId && !draft.trim()) {
+      setDraftTaskContext({ id: task.id, title: task.title })
+    }
+  }, [draft, pinned, task?.id, task?.title, taskId])
 
   const activeRunSummary = config?.active_run
   const activeRunId =
@@ -984,9 +992,7 @@ function ProjectCopilotSession({
                         })}
                       </time>
                     </div>
-                    <p className="whitespace-pre-wrap break-words">
-                      {traceEntryText(entry)}
-                    </p>
+                    <p className="whitespace-pre-wrap break-words">{traceEntryText(entry)}</p>
                   </div>
                 ))}
               </div>

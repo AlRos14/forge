@@ -6,15 +6,19 @@ rama `feat/orchestrated-delivery-polish`. La revisión final se publicó en
 N05A/N05B están DONE como código tras revisión Domain/API/MCP. N06A está DONE
 como pruebas escritas/revisadas (**NOT RUN**) y N06B está DONE en documentación.
 N07A está DONE (STATIC) y N07 DONE (CODE/STATIC) tras revisión cruzada y
-formato final. El run GitHub `43116423800` falló en ambos jobs sobre el SHA
-publicado `00d9de0d0c74e1f26a07e31202ffde7c98e83e4f`: `build` reportó errores
-TypeScript en `pnpm build`/`tsc -b`, y `rust-checks` encontró E0433 por falta
-del import `TaskCoordinationMode` en `crates/db/src/sqlite/task_coordination.rs`
-(líneas 137 y 512). Las correcciones UI y DB ya están aplicadas en el árbol compartido; faltan
-commit combinado y nuevo dispatch. `api-types` pasó 449 tests (1
-ignorado) y `cli-adapters` pasó 120; crates dependientes quedaron bloqueados por
-la compilación, sin fallos funcionales observados aún. No se han ejecutado
-validaciones locales. El PASS anterior, run `42936901984` sobre el baseline
+formato final. El run `43116423800` falló en ambos jobs sobre el SHA
+`00d9de0d0c74e1f26a07e31202ffde7c98e83e4f`: TypeScript en `build` y E0433 por
+falta del import `TaskCoordinationMode` en DB. Esos fixes están aplicados. La
+segunda pasada, run `43117911227` sobre SHA
+`15a58bfcc3c112cacc7122d37016510693817ca4`, pasó web build y lint pero falló
+web tests: 194/198 pasaron y cuatro fallaron en tres archivos. También falló
+`rust-checks` al compilar `services`, con 16 diagnósticos de los tipos E0063,
+E0432, E0425, E0277, E0308, E0599, E0603 y E0609. `api-types` pasó 449 tests
+(1 ignorado), `cli-adapters` 120 y `db` PR6 cinco. Los fixes UI/Rust están
+aplicados y tuvieron revisión estática recíproca de tres agentes Luna 6 Max;
+`cargo fmt --all` y `git diff --check` locales terminaron con exit 0. N08 sigue
+**retry pending**, a la espera de commit/push y nuevo dispatch de Root. No se han
+ejecutado tests, builds ni CI locales. El PASS anterior, run `42936901984` sobre el baseline
 `b30cb448`, no valida este árbol modificado.
 
 ### Relevo operativo — 2026-11-11
@@ -88,8 +92,8 @@ flowchart TD
     N04 --> N07
     N06A --> N07
     N06B --> N07
-    N07 --> N08["N08 · Validación final en GitHub · BOTH JOBS FAILED / retry pending"]
-    N08 --> N09["N09 · Fallos registrados; fixes UI/DB aplicados"]
+    N07 --> N08["N08 · Validación GitHub · web tests + rust-checks FAILED / retry pending"]
+    N08 --> N09["N09 · fallos registrados; fixes UI/Rust revisados y formateados"]
     N09 --> N10["N10 · Entrega con evidencia"]
 ```
 
@@ -108,8 +112,8 @@ flowchart TD
 | N06B | Actualizar arquitectura, conceptos, API y CHANGELOG según el comportamiento implementado y confirmado.                                                                | N02, N03, N04, N05A, N05B | /root/luna_integration_plan; Domain/API confirm behavior | **DONE** | `docs/concepts/project-plan.md`, `docs/api.md`, `docs/architecture.md` y `CHANGELOG.md` describen el refresh del placeholder manual, la auth/batch activa, la aprobación vigente del Artifact seleccionado y su receipt exacto si materializado. HumanReplan selecciona el ID explícito; varias propuestas pueden tener aprobación vigente en la misma auth y la autoridad no se deriva de la última fecha. Docs concordadas con el freeze Domain/API; validaciones **NOT RUN**. API/concept/CHANGELOG documentan el ámbito batch exacto, la separación de límites de turnos/calidad/rework y las condiciones de retry. Sin checks. La revocación explícita de Task coordination también permite abandonar el batch; el snapshot de batch queda stale y no admite más trabajo. |
 | N07A | Revisión cruzada estática de dominio/scheduler, API/batches y consistencia UI↔DTO↔REST↔docs, con hallazgos asignados al owner.                                        | N02, N03, N05A, N05B      | /root/luna_final_domain, /root/luna_budget_review, /root/luna_integration_plan (Luna 6 Max) | **DONE (STATIC)** | Revisión final estática Domain/API/Budget/UI PASS. API expone binding batch exacto, `can_request=false` y el guard atómico del writer devuelve 409 al reemplazo genérico mientras el batch siga running/paused. Domain reclama solo el blocker exacto de turnos agotados bajo batch running/preparado con snapshot, autoridad, equipo, presupuesto y prerrequisitos vigentes; continúa con claim token fresco y origin exacto. UI oculta Start/request y edición genérica de autorización solo con batch running/paused, mantiene `can_authorize` para revoke/retry y permite auth Human independiente tras revoke/completion; no revive el batch stale. Copy, SSE e invalidaciones revisados. Pruebas escritas **NOT RUN**. |
 | N07  | Revisión final de integración y callers, formato de fuentes modificadas, resolver incompatibilidades detectables por lectura.                                         | N04, N06A, N06B, N07A     | Root orquesta; los tres subagentes Luna 6 Max revisan sus áreas                                  | **DONE (CODE/STATIC)** | Domain/API/UI revisión estática PASS. Formato final: `cargo fmt --all` PASS; `./node_modules/.bin/prettier --write` sobre siete fuentes frontend PASS; `git diff --check` PASS. La primera ejecución de Prettier encontró una coma colgante en `task-autonomy-limits.tsx`; corregida y la repetición pasó. Tests/builds/checks/CI **NOT RUN**. Root conserva commit/push y dispatch final. |
-| N08  | Única fase de validación: ejecutar checks/tests/CI en GitHub sobre HEAD exacto, con resultados PASS/FAIL/NOT RUN por alcance. No builds/tests locales.                | N07                       |Root autoriza; Luna 6 Max ejecuta al final| **AMBOS JOBS FALLARON; FIXES APLICADOS, RETRY PENDIENTE** | Los jobs `build` y `rust-checks` del run `43116423800` fallaron sobre SHA `00d9de0d0c74e1f26a07e31202ffde7c98e83e4f`; los fixes UI/DB ya están en el árbol compartido. Falta commit combinado y nuevo dispatch GitHub. |
-| N09  | Registrar cada fallo final con job/SHA/error, corrección y nueva evidencia. Reejecutar únicamente validación final justificada. Si no hay fallos, cerrar como N/A.    | N08                       | Agentes según área; Root coordina                                                                | **DOS FALLOS REGISTRADOS; FIXES APLICADOS** | El anexo detalla TS2339/TS2741 en frontend y E0433 por import omitido en DB. `api-types` y `cli-adapters` pasaron; dependientes quedaron bloqueados por compilación, sin fallos funcionales observados aún. Retry pendiente. |
+| N08  | Única fase de validación: ejecutar checks/tests/CI en GitHub sobre HEAD exacto, con resultados PASS/FAIL/NOT RUN por alcance. No builds/tests locales.                | N07                       |Root autoriza; Luna 6 Max ejecuta al final| **RUN 43117911227 FAILED: WEB TESTS + RUST COMPILE; RETRY PENDIENTE** | SHA `15a58bfcc3c112cacc7122d37016510693817ca4`: web build/lint PASS, tests 194/198 PASS con cuatro fallos en tres archivos; `rust-checks` falla al compilar `services` con E0063/E0432/E0425/E0277/E0308/E0599/E0603/E0609. Fixes UI/Rust aplicados y revisados estáticamente; espera commit/push y retry de Root. |
+| N09  | Registrar cada fallo final con job/SHA/error, corrección y nueva evidencia. Reejecutar únicamente validación final justificada. Si no hay fallos, cerrar como N/A.    | N08                       | Agentes según área; Root coordina                                                                | **2 PASADAS FALLIDAS; FIXES UI/RUST APLICADOS Y REVISADOS** | El anexo registra fallos de compilación iniciales y cuatro pruebas frontend, además de errores de compilación en services en la segunda pasada. `api-types` 449/1 ignored, `cli-adapters` 120 y `db` PR6 5 pasaron; suites Rust dependientes bloqueadas. Los fixes no tienen aún resultado de retry. |
 | N10  | Entregar plan actualizado, SHA/árbol, estado CI exacto, limitaciones y aceptación real separada de pruebas automatizadas.                                             | N09                       | Root                                                                                             | TODO        | Sin merge/despliegue ni aceptación real de FirePOS implícitos.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 ## Reparto de archivos y coordinación
@@ -204,22 +208,28 @@ construye los binarios y sube el bundle. `run_checks=true` añade `pnpm lint`,
 `pnpm test`, el browser smoke `pnpm run e2e`, `cargo fmt`, Clippy y los tests
 Rust enfocados que lista el workflow, incluido `cargo test -p api --test happy_path`. No se requiere otro `pnpm typecheck`: ya forma parte de `pnpm build`.
 
-El dispatch acredita ref, SHA, URL/ID y `run_checks=true`. Ambos jobs fallaron;
-dependientes de DB no pudieron compilar. Sí terminaron `api-types` (449 passed,
-1 ignored) y `cli-adapters` (120 passed), sin fallos funcionales observados en
-esas suites. Las correcciones frontend y DB están aplicadas. Falta commit y dispatch
-sobre el SHA combinado. El PASS
-`42936901984` corresponde al baseline `b30cb448` y no cuenta. La automatización
-no constituye despliegue ni aceptación real de FirePOS.
+El dispatch inicial acredita ref, SHA, URL/ID y `run_checks=true`; fallaron
+ambos jobs por typecheck y compilación DB. `api-types` pasó (449 passed, 1
+ignored) y `cli-adapters` pasó (120 passed). En la segunda pasada, SHA
+`15a58bfcc3c112cacc7122d37016510693817ca4`, web build y lint pasaron; los tests
+web fallaron 4/198 en tres archivos. La corrección UI está aplicada en el árbol
+compartido; `rust-checks` falló al compilar `services` con errores E0063,
+E0432, E0425, E0277, E0308, E0599, E0603 y E0609. Suites dependientes quedaron
+bloqueadas; `db` PR6 sí pasó cinco pruebas. Los owners Rust reparan sus errores;
+faltan commit combinado y nuevo dispatch. El PASS `42936901984` corresponde al baseline `b30cb448` y no
+cuenta. La automatización no constituye despliegue ni aceptación real de
+FirePOS.
 
 ## Anexo — fallos de CI y correcciones
 
-**Fallos de build y compilación Rust registrados; fixes UI/DB aplicados, nueva ejecución pendiente.**
+**Dos pasadas con fallos registrados; frontend corregido y errores Rust en reparación, nueva ejecución pendiente.**
 
 | Entrada | SHA / ejecución / job | Fallo observado | Corrección / nodo | Evidencia final |
 | ------- | --------------------- | --------------- | ----------------- | --------------- |
 | 1 | SHA `00d9de0d0c74e1f26a07e31202ffde7c98e83e4f` / run `43116423800`, job `build`, paso `pnpm build` (`tsc -b`) | `ProjectPlanPage.test.tsx`: cuatro accesos a `.disabled` sobre `HTMLElement` (TS2339); `ProjectPlanPage.tsx`: faltaba `search` requerido para `/projects/$projectId/tasks` (TS2741). | Aplicados casts DOM específicos (`HTMLButtonElement`/`HTMLInputElement`) a los controles y `search={{ sort_by: 'updated_at', sort_order: 'desc' }}` al Link. Prettier ejecutado; CI de la corrección pendiente. | Run original falló: [43116423800](https://github.com/AlRos14/forge/actions/runs/43116423800). No se ha reejecutado. |
 | 2 | SHA `00d9de0d0c74e1f26a07e31202ffde7c98e83e4f` / run `43116423800`, job `rust-checks` | E0433: `TaskCoordinationMode` no declarado en `crates/db/src/sqlite/task_coordination.rs:137` y `:512`; crates dependientes no compilaron. | Domain añadió el import faltante antes del commit combinado. Suites completadas: `api-types` 449 passed / 1 ignored; `cli-adapters` 120 passed. No se observaron fallos funcionales en esas suites. | Run original falló: [43116423800](https://github.com/AlRos14/forge/actions/runs/43116423800). Retry pendiente tras commit combinado de fixes DB y UI. |
+| 3 | SHA `15a58bfcc3c112cacc7122d37016510693817ca4` / run `43117911227`, job `build`, paso `pnpm test` | 4/198 fallaron (194 pasaron) en `sse.test.ts`, `ProjectCopilotDock.test.tsx` y `ProjectPlanPage.test.tsx`: SSE test seleccionaba el predicado de invalidación equivocado; navegación Task A→B limpiaba el contexto del borrador mientras cargaba B; dos asserts de ProjectPlan exigían texto exacto en elementos compuestos o inspeccionaban estado React antes de `act`. | SSE test selecciona el predicado específico de Project plan. Copilot preserva el contexto enlazado durante la carga de la Task destino y solo desvincula al pasar a ruta Project. ProjectPlan usa regex para la etiqueta con enlaces y `act` para el callback mock. Web build y lint pasaron; retry pendiente. | [Run 43117911227](https://github.com/AlRos14/forge/actions/runs/43117911227). El fallo de `rust-checks` de esta pasada se documenta en entrada 4. |
+| 4 | SHA `15a58bfcc3c112cacc7122d37016510693817ca4` / run `43117911227`, job `rust-checks`, compile `services` | 16 compile diagnostics across E0063/E0432/E0425/E0277/E0308/E0599/E0603/E0609 in API, DB and Services paths; dependent suites blocked before functional tests. | Domain/Budget owners are fixing scoped DB/service/API issues. In the same run `api-types` passed 449 / 1 ignored, `cli-adapters` passed 120, and DB PR6 passed 5. | [Run 43117911227](https://github.com/AlRos14/forge/actions/runs/43117911227) failed; no retry until owners complete fixes. |
 
 ## Historial de actualización
 
@@ -257,3 +267,5 @@ no constituye despliegue ni aceptación real de FirePOS.
 - 2026-11-11: Revisión final de UI/API/Domain y documentación PASS. `cargo fmt --all`, Prettier en siete fuentes frontend y `git diff --check` PASS. Tests, builds, checks y CI permanecen **NOT RUN**; N07 queda **DONE (CODE/STATIC)** y N08 **READY — NOT RUN**, pendiente del commit/push y dispatch manual de Root.
 - 2026-11-12: Root publica `00d9de0d0c74e1f26a07e31202ffde7c98e83e4f` en `origin/feat/orchestrated-delivery-polish` y dispara `.github/workflows/build-local-linux.yml` con `run_checks=true`; el run `43116423800` está en cola. N08 pasa a **IN PROGRESS** y N09 queda **SIN FALLOS CONOCIDOS** hasta recibir resultados. No se ejecutan validaciones locales.
 - 2026-11-12: El run `43116423800`, SHA `00d9de0d0c74e1f26a07e31202ffde7c98e83e4f`, termina ambos jobs en FAILURE: `build`/`pnpm build` reporta cuatro TS2339 por `.disabled` y un TS2741 por `search`; `rust-checks` reporta dos E0433 por falta de `TaskCoordinationMode` en `task_coordination.rs:137,512`. UI aplica casts DOM específicos y search por defecto; Prettier PASS. Domain añade el import DB. `api-types` pasa 449 (1 ignored), `cli-adapters` 120; suites dependientes bloqueadas por compilación, sin fallos funcionales observados aún. N09 registra ambos fallos y los fixes aplicados; N08 espera commit combinado y retry. No se ejecutaron validaciones locales.
+- 2026-11-12: Segunda pasada `43117911227`, SHA `15a58bfcc3c112cacc7122d37016510693817ca4`: web build y lint PASS; `pnpm test` falla 4/198 (194 PASS) en tres archivos. SSE test elegía otro predicate; Copilot perdía el task binding del borrador al confundir carga de Task con ruta Project; ProjectPlan tenía un assert exacto sobre label y enlaces, y otro tras callback React sin `act`. Se corrigieron los tests y el manejo de contexto de producción. `rust-checks` también falla al compilar `services` con 16 diagnósticos E0063/E0432/E0425/E0277/E0308/E0599/E0603/E0609; las suites dependientes quedan bloqueadas. `api-types` pasó 449 (1 ignored), `cli-adapters` 120 y DB PR6 5. Errores backend en reparación; no se ejecutaron validaciones locales.
+- 2026-11-12: Los fixes UI/Rust para los fallos de `43117911227` quedan aplicados y con revisión estática recíproca de tres agentes Luna 6 Max. `cargo fmt --all` y `git diff --check` locales: exit 0. Sin tests, builds ni CI locales ni claims de test PASS para estos fixes. N08 sigue retry pending, a la espera de commit/push y nuevo dispatch de Root.

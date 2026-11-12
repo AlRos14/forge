@@ -1,8 +1,7 @@
 //! Optional project DAG planning; cognitive proposals never grant execution authority.
 use crate::{Result, ServiceError, TaskService};
 use db::{
-    new_uuid_v4, now_rfc3339, DomainEventRepo, ProjectCopilotRepo, ProjectCopilotRunGrant,
-    SqliteDb, TaskRepo,
+    new_uuid_v4, now_rfc3339, DomainEventRepo, ProjectCopilotRepo, ProjectCopilotRunGrant, SqliteDb,
 };
 use events::EventBus;
 use serde::{de::DeserializeOwned, Serialize};

@@ -196,12 +196,18 @@ describe('routeSsePayload', () => {
       queryClient,
       { dispatch: vi.fn() },
     )
-    const predicate = invalidateQueries.mock.calls
-      .map(([filters]) => filters)
-      .find((filters) => typeof filters?.predicate === 'function')?.predicate
+    const projectPlanPredicate = invalidateQueries.mock.calls
+      .map(([filters]) => filters?.predicate)
+      .find(
+        (predicate) =>
+          typeof predicate === 'function' &&
+          predicate({ queryKey: ['projects', 'project-1', 'plan'] } as never),
+      )
 
-    expect(predicate?.({ queryKey: ['projects', 'project-1', 'plan'] } as never)).toBe(true)
-    expect(predicate?.({ queryKey: ['projects', 'project-1', 'tasks'] } as never)).toBe(false)
+    expect(projectPlanPredicate).toBeDefined()
+    expect(projectPlanPredicate?.({ queryKey: ['projects', 'project-1', 'tasks'] } as never)).toBe(
+      false,
+    )
   })
 
   it('resynchronizes active queries when the public stream reports lag', () => {

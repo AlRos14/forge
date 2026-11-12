@@ -488,6 +488,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
             .await
             .expect("materialized plan record loads")
             .expect("real WorkUnitPlan record persists");
+    assert_eq!(plan_record.task_id, task.id);
     assert_eq!(
         plan_record.state,
         db::TaskCoordinationPlanState::Materialized
@@ -544,7 +545,6 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         "the explicitly selected plan has approval and receipt exact to this current authorization",
     );
     assert_eq!(human_replan_binding.batch_id, batch.id);
-    assert_eq!(human_replan_binding.task_id, task.id);
     assert_eq!(
         human_replan_binding.expected_coordination_version,
         coordination.authorization_version
@@ -645,6 +645,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         .expect("ReviewReport Artifact loads")
         .expect("formal reviewer produced a durable report");
     assert_eq!(report.kind, ArtifactKind::ReviewReport);
+    assert_eq!(report.task_id, task.id);
     let report_producer_id = report
         .execution_producer()
         .map(|(id, _)| id.to_owned())
@@ -672,7 +673,6 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
             .expect("exact ReviewReport batch-origin lookup succeeds")
             .expect("ReviewReport resolves to the running batch that admitted its producer");
     assert_eq!(quality_binding.batch_id, batch.id);
-    assert_eq!(quality_binding.task_id, task.id);
     assert_eq!(
         quality_binding.expected_coordination_version,
         coordination.authorization_version
