@@ -62,17 +62,16 @@ null `requested_by`/`revoked_at`, and supported default envelope values, not by
 an authorization version number.
 
 TaskCoordination authority minted for a Project batch is bound to that exact
-batch and is not a reusable direct Task grant. The public
-`POST /tasks/{id}/coordination/requests` route returns
-`409 project_plan_batch_inactive` when given that batch-scoped authorization version,
-even after the batch has been revoked or completed. While the batch is running
-or paused, the generic Task authorization route also returns
-`409 project_plan_batch_inactive`; `can_authorize` describes caller eligibility
-and does not override this exact batch guard. To switch to standalone Task
-coordination, explicitly revoke the Task authorization or revoke/complete the
-Project batch, then authorize again as a Human. The old batch grant becomes
-stale and admits no further work; the new authorization is independent of that
-history and does not revive it. Batch scheduler requests carry
+batch and authorization version; it is not a reusable generic Task grant. The
+public `POST /tasks/{id}/coordination/requests` route returns
+`409 project_plan_batch_inactive` for that version even after the batch is
+paused, revoked, or completed. While a batch is running or paused, the generic
+Task authorization route also returns `409 project_plan_batch_inactive`;
+`can_authorize` describes caller eligibility and does not override this guard.
+To restore standalone Task coordination, wait until the batch is inactive and
+have a Human create a fresh authorization with a new version. The previous
+batch-bound version admits no generic Agent turn and is not revived by the new
+authorization. Batch scheduler requests carry
 the current claim token, Quality
 Replan requests carry the exact source Artifact and producer Execution, and
 Human Replan requests carry the explicitly selected plan Artifact ID. That plan
@@ -82,6 +81,16 @@ and authorization version. Several plans can retain valid approval in one
 authorization; selection uses the supplied ID and never a latest timestamp or
 single canonical pointer. These origins are persisted against the Task and
 authorization version rather than inferred from version arithmetic.
+
+While the current authorization is batch-bound, generic Task events cannot
+create Agent coordinator wakes, including after the batch is paused, revoked,
+or completed. The three typed request origins above are the only batch-scoped
+Agent coordination entries. Human-targeted collaboration remains available.
+Terminal events for existing batch-linked coordinator Executions continue to
+reconcile against their exact durable wake, attempt, and request; they do not
+create generic replacement turns. Provider Start rechecks the exact batch
+request and Execution link in its write transaction, so a generic wake that
+races with batch authorization fails closed.
 
 The Task coordination overview exposes `project_plan_batch_scope` from the exact
 authorization binding: `batch_id`, `batch_state`, `task_state`, and `blocker`.

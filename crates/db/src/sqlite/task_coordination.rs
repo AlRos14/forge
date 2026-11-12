@@ -1316,6 +1316,24 @@ impl TaskCoordinationRepo for SqliteDb {
         .await?)
     }
 
+    async fn has_current_project_plan_batch_coordination_authorization(
+        &self,
+        task_id: &str,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_coordination coordination
+                JOIN project_plan_batch_coordination_authorization origin
+                  ON origin.task_id=coordination.task_id
+                 AND origin.authorization_version=coordination.authorization_version
+                WHERE coordination.task_id=?
+            )",
+        )
+        .bind(task_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     async fn revoke_task_coordination(
         &self,
         input: RevokeTaskCoordinationInput,

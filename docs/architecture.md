@@ -156,7 +156,7 @@ dispatch, and batch state remain distinct projections.
 TaskCoordination authorizations minted by a Project batch retain an immutable
 binding to that exact batch. The generic Task coordination request route rejects
 such a version with `409 project_plan_batch_inactive`, including after the batch
-is revoked or completed; a fresh explicit TaskCoordination authorization
+is paused, revoked, or completed; a fresh explicit TaskCoordination authorization
 restores the standalone request path. Scheduler, Quality Replan, and Human
 Replan continuations retain their exact claim token or source Artifact,
 producer Execution, or explicitly selected plan Artifact. Human Replan requires
@@ -164,6 +164,16 @@ approval valid in the active authorization/batch and an exact materialization
 receipt when the plan is materialized. Multiple plans may remain valid in one
 authorization; authority is never selected by latest timestamp. The origin is
 recorded directly and is never inferred from an authorization-version change.
+
+While that authorization version remains batch-bound, generic Task events do
+not create Agent coordinator wakes. Batch-bound Agent coordination starts only
+from its typed Scheduler, Quality Replan, or Human Replan request; Human-targeted
+collaboration remains available. Terminal events for existing batch-linked
+coordinator Executions continue to reconcile against their exact durable wake,
+attempt, and request. A fresh explicit Human authorization with a new version
+restores generic standalone coordination after the batch is inactive. Provider
+Start checks the batch request and Execution link in its write transaction, so
+a generic wake racing with batch authorization fails closed.
 
 ## Review, validation, and Gates
 

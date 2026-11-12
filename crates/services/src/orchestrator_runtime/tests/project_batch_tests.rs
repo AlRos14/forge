@@ -8,6 +8,34 @@ use db::{
 use serde_json::json;
 use std::{path::Path, process::Command, sync::Arc, time::Duration};
 
+type ObservedWorkUnitExecutionRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+type ObservedWakeRow = (String, String, String, Option<String>, Option<i64>);
+type ObservedExecutionDiagnosticRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 #[derive(Clone)]
 struct ProjectBatchHarnessAdapter {
     plan: String,
@@ -42,8 +70,8 @@ impl executors::HarnessAdapter for ProjectBatchHarnessAdapter {
                     self.plan.clone()
                 } else {
                     // The explicit batch request produces the WorkUnitPlan.
-                    // Later generic lifecycle wakes get the typed PR6 no-op
-                    // response, so this fixture does not invent more work.
+                    // Keep any later supported coordinator turn bounded to a
+                    // typed PR6 no-op; it must not invent more work.
                     r#"{"actions":[]}"#.to_owned()
                 }
             }
@@ -643,23 +671,10 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
     );
     let mut execution_events = event_bus.subscribe();
     let workflow_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-    let mut report_artifact_id: Option<String>;
-    let mut observed_execution_rows: Vec<(
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )>;
+    let report_artifact_id: Option<String>;
+    let mut observed_execution_rows: Vec<ObservedWorkUnitExecutionRow>;
     let mut observed_work_units: Vec<db::WorkUnit>;
-    let mut observed_wakes: Vec<(String, String, String, Option<String>, Option<i64>)>;
+    let mut observed_wakes: Vec<ObservedWakeRow>;
     let mut observed_wake_attempts: Vec<(String, i64, String, String, Option<String>, String)>;
     loop {
         let dispatch_outcome = dispatcher
@@ -669,7 +684,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         let runtime_outcome = runtime
             .run_once(100)
             .await
-            .expect("OrchestratorRuntime reconciles WorkUnit terminal events and follow-up wakes");
+            .expect("OrchestratorRuntime reconciles terminal events under batch authority");
         observed_execution_rows = sqlx::query_as(
             "SELECT e.id,e.role,e.status,e.error,e.summary,e.work_unit_id,e.work_unit_version,
                     e.workspace_id,e.harness_session_id,hs.external_session_id,hs.status,
@@ -719,7 +734,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         .bind(&task.id)
         .fetch_all(database.pool())
         .await
-        .expect("coordinator follow-up attempt receipts load");
+        .expect("durable coordinator wake attempt receipts load");
         let work_unit_executions_complete = observed_execution_rows.len() == 2
             && observed_execution_rows
                 .iter()
@@ -809,7 +824,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
                                 && matches!(entity_type.as_str(), "execution" | "work_unit")
                         ) =>
                     {
-                        break true
+                        break true;
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break true,
@@ -872,18 +887,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         .fetch_all(database.pool())
         .await
         .expect("batch plan, delivery, and review artifacts diagnose");
-        let all_execution_diagnostics: Vec<(
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        )> = sqlx::query_as(
+        let all_execution_diagnostics: Vec<ObservedExecutionDiagnosticRow> = sqlx::query_as(
             "SELECT e.id,e.role,e.status,e.error,e.summary,e.work_unit_id,
                     e.work_unit_version,e.workspace_id,hs.external_session_id,hs.status
              FROM execution e LEFT JOIN harness_session hs ON hs.id=e.harness_session_id
@@ -904,6 +908,33 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
     }
     let report_artifact_id =
         report_artifact_id.expect("completed reviewer has its exact report Artifact");
+    assert_eq!(
+        observed_wakes.len(),
+        1,
+        "only the exact batch coordination request admits an Agent orchestration wake"
+    );
+    assert_eq!(
+        observed_wakes[0].2, "task.coordination_requested",
+        "generic lifecycle events cannot create unlinked Agent wakes during the batch"
+    );
+    let wake_origins: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT event.event_type,event.entity_type,event.entity_id
+         FROM orchestrator_wake wake JOIN domain_event event ON event.id=wake.event_id
+         WHERE wake.task_id=? ORDER BY event.sequence,event.id",
+    )
+    .bind(&task.id)
+    .fetch_all(database.pool())
+    .await
+    .expect("exact and generic Agent wake origins load");
+    assert_eq!(
+        wake_origins,
+        vec![(
+            "task.coordination_requested".to_owned(),
+            "task_coordination_request".to_owned(),
+            request_id.clone(),
+        )],
+        "the durable Agent wake belongs to this exact batch request"
+    );
 
     let execution_rows = sqlx::query(
         "SELECT e.id,e.role,e.status,e.work_unit_id,link.batch_id,link.authorization_version
@@ -1057,8 +1088,8 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         })
         .collect::<Vec<_>>();
     assert!(
-        !follow_up_orchestrators.is_empty(),
-        "completed Worker lifecycle events produce their supported coordinator follow-up"
+        follow_up_orchestrators.is_empty(),
+        "batch Worker lifecycle events do not create unlinked generic coordinator Executions"
     );
     for execution in &follow_up_orchestrators {
         assert_eq!(execution.2, "completed");
@@ -1075,7 +1106,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
     assert_eq!(
         distinct_native_sessions.len(),
         observations.len(),
-        "every coordinator follow-up, Worker, and reviewer receives a fresh native session"
+        "every coordinator, Worker, and reviewer execution receives a fresh native session"
     );
 
     let observation_sessions = observations
@@ -1157,6 +1188,6 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
     assert_eq!(
         persisted_native_sessions.len(),
         observations.len(),
-        "every native identity persists once across initial and no-op follow-up turns"
+        "every native identity persists once across the coordinator, Worker, and reviewer turns"
     );
 }

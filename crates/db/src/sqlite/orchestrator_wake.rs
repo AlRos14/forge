@@ -51,6 +51,81 @@ async fn admit_orchestrator_wake_with_autonomy_fence(
         }
     }
 
+    if input.actor_kind == ActorKind::Agent {
+        let has_current_batch_origin: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_coordination coordination
+                JOIN project_plan_batch_coordination_authorization origin
+                  ON origin.task_id=coordination.task_id
+                 AND origin.authorization_version=coordination.authorization_version
+                WHERE coordination.task_id=?
+            )",
+        )
+        .bind(&input.task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let input_is_batch_request =
+            if let Some(request_id) = input.coordination_request_id.as_deref() {
+                sqlx::query_scalar(
+                    "SELECT EXISTS(
+                    SELECT 1 FROM project_plan_batch_coordination_request
+                    WHERE request_id=? AND task_id=?
+                )",
+                )
+                .bind(request_id)
+                .bind(&input.task_id)
+                .fetch_one(&mut *tx)
+                .await?
+            } else {
+                false
+            };
+        if has_current_batch_origin || input_is_batch_request {
+            let exact_batch_request =
+                if let Some(request_id) = input.coordination_request_id.as_deref() {
+                    sqlx::query_scalar(
+                        "SELECT EXISTS(
+                        SELECT 1
+                        FROM project_plan_batch_coordination_request scope
+                        JOIN task_coordination_request request
+                          ON request.id=scope.request_id AND request.task_id=scope.task_id
+                        JOIN task_coordination coordination
+                          ON coordination.task_id=scope.task_id
+                         AND coordination.authorization_version=scope.authorization_version
+                        JOIN domain_event event
+                          ON event.id=? AND event.sequence=?
+                         AND event.event_type='task.coordination_requested'
+                         AND event.entity_type='task_coordination_request'
+                         AND event.entity_id=request.id
+                         AND event.scope_type='task' AND event.scope_id=request.task_id
+                        WHERE scope.request_id=? AND scope.task_id=?
+                          AND request.authorization_version=scope.authorization_version
+                          AND coordination.coordinator_task_role_id=?
+                          AND coordination.coordinator_actor_kind='agent'
+                          AND coordination.coordinator_actor_id=?
+                    )",
+                    )
+                    .bind(&input.event_id)
+                    .bind(input.event_sequence)
+                    .bind(request_id)
+                    .bind(&input.task_id)
+                    .bind(&input.task_role_id)
+                    .bind(&input.actor_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                } else {
+                    false
+                };
+            if !exact_batch_request {
+                // A generic Agent wake cannot inherit a Project batch grant,
+                // and a stale batch request cannot become a standalone turn.
+                // Only the request row and source event bound to the exact
+                // current batch authorization can admit the coordinator.
+                tx.rollback().await?;
+                return Ok(false);
+            }
+        }
+    }
+
     // A coordination wake and its request identity are one durable fact.
     // Linking them in a separate call leaves a crash window where the
     // dispatcher sees a wake with no request and falls back to generic

@@ -1107,6 +1107,21 @@ impl OrchestratorRuntime {
         } else {
             None
         };
+        let exact_batch_request = match coordination_request.as_ref() {
+            Some(request) => {
+                TaskCoordinationRepo::is_project_plan_batch_coordination_request(
+                    &*self.db,
+                    &request.id,
+                )
+                .await?
+            }
+            None => false,
+        };
+        let batch_scoped =
+            TaskCoordinationRepo::has_current_project_plan_batch_coordination_authorization(
+                &*self.db, task_id,
+            )
+            .await?;
         let current_coordination =
             TaskCoordinationRepo::get_task_coordination(&*self.db, task_id).await?;
         let guided_role_id=current_coordination.filter(|c|c.mode != db::TaskCoordinationMode::Manual && c.revoked_at.is_none() && !c.team_stale)
@@ -1168,6 +1183,14 @@ impl OrchestratorRuntime {
                 &signal.target,
             );
             for membership in targets {
+                if batch_scoped && !exact_batch_request && membership.actor_kind == ActorKind::Agent
+                {
+                    // A Project batch owns Agent orchestration turns through
+                    // its exact coordination request. Generic events have no
+                    // batch receipt, so they cannot safely start an Agent
+                    // Execution under the batch authorization.
+                    continue;
+                }
                 if (event_is_authored_by_member(event, membership)
                     && !matches!(
                         event.event_type.as_str(),

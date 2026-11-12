@@ -143,6 +143,12 @@ pub trait TaskCoordinationRepo: Send + Sync {
         expected_batch_version: i64,
         expected_graph_version: i64,
     ) -> Result<bool>;
+    /// Returns whether the Task's current coordination version still has a
+    /// durable Project batch authorization origin, regardless of batch state.
+    async fn has_current_project_plan_batch_coordination_authorization(
+        &self,
+        task_id: &str,
+    ) -> Result<bool>;
     async fn revoke_task_coordination(
         &self,
         input: RevokeTaskCoordinationInput,

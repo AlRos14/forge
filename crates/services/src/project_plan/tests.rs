@@ -4,13 +4,14 @@ use db::{
     AgentStatus, CreateAgent, CreateDomainEvent, CreateOrchestratorWake, CreateProject,
     CreateProjectMember, CreateRepo, CreateRoleMembership, CreateTask, CreateTaskRole,
     CreateWorkUnit, CreateWorkUnitIntegration, CreateWorkUnitWorkspace, CreateWorkspace,
-    DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus, OrchestratorWakeRepo,
-    ProjectMemberRepo, ProjectPlanBatchRequestBinding, ProjectPlanBatchRequestOrigin, ProjectRepo,
-    RecordWorkUnitIntegration, RepoRepo, RoleMembershipRepo, RoleMembershipStatus,
-    TaskCoordinationMode, TaskCoordinationRepo, TaskDependencyRepo, TaskLifecycleRepo,
-    TaskLifecycleState, TaskRepo, TaskRoleRepo, TransitionWorkUnit, UpdateAgent,
-    UpdateDaemonReport, UpsertDaemon, User, UserRepo, WorkMode, WorkUnitIntegrationOutcome,
-    WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo, WorkspaceStatus,
+    DaemonRepo, DaemonStatus, DomainEventRepo, ExecutionRepo, ExecutionStatus,
+    OrchestratorWakeRepo, ProjectMemberRepo, ProjectPlanBatchRequestBinding,
+    ProjectPlanBatchRequestOrigin, ProjectRepo, RecordWorkUnitIntegration, RepoRepo,
+    RoleMembershipRepo, RoleMembershipStatus, TaskCoordinationMode, TaskCoordinationRepo,
+    TaskDependencyRepo, TaskLifecycleRepo, TaskLifecycleState, TaskRepo, TaskRoleRepo,
+    TransitionWorkUnit, UpdateAgent, UpdateDaemonReport, UpsertDaemon, User, UserRepo, WorkMode,
+    WorkUnitIntegrationOutcome, WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use events::EventBus;
 use std::{
@@ -1513,6 +1514,290 @@ async fn batch_scoped_coordination_requires_fresh_human_reauthorization_after_re
         .await
         .expect("no provider Execution is created by the request");
     assert_eq!(execution_count, 0);
+}
+
+#[tokio::test]
+async fn current_batch_origin_fences_generic_agent_wakes_until_fresh_human_authorization() {
+    let fixture = fixture().await;
+    let task_id = seed_task(
+        &fixture.db,
+        &fixture.project_id,
+        "Current batch wake admission fence",
+    )
+    .await;
+    let agent_id = new_uuid_v4();
+    seed_agent_coordinator(&fixture, &task_id, &agent_id).await;
+
+    // This generic Task event exists before the batch grant. Its admission
+    // below models a classifier read that raced ahead of the grant and then
+    // reached the durable writer after the grant committed.
+    let source_event = DomainEventRepo::append_event(
+        &*fixture.db,
+        domain_event(
+            "task.updated",
+            "task",
+            &task_id,
+            &task_id,
+            &fixture.owner_id,
+        ),
+    )
+    .await
+    .expect("pre-grant generic source event commits durably");
+    let graph = fixture
+        .service
+        .graph(&fixture.project_id)
+        .await
+        .expect("Project plan graph loads before batch authorization");
+    let batch = fixture
+        .service
+        .authorize_batch(
+            &fixture.project_id,
+            &fixture.owner_id,
+            graph.version,
+            vec![task_id.clone()],
+            1,
+            "generic-wake-batch-fence",
+        )
+        .await
+        .expect("Project owner authorizes the exact batch Task");
+    assert_eq!(batch.state, "running");
+    assert!(
+        TaskCoordinationRepo::has_current_project_plan_batch_coordination_authorization(
+            &*fixture.db,
+            &task_id,
+        )
+        .await
+        .expect("current batch coordination origin loads")
+    );
+
+    let coordination = TaskCoordinationRepo::get_task_coordination(&*fixture.db, &task_id)
+        .await
+        .expect("current batch coordination loads")
+        .expect("batch Task retains coordination authority");
+    let task_role_id = coordination
+        .coordinator_task_role_id
+        .clone()
+        .expect("batch coordinator TaskRole remains exact");
+    let role = TaskRoleRepo::get_by_id(&*fixture.db, &task_role_id)
+        .await
+        .expect("current coordinator TaskRole loads")
+        .expect("current coordinator TaskRole exists");
+    let make_wake =
+        |event: &db::DomainEvent, coordination_request_id: Option<String>| CreateOrchestratorWake {
+            id: new_uuid_v4(),
+            event_id: event.id.clone(),
+            event_sequence: event.sequence,
+            task_id: task_id.clone(),
+            task_role_id: role.id.clone(),
+            coordination_mode: role.coordination_mode,
+            actor_kind: ActorKind::Agent,
+            actor_id: agent_id.clone(),
+            work_unit_id: None,
+            correlation_id: event.correlation_id.clone(),
+            causation_id: Some(event.id.clone()),
+            causation_depth: event.causation_depth,
+            policy_ref: "forge.orchestrator.wake-policy".to_owned(),
+            policy_version: 2,
+            policy_digest: "fixture-wake-policy-v2".to_owned(),
+            task_role_version: role.version,
+            task_role_policy_json: role.policy_json.clone(),
+            coordination_request_id,
+            available_at: now_rfc3339(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        };
+
+    assert!(
+        !OrchestratorWakeRepo::admit_orchestrator_wake(
+            &*fixture.db,
+            make_wake(&source_event, None),
+        )
+        .await
+        .expect("atomic admission checks the current batch origin"),
+        "a stale generic classifier read cannot admit an Agent wake after the batch grant commits"
+    );
+    let suppressed_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM orchestrator_wake
+         WHERE event_id=? AND task_id=? AND actor_kind='agent' AND actor_id=?",
+    )
+    .bind(&source_event.id)
+    .bind(&task_id)
+    .bind(&agent_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("suppressed generic Agent wake count loads");
+    assert_eq!(suppressed_count, 0);
+
+    assert_eq!(
+        fixture
+            .service
+            .check_once()
+            .await
+            .expect("scheduler creates the exact batch coordination request"),
+        1
+    );
+    let request_id: String = sqlx::query_scalar(
+        "SELECT request_id FROM project_plan_batch_coordination_request
+         WHERE batch_id=? AND task_id=?",
+    )
+    .bind(&batch.id)
+    .bind(&task_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("exact batch request identity loads");
+    let request_event = DomainEventRepo::list_events_after(&*fixture.db, 0, 500)
+        .await
+        .expect("durable coordination request events load")
+        .into_iter()
+        .find(|event| {
+            event.event_type == "task.coordination_requested"
+                && event.entity_type == "task_coordination_request"
+                && event.entity_id == request_id
+                && event.scope_id == task_id
+        })
+        .expect("exact scheduler request has its durable source event");
+    let exact_wake = make_wake(&request_event, Some(request_id.clone()));
+    let exact_wake_id = exact_wake.id.clone();
+    assert!(
+        OrchestratorWakeRepo::admit_orchestrator_wake(&*fixture.db, exact_wake)
+            .await
+            .expect("exact batch request admission remains available"),
+        "only the request with its matching current batch origin gets the Agent exception"
+    );
+    let linked_request =
+        TaskCoordinationRepo::get_task_coordination_request(&*fixture.db, &request_id)
+            .await
+            .expect("batch request wake receipt loads")
+            .expect("batch request remains durable");
+    assert_eq!(
+        linked_request.wake_id.as_deref(),
+        Some(exact_wake_id.as_str())
+    );
+
+    let current_batch_version: i64 =
+        sqlx::query_scalar("SELECT version FROM project_plan_batch WHERE id=?")
+            .bind(&batch.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("current Project batch version loads");
+    let revoked = fixture
+        .service
+        .update_batch(
+            &fixture.project_id,
+            &fixture.owner_id,
+            &batch.id,
+            current_batch_version,
+            "revoke",
+            "generic-wake-batch-fence-revoke",
+        )
+        .await
+        .expect("Project owner revokes the batch");
+    assert_eq!(revoked.state, "revoked");
+    assert!(
+        TaskCoordinationRepo::has_current_project_plan_batch_coordination_authorization(
+            &*fixture.db,
+            &task_id,
+        )
+        .await
+        .expect("revoked batch origin still loads for its unchanged current authorization")
+    );
+    let coordination_service = crate::task_coordination::TaskCoordinationService::new(
+        Arc::clone(&fixture.db),
+        Arc::clone(&fixture.event_bus),
+    );
+    coordination_service
+        .mark_request_cancelled(&linked_request)
+        .await
+        .expect("revoked batch request is terminalized before fresh authorization");
+    let after_revoke_event = DomainEventRepo::append_event(
+        &*fixture.db,
+        domain_event(
+            "task.updated",
+            "task",
+            &task_id,
+            &task_id,
+            &fixture.owner_id,
+        ),
+    )
+    .await
+    .expect("post-revoke generic event commits durably");
+    assert!(
+        !OrchestratorWakeRepo::admit_orchestrator_wake(
+            &*fixture.db,
+            make_wake(&after_revoke_event, None),
+        )
+        .await
+        .expect("revoked current origin still fences generic Agent admission"),
+        "revoking or completing a batch does not silently convert its current grant into generic Agent authority"
+    );
+
+    let task = TaskRepo::get_by_id(&*fixture.db, &task_id, false)
+        .await
+        .expect("Task reloads before fresh Human authorization")
+        .expect("Task remains available");
+    let coordination = TaskCoordinationRepo::get_task_coordination(&*fixture.db, &task_id)
+        .await
+        .expect("coordination reloads before fresh Human authorization")
+        .expect("Task coordination remains durable");
+    let fresh_authorization = coordination_service
+        .authorize_with_expected_team_generation(
+            &task_id,
+            &fixture.owner_id,
+            crate::task_coordination::AuthorizationInput {
+                expected_task_version: task.version,
+                expected_coordination_version: coordination.authorization_version,
+                mode: TaskCoordinationMode::PrepareAndExecute,
+                coordinator_task_role_id: coordination.coordinator_task_role_id.clone(),
+                coordinator_actor: coordination.coordinator_actor.clone(),
+                envelope: None,
+                idempotency_key: "fresh-human-authorization-after-batch-fence".to_owned(),
+            },
+            coordination.team_generation,
+        )
+        .await
+        .expect("fresh Human authorization replaces the prior batch grant");
+    assert_eq!(
+        fresh_authorization.coordination.requested_by.as_deref(),
+        Some(fixture.owner_id.as_str())
+    );
+    assert!(
+        !TaskCoordinationRepo::has_current_project_plan_batch_coordination_authorization(
+            &*fixture.db,
+            &task_id,
+        )
+        .await
+        .expect("fresh authorization no longer matches the old batch origin")
+    );
+    assert!(
+        !OrchestratorWakeRepo::admit_orchestrator_wake(
+            &*fixture.db,
+            make_wake(&request_event, Some(request_id.clone())),
+        )
+        .await
+        .expect("old batch request cannot be admitted under the fresh authorization"),
+        "a batch request stays bound to the authorization version that created it"
+    );
+    let after_reauthorization_event = DomainEventRepo::append_event(
+        &*fixture.db,
+        domain_event(
+            "task.updated",
+            "task",
+            &task_id,
+            &task_id,
+            &fixture.owner_id,
+        ),
+    )
+    .await
+    .expect("freshly authorized generic event commits durably");
+    assert!(
+        OrchestratorWakeRepo::admit_orchestrator_wake(
+            &*fixture.db,
+            make_wake(&after_reauthorization_event, None),
+        )
+        .await
+        .expect("fresh Human authorization permits a generic Agent wake"),
+        "a new Human authorization version may admit generic Agent work after the batch fence is replaced"
+    );
 }
 
 #[tokio::test]
