@@ -271,7 +271,9 @@ describe('ProjectPlanPage', () => {
     })
     expect(within(graphRegion).getAllByRole('article')).toHaveLength(3)
     expect(within(graphRegion).queryByRole('link', { name: 'Task D' })).toBeNull()
-    expect(within(graphRegion).getAllByRole('row')).toHaveLength(3)
+    expect(
+      within(screen.getByRole('table', { name: 'Task dependency links' })).getAllByRole('row'),
+    ).toHaveLength(3)
   })
 
   it('keeps critical path duration unknown when any estimate is missing', () => {

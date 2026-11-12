@@ -603,7 +603,7 @@ impl ProjectPlanService {
             return Err("coordination:agent_required".into());
         }
         let actor = ActorRef::Agent(actor_id);
-        let envelope = batch_envelope_input(baseline)?;
+        let envelope = batch_envelope_input(&baseline).map_err(|error| error.to_string())?;
         let mut has_exact_batch_authorization =
             TaskCoordinationRepo::has_project_plan_batch_coordination_authorization(
                 &*self.db,
