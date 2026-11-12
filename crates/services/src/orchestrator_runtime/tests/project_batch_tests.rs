@@ -11,6 +11,7 @@ use std::{path::Path, process::Command, sync::Arc, time::Duration};
 #[derive(Clone)]
 struct ProjectBatchHarnessAdapter {
     plan: String,
+    orchestrator_turns: Arc<std::sync::atomic::AtomicUsize>,
     observations: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
 }
 
@@ -32,7 +33,20 @@ impl executors::HarnessAdapter for ProjectBatchHarnessAdapter {
         context: executors::ExecutionContext,
     ) -> std::result::Result<executors::ExecutionResult, executors::ExecutorError> {
         let output = match context.role.as_str() {
-            "orchestrator" => self.plan.clone(),
+            "orchestrator" => {
+                if self
+                    .orchestrator_turns
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 0
+                {
+                    self.plan.clone()
+                } else {
+                    // The explicit batch request produces the WorkUnitPlan.
+                    // Later generic lifecycle wakes get the typed PR6 no-op
+                    // response, so this fixture does not invent more work.
+                    r#"{"actions":[]}"#.to_owned()
+                }
+            }
             "implementer" => "Implementation delivered for the exact WorkUnit scope.".to_owned(),
             "reviewer" => "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"The exact implementation result meets its acceptance criterion.\",\"criteria\":[\"correctness\"],\"findings\":[],\"questions\":[],\"evidence_considered\":[]}".to_owned(),
             role => {
@@ -438,6 +452,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
     let mut registry = executors::HarnessAdapterRegistry::new();
     registry.register(Box::new(ProjectBatchHarnessAdapter {
         plan,
+        orchestrator_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         observations: Arc::clone(&observations),
     }));
     let registry = Arc::new(registry);
@@ -446,6 +461,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         TaskService::new(Arc::clone(&database), Arc::clone(&event_bus))
             .with_workspace_root(workspace_root.path().to_path_buf())
             .with_workspace_exec_locks(Arc::new(crate::WorkspaceExecutionLockManager::new()))
+            .with_repo_cache_locks(Arc::new(::workspace::RepoCacheLockManager::new()))
             .with_task_executor(Arc::new(executors::AdapterExecutor::new(Arc::clone(
                 &registry,
             ))))
@@ -625,18 +641,47 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         Arc::clone(&event_bus),
         Arc::clone(&task_service),
     );
-    let mut report_artifact = None;
-    for _ in 0..200 {
-        let _ = dispatcher
+    let mut execution_events = event_bus.subscribe();
+    let workflow_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut report_artifact_id: Option<String>;
+    let mut observed_execution_rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )>;
+    let mut observed_work_units: Vec<db::WorkUnit>;
+    let mut observed_wakes: Vec<(String, String, String, Option<String>, Option<i64>)>;
+    let mut observed_wake_attempts: Vec<(String, i64, String, String, Option<String>, String)>;
+    loop {
+        let dispatch_outcome = dispatcher
             .check_once()
             .await
             .expect("TaskDispatcher admits the next ready materialized WorkUnit");
-        let execution_rows = sqlx::query(
-            "SELECT e.id,e.role,e.status,a.id AS artifact_id
+        let runtime_outcome = runtime
+            .run_once(100)
+            .await
+            .expect("OrchestratorRuntime reconciles WorkUnit terminal events and follow-up wakes");
+        observed_execution_rows = sqlx::query_as(
+            "SELECT e.id,e.role,e.status,e.error,e.summary,e.work_unit_id,e.work_unit_version,
+                    e.workspace_id,e.harness_session_id,hs.external_session_id,hs.status,
+                    report.id AS report_artifact_id
              FROM execution e
              JOIN work_unit w ON w.id=e.work_unit_id
-             LEFT JOIN artifact_execution_producer producer ON producer.execution_id=e.id
-             LEFT JOIN artifact a ON a.id=producer.artifact_id AND a.kind='review_report'
+             LEFT JOIN harness_session hs ON hs.id=e.harness_session_id
+             LEFT JOIN artifact_execution_producer producer
+               ON producer.execution_id=e.id AND producer.task_id=e.task_id
+             LEFT JOIN artifact report
+               ON report.id=producer.artifact_id AND report.task_id=e.task_id
+              AND report.kind='review_report'
              WHERE e.task_id=? AND w.provenance_kind='artifact' AND w.provenance_id=?
              ORDER BY e.created_at,e.id",
         )
@@ -645,22 +690,220 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         .fetch_all(database.pool())
         .await
         .expect("materialized WorkUnit Executions and report links load");
-        report_artifact = execution_rows.iter().find_map(|row| {
-            let role: String = row.try_get("role").expect("Execution role reads");
-            (role == "reviewer")
-                .then(|| {
-                    row.try_get::<Option<String>, _>("artifact_id")
-                        .expect("report Artifact ID reads")
-                })
-                .flatten()
+        let work_units = WorkUnitRepo::list_by_task(&*database, &task.id)
+            .await
+            .expect("materialized WorkUnits load")
+            .into_iter()
+            .filter(|unit| {
+                unit.provenance == Some(db::WorkUnitProvenance::Artifact(plan_artifact_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        observed_work_units = work_units;
+        observed_wakes = sqlx::query_as(
+            "SELECT w.id,w.state,e.event_type,w.last_error,w.current_attempt
+             FROM orchestrator_wake w JOIN domain_event e ON e.id=w.event_id
+             WHERE w.task_id=? ORDER BY w.event_sequence,w.id",
+        )
+        .bind(&task.id)
+        .fetch_all(database.pool())
+        .await
+        .expect("batch orchestration wake states load");
+        observed_wake_attempts = sqlx::query_as(
+            "SELECT attempt.wake_id,attempt.attempt_number,attempt.execution_id,
+                    attempt.state,attempt.last_error,execution.status
+             FROM orchestrator_wake_execution attempt
+             JOIN orchestrator_wake wake ON wake.id=attempt.wake_id
+             JOIN execution ON execution.id=attempt.execution_id
+             WHERE wake.task_id=? ORDER BY attempt.wake_id,attempt.attempt_number",
+        )
+        .bind(&task.id)
+        .fetch_all(database.pool())
+        .await
+        .expect("coordinator follow-up attempt receipts load");
+        let work_unit_executions_complete = observed_execution_rows.len() == 2
+            && observed_execution_rows
+                .iter()
+                .all(|row| row.2 == "completed")
+            && observed_execution_rows
+                .iter()
+                .any(|row| row.1 == "implementer")
+            && observed_execution_rows
+                .iter()
+                .any(|row| row.1 == "reviewer");
+        let all_work_units_complete = observed_work_units.len() == 2
+            && observed_work_units
+                .iter()
+                .all(|unit| unit.status == db::WorkUnitStatus::Completed);
+        let has_review_report = observed_execution_rows
+            .iter()
+            .find(|row| row.1 == "reviewer")
+            .and_then(|row| row.11.clone());
+        let all_wakes_completed =
+            !observed_wakes.is_empty() && observed_wakes.iter().all(|wake| wake.1 == "completed");
+        let terminally_blocked_wakes = observed_wakes
+            .iter()
+            .filter(|wake| matches!(wake.1.as_str(), "failed" | "awaiting_human" | "uncertain"))
+            .count();
+        let all_wake_attempts_completed = observed_wakes.iter().all(|wake| {
+            observed_wake_attempts
+                .iter()
+                .filter(|attempt| attempt.0 == wake.0)
+                .max_by_key(|attempt| attempt.1)
+                .is_some_and(|attempt| attempt.3 == "completed" && attempt.5 == "completed")
         });
-        if report_artifact.is_some() {
+        let all_wake_attempt_rows_terminal = observed_wake_attempts.iter().all(|attempt| {
+            matches!(attempt.3.as_str(), "completed" | "failed") && attempt.5 != "running"
+        });
+        if work_unit_executions_complete
+            && all_work_units_complete
+            && has_review_report.is_some()
+            && all_wakes_completed
+            && all_wake_attempts_completed
+            && all_wake_attempt_rows_terminal
+        {
+            report_artifact_id = has_review_report;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let failed_work_execution = observed_execution_rows
+            .iter()
+            .any(|row| matches!(row.2.as_str(), "failed" | "cancelled"));
+        if failed_work_execution
+            || terminally_blocked_wakes > 0
+            || tokio::time::Instant::now() >= workflow_deadline
+        {
+            report_artifact_id = None;
+            break;
+        }
+
+        let running_executions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution WHERE task_id=? AND status='running'",
+        )
+        .bind(&task.id)
+        .fetch_one(database.pool())
+        .await
+        .expect("active batch execution count loads");
+        let made_progress = dispatch_outcome > 0
+            || runtime_outcome.processed_events > 0
+            || runtime_outcome.admitted_wakes > 0
+            || runtime_outcome.dispatched_wakes > 0
+            || runtime_outcome.retried_wakes > 0;
+
+        // DomainEventCommitted is a delivery hint only. The following pass
+        // reloads authoritative WorkUnit, Execution, Artifact, and Wake rows.
+        let wait_deadline =
+            (tokio::time::Instant::now() + Duration::from_secs(5)).min(workflow_deadline);
+        let next_event = tokio::time::timeout_at(wait_deadline, async {
+            loop {
+                match execution_events.recv().await {
+                    Ok(event)
+                        if matches!(
+                            &event.context,
+                            events::EventContext::DomainEventCommitted {
+                                entity_type,
+                                scope_type,
+                                scope_id,
+                                ..
+                            } if scope_type == "task"
+                                && scope_id == &task.id
+                                && matches!(entity_type.as_str(), "execution" | "work_unit")
+                        ) =>
+                    {
+                        break true
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break true,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break false,
+                }
+            }
+        })
+        .await;
+        if matches!(next_event, Ok(false))
+            || (next_event.is_err()
+                && running_executions == 0
+                && observed_wakes.iter().all(|wake| wake.1 == "completed")
+                && !made_progress)
+        {
+            report_artifact_id = None;
+            break;
+        }
     }
-    let report_artifact_id = report_artifact
-        .expect("Worker and reviewer Executions complete through the fake Harness and produce a ReviewReport");
+    if report_artifact_id.is_none() {
+        let unit_diagnostics = {
+            let mut diagnostics = Vec::new();
+            for unit in &observed_work_units {
+                let dependencies = WorkUnitRepo::list_dependencies(&*database, &unit.id)
+                    .await
+                    .expect("WorkUnit dependency diagnostics load");
+                let active_execution_ids =
+                    WorkUnitRepo::list_active_execution_ids(&*database, &unit.id)
+                        .await
+                        .expect("WorkUnit active Execution diagnostics load");
+                let workspace =
+                    db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*database, &unit.id)
+                        .await
+                        .expect("WorkUnit Workspace diagnostics load");
+                let lease = db::WorkspaceLeaseRepo::get_active_for_work_unit(&*database, &unit.id)
+                    .await
+                    .expect("WorkUnit WorkspaceLease diagnostics load");
+                diagnostics.push((
+                    unit.clone(),
+                    dependencies,
+                    active_execution_ids,
+                    workspace,
+                    lease,
+                ));
+            }
+            diagnostics
+        };
+        let produced_artifacts: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT a.id,a.kind,a.digest,p.execution_id
+             FROM artifact a JOIN artifact_execution_producer p
+               ON p.artifact_id=a.id AND p.task_id=a.task_id
+             JOIN execution e ON e.id=p.execution_id AND e.task_id=p.task_id
+             WHERE e.task_id=? AND (e.role='orchestrator' OR e.work_unit_id IN (
+                 SELECT id FROM work_unit WHERE task_id=?
+                   AND provenance_kind='artifact' AND provenance_id=?
+             )) ORDER BY e.created_at,e.id,a.kind,a.id",
+        )
+        .bind(&task.id)
+        .bind(&task.id)
+        .bind(&plan_artifact_id)
+        .fetch_all(database.pool())
+        .await
+        .expect("batch plan, delivery, and review artifacts diagnose");
+        let all_execution_diagnostics: Vec<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT e.id,e.role,e.status,e.error,e.summary,e.work_unit_id,
+                    e.work_unit_version,e.workspace_id,hs.external_session_id,hs.status
+             FROM execution e LEFT JOIN harness_session hs ON hs.id=e.harness_session_id
+             WHERE e.task_id=? ORDER BY e.created_at,e.id",
+        )
+        .bind(&task.id)
+        .fetch_all(database.pool())
+        .await
+        .expect("all coordinator, Worker, and reviewer Execution diagnostics load");
+        panic!(
+            "batch Worker/reviewer lifecycle did not reach exact completion; \
+             work_units={unit_diagnostics:?}; executions={observed_execution_rows:?}; \
+             all_executions={all_execution_diagnostics:?}; \
+             produced_artifacts={produced_artifacts:?}; orchestration_wakes={observed_wakes:?}; \
+             orchestration_attempts={observed_wake_attempts:?}; \
+             deadline={workflow_deadline:?}"
+        );
+    }
+    let report_artifact_id =
+        report_artifact_id.expect("completed reviewer has its exact report Artifact");
 
     let execution_rows = sqlx::query(
         "SELECT e.id,e.role,e.status,e.work_unit_id,link.batch_id,link.authorization_version
@@ -773,14 +1016,56 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         .lock()
         .expect("fake Harness observations remain readable")
         .clone();
-    for role in ["orchestrator", "implementer", "reviewer"] {
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|(observed_role, _, _)| observed_role == "implementer")
+            .count(),
+        1,
+        "the bounded plan admits one implementation Execution"
+    );
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|(observed_role, _, _)| observed_role == "reviewer")
+            .count(),
+        1,
+        "the bounded plan admits one formal review Execution"
+    );
+    assert!(
+        observations.iter().any(|(observed_role, execution_id, _)| {
+            observed_role == "orchestrator" && execution_id == &coordinator_execution_id
+        }),
+        "the explicit batch request's coordinator Execution reaches the fake Harness"
+    );
+    let all_executions: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id,role,status,summary FROM execution WHERE task_id=? ORDER BY created_at,id",
+    )
+    .bind(&task.id)
+    .fetch_all(database.pool())
+    .await
+    .expect("all coordinator, Worker, and reviewer Executions load");
+    assert_eq!(
+        all_executions.len(),
+        observations.len(),
+        "every durable execution in the fixture has one corresponding fake Harness turn"
+    );
+    let follow_up_orchestrators = all_executions
+        .iter()
+        .filter(|execution| {
+            execution.1 == "orchestrator" && execution.0 != coordinator_execution_id
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !follow_up_orchestrators.is_empty(),
+        "completed Worker lifecycle events produce their supported coordinator follow-up"
+    );
+    for execution in &follow_up_orchestrators {
+        assert_eq!(execution.2, "completed");
         assert_eq!(
-            observations
-                .iter()
-                .filter(|(observed_role, _, _)| observed_role == role)
-                .count(),
-            1,
-            "the fake Harness handles one fresh {role} Execution"
+            execution.3.as_deref(),
+            Some(r#"{"actions":[]}"#),
+            "follow-up coordinator Executions return the valid PR6 no-action envelope"
         );
     }
     let distinct_native_sessions = observations
@@ -789,8 +1074,8 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(
         distinct_native_sessions.len(),
-        3,
-        "coordinator, Worker, and reviewer receive separate native sessions"
+        observations.len(),
+        "every coordinator follow-up, Worker, and reviewer receives a fresh native session"
     );
 
     let observation_sessions = observations
@@ -798,21 +1083,32 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         .map(|(_, execution_id, session)| (execution_id.as_str(), session.as_str()))
         .collect::<std::collections::HashMap<_, _>>();
     let persisted_sessions = sqlx::query(
-        "SELECT e.id,e.harness_session_id,hs.id AS persisted_session_id,hs.external_session_id
+        "SELECT e.id,e.role,e.harness_session_id,hs.id AS persisted_session_id,
+                hs.external_session_id,hs.status,e.status AS execution_status
          FROM execution e
          JOIN harness_session hs ON hs.id=e.harness_session_id
-         WHERE e.id IN (?,?,?)",
+         WHERE e.task_id=? ORDER BY e.created_at,e.id",
     )
-    .bind(&coordinator_execution_id)
-    .bind(&work_unit_execution_ids[0])
-    .bind(&work_unit_execution_ids[1])
+    .bind(&task.id)
     .fetch_all(database.pool())
     .await
-    .expect("persisted coordinator, Worker, and reviewer HarnessSessions load");
-    assert_eq!(persisted_sessions.len(), 3);
+    .expect("all persisted coordinator, Worker, and reviewer HarnessSessions load");
+    assert_eq!(persisted_sessions.len(), observations.len());
     let mut persisted_native_sessions = std::collections::HashSet::new();
+    let mut core_native_sessions = std::collections::HashSet::new();
+    let core_execution_ids = [
+        coordinator_execution_id.as_str(),
+        work_unit_execution_ids[0].as_str(),
+        work_unit_execution_ids[1].as_str(),
+    ]
+    .into_iter()
+    .collect::<std::collections::HashSet<_>>();
     for row in &persisted_sessions {
         let execution_id: String = row.try_get("id").expect("Execution ID reads");
+        let role: String = row.try_get("role").expect("Execution role reads");
+        let execution_status: String = row
+            .try_get("execution_status")
+            .expect("Execution terminal status reads");
         let harness_session_id: Option<String> = row
             .try_get("harness_session_id")
             .expect("Execution HarnessSession ID reads");
@@ -822,6 +1118,11 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         let external_session_id: Option<String> = row
             .try_get("external_session_id")
             .expect("HarnessSession external ID reads");
+        let session_status: String = row
+            .try_get("status")
+            .expect("HarnessSession terminal status reads");
+        assert_eq!(execution_status, "completed");
+        assert_eq!(session_status, "active");
         assert_eq!(
             harness_session_id.as_deref(),
             Some(persisted_session_id.as_str())
@@ -833,11 +1134,29 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
             Some(external_session_id.as_str()),
             "the persisted native session matches the ID returned by this Execution's fake Harness"
         );
-        persisted_native_sessions.insert(external_session_id);
+        assert!(
+            persisted_native_sessions.insert(external_session_id.clone()),
+            "each fake Harness execution persists a distinct external session"
+        );
+        if core_execution_ids.contains(execution_id.as_str()) {
+            core_native_sessions.insert(external_session_id);
+        }
+        if role == "orchestrator" && execution_id != coordinator_execution_id {
+            let durable_execution = all_executions
+                .iter()
+                .find(|execution| execution.0 == execution_id)
+                .expect("follow-up coordinator execution is in the exact execution list");
+            assert_eq!(durable_execution.3.as_deref(), Some(r#"{"actions":[]}"#));
+        }
     }
     assert_eq!(
-        persisted_native_sessions.len(),
+        core_native_sessions.len(),
         3,
-        "coordinator, Worker, and reviewer HarnessSessions persist distinct native identities"
+        "the initial coordinator, Worker, and reviewer retain three separate native identities"
+    );
+    assert_eq!(
+        persisted_native_sessions.len(),
+        observations.len(),
+        "every native identity persists once across initial and no-op follow-up turns"
     );
 }

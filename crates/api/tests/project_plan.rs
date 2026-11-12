@@ -358,7 +358,7 @@ async fn direct_task_dependency_writes_require_the_current_graph_version_and_rep
 }
 
 #[tokio::test]
-async fn one_phase_grant_waits_for_prerequisite_acceptance_before_requesting_successor() {
+async fn one_phase_grant_keeps_successor_blocked_before_prerequisite_acceptance() {
     let directory = TestDir::new("project-plan-batch-dependency-order");
     let harness = test_app(directory.path(), "project-plan-batch-dependency-order").await;
     let project: ProjectResponse = json_request(
@@ -440,28 +440,19 @@ async fn one_phase_grant_waits_for_prerequisite_acceptance_before_requesting_suc
         .expect("successor request lookup")
         .is_none()
     );
-
-    sqlx::query(
-        "UPDATE task_lifecycle SET state='done',version=version+1,updated_at=? WHERE task_id=?",
+    let successor_batch_state: (String, Option<String>) = sqlx::query_as(
+        "SELECT state,blocker FROM project_plan_batch_task WHERE batch_id=? AND task_id=?",
     )
-    .bind(db::now_rfc3339())
-    .bind(&prerequisite.id)
-    .execute(harness.state.db.pool())
+    .bind(&batch.id)
+    .bind(&successor.id)
+    .fetch_one(harness.state.db.pool())
     .await
-    .expect("fixture accepts prerequisite without creating worker execution");
+    .expect("successor batch state loads");
+    assert_eq!(successor_batch_state.0, "blocked");
+    let dependency_blocker = format!("dependency:{}", prerequisite.id);
     assert_eq!(
-        planner.check_once().await.expect("second scheduler tick"),
-        1
-    );
-    assert!(
-        db::TaskCoordinationRepo::get_task_coordination_request_by_key(
-            &*harness.state.db,
-            &successor.id,
-            &successor_key,
-        )
-        .await
-        .expect("successor request lookup after acceptance")
-        .is_some()
+        successor_batch_state.1.as_deref(),
+        Some(dependency_blocker.as_str())
     );
     let executions: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id IN (?,?)")
@@ -916,6 +907,16 @@ async fn lifecycle_blocked_batch_task_waits_for_human_recovery_under_the_same_ba
         planner.check_once().await.expect("blocked scheduler tick"),
         0
     );
+    let batch_task_state: (String, Option<String>) = sqlx::query_as(
+        "SELECT state,blocker FROM project_plan_batch_task WHERE batch_id=? AND task_id=?",
+    )
+    .bind(&batch.id)
+    .bind(&task.id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .expect("lifecycle blocker persists in the batch");
+    assert_eq!(batch_task_state.0, "blocked");
+    assert_eq!(batch_task_state.1.as_deref(), Some("lifecycle:blocked"));
     let request_key = format!("project-plan-batch:{}:turn:{}", batch.id, task.id);
     assert!(
         db::TaskCoordinationRepo::get_task_coordination_request_by_key(
@@ -951,6 +952,34 @@ async fn lifecycle_blocked_batch_task_waits_for_human_recovery_under_the_same_ba
     .await;
     assert_eq!(
         planner.check_once().await.expect("recovery scheduler tick"),
+        0,
+        "the recovery tick reauthorizes the Task before a later tick requests coordination"
+    );
+    let batch_task_state: (String, Option<String>) = sqlx::query_as(
+        "SELECT state,blocker FROM project_plan_batch_task WHERE batch_id=? AND task_id=?",
+    )
+    .bind(&batch.id)
+    .bind(&task.id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .expect("recovered batch state persists");
+    assert_eq!(batch_task_state.0, "pending");
+    assert_eq!(batch_task_state.1, None);
+    assert!(
+        db::TaskCoordinationRepo::get_task_coordination_request_by_key(
+            &*harness.state.db,
+            &task.id,
+            &request_key,
+        )
+        .await
+        .expect("request remains absent during the recovery tick")
+        .is_none()
+    );
+    assert_eq!(
+        planner
+            .check_once()
+            .await
+            .expect("scheduler request after recovery"),
         1
     );
     assert!(
