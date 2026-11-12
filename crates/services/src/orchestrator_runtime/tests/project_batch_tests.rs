@@ -484,20 +484,68 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
 
     let mut materialized_plan_id = None;
     let mut coordinator_execution_id = None;
+    let mut observed_request = request.clone();
     for _ in 0..200 {
         let current = TaskCoordinationRepo::get_task_coordination_request(&*database, &request_id)
             .await
             .expect("batch request status loads")
             .expect("batch request remains durable");
+        observed_request = current.clone();
         if current.state == db::TaskCoordinationRequestState::Materialized {
             materialized_plan_id = current.plan_artifact_id;
             coordinator_execution_id = current.execution_id;
             break;
         }
+        if let Some(execution_id) = current.execution_id.as_deref() {
+            let execution = db::ExecutionRepo::get_by_id(&*database, execution_id)
+                .await
+                .expect("coordinator Execution status loads")
+                .expect("running request has its exact coordinator Execution");
+            if execution.status != db::ExecutionStatus::Running {
+                // run_once dispatches the coordinator after its event scan.
+                // Drive the durable terminal event in a subsequent pass as
+                // the normal OrchestratorRuntime loop does.
+                runtime
+                    .run_once(100)
+                    .await
+                    .expect("OrchestratorRuntime reconciles the coordinator terminal event");
+            }
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let plan_artifact_id = materialized_plan_id
-        .expect("fake cognitive plan is persisted and materialized by TaskCoordinationService");
+    let execution_diagnostic = match observed_request.execution_id.as_deref() {
+        Some(execution_id) => db::ExecutionRepo::get_by_id(&*database, execution_id)
+            .await
+            .expect("coordinator Execution diagnostic loads")
+            .map(|execution| {
+                (
+                    execution.id,
+                    execution.status,
+                    execution.error,
+                    execution.summary,
+                    execution.harness_session_id,
+                )
+            }),
+        None => None,
+    };
+    let terminal_wake_diagnostic: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT w.state,w.last_error
+         FROM orchestrator_wake w
+         JOIN domain_event e ON e.id=w.event_id
+         WHERE e.event_type='task.coordination_requested' AND e.entity_id=? AND w.task_id=?",
+    )
+    .bind(&request_id)
+    .bind(&task.id)
+    .fetch_optional(database.pool())
+    .await
+    .expect("terminal batch coordinator wake diagnostic loads");
+    let plan_artifact_id = materialized_plan_id.unwrap_or_else(|| {
+        panic!(
+            "fake cognitive plan was not persisted and materialized by TaskCoordinationService; \
+             request={observed_request:?}; coordinator_execution={execution_diagnostic:?}; \
+             durable_wake={terminal_wake_diagnostic:?}"
+        )
+    });
     let coordinator_execution_id = coordinator_execution_id
         .expect("materialized WorkUnitPlan identifies its coordinator Execution");
     let plan_record =

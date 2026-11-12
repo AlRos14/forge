@@ -723,16 +723,22 @@ async fn batch_coordination_auth_scope_fault_injection_never_leaves_an_unscoped_
     // and block later use, or roll back both writes; this trigger is not a
     // concurrent HTTP owner revocation because SQLite serializes writers.
     let revoke_trigger = format!(
-        "CREATE TRIGGER test_revoke_batch_after_coordination_auth\n\
-         AFTER UPDATE OF authorization_version ON task_coordination\n\
-         WHEN NEW.task_id='{task_id}' AND NEW.authorization_version > OLD.authorization_version\n\
-         BEGIN\n\
-           UPDATE project_plan_batch SET state='revoked',version=version+1,\
-             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')\n\
-           WHERE id IN (SELECT bt.batch_id FROM project_plan_batch_task bt\
-             JOIN project_plan_batch b ON b.id=bt.batch_id\
-             WHERE bt.task_id=NEW.task_id AND b.state='paused' AND b.preparation_complete=0);\n\
-         END;",
+        r#"CREATE TRIGGER test_revoke_batch_after_coordination_auth
+        AFTER UPDATE OF authorization_version ON task_coordination
+        WHEN NEW.task_id='{task_id}' AND NEW.authorization_version > OLD.authorization_version
+        BEGIN
+          UPDATE project_plan_batch
+          SET state='revoked', version=version+1,
+              updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id IN (
+              SELECT bt.batch_id
+              FROM project_plan_batch_task bt
+              JOIN project_plan_batch b ON b.id=bt.batch_id
+              WHERE bt.task_id=NEW.task_id
+                AND b.state='paused'
+                AND b.preparation_complete=0
+          );
+        END;"#,
         task_id = task.id,
     );
     sqlx::query(&revoke_trigger)
@@ -981,32 +987,49 @@ async fn configure_project_coordinator(harness: &common::Harness, project_id: &s
     let agent = common::create_harness_agent(&harness.app, &token, "Project DAG coordinator")
         .await
         .agent;
-    let defaults =
-        db::ProjectTaskRoleDefaultsRepo::get_task_role_defaults(&*harness.state.db, project_id)
-            .await
-            .expect("Project TaskRole defaults load");
-    let configuration = api_types::ProjectTaskRoleConfiguration {
-        schema_version: 1,
-        display_label: Some("Project coordinator".to_owned()),
-        capabilities: vec![api_types::TaskRoleCapability::Orchestration],
-        rework: None,
-        coordinator_actor: Some(api_types::ActorRef::Agent(agent.id.clone())),
-    };
-    db::ProjectTaskRoleDefaultsRepo::replace_task_role_defaults(
-        &*harness.state.db,
-        project_id,
-        "test-user-id",
-        defaults.version,
-        vec![db::ProjectTaskRoleDefault {
-            role: "orchestrator".to_owned(),
-            coordination_mode: db::CoordinationMode::Independent,
-            configuration_json: serde_json::to_string(&configuration)
-                .expect("Project coordinator configuration serializes"),
-            members: vec![db::ActorRef::Agent(agent.id.clone())],
-        }],
-        &db::now_rfc3339(),
+    let defaults: api_types::ProjectTaskRoleDefaultsResponse = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/task-role-defaults"),
+        json!({}),
+        StatusCode::OK,
     )
-    .await
-    .expect("Project coordinator defaults save");
+    .await;
+    let _: api_types::ProjectTaskRoleDefaultsResponse = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/projects/{project_id}/task-role-defaults"),
+        json!({
+            "expected_version": defaults.version,
+            "roles": [
+                {
+                    "role": "orchestrator",
+                    "coordination_mode": "independent",
+                    "configuration": {
+                        "schema_version": 1,
+                        "display_label": "Project coordinator",
+                        "capabilities": ["orchestration"],
+                        "rework": null,
+                        "coordinator_actor": {"kind": "agent", "id": agent.id}
+                    },
+                    "members": [{"kind": "agent", "id": agent.id}]
+                },
+                {
+                    "role": "quality_reviewer",
+                    "coordination_mode": "independent",
+                    "configuration": {
+                        "schema_version": 1,
+                        "display_label": "Quality reviewer",
+                        "capabilities": ["formal_review"],
+                        "rework": null,
+                        "coordinator_actor": null
+                    },
+                    "members": [{"kind": "human", "id": "test-user-id"}]
+                }
+            ]
+        }),
+        StatusCode::OK,
+    )
+    .await;
     agent.id
 }
