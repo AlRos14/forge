@@ -256,7 +256,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         .expect("isolated schema migrates");
     let database = Arc::new(db::SqliteDb::new(pool));
     let event_bus = Arc::new(EventBus::new(64));
-    let owner_id = test_user(&database, "Project batch owner").await;
+    let owner_id = test_admin_user(&database, "Project batch owner and embedded host admin").await;
     let project_id = test_project(&database, &owner_id).await;
     let repo_root = tempfile::tempdir().expect("isolated repository root creates");
     add_project_repo(&database, &project_id, repo_root.path()).await;
@@ -466,7 +466,21 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         run.admitted_wakes, 1,
         "only the exact batch request is admitted"
     );
-    assert_eq!(run.dispatched_wakes, 1, "the batch coordinator starts once");
+    let wake_diagnostic: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT w.state,w.last_error
+         FROM orchestrator_wake w
+         JOIN domain_event e ON e.id=w.event_id
+         WHERE e.event_type='task.coordination_requested' AND e.entity_id=? AND w.task_id=?",
+    )
+    .bind(&request_id)
+    .bind(&task.id)
+    .fetch_optional(database.pool())
+    .await
+    .expect("exact batch coordinator wake diagnostic loads");
+    assert_eq!(
+        run.dispatched_wakes, 1,
+        "the batch coordinator starts once; run={run:?}; durable wake state/error={wake_diagnostic:?}"
+    );
 
     let mut materialized_plan_id = None;
     let mut coordinator_execution_id = None;

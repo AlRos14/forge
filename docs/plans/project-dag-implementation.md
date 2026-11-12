@@ -249,6 +249,8 @@ FirePOS.
 
 Actualización run 4: fixes de dominio/runtime y callers/tests aplicados; incluyen derivar roles permitidos conservando el rechazo a lista vacía, fixture de reviewer formal mediante TaskService, refresh limitado al placeholder manual persistido con envelope normalizado y conflicto de versión tipado, y registry fake con capability Codex. La API/service test compile y el orden Clippy también quedan corregidos. Revisión estática **PASS**, formato aplicado; retry CI pendiente. Sin tests locales.
 
+Actualización run 5 (`43203612188`, SHA `b9a368296a441e208620ef74394cd139f2b292fa`): build **PASS** (web 198, browser smoke, bundle de binarios). Rust: Clippy 3 hallazgos; `orchestrator_runtime` 43/44; `services --test task_coordination` 0/17; `services --lib project_plan` 18/20; API Copilot authority 0/1 por `requested_by` nulo. API `project_plan` **NOT RUN**: el binario Copilot falló primero. Pasaron `api-types` 449 + 1 ignored, `forge-client` 18, `cli-adapters` 120, DB PR6 5 y DB integration 17/17/8/4/2. El evento de propuesta Copilot ahora conserva `requested_by` humano y el actor Agent/correlation originales; runtime/normalización/Clippy revisados. Colisión reviewer del fixture de coordinación corregida; formato y `git diff --check` PASS según Root, revisión final en curso y retry pendiente. Logs: `/tmp/forge-ci-43203612188-rust.log`; el workflow tiene artefactos de fallo listos para la siguiente pasada. Sin tests locales.
+
 ## Historial de actualización
 
 - 2026-11-11: creado el plan; N00 DONE, N01 IN PROGRESS. Sin tests ni CI nuevos.

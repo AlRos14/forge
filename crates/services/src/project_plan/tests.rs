@@ -4,13 +4,13 @@ use db::{
     AgentStatus, CreateAgent, CreateDomainEvent, CreateOrchestratorWake, CreateProject,
     CreateProjectMember, CreateRepo, CreateRoleMembership, CreateTask, CreateTaskRole,
     CreateWorkUnit, CreateWorkUnitIntegration, CreateWorkUnitWorkspace, CreateWorkspace,
-    ExecutionRepo, ExecutionStatus, OrchestratorWakeRepo, ProjectMemberRepo,
-    ProjectPlanBatchRequestBinding, ProjectPlanBatchRequestOrigin, ProjectRepo,
+    DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus, OrchestratorWakeRepo,
+    ProjectMemberRepo, ProjectPlanBatchRequestBinding, ProjectPlanBatchRequestOrigin, ProjectRepo,
     RecordWorkUnitIntegration, RepoRepo, RoleMembershipRepo, RoleMembershipStatus,
     TaskCoordinationMode, TaskCoordinationRepo, TaskDependencyRepo, TaskLifecycleRepo,
-    TaskLifecycleState, TaskRepo, TaskRoleRepo, TransitionWorkUnit, User, UserRepo, WorkMode,
-    WorkUnitIntegrationOutcome, WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo,
-    WorkspaceStatus,
+    TaskLifecycleState, TaskRepo, TaskRoleRepo, TransitionWorkUnit, UpdateAgent,
+    UpdateDaemonReport, UpsertDaemon, User, UserRepo, WorkMode, WorkUnitIntegrationOutcome,
+    WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::EventBus;
 use std::{
@@ -402,6 +402,75 @@ async fn seed_agent(fixture: &Fixture, agent_id: &str) {
         .await
         .expect("test Agent creates without starting a provider");
     }
+}
+
+async fn seed_authenticated_codex_daemon_for_agent(fixture: &Fixture, agent_id: &str) {
+    let now = now_rfc3339();
+    let daemon_id = new_uuid_v4();
+    DaemonRepo::upsert_by_machine_id(
+        fixture.db.as_ref(),
+        UpsertDaemon {
+            id: daemon_id.clone(),
+            machine_id: format!("project-plan-codex-{daemon_id}"),
+            hostname: "project-plan-test-host".to_owned(),
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            agent_version: None,
+            labels_json: "{}".to_owned(),
+            status: DaemonStatus::Online,
+            registration_token_hash: None,
+            owner_id: Some(fixture.owner_id.clone()),
+            visibility: "account".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("account-owned execution daemon registers");
+    DaemonRepo::update_report(
+        fixture.db.as_ref(),
+        UpdateDaemonReport {
+            id: daemon_id.clone(),
+            detected_clis_json: r#"[{"kind":"codex","availability":"authenticated"}]"#.to_owned(),
+            labels_json: None,
+            status: DaemonStatus::Online,
+            last_report_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("account-owned daemon reports authenticated Codex");
+
+    let agent = AgentRepo::get_by_id(&*fixture.db, agent_id)
+        .await
+        .expect("Agent lookup succeeds")
+        .expect("Agent exists before daemon binding");
+    AgentRepo::update(
+        fixture.db.as_ref(),
+        UpdateAgent {
+            id: agent.id,
+            expected_version: agent.version,
+            name: None,
+            description: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: None,
+            config_json: None,
+            daemon_id: Some(Some(daemon_id)),
+            max_concurrent_tasks: None,
+            heartbeat_interval_seconds: None,
+            max_missed_heartbeats: None,
+            status: None,
+            last_heartbeat_at: None,
+            is_default: None,
+            paused: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Agent binds to its exact account-authorized daemon");
 }
 
 async fn seed_agent_coordinator(fixture: &Fixture, task_id: &str, agent_id: &str) {
@@ -2468,6 +2537,7 @@ async fn authorized_successor_waits_for_accepted_git_handoff_and_provider_start_
 
     let agent_id = new_uuid_v4();
     seed_agent(&fixture, &agent_id).await;
+    seed_authenticated_codex_daemon_for_agent(&fixture, &agent_id).await;
     let implementer_role_id = seed_implementer_role(&fixture.db, &successor).await;
     RoleMembershipRepo::add(
         &*fixture.db,

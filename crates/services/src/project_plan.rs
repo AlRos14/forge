@@ -307,6 +307,14 @@ impl ProjectPlanService {
             created_at: now_rfc3339(),
         };
         sqlx::query("INSERT INTO project_plan_proposal(id,project_id,base_version,document_json,digest,state,requested_by,idempotency_key,created_at) VALUES(?,?,?,?,?,'proposed',?,?,?)").bind(&proposal.id).bind(project_id).bind(expected_version).bind(document_json).bind(&proposal.digest).bind(user_id).bind(idempotency_key).bind(&proposal.created_at).execute(&mut *tx).await?;
+        // Copilot is the event actor; retain the human requester separately in
+        // the durable event payload, using the authenticated caller already
+        // bound to the proposal row and authorized Copilot run.
+        let event_payload = if grant.is_some() {
+            json!({"project_id":project_id,"requested_by":user_id})
+        } else {
+            json!({"project_id":project_id})
+        };
         let event = self
             .event_for_actor(
                 &mut tx,
@@ -316,7 +324,7 @@ impl ProjectPlanService {
                     .unwrap_or(ProjectPlanEventActor::Human(user_id)),
                 "project.plan_proposed",
                 &proposal.id,
-                json!({"project_id":project_id}),
+                event_payload,
             )
             .await?;
         tx.commit().await?;

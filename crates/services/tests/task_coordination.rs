@@ -3,10 +3,11 @@ use std::sync::Arc;
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ActorKind, AgentRepo,
     AgentStatus, CoordinationMode, CreateAgentIdentity, CreateAgentProfile, CreateDomainEvent,
-    CreateOrchestratorWake, CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkUnit,
-    DomainEventRepo, OrchestratorWakeRepo, ProjectRepo, ProjectTaskRoleDefault,
-    ProjectTaskRoleDefaultsRepo, RoleMembershipRepo, SqliteDb, TaskCoordinationMode, TaskRepo,
-    TaskRoleRepo, UserRepo, WorkUnitProvenance, WorkUnitRepo, WorkUnitStatus,
+    CreateOrchestratorWake, CreateProjectMember, CreateRoleMembership, CreateTask, CreateTaskRole,
+    CreateWorkUnit, DomainEventRepo, OrchestratorWakeRepo, ProjectMemberRepo, ProjectRepo,
+    ProjectTaskRoleDefault, ProjectTaskRoleDefaultsRepo, RoleMembershipRepo, SqliteDb,
+    TaskCoordinationMode, TaskRepo, TaskRoleRepo, UserRepo, WorkUnitProvenance, WorkUnitRepo,
+    WorkUnitStatus,
 };
 use events::EventBus;
 use services::{
@@ -151,11 +152,31 @@ async fn fixture(suffix: &str) -> Fixture {
     )
     .await
     .expect("membership");
+    let event_bus = Arc::new(EventBus::new(32));
+    let task_service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    task_service
+        .create_task_role_with_configuration(
+            &task_id,
+            "reviewer",
+            CoordinationMode::Independent,
+            "{}".to_owned(),
+            r#"{"schema_version":1,"display_label":"Reviewer","capabilities":["formal_review"],"rework":null}"#.to_owned(),
+        )
+        .await
+        .expect("reviewer TaskRole with formal_review capability creates through TaskService");
+    task_service
+        .add_task_role_member(
+            &task_id,
+            "reviewer",
+            api_types::ActorRef::Agent(agent_id.clone()),
+        )
+        .await
+        .expect("Agent becomes an active member of the formal reviewer role");
     let task = TaskRepo::get_by_id(&*db, &task_id, false)
         .await
         .expect("task")
         .expect("task row");
-    let service = TaskCoordinationService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    let service = TaskCoordinationService::new(Arc::clone(&db), event_bus);
     let overview = service
         .authorize(
             &task_id,
@@ -982,35 +1003,32 @@ async fn rework_correction_completion_freezes_result_for_its_review() {
     )
     .await
     .expect("specialist membership");
-    TaskRoleRepo::create_with_configuration(
+    let task_project_id: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id=?")
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("task project ID");
+    ProjectMemberRepo::add_member(
         &*fixture.db,
-        CreateTaskRole {
-            id: "rework-reviewer-role".to_owned(),
-            task_id: fixture.task_id.clone(),
-            role: "reviewer".to_owned(),
-            coordination_mode: Some(CoordinationMode::Independent),
-            policy_json: "{}".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-        r#"{"schema_version":1,"display_label":"Reviewer","capabilities":["formal_review"],"rework":null}"#,
-    )
-    .await
-    .expect("reviewer role");
-    RoleMembershipRepo::add(
-        &*fixture.db,
-        CreateRoleMembership {
+        CreateProjectMember {
             id: new_uuid_v4(),
-            task_role_id: "rework-reviewer-role".to_owned(),
-            actor_kind: ActorKind::Human,
-            actor_id: reviewer_user_id.clone(),
-            status: db::RoleMembershipStatus::Active,
+            project_id: task_project_id,
+            user_id: reviewer_user_id.clone(),
+            role: "member".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
     )
     .await
-    .expect("reviewer membership");
+    .expect("human reviewer becomes a current Project member");
+    TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)))
+        .add_task_role_member(
+            &fixture.task_id,
+            "reviewer",
+            api_types::ActorRef::Human(reviewer_user_id.clone()),
+        )
+        .await
+        .expect("human reviewer joins the existing formal_review TaskRole");
     sqlx::query("UPDATE task_coordination SET team_stale = 0 WHERE task_id = ?")
         .bind(&fixture.task_id)
         .execute(fixture.db.pool())

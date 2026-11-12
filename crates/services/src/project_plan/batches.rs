@@ -829,14 +829,11 @@ mod envelope_tests {
             .expect("configured envelope is preserved");
         let normalized: CoordinationEnvelope =
             serde_json::from_value(envelope).expect("configured envelope remains typed");
-        assert_eq!(
-            normalized,
-            CoordinationEnvelope {
-                allowed_review_roles: vec!["quality_reviewer".to_owned()],
-                max_work_units: 2,
-                ..CoordinationEnvelope::default()
-            }
-        );
+        let expected: CoordinationEnvelope = serde_json::from_str(
+            r#"{"allowed_review_roles":["quality_reviewer"],"max_work_units":2}"#,
+        )
+        .expect("the persisted human envelope deserializes");
+        assert_eq!(normalized, expected);
     }
 
     #[test]

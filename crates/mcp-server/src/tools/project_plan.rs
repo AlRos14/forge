@@ -278,7 +278,7 @@ async fn repo_snapshot(
     let top_level = run_git_bounded(&repo_path, &["rev-parse", "--show-toplevel"], 4096).await?;
     let top_level = String::from_utf8(top_level)
         .map_err(|_| McpToolError::new(-32602, "Repository source is unavailable locally"))?;
-    let top_level = PathBuf::from(top_level.trim_end_matches(|ch| ch == '\r' || ch == '\n'));
+    let top_level = PathBuf::from(top_level.trim_end_matches(['\r', '\n']));
     if top_level != repo_path {
         return Err(McpToolError::new(
             -32602,
@@ -360,7 +360,7 @@ async fn run_git_bounded(
         .kill_on_drop(true)
         .spawn()
         .map_err(|_| invalid_source())?;
-    let mut stdout = child.stdout.take().ok_or_else(invalid_source)?;
+    let stdout = child.stdout.take().ok_or_else(invalid_source)?;
     let mut bytes = Vec::new();
     let read = timeout(
         GIT_TIMEOUT,
@@ -590,7 +590,7 @@ fn token_after_marker_is_secret(content: &str, marker: &str, minimum_token_len: 
 fn is_secret_token(value: &str, minimum_token_len: usize) -> bool {
     let lower = value.to_ascii_lowercase();
     let token = lower
-        .trim_start_matches(|ch: char| matches!(ch, ' ' | '\t' | '"' | '\'' | '='))
+        .trim_start_matches([' ', '\t', '"', '\'', '='])
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
         .next()
         .unwrap_or_default();
