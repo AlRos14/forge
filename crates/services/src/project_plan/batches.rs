@@ -760,26 +760,17 @@ pub(super) fn semantic_unconfigured_manual_default(
     revoked_at: Option<&str>,
     envelope_text: Option<&str>,
 ) -> bool {
-    if mode != Some("manual") || requested_by.is_some() || revoked_at.is_some() {
-        return false;
-    }
-    let Some(envelope_text) = envelope_text else {
-        return false;
-    };
-    let Ok(envelope) = serde_json::from_str::<CoordinationEnvelope>(envelope_text) else {
-        return false;
-    };
-    let current_default = CoordinationEnvelope::default();
-    let mut legacy_default = current_default.clone();
-    legacy_default.max_work_units = 4;
-    legacy_default.orchestrator_reviews_findings = false;
-    envelope == current_default || envelope == legacy_default
+    crate::task_coordination::semantic_unconfigured_manual_default(
+        mode,
+        requested_by,
+        revoked_at,
+        envelope_text,
+    )
 }
 
 #[cfg(test)]
 mod envelope_tests {
     use super::*;
-    use serde_json::json;
 
     fn baseline() -> super::super::types::BatchCoordinatorBaseline {
         super::super::types::BatchCoordinatorBaseline {
@@ -827,7 +818,7 @@ mod envelope_tests {
     }
 
     #[test]
-    fn an_existing_human_envelope_is_preserved() {
+    fn an_existing_human_envelope_preserves_values_when_defaults_are_normalized() {
         let mut baseline = baseline();
         baseline.authorization_version = Some(3);
         baseline.team_stale = Some(true);
@@ -836,12 +827,15 @@ mod envelope_tests {
         let envelope = batch_envelope_input(&baseline)
             .expect("configured envelope is valid")
             .expect("configured envelope is preserved");
+        let normalized: CoordinationEnvelope =
+            serde_json::from_value(envelope).expect("configured envelope remains typed");
         assert_eq!(
-            envelope,
-            json!({
-                "allowed_review_roles": ["quality_reviewer"],
-                "max_work_units": 2
-            })
+            normalized,
+            CoordinationEnvelope {
+                allowed_review_roles: vec!["quality_reviewer".to_owned()],
+                max_work_units: 2,
+                ..CoordinationEnvelope::default()
+            }
         );
     }
 

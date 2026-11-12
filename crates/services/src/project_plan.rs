@@ -25,6 +25,12 @@ pub struct ProjectPlanService {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
 }
+
+enum ProjectPlanEventActor<'a> {
+    Human(&'a str),
+    Copilot(&'a ProjectCopilotRunGrant),
+}
+
 fn invalid(message: impl Into<String>) -> ServiceError {
     ServiceError::invalid_operation(message)
 }
@@ -96,25 +102,6 @@ impl ProjectPlanService {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
         Self { db, event_bus }
     }
-    async fn event(
-        &self,
-        tx: &mut Transaction<'_, Sqlite>,
-        project_id: &str,
-        user_id: &str,
-        kind: &str,
-        entity_id: &str,
-    ) -> Result<db::DomainEvent> {
-        self.event_for_actor(
-            tx,
-            project_id,
-            user_id,
-            None,
-            kind,
-            entity_id,
-            json!({"project_id":project_id}),
-        )
-        .await
-    }
     pub(super) async fn event_with_payload(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
@@ -124,27 +111,34 @@ impl ProjectPlanService {
         entity_id: &str,
         payload: serde_json::Value,
     ) -> Result<db::DomainEvent> {
-        self.event_for_actor(tx, project_id, user_id, None, kind, entity_id, payload)
-            .await
+        self.event_for_actor(
+            tx,
+            project_id,
+            ProjectPlanEventActor::Human(user_id),
+            kind,
+            entity_id,
+            payload,
+        )
+        .await
     }
     async fn event_for_actor(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         project_id: &str,
-        user_id: &str,
-        grant: Option<&ProjectCopilotRunGrant>,
+        actor: ProjectPlanEventActor<'_>,
         kind: &str,
         entity_id: &str,
         payload: serde_json::Value,
     ) -> Result<db::DomainEvent> {
         let id = new_uuid_v4();
-        let actor_type = if grant.is_some() { "agent" } else { "human" };
-        let actor_id = grant
-            .map(|grant| grant.agent_id.clone())
-            .or_else(|| Some(user_id.into()));
-        let correlation_id = grant
-            .map(|grant| grant.run_id.clone())
-            .unwrap_or_else(|| id.clone());
+        let (actor_type, actor_id, correlation_id) = match actor {
+            ProjectPlanEventActor::Human(user_id) => {
+                ("human", Some(user_id.to_owned()), id.clone())
+            }
+            ProjectPlanEventActor::Copilot(grant) => {
+                ("agent", Some(grant.agent_id.clone()), grant.run_id.clone())
+            }
+        };
         Ok(DomainEventRepo::append_event_in_tx(
             &*self.db,
             tx,
@@ -317,8 +311,9 @@ impl ProjectPlanService {
             .event_for_actor(
                 &mut tx,
                 project_id,
-                user_id,
-                grant,
+                grant
+                    .map(ProjectPlanEventActor::Copilot)
+                    .unwrap_or(ProjectPlanEventActor::Human(user_id)),
                 "project.plan_proposed",
                 &proposal.id,
                 json!({"project_id":project_id}),
@@ -574,8 +569,9 @@ impl ProjectPlanService {
             .event_for_actor(
                 &mut tx,
                 project_id,
-                user_id,
-                grant,
+                grant
+                    .map(ProjectPlanEventActor::Copilot)
+                    .unwrap_or(ProjectPlanEventActor::Human(user_id)),
                 "project.plan_applied",
                 proposal_id,
                 json!({"project_id":project_id,"graph_version":version}),

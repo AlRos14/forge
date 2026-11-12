@@ -1254,31 +1254,6 @@ fn plan_revision_failure(error: &ServiceError) -> (&'static str, String) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plan_revision_reports_stale_batch_scope_as_a_human_blocker() {
-        let error = ServiceError::Db(DbError::ProjectPlanBatchInactive);
-        let (code, message) = plan_revision_failure(&error);
-        assert_eq!(code, "project_plan_batch_inactive");
-        assert!(message.contains("exact quality source"));
-        assert!(message.contains("owner or admin"));
-    }
-
-    #[test]
-    fn plan_revision_preserves_coordination_failure_codes() {
-        let error = ServiceError::Coordination {
-            code: "coordination.authorization_revoked",
-            message: "the authorization was revoked".to_owned(),
-        };
-        let (code, message) = plan_revision_failure(&error);
-        assert_eq!(code, "coordination.authorization_revoked");
-        assert_eq!(message, "the authorization was revoked");
-    }
-}
-
 fn revision_brief(request: &TaskQualityRequest) -> CoordinationBrief {
     let findings = serde_json::from_str::<Vec<String>>(&request.findings_json).unwrap_or_default();
     CoordinationBrief {
@@ -1329,4 +1304,29 @@ fn bounded_text(value: &str, max_bytes: usize) -> String {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_revision_reports_stale_batch_scope_as_a_human_blocker() {
+        let error = ServiceError::Db(DbError::ProjectPlanBatchInactive);
+        let (code, message) = plan_revision_failure(&error);
+        assert_eq!(code, "project_plan_batch_inactive");
+        assert!(message.contains("exact quality source"));
+        assert!(message.contains("owner or admin"));
+    }
+
+    #[test]
+    fn plan_revision_preserves_coordination_failure_codes() {
+        let error = ServiceError::Coordination {
+            code: "coordination.authorization_revoked",
+            message: "the authorization was revoked".to_owned(),
+        };
+        let (code, message) = plan_revision_failure(&error);
+        assert_eq!(code, "coordination.authorization_revoked");
+        assert_eq!(message, "the authorization was revoked");
+    }
 }

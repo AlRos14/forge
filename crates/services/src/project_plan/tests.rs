@@ -438,6 +438,26 @@ async fn seed_agent_coordinator(fixture: &Fixture, task_id: &str, agent_id: &str
     .await
     .expect("Agent becomes an active member of the exact role");
 
+    let task_service = TaskService::new(Arc::clone(&fixture.db), Arc::clone(&fixture.event_bus));
+    task_service
+        .create_task_role_with_configuration(
+            task_id,
+            "reviewer",
+            db::CoordinationMode::Independent,
+            "{}".to_owned(),
+            r#"{"schema_version":1,"display_label":null,"capabilities":["formal_review"],"rework":null}"#.to_owned(),
+        )
+        .await
+        .expect("reviewer TaskRole with formal_review capability creates through TaskService");
+    task_service
+        .add_task_role_member(
+            task_id,
+            "reviewer",
+            api_types::ActorRef::Agent(agent_id.to_owned()),
+        )
+        .await
+        .expect("Agent becomes an active member of the formal reviewer role");
+
     let task = TaskRepo::get_by_id(&*fixture.db, task_id, false)
         .await
         .expect("Task lookup succeeds")
@@ -962,7 +982,10 @@ async fn proposal_replay_is_idempotent_and_graph_version_is_fenced() {
         )
         .await
         .expect_err("stale graph version is rejected");
-    assert!(matches!(stale_error, ServiceError::Conflict(_)));
+    assert!(matches!(
+        stale_error,
+        ServiceError::Db(db::DbError::VersionConflict)
+    ));
 }
 
 #[tokio::test]

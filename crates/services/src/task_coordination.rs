@@ -156,6 +156,28 @@ impl CoordinationEnvelope {
     }
 }
 
+pub(crate) fn semantic_unconfigured_manual_default(
+    mode: Option<&str>,
+    requested_by: Option<&str>,
+    revoked_at: Option<&str>,
+    envelope_text: Option<&str>,
+) -> bool {
+    if mode != Some("manual") || requested_by.is_some() || revoked_at.is_some() {
+        return false;
+    }
+    let Some(envelope_text) = envelope_text else {
+        return false;
+    };
+    let Ok(envelope) = serde_json::from_str::<CoordinationEnvelope>(envelope_text) else {
+        return false;
+    };
+    let current_default = CoordinationEnvelope::default();
+    let mut legacy_default = current_default.clone();
+    legacy_default.max_work_units = 4;
+    legacy_default.orchestrator_reviews_findings = false;
+    envelope == current_default || envelope == legacy_default
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CoordinationBrief {
@@ -592,7 +614,6 @@ impl TaskCoordinationService {
         expected_team_generation: Option<i64>,
         batch_binding: Option<ProjectPlanBatchAuthorizationBinding>,
     ) -> Result<Overview> {
-        let unconfigured_default_refresh = batch_binding.is_some() && input.envelope.is_none();
         let source = CollaborationActorSource::Human(user_id.to_owned());
         let (task, _) = self
             .collaboration
@@ -609,7 +630,9 @@ impl TaskCoordinationService {
             }
             None => CoordinationEnvelope::default(),
         };
-        envelope.validate()?;
+        if input.envelope.is_some() {
+            envelope.validate()?;
+        }
         if input.mode != TaskCoordinationMode::Manual
             && (input.coordinator_task_role_id.is_none() || input.coordinator_actor.is_none())
         {
@@ -618,6 +641,15 @@ impl TaskCoordinationService {
             ));
         }
         let coordination_before = self.require_coordination(&task.id).await?;
+        let current_mode = coordination_before.mode.to_string();
+        let unconfigured_default_refresh = batch_binding.is_some()
+            && input.envelope.is_none()
+            && semantic_unconfigured_manual_default(
+                Some(&current_mode),
+                coordination_before.requested_by.as_deref(),
+                coordination_before.revoked_at.as_deref(),
+                Some(&coordination_before.envelope_json),
+            );
         if expected_team_generation
             .is_some_and(|expected| coordination_before.team_generation != expected)
         {
@@ -633,6 +665,7 @@ impl TaskCoordinationService {
                 })
                 .map(|role| role.role.clone())
                 .collect();
+            envelope.validate()?;
         }
         let team_snapshot_json = self.team_snapshot_json(&team)?;
         let team_digest = sha256_hex(team_snapshot_json.as_bytes());

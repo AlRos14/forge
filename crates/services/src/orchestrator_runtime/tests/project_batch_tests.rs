@@ -449,7 +449,10 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
             .with_task_executor(Arc::new(executors::AdapterExecutor::new(Arc::clone(
                 &registry,
             ))))
-            .with_adapter_registry(registry),
+            // The fake controls the Harness result; the installed Codex
+            // adapter supplies the real capability evidence required by
+            // automatic orchestration admission.
+            .with_adapter_registry(Arc::new(cli_adapters::default_registry())),
     );
     let runtime = OrchestratorRuntime::new(
         Arc::clone(&database),

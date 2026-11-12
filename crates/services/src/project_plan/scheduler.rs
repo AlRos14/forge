@@ -599,74 +599,71 @@ impl ProjectPlanService {
                 .await?;
                 continue;
             }
-            match self.claim_batch_task(&batch, &row.task_id).await? {
-                Some((context, claim_token)) => {
-                    let coordination =
-                        TaskCoordinationRepo::get_task_coordination(&*self.db, &row.task_id)
-                            .await?
-                            .ok_or_else(|| {
-                                ServiceError::Conflict(
-                                    "Task coordination authorization disappeared after reservation"
-                                        .into(),
-                                )
-                            })?;
-                    let task = TaskRepo::get_by_id(&*self.db, &row.task_id, false)
+            if let Some((context, claim_token)) =
+                self.claim_batch_task(&batch, &row.task_id).await?
+            {
+                let coordination =
+                    TaskCoordinationRepo::get_task_coordination(&*self.db, &row.task_id)
                         .await?
-                        .ok_or_else(|| ServiceError::not_found("task", row.task_id.clone()))?;
-                    let brief = self.coordination_brief(&batch, &task, &context).await?;
-                    let idempotency_key =
-                        format!("project-plan-batch:{}:turn:{}", batch.id, row.task_id);
-                    let snapshot_digest = row
-                        .coordination_snapshot_digest
-                        .as_deref()
-                        .ok_or(db::DbError::ProjectPlanBatchInactive)?;
-                    let binding = ProjectPlanBatchRequestBinding {
-                        project_id: batch.project_id.clone(),
-                        batch_id: batch.id.clone(),
-                        authorized_by: batch.authorized_by.clone(),
-                        expected_batch_version: batch.version,
-                        expected_graph_version: batch.graph_version,
-                        expected_task_version: task.version,
-                        expected_coordination_version: coordination.authorization_version,
-                        coordination_snapshot_digest: snapshot_digest.to_owned(),
-                        origin: ProjectPlanBatchRequestOrigin::Scheduler {
-                            claim_token: claim_token.clone(),
-                        },
-                    };
-                    let service = TaskCoordinationService::new(
-                        Arc::clone(&self.db),
-                        Arc::clone(&self.event_bus),
-                    );
-                    match service
-                        .request_project_batch_turn(
-                            &row.task_id,
-                            &batch.authorized_by,
-                            TurnRequestInput {
-                                expected_task_version: task.version,
-                                expected_coordination_version: coordination.authorization_version,
-                                brief,
-                                idempotency_key,
-                            },
-                            binding,
-                        )
-                        .await
-                    {
-                        Ok((_request, _created)) => {
-                            started += 1;
-                        }
-                        Err(error) => {
-                            self.release_batch_claim(
-                                batch_id,
-                                &row.task_id,
-                                &claim_token,
-                                batch.version,
-                                Some(&coordination_blocker(&error)),
+                        .ok_or_else(|| {
+                            ServiceError::Conflict(
+                                "Task coordination authorization disappeared after reservation"
+                                    .into(),
                             )
-                            .await?
-                        }
+                        })?;
+                let task = TaskRepo::get_by_id(&*self.db, &row.task_id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", row.task_id.clone()))?;
+                let brief = self.coordination_brief(&batch, &task, &context).await?;
+                let idempotency_key =
+                    format!("project-plan-batch:{}:turn:{}", batch.id, row.task_id);
+                let snapshot_digest = row
+                    .coordination_snapshot_digest
+                    .as_deref()
+                    .ok_or(db::DbError::ProjectPlanBatchInactive)?;
+                let binding = ProjectPlanBatchRequestBinding {
+                    project_id: batch.project_id.clone(),
+                    batch_id: batch.id.clone(),
+                    authorized_by: batch.authorized_by.clone(),
+                    expected_batch_version: batch.version,
+                    expected_graph_version: batch.graph_version,
+                    expected_task_version: task.version,
+                    expected_coordination_version: coordination.authorization_version,
+                    coordination_snapshot_digest: snapshot_digest.to_owned(),
+                    origin: ProjectPlanBatchRequestOrigin::Scheduler {
+                        claim_token: claim_token.clone(),
+                    },
+                };
+                let service =
+                    TaskCoordinationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+                match service
+                    .request_project_batch_turn(
+                        &row.task_id,
+                        &batch.authorized_by,
+                        TurnRequestInput {
+                            expected_task_version: task.version,
+                            expected_coordination_version: coordination.authorization_version,
+                            brief,
+                            idempotency_key,
+                        },
+                        binding,
+                    )
+                    .await
+                {
+                    Ok((_request, _created)) => {
+                        started += 1;
+                    }
+                    Err(error) => {
+                        self.release_batch_claim(
+                            batch_id,
+                            &row.task_id,
+                            &claim_token,
+                            batch.version,
+                            Some(&coordination_blocker(&error)),
+                        )
+                        .await?
                     }
                 }
-                None => {}
             }
         }
         self.refresh_batch_completions(&batch).await?;
@@ -1140,13 +1137,13 @@ pub(super) async fn insert_batch_task_with_authority_baseline_in_tx(
 }
 
 fn task_objective_digest_from_row(row: &SqliteRow) -> Result<String> {
-    Ok(digest(&(
+    digest(&(
         row.try_get::<String, _>("project_id")?,
         row.try_get::<String, _>("title")?,
         row.try_get::<Option<String>, _>("description")?,
         row.try_get::<Option<String>, _>("repo_id")?,
         row.try_get::<Option<String>, _>("parent_task_id")?,
-    ))?)
+    ))
 }
 
 pub(super) async fn batch_coordination_snapshot_current_in_tx(

@@ -7,7 +7,7 @@ use api_types::{
 use axum::http::{Method, StatusCode};
 use serde_json::{json, Value};
 
-use common::{empty_request, json_request, test_app, TestDir};
+use common::{empty_request, json_request, parse_response, test_app, TestDir};
 
 #[tokio::test]
 async fn initial_graph_version_is_one_and_projects_every_task_before_a_plan_exists() {
@@ -285,7 +285,7 @@ async fn only_project_owner_or_admin_can_authorize_a_plan_batch() {
     )
     .await;
     assert_eq!(batch.authorized_by, "test-user-id");
-    assert_eq!(batch.task_ids, vec![task.id]);
+    assert_eq!(batch.task_ids, vec![task.id.clone()]);
     assert!(!batch.state.is_empty());
     let executions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id=?")
         .bind(&task.id)
@@ -668,10 +668,7 @@ async fn batch_turn_is_linked_to_its_task_and_remains_inspectable_after_revoke()
     )
     .await;
     assert_eq!(escaped_turn.status(), StatusCode::CONFLICT);
-    let escaped_error: Value = escaped_turn
-        .json()
-        .await
-        .expect("batch fence error decodes");
+    let escaped_error: Value = parse_response(escaped_turn, StatusCode::CONFLICT).await;
     assert_eq!(escaped_error["code"], "project_plan_batch_inactive");
     let coordination_after =
         db::TaskCoordinationRepo::get_task_coordination(&*harness.state.db, &task.id)
@@ -813,10 +810,7 @@ async fn batch_coordination_auth_scope_fault_injection_never_leaves_an_unscoped_
         )
         .await;
         assert_eq!(escaped_turn.status(), StatusCode::CONFLICT);
-        let escaped_error: Value = escaped_turn
-            .json()
-            .await
-            .expect("batch scope error decodes");
+        let escaped_error: Value = parse_response(escaped_turn, StatusCode::CONFLICT).await;
         assert_eq!(escaped_error["code"], "project_plan_batch_inactive");
         let requests: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM task_coordination_request WHERE task_id=?")

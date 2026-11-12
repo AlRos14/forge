@@ -1752,7 +1752,13 @@ async fn batch_scoped_plan_revision_without_exact_batch_origin_requires_human() 
         .await
         .expect("owner authorizes the exact Task phase");
     assert_eq!(batch.state, "running");
-    assert!(batch.preparation_complete);
+    let preparation_complete: i64 =
+        sqlx::query_scalar("SELECT preparation_complete FROM project_plan_batch WHERE id=?")
+            .bind(&batch.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("batch preparation status persists");
+    assert_eq!(preparation_complete, 1);
 
     let quality = TaskQualityService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)));
     let request = fixture
