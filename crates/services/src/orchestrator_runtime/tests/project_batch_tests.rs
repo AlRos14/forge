@@ -486,7 +486,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
                     allowed_destination_roles: vec!["implementer".to_owned()],
                     next_review_role: Some("reviewer".to_owned()),
                     correction_actor: Some(api_types::ReworkActorSelection::OriginalContributor),
-                    review_actor: Some(ActorRef::Agent(reviewer_agent_id.clone())),
+                    review_actor: Some(api_types::ActorRef::Agent(reviewer_agent_id.clone())),
                 }),
             ),
         ],
@@ -1598,8 +1598,8 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         let (replayed, created) = coordination_service
             .request_review_findings_for_report(&task.id, &request.2)
             .await
-            .expect("exact triage request replay is safe");
-        let replayed = replayed.expect("exact source preserves its durable request");
+            .expect("exact triage request replay is safe")
+            .expect("exact source still has a current triage request");
         assert_eq!(replayed.id, request.0);
         assert!(!created, "replay does not create another typed request");
     }

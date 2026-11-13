@@ -20,6 +20,7 @@ use db::{
 use events::{EventBus, ForgeEvent};
 use serde_json::{json, Value};
 use sha2::Digest;
+use sqlx::Row;
 use tokio::{sync::watch, task::JoinHandle, time::MissedTickBehavior};
 use uuid::Uuid;
 

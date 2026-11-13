@@ -393,7 +393,8 @@ describe('coordination next action', () => {
       }),
     )
     expect(next.summary).toMatch(/ready for integration/i)
-    expect(next.detail).toMatch(/does not admit integration/i)
+    expect(next.kind).toBe('wait')
+    expect(next.owner).toBe('You')
   })
 
   it('lets ready-to-merge TaskLifecycle outrank review-triage and dispatch state', () => {

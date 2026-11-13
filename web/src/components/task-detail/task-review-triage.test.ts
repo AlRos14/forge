@@ -234,7 +234,8 @@ describe('review findings continuation projection', () => {
 
     expect(projection?.triage?.disposition).toBe('correct')
     expect(projection?.action.kind).toBe('manual')
-    expect(projection?.action.detail).toMatch(/does not itself prove a correction WorkUnit was created/i)
+    expect(projection?.reworkIntent).toBeNull()
+    expect(projection?.correctionWorkUnit).toBeNull()
   })
 
   it('shows queued correction only from the exact durable automation intent', () => {
@@ -244,9 +245,14 @@ describe('review findings continuation projection', () => {
       automationIntents: [automationIntent('pending')],
     })
 
+    expect(projection?.action.kind).toBe('wait')
     expect(projection?.action.owner).toBe('Forge')
     expect(projection?.action.summary).toMatch(/durably queued/i)
-    expect(projection?.action.detail).toMatch(/does not prove/i)
+    expect(projection?.reworkIntent?.state).toBe('pending')
+    expect(projection?.reworkIntent?.review_report_artifact_id).toBe(
+      projection?.request.review_report_artifact_id,
+    )
+    expect(projection?.correctionWorkUnit).toBeNull()
   })
 
   it('keeps a human disposition blocked and does not create correction or review work', () => {
@@ -271,7 +277,10 @@ describe('review findings continuation projection', () => {
 
     expect(projection?.reviewWorkUnit?.id).toBe('review-work-unit-1')
     expect(projection?.action.summary).toMatch(/awaits dispatch/i)
-    expect(projection?.action.detail).toMatch(/This triage is not a PASS/)
+    expect(projection?.action.detail).toMatch(/new ReviewReport is required/i)
+    expect(projection?.action.kind).toBe('wait')
+    expect(projection?.triage?.disposition).toBe('recheck')
+    expect(projection?.action.summary).not.toMatch(/\b(pass|approved|accepted)\b/i)
   })
 
   it('does not offer a duplicate request after an uncertain provider start', () => {

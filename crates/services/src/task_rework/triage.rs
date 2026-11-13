@@ -420,7 +420,9 @@ impl TaskReworkService {
                     ActorRef::Human(_) => "human",
                 }
                 .to_owned(),
-                actor_id: Some(actor.id().to_owned()),
+                actor_id: Some(match &actor {
+                    ActorRef::Agent(id) | ActorRef::Human(id) => id.clone(),
+                }),
                 scope_type: "task".to_owned(),
                 scope_id: task_id.clone(),
                 correlation_id: task_id.clone(),
