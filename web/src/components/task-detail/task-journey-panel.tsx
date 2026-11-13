@@ -1,5 +1,9 @@
 import { Link } from '@tanstack/react-router'
-import { useTaskInterventionsQuery, useTaskQualityRequestsQuery } from '@/api/hooks'
+import {
+  useTaskInterventionsQuery,
+  useTaskQualityRequestsQuery,
+  useTaskReworkAutomationQuery,
+} from '@/api/hooks'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { resolveActorIdentity } from '@/features/task-roles/ActorIdentity'
@@ -19,6 +23,11 @@ import {
   type JourneyStage,
   type JourneyStageStatus,
 } from './task-journey'
+import {
+  deriveReviewFindingsProjection,
+  isReviewFindingsRequest,
+  type ReviewFindingsDataState,
+} from './task-review-triage'
 
 const statusLabels: Record<JourneyStageStatus, string> = {
   done: 'Complete',
@@ -63,6 +72,8 @@ export function TaskJourneyPanel({
   coordination,
   dispatch,
   workUnits,
+  workUnitsState,
+  onRetryWorkUnits,
   reviewLines,
   gates,
   agents,
@@ -76,6 +87,8 @@ export function TaskJourneyPanel({
   coordination: TaskCoordinationOverviewResponse
   dispatch: TaskLaunchPreflightResponse | undefined
   workUnits: WorkUnitResponse[]
+  workUnitsState: ReviewFindingsDataState
+  onRetryWorkUnits: () => void
   reviewLines: ReviewLineResponse[]
   gates: GateResponse[]
   agents: AgentResponse[]
@@ -87,6 +100,21 @@ export function TaskJourneyPanel({
 }) {
   const qualityQuery = useTaskQualityRequestsQuery(task.id)
   const interventionsQuery = useTaskInterventionsQuery(task.id)
+  const reworkAutomationQuery = useTaskReworkAutomationQuery(task.id)
+  const automationIntents = reworkAutomationQuery.data?.items ?? []
+  const automationIntentsState: ReviewFindingsDataState = reworkAutomationQuery.isError
+    ? 'error'
+    : reworkAutomationQuery.data === undefined
+      ? 'loading'
+      : 'loaded'
+  const reviewFindings = deriveReviewFindingsProjection({
+    overview: coordination,
+    request: coordination.latest_request,
+    automationIntents,
+    automationIntentsState,
+    workUnits,
+    workUnitsState,
+  })
   const journey = deriveJourney({
     task,
     coordination,
@@ -96,7 +124,15 @@ export function TaskJourneyPanel({
     gates,
     qualityRequests: qualityQuery.data?.items ?? [],
     interventions: interventionsQuery.data?.items ?? [],
+    reviewAutomationIntents: automationIntents,
+    reviewAutomationIntentsState: automationIntentsState,
+    workUnitsState,
   })
+  const currentRequest = coordination.latest_request
+  const requestKindLabel = isReviewFindingsRequest(currentRequest)
+    ? 'Review findings'
+    : 'WorkUnit plan'
+  const blockers = [...new Set([...journey.blockers, ...(reviewFindings?.blockers ?? [])])]
 
   return (
     <section
@@ -150,7 +186,76 @@ export function TaskJourneyPanel({
         ) : null}
       </div>
 
-      {journey.blockers.length ? (
+      {currentRequest ? (
+        <section
+          className="min-w-0 space-y-2 rounded-md border bg-background/50 p-3"
+          aria-label="Current coordination request"
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              Current request · {requestKindLabel}
+            </p>
+            <Badge variant="outline">
+              {reviewFindings?.stateLabel ?? currentRequest.state.replaceAll('_', ' ')}
+            </Badge>
+          </div>
+          {reviewFindings ? (
+            <>
+              {reviewFindings.triage ? (
+                <p className="text-sm text-muted-foreground">
+                  Coordinator disposition · {reviewFindings.triage.disposition}. The next step is
+                  derived from its linked durable continuation records.
+                </p>
+              ) : null}
+              <details className="text-xs text-muted-foreground">
+                <summary className="w-fit cursor-pointer">Evidence</summary>
+                <div className="mt-2 space-y-1 break-all">
+                  <p>Request ID: {currentRequest.id}</p>
+                  <p>ReviewReport: {reviewFindings.reportId ?? 'source unavailable'}</p>
+                  <p>ReviewReport digest: {reviewFindings.reportDigest ?? 'source unavailable'}</p>
+                  <p>
+                    Reviewer producer Execution:{' '}
+                    {reviewFindings.producerExecutionId ?? 'source unavailable'}
+                  </p>
+                  {currentRequest.execution_id ? (
+                    <p>Coordinator Execution: {currentRequest.execution_id}</p>
+                  ) : null}
+                  {reviewFindings.triage?.review_work_unit_id ? (
+                    <p>Recheck WorkUnit: {reviewFindings.triage.review_work_unit_id}</p>
+                  ) : null}
+                  {reviewFindings.reworkIntent?.correction_work_unit_id ? (
+                    <p>Correction WorkUnit: {reviewFindings.reworkIntent.correction_work_unit_id}</p>
+                  ) : null}
+                  {reviewFindings.reworkIntent?.review_work_unit_id ? (
+                    <p>Follow-up review WorkUnit: {reviewFindings.reworkIntent.review_work_unit_id}</p>
+                  ) : null}
+                </div>
+              </details>
+            </>
+          ) : (
+            <details className="text-xs text-muted-foreground">
+              <summary className="w-fit cursor-pointer">Evidence</summary>
+              <p className="mt-2 break-all">Request ID: {currentRequest.id}</p>
+            </details>
+          )}
+          {reviewFindings &&
+          (automationIntentsState === 'error' || workUnitsState === 'error') ? (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={reworkAutomationQuery.isFetching}
+              onClick={() => {
+                if (automationIntentsState === 'error') void reworkAutomationQuery.refetch()
+                if (workUnitsState === 'error') onRetryWorkUnits()
+              }}
+            >
+              Retry continuation evidence
+            </Button>
+          ) : null}
+        </section>
+      ) : null}
+
+      {blockers.length ? (
         <div
           className="rounded-md border border-amber-400/60 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100"
           aria-labelledby="journey-blockers-title"
@@ -159,16 +264,16 @@ export function TaskJourneyPanel({
             Why Forge is stopped or waiting
           </h3>
           <ul className="mt-1 list-disc space-y-1 pl-5">
-            {journey.blockers.slice(0, 4).map((blocker) => (
+            {blockers.slice(0, 4).map((blocker) => (
               <li key={blocker} className="break-words">
                 {blocker}
               </li>
             ))}
           </ul>
-          {journey.blockers.length > 4 ? (
+          {blockers.length > 4 ? (
             <p className="mt-1 text-xs opacity-80">
-              {journey.blockers.length - 4} more blocker
-              {journey.blockers.length - 4 === 1 ? '' : 's'} are listed in the panels below.
+              {blockers.length - 4} more blocker
+              {blockers.length - 4 === 1 ? '' : 's'} are listed in the panels below.
             </p>
           ) : null}
         </div>

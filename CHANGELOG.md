@@ -10,6 +10,13 @@ PR14 audit on 2026-10-16.
 
 ### Breaking
 
+- Task coordination request responses now expose `kind` (`work_unit_plan` or
+  `review_findings`) and exact nullable ReviewReport source identifiers/digest.
+  Clients must handle the new terminal `triaged` request state; it records a
+  coordinator decision, not a passing review or Task acceptance. Review triage
+  output is accepted only by an exact `review_findings` request; generic
+  Orchestrator action responses no longer accept a `review_findings` array.
+
 - Direct Task dependency mutations now use the versioned Project DAG service.
   `POST /tasks/{id}/dependencies` and the Project DAG MCP add/remove tools require
   `expected_graph_version` and `idempotency_key`; `DELETE` also requires a JSON

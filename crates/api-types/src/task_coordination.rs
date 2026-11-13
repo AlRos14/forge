@@ -19,12 +19,21 @@ pub enum TaskCoordinationMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
+pub enum TaskCoordinationRequestKind {
+    WorkUnitPlan,
+    ReviewFindings,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum TaskCoordinationRequestState {
     Requested,
     Running,
     PlanReady,
     AwaitingApproval,
     Materialized,
+    Triaged,
     Failed,
     Cancelled,
     Uncertain,
@@ -204,6 +213,10 @@ pub struct TaskCoordinationBriefResponse {
 pub struct TaskCoordinationRequestResponse {
     pub id: String,
     pub task_id: String,
+    pub kind: TaskCoordinationRequestKind,
+    pub review_report_artifact_id: Option<String>,
+    pub review_report_digest: Option<String>,
+    pub review_producer_execution_id: Option<String>,
     pub mode: TaskCoordinationMode,
     pub state: TaskCoordinationRequestState,
     #[ts(type = "number")]

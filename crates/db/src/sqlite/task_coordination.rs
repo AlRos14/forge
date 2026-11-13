@@ -385,7 +385,12 @@ async fn create_task_coordination_request_write(
     .map(map_task_coordination_request)
     .transpose()?
     {
-        if existing.request_digest != input.request_digest {
+        if existing.request_digest != input.request_digest
+            || existing.kind != input.kind
+            || existing.review_report_artifact_id != input.review_report_artifact_id
+            || existing.review_report_digest != input.review_report_digest
+            || existing.review_producer_execution_id != input.review_producer_execution_id
+        {
             return Err(DbError::IdempotencyConflict);
         }
         let existing_is_batch_bound: bool = sqlx::query_scalar(
@@ -407,6 +412,16 @@ async fn create_task_coordination_request_write(
                         producer_execution_id,
                     } => (
                         "quality_replan",
+                        None,
+                        Some(source_artifact_id.as_str()),
+                        Some(producer_execution_id.as_str()),
+                        None,
+                    ),
+                    ProjectPlanBatchRequestOrigin::ReviewTriage {
+                        source_artifact_id,
+                        producer_execution_id,
+                    } => (
+                        "review_triage",
                         None,
                         Some(source_artifact_id.as_str()),
                         Some(producer_execution_id.as_str()),
@@ -528,6 +543,16 @@ async fn create_task_coordination_request_write(
                 Some(producer_execution_id.as_str()),
                 None,
             ),
+            ProjectPlanBatchRequestOrigin::ReviewTriage {
+                source_artifact_id,
+                producer_execution_id,
+            } => (
+                "review_triage",
+                None,
+                Some(source_artifact_id.as_str()),
+                Some(producer_execution_id.as_str()),
+                None,
+            ),
             ProjectPlanBatchRequestOrigin::HumanReplan {
                 approved_plan_artifact_id,
             } => (
@@ -613,8 +638,9 @@ async fn create_task_coordination_request_write(
         "INSERT INTO task_coordination_request (
             id, task_id, authorization_version, mode, brief_json,
             objective_digest, request_digest, idempotency_key, state,
-            version, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', 1, ?, ?)",
+            version, created_at, updated_at, kind, review_report_artifact_id,
+            review_report_digest, review_producer_execution_id
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', 1, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&input.id)
     .bind(&input.task_id)
@@ -626,6 +652,10 @@ async fn create_task_coordination_request_write(
     .bind(&input.idempotency_key)
     .bind(&input.created_at)
     .bind(&input.created_at)
+    .bind(input.kind.to_string())
+    .bind(&input.review_report_artifact_id)
+    .bind(&input.review_report_digest)
+    .bind(&input.review_producer_execution_id)
     .execute(&mut *tx)
     .await
     .map_err(check_error)?;
@@ -646,7 +676,8 @@ async fn create_task_coordination_request_write(
                 .await?
             }
             ProjectPlanBatchRequestOrigin::QualityReplan { .. }
-            | ProjectPlanBatchRequestOrigin::HumanReplan { .. } => {
+            | ProjectPlanBatchRequestOrigin::HumanReplan { .. }
+            | ProjectPlanBatchRequestOrigin::ReviewTriage { .. } => {
                 sqlx::query(
                     "UPDATE project_plan_batch_task SET
                         coordination_request_id=COALESCE(coordination_request_id,?)
@@ -694,6 +725,10 @@ async fn validate_project_batch_request_binding_in_tx(
             .await?
         }
         ProjectPlanBatchRequestOrigin::QualityReplan {
+            source_artifact_id,
+            producer_execution_id,
+        }
+        | ProjectPlanBatchRequestOrigin::ReviewTriage {
             source_artifact_id,
             producer_execution_id,
         } => {
@@ -1074,6 +1109,10 @@ fn map_task_coordination_receipt(row: SqliteRow) -> Result<TaskCoordinationRecei
 fn map_task_coordination_request(row: SqliteRow) -> Result<TaskCoordinationRequest> {
     Ok(TaskCoordinationRequest {
         id: row.try_get("id")?,
+        kind: parse_enum(row.try_get("kind")?)?,
+        review_report_artifact_id: row.try_get("review_report_artifact_id")?,
+        review_report_digest: row.try_get("review_report_digest")?,
+        review_producer_execution_id: row.try_get("review_producer_execution_id")?,
         task_id: row.try_get("task_id")?,
         authorization_version: row.try_get("authorization_version")?,
         mode: parse_enum(row.try_get("mode")?)?,

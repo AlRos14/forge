@@ -6,6 +6,7 @@ import type {
   TaskDispatchIntentResponse,
   TaskInterventionResponse,
   TaskQualityRequestResponse,
+  TaskReworkAutomationIntentResponse,
   WorkUnitResponse,
 } from '@/types/generated'
 import {
@@ -14,6 +15,10 @@ import {
   isTurnBudgetExhausted,
   readableCoordinationCode,
 } from './task-coordination-status'
+import {
+  deriveReviewFindingsProjection,
+  type ReviewFindingsDataState,
+} from './task-review-triage'
 
 export type JourneyStageStatus = 'done' | 'current' | 'waiting' | 'blocked' | 'not_started'
 
@@ -34,6 +39,9 @@ export type JourneyInput = {
   gates: GateResponse[]
   qualityRequests: TaskQualityRequestResponse[]
   interventions: TaskInterventionResponse[]
+  reviewAutomationIntents?: TaskReworkAutomationIntentResponse[]
+  reviewAutomationIntentsState?: ReviewFindingsDataState
+  workUnitsState?: ReviewFindingsDataState
 }
 
 export type JourneyProjection = {
@@ -69,16 +77,41 @@ export function deriveJourney(input: JourneyInput): JourneyProjection {
       .map((role) => role.role),
   )
   const openExecutionUnits = activeUnits.filter((unit) => !reviewRoleNames.has(unit.role))
-  const paused = dispatch?.state === 'paused' || coordination.dispatch.state === 'paused'
+  const lifecycleOverridesCoordination =
+    task.lifecycle.state === 'done' ||
+    task.lifecycle.state === 'ready_to_merge' ||
+    task.lifecycle.state === 'merging'
+  const paused =
+    !lifecycleOverridesCoordination &&
+    (dispatch?.state === 'paused' || coordination.dispatch.state === 'paused')
   const cancelled =
-    task.lifecycle.state === 'cancelled' || coordination.dispatch.state === 'cancelled'
+    task.lifecycle.state === 'cancelled' ||
+    (!lifecycleOverridesCoordination && coordination.dispatch.state === 'cancelled')
   const done = task.lifecycle.state === 'done'
   const plan = coordination.latest_plan
   const request = coordination.latest_request
-  const next = deriveCoordinationNextAction(coordination, request, plan)
+  const reviewAutomationIntents = input.reviewAutomationIntents ?? []
+  const reviewFindings = deriveReviewFindingsProjection({
+    overview: coordination,
+    request,
+    automationIntents: reviewAutomationIntents,
+    automationIntentsState: input.reviewAutomationIntentsState,
+    workUnits,
+    workUnitsState: input.workUnitsState,
+  })
+  const next = deriveCoordinationNextAction(coordination, request, plan, {
+    automationIntents: reviewAutomationIntents,
+    automationIntentsState: input.reviewAutomationIntentsState,
+    workUnits,
+    workUnitsState: input.workUnitsState,
+  })
   const escalatedQuality = qualityRequests.filter((item) => item.state === 'requires_human')
   const escalatedInterventions = interventions.filter((item) => item.state === 'requires_human')
-  const escalatedToHuman = escalatedQuality.length > 0 || escalatedInterventions.length > 0
+  const escalatedToHuman =
+    !lifecycleOverridesCoordination &&
+    (escalatedQuality.length > 0 ||
+      escalatedInterventions.length > 0 ||
+      reviewFindings?.escalatedToHuman === true)
   const openReview = reviewLines.filter((line) => line.latest_verdict !== 'pass')
   const maxRevision = reviewLines.reduce((max, line) => Math.max(max, line.revision), 0)
   const activeRoleMembers = coordination.team.flatMap((role) =>
@@ -157,6 +190,22 @@ export function deriveJourney(input: JourneyInput): JourneyProjection {
       detail: paused
         ? 'Forge will not create WorkUnits while the Task is paused.'
         : 'Materialize the exact approved plan to create WorkUnits and the task launch intent.',
+    }
+  } else if (reviewFindings) {
+    const triaged = request?.state === 'triaged' && reviewFindings.triage !== null
+    const inProgress = request?.state === 'requested' || request?.state === 'running'
+    planStage = {
+      id: 'plan',
+      title: 'Plan',
+      status: triaged ? 'done' : inProgress ? 'waiting' : 'blocked',
+      summary: triaged
+        ? 'Review triage recorded'
+        : inProgress
+          ? 'Coordinator is triaging review findings'
+          : 'Review-findings request needs attention',
+      detail: triaged
+        ? 'The exact disposition and its durable continuation records are shown in Current request. Triage does not approve a ReviewReport or satisfy a Gate.'
+        : 'This request is bound to an exact ReviewReport; it is not preparing a WorkUnit plan. Its status and evidence are shown in Current request.',
     }
   } else if (isTurnBudgetExhausted(coordination)) {
     planStage = {
@@ -271,6 +320,8 @@ export function deriveJourney(input: JourneyInput): JourneyProjection {
       summary: routeEscalation ? 'Quality route escalated to a human' : 'Escalated to a human',
       detail: routeEscalation
         ? routeEscalation.reason
+        : reviewFindings?.escalatedToHuman
+          ? reviewFindings.action.detail
         : escalatedQuality.length > 0
           ? `${plural(escalatedQuality.length, 'quality request')} needs a decision before another automatic route is applied.`
           : 'An intervention recorded that a human decision is required.',
@@ -340,8 +391,9 @@ export function deriveJourney(input: JourneyInput): JourneyProjection {
       id: 'delivery',
       title: 'Delivery',
       status: 'current',
-      summary: 'Ready for integration checks',
-      detail: `Evaluate the current Gate${gates.length === 1 ? '' : 's'} against the exact passing result before integration.`,
+      summary: 'Ready for integration',
+      detail:
+        'The current TaskLifecycle is ready_to_merge. Admit the exact integration operation through the existing delivery controls.',
     }
   } else if (gates.length) {
     deliveryStage = {
@@ -364,8 +416,9 @@ export function deriveJourney(input: JourneyInput): JourneyProjection {
 
   const blockers = [
     ...coordination.blockers.map((blocker) => readableCoordinationCode(blocker.code)),
+    ...(reviewFindings?.blockers ?? []),
     ...(paused ? ['The Task dispatch is paused.'] : []),
-    ...(escalatedQuality.length
+    ...(!lifecycleOverridesCoordination && escalatedQuality.length
       ? [
           routeEscalation
             ? `Quality route escalated: ${routeEscalation.reason}`

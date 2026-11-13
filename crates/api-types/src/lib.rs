@@ -182,6 +182,7 @@ fn export_typescript() {
     TaskDispatchActionResponse::export().expect("export TaskDispatchActionResponse");
     TaskLaunchResponse::export().expect("export TaskLaunchResponse");
     TaskCoordinationMode::export().expect("export TaskCoordinationMode");
+    TaskCoordinationRequestKind::export().expect("export TaskCoordinationRequestKind");
     TaskCoordinationRequestState::export().expect("export TaskCoordinationRequestState");
     TaskCoordinationPlanState::export().expect("export TaskCoordinationPlanState");
     TaskQualityCategory::export().expect("export TaskQualityCategory");

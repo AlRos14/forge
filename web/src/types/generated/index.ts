@@ -283,6 +283,7 @@ export type { EffectiveExecutionPolicy } from './bindings/EffectiveExecutionPoli
 export type { ErrorResponse } from './bindings/ErrorResponse'
 
 export type { TaskCoordinationMode } from './bindings/TaskCoordinationMode'
+export type { TaskCoordinationRequestKind } from './bindings/TaskCoordinationRequestKind'
 export type { TaskCoordinationRequestState } from './bindings/TaskCoordinationRequestState'
 export type { TaskCoordinationPlanState } from './bindings/TaskCoordinationPlanState'
 export type { TaskQualityCategory } from './bindings/TaskQualityCategory'

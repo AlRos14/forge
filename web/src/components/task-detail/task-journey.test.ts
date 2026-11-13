@@ -316,9 +316,41 @@ describe('guided journey projection', () => {
     const journey = deriveJourney({
       ...empty,
       task: task('done'),
-      coordination: overview(),
+      coordination: overview({
+        lifecycle: {
+          ...overview().lifecycle,
+          state: 'done',
+        },
+        dispatch: {
+          ...overview().dispatch,
+          state: 'cancelled',
+        },
+      }),
+      qualityRequests: [quality()],
     })
     expect(journey.stages.find((stage) => stage.id === 'delivery')?.status).toBe('done')
     expect(journey.nextOwner).toBe('Nobody')
+    expect(journey.escalatedToHuman).toBe(false)
+    expect(journey.nextSummary).toMatch(/Task is done/i)
+  })
+
+  it('keeps ready-to-merge lifecycle ahead of stale quality escalation', () => {
+    const journey = deriveJourney({
+      ...empty,
+      task: task('ready_to_merge'),
+      coordination: overview({
+        lifecycle: {
+          ...overview().lifecycle,
+          state: 'ready_to_merge',
+        },
+      }),
+      qualityRequests: [quality()],
+    })
+
+    expect(journey.escalatedToHuman).toBe(false)
+    expect(journey.nextSummary).toMatch(/ready for integration/i)
+    expect(journey.stages.find((stage) => stage.id === 'delivery')?.summary).toMatch(
+      /Ready for integration/,
+    )
   })
 })

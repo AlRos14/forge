@@ -224,6 +224,14 @@ fn parse_enum<T: FromStr<Err = String>>(value: String) -> Result<T> {
 
 fn check_error(error: sqlx::Error) -> DbError {
     if let sqlx::Error::Database(database_error) = &error {
+        match database_error.message() {
+            "FORGE_COORDINATION_REVIEW_SOURCE_STALE"
+            | "FORGE_COORDINATION_REVIEW_DECISION_STALE" => {
+                return DbError::VersionConflict;
+            }
+            "FORGE_PROJECT_PLAN_BATCH_INACTIVE" => return DbError::ProjectPlanBatchInactive,
+            _ => {}
+        }
         if database_error
             .message()
             .to_ascii_lowercase()

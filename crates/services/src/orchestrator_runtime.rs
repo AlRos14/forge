@@ -73,6 +73,8 @@ pub struct OrchestratorRuntime {
     gate_engine: crate::gate_engine::GateEngine,
     consumer_name: String,
     lease_owner: String,
+    #[cfg(test)]
+    pre_start_test_barrier: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,8 +87,6 @@ struct WakeSignal {
 #[serde(deny_unknown_fields)]
 struct OrchestratorResponse {
     actions: Vec<OrchestratorAction>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    review_findings: Vec<crate::task_rework::ReviewFindingsDecision>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -274,6 +274,8 @@ impl OrchestratorRuntime {
             task_service,
             consumer_name: CONSUMER_NAME.to_owned(),
             lease_owner: Uuid::new_v4().to_string(),
+            #[cfg(test)]
+            pre_start_test_barrier: None,
         }
     }
 
@@ -354,6 +356,22 @@ impl OrchestratorRuntime {
             )
             .process_domain_event(&event)
             .await?;
+            if event.event_type == "artifact.created" && event.entity_type == "artifact" {
+                if let Err(error) = crate::task_coordination::TaskCoordinationService::new(
+                    Arc::clone(&self.db),
+                    Arc::clone(&self.event_bus),
+                )
+                .request_review_findings_for_report(&event.scope_id, &event.entity_id)
+                .await
+                {
+                    tracing::warn!(
+                        task_id = %event.scope_id,
+                        review_report_artifact_id = %event.entity_id,
+                        %error,
+                        "review findings request remains pending after a source-local error"
+                    );
+                }
+            }
             crate::task_quality::TaskQualityService::new(
                 Arc::clone(&self.db),
                 Arc::clone(&self.event_bus),
@@ -402,12 +420,21 @@ impl OrchestratorRuntime {
         )
         .process_pending_automatic_rework(100)
         .await?;
+        crate::task_coordination::TaskCoordinationService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .process_pending_review_findings_requests(100)
+        .await?;
         crate::task_quality::TaskQualityService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
         )
         .process_pending(100)
         .await?;
+
+        run.admitted_wakes += self.recover_unlinked_review_findings_requests(100).await?;
+        run.processed_events += self.recover_completed_review_findings_requests(100).await?;
 
         for _ in 0..16 {
             match self.dispatch_one().await? {
@@ -417,6 +444,93 @@ impl OrchestratorRuntime {
             }
         }
         Ok(run)
+    }
+
+    /// A request event may be acknowledged while a Task or Project batch is
+    /// paused, before a wake can be admitted. Reuse its original durable event
+    /// after resume rather than minting a new request or budget receipt.
+    async fn recover_unlinked_review_findings_requests(&self, limit: i64) -> Result<usize> {
+        let rows = sqlx::query(
+            "SELECT event.id AS event_id
+             FROM task_coordination_request request
+             JOIN task_review_coordination_request_current current
+               ON current.request_id=request.id
+             JOIN domain_event event
+               ON event.event_type='task.coordination_requested'
+              AND event.entity_type='task_coordination_request'
+              AND event.entity_id=request.id
+             WHERE request.kind='review_findings' AND request.state='requested'
+               AND request.wake_id IS NULL
+             ORDER BY event.sequence LIMIT ?",
+        )
+        .bind(limit.clamp(1, 100))
+        .fetch_all(self.db.pool())
+        .await?;
+        let mut admitted = 0;
+        for row in rows {
+            let event_id: String = row.try_get("event_id")?;
+            let result = async {
+                let Some(event) = DomainEventRepo::get_event(&*self.db, &event_id).await? else {
+                    return Ok(0);
+                };
+                let Some(signal) = self.classify_event(&event).await? else {
+                    return Ok(0);
+                };
+                self.admit_signal(&event, signal).await
+            }
+            .await;
+            match result {
+                Ok(count) => admitted += count,
+                Err(error) => tracing::warn!(
+                    event_id,
+                    %error,
+                    "unlinked ReviewFindings request remains pending after a source-local recovery error"
+                ),
+            }
+        }
+        Ok(admitted)
+    }
+
+    /// Retry an already completed ReviewFindings Execution after a paused
+    /// Task or Project batch resumes. This replays the persisted response
+    /// through terminal reconciliation and never starts another provider.
+    async fn recover_completed_review_findings_requests(&self, limit: i64) -> Result<usize> {
+        let rows = sqlx::query(
+            "SELECT event.id AS event_id
+             FROM task_coordination_request request
+             JOIN task_review_coordination_request_current current
+               ON current.request_id=request.id
+             JOIN execution ON execution.id=request.execution_id
+              AND execution.task_id=request.task_id AND execution.status='completed'
+             JOIN domain_event event ON event.entity_type='execution'
+              AND event.entity_id=execution.id AND event.event_type='execution.completed'
+             WHERE request.kind='review_findings' AND request.state IN ('running','uncertain')
+             ORDER BY event.sequence LIMIT ?",
+        )
+        .bind(limit.clamp(1, 100))
+        .fetch_all(self.db.pool())
+        .await?;
+        let mut recovered = 0;
+        for row in rows {
+            let event_id: String = row.try_get("event_id")?;
+            let result = async {
+                let Some(event) = DomainEventRepo::get_event(&*self.db, &event_id).await? else {
+                    return Ok(false);
+                };
+                self.reconcile_orchestrator_terminal(&event).await
+            }
+            .await;
+            match result {
+                Ok(true) => recovered += 1,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    event_id,
+                    %error,
+                    "completed ReviewFindings response remains pending after a source-local recovery error"
+                ),
+            }
+        }
+        Ok(recovered)
     }
 
     async fn classify_event(&self, event: &DomainEvent) -> Result<Option<WakeSignal>> {
@@ -455,6 +569,72 @@ impl OrchestratorRuntime {
         };
         if task.id != event.scope_id {
             return Ok(None);
+        }
+        if event.event_type == "task.review_triaged" {
+            // The typed ReviewFindings request already owns this coordinator
+            // turn. Its receipt event must not produce a generic second wake.
+            return Ok(None);
+        }
+        if event.event_type == "execution.completed" && event.entity_type == "execution" {
+            let typed_review_completion: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM artifact_execution_producer producer
+                    JOIN artifact report ON report.id=producer.artifact_id
+                     AND report.task_id=producer.task_id
+                    WHERE producer.execution_id=? AND report.task_id=?
+                      AND report.kind='review_report'
+                      AND json_extract(report.content,'$.verdict')='request_changes'
+                      AND (
+                        EXISTS(SELECT 1 FROM task_coordination_request request
+                               WHERE request.task_id=report.task_id
+                                 AND request.kind='review_findings'
+                                 AND request.review_report_artifact_id=report.id)
+                        OR EXISTS(SELECT 1 FROM task_review_coordination_source_current source
+                                  WHERE source.report_id=report.id
+                                    AND source.producer_execution_id=producer.execution_id)
+                      )
+                )",
+            )
+            .bind(&event.entity_id)
+            .bind(task_id)
+            .fetch_one(self.db.pool())
+            .await?;
+            if typed_review_completion {
+                // Its exact typed request owns this completion; do not also
+                // dispatch a generic orchestration turn for the same report.
+                return Ok(None);
+            }
+        }
+        if event.event_type == "artifact.created" && event.entity_type == "artifact" {
+            let typed_review_source: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM task_coordination_request request
+                    WHERE request.task_id=? AND request.kind='review_findings'
+                      AND request.review_report_artifact_id=?
+                    UNION ALL
+                    SELECT 1 FROM artifact report
+                    JOIN task_rework_automation_intent intent
+                      ON intent.task_id=report.task_id
+                     AND intent.review_report_artifact_id=report.id
+                     AND intent.state='pending'
+                    JOIN task_coordination coordination ON coordination.task_id=report.task_id
+                    WHERE report.id=? AND report.task_id=? AND report.kind='review_report'
+                      AND json_extract(report.content,'$.verdict')='request_changes'
+                      AND coordination.mode!='manual' AND coordination.revoked_at IS NULL
+                      AND coordination.team_stale=0
+                      AND COALESCE(json_extract(coordination.envelope_json,
+                           '$.orchestrator_reviews_findings'),0)=1
+                )",
+            )
+            .bind(task_id)
+            .bind(&event.entity_id)
+            .bind(&event.entity_id)
+            .bind(task_id)
+            .fetch_one(self.db.pool())
+            .await?;
+            if typed_review_source {
+                return Ok(None);
+            }
         }
         let coordination = TaskCoordinationRepo::get_task_coordination(&*self.db, task_id).await?;
         if let Some(c) = coordination.as_ref() {
@@ -1452,6 +1632,12 @@ impl OrchestratorRuntime {
                 .as_deref()
                 {
                     Some("paused") => {
+                        if self
+                            .preserve_paused_review_findings_attempt(&wake, request)
+                            .await?
+                        {
+                            return Ok(DispatchOutcome::Retried);
+                        }
                         self.defer_wake(&wake, "Project batch is paused").await?;
                         return Ok(DispatchOutcome::Retried);
                     }
@@ -1472,6 +1658,22 @@ impl OrchestratorRuntime {
                     }
                     _ => {}
                 }
+            }
+        }
+        if let Some(request) = coordination_request.as_ref() {
+            if TaskLifecycleRepo::get_task_dispatch(&*self.db, &request.task_id)
+                .await?
+                .is_some_and(|dispatch| dispatch.state == db::TaskDispatchState::Paused)
+            {
+                if self
+                    .preserve_paused_review_findings_attempt(&wake, request)
+                    .await?
+                {
+                    return Ok(DispatchOutcome::Retried);
+                }
+                self.defer_wake(&wake, "Task paused before Harness Start")
+                    .await?;
+                return Ok(DispatchOutcome::Retried);
             }
         }
         let unit = match wake.work_unit_id.as_deref() {
@@ -1564,7 +1766,13 @@ impl OrchestratorRuntime {
         }
 
         let context = match self
-            .build_context(&wake, &role, &memberships, &role_policy)
+            .build_context(
+                &wake,
+                &role,
+                &memberships,
+                &role_policy,
+                coordination_request.as_ref(),
+            )
             .await
         {
             Ok(context) => context,
@@ -1805,6 +2013,11 @@ impl OrchestratorRuntime {
                 .await?;
             return Ok(DispatchOutcome::Retried);
         }
+        #[cfg(test)]
+        if let Some((reached, release)) = self.pre_start_test_barrier.as_ref() {
+            reached.wait().await;
+            release.wait().await;
+        }
         let start_result = self.task_service.start_execution(&execution.id).await;
         let start_result_accepted = matches!(&start_result, Ok(result) if result.accepted);
         let start_result_rejected = matches!(&start_result, Ok(result) if !result.accepted);
@@ -1845,8 +2058,8 @@ impl OrchestratorRuntime {
                 .await?;
                 Ok(DispatchOutcome::Retried)
             }
-            ProviderStartReceiptEvidence::NoAttempt
-            | ProviderStartReceiptEvidence::IncoherentWithoutAttempt => {
+            evidence @ (ProviderStartReceiptEvidence::NoAttempt
+            | ProviderStartReceiptEvidence::IncoherentWithoutAttempt) => {
                 let reason = if start_result_rejected {
                     "Start was rejected or cancelled before any external attempt"
                 } else {
@@ -1929,6 +2142,41 @@ impl OrchestratorRuntime {
                         }
                         return Ok(DispatchOutcome::Retried);
                     }
+                    if evidence == ProviderStartReceiptEvidence::NoAttempt
+                        && TaskLifecycleRepo::get_task_dispatch(&*self.db, &request.task_id)
+                            .await?
+                            .is_some_and(|dispatch| dispatch.state == db::TaskDispatchState::Paused)
+                    {
+                        self.fail_start_execution_if_running(&execution, reason)
+                            .await?;
+                        let failed_attempt =
+                            OrchestratorWakeRepo::transition_orchestrator_wake_execution(
+                                &*self.db,
+                                db::TransitionOrchestratorWakeExecution {
+                                    wake_id: wake.id.clone(),
+                                    attempt_number: reserved.attempt_number,
+                                    execution_id: reserved.execution_id.clone(),
+                                    lease_owner: Some(self.lease_owner.clone()),
+                                    expected_state: Some("start_requested".to_owned()),
+                                    state: "failed".to_owned(),
+                                    last_error: Some(Some(reason.to_owned())),
+                                    updated_at: now_rfc3339(),
+                                },
+                            )
+                            .await?;
+                        if !failed_attempt {
+                            self.make_uncertain(
+                                &wake,
+                                &reserved,
+                                "paused task coordinator attempt changed before its no-Start result was recorded",
+                            )
+                            .await?;
+                            return Ok(DispatchOutcome::Retried);
+                        }
+                        self.defer_wake(&wake, "Task paused before Harness Start")
+                            .await?;
+                        return Ok(DispatchOutcome::Retried);
+                    }
                 }
                 self.fail_start_execution_if_running(&execution, reason)
                     .await?;
@@ -1970,7 +2218,15 @@ impl OrchestratorRuntime {
         role: &TaskRole,
         memberships: &[RoleMembership],
         role_policy: &TaskRoleOrchestratorPolicy,
+        coordination_request: Option<&db::TaskCoordinationRequest>,
     ) -> Result<Value> {
+        if let Some(request) = coordination_request
+            .filter(|request| request.kind == db::TaskCoordinationRequestKind::ReviewFindings)
+        {
+            return self
+                .build_review_findings_context(wake, role, memberships, role_policy, request)
+                .await;
+        }
         let task = TaskRepo::get_by_id(&*self.db, &wake.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", wake.task_id.clone()))?;
@@ -2114,22 +2370,6 @@ impl OrchestratorRuntime {
             });
         }
         let event_payload = parse_payload(&event);
-        let rework =
-            crate::task_rework::TaskReworkService::new(self.db.clone(), self.event_bus.clone());
-        let (pending_review_findings, previous_review_decisions) = if wake.work_unit_id.is_none() {
-            (
-                rework.pending_triage_context(&task.id).await?,
-                rework
-                    .list_review_triage(&task.id)
-                    .await?
-                    .into_iter()
-                    .take(8)
-                    .collect::<Vec<_>>(),
-            )
-        } else {
-            // A WorkUnit-scoped wake cannot inspect sibling review evidence.
-            (Vec::new(), Vec::new())
-        };
         let coordination = TaskCoordinationRepo::get_task_coordination(&*self.db, &task.id).await?;
         let repository = if let Some(id) = task.repo_id.as_deref() {
             db::RepoRepo::get_by_id(&*self.db, id).await?
@@ -2138,8 +2378,6 @@ impl OrchestratorRuntime {
         };
         Ok(json!({
             "repository": repository.as_ref().map(|repo| json!({"name":repo.name,"local_path":repo.local_path,"default_branch":repo.default_branch})),
-            "pending_review_findings": pending_review_findings,
-            "previous_review_decisions": previous_review_decisions,
             "coordination_authorization_version": coordination.as_ref().map(|c|c.authorization_version),
             "task": {
                 "id": task.id,
@@ -2256,6 +2494,96 @@ impl OrchestratorRuntime {
         }))
     }
 
+    async fn build_review_findings_context(
+        &self,
+        wake: &OrchestratorWake,
+        role: &TaskRole,
+        memberships: &[RoleMembership],
+        role_policy: &TaskRoleOrchestratorPolicy,
+        request: &db::TaskCoordinationRequest,
+    ) -> Result<Value> {
+        if wake.work_unit_id.is_some()
+            || request.task_id != wake.task_id
+            || request.wake_id.as_deref().is_some_and(|id| id != wake.id)
+        {
+            return Err(ServiceError::invalid_operation(
+                "ReviewFindings requires its exact workspace-free coordinator request",
+            ));
+        }
+        let task = TaskRepo::get_by_id(&*self.db, &wake.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", wake.task_id.clone()))?;
+        let coordination = TaskCoordinationRepo::get_task_coordination(&*self.db, &task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task coordination", task.id.clone()))?;
+        if coordination.authorization_version != request.authorization_version
+            || coordination.revoked_at.is_some()
+            || coordination.team_stale
+        {
+            return Err(ServiceError::invalid_operation(
+                "ReviewFindings authorization changed before context load",
+            ));
+        }
+        let review_findings = crate::task_rework::TaskReworkService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .exact_review_findings_context(request)
+        .await?;
+        let source_event = DomainEventRepo::get_event(&*self.db, &wake.event_id).await?;
+        let source_event = source_event
+            .ok_or_else(|| ServiceError::not_found("domain_event", wake.event_id.clone()))?;
+        if source_event.entity_type != "task_coordination_request"
+            || source_event.entity_id != request.id
+            || source_event.event_type != "task.coordination_requested"
+        {
+            return Err(ServiceError::invalid_operation(
+                "ReviewFindings wake is not attached to its exact durable request event",
+            ));
+        }
+        Ok(json!({
+            "task": {
+                "id": task.id,
+                "project_id": task.project_id,
+                "title": truncate(&task.title, 512),
+                "description": task.description.as_deref().map(|value| truncate(value, 16 * 1024)),
+                "lifecycle_state": task.lifecycle_state,
+                "version": task.version,
+            },
+            "coordination_authorization_version": coordination.authorization_version,
+            "task_role": {
+                "id": role.id,
+                "role": role.role,
+                "policy_ref": POLICY_REF,
+                "policy_version": POLICY_VERSION,
+                "policy_digest": wake.policy_digest,
+                "version": wake.task_role_version,
+                "policy_json": wake.task_role_policy_json,
+                "policy_digest_for_task_role": task_role_policy_digest(&wake.task_role_policy_json),
+                "pr6_policy": role_policy.context_value(),
+            },
+            "active_memberships": memberships.iter()
+                .filter(|membership| membership.status == RoleMembershipStatus::Active)
+                .map(|membership| json!({"actor_kind": membership.actor_kind.to_string(), "actor_id": membership.actor_id}))
+                .collect::<Vec<_>>(),
+            "review_findings": review_findings,
+            "wake": {
+                "id": wake.id,
+                "event_id": source_event.id,
+                "event_sequence": source_event.sequence,
+                "event_type": source_event.event_type,
+                "event_entity_type": source_event.entity_type,
+                "event_entity_id": source_event.entity_id,
+                "scope_type": source_event.scope_type,
+                "scope_id": source_event.scope_id,
+                "correlation_id": source_event.correlation_id,
+                "causation_id": source_event.causation_id,
+                "causation_depth": source_event.causation_depth,
+                "payload": parse_payload(&source_event),
+            }
+        }))
+    }
+
     async fn reconcile_orchestrator_terminal(&self, event: &DomainEvent) -> Result<bool> {
         if event.entity_type != "execution"
             || event.scope_type != "task"
@@ -2357,6 +2685,61 @@ impl OrchestratorRuntime {
         };
         let now = now_rfc3339();
         if event.event_type == "execution.completed" {
+            if let Some(request) = coordination_request
+                .as_ref()
+                .filter(|request| request.kind == db::TaskCoordinationRequestKind::ReviewFindings)
+            {
+                let dispatch =
+                    TaskLifecycleRepo::get_task_dispatch(&*self.db, &request.task_id).await?;
+                let batch_state =
+                    TaskCoordinationRepo::project_plan_batch_coordination_request_state(
+                        &*self.db,
+                        &request.id,
+                    )
+                    .await?;
+                if dispatch.is_some_and(|dispatch| dispatch.state == db::TaskDispatchState::Paused)
+                    || batch_state.as_deref() == Some("paused")
+                {
+                    // Preserve the completed provider response and its exact
+                    // request. The durable completion scanner retries triage
+                    // after the same authorization is resumed.
+                    tracing::info!(
+                        task_id = %request.task_id,
+                        request_id = %request.id,
+                        execution_id = %execution.id,
+                        "completed ReviewFindings response deferred while dispatch is paused"
+                    );
+                    return Ok(true);
+                }
+
+                let snapshot_policy =
+                    TaskRoleOrchestratorPolicy::parse(&wake.task_role_policy_json)
+                        .map_err(invalid_action)?;
+                if snapshot_policy.action_limit() < 1
+                    || snapshot_policy
+                        .allowed_actions
+                        .as_ref()
+                        .is_some_and(|allowed| {
+                            !allowed.contains(&OrchestratorActionKind::ReviewFindings)
+                        })
+                {
+                    return Err(invalid_action(
+                        "admitted TaskRole policy excludes ReviewFindings",
+                    ));
+                }
+                let current_policy = self.validate_current_role_policy(&wake).await?;
+                if current_policy
+                    .allowed_actions
+                    .as_ref()
+                    .is_some_and(|allowed| {
+                        !allowed.contains(&OrchestratorActionKind::ReviewFindings)
+                    })
+                {
+                    return Err(invalid_action(
+                        "Current TaskRole policy excludes ReviewFindings",
+                    ));
+                }
+            }
             let completed = if let Some(request) = coordination_request.as_ref() {
                 crate::task_coordination::TaskCoordinationService::new(
                     Arc::clone(&self.db),
@@ -2371,22 +2754,40 @@ impl OrchestratorRuntime {
                 self.apply_completed_actions(&execution, &wake).await
             };
             if let Err(error) = completed {
-                if let Some(request) = coordination_request.as_ref() {
-                    crate::task_coordination::TaskCoordinationService::new(
-                        Arc::clone(&self.db),
-                        Arc::clone(&self.event_bus),
-                    )
-                    .mark_request_failed(request, "coordination.plan_invalid", &error.to_string())
-                    .await
-                    .ok();
-                }
                 match error {
+                    ServiceError::Coordination {
+                        code: "coordination.paused",
+                        ..
+                    } => {
+                        if let Some(request) = coordination_request.as_ref() {
+                            tracing::info!(
+                                task_id = %request.task_id,
+                                request_id = %request.id,
+                                execution_id = %execution.id,
+                                "completed ReviewFindings response deferred by the writer pause fence"
+                            );
+                        }
+                        return Ok(true);
+                    }
                     ServiceError::InvalidOperation { .. }
                     | ServiceError::AuthorizationDenied { .. }
                     | ServiceError::NotFound { .. }
                     | ServiceError::Conflict(_)
                     | ServiceError::Coordination { .. }
                     | ServiceError::Db(db::DbError::StaleOrchestratorAction) => {
+                        if let Some(request) = coordination_request.as_ref() {
+                            crate::task_coordination::TaskCoordinationService::new(
+                                Arc::clone(&self.db),
+                                Arc::clone(&self.event_bus),
+                            )
+                            .mark_request_failed(
+                                request,
+                                "coordination.plan_invalid",
+                                &error.to_string(),
+                            )
+                            .await
+                            .ok();
+                        }
                         OrchestratorWakeRepo::transition_orchestrator_wake_execution(
                             &*self.db,
                             db::TransitionOrchestratorWakeExecution {
@@ -2573,33 +2974,10 @@ impl OrchestratorRuntime {
         let snapshot_policy = TaskRoleOrchestratorPolicy::parse(&wake.task_role_policy_json)
             .map_err(invalid_action)?;
         validate_action_policy(&snapshot_policy, &response.actions)?;
-        if response.actions.len() + response.review_findings.len() > snapshot_policy.action_limit()
-            || (!response.review_findings.is_empty()
-                && snapshot_policy
-                    .allowed_actions
-                    .as_ref()
-                    .is_some_and(|allowed| {
-                        !allowed.contains(&OrchestratorActionKind::ReviewFindings)
-                    }))
-        {
+        if response.actions.len() > snapshot_policy.action_limit() {
             return Err(invalid_action(
-                "Review triage exceeds or is excluded by the admitted TaskRole policy",
+                "orchestrator actions exceed the admitted TaskRole policy",
             ));
-        }
-        for decision in response.review_findings {
-            let current = self.validate_current_role_policy(wake).await?;
-            if current
-                .allowed_actions
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&OrchestratorActionKind::ReviewFindings))
-            {
-                return Err(invalid_action(
-                    "Current TaskRole policy excludes review triage",
-                ));
-            }
-            crate::task_rework::TaskReworkService::new(self.db.clone(), self.event_bus.clone())
-                .record_review_triage(&execution.id, decision)
-                .await?;
         }
         let collaboration =
             CollaborationService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
@@ -3033,6 +3411,174 @@ impl OrchestratorRuntime {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Keep a ReviewFindings request bound to its exact provider attempt while
+    /// paused. Completed responses remain eligible for terminal reconciliation;
+    /// running executions are retried only when the durable receipt proves no
+    /// external Start was attempted.
+    async fn preserve_paused_review_findings_attempt(
+        &self,
+        wake: &OrchestratorWake,
+        request: &db::TaskCoordinationRequest,
+    ) -> Result<bool> {
+        if request.kind != db::TaskCoordinationRequestKind::ReviewFindings
+            || request.state != TaskCoordinationRequestState::Running
+            || request.wake_id.as_deref() != Some(wake.id.as_str())
+        {
+            return Ok(false);
+        }
+        let Some(execution_id) = request.execution_id.as_deref() else {
+            return Ok(false);
+        };
+        let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? else {
+            return Ok(false);
+        };
+        if execution.task_id != request.task_id {
+            return Ok(false);
+        }
+        let Some((execution_wake, attempt)) =
+            OrchestratorWakeRepo::get_orchestrator_wake_by_execution(&*self.db, execution_id)
+                .await?
+        else {
+            return Ok(false);
+        };
+        if execution_wake.id != wake.id
+            || execution_wake.current_attempt != Some(attempt.attempt_number)
+            || wake.current_attempt != Some(attempt.attempt_number)
+        {
+            return Ok(false);
+        }
+        let (next_wake_state, last_error) = match &execution.status {
+            ExecutionStatus::Cancelled => (
+                OrchestratorWakeState::Running,
+                "cancelled ReviewFindings attempt retained for terminal reconciliation",
+            ),
+            ExecutionStatus::Completed => (
+                OrchestratorWakeState::Running,
+                "completed ReviewFindings response retained while dispatch is paused",
+            ),
+            ExecutionStatus::Running => {
+                match self.provider_start_receipt_evidence(&execution).await? {
+                    ProviderStartReceiptEvidence::NoAttempt => {
+                        self.fail_start_execution_if_running(
+                            &execution,
+                            "Task or Project batch paused before Harness Start",
+                        )
+                        .await?;
+                        let failed_attempt =
+                            OrchestratorWakeRepo::transition_orchestrator_wake_execution(
+                                &*self.db,
+                                db::TransitionOrchestratorWakeExecution {
+                                    wake_id: wake.id.clone(),
+                                    attempt_number: attempt.attempt_number,
+                                    execution_id: execution.id.clone(),
+                                    lease_owner: Some(self.lease_owner.clone()),
+                                    expected_state: Some(attempt.state.clone()),
+                                    state: "failed".to_owned(),
+                                    last_error: Some(Some(
+                                        "paused before Harness Start with no external attempt"
+                                            .to_owned(),
+                                    )),
+                                    updated_at: now_rfc3339(),
+                                },
+                            )
+                            .await?;
+                        if failed_attempt {
+                            self.defer_wake(
+                                wake,
+                                "Task or Project batch paused before Harness Start",
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
+                        (
+                            OrchestratorWakeState::Uncertain,
+                            "paused no-Start attempt changed before durable reconciliation",
+                        )
+                    }
+                    ProviderStartReceiptEvidence::Accepted => (
+                        OrchestratorWakeState::Running,
+                        "accepted ReviewFindings attempt retained while dispatch is paused",
+                    ),
+                    ProviderStartReceiptEvidence::Rejected
+                    | ProviderStartReceiptEvidence::Uncertain
+                    | ProviderStartReceiptEvidence::AttemptedWithoutOutcome
+                    | ProviderStartReceiptEvidence::IncoherentWithAttempt
+                    | ProviderStartReceiptEvidence::IncoherentWithoutAttempt => (
+                        OrchestratorWakeState::Uncertain,
+                        "ambiguous ReviewFindings provider attempt retained while dispatch is paused",
+                    ),
+                }
+            }
+            _ => return Ok(false),
+        };
+        if next_wake_state == OrchestratorWakeState::Uncertain
+            && !matches!(attempt.state.as_str(), "uncertain" | "completed" | "failed")
+        {
+            let changed = OrchestratorWakeRepo::transition_orchestrator_wake_execution(
+                &*self.db,
+                db::TransitionOrchestratorWakeExecution {
+                    wake_id: wake.id.clone(),
+                    attempt_number: attempt.attempt_number,
+                    execution_id: execution.id.clone(),
+                    lease_owner: Some(self.lease_owner.clone()),
+                    expected_state: Some(attempt.state.clone()),
+                    state: "uncertain".to_owned(),
+                    last_error: Some(Some(last_error.to_owned())),
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await?;
+            if !changed {
+                tracing::info!(
+                    task_id = %request.task_id,
+                    request_id = %request.id,
+                    execution_id,
+                    "paused ReviewFindings attempt advanced while uncertainty was being recorded"
+                );
+            }
+        }
+        let changed = OrchestratorWakeRepo::transition_orchestrator_wake(
+            &*self.db,
+            db::TransitionOrchestratorWake {
+                id: wake.id.clone(),
+                expected_state: Some(OrchestratorWakeState::Leased),
+                lease_owner: Some(self.lease_owner.clone()),
+                state: next_wake_state,
+                available_at: None,
+                current_attempt: Some(Some(attempt.attempt_number)),
+                last_error: Some(Some(last_error.to_owned())),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+        if !changed {
+            tracing::info!(
+                task_id = %request.task_id,
+                request_id = %request.id,
+                execution_id,
+                "paused ReviewFindings attempt advanced concurrently; retaining its durable result"
+            );
+        }
+        if next_wake_state == OrchestratorWakeState::Uncertain {
+            let coordination = crate::task_coordination::TaskCoordinationService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            );
+            if let Err(error) = coordination
+                .mark_request_uncertain(request, last_error)
+                .await
+            {
+                tracing::warn!(
+                    task_id = %request.task_id,
+                    request_id = %request.id,
+                    %error,
+                    "paused ReviewFindings request remains recoverable after uncertainty transition conflict"
+                );
+            }
+        }
+        Ok(true)
     }
 
     async fn defer_wake(&self, wake: &OrchestratorWake, reason: &str) -> Result<()> {
@@ -3484,7 +4030,6 @@ fn render_orchestrator_prompt(wake: &OrchestratorWake, context: &Value) -> Strin
     // Describe the existing typed output, rather than asking the harness to
     // guess required fields from action names alone.
     let action_examples = OrchestratorResponse {
-        review_findings: Vec::new(),
         actions: vec![
             OrchestratorAction::Message {
                 target: ActionTarget::Task,
@@ -3527,7 +4072,6 @@ fn render_orchestrator_prompt(wake: &OrchestratorWake, context: &Value) -> Strin
     format!(
         "You are the Actor holding the exact admitted orchestration-capable TaskRole for this Task. Direct work through collaboration records. This execution has a read-only isolated context and must not modify repository files.\n\
          Return exactly one JSON object with an `actions` array. Supported action types are `message`, `handoff`, `create_work_unit`, and `proposal`. WorkUnit creation is limited to four bounded records per Execution and never starts work by itself. A WorkUnit-scoped wake may only reference that exact WorkUnit and may create a child under it. A Handoff expresses work intent and never changes RoleMembership. A Proposal never executes its action. Do not claim that stop, cancel, reassign, discard, invalidate, merge, or override occurred. If no action is needed, return `{{\"actions\":[]}}`.\n\
-         When `pending_review_findings` is nonempty, evaluate each exact report critically against scope and evidence. Return an additional `review_findings` array with objects containing `authorization_version` (from `coordination_authorization_version`), `review_report_artifact_id`, `report_digest`, `disposition` (`correct`, `recheck`, or `human`), `rationale`, and `instructions`. Confirm only reproducible defects: `correct` sends a bounded correction to the authorized implementer, `recheck` asks a fresh independent review to examine your objections without changing the implementation, and `human` requests a decision outside your authority. Triage never changes the reviewer verdict or satisfies an approval Gate. Do not blindly relay findings, silently approve a failed review, or widen scope. If a report is disputed, explain the evidence and use `recheck` rather than treating your opinion as approval.\n\
          Action shape examples (not a request to execute these actions): {examples}. Replace placeholder values with exact identities from context; do not invent fields or emit every example. For Actor targets use {{\"kind\":\"actor\",\"actor_kind\":\"human|agent\",\"actor_id\":\"exact-id\"}}.\n\
          Wake {} was caused by durable event {}. Runtime policy {} version {} digest {}; TaskRole policy version {} digest {}.\n\
          Task-scoped context follows as JSON:\n{}",

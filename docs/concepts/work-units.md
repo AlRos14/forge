@@ -196,16 +196,19 @@ ReviewReport whose exact subject names the reviewed WorkUnit and version; a
 generic Task report cannot be applied to another delivery. The operation
 validates the report and subject, creates a correction and a new reviewer
 WorkUnit, records the correction result subject, and consumes one bounded
-rework round atomically. The current budget is eight correction rounds per
-Task. Replaying the same key consumes no additional round.
+rework round atomically. New Tasks default to sixteen correction/reassessment rounds; historical
+limits are preserved and Human extensions are versioned. Replaying the same key consumes no additional round.
 
 A repository correction Workspace is prepared from the reviewed result commit,
 not from the Task integration branch, so it can correct a result that has not
 been integrated. The new reviewer WorkUnit waits for the exact completed
 correction result through the result subject relation; it does not require the
-correction to be integrated first. The independent reviewer cannot be the
-Actor assigned to or contributing to the reviewed result, including the new
-correction Actor, and the check is repeated on later allocation. Exhaustion or
+correction to be integrated first. A Human contributor cannot independently
+review that result. An Agent may reuse the same saved Actor/profile across
+roles, but review requires a fresh native HarnessSession and isolated role
+context, without reusing or forking the contributor conversation. V162 session
+and current RoleMembership checks enforce that boundary on later allocation
+and admission as well. Exhaustion or
 an unavailable independent reviewer leaves an explicit human decision instead
 of an automatic approval.
 

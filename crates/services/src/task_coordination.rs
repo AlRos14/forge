@@ -10,9 +10,10 @@ use db::{
     ProjectPlanBatchRequestOrigin, RoleMembershipRepo, RoleMembershipStatus, SqliteDb, Task,
     TaskCoordination, TaskCoordinationMaterialization, TaskCoordinationMode, TaskCoordinationPlan,
     TaskCoordinationPlanState, TaskCoordinationRepo, TaskCoordinationRequest,
-    TaskCoordinationRequestState, TaskCoordinationWrite, TaskIntervention, TaskInterventionKind,
-    TaskInterventionState, TaskLifecycleRepo, TaskLifecycleState, TaskQualityCategory,
-    TaskQualityRequest, TaskQualityState, TaskQualityTargetKind, TaskRepo, TaskRoleRepo, UserRepo,
+    TaskCoordinationRequestKind, TaskCoordinationRequestState, TaskCoordinationWrite,
+    TaskIntervention, TaskInterventionKind, TaskInterventionState, TaskLifecycleRepo,
+    TaskLifecycleState, TaskQualityCategory, TaskQualityRequest, TaskQualityState,
+    TaskQualityTargetKind, TaskRepo, TaskRoleRepo, UserRepo,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -1018,6 +1019,10 @@ impl TaskCoordinationService {
         let create_input = db::CreateTaskCoordinationRequestInput {
             id: request_id,
             task_id: task.id.clone(),
+            kind: TaskCoordinationRequestKind::WorkUnitPlan,
+            review_report_artifact_id: None,
+            review_report_digest: None,
+            review_producer_execution_id: None,
             requested_by: user_id.to_owned(),
             expected_task_version: input.expected_task_version,
             authorization_version: coordination.authorization_version,
@@ -1053,6 +1058,318 @@ impl TaskCoordinationService {
             self.domain_events.publish_committed(event);
         }
         Ok((request, committed.is_some()))
+    }
+
+    /// Create the exact coordinator turn that triages one current ReviewReport.
+    /// The database writer revalidates the report producer, pending rework
+    /// intent, review-line head, current coordination, and any batch origin.
+    pub async fn request_review_findings_for_report(
+        &self,
+        task_id: &str,
+        review_report_artifact_id: &str,
+    ) -> Result<Option<(TaskCoordinationRequest, bool)>> {
+        if task_id.trim().is_empty() || review_report_artifact_id.trim().is_empty() {
+            return Err(invalid_plan(
+                "review findings source identifiers must be nonempty",
+            ));
+        }
+        let source = sqlx::query(
+            "SELECT report.digest, producer.execution_id AS producer_execution_id
+             FROM artifact report
+             JOIN artifact_execution_producer producer
+               ON producer.artifact_id=report.id AND producer.task_id=report.task_id
+             WHERE report.id=? AND report.task_id=? AND report.kind='review_report'",
+        )
+        .bind(review_report_artifact_id)
+        .bind(task_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        let report_digest: String = source.try_get("digest")?;
+        let review_producer_execution_id: String = source.try_get("producer_execution_id")?;
+        let Some(coordination) =
+            TaskCoordinationRepo::get_task_coordination(&*self.db, task_id).await?
+        else {
+            return Ok(None);
+        };
+        let idempotency_key = format!(
+            "review-findings:{}:{review_report_artifact_id}",
+            coordination.authorization_version
+        );
+
+        // A request remains the receipt for this source after triage,
+        // revocation, or a later review-line revision. Replay it before
+        // requiring the source to remain pending so no second turn is charged.
+        if let Some(existing) = TaskCoordinationRepo::get_task_coordination_request_by_key(
+            &*self.db,
+            task_id,
+            &idempotency_key,
+        )
+        .await?
+        {
+            if existing.kind != TaskCoordinationRequestKind::ReviewFindings
+                || existing.review_report_artifact_id.as_deref() != Some(review_report_artifact_id)
+                || existing.review_report_digest.as_deref() != Some(report_digest.as_str())
+                || existing.review_producer_execution_id.as_deref()
+                    != Some(review_producer_execution_id.as_str())
+                || existing.authorization_version != coordination.authorization_version
+            {
+                return Err(db::DbError::IdempotencyConflict.into());
+            }
+            return Ok(Some((existing, false)));
+        }
+
+        let source_current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_review_coordination_source_current source
+                WHERE source.report_id=? AND source.task_id=?
+                  AND source.report_digest=?
+                  AND source.producer_execution_id=?
+                  AND source.authorization_version=?
+            )",
+        )
+        .bind(review_report_artifact_id)
+        .bind(task_id)
+        .bind(&report_digest)
+        .bind(&review_producer_execution_id)
+        .bind(coordination.authorization_version)
+        .fetch_one(self.db.pool())
+        .await?;
+        if !source_current {
+            return Ok(None);
+        }
+
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        if coordination.mode == TaskCoordinationMode::Manual
+            || coordination.revoked_at.is_some()
+            || coordination.team_stale
+        {
+            return Ok(None);
+        }
+        let Some(requested_by) = coordination.requested_by.as_deref() else {
+            return Ok(None);
+        };
+        let team = self.current_team(task_id).await?;
+        if self.team_digest(&team)? != coordination.team_digest {
+            return Ok(None);
+        }
+        let coordinator = self.resolve_coordinator(&coordination, &team).await?;
+        if coordinator
+            .as_ref()
+            .is_none_or(|value| value.actor_ref.kind() != db::ActorKind::Agent)
+        {
+            return Ok(None);
+        }
+        let envelope = self.envelope(&coordination)?;
+        if !envelope.orchestrator_reviews_findings {
+            return Ok(None);
+        }
+
+        let has_batch_authority =
+            TaskCoordinationRepo::has_current_project_plan_batch_coordination_authorization(
+                &*self.db, task_id,
+            )
+            .await?;
+        let batch_binding = if has_batch_authority {
+            self.project_batch_binding_for_review_triage(
+                task_id,
+                requested_by,
+                review_report_artifact_id,
+                task.version,
+                coordination.authorization_version,
+            )
+            .await?
+        } else {
+            None
+        };
+        if has_batch_authority && batch_binding.is_none() {
+            // Paused or stale batches retain the source. The durable scanner
+            // retries after a valid resume without creating a generic wake.
+            return Ok(None);
+        }
+
+        let brief = CoordinationBrief {
+            objective: format!(
+                "Triage ReviewReport {review_report_artifact_id} ({report_digest})"
+            ),
+            constraints: Some(
+                "Decide only correct, recheck, or human for this exact report. Do not rewrite its verdict, widen scope, or approve its Gate.".to_owned(),
+            ),
+            acceptance_criteria: vec![
+                "Use only the exact report and reviewed result supplied in the request context".to_owned(),
+                "A recheck is a fresh formal review of the same subject without changing implementation".to_owned(),
+            ],
+            context: Some(
+                json!({
+                    "task_version": task.version,
+                    "authorization_version": coordination.authorization_version,
+                    "coordinator_task_role_id": coordination.coordinator_task_role_id,
+                    "coordinator_actor": coordination.coordinator_actor,
+                    "team_generation": coordination.team_generation,
+                    "team_digest": coordination.team_digest,
+                    "envelope_digest": coordination.envelope_digest,
+                    "review_report_artifact_id": review_report_artifact_id,
+                    "review_report_digest": report_digest,
+                    "review_producer_execution_id": review_producer_execution_id,
+                })
+                .to_string(),
+            ),
+        };
+        brief.validate()?;
+        let brief_json = canonical_json(&brief)?;
+        let objective_digest = sha256_hex(brief_json.as_bytes());
+        let request_digest = sha256_hex(
+            canonical_json(&json!({
+                "kind": "review_findings",
+                "task_id": task.id,
+                "task_version": task.version,
+                "authorization_version": coordination.authorization_version,
+                "team_generation": coordination.team_generation,
+                "team_digest": coordination.team_digest,
+                "envelope_digest": coordination.envelope_digest,
+                "review_report_artifact_id": review_report_artifact_id,
+                "review_report_digest": report_digest,
+                "review_producer_execution_id": review_producer_execution_id,
+            }))?
+            .as_bytes(),
+        );
+        let request_id = new_uuid_v4();
+        let now = now_rfc3339();
+        let mut event = self.event(
+            "task.coordination_requested",
+            "task_coordination_request",
+            &request_id,
+            "system",
+            None,
+            &task.id,
+            json!({
+                "task_id": task.id,
+                "request_id": request_id,
+                "kind": TaskCoordinationRequestKind::ReviewFindings.to_string(),
+                "authorization_version": coordination.authorization_version,
+                "review_report_artifact_id": review_report_artifact_id,
+                "review_report_digest": report_digest,
+                "review_producer_execution_id": review_producer_execution_id,
+                "objective_digest": objective_digest,
+            }),
+            &now,
+        );
+        event.dedupe_key = Some(format!(
+            "review-findings-request:{}:{review_report_artifact_id}",
+            coordination.authorization_version
+        ));
+        let create_input = db::CreateTaskCoordinationRequestInput {
+            id: request_id,
+            task_id: task.id.clone(),
+            kind: TaskCoordinationRequestKind::ReviewFindings,
+            review_report_artifact_id: Some(review_report_artifact_id.to_owned()),
+            review_report_digest: Some(report_digest),
+            review_producer_execution_id: Some(review_producer_execution_id),
+            requested_by: requested_by.to_owned(),
+            expected_task_version: task.version,
+            authorization_version: coordination.authorization_version,
+            mode: coordination.mode,
+            brief_json,
+            objective_digest,
+            request_digest,
+            idempotency_key,
+            created_at: now,
+            event,
+        };
+        let write = if let Some(binding) = batch_binding {
+            TaskCoordinationRepo::create_project_plan_batch_coordination_request(
+                &*self.db,
+                create_input,
+                binding,
+            )
+            .await?
+        } else {
+            TaskCoordinationRepo::create_task_coordination_request(&*self.db, create_input).await?
+        };
+        if let Some(event) = write.1.as_ref() {
+            self.domain_events.publish_committed(event);
+        }
+        Ok(Some((write.0, write.1.is_some())))
+    }
+
+    /// Reconcile current pending sources after startup/resume. Requests use
+    /// the exact report and authorization version as their idempotency key, so
+    /// retries do not charge another coordination turn and reauthorization can
+    /// admit a new request only while the report remains the current source.
+    pub async fn process_pending_review_findings_requests(&self, limit: i64) -> Result<usize> {
+        let rows = sqlx::query(
+            "SELECT source.report_id,source.task_id
+             FROM task_review_coordination_source_current source
+             JOIN task_coordination coordination
+               ON coordination.task_id=source.task_id
+              AND coordination.authorization_version=source.authorization_version
+             WHERE coordination.turn_count < coordination.max_turns
+               AND coordination.coordinator_task_role_id IS NOT NULL
+               AND coordination.coordinator_actor_kind='agent'
+               AND coordination.coordinator_actor_id IS NOT NULL
+               AND (
+                 NOT EXISTS(
+                   SELECT 1 FROM project_plan_batch_coordination_authorization grant_scope
+                   WHERE grant_scope.task_id=source.task_id
+                     AND grant_scope.authorization_version=source.authorization_version
+                 )
+                 OR EXISTS(
+                   SELECT 1
+                   FROM project_plan_batch_execution producer_link
+                   JOIN project_plan_batch batch ON batch.id=producer_link.batch_id
+                   JOIN project_plan plan ON plan.project_id=batch.project_id
+                   JOIN project_plan_batch_task batch_task
+                     ON batch_task.batch_id=batch.id AND batch_task.task_id=source.task_id
+                   JOIN project_plan_batch_coordination_authorization grant_scope
+                     ON grant_scope.batch_id=batch.id AND grant_scope.task_id=source.task_id
+                    AND grant_scope.authorization_version=source.authorization_version
+                   WHERE producer_link.execution_id=source.producer_execution_id
+                     AND producer_link.task_id=source.task_id
+                     AND producer_link.authorization_version=source.authorization_version
+                     AND batch.state='running' AND batch.preparation_complete=1
+                     AND batch.graph_version=plan.version
+                     AND batch_task.state='started'
+                     AND batch_task.coordination_snapshot_json IS NOT NULL
+                     AND batch_task.coordination_snapshot_digest IS NOT NULL
+                 )
+               )
+               AND NOT EXISTS(
+                 SELECT 1 FROM task_coordination_request request
+                 WHERE request.task_id=source.task_id
+                   AND request.authorization_version=source.authorization_version
+                   AND request.kind='review_findings'
+                   AND request.review_report_artifact_id=source.report_id
+               )
+             ORDER BY source.report_id LIMIT ?",
+        )
+        .bind(limit.clamp(1, 100))
+        .fetch_all(self.db.pool())
+        .await?;
+        let mut created = 0;
+        for row in rows {
+            let report_id: String = row.try_get("report_id")?;
+            let task_id: String = row.try_get("task_id")?;
+            match self
+                .request_review_findings_for_report(&task_id, &report_id)
+                .await
+            {
+                Ok(Some((_, true))) => created += 1,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        task_id,
+                        review_report_artifact_id = %report_id,
+                        %error,
+                        "review findings request remains pending after a source-local error"
+                    );
+                }
+            }
+        }
+        Ok(created)
     }
 
     /// Resolves the exact producer Execution for a quality source Artifact into
@@ -1153,6 +1470,46 @@ impl TaskCoordinationService {
                 }
             },
         ))
+    }
+
+    /// Uses the exact ReviewReport producer already linked to the active batch,
+    /// while preserving the distinct typed `review_triage` origin at write.
+    pub async fn project_batch_binding_for_review_triage(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        review_report_artifact_id: &str,
+        expected_task_version: i64,
+        expected_coordination_version: i64,
+    ) -> Result<Option<ProjectPlanBatchRequestBinding>> {
+        let Some(mut binding) = self
+            .project_batch_binding_for_quality_source(
+                task_id,
+                user_id,
+                review_report_artifact_id,
+                expected_task_version,
+                expected_coordination_version,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let producer_execution_id = match binding.origin {
+            ProjectPlanBatchRequestOrigin::QualityReplan {
+                producer_execution_id,
+                ..
+            } => producer_execution_id,
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "Review triage source resolved to a non-quality batch origin",
+                ))
+            }
+        };
+        binding.origin = ProjectPlanBatchRequestOrigin::ReviewTriage {
+            source_artifact_id: review_report_artifact_id.to_owned(),
+            producer_execution_id,
+        };
+        Ok(Some(binding))
     }
 
     /// Resolves a Human-requested plan revision only from an exact approved
@@ -1872,6 +2229,9 @@ impl TaskCoordinationService {
         request: &TaskCoordinationRequest,
         execution: &db::Execution,
     ) -> Result<()> {
+        if request.kind == TaskCoordinationRequestKind::ReviewFindings {
+            return self.complete_review_findings_turn(request, execution).await;
+        }
         if let Some(existing) =
             TaskCoordinationRepo::list_task_coordination_plans(&*self.db, &request.task_id, 100)
                 .await?
@@ -2117,6 +2477,65 @@ impl TaskCoordinationService {
         Ok(())
     }
 
+    async fn complete_review_findings_turn(
+        &self,
+        request: &TaskCoordinationRequest,
+        execution: &db::Execution,
+    ) -> Result<()> {
+        const MAX_REVIEW_FINDINGS_BYTES: usize = 64 * 1024;
+
+        let output = execution.summary.as_deref().ok_or_else(|| {
+            invalid_plan("the ReviewFindings coordination Execution has no triage output")
+        })?;
+        if output.len() > MAX_REVIEW_FINDINGS_BYTES {
+            return Err(invalid_plan(
+                "the ReviewFindings triage output exceeds 64 KiB",
+            ));
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ReviewFindingsTurn {
+            schema_version: u32,
+            request_id: String,
+            task_id: String,
+            authorization_version: i64,
+            review_findings: Vec<crate::task_rework::ReviewFindingsDecision>,
+        }
+        let response: ReviewFindingsTurn = serde_json::from_str(output).map_err(|_| {
+            invalid_plan("the ReviewFindings output is not its typed JSON envelope")
+        })?;
+        if response.schema_version != 1
+            || response.request_id != request.id
+            || response.task_id != request.task_id
+            || response.authorization_version != request.authorization_version
+            || response.review_findings.len() != 1
+        {
+            return Err(invalid_plan(
+                "ReviewFindings requires exactly one decision for its exact request and authorization",
+            ));
+        }
+        let decision = response
+            .review_findings
+            .into_iter()
+            .next()
+            .expect("one ReviewFindings decision was checked");
+        if decision.authorization_version != request.authorization_version
+            || request.review_report_artifact_id.as_deref()
+                != Some(decision.review_report_artifact_id.as_str())
+            || request.review_report_digest.as_deref() != Some(decision.report_digest.as_str())
+        {
+            return Err(invalid_plan(
+                "ReviewFindings decision does not match its exact report and authorization",
+            ));
+        }
+        crate::task_rework::TaskReworkService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .record_review_triage(&execution.id, &request.id, decision)
+        .await
+    }
+
     pub async fn mark_turn_started(
         &self,
         request: &TaskCoordinationRequest,
@@ -2249,6 +2668,29 @@ impl TaskCoordinationService {
         request: &TaskCoordinationRequest,
         context: &Value,
     ) -> Result<String> {
+        if request.kind == TaskCoordinationRequestKind::ReviewFindings {
+            let report_id = request
+                .review_report_artifact_id
+                .as_deref()
+                .ok_or_else(|| invalid_plan("ReviewFindings request has no exact report ID"))?;
+            let report_digest = request
+                .review_report_digest
+                .as_deref()
+                .ok_or_else(|| invalid_plan("ReviewFindings request has no exact report digest"))?;
+            return Ok(format!(
+                "You are the selected Task coordinator reviewing one exact request-changes ReviewReport. This execution is read-only and cannot change the report, its verdict, the reviewed result, or a Gate.\n\
+Return exactly one JSON object and no markdown fences. It must match this schema:\n\
+{{\"schema_version\":1,\"request_id\":{request_id},\"task_id\":{task_id},\"authorization_version\":{authorization_version},\"review_findings\":[{{\"authorization_version\":{authorization_version},\"review_report_artifact_id\":{report_id},\"report_digest\":{report_digest},\"disposition\":\"correct|recheck|human\",\"rationale\":\"...\",\"instructions\":\"...\"}}]}}\n\
+Return exactly one decision in `review_findings` and no `actions`, plan, or WorkUnits. `correct` confirms a reproducible defect and gives a bounded correction for the authorized implementer. `recheck` asks for a fresh formal review of the same frozen subject without changing implementation. `human` identifies the concrete decision that needs a Human. Use only the report and reviewed result in this context; do not blindly relay findings or widen scope. Keep rationale nonempty and under 8 KiB, and instructions nonempty and under 16 KiB.\n\
+Exact report: {report_id} ({report_digest})\nTask context: {context}",
+                request_id = serde_json::to_string(&request.id).unwrap(),
+                task_id = serde_json::to_string(&request.task_id).unwrap(),
+                authorization_version = request.authorization_version,
+                report_id = serde_json::to_string(report_id).unwrap(),
+                report_digest = serde_json::to_string(report_digest).unwrap(),
+                context = serde_json::to_string(context).unwrap_or_else(|_| "{}".to_owned()),
+            ));
+        }
         let brief = self.parse_brief(request)?;
         let coordination = self.require_coordination(&request.task_id).await?;
         let envelope = self.envelope(&coordination)?;

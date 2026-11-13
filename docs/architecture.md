@@ -65,6 +65,16 @@ any TaskRole, capability, or membership mutation; materialization and Provider
 Start revalidate revocation, team state, dispatch, lifecycle, and the exact
 coordination request under their own write locks. `manual` remains the default
 for existing Tasks, and no coordination turn is triggered retrospectively.
+V168 distinguishes immutable request kinds: existing requests remain
+`work_unit_plan`; `review_findings` pins one ReviewReport/digest and its reviewer
+producer Execution. The coordinator consumes only that report and applies one
+bounded `correct|recheck|human` decision; the immutable triage and terminal
+`triaged` request state commit together without a plan Artifact. Batch requests
+retain a typed `review_triage` origin and the same authority fences. `recheck`
+uses a fresh formal review of the unchanged frozen subject, not an arbitrary
+verification command. A later request-changes report opens another exact turn;
+a passing report remains subject to the current review line and Gate policy.
+Neither the triage nor technical completion confers acceptance or Task Done.
 Quality requests and the versioned intervention circuit are separate durable
 records; they do not replace TaskLifecycle, review, Gate, or collaboration
 authority. A durable quality consumer follows the exact report/rework chain:
@@ -157,8 +167,8 @@ TaskCoordination authorizations minted by a Project batch retain an immutable
 binding to that exact batch. The generic Task coordination request route rejects
 such a version with `409 project_plan_batch_inactive`, including after the batch
 is paused, revoked, or completed; a fresh explicit TaskCoordination authorization
-restores the standalone request path. Scheduler, Quality Replan, and Human
-Replan continuations retain their exact claim token or source Artifact,
+restores the standalone request path. Scheduler, Quality Replan, Human Replan, and ReviewTriage
+continuations retain their exact claim token or source Artifact,
 producer Execution, or explicitly selected plan Artifact. Human Replan requires
 approval valid in the active authorization/batch and an exact materialization
 receipt when the plan is materialized. Multiple plans may remain valid in one
@@ -167,7 +177,7 @@ recorded directly and is never inferred from an authorization-version change.
 
 While that authorization version remains batch-bound, generic Task events do
 not create Agent coordinator wakes. Batch-bound Agent coordination starts only
-from its typed Scheduler, Quality Replan, or Human Replan request; Human-targeted
+from its typed Scheduler, Quality Replan, Human Replan, or ReviewTriage request; Human-targeted
 collaboration remains available. Terminal events for existing batch-linked
 coordinator Executions continue to reconcile against their exact durable wake,
 attempt, and request. A fresh explicit Human authorization with a new version
@@ -185,7 +195,7 @@ A Gate is a deterministic policy over exact durable records. Its immutable GateE
 
 ## Persistence and history
 
-SQLite is the current persistence layer. Numbered migrations V001–V167 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add the Task coordination authorization, turn, plan, materialization, quality-request, intervention, team-staleness, and quality-resolution records described by the PR0 contract. V161 adds persisted quality-route counters, exact cycle evidence, and inspectable Human-escalation reasons; it preserves historical request states. V167 adds optional Project plan versions and proposals, source and Task identity provenance, batch authorization, delivery readiness, and fail-closed guards for incomplete imports and provider starts.
+SQLite is the current persistence layer. Numbered migrations V001–V168 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add the Task coordination authorization, turn, plan, materialization, quality-request, intervention, team-staleness, and quality-resolution records described by the PR0 contract. V161 adds persisted quality-route counters, exact cycle evidence, and inspectable Human-escalation reasons; it preserves historical request states. V167 adds optional Project plan versions and proposals, source and Task identity provenance, batch authorization, delivery readiness, and fail-closed guards for incomplete imports and provider starts.
 
 Historical `agent_session_history`, immutable Execution records, ProjectRelease snapshots, Artifact and Evidence references, HarnessSession identities, cross-record IDs, migration decisions, ADRs, and upstream license attribution remain readable history. History does not regain runtime authority. ProjectRelease is a read-only historical snapshot and does not create a current Charter, milestone, readiness workflow, or release operation.
 
@@ -194,7 +204,8 @@ requests. A grant records the exact Project, batch, Task, authorized Human,
 versions, Task objective, team/envelope snapshot, and coordinator Role/Actor in
 the same write as the authorization change. Each batch request additionally
 records whether it came from a scheduler claim, a Quality Replan Artifact and
-producer Execution, or an approved Human Replan Artifact.
+producer Execution, an approved Human Replan Artifact, or an exact ReviewTriage
+Report and reviewer producer Execution.
 
 Configuration or data path changes can affect installed users. The current local identifiers include the `forge` brand, `FORGE_*` variables, `~/.forge`, `forge.yaml`, `forge.db`, `jwt_secret.bin`, `server.json`, workspace roots, and log locations. Changing them requires a separately reviewed discovery and preservation strategy; no such rename has been authorized.
 

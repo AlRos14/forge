@@ -11,6 +11,8 @@ import {
   useTaskCoordinationPlanQuery,
   useTaskCoordinationQuery,
   useTaskCoordinationRequestQuery,
+  useTaskReworkAutomationQuery,
+  useTaskWorkUnitsQuery,
 } from '@/api/hooks'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -49,6 +51,10 @@ import {
   isTurnBudgetExhausted,
   readableCoordinationCode,
 } from './task-coordination-status'
+import {
+  deriveReviewFindingsProjection,
+  isReviewFindingsRequest,
+} from './task-review-triage'
 import { TaskInterventionsPanel } from './task-interventions-panel'
 import { TaskAutonomyLimitsPanel } from './task-autonomy-limits'
 import { TaskQualityRequestsPanel } from './task-quality-requests-panel'
@@ -82,6 +88,7 @@ const modeOptions: Array<{
 const requestStateLabels: Record<TaskCoordinationRequestResponse['state'], string> = {
   requested: 'Request recorded',
   running: 'Preparing a plan',
+  triaged: 'Findings triaged',
   plan_ready: 'Plan is ready',
   awaiting_approval: 'Waiting for approval',
   materialized: 'Work items materialized',
@@ -168,15 +175,30 @@ export function TaskCoordinationPanel({
   )
   const query = useTaskCoordinationQuery(task.id)
   const overview = query.data
+  const latestRequestIsReviewFindings = isReviewFindingsRequest(overview?.latest_request)
   const planQuery = useTaskCoordinationPlanQuery(
     task.id,
     overview?.latest_plan?.artifact_id ?? null,
   )
   const overviewPlan = overview?.latest_plan ?? null
   const plan = planQuery.data ?? overviewPlan
-  const requestId = plan?.request_id ?? overview?.latest_request?.id ?? null
+  const requestId = latestRequestIsReviewFindings
+    ? (overview?.latest_request?.id ?? null)
+    : (plan?.request_id ?? overview?.latest_request?.id ?? null)
   const requestQuery = useTaskCoordinationRequestQuery(task.id, requestId)
   const request = requestQuery.data ?? overview?.latest_request ?? null
+  const workUnitsQuery = useTaskWorkUnitsQuery(task.id)
+  const reworkAutomationQuery = useTaskReworkAutomationQuery(task.id)
+  const automationIntentsState = reworkAutomationQuery.isError
+    ? 'error'
+    : reworkAutomationQuery.data === undefined
+      ? 'loading'
+      : 'loaded'
+  const workUnitsState = workUnitsQuery.isError
+    ? 'error'
+    : workUnitsQuery.data === undefined
+      ? 'loading'
+      : 'loaded'
   const authorize = useAuthorizeTaskCoordination()
   const requestTurn = useRequestTaskCoordinationTurn()
   const createIntervention = useCreateTaskIntervention()
@@ -255,7 +277,24 @@ export function TaskCoordinationPanel({
   const coordinatorRole = overview?.team.find(
     (role) => role.id === overview.coordinator?.task_role_id,
   )
-  const derivedNextAction = overview ? deriveCoordinationNextAction(overview, request, plan) : null
+  const derivedNextAction = overview
+    ? deriveCoordinationNextAction(overview, request, plan, {
+        automationIntents: reworkAutomationQuery.data?.items ?? [],
+        automationIntentsState,
+        workUnits: workUnitsQuery.data ?? [],
+        workUnitsState,
+      })
+    : null
+  const reviewFindingsProjection = overview
+    ? deriveReviewFindingsProjection({
+        overview,
+        request,
+        automationIntents: reworkAutomationQuery.data?.items ?? [],
+        automationIntentsState,
+        workUnits: workUnitsQuery.data ?? [],
+        workUnitsState,
+      })
+    : null
   const baseNextAction =
     overview?.mode === 'manual' &&
     canEditCoordinationAuthorization &&
@@ -633,6 +672,20 @@ export function TaskCoordinationPanel({
               nextAction.kind === 'authorize' ? (
                 <Button size="sm" variant="outline" onClick={onOpenAdvancedWork}>
                   Open Advanced work
+                </Button>
+              ) : null}
+              {latestRequestIsReviewFindings &&
+              (reworkAutomationQuery.isError || workUnitsQuery.isError) ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={reworkAutomationQuery.isFetching || workUnitsQuery.isFetching}
+                  onClick={() => {
+                    if (reworkAutomationQuery.isError) void reworkAutomationQuery.refetch()
+                    if (workUnitsQuery.isError) void workUnitsQuery.refetch()
+                  }}
+                >
+                  Retry continuation evidence
                 </Button>
               ) : null}
             </div>
@@ -1071,8 +1124,13 @@ export function TaskCoordinationPanel({
         >
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h3 id="coordination-request-title" className="font-medium">
-              Latest preparation request
+              {reviewFindingsProjection
+                ? 'Latest review-findings request'
+                : 'Latest preparation request'}
             </h3>
+            <Badge variant="outline">
+              {reviewFindingsProjection ? 'Review findings' : 'WorkUnit plan'}
+            </Badge>
             <Badge
               variant={
                 request.state === 'failed' || request.state === 'uncertain'
@@ -1080,16 +1138,77 @@ export function TaskCoordinationPanel({
                   : 'outline'
               }
             >
-              {requestStateLabels[request.state]}
+              {reviewFindingsProjection?.stateLabel ?? requestStateLabels[request.state]}
             </Badge>
           </div>
-          <p className="mt-2 break-words text-sm">{request.brief.objective}</p>
-          {request.brief.constraints ? (
+          {reviewFindingsProjection ? (
+            <div className="mt-2 space-y-2 rounded-md border bg-background/60 p-3 text-sm">
+              <p className="font-medium">
+                Request kind · Review findings · {reviewFindingsProjection.stateLabel}
+              </p>
+              <div className="space-y-1 break-all text-xs text-muted-foreground">
+                <p>
+                  {reviewFindingsProjection.reportId
+                    ? 'Exact ReviewReport source is attached.'
+                    : 'Exact ReviewReport source is unavailable.'}
+                </p>
+                <p>
+                  {reviewFindingsProjection.producerExecutionId
+                    ? 'Reviewer producer Execution source is attached.'
+                    : 'Reviewer producer Execution source is unavailable.'}
+                </p>
+                {request.execution_id ? <p>Coordinator disposition is recorded.</p> : null}
+              </div>
+              {reviewFindingsProjection.triage ? (
+                <p className="text-xs text-muted-foreground">
+                  The coordinator recorded a disposition for this exact report. This does not
+                  approve the ReviewReport, satisfy a Gate, or set TaskLifecycle to done.
+                </p>
+              ) : null}
+              {reviewFindingsProjection.blockers.length ? (
+                <ul className="list-disc space-y-1 pl-5 text-xs text-amber-800 dark:text-amber-200">
+                  {reviewFindingsProjection.blockers.map((blocker) => (
+                    <li key={blocker}>{blocker}</li>
+                  ))}
+                </ul>
+              ) : null}
+              <details className="text-xs text-muted-foreground">
+                <summary className="w-fit cursor-pointer">Full immutable source references</summary>
+                <div className="mt-2 space-y-1 break-all">
+                  <p>Request ID: {request.id}</p>
+                  <p>ReviewReport: {reviewFindingsProjection.reportId ?? 'unavailable'}</p>
+                  <p>Report digest: {reviewFindingsProjection.reportDigest ?? 'unavailable'}</p>
+                  <p>
+                    Reviewer producer Execution:{' '}
+                    {reviewFindingsProjection.producerExecutionId ?? 'unavailable'}
+                  </p>
+                  {request.execution_id ? <p>Coordinator Execution: {request.execution_id}</p> : null}
+                  <div className="flex flex-wrap gap-2">
+                    {reviewFindingsProjection.reportId ? (
+                      <CopyReferenceButton
+                        value={reviewFindingsProjection.reportId}
+                        label="ReviewReport ID"
+                      />
+                    ) : null}
+                    {reviewFindingsProjection.reportDigest ? (
+                      <CopyReferenceButton
+                        value={reviewFindingsProjection.reportDigest}
+                        label="ReviewReport digest"
+                      />
+                    ) : null}
+                  </div>
+                </div>
+              </details>
+            </div>
+          ) : (
+            <p className="mt-2 break-words text-sm">{request.brief.objective}</p>
+          )}
+          {!reviewFindingsProjection && request.brief.constraints ? (
             <p className="mt-1 whitespace-pre-wrap break-words text-sm text-muted-foreground">
               Constraints: {request.brief.constraints}
             </p>
           ) : null}
-          {request.brief.acceptance_criteria.length ? (
+          {!reviewFindingsProjection && request.brief.acceptance_criteria.length ? (
             <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
               {request.brief.acceptance_criteria.map((criterion, index) => (
                 <li key={`${index}:${criterion}`} className="break-words">
@@ -1435,7 +1554,13 @@ export function TaskCoordinationPanel({
 
       {overview.review_triage?.length ? (
         <section className="space-y-3 rounded-lg border p-4">
-          <h3 className="font-medium">Coordinator review decision history</h3>
+          <div>
+            <h3 className="font-medium">Coordinator review triage history</h3>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Each disposition is bound to one ReviewReport. Triage does not change its verdict,
+              satisfy a Gate, or complete the Task.
+            </p>
+          </div>
           {overview.review_triage.map((triage) => (
             <article
               key={triage.review_report_artifact_id}
@@ -1445,7 +1570,7 @@ export function TaskCoordinationPanel({
                 {triage.disposition === 'correct'
                   ? 'Findings confirmed for correction'
                   : triage.disposition === 'recheck'
-                    ? 'Fresh independent review requested'
+                    ? 'Fresh review WorkUnit recorded'
                     : 'Human decision requested'}
               </p>
               <p className="mt-2 whitespace-pre-wrap">{triage.rationale}</p>

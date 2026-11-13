@@ -6,7 +6,7 @@ use db::{
     UpdateDaemonReport, UpdateProject, UpsertDaemon, WorkMode, WorkUnitRepo,
 };
 use serde_json::json;
-use std::{path::Path, process::Command, sync::Arc, time::Duration};
+use std::{collections::VecDeque, path::Path, process::Command, sync::Arc, time::Duration};
 
 type ObservedWorkUnitExecutionRow = (
     String,
@@ -40,7 +40,100 @@ type ObservedExecutionDiagnosticRow = (
 struct ProjectBatchHarnessAdapter {
     plan: String,
     orchestrator_turns: Arc<std::sync::atomic::AtomicUsize>,
+    implementer_turns: Arc<std::sync::atomic::AtomicUsize>,
+    reviewer_turns: Arc<std::sync::atomic::AtomicUsize>,
+    triage_dispositions: Arc<std::sync::Mutex<VecDeque<String>>>,
+    first_triage_started: Arc<tokio::sync::Notify>,
+    release_first_triage: Arc<tokio::sync::Notify>,
+    block_first_triage: Arc<std::sync::atomic::AtomicBool>,
     observations: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+}
+
+fn prompt_json_string(prompt: &str, key: &str) -> String {
+    let marker = format!("\"{key}\":");
+    let value = prompt
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("ReviewFindings prompt has {key:?}"))
+        .1;
+    let end = value
+        .find(|character| matches!(character, ',' | '}'))
+        .expect("ReviewFindings prompt JSON string has a delimiter");
+    serde_json::from_str(&value[..end]).expect("ReviewFindings prompt field is a JSON string")
+}
+
+fn prompt_json_number(prompt: &str, key: &str) -> i64 {
+    let marker = format!("\"{key}\":");
+    let value = prompt
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("ReviewFindings prompt has {key:?}"))
+        .1;
+    let end = value
+        .find(|character| matches!(character, ',' | '}'))
+        .expect("ReviewFindings prompt number has a delimiter");
+    value[..end]
+        .parse()
+        .expect("ReviewFindings prompt field is an integer")
+}
+
+fn review_findings_output(prompt: &str, disposition: &str) -> String {
+    let exact_report = prompt
+        .split_once("Exact report: ")
+        .expect("ReviewFindings prompt includes its exact report")
+        .1;
+    let (report_id_json, rest) = exact_report
+        .split_once(" (")
+        .expect("ReviewFindings prompt report includes its digest");
+    let (report_digest_json, _) = rest
+        .split_once(')')
+        .expect("ReviewFindings prompt digest has a closing delimiter");
+    let report_id: String =
+        serde_json::from_str(report_id_json).expect("exact report ID is JSON encoded");
+    let report_digest: String =
+        serde_json::from_str(report_digest_json).expect("exact report digest is JSON encoded");
+    json!({
+        "schema_version": 1,
+        "request_id": prompt_json_string(prompt, "request_id"),
+        "task_id": prompt_json_string(prompt, "task_id"),
+        "authorization_version": prompt_json_number(prompt, "authorization_version"),
+        "review_findings": [{
+            "authorization_version": prompt_json_number(prompt, "authorization_version"),
+            "review_report_artifact_id": report_id,
+            "report_digest": report_digest,
+            "disposition": disposition,
+            "rationale": format!("The exact report supports the scripted {disposition} decision."),
+            "instructions": if disposition == "recheck" {
+                "Independently review the same frozen result and report whether the finding is reproducible."
+            } else {
+                "Correct the exact confirmed finding within the original accepted scope."
+            }
+        }]
+    })
+    .to_string()
+}
+
+fn review_report_output(verdict: &str) -> String {
+    let finding = if verdict == "request_changes" {
+        vec!["The delivered result is missing the required acceptance evidence."]
+    } else {
+        Vec::new()
+    };
+    format!(
+        "FORGE_RESULT: {}",
+        json!({
+            "schema_version": 1,
+            "kind": "review",
+            "verdict": verdict,
+            "summary": if verdict == "request_changes" {
+                "The exact reviewed result is missing required acceptance evidence."
+            } else {
+                "The exact corrected result satisfies the acceptance criterion."
+            },
+            "criteria": ["The exact result satisfies the requested acceptance criterion."],
+            "findings": finding,
+            "questions": [],
+            "evidence_considered": []
+        })
+    )
 }
 
 #[async_trait::async_trait]
@@ -62,21 +155,42 @@ impl executors::HarnessAdapter for ProjectBatchHarnessAdapter {
     ) -> std::result::Result<executors::ExecutionResult, executors::ExecutorError> {
         let output = match context.role.as_str() {
             "orchestrator" => {
-                if self
+                let turn = self
                     .orchestrator_turns
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    == 0
-                {
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if turn == 0 {
                     self.plan.clone()
+                } else if context.description.contains("Exact report: ") {
+                    let disposition = self
+                        .triage_dispositions
+                        .lock()
+                        .expect("fake Harness triage script locks")
+                        .pop_front()
+                        .expect("each exact ReviewFindings turn has one scripted decision");
+                    if self
+                        .block_first_triage
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        self.first_triage_started.notify_one();
+                        self.release_first_triage.notified().await;
+                    }
+                    review_findings_output(&context.description, &disposition)
                 } else {
-                    // The explicit batch request produces the WorkUnitPlan.
-                    // Keep any later supported coordinator turn bounded to a
-                    // typed PR6 no-op; it must not invent more work.
                     r#"{"actions":[]}"#.to_owned()
                 }
             }
-            "implementer" => "Implementation delivered for the exact WorkUnit scope.".to_owned(),
-            "reviewer" => "FORGE_RESULT: {\"schema_version\":1,\"kind\":\"review\",\"verdict\":\"pass\",\"summary\":\"The exact implementation result meets its acceptance criterion.\",\"criteria\":[\"correctness\"],\"findings\":[],\"questions\":[],\"evidence_considered\":[]}".to_owned(),
+            "implementer" => {
+                let turn = self
+                    .implementer_turns
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                format!("Implementation pass {turn} delivered for the exact WorkUnit scope.")
+            }
+            "reviewer" => {
+                let turn = self
+                    .reviewer_turns
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                review_report_output(if turn < 2 { "request_changes" } else { "pass" })
+            }
             role => {
                 return Err(executors::ExecutorError::Other(format!(
                     "unexpected Project batch harness role {role:?}"
@@ -109,8 +223,9 @@ fn project_role_default(
     role: &str,
     coordination_mode: db::CoordinationMode,
     capabilities: Vec<api_types::TaskRoleCapability>,
-    agent_id: &str,
-    coordinator: bool,
+    members: Vec<ActorRef>,
+    coordinator_actor: Option<&str>,
+    rework: Option<api_types::ProjectTaskRoleReworkConfiguration>,
 ) -> ProjectTaskRoleDefault {
     ProjectTaskRoleDefault {
         role: role.to_owned(),
@@ -119,11 +234,12 @@ fn project_role_default(
             schema_version: 1,
             display_label: None,
             capabilities,
-            rework: None,
-            coordinator_actor: coordinator.then(|| api_types::ActorRef::Agent(agent_id.to_owned())),
+            rework,
+            coordinator_actor: coordinator_actor
+                .map(|actor_id| api_types::ActorRef::Agent(actor_id.to_owned())),
         })
         .expect("Project TaskRole configuration serializes"),
-        members: vec![ActorRef::Agent(agent_id.to_owned())],
+        members,
     }
 }
 
@@ -217,7 +333,10 @@ async fn add_project_repo(
     repo_id
 }
 
-async fn add_embedded_codex_agent(database: &Arc<db::SqliteDb>, owner_id: &str) -> String {
+async fn add_embedded_codex_agent(
+    database: &Arc<db::SqliteDb>,
+    owner_id: &str,
+) -> (String, String) {
     let now = now_rfc3339();
     let daemon_id = new_uuid_v4();
     DaemonRepo::upsert_by_machine_id(
@@ -253,12 +372,29 @@ async fn add_embedded_codex_agent(database: &Arc<db::SqliteDb>, owner_id: &str) 
     )
     .await
     .expect("embedded host advertises the fake Codex route");
+    let agent_id = add_codex_agent_to_daemon(
+        database,
+        owner_id,
+        &daemon_id,
+        "Project batch coordinator fake Harness",
+    )
+    .await;
+    (daemon_id, agent_id)
+}
+
+async fn add_codex_agent_to_daemon(
+    database: &Arc<db::SqliteDb>,
+    owner_id: &str,
+    daemon_id: &str,
+    name: &str,
+) -> String {
+    let now = now_rfc3339();
     let agent_id = new_uuid_v4();
     AgentRepo::create(
         &**database,
         CreateAgent {
             id: agent_id.clone(),
-            name: "Project batch fake Harness".to_owned(),
+            name: name.to_owned(),
             description: None,
             executor_type: "codex".to_owned(),
             model: None,
@@ -268,7 +404,7 @@ async fn add_embedded_codex_agent(database: &Arc<db::SqliteDb>, owner_id: &str) 
             capabilities_json: "[]".to_owned(),
             config_json: "{}".to_owned(),
             credential_ref: None,
-            daemon_id: Some(daemon_id),
+            daemon_id: Some(daemon_id.to_owned()),
             max_concurrent_tasks: 4,
             heartbeat_interval_seconds: 30,
             max_missed_heartbeats: 3,
@@ -302,7 +438,14 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
     let project_id = test_project(&database, &owner_id).await;
     let repo_root = tempfile::tempdir().expect("isolated repository root creates");
     add_project_repo(&database, &project_id, repo_root.path()).await;
-    let agent_id = add_embedded_codex_agent(&database, &owner_id).await;
+    let (daemon_id, agent_id) = add_embedded_codex_agent(&database, &owner_id).await;
+    let reviewer_agent_id = add_codex_agent_to_daemon(
+        &database,
+        &owner_id,
+        &daemon_id,
+        "Project batch independent reviewer fake Harness",
+    )
+    .await;
 
     let defaults = db::ProjectTaskRoleDefaultsRepo::get_task_role_defaults(&*database, &project_id)
         .await
@@ -317,22 +460,34 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
                 "orchestrator",
                 db::CoordinationMode::Collaborative,
                 vec![api_types::TaskRoleCapability::Orchestration],
-                &agent_id,
-                true,
+                vec![ActorRef::Agent(agent_id.clone())],
+                Some(&agent_id),
+                None,
             ),
             project_role_default(
                 "implementer",
                 db::CoordinationMode::Independent,
                 Vec::new(),
-                &agent_id,
-                false,
+                vec![ActorRef::Agent(agent_id.clone())],
+                None,
+                None,
             ),
             project_role_default(
                 "reviewer",
                 db::CoordinationMode::Independent,
-                vec![api_types::TaskRoleCapability::FormalReview],
-                &agent_id,
-                false,
+                vec![
+                    api_types::TaskRoleCapability::FormalReview,
+                    api_types::TaskRoleCapability::RequestRework,
+                ],
+                vec![ActorRef::Agent(reviewer_agent_id.clone())],
+                None,
+                Some(api_types::ProjectTaskRoleReworkConfiguration {
+                    mode: api_types::TaskRoleReworkMode::Automatic,
+                    allowed_destination_roles: vec!["implementer".to_owned()],
+                    next_review_role: Some("reviewer".to_owned()),
+                    correction_actor: Some(api_types::ReworkActorSelection::OriginalContributor),
+                    review_actor: Some(ActorRef::Agent(reviewer_agent_id.clone())),
+                }),
             ),
         ],
         &now_rfc3339(),
@@ -346,7 +501,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
             project_id.clone(),
             "Deliver a reviewed Project packet",
             Some(
-                "Use one Agent for the bounded implementation and its independent formal review."
+                "Use a bounded implementation, an independent formal review, and exact review triage."
                     .to_owned(),
             ),
             None,
@@ -460,7 +615,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
                 "title": "Review the exact implementation result",
                 "scope": "Check the implementation against its acceptance criterion and return a structured ReviewReport.",
                 "role": "reviewer",
-                "assigned_actor": {"kind": "agent", "id": agent_id},
+                "assigned_actor": {"kind": "agent", "id": reviewer_agent_id},
                 "parent_key": null,
                 "depends_on": ["implementation"],
                 "requires_integration": false,
@@ -477,10 +632,21 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
     .to_string();
 
     let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let first_triage_started = Arc::new(tokio::sync::Notify::new());
+    let release_first_triage = Arc::new(tokio::sync::Notify::new());
     let mut registry = executors::HarnessAdapterRegistry::new();
     registry.register(Box::new(ProjectBatchHarnessAdapter {
         plan,
         orchestrator_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        implementer_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        reviewer_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        triage_dispositions: Arc::new(std::sync::Mutex::new(VecDeque::from([
+            "recheck".to_owned(),
+            "correct".to_owned(),
+        ]))),
+        first_triage_started: Arc::clone(&first_triage_started),
+        release_first_triage: Arc::clone(&release_first_triage),
+        block_first_triage: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         observations: Arc::clone(&observations),
     }));
     let registry = Arc::new(registry);
@@ -669,6 +835,38 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         Arc::clone(&event_bus),
         Arc::clone(&task_service),
     );
+    let pause_database = Arc::clone(&database);
+    let pause_event_bus = Arc::clone(&event_bus);
+    let pause_started = Arc::clone(&first_triage_started);
+    let pause_release = Arc::clone(&release_first_triage);
+    let pause_project_id = project_id.clone();
+    let pause_batch_id = batch.id.clone();
+    let pause_owner_id = owner_id.clone();
+    let pause_task = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(45), pause_started.notified())
+            .await
+            .expect("the first exact ReviewFindings turn reaches the fake Harness");
+        let plan_service =
+            crate::project_plan::ProjectPlanService::new(pause_database.clone(), pause_event_bus);
+        let version: i64 = sqlx::query_scalar("SELECT version FROM project_plan_batch WHERE id=?")
+            .bind(&pause_batch_id)
+            .fetch_one(pause_database.pool())
+            .await
+            .expect("current batch version loads at the provider boundary");
+        let paused = plan_service
+            .update_batch(
+                &pause_project_id,
+                &pause_owner_id,
+                &pause_batch_id,
+                version,
+                "pause",
+                "project-batch-review-pause",
+            )
+            .await
+            .expect("owner pauses the batch after fake provider Start");
+        pause_release.notify_one();
+        paused
+    });
     let mut execution_events = event_bus.subscribe();
     let workflow_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     let report_artifact_id: Option<String>;
@@ -753,29 +951,11 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
             .iter()
             .find(|row| row.1 == "reviewer")
             .and_then(|row| row.11.clone());
-        let all_wakes_completed =
-            !observed_wakes.is_empty() && observed_wakes.iter().all(|wake| wake.1 == "completed");
         let terminally_blocked_wakes = observed_wakes
             .iter()
             .filter(|wake| matches!(wake.1.as_str(), "failed" | "awaiting_human" | "uncertain"))
             .count();
-        let all_wake_attempts_completed = observed_wakes.iter().all(|wake| {
-            observed_wake_attempts
-                .iter()
-                .filter(|attempt| attempt.0 == wake.0)
-                .max_by_key(|attempt| attempt.1)
-                .is_some_and(|attempt| attempt.3 == "completed" && attempt.5 == "completed")
-        });
-        let all_wake_attempt_rows_terminal = observed_wake_attempts.iter().all(|attempt| {
-            matches!(attempt.3.as_str(), "completed" | "failed") && attempt.5 != "running"
-        });
-        if work_unit_executions_complete
-            && all_work_units_complete
-            && has_review_report.is_some()
-            && all_wakes_completed
-            && all_wake_attempts_completed
-            && all_wake_attempt_rows_terminal
-        {
+        if work_unit_executions_complete && all_work_units_complete && has_review_report.is_some() {
             report_artifact_id = has_review_report;
             break;
         }
@@ -906,17 +1086,251 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
              deadline={workflow_deadline:?}"
         );
     }
-    let report_artifact_id =
-        report_artifact_id.expect("completed reviewer has its exact report Artifact");
+    let initial_report_artifact_id =
+        report_artifact_id.expect("first formal review produces its exact report Artifact");
+    let paused_batch = tokio::time::timeout(Duration::from_secs(10), pause_task)
+        .await
+        .expect("batch pause completes at the first ReviewFindings provider boundary")
+        .expect("batch pause task joins");
+    assert_eq!(paused_batch.state, "paused");
+    let first_review_request_key = format!(
+        "review-findings:{}:{initial_report_artifact_id}",
+        coordination.authorization_version
+    );
+    let first_review_request = TaskCoordinationRepo::get_task_coordination_request_by_key(
+        &*database,
+        &task.id,
+        &first_review_request_key,
+    )
+    .await
+    .expect("first typed ReviewFindings request lookup succeeds")
+    .expect("first request is durably keyed to the exact report and authorization");
     assert_eq!(
-        observed_wakes.len(),
-        1,
-        "only the exact batch coordination request admits an Agent orchestration wake"
+        first_review_request.kind,
+        db::TaskCoordinationRequestKind::ReviewFindings
     );
     assert_eq!(
-        observed_wakes[0].2, "task.coordination_requested",
-        "generic lifecycle events cannot create unlinked Agent wakes during the batch"
+        first_review_request.state,
+        db::TaskCoordinationRequestState::Running,
+        "pause preserves the provider-started exact request"
     );
+    let first_triage_execution_id = first_review_request
+        .execution_id
+        .clone()
+        .expect("started typed request records its coordinator Execution");
+    let provider_result = db::ExecutionRepo::get_by_id(&*database, &first_triage_execution_id)
+        .await
+        .expect("first ReviewFindings Execution reloads after the fake provider returns")
+        .expect("first ReviewFindings Execution remains durable");
+    assert_eq!(provider_result.status, db::ExecutionStatus::Completed);
+    let triage_count_while_paused: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_review_triage WHERE task_id=?")
+            .bind(&task.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("triage receipt count loads while the batch is paused");
+    assert_eq!(triage_count_while_paused, 0);
+    // Simulate a long pause after the provider already completed. Recovery
+    // must retain this exact response even when the original wake lease ends.
+    sqlx::query("UPDATE orchestrator_wake SET lease_until='2000-01-01T00:00:00Z' WHERE id=?")
+        .bind(
+            first_review_request
+                .wake_id
+                .as_deref()
+                .expect("exact typed wake"),
+        )
+        .execute(database.pool())
+        .await
+        .expect("expire only the disposable completed-response wake lease");
+    runtime
+        .run_once(100)
+        .await
+        .expect("runtime defers the completed exact response while the batch is paused");
+    let still_pending =
+        TaskCoordinationRepo::get_task_coordination_request(&*database, &first_review_request.id)
+            .await
+            .expect("paused typed request reloads")
+            .expect("paused typed request remains durable");
+    assert_eq!(
+        still_pending.state,
+        db::TaskCoordinationRequestState::Running
+    );
+    let no_paused_triage: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_review_triage WHERE task_id=?")
+            .bind(&task.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("paused triage receipt count reloads");
+    assert_eq!(no_paused_triage, 0);
+    let coordinator_starts_while_paused: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE task_id=? AND role='orchestrator'",
+    )
+    .bind(&task.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("coordinator Execution count loads while paused");
+    assert_eq!(
+        coordinator_starts_while_paused, 2,
+        "a completed provider response is retained without another Start while paused"
+    );
+    let plan_service =
+        crate::project_plan::ProjectPlanService::new(Arc::clone(&database), Arc::clone(&event_bus));
+    let resumed_batch = plan_service
+        .update_batch(
+            &project_id,
+            &owner_id,
+            &batch.id,
+            paused_batch.version,
+            "resume",
+            "project-batch-review-resume",
+        )
+        .await
+        .expect("owner resumes the same prepared batch");
+    assert_eq!(resumed_batch.state, "running");
+    let mut resumed_request = still_pending;
+    for _ in 0..200 {
+        runtime
+            .run_once(100)
+            .await
+            .expect("runtime recovers the exact completed ReviewFindings Execution after resume");
+        resumed_request = TaskCoordinationRepo::get_task_coordination_request(
+            &*database,
+            &first_review_request.id,
+        )
+        .await
+        .expect("resumed ReviewFindings request reloads")
+        .expect("resumed ReviewFindings request remains durable");
+        if resumed_request.state == db::TaskCoordinationRequestState::Triaged {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        resumed_request.state,
+        db::TaskCoordinationRequestState::Triaged,
+        "resume applies the persisted recheck decision"
+    );
+    assert_eq!(
+        resumed_request.execution_id.as_deref(),
+        Some(first_triage_execution_id.as_str())
+    );
+    let triage_starts_after_resume: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE task_id=? AND role='orchestrator'",
+    )
+    .bind(&task.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("coordinator Execution count reloads after resume");
+    assert_eq!(triage_starts_after_resume, 2);
+    let first_triage_row: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT disposition,review_report_artifact_id,review_work_unit_id
+         FROM task_review_triage WHERE task_id=? AND review_report_artifact_id=?",
+    )
+    .bind(&task.id)
+    .bind(&initial_report_artifact_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("first exact triage receipt loads");
+    assert_eq!(first_triage_row.0, "recheck");
+    assert_eq!(first_triage_row.1, initial_report_artifact_id);
+    let recheck_work_unit_id = first_triage_row
+        .2
+        .expect("recheck disposition creates a formal review WorkUnit");
+    let original_subject: (String, i64, String, Option<String>, Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT reviewed_work_unit_id,reviewed_work_unit_version,result_execution_id,
+                    result_artifact_id,result_commit_sha,result_workspace_id,workspace_snapshot_digest
+             FROM work_unit_review_subject subject
+             WHERE subject.review_work_unit_id=(
+                 SELECT review_execution.work_unit_id
+                 FROM artifact report
+                 JOIN artifact_execution_producer producer ON producer.artifact_id=report.id
+                 JOIN execution review_execution ON review_execution.id=producer.execution_id
+                 WHERE report.id=? AND report.kind='review_report')",
+        )
+        .bind(&initial_report_artifact_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("initial ReviewReport frozen subject loads");
+    let recheck_subject: (String, i64, String, Option<String>, Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT reviewed_work_unit_id,reviewed_work_unit_version,result_execution_id,
+                    result_artifact_id,result_commit_sha,result_workspace_id,workspace_snapshot_digest
+             FROM work_unit_review_subject WHERE review_work_unit_id=?",
+        )
+        .bind(&recheck_work_unit_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("recheck formal review freezes its subject");
+    assert_eq!(recheck_subject, original_subject);
+
+    let full_workflow_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        dispatcher
+            .check_once()
+            .await
+            .expect("dispatcher admits the reassessment and correction WorkUnits");
+        runtime
+            .run_once(100)
+            .await
+            .expect("runtime advances the exact recheck and correction requests");
+        let units = WorkUnitRepo::list_by_task(&*database, &task.id)
+            .await
+            .expect("all original and rework WorkUnits load");
+        let review_reports: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifact WHERE task_id=? AND kind='review_report'",
+        )
+        .bind(&task.id)
+        .fetch_one(database.pool())
+        .await
+        .expect("fresh formal reports count loads");
+        let review_requests: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id,state FROM task_coordination_request
+             WHERE task_id=? AND kind='review_findings' ORDER BY created_at,id",
+        )
+        .bind(&task.id)
+        .fetch_all(database.pool())
+        .await
+        .expect("exact typed ReviewFindings request states load");
+        let failed_work: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution WHERE task_id=? AND status IN ('failed','cancelled')",
+        )
+        .bind(&task.id)
+        .fetch_one(database.pool())
+        .await
+        .expect("failed WorkUnit Execution count loads");
+        let blocked_wakes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM orchestrator_wake
+             WHERE task_id=? AND state IN ('failed','awaiting_human','uncertain')",
+        )
+        .bind(&task.id)
+        .fetch_one(database.pool())
+        .await
+        .expect("blocked wake count loads");
+        let completed = units.len() == 5
+            && units
+                .iter()
+                .all(|unit| unit.status == db::WorkUnitStatus::Completed)
+            && review_reports == 3
+            && review_requests.len() == 2
+            && review_requests.iter().all(|(_, state)| state == "triaged");
+        if completed {
+            break;
+        }
+        if failed_work > 0
+            || blocked_wakes > 0
+            || tokio::time::Instant::now() >= full_workflow_deadline
+        {
+            panic!(
+                "review/rework workflow did not converge: work_units={units:?}; \
+                 review_reports={review_reports}; review_requests={review_requests:?}; \
+                 failed_work={failed_work}; blocked_wakes={blocked_wakes}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let report_artifact_id = initial_report_artifact_id;
     let wake_origins: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT event.event_type,event.entity_type,event.entity_id
          FROM orchestrator_wake wake JOIN domain_event event ON event.id=wake.event_id
@@ -926,105 +1340,10 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
     .fetch_all(database.pool())
     .await
     .expect("exact and generic Agent wake origins load");
-    assert_eq!(
-        wake_origins,
-        vec![(
-            "task.coordination_requested".to_owned(),
-            "task_coordination_request".to_owned(),
-            request_id.clone(),
-        )],
-        "the durable Agent wake belongs to this exact batch request"
-    );
-
-    let execution_rows = sqlx::query(
-        "SELECT e.id,e.role,e.status,e.work_unit_id,link.batch_id,link.authorization_version
-         FROM execution e
-         JOIN work_unit w ON w.id=e.work_unit_id
-         JOIN project_plan_batch_execution link ON link.execution_id=e.id
-         WHERE e.task_id=? AND w.provenance_kind='artifact' AND w.provenance_id=?
-         ORDER BY e.role",
-    )
-    .bind(&task.id)
-    .bind(&plan_artifact_id)
-    .fetch_all(database.pool())
-    .await
-    .expect("exact batch-origin Worker and reviewer Executions load");
-    assert_eq!(
-        execution_rows.len(),
-        2,
-        "one Worker and one formal reviewer execute"
-    );
-    let mut work_unit_execution_ids = Vec::new();
-    for row in &execution_rows {
-        let role: String = row.try_get("role").expect("Execution role reads");
-        let status: String = row.try_get("status").expect("Execution status reads");
-        let linked_batch: String = row.try_get("batch_id").expect("batch provenance reads");
-        let authorization_version: i64 = row
-            .try_get("authorization_version")
-            .expect("batch authorization version reads");
-        let execution_id: String = row.try_get("id").expect("Execution ID reads");
-        assert!(matches!(role.as_str(), "implementer" | "reviewer"));
-        assert_eq!(status, "completed");
-        assert_eq!(linked_batch, batch.id);
-        assert_eq!(authorization_version, coordination.authorization_version);
-        work_unit_execution_ids.push(execution_id);
-    }
-    let roles = execution_rows
-        .iter()
-        .map(|row| {
-            row.try_get::<String, _>("role")
-                .expect("Execution role reads")
-        })
-        .collect::<std::collections::HashSet<_>>();
-    assert!(roles.contains("implementer"));
-    assert!(roles.contains("reviewer"));
-
-    let report = db::CollaborationRepo::get_artifact(&*database, &report_artifact_id)
-        .await
-        .expect("ReviewReport Artifact loads")
-        .expect("formal reviewer produced a durable report");
-    assert_eq!(report.kind, ArtifactKind::ReviewReport);
-    assert_eq!(report.task_id, task.id);
-    let report_producer_id = report
-        .execution_producer()
-        .map(|(id, _)| id.to_owned())
-        .expect("ReviewReport names its exact producer Execution");
-    assert!(work_unit_execution_ids.contains(&report_producer_id));
-
-    let current_task = TaskRepo::get_by_id(&*database, &task.id, false)
-        .await
-        .expect("current Task loads after delivery and review")
-        .expect("batch Task still exists");
-    let current_coordination = TaskCoordinationRepo::get_task_coordination(&*database, &task.id)
-        .await
-        .expect("current TaskCoordination loads")
-        .expect("batch authorization remains current");
-    let quality_binding =
-        crate::TaskCoordinationService::new(Arc::clone(&database), Arc::clone(&event_bus))
-            .project_batch_binding_for_quality_source(
-                &task.id,
-                &owner_id,
-                &report_artifact_id,
-                current_task.version,
-                current_coordination.authorization_version,
-            )
-            .await
-            .expect("exact ReviewReport batch-origin lookup succeeds")
-            .expect("ReviewReport resolves to the running batch that admitted its producer");
-    assert_eq!(quality_binding.batch_id, batch.id);
-    assert_eq!(
-        quality_binding.expected_coordination_version,
-        coordination.authorization_version
-    );
-    assert!(matches!(
-        quality_binding.origin,
-        db::ProjectPlanBatchRequestOrigin::QualityReplan {
-            source_artifact_id,
-            producer_execution_id,
-        } if source_artifact_id == report_artifact_id
-            && producer_execution_id == report_producer_id
-    ));
-
+    assert_eq!(wake_origins.len(), 3);
+    assert!(wake_origins.iter().all(|origin| {
+        origin.0 == "task.coordination_requested" && origin.1 == "task_coordination_request"
+    }));
     let scoped_request: (String, Option<String>, i64, String, String) = sqlx::query_as(
         "SELECT origin_kind,claim_token,authorization_version,batch_id,task_id
          FROM project_plan_batch_coordination_request WHERE request_id=?",
@@ -1041,80 +1360,374 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
 
     let work_units = WorkUnitRepo::list_by_task(&*database, &task.id)
         .await
-        .expect("materialized Worker and reviewer WorkUnits load");
-    assert_eq!(work_units.len(), 2);
-    let observations = observations
-        .lock()
-        .expect("fake Harness observations remain readable")
-        .clone();
+        .expect("original, recheck, correction, and fresh-review WorkUnits load");
+    assert_eq!(work_units.len(), 5);
+    assert!(work_units
+        .iter()
+        .all(|unit| unit.status == db::WorkUnitStatus::Completed));
+
+    let typed_review_requests: Vec<(String, String, String, String, String, i64, Option<String>)> =
+        sqlx::query_as(
+            "SELECT request.id,request.state,request.review_report_artifact_id,
+                    request.review_report_digest,request.review_producer_execution_id,
+                    request.authorization_version,request.execution_id
+             FROM task_coordination_request request
+             WHERE request.task_id=? AND request.kind='review_findings'
+             ORDER BY request.created_at,request.id",
+        )
+        .bind(&task.id)
+        .fetch_all(database.pool())
+        .await
+        .expect("both exact ReviewFindings requests load");
+    assert_eq!(typed_review_requests.len(), 2);
+    assert!(typed_review_requests
+        .iter()
+        .all(|request| request.1 == "triaged"));
+    let first_request_index = typed_review_requests
+        .iter()
+        .position(|request| request.2 == report_artifact_id)
+        .expect("first typed request is bound to the original ReviewReport");
+    let second_request_index = (0..typed_review_requests.len())
+        .find(|index| *index != first_request_index)
+        .expect("a second exact typed request exists");
+    let first_typed_request = &typed_review_requests[first_request_index];
+    let second_typed_request = &typed_review_requests[second_request_index];
+    assert_ne!(second_typed_request.2, first_typed_request.2);
+
+    let triage_rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT review_report_artifact_id,disposition,execution_id,review_work_unit_id
+         FROM task_review_triage WHERE task_id=? ORDER BY created_at,review_report_artifact_id",
+    )
+    .bind(&task.id)
+    .fetch_all(database.pool())
+    .await
+    .expect("immutable exact review triage receipts load");
+    assert_eq!(triage_rows.len(), 2);
+    let recheck_triage = triage_rows
+        .iter()
+        .find(|row| row.0 == first_typed_request.2)
+        .expect("original report has its exact recheck triage receipt");
+    assert_eq!(recheck_triage.1, "recheck");
     assert_eq!(
-        observations
-            .iter()
-            .filter(|(observed_role, _, _)| observed_role == "implementer")
-            .count(),
-        1,
-        "the bounded plan admits one implementation Execution"
+        recheck_triage.3.as_deref(),
+        Some(recheck_work_unit_id.as_str())
     );
+    let correction_triage = triage_rows
+        .iter()
+        .find(|row| row.0 == second_typed_request.2)
+        .expect("fresh recheck report has its exact correction triage receipt");
+    assert_eq!(correction_triage.1, "correct");
+    assert!(correction_triage.3.is_none());
+
+    let report_rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT report.id,report.digest,report.content
+         FROM artifact report
+         WHERE report.task_id=? AND report.kind='review_report'
+         ORDER BY report.created_at,report.id",
+    )
+    .bind(&task.id)
+    .fetch_all(database.pool())
+    .await
+    .expect("all immutable formal ReviewReports load");
+    assert_eq!(report_rows.len(), 3);
+    let recheck_report_id: String = sqlx::query_scalar(
+        "SELECT report.id FROM artifact report
+         JOIN artifact_execution_producer producer ON producer.artifact_id=report.id
+         JOIN execution reviewer_execution ON reviewer_execution.id=producer.execution_id
+         WHERE report.task_id=? AND report.kind='review_report'
+           AND reviewer_execution.work_unit_id=?",
+    )
+    .bind(&task.id)
+    .bind(&recheck_work_unit_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("fresh recheck report is linked to its formal review WorkUnit");
+    assert_eq!(second_typed_request.2, recheck_report_id);
+    let first_report_row = report_rows
+        .iter()
+        .find(|report| report.0 == report_artifact_id)
+        .expect("original ReviewReport remains in the report set");
+    let recheck_report_row = report_rows
+        .iter()
+        .find(|report| report.0 == recheck_report_id)
+        .expect("fresh recheck ReviewReport remains in the report set");
+    let first_report: Value =
+        serde_json::from_str(&first_report_row.2).expect("first ReviewReport content is JSON");
+    let second_report: Value =
+        serde_json::from_str(&recheck_report_row.2).expect("recheck ReviewReport content is JSON");
+    assert_eq!(first_report["verdict"], "request_changes");
+    assert_eq!(second_report["verdict"], "request_changes");
+    assert_eq!(first_report["subject"], second_report["subject"]);
+
+    let rework_receipt: (String, String, String, String) = sqlx::query_as(
+        "SELECT review_report_artifact_id,reviewed_work_unit_id,
+                correction_work_unit_id,review_work_unit_id
+         FROM task_rework_receipt WHERE task_id=?",
+    )
+    .bind(&task.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("correct decision creates one exact correction/review receipt");
+    assert_eq!(rework_receipt.0, second_typed_request.2);
     assert_eq!(
-        observations
+        rework_receipt.1,
+        first_report["subject"]["reviewed_work_unit_id"]
+            .as_str()
+            .expect("initial report subject has a WorkUnit")
+    );
+    let final_report_id: String = sqlx::query_scalar(
+        "SELECT report.id FROM artifact report
+         JOIN artifact_execution_producer producer ON producer.artifact_id=report.id
+         JOIN execution reviewer_execution ON reviewer_execution.id=producer.execution_id
+         WHERE report.task_id=? AND report.kind='review_report'
+           AND reviewer_execution.work_unit_id=?",
+    )
+    .bind(&task.id)
+    .bind(&rework_receipt.3)
+    .fetch_one(database.pool())
+    .await
+    .expect("fresh correction review produces its own exact ReviewReport");
+    let final_report_row = report_rows
+        .iter()
+        .find(|report| report.0 == final_report_id)
+        .expect("fresh correction ReviewReport remains in the report set");
+    let final_report: Value =
+        serde_json::from_str(&final_report_row.2).expect("fresh ReviewReport content is JSON");
+    assert_eq!(final_report["verdict"], "pass");
+    assert_eq!(
+        final_report["subject"]["reviewed_work_unit_id"],
+        rework_receipt.2
+    );
+    let correction_execution_id: String =
+        sqlx::query_scalar("SELECT id FROM execution WHERE work_unit_id=? AND status='completed'")
+            .bind(&rework_receipt.2)
+            .fetch_one(database.pool())
+            .await
+            .expect("correction WorkUnit has its completed exact result");
+    assert_eq!(
+        final_report["subject"]["reviewed_result"]["execution_id"],
+        correction_execution_id
+    );
+    let current_review_line: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_unit_review_line
+         WHERE task_id=? AND latest_report_artifact_id=? AND latest_verdict='pass'",
+    )
+    .bind(&task.id)
+    .bind(&final_report_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("latest formal-review line lookup succeeds");
+    assert_eq!(current_review_line, 1);
+
+    let batch_sources: Vec<(String, String, String, i64, String, String)> = sqlx::query_as(
+        "SELECT request.id,scope.origin_kind,scope.source_artifact_id,
+                scope.authorization_version,scope.producer_execution_id,scope.batch_id
+         FROM task_coordination_request request
+         JOIN project_plan_batch_coordination_request scope ON scope.request_id=request.id
+         WHERE request.task_id=? AND request.kind='review_findings'
+         ORDER BY request.created_at,request.id",
+    )
+    .bind(&task.id)
+    .fetch_all(database.pool())
+    .await
+    .expect("ReviewFindings requests carry immutable batch source bindings");
+    assert_eq!(batch_sources.len(), 2);
+    for source in &batch_sources {
+        let request = typed_review_requests
             .iter()
-            .filter(|(observed_role, _, _)| observed_role == "reviewer")
-            .count(),
-        1,
-        "the bounded plan admits one formal review Execution"
-    );
-    assert!(
-        observations.iter().any(|(observed_role, execution_id, _)| {
-            observed_role == "orchestrator" && execution_id == &coordinator_execution_id
-        }),
-        "the explicit batch request's coordinator Execution reaches the fake Harness"
-    );
+            .find(|request| request.0 == source.0)
+            .expect("batch source belongs to one exact typed request");
+        assert_eq!(source.1, "review_triage");
+        assert_eq!(source.2, request.2);
+        assert_eq!(source.3, coordination.authorization_version);
+        assert_eq!(source.4, request.4);
+        assert_eq!(source.5, batch.id);
+        assert_eq!(request.5, coordination.authorization_version);
+        assert_eq!(
+            request.3,
+            report_rows
+                .iter()
+                .find(|report| report.0 == source.2)
+                .and_then(|report| report.1.clone())
+                .expect("typed request digest matches its exact source report")
+        );
+        assert_eq!(
+            request.1, "triaged",
+            "only the exact request source reaches its terminal triage state"
+        );
+        assert_eq!(
+            db::TaskCoordinationRepo::get_task_coordination_request_by_key(
+                &*database,
+                &task.id,
+                &format!(
+                    "review-findings:{}:{}",
+                    coordination.authorization_version, source.2
+                ),
+            )
+            .await
+            .expect("auth-version/report idempotency key lookup succeeds")
+            .as_ref()
+            .map(|request| request.id.as_str()),
+            Some(request.0.as_str())
+        );
+    }
+
+    let scoped_request: (String, Option<String>, i64, String, String) = sqlx::query_as(
+        "SELECT origin_kind,claim_token,authorization_version,batch_id,task_id
+         FROM project_plan_batch_coordination_request WHERE request_id=?",
+    )
+    .bind(&request_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("scheduler origin and authorization version remain inspectable");
+    assert_eq!(scoped_request.0, "scheduler");
+    assert!(scoped_request.1.is_some_and(|token| !token.is_empty()));
+    assert_eq!(scoped_request.2, coordination.authorization_version);
+    assert_eq!(scoped_request.3, batch.id);
+    assert_eq!(scoped_request.4, task.id);
+
+    let turn_count_before_replay: i64 =
+        sqlx::query_scalar("SELECT turn_count FROM task_coordination WHERE task_id=?")
+            .bind(&task.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("turn budget counter loads before replay");
+    let coordination_service =
+        crate::TaskCoordinationService::new(Arc::clone(&database), Arc::clone(&event_bus));
+    for request in &typed_review_requests {
+        let (replayed, created) = coordination_service
+            .request_review_findings_for_report(&task.id, &request.2)
+            .await
+            .expect("exact triage request replay is safe");
+        let replayed = replayed.expect("exact source preserves its durable request");
+        assert_eq!(replayed.id, request.0);
+        assert!(!created, "replay does not create another typed request");
+    }
+    let turn_count_after_replay: i64 =
+        sqlx::query_scalar("SELECT turn_count FROM task_coordination WHERE task_id=?")
+            .bind(&task.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("turn budget counter loads after replay");
+    assert_eq!(turn_count_after_replay, turn_count_before_replay);
+    assert_eq!(turn_count_after_replay, 3);
+
+    let typed_request_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_coordination_request WHERE task_id=? AND kind='review_findings'",
+    )
+    .bind(&task.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("typed request count reloads after replay");
+    assert_eq!(typed_request_count, 2);
+    let typed_execution_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE task_id=? AND role='orchestrator'",
+    )
+    .bind(&task.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("orchestrator Start count reloads after replay");
+    assert_eq!(typed_execution_count, 3);
+    let duplicate_provider_starts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE scope_id=? AND event_type='execution.provider_start_attempted'
+           AND entity_id IN (SELECT execution_id FROM task_coordination_request
+                             WHERE task_id=? AND kind='review_findings')",
+    )
+    .bind(&task.id)
+    .bind(&task.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("typed coordinator Provider Start receipt count loads");
+    assert_eq!(duplicate_provider_starts, 2);
+
+    let task_work_unit_execution_rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT e.id,e.role,e.status,link.batch_id,link.authorization_version
+             FROM execution e
+             JOIN project_plan_batch_execution link ON link.execution_id=e.id
+             WHERE e.task_id=? AND e.work_unit_id IS NOT NULL
+             ORDER BY e.created_at,e.id",
+    )
+    .bind(&task.id)
+    .fetch_all(database.pool())
+    .await
+    .expect("all five source-bound batch WorkUnit Executions load");
+    assert_eq!(task_work_unit_execution_rows.len(), 5);
+    for row in &task_work_unit_execution_rows {
+        assert_eq!(row.2, "completed");
+        assert_eq!(row.3, batch.id);
+        assert_eq!(row.4, coordination.authorization_version);
+        assert!(matches!(row.1.as_str(), "implementer" | "reviewer"));
+    }
+
     let all_executions: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT id,role,status,summary FROM execution WHERE task_id=? ORDER BY created_at,id",
     )
     .bind(&task.id)
     .fetch_all(database.pool())
     .await
-    .expect("all coordinator, Worker, and reviewer Executions load");
-    assert_eq!(
-        all_executions.len(),
-        observations.len(),
-        "every durable execution in the fixture has one corresponding fake Harness turn"
-    );
-    let follow_up_orchestrators = all_executions
+    .expect("all coordinator, Worker, recheck, and correction Executions load");
+    assert_eq!(all_executions.len(), 8);
+    assert!(all_executions
         .iter()
-        .filter(|execution| {
-            execution.1 == "orchestrator" && execution.0 != coordinator_execution_id
-        })
+        .all(|execution| execution.2 == "completed"));
+    let coordinator_execution_rows = all_executions
+        .iter()
+        .filter(|execution| execution.1 == "orchestrator")
         .collect::<Vec<_>>();
-    assert!(
-        follow_up_orchestrators.is_empty(),
-        "batch Worker lifecycle events do not create unlinked generic coordinator Executions"
-    );
-    for execution in &follow_up_orchestrators {
-        assert_eq!(execution.2, "completed");
+    assert_eq!(coordinator_execution_rows.len(), 3);
+    assert!(coordinator_execution_rows
+        .iter()
+        .any(|execution| execution.0 == coordinator_execution_id));
+    for request in &typed_review_requests {
+        let execution_id = request
+            .6
+            .as_deref()
+            .expect("typed request owns one coordinator Execution");
+        assert!(coordinator_execution_rows
+            .iter()
+            .any(|execution| execution.0 == execution_id));
+        let output: Value = serde_json::from_str(
+            coordinator_execution_rows
+                .iter()
+                .find(|execution| execution.0 == execution_id)
+                .and_then(|execution| execution.3.as_deref())
+                .expect("typed decision Execution has a durable structured result"),
+        )
+        .expect("typed decision result is JSON");
+        assert_eq!(output["review_findings"].as_array().map(Vec::len), Some(1));
+    }
+
+    let observations = observations
+        .lock()
+        .expect("fake Harness observations remain readable")
+        .clone();
+    assert_eq!(observations.len(), all_executions.len());
+    for (role, count) in [("orchestrator", 3), ("implementer", 2), ("reviewer", 3)] {
         assert_eq!(
-            execution.3.as_deref(),
-            Some(r#"{"actions":[]}"#),
-            "follow-up coordinator Executions return the valid PR6 no-action envelope"
+            observations
+                .iter()
+                .filter(|(observed_role, _, _)| observed_role == role)
+                .count(),
+            count,
+            "each {role} turn is admitted once"
         );
     }
+    assert!(observations.iter().any(|(observed_role, execution_id, _)| {
+        observed_role == "orchestrator" && execution_id == &coordinator_execution_id
+    }));
     let distinct_native_sessions = observations
         .iter()
         .map(|(_, _, session)| session.as_str())
         .collect::<std::collections::HashSet<_>>();
-    assert_eq!(
-        distinct_native_sessions.len(),
-        observations.len(),
-        "every coordinator, Worker, and reviewer execution receives a fresh native session"
-    );
+    assert_eq!(distinct_native_sessions.len(), observations.len());
 
     let observation_sessions = observations
         .iter()
         .map(|(_, execution_id, session)| (execution_id.as_str(), session.as_str()))
         .collect::<std::collections::HashMap<_, _>>();
     let persisted_sessions = sqlx::query(
-        "SELECT e.id,e.role,e.harness_session_id,hs.id AS persisted_session_id,
+        "SELECT e.id,e.harness_session_id,hs.id AS persisted_session_id,
                 hs.external_session_id,hs.status,e.status AS execution_status
          FROM execution e
          JOIN harness_session hs ON hs.id=e.harness_session_id
@@ -1123,20 +1736,11 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
     .bind(&task.id)
     .fetch_all(database.pool())
     .await
-    .expect("all persisted coordinator, Worker, and reviewer HarnessSessions load");
+    .expect("all coordinator, Worker, and review HarnessSessions load");
     assert_eq!(persisted_sessions.len(), observations.len());
     let mut persisted_native_sessions = std::collections::HashSet::new();
-    let mut core_native_sessions = std::collections::HashSet::new();
-    let core_execution_ids = [
-        coordinator_execution_id.as_str(),
-        work_unit_execution_ids[0].as_str(),
-        work_unit_execution_ids[1].as_str(),
-    ]
-    .into_iter()
-    .collect::<std::collections::HashSet<_>>();
     for row in &persisted_sessions {
         let execution_id: String = row.try_get("id").expect("Execution ID reads");
-        let role: String = row.try_get("role").expect("Execution role reads");
         let execution_status: String = row
             .try_get("execution_status")
             .expect("Execution terminal status reads");
@@ -1146,48 +1750,22 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         let persisted_session_id: String = row
             .try_get("persisted_session_id")
             .expect("joined HarnessSession ID reads");
-        let external_session_id: Option<String> = row
-            .try_get("external_session_id")
-            .expect("HarnessSession external ID reads");
-        let session_status: String = row
-            .try_get("status")
-            .expect("HarnessSession terminal status reads");
+        let external_session_id: String = row
+            .try_get::<Option<String>, _>("external_session_id")
+            .expect("HarnessSession external ID reads")
+            .expect("completed fake Harness turn persists its native session");
+        let session_status: String = row.try_get("status").expect("session status reads");
         assert_eq!(execution_status, "completed");
         assert_eq!(session_status, "active");
         assert_eq!(
             harness_session_id.as_deref(),
             Some(persisted_session_id.as_str())
         );
-        let external_session_id = external_session_id
-            .expect("completed fake Harness turn persists an external session ID");
         assert_eq!(
             observation_sessions.get(execution_id.as_str()).copied(),
-            Some(external_session_id.as_str()),
-            "the persisted native session matches the ID returned by this Execution's fake Harness"
+            Some(external_session_id.as_str())
         );
-        assert!(
-            persisted_native_sessions.insert(external_session_id.clone()),
-            "each fake Harness execution persists a distinct external session"
-        );
-        if core_execution_ids.contains(execution_id.as_str()) {
-            core_native_sessions.insert(external_session_id);
-        }
-        if role == "orchestrator" && execution_id != coordinator_execution_id {
-            let durable_execution = all_executions
-                .iter()
-                .find(|execution| execution.0 == execution_id)
-                .expect("follow-up coordinator execution is in the exact execution list");
-            assert_eq!(durable_execution.3.as_deref(), Some(r#"{"actions":[]}"#));
-        }
+        assert!(persisted_native_sessions.insert(external_session_id));
     }
-    assert_eq!(
-        core_native_sessions.len(),
-        3,
-        "the initial coordinator, Worker, and reviewer retain three separate native identities"
-    );
-    assert_eq!(
-        persisted_native_sessions.len(),
-        observations.len(),
-        "every native identity persists once across the coordinator, Worker, and reviewer turns"
-    );
+    assert_eq!(persisted_native_sessions.len(), observations.len());
 }

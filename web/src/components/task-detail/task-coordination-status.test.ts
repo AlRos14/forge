@@ -97,6 +97,10 @@ function request(
   return {
     id: 'request-1',
     task_id: 'task-1',
+    kind: 'work_unit_plan',
+    review_report_artifact_id: null,
+    review_report_digest: null,
+    review_producer_execution_id: null,
     mode: 'proposal',
     state: 'requested',
     authorization_version: 2,
@@ -361,7 +365,7 @@ describe('coordination next action', () => {
     expect(next.kind).toBe('resume')
   })
 
-  it('turns a materialized ready-to-merge Task toward the exact Gate review', () => {
+  it('keeps a materialized ready-to-merge Task on the exact integration path', () => {
     const next = deriveCoordinationNextAction(
       overview({
         lifecycle: {
@@ -388,8 +392,68 @@ describe('coordination next action', () => {
         },
       }),
     )
-    expect(next.summary).toMatch(/Gate review/)
-    expect(next.detail).toMatch(/does not run tests/)
+    expect(next.summary).toMatch(/ready for integration/i)
+    expect(next.detail).toMatch(/does not admit integration/i)
+  })
+
+  it('lets ready-to-merge TaskLifecycle outrank review-triage and dispatch state', () => {
+    const next = deriveCoordinationNextAction(
+      overview({
+        lifecycle: {
+          task_id: 'task-1',
+          state: 'ready_to_merge',
+          version: 4,
+          reason_kind: null,
+          reason_ref: null,
+          created_at: '',
+          updated_at: '',
+        },
+        dispatch: {
+          task_id: 'task-1',
+          state: 'cancelled',
+          version: 2,
+          requested_by: null,
+          reason: null,
+          created_at: '',
+          updated_at: '',
+        },
+      }),
+      request({ kind: 'review_findings', state: 'triaged' }),
+      null,
+    )
+
+    expect(next.summary).toMatch(/ready for integration/i)
+    expect(next.kind).toBe('wait')
+  })
+
+  it('lets TaskLifecycle done outrank a cancelled dispatch intent', () => {
+    const next = deriveCoordinationNextAction(
+      overview({
+        lifecycle: {
+          task_id: 'task-1',
+          state: 'done',
+          version: 5,
+          reason_kind: null,
+          reason_ref: null,
+          created_at: '',
+          updated_at: '',
+        },
+        dispatch: {
+          task_id: 'task-1',
+          state: 'cancelled',
+          version: 2,
+          requested_by: null,
+          reason: null,
+          created_at: '',
+          updated_at: '',
+        },
+      }),
+      request({ kind: 'review_findings', state: 'triaged' }),
+      null,
+    )
+
+    expect(next.kind).toBe('done')
+    expect(next.owner).toBe('Nobody')
   })
 
   it('does not retry an uncertain provider outcome', () => {

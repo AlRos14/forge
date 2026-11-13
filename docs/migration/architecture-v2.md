@@ -788,6 +788,7 @@ reads or writes.
 | V159 | Add structured Task quality requests and the single durable Human/Project Copilot intervention circuit. |
 | V160 | Fence coordination authorization against TaskRole, capability, and membership changes; link quality requests to exact coordination turns and resolution evidence. |
 | V161 | Add per-source-chain quality-route counters, stable review-line identity, pending-role cycle evidence, and durable Human-escalation reasons. Existing request states and exact review/rework evidence are preserved. |
+| V168 | Preserve existing coordination requests and batch origins while adding exact `review_findings` request sources, typed ReviewTriage origins, immutable source guards and terminal `triaged` decision receipts. No historical request is replayed or reclassified as a review turn. |
 
 ProjectRelease GETs are read-only and reconstruct only from `project_release`,
 `project_release_history_*`, shared media assets, and tombstones. They validate

@@ -4,7 +4,14 @@ import type {
   TaskCoordinationRequestResponse,
   TaskCoordinationTeamRoleResponse,
   TaskDispatchIntentResponse,
+  TaskReworkAutomationIntentResponse,
+  WorkUnitResponse,
 } from '@/types/generated'
+import {
+  deriveReviewFindingsProjection,
+  type ReviewFindingsDataState,
+  type ReviewFindingsProjection,
+} from './task-review-triage'
 
 export type CoordinationActionKind =
   | 'authorize'
@@ -114,18 +121,13 @@ export function deriveCoordinationNextAction(
   overview: TaskCoordinationOverviewResponse,
   request: TaskCoordinationRequestResponse | null,
   plan: TaskCoordinationPlanResponse | null,
+  reviewContext: {
+    automationIntents?: TaskReworkAutomationIntentResponse[]
+    automationIntentsState?: ReviewFindingsDataState
+    workUnits?: WorkUnitResponse[]
+    workUnitsState?: ReviewFindingsDataState
+  } = {},
 ): CoordinationNextAction {
-  if (overview.lifecycle.state === 'cancelled' || overview.dispatch.state === 'cancelled') {
-    return {
-      summary: 'This Task is cancelled.',
-      detail:
-        'No new preparation, materialization, or dispatch is admitted. Existing plans, WorkUnits, reviews, and evidence remain in history.',
-      owner: 'Nobody',
-      kind: 'done',
-      tone: 'done',
-    }
-  }
-
   if (overview.lifecycle.state === 'done') {
     return {
       summary: 'The Task is done.',
@@ -147,6 +149,38 @@ export function deriveCoordinationNextAction(
       tone: 'wait',
     }
   }
+
+  if (overview.lifecycle.state === 'ready_to_merge') {
+    return {
+      summary: 'Task is ready for integration.',
+      detail:
+        'The current TaskLifecycle is ready_to_merge. Continue through the existing exact integration operation. Review triage does not change that state or admit integration.',
+      owner: 'You',
+      kind: 'wait',
+      tone: 'action',
+    }
+  }
+
+  if (overview.lifecycle.state === 'cancelled' || overview.dispatch.state === 'cancelled') {
+    return {
+      summary: 'This Task is cancelled.',
+      detail:
+        'No new preparation, materialization, or dispatch is admitted. Existing plans, WorkUnits, reviews, and evidence remain in history.',
+      owner: 'Nobody',
+      kind: 'done',
+      tone: 'done',
+    }
+  }
+
+  const reviewFindings: ReviewFindingsProjection | null = deriveReviewFindingsProjection({
+    overview,
+    request,
+    automationIntents: reviewContext.automationIntents,
+    automationIntentsState: reviewContext.automationIntentsState,
+    workUnits: reviewContext.workUnits,
+    workUnitsState: reviewContext.workUnitsState,
+  })
+  if (reviewFindings) return reviewFindings.action
 
   if (overview.revoked_at) {
     return {
@@ -322,16 +356,6 @@ export function deriveCoordinationNextAction(
   }
 
   if (plan?.materialization) {
-    if (overview.lifecycle.state === 'ready_to_merge') {
-      return {
-        summary: 'Delivery is ready for exact Gate review.',
-        detail:
-          'Evaluate the merge-readiness Gate against the current immutable review inputs, then mark the Task ready for integration or admit integration with that exact evaluation. A Gate does not run tests, review code, or merge.',
-        owner: 'You',
-        kind: 'wait',
-        tone: 'action',
-      }
-    }
     if (overview.dispatch.state === 'paused') {
       return {
         summary: 'Work is prepared, but new dispatch is paused.',

@@ -100,6 +100,7 @@ fn api_request_state(state: DbRequestState) -> TaskCoordinationRequestState {
         DbRequestState::PlanReady => TaskCoordinationRequestState::PlanReady,
         DbRequestState::AwaitingApproval => TaskCoordinationRequestState::AwaitingApproval,
         DbRequestState::Materialized => TaskCoordinationRequestState::Materialized,
+        DbRequestState::Triaged => TaskCoordinationRequestState::Triaged,
         DbRequestState::Failed => TaskCoordinationRequestState::Failed,
         DbRequestState::Cancelled => TaskCoordinationRequestState::Cancelled,
         DbRequestState::Uncertain => TaskCoordinationRequestState::Uncertain,
@@ -247,6 +248,17 @@ fn request_response(
     TaskCoordinationRequestResponse {
         id: request.id,
         task_id: request.task_id,
+        kind: match request.kind {
+            db::TaskCoordinationRequestKind::WorkUnitPlan => {
+                api_types::TaskCoordinationRequestKind::WorkUnitPlan
+            }
+            db::TaskCoordinationRequestKind::ReviewFindings => {
+                api_types::TaskCoordinationRequestKind::ReviewFindings
+            }
+        },
+        review_report_artifact_id: request.review_report_artifact_id,
+        review_report_digest: request.review_report_digest,
+        review_producer_execution_id: request.review_producer_execution_id,
         mode: api_mode(request.mode),
         state: api_request_state(request.state),
         authorization_version: request.authorization_version,

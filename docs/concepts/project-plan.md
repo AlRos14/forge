@@ -82,9 +82,18 @@ authorization; selection uses the supplied ID and never a latest timestamp or
 single canonical pointer. These origins are persisted against the Task and
 authorization version rather than inferred from version arithmetic.
 
+ReviewTriage requests bind one exact request-changes ReviewReport, its digest,
+and its reviewer producer Execution. The shared coordination request has
+`kind=review_findings`; it can return only one `correct|recheck|human` decision
+for that report, without a plan Artifact. Recheck uses a fresh isolated formal
+review of the unchanged result. Further request-changes reports open new exact
+turns; replay, pause/resume and restart reuse durable request/event identities.
+The terminal request state `triaged` records the immutable decision and grants
+no review PASS, Gate waiver, Task Done or successor release.
+
 While the current authorization is batch-bound, generic Task events cannot
 create Agent coordinator wakes, including after the batch is paused, revoked,
-or completed. The three typed request origins above are the only batch-scoped
+or completed. The four typed request origins are the only batch-scoped
 Agent coordination entries. Human-targeted collaboration remains available.
 Terminal events for existing batch-linked coordinator Executions continue to
 reconcile against their exact durable wake, attempt, and request; they do not

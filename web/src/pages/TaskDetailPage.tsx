@@ -179,6 +179,11 @@ export function TaskDetailPage({
   const validations = validationsQuery.data ?? []
   const executions = executionsQuery.data?.items ?? []
   const workUnits = workUnitsQuery.data ?? []
+  const workUnitsState = workUnitsQuery.isError
+    ? 'error'
+    : workUnitsQuery.data === undefined
+      ? 'loading'
+      : 'loaded'
   const dispatch = dispatchQuery.data
   const hasMergeReadinessGate =
     gatesQuery.data?.some((entry) => entry.gate.gate_kind === 'merge_readiness') ?? false
@@ -642,6 +647,8 @@ export function TaskDetailPage({
                 coordination={coordinationQuery.data}
                 dispatch={dispatch}
                 workUnits={workUnits}
+                workUnitsState={workUnitsState}
+                onRetryWorkUnits={() => void workUnitsQuery.refetch()}
                 reviewLines={reviewLinesQuery.data ?? []}
                 gates={gatesQuery.data ?? []}
                 agents={agents}

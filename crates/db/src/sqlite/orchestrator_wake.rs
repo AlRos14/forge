@@ -51,6 +51,24 @@ async fn admit_orchestrator_wake_with_autonomy_fence(
         }
     }
 
+    if let Some(request_id) = input.coordination_request_id.as_deref() {
+        let source_current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM task_coordination_request request
+             WHERE request.id=? AND request.task_id=? AND
+              (request.kind='work_unit_plan' OR EXISTS(
+                SELECT 1 FROM task_review_coordination_request_current current
+                WHERE current.request_id=request.id)))",
+        )
+        .bind(request_id)
+        .bind(&input.task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !source_current {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+    }
+
     if input.actor_kind == ActorKind::Agent {
         let has_current_batch_origin: bool = sqlx::query_scalar(
             "SELECT EXISTS(

@@ -2754,12 +2754,25 @@ pub struct RevokeTaskCoordinationInput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TaskCoordinationRequestKind {
+    WorkUnitPlan,
+    ReviewFindings,
+}
+
+enum_strings!(TaskCoordinationRequestKind {
+    WorkUnitPlan => "work_unit_plan",
+    ReviewFindings => "review_findings",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskCoordinationRequestState {
     Requested,
     Running,
     PlanReady,
     AwaitingApproval,
     Materialized,
+    Triaged,
     Failed,
     Cancelled,
     Uncertain,
@@ -2771,6 +2784,7 @@ enum_strings!(TaskCoordinationRequestState {
     PlanReady => "plan_ready",
     AwaitingApproval => "awaiting_approval",
     Materialized => "materialized",
+    Triaged => "triaged",
     Failed => "failed",
     Cancelled => "cancelled",
     Uncertain => "uncertain",
@@ -2778,7 +2792,10 @@ enum_strings!(TaskCoordinationRequestState {
 
 impl TaskCoordinationRequestState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Materialized | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Materialized | Self::Triaged | Self::Failed | Self::Cancelled
+        )
     }
 }
 
@@ -2786,6 +2803,10 @@ impl TaskCoordinationRequestState {
 pub struct TaskCoordinationRequest {
     pub id: String,
     pub task_id: String,
+    pub kind: TaskCoordinationRequestKind,
+    pub review_report_artifact_id: Option<String>,
+    pub review_report_digest: Option<String>,
+    pub review_producer_execution_id: Option<String>,
     pub authorization_version: i64,
     pub mode: TaskCoordinationMode,
     pub brief_json: String,
@@ -2808,6 +2829,10 @@ pub struct TaskCoordinationRequest {
 pub struct CreateTaskCoordinationRequestInput {
     pub id: String,
     pub task_id: String,
+    pub kind: TaskCoordinationRequestKind,
+    pub review_report_artifact_id: Option<String>,
+    pub review_report_digest: Option<String>,
+    pub review_producer_execution_id: Option<String>,
     pub requested_by: String,
     pub expected_task_version: i64,
     pub authorization_version: i64,
@@ -2848,6 +2873,10 @@ pub enum ProjectPlanBatchRequestOrigin {
     },
     HumanReplan {
         approved_plan_artifact_id: String,
+    },
+    ReviewTriage {
+        source_artifact_id: String,
+        producer_execution_id: String,
     },
 }
 

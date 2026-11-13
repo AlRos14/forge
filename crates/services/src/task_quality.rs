@@ -956,6 +956,19 @@ impl TaskQualityService {
         request: &TaskQualityRequest,
         turn: &TaskCoordinationRequest,
     ) -> Result<()> {
+        if turn.kind != db::TaskCoordinationRequestKind::WorkUnitPlan {
+            return self
+                .transition(
+                    request,
+                    TaskQualityState::RequiresHuman,
+                    None,
+                    None,
+                    None,
+                    Some("coordination.request_kind_mismatch"),
+                    "a review-findings decision cannot resolve a plan revision",
+                )
+                .await;
+        }
         if let Some(plan_artifact_id) = turn.plan_artifact_id.as_deref() {
             if TaskCoordinationRepo::get_task_coordination_materialization(
                 &*self.db,
@@ -1043,6 +1056,7 @@ impl TaskQualityService {
                 .await
             }
             TaskCoordinationRequestState::Failed
+            | TaskCoordinationRequestState::Triaged
             | TaskCoordinationRequestState::Cancelled
             | TaskCoordinationRequestState::Uncertain => {
                 self.transition(

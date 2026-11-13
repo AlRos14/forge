@@ -66,6 +66,7 @@ use std::{
 // and per-Task access settings while keeping Task data and repository authority
 // checks current.
 // V157 advances rework review lines by their exact result across parallel reports.
+// V168 preserves coordination requests and adds exact review-findings continuation sources.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

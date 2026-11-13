@@ -5,9 +5,78 @@ use db::{
     CreateProjectMember, CreateRoleMembership, CreateTaskRole, ProjectMemberRepo,
     RoleMembershipRepo, TaskRoleRepo, WorkUnitRepo,
 };
+use sqlx::Row;
 
-async fn triage_fixture(disposition: api_types::TaskReviewDisposition, extra_rechecks: usize) {
-    let fixture = completed_pr6_execution_fixture(Vec::new()).await;
+fn review_findings_output(
+    request: &db::TaskCoordinationRequest,
+    decision: &crate::task_rework::ReviewFindingsDecision,
+) -> String {
+    json!({
+        "schema_version": 1,
+        "request_id": request.id,
+        "task_id": request.task_id,
+        "authorization_version": request.authorization_version,
+        "review_findings": [decision],
+    })
+    .to_string()
+}
+
+async fn create_review_request(
+    coordination: &crate::task_coordination::TaskCoordinationService,
+    task_id: &str,
+    report_id: &str,
+) -> db::TaskCoordinationRequest {
+    let (request, created) = coordination
+        .request_review_findings_for_report(task_id, report_id)
+        .await
+        .unwrap()
+        .expect("current ReviewReport creates an exact typed request");
+    assert!(created);
+    request
+}
+
+async fn start_review_request(
+    coordination: &crate::task_coordination::TaskCoordinationService,
+    database: &db::SqliteDb,
+    request: &db::TaskCoordinationRequest,
+    wake_id: &str,
+    execution_id: &str,
+) -> db::TaskCoordinationRequest {
+    coordination
+        .mark_turn_started(request, wake_id, execution_id)
+        .await
+        .unwrap();
+    db::TaskCoordinationRepo::get_task_coordination_request(database, &request.id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+async fn submit_review_findings(
+    coordination: &crate::task_coordination::TaskCoordinationService,
+    request: &db::TaskCoordinationRequest,
+    execution: &db::Execution,
+    decision: &crate::task_rework::ReviewFindingsDecision,
+) -> crate::Result<()> {
+    let mut completed = execution.clone();
+    completed.summary = Some(review_findings_output(request, decision));
+    coordination.complete_turn(request, &completed).await
+}
+
+async fn triage_fixture(
+    disposition: api_types::TaskReviewDisposition,
+    extra_rechecks: usize,
+    pause_before_provider_start: bool,
+) {
+    let mut fixture = completed_pr6_execution_fixture(Vec::new()).await;
+    let pre_start_barriers = if pause_before_provider_start {
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        fixture.runtime.pre_start_test_barrier = Some((Arc::clone(&reached), Arc::clone(&release)));
+        Some((reached, release))
+    } else {
+        None
+    };
     let db = &fixture.database;
     let task_service = &fixture.runtime.task_service;
     let units = task_service.orchestrator_work_unit_service();
@@ -183,13 +252,183 @@ async fn triage_fixture(disposition: api_types::TaskReviewDisposition, extra_rec
         )
         .await
         .unwrap();
-    let pending = rework.pending_triage_context(&task.id).await.unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0]["reviewed_result"]["execution_id"], delivery_id);
+    let lifecycle_service =
+        crate::task_lifecycle::TaskLifecycleService::new(db.clone(), fixture.event_bus.clone());
+    let current_task = TaskRepo::get_by_id(&**db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&**db, &task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    lifecycle_service
+        .launch_task(
+            &task.id,
+            current_task.version,
+            lifecycle.version,
+            &api_types::ActorRef::Human(owner.clone()),
+            "review-triage-fixture-launch",
+        )
+        .await
+        .unwrap();
+    // The fixture explicitly budgets enough typed turns to retain coverage of
+    // ten exact review reports without changing product defaults.
+    sqlx::query("UPDATE task_coordination SET max_turns=32 WHERE task_id=?")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut request = create_review_request(&coordination, &task.id, &report.id).await;
+    assert!(fixture
+        .runtime
+        .classify_event(&event)
+        .await
+        .unwrap()
+        .is_none());
+    let exact_context = rework
+        .exact_review_findings_context(&request)
+        .await
+        .unwrap();
     assert_eq!(
-        pending[0]["reviewed_result"]["original_scope"],
+        exact_context["reviewed_result"]["execution_id"],
+        delivery_id
+    );
+    assert_eq!(
+        exact_context["reviewed_result"]["original_scope"],
         implementation.scope
     );
+    assert_eq!(exact_context["review_work_unit_id"], review.id);
+    assert_eq!(exact_context["review_scope"], review.scope);
+    let request_event = sqlx::query(
+        "SELECT id,sequence FROM domain_event
+         WHERE event_type='task.coordination_requested'
+           AND entity_type='task_coordination_request' AND entity_id=?",
+    )
+    .bind(&request.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let request_event_id: String = request_event.try_get("id").unwrap();
+    let request_event_sequence: i64 = request_event.try_get("sequence").unwrap();
+    let request_domain_event = DomainEventRepo::get_event(&**db, &request_event_id)
+        .await
+        .unwrap()
+        .unwrap();
+    if pause_before_provider_start {
+        let (reached, release) = pre_start_barriers
+            .as_ref()
+            .expect("pre-Start barrier is configured for this regression");
+        let signal = fixture
+            .runtime
+            .classify_event(&request_domain_event)
+            .await
+            .unwrap()
+            .expect("exact typed request classifies for its coordinator");
+        assert_eq!(
+            fixture
+                .runtime
+                .admit_signal(&request_domain_event, signal)
+                .await
+                .unwrap(),
+            1,
+            "exact typed request admits one coordinator wake"
+        );
+        let wake_id: String =
+            sqlx::query_scalar("SELECT id FROM orchestrator_wake WHERE event_id=? AND task_id=?")
+                .bind(&request_event_id)
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let turn_count_before: i64 =
+            sqlx::query_scalar("SELECT turn_count FROM task_coordination WHERE task_id=?")
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let dispatch_runtime = Arc::new(fixture.runtime.clone());
+        let dispatch = tokio::spawn(async move { dispatch_runtime.dispatch_one().await });
+        reached.wait().await;
+        let current_task = TaskRepo::get_by_id(&**db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&**db, &task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        lifecycle_service
+            .pause_task(
+                &task.id,
+                current_task.version,
+                lifecycle.version,
+                &api_types::ActorRef::Human(owner.clone()),
+                Some("pause exact coordinator request before provider Start".into()),
+                "review-triage-pre-start-pause",
+            )
+            .await
+            .unwrap();
+        release.wait().await;
+
+        assert!(matches!(
+            dispatch.await.unwrap().unwrap(),
+            DispatchOutcome::Retried
+        ));
+
+        let deferred_request =
+            db::TaskCoordinationRepo::get_task_coordination_request(&**db, &request.id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            deferred_request.state,
+            db::TaskCoordinationRequestState::Running,
+            "a no-Start pause keeps the typed request recoverable"
+        );
+        assert_eq!(deferred_request.wake_id.as_deref(), Some(wake_id.as_str()));
+        let execution_id = deferred_request
+            .execution_id
+            .as_deref()
+            .expect("the failed pre-Start Execution remains linked")
+            .to_owned();
+        let deferred_wake = db::OrchestratorWakeRepo::get_orchestrator_wake(&**db, &wake_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred_wake.state, db::OrchestratorWakeState::Pending);
+        assert_eq!(deferred_wake.current_attempt, None);
+        let (attempt_state, attempt_execution_id): (String, String) = sqlx::query_as(
+            "SELECT state,execution_id FROM orchestrator_wake_execution
+             WHERE wake_id=? AND attempt_number=1",
+        )
+        .bind(&wake_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(attempt_state, "failed");
+        assert_eq!(attempt_execution_id, execution_id);
+        let execution = ExecutionRepo::get_by_id(&**db, &execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Failed);
+        assert!(DomainEventRepo::get_event_by_dedupe(
+            &**db,
+            &format!("execution.provider_start_attempted:{execution_id}")
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let turn_count_after: i64 =
+            sqlx::query_scalar("SELECT turn_count FROM task_coordination WHERE task_id=?")
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(turn_count_after, turn_count_before);
+        return;
+    }
     let role = TaskRoleRepo::get_by_id(&**db, &fixture.task_role_id)
         .await
         .unwrap()
@@ -202,24 +441,125 @@ async fn triage_fixture(disposition: api_types::TaskReviewDisposition, extra_rec
     scoped_wake.work_unit_id = Some(implementation.id.clone());
     let scoped = fixture
         .runtime
-        .build_context(&scoped_wake, &role, &members, &policy)
+        .build_context(&scoped_wake, &role, &members, &policy, None)
         .await
         .unwrap();
-    assert_eq!(scoped["pending_review_findings"], json!([]));
-    assert_eq!(scoped["previous_review_decisions"], json!([]));
+    assert!(scoped.get("review_findings").is_none());
+    assert!(scoped.get("pending_review_findings").is_none());
+    assert!(serde_json::from_value::<OrchestratorResponse>(json!({
+        "actions": [],
+        "review_findings": [],
+    }))
+    .is_err());
+    let mut typed_wake = fixture.wake.clone();
+    typed_wake.event_id = request_event_id;
+    typed_wake.event_sequence = request_event_sequence;
+    let typed = fixture
+        .runtime
+        .build_context(&typed_wake, &role, &members, &policy, Some(&request))
+        .await
+        .unwrap();
+    assert_eq!(typed["review_findings"]["report_artifact_id"], report.id);
+    let prompt = coordination
+        .render_turn_prompt(&request, &typed)
+        .await
+        .unwrap();
+    assert!(prompt.contains("exactly one decision"));
+    assert!(prompt.contains("no `actions`"));
+    assert!(!prompt.contains("\"work_units\""));
+    request = start_review_request(
+        &coordination,
+        &**db,
+        &request,
+        &fixture.wake.id,
+        &fixture.execution.id,
+    )
+    .await;
+    let mut mixed_output: serde_json::Value = serde_json::from_str(&review_findings_output(
+        &request,
+        &crate::task_rework::ReviewFindingsDecision {
+            authorization_version: authorized.coordination.authorization_version,
+            review_report_artifact_id: report.id.clone(),
+            report_digest: report.digest.clone().unwrap(),
+            disposition: api_types::TaskReviewDisposition::Human,
+            rationale: "Needs a Human decision".into(),
+            instructions: "Choose whether the evidence gap is acceptable".into(),
+        },
+    ))
+    .unwrap();
+    mixed_output["actions"] = json!([]);
+    let mut mixed_execution = fixture.execution.clone();
+    mixed_execution.summary = Some(mixed_output.to_string());
+    assert!(coordination
+        .complete_turn(&request, &mixed_execution)
+        .await
+        .is_err());
+    let pause_decision = crate::task_rework::ReviewFindingsDecision {
+        authorization_version: authorized.coordination.authorization_version,
+        review_report_artifact_id: report.id.clone(),
+        report_digest: report.digest.clone().unwrap(),
+        disposition: api_types::TaskReviewDisposition::Human,
+        rationale: "Pause fence check".into(),
+        instructions: "Wait for dispatch to resume".into(),
+    };
+    let current_task = TaskRepo::get_by_id(&**db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&**db, &task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    lifecycle_service
+        .pause_task(
+            &task.id,
+            current_task.version,
+            lifecycle.version,
+            &api_types::ActorRef::Human(owner.clone()),
+            Some("exercise the exact ReviewFindings pause fence".into()),
+            "review-triage-fixture-pause",
+        )
+        .await
+        .unwrap();
+    let paused =
+        submit_review_findings(&coordination, &request, &fixture.execution, &pause_decision)
+            .await
+            .expect_err("writer pause fence preserves the completed response");
+    assert!(matches!(
+        paused,
+        crate::ServiceError::Coordination {
+            code: "coordination.paused",
+            ..
+        }
+    ));
+    let current_task = TaskRepo::get_by_id(&**db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&**db, &task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    lifecycle_service
+        .resume_task(
+            &task.id,
+            current_task.version,
+            lifecycle.version,
+            &api_types::ActorRef::Human(owner.clone()),
+            "review-triage-fixture-resume",
+        )
+        .await
+        .unwrap();
     for _ in 0..extra_rechecks {
-        rework
-            .record_review_triage(
-                &fixture.execution.id,
-                crate::task_rework::ReviewFindingsDecision {
-                    authorization_version: authorized.coordination.authorization_version,
-                    review_report_artifact_id: report.id.clone(),
-                    report_digest: report.digest.clone().unwrap(),
-                    disposition: api_types::TaskReviewDisposition::Recheck,
-                    rationale: "Check the exact acceptance evidence again".into(),
-                    instructions: "Independently verify the original delivery evidence".into(),
-                },
-            )
+        let decision = crate::task_rework::ReviewFindingsDecision {
+            authorization_version: authorized.coordination.authorization_version,
+            review_report_artifact_id: report.id.clone(),
+            report_digest: report.digest.clone().unwrap(),
+            disposition: api_types::TaskReviewDisposition::Recheck,
+            rationale: "Check the exact acceptance evidence again".into(),
+            instructions: "Independently verify the original delivery evidence".into(),
+        };
+        submit_review_findings(&coordination, &request, &fixture.execution, &decision)
             .await
             .unwrap();
         rework.process_pending_automatic_rework(10).await.unwrap();
@@ -249,6 +589,21 @@ async fn triage_fixture(disposition: api_types::TaskReviewDisposition, extra_rec
             .await
             .unwrap();
         report = next_report;
+        request = create_review_request(&coordination, &task.id, &report.id).await;
+        request = start_review_request(
+            &coordination,
+            &**db,
+            &request,
+            &fixture.wake.id,
+            &fixture.execution.id,
+        )
+        .await;
+        let recheck_context = rework
+            .exact_review_findings_context(&request)
+            .await
+            .unwrap();
+        assert_eq!(recheck_context["review_work_unit_id"], next.id);
+        assert_eq!(recheck_context["review_scope"], next.scope);
     }
     // Until the coordinator decides, the automatic pair must remain absent.
     rework.process_pending_automatic_rework(10).await.unwrap();
@@ -270,38 +625,39 @@ async fn triage_fixture(disposition: api_types::TaskReviewDisposition, extra_rec
     };
     let mut wrong = decision.clone();
     wrong.report_digest = "0".repeat(64);
-    assert!(rework
-        .record_review_triage(&fixture.execution.id, wrong)
-        .await
-        .is_err());
+    assert!(
+        submit_review_findings(&coordination, &request, &fixture.execution, &wrong)
+            .await
+            .is_err()
+    );
     sqlx::query("UPDATE task_coordination SET team_stale=1 WHERE task_id=?")
         .bind(&task.id)
         .execute(db.pool())
         .await
         .unwrap();
-    assert!(rework
-        .record_review_triage(&fixture.execution.id, decision.clone())
-        .await
-        .is_err());
+    assert!(
+        submit_review_findings(&coordination, &request, &fixture.execution, &decision)
+            .await
+            .is_err()
+    );
     sqlx::query("UPDATE task_coordination SET team_stale=0 WHERE task_id=?")
         .bind(&task.id)
         .execute(db.pool())
         .await
         .unwrap();
-    rework
-        .record_review_triage(&fixture.execution.id, decision.clone())
+    submit_review_findings(&coordination, &request, &fixture.execution, &decision)
         .await
         .unwrap();
-    rework
-        .record_review_triage(&fixture.execution.id, decision.clone())
+    submit_review_findings(&coordination, &request, &fixture.execution, &decision)
         .await
         .expect("exact retry is effect-free");
     let mut changed = decision;
     changed.instructions = "Different decision".into();
-    assert!(rework
-        .record_review_triage(&fixture.execution.id, changed)
-        .await
-        .is_err());
+    assert!(
+        submit_review_findings(&coordination, &request, &fixture.execution, &changed)
+            .await
+            .is_err()
+    );
     rework.process_pending_automatic_rework(10).await.unwrap();
     let (state,recheck):(String,Option<String>)=sqlx::query_as("SELECT i.state,t.review_work_unit_id FROM task_rework_automation_intent i JOIN task_review_triage t ON t.review_report_artifact_id=i.review_report_artifact_id WHERE i.review_report_artifact_id=?").bind(&report.id).fetch_one(db.pool()).await.unwrap();
     match disposition {
@@ -324,16 +680,10 @@ async fn triage_fixture(disposition: api_types::TaskReviewDisposition, extra_rec
     }
     let next_context = fixture
         .runtime
-        .build_context(&fixture.wake, &role, &members, &policy)
+        .build_context(&fixture.wake, &role, &members, &policy, None)
         .await
         .unwrap();
-    assert_eq!(
-        next_context["previous_review_decisions"]
-            .as_array()
-            .unwrap()
-            .len(),
-        (extra_rechecks + 1).min(8)
-    );
+    assert!(next_context.get("previous_review_decisions").is_none());
     let original = CollaborationRepo::get_artifact(&**db, &report.id)
         .await
         .unwrap()
@@ -350,20 +700,25 @@ async fn triage_fixture(disposition: api_types::TaskReviewDisposition, extra_rec
 
 #[tokio::test]
 async fn confirmed_review_findings_create_one_exact_correction_pair() {
-    triage_fixture(api_types::TaskReviewDisposition::Correct, 0).await;
+    triage_fixture(api_types::TaskReviewDisposition::Correct, 0, false).await;
 }
 
 #[tokio::test]
 async fn disputed_review_findings_create_a_new_review_of_the_same_result() {
-    triage_fixture(api_types::TaskReviewDisposition::Recheck, 0).await;
+    triage_fixture(api_types::TaskReviewDisposition::Recheck, 0, false).await;
 }
 
 #[tokio::test]
 async fn coordinator_can_request_human_help_without_approving_the_result() {
-    triage_fixture(api_types::TaskReviewDisposition::Human, 0).await;
+    triage_fixture(api_types::TaskReviewDisposition::Human, 0, false).await;
 }
 
 #[tokio::test]
 async fn correction_round_ten_is_persisted_after_nine_independent_reassessments() {
-    triage_fixture(api_types::TaskReviewDisposition::Correct, 9).await;
+    triage_fixture(api_types::TaskReviewDisposition::Correct, 9, false).await;
+}
+
+#[tokio::test]
+async fn standalone_review_findings_pause_before_start_defers_same_request_and_wake() {
+    triage_fixture(api_types::TaskReviewDisposition::Human, 0, true).await;
 }
