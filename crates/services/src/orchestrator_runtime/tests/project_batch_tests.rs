@@ -121,8 +121,8 @@ fn review_findings_output(prompt: &str, disposition: &str) -> String {
     .to_string()
 }
 
-fn review_report_output(verdict: &str) -> String {
-    let finding = if verdict == "request_changes" {
+fn review_report_output(native_verdict: &str) -> String {
+    let finding = if native_verdict == "fail" {
         vec!["The delivered result is missing the required acceptance evidence."]
     } else {
         Vec::new()
@@ -132,8 +132,8 @@ fn review_report_output(verdict: &str) -> String {
         json!({
             "schema_version": 1,
             "kind": "review",
-            "verdict": verdict,
-            "summary": if verdict == "request_changes" {
+            "verdict": native_verdict,
+            "summary": if native_verdict == "fail" {
                 "The exact reviewed result is missing required acceptance evidence."
             } else {
                 "The exact corrected result satisfies the acceptance criterion."
@@ -199,7 +199,7 @@ impl executors::HarnessAdapter for ProjectBatchHarnessAdapter {
                 let turn = self
                     .reviewer_turns
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                review_report_output(if turn < 2 { "request_changes" } else { "pass" })
+                review_report_output(if turn < 2 { "fail" } else { "pass" })
             }
             role => {
                 return Err(executors::ExecutorError::Other(format!(

@@ -465,6 +465,174 @@ async fn triage_fixture(
                 .await
                 .unwrap();
         assert_eq!(turn_count_after, turn_count_before);
+
+        let current_task = TaskRepo::get_by_id(&**db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&**db, &task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        lifecycle_service
+            .resume_task(
+                &task.id,
+                current_task.version,
+                lifecycle.version,
+                &api_types::ActorRef::Human(owner.clone()),
+                "review-triage-pre-start-resume",
+            )
+            .await
+            .unwrap();
+        let retry_at: String = sqlx::query_scalar(
+            "SELECT available_at FROM orchestrator_wake WHERE id=? AND state='pending'",
+        )
+        .bind(&wake_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let retry_at = chrono::DateTime::parse_from_rfc3339(&retry_at).unwrap();
+        let deferred_at = chrono::DateTime::parse_from_rfc3339(&deferred_wake.updated_at).unwrap();
+        assert!(retry_at > deferred_at);
+        // Simulate the retry delay elapsing in this disposable fixture by
+        // advancing only availability; preserve the persisted request/attempt.
+        let dispatch_now = now_rfc3339();
+        let advanced = sqlx::query(
+            "UPDATE orchestrator_wake SET available_at=? WHERE id=? AND state='pending'",
+        )
+        .bind(&dispatch_now)
+        .bind(&wake_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(advanced.rows_affected(), 1);
+        let resumed_dispatch_runtime = Arc::new(fixture.runtime.clone());
+        let resumed_dispatch =
+            tokio::spawn(async move { resumed_dispatch_runtime.dispatch_one().await });
+        if tokio::time::timeout(std::time::Duration::from_secs(30), reached.wait())
+            .await
+            .is_err()
+        {
+            let current_wake = db::OrchestratorWakeRepo::get_orchestrator_wake(&**db, &wake_id)
+                .await
+                .unwrap();
+            let current_request =
+                db::TaskCoordinationRepo::get_task_coordination_request(&**db, &request.id)
+                    .await
+                    .unwrap();
+            panic!(
+                "resumed pre-Start dispatcher did not reach its barrier: wake={:?}, request={:?}, dispatch_finished={}",
+                current_wake.map(|wake| (wake.state, wake.current_attempt)),
+                current_request.map(|request| (request.state, request.execution_id)),
+                resumed_dispatch.is_finished(),
+            );
+        }
+        let resumed_request =
+            db::TaskCoordinationRepo::get_task_coordination_request(&**db, &request.id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            resumed_request.state,
+            db::TaskCoordinationRequestState::Running
+        );
+        assert_eq!(resumed_request.wake_id.as_deref(), Some(wake_id.as_str()));
+        let resumed_execution_id = resumed_request
+            .execution_id
+            .as_deref()
+            .expect("resume admits a fresh technical attempt for the same request")
+            .to_owned();
+        assert_ne!(resumed_execution_id, execution_id);
+        let resumed_wake = db::OrchestratorWakeRepo::get_orchestrator_wake(&**db, &wake_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed_wake.state, db::OrchestratorWakeState::Leased);
+        assert_eq!(resumed_wake.current_attempt, Some(2));
+        let second_attempt_state: String = sqlx::query_scalar(
+            "SELECT state FROM orchestrator_wake_execution
+             WHERE wake_id=? AND attempt_number=2",
+        )
+        .bind(&wake_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(second_attempt_state, "start_requested");
+        let current_task = TaskRepo::get_by_id(&**db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&**db, &task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        lifecycle_service
+            .pause_task(
+                &task.id,
+                current_task.version,
+                lifecycle.version,
+                &api_types::ActorRef::Human(owner.clone()),
+                Some("pause same request before retry Start".into()),
+                "review-triage-pre-start-pause-again",
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), release.wait())
+                .await
+                .is_ok(),
+            "resumed pre-Start dispatcher reached its gate but not the release barrier"
+        );
+        assert!(matches!(
+            resumed_dispatch.await.unwrap().unwrap(),
+            DispatchOutcome::Retried
+        ));
+        let final_request =
+            db::TaskCoordinationRepo::get_task_coordination_request(&**db, &request.id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            final_request.state,
+            db::TaskCoordinationRequestState::Running
+        );
+        assert_eq!(final_request.wake_id.as_deref(), Some(wake_id.as_str()));
+        assert_eq!(
+            final_request.execution_id.as_deref(),
+            Some(resumed_execution_id.as_str())
+        );
+        let final_wake = db::OrchestratorWakeRepo::get_orchestrator_wake(&**db, &wake_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_wake.state, db::OrchestratorWakeState::Pending);
+        assert_eq!(final_wake.current_attempt, None);
+        let attempt_states: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT attempt_number,state FROM orchestrator_wake_execution
+             WHERE wake_id=? ORDER BY attempt_number",
+        )
+        .bind(&wake_id)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            attempt_states,
+            vec![(1, "failed".to_owned()), (2, "failed".to_owned())]
+        );
+        assert!(DomainEventRepo::get_event_by_dedupe(
+            &**db,
+            &format!("execution.provider_start_attempted:{resumed_execution_id}")
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let final_turn_count: i64 =
+            sqlx::query_scalar("SELECT turn_count FROM task_coordination WHERE task_id=?")
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(final_turn_count, turn_count_before);
         return;
     }
     let role = TaskRoleRepo::get_by_id(&**db, &fixture.task_role_id)

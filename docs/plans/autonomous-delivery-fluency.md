@@ -452,3 +452,22 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
   capturado no llegó a imprimirse porque el otro test no terminaba. El workflow
   conserva toda la suite y añade `--nocapture` para retener el diagnóstico en la
   siguiente ejecución. Ese caso seguirá sin aceptación hasta obtener resultado.
+
+### Anexo CI 4 — diagnóstico funcional completo
+
+- SHA: `f0af8fe69e082661eb3bfa8fb7f432d178832d2d`; run
+  [43478216837](https://github.com/AlRos14/forge/actions/runs/43478216837).
+- Build, frontend, navegador y Clippy **PASS**. Runtime **FAIL**: 43 casos
+  pasan y dos fallan; ya no queda una espera indefinida.
+- El caso de pausa antes de Start conserva `current_attempt = 1` al diferir el
+  Wake, mientras el test exige liberarlo tras confirmar que no hubo Start.
+  La transición ahora limpia explícitamente el intento solo tras NoAttempt
+  confirmado; los demás aplazamientos conservan su semántica. La regresión
+  reanuda el mismo request/Wake tras el backoff, registra otro intento técnico
+  y confirma ausencia de Start y de consumo adicional tras una segunda pausa.
+- El caso batch llega a la revisión, pero el resultado simulado usa un verdict
+  rechazado por el parser nativo de `FORGE_RESULT`. El fixture ahora emite
+  `fail`, normalizado por el parser vigente a `request_changes`, sin ampliar
+  el parser ni sustituir la revisión formal.
+- La siguiente repetición se justifica por estos dos fallos concretos. Las
+  suites restantes continúan; los PASS parciales no validan otro SHA.

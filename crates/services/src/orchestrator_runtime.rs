@@ -1969,8 +1969,11 @@ impl OrchestratorRuntime {
                         return Ok(DispatchOutcome::Retried);
                     }
                     if batch_state.as_deref() == Some("paused") {
-                        self.defer_wake(&wake, "Project batch paused before Harness Start")
-                            .await?;
+                        self.defer_wake_after_no_attempt(
+                            &wake,
+                            "Project batch paused before Harness Start",
+                        )
+                        .await?;
                     } else {
                         if let Err(mark_error) = coordination
                             .mark_request_failed(request, "project_plan_batch_inactive", &reason)
@@ -2106,8 +2109,19 @@ impl OrchestratorRuntime {
                                 .await?;
                                 return Ok(DispatchOutcome::Retried);
                             }
-                            self.defer_wake(&wake, "Project batch paused before Harness Start")
+                            if evidence == ProviderStartReceiptEvidence::NoAttempt {
+                                self.defer_wake_after_no_attempt(
+                                    &wake,
+                                    "Project batch paused before Harness Start",
+                                )
                                 .await?;
+                            } else {
+                                self.defer_wake(
+                                    &wake,
+                                    "Project batch paused before Harness Start with incoherent receipt evidence",
+                                )
+                                .await?;
+                            }
                         } else {
                             let coordination =
                                 crate::task_coordination::TaskCoordinationService::new(
@@ -2174,7 +2188,7 @@ impl OrchestratorRuntime {
                             .await?;
                             return Ok(DispatchOutcome::Retried);
                         }
-                        self.defer_wake(&wake, "Task paused before Harness Start")
+                        self.defer_wake_after_no_attempt(&wake, "Task paused before Harness Start")
                             .await?;
                         return Ok(DispatchOutcome::Retried);
                     }
@@ -3486,7 +3500,7 @@ impl OrchestratorRuntime {
                             )
                             .await?;
                         if failed_attempt {
-                            self.defer_wake(
+                            self.defer_wake_after_no_attempt(
                                 wake,
                                 "Task or Project batch paused before Harness Start",
                             )
@@ -3583,6 +3597,26 @@ impl OrchestratorRuntime {
     }
 
     async fn defer_wake(&self, wake: &OrchestratorWake, reason: &str) -> Result<()> {
+        self.transition_wake_to_pending(wake, reason, None).await
+    }
+
+    /// A durable NoAttempt result closes the failed attempt. Clear its number
+    /// when deferring so the next dispatch records a fresh, explicit attempt.
+    async fn defer_wake_after_no_attempt(
+        &self,
+        wake: &OrchestratorWake,
+        reason: &str,
+    ) -> Result<()> {
+        self.transition_wake_to_pending(wake, reason, Some(None))
+            .await
+    }
+
+    async fn transition_wake_to_pending(
+        &self,
+        wake: &OrchestratorWake,
+        reason: &str,
+        current_attempt: Option<Option<i64>>,
+    ) -> Result<()> {
         let now = now_rfc3339();
         OrchestratorWakeRepo::transition_orchestrator_wake(
             &*self.db,
@@ -3592,7 +3626,7 @@ impl OrchestratorRuntime {
                 lease_owner: Some(self.lease_owner.clone()),
                 state: OrchestratorWakeState::Pending,
                 available_at: Some(add_duration(&now, RETRY_DELAY)),
-                current_attempt: None,
+                current_attempt,
                 last_error: Some(Some(reason.to_owned())),
                 updated_at: now,
             },
