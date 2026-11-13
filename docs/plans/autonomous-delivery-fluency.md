@@ -434,3 +434,21 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
 - La siguiente revalidación se justifica por este diagnóstico nuevo, que
   quedaba oculto tras los errores de tipos anteriores. Ningún PASS parcial se
   traslada al SHA siguiente.
+
+### Anexo CI 3 — fixture bloqueado y diagnósticos
+
+- SHA: `f20aa01c2d25536e07f9de72c147c3f34a33c861`; run
+  [43473922248](https://github.com/AlRos14/forge/actions/runs/43473922248).
+- Build completo, web, navegador y binarios **PASS**. Clippy **FAIL** por siete
+  lints en tests (patrones de caracteres, aliases de filas y auto-deref).
+- Runtime **BLOCKED**: un fixture conservaba otro Wake `running` del mismo
+  Actor; la exclusión correcta del dispatcher impedía llegar a una barrera sin
+  timeout. Se canceló el run para detener la espera indefinida; su conclusión
+  real es **CANCELLED**, no PASS. Los fallos de Clippy quedan registrados.
+- Corrección del fixture mediante reconciliación real del Execution anterior;
+  barreras limitadas a 30 segundos con diagnóstico. No se relaja la exclusión de
+  Actors ni ningún guard de producción. Los lints se corrigen sin supresiones.
+- El test batch también apareció como FAIL antes de la cancelación; su detalle
+  capturado no llegó a imprimirse porque el otro test no terminaba. El workflow
+  conserva toda la suite y añade `--nocapture` para retener el diagnóstico en la
+  siguiente ejecución. Ese caso seguirá sin aceptación hasta obtener resultado.

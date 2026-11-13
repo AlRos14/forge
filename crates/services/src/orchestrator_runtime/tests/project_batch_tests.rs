@@ -35,6 +35,16 @@ type ObservedExecutionDiagnosticRow = (
     Option<String>,
     Option<String>,
 );
+type RowSubject = (
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+type RowTypedReviewRequest = (String, String, String, String, String, i64, Option<String>);
 
 #[derive(Clone)]
 struct ProjectBatchHarnessAdapter {
@@ -56,7 +66,7 @@ fn prompt_json_string(prompt: &str, key: &str) -> String {
         .unwrap_or_else(|| panic!("ReviewFindings prompt has {key:?}"))
         .1;
     let end = value
-        .find(|character| matches!(character, ',' | '}'))
+        .find([',', '}'])
         .expect("ReviewFindings prompt JSON string has a delimiter");
     serde_json::from_str(&value[..end]).expect("ReviewFindings prompt field is a JSON string")
 }
@@ -68,7 +78,7 @@ fn prompt_json_number(prompt: &str, key: &str) -> i64 {
         .unwrap_or_else(|| panic!("ReviewFindings prompt has {key:?}"))
         .1;
     let end = value
-        .find(|character| matches!(character, ',' | '}'))
+        .find([',', '}'])
         .expect("ReviewFindings prompt number has a delimiter");
     value[..end]
         .parse()
@@ -1236,8 +1246,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
     let recheck_work_unit_id = first_triage_row
         .2
         .expect("recheck disposition creates a formal review WorkUnit");
-    let original_subject: (String, i64, String, Option<String>, Option<String>, Option<String>, Option<String>) =
-        sqlx::query_as(
+    let original_subject: RowSubject = sqlx::query_as(
             "SELECT reviewed_work_unit_id,reviewed_work_unit_version,result_execution_id,
                     result_artifact_id,result_commit_sha,result_workspace_id,workspace_snapshot_digest
              FROM work_unit_review_subject subject
@@ -1252,8 +1261,7 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         .fetch_one(database.pool())
         .await
         .expect("initial ReviewReport frozen subject loads");
-    let recheck_subject: (String, i64, String, Option<String>, Option<String>, Option<String>, Option<String>) =
-        sqlx::query_as(
+    let recheck_subject: RowSubject = sqlx::query_as(
             "SELECT reviewed_work_unit_id,reviewed_work_unit_version,result_execution_id,
                     result_artifact_id,result_commit_sha,result_workspace_id,workspace_snapshot_digest
              FROM work_unit_review_subject WHERE review_work_unit_id=?",
@@ -1366,19 +1374,18 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         .iter()
         .all(|unit| unit.status == db::WorkUnitStatus::Completed));
 
-    let typed_review_requests: Vec<(String, String, String, String, String, i64, Option<String>)> =
-        sqlx::query_as(
-            "SELECT request.id,request.state,request.review_report_artifact_id,
+    let typed_review_requests: Vec<RowTypedReviewRequest> = sqlx::query_as(
+        "SELECT request.id,request.state,request.review_report_artifact_id,
                     request.review_report_digest,request.review_producer_execution_id,
                     request.authorization_version,request.execution_id
              FROM task_coordination_request request
              WHERE request.task_id=? AND request.kind='review_findings'
              ORDER BY request.created_at,request.id",
-        )
-        .bind(&task.id)
-        .fetch_all(database.pool())
-        .await
-        .expect("both exact ReviewFindings requests load");
+    )
+    .bind(&task.id)
+    .fetch_all(database.pool())
+    .await
+    .expect("both exact ReviewFindings requests load");
     assert_eq!(typed_review_requests.len(), 2);
     assert!(typed_review_requests
         .iter()

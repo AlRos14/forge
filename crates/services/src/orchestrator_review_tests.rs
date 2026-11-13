@@ -319,6 +319,22 @@ async fn triage_fixture(
         let (reached, release) = pre_start_barriers
             .as_ref()
             .expect("pre-Start barrier is configured for this regression");
+        assert!(
+            fixture
+                .runtime
+                .reconcile_orchestrator_terminal(&fixture.terminal_event)
+                .await
+                .unwrap(),
+            "fixture's completed same-Agent wake is terminal before admitting a new one"
+        );
+        assert_eq!(
+            db::OrchestratorWakeRepo::get_orchestrator_wake(&**db, &fixture.wake.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            db::OrchestratorWakeState::Completed
+        );
         let signal = fixture
             .runtime
             .classify_event(&request_domain_event)
@@ -349,7 +365,24 @@ async fn triage_fixture(
                 .unwrap();
         let dispatch_runtime = Arc::new(fixture.runtime.clone());
         let dispatch = tokio::spawn(async move { dispatch_runtime.dispatch_one().await });
-        reached.wait().await;
+        if tokio::time::timeout(std::time::Duration::from_secs(30), reached.wait())
+            .await
+            .is_err()
+        {
+            let current_wake = db::OrchestratorWakeRepo::get_orchestrator_wake(&**db, &wake_id)
+                .await
+                .unwrap();
+            let current_request =
+                db::TaskCoordinationRepo::get_task_coordination_request(&**db, &request.id)
+                    .await
+                    .unwrap();
+            panic!(
+                "pre-Start dispatcher did not reach its barrier: wake={:?}, request={:?}, dispatch_finished={}",
+                current_wake.map(|wake| (wake.state, wake.current_attempt)),
+                current_request.map(|request| (request.state, request.execution_id)),
+                dispatch.is_finished(),
+            );
+        }
         let current_task = TaskRepo::get_by_id(&**db, &task.id, false)
             .await
             .unwrap()
@@ -369,7 +402,12 @@ async fn triage_fixture(
             )
             .await
             .unwrap();
-        release.wait().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), release.wait())
+                .await
+                .is_ok(),
+            "pre-Start dispatcher reached the gate but did not reach its release barrier"
+        );
 
         assert!(matches!(
             dispatch.await.unwrap().unwrap(),
@@ -469,7 +507,7 @@ async fn triage_fixture(
     assert!(!prompt.contains("\"work_units\""));
     request = start_review_request(
         &coordination,
-        &**db,
+        db,
         &request,
         &fixture.wake.id,
         &fixture.execution.id,
@@ -592,7 +630,7 @@ async fn triage_fixture(
         request = create_review_request(&coordination, &task.id, &report.id).await;
         request = start_review_request(
             &coordination,
-            &**db,
+            db,
             &request,
             &fixture.wake.id,
             &fixture.execution.id,

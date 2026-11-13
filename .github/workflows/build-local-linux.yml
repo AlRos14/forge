@@ -100,7 +100,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          cargo test --locked -p services --lib orchestrator_runtime 2>&1 | tee "$RUNNER_TEMP/forge-ci-runtime.log"
+          cargo test --locked -p services --lib orchestrator_runtime -- --nocapture 2>&1 | tee "$RUNNER_TEMP/forge-ci-runtime.log"
       - name: Upload orchestrator runtime diagnostic log
         if: ${{ failure() && !cancelled() && steps.rust_runtime.outcome == 'failure' }}
         uses: actions/upload-artifact@v6
