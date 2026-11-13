@@ -1,26 +1,40 @@
 mod common;
 
 use api_types::{
-    AgentResponse, ExecutionResponse, ExecutionStatus, ExecutionTerminalNotification,
-    GateEvaluationResponse, GateResponse, MergeAfterGateResponse, ProjectPlanBatchResponse,
-    ProjectPlanGraphResponse, ProjectTaskRoleDefaultsResponse, SubmitReviewReportResponse,
-    TaskLifecycleState, TaskResponse, WorkUnitIntegrationResponse, WorkUnitResponse,
-    METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL,
+    AgentResponse, DaemonFrame, DaemonProtocolCapabilities, ExecutionResponse, ExecutionStatus,
+    ExecutionTerminalNotification, GateEvaluationResponse, GateResponse, MergeAfterGateResponse,
+    ProjectPlanBatchResponse, ProjectPlanGraphResponse, ProjectTaskRoleDefaultsResponse,
+    SubmitReviewReportResponse, TaskLifecycleState, TaskResponse, WorkUnitIntegrationResponse,
+    WorkUnitResponse, DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1,
+    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1, METHOD_EXECUTION_START,
+    METHOD_EXECUTION_TERMINAL, METHOD_PROTOCOL_CAPABILITIES,
 };
 use axum::http::{Method, StatusCode};
 use db::{DomainEventRepo, TaskCoordinationRepo};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use sha2::Digest;
-use std::time::Duration;
+use std::{fmt::Debug, time::Duration};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use common::fake_daemon::{
-    connect_daemon, next_daemon_request, register_daemon, send_daemon_notification,
-    send_daemon_response, wait_until_connected, TestServer,
+    connect_daemon, register_daemon, send_daemon_notification, send_daemon_response,
+    wait_until_connected, TestServer,
 };
 use common::{
     create_project_and_repo, create_shell_agents, empty_request, json_request, setup_git_repo,
     test_app, TestDir,
 };
+
+type CoordinatorWakeDiagnostic = (
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 async fn configure_project_delivery_roles(
     app: &axum::Router,
@@ -152,6 +166,109 @@ async fn move_orchestrator_cursor_to_head(harness: &common::Harness) {
     .execute(harness.state.db.pool())
     .await
     .expect("fixture cursor excludes setup events");
+}
+
+async fn coordinator_start_diagnostics(
+    harness: &common::Harness,
+    request_id: &str,
+    task_id: &str,
+) -> String {
+    let request = TaskCoordinationRepo::get_task_coordination_request(&*harness.state.db, request_id)
+        .await
+        .expect("batch request diagnostic loads");
+    let wake_rows: Vec<CoordinatorWakeDiagnostic> = sqlx::query_as(
+        "SELECT wake.id,wake.state,wake.last_error,wake.current_attempt,
+                attempt.execution_id,attempt.state,attempt.last_error
+         FROM orchestrator_wake wake
+         JOIN domain_event event ON event.id=wake.event_id
+         LEFT JOIN orchestrator_wake_execution attempt ON attempt.wake_id=wake.id
+         WHERE event.event_type='task.coordination_requested' AND event.entity_id=?
+         ORDER BY wake.created_at,wake.id,attempt.attempt_number",
+    )
+    .bind(request_id)
+    .fetch_all(harness.state.db.pool())
+    .await
+    .expect("batch coordinator wake diagnostics load");
+    let executions: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id,status,error FROM execution
+         WHERE task_id=? AND role='orchestrator' ORDER BY created_at,id",
+    )
+    .bind(task_id)
+    .fetch_all(harness.state.db.pool())
+    .await
+    .expect("batch coordinator Execution diagnostics load");
+    format!("request={request:?}; wakes_and_attempts={wake_rows:?}; coordinator_executions={executions:?}")
+}
+
+async fn next_coordinator_start_or_runtime_exit<T: Debug + Send + 'static>(
+    socket: &mut common::fake_daemon::ClientSocket,
+    coordinator_start: &mut tokio::task::JoinHandle<T>,
+    harness: &common::Harness,
+    request_id: &str,
+    task_id: &str,
+) -> (String, Value) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        tokio::select! {
+            result = &mut *coordinator_start => {
+                let diagnostics = coordinator_start_diagnostics(harness, request_id, task_id).await;
+                panic!("OrchestratorRuntime finished before daemon execution.start arrived: result={result:?}; {diagnostics}");
+            }
+            incoming = tokio::time::timeout_at(deadline, socket.next()) => {
+                let message = match incoming {
+                    Ok(Some(Ok(message))) => message,
+                    Ok(Some(Err(error))) => {
+                        let diagnostics = coordinator_start_diagnostics(harness, request_id, task_id).await;
+                        coordinator_start.abort();
+                        panic!("fake Harness daemon socket failed before execution.start: {error}; {diagnostics}");
+                    }
+                    Ok(None) => {
+                        let diagnostics = coordinator_start_diagnostics(harness, request_id, task_id).await;
+                        coordinator_start.abort();
+                        panic!("fake Harness daemon socket closed before execution.start; {diagnostics}");
+                    }
+                    Err(_) => {
+                        let diagnostics = coordinator_start_diagnostics(harness, request_id, task_id).await;
+                        coordinator_start.abort();
+                        panic!("30-second deadline elapsed before daemon execution.start; {diagnostics}");
+                    }
+                };
+                let WsMessage::Text(text) = message else {
+                    continue;
+                };
+                let frame: DaemonFrame = serde_json::from_str(text.as_ref())
+                    .expect("fake Harness daemon frame parses before coordinator start");
+                match frame {
+                    DaemonFrame::Request {
+                        id,
+                        method,
+                        params: _,
+                    }
+                        if method == METHOD_PROTOCOL_CAPABILITIES =>
+                    {
+                        send_daemon_response(
+                            socket,
+                            id,
+                            DaemonProtocolCapabilities {
+                                schema_version: 1,
+                                features: vec![
+                                    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1.to_owned(),
+                                    DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1.to_owned(),
+                                ],
+                            },
+                        )
+                        .await;
+                    }
+                    DaemonFrame::Request { id, method, params } => {
+                        assert_eq!(method, METHOD_EXECUTION_START);
+                        return (id, params);
+                    }
+                    DaemonFrame::Heartbeat { .. } => {}
+                    other => panic!("expected coordinator Harness request, got {other:?}"),
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -331,9 +448,16 @@ async fn successor_starts_only_after_predecessor_task_merge_and_exact_handoff() 
         harness.state.task_service.clone(),
     );
     let runtime_for_start = runtime.clone();
-    let coordinator_start = tokio::spawn(async move { runtime_for_start.run_once(100).await });
-    let (start_id, start_params) =
-        next_daemon_request(&mut fake_harness, METHOD_EXECUTION_START).await;
+    let mut coordinator_start =
+        tokio::spawn(async move { runtime_for_start.run_once(100).await });
+    let (start_id, start_params) = next_coordinator_start_or_runtime_exit(
+        &mut fake_harness,
+        &mut coordinator_start,
+        &harness,
+        &request.id,
+        &predecessor.id,
+    )
+    .await;
     let coordinator_execution_id = start_params["execution_id"]
         .as_str()
         .expect("fake Harness start has an Execution id")

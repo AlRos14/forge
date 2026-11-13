@@ -470,4 +470,13 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
   `fail`, normalizado por el parser vigente a `request_changes`, sin ampliar
   el parser ni sustituir la revisión formal.
 - La siguiente repetición se justifica por estos dos fallos concretos. Las
-  suites restantes continúan; los PASS parciales no validan otro SHA.
+  suites restantes terminaron: persistencia/migraciones, coordinación/calidad,
+  Project Plan, MCP, API e2e y superficie pública **PASS**. En la batería final
+  pasó el resto de regresiones API, pero el nuevo A→B **FAIL** al agotar la
+  espera del Start del daemon simulado (`daemon request arrives: Elapsed`).
+  La revisión estática no encontró una causa de autoridad/admisión; el helper
+  compartido limita cada frame a dos segundos mientras el runtime recorre sus
+  scanners antes de Start. La espera del fixture A→B se acota localmente con
+  diagnóstico del resultado del runtime y sus registros durables, sin cambiar
+  el helper compartido ni los guards. La causa queda pendiente de confirmar en
+  CI. El run completo concluyó **FAIL**; los PASS parciales no validan otro SHA.
