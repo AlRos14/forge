@@ -173,9 +173,10 @@ async fn coordinator_start_diagnostics(
     request_id: &str,
     task_id: &str,
 ) -> String {
-    let request = TaskCoordinationRepo::get_task_coordination_request(&*harness.state.db, request_id)
-        .await
-        .expect("batch request diagnostic loads");
+    let request =
+        TaskCoordinationRepo::get_task_coordination_request(&*harness.state.db, request_id)
+            .await
+            .expect("batch request diagnostic loads");
     let wake_rows: Vec<CoordinatorWakeDiagnostic> = sqlx::query_as(
         "SELECT wake.id,wake.state,wake.last_error,wake.current_attempt,
                 attempt.execution_id,attempt.state,attempt.last_error
@@ -448,8 +449,7 @@ async fn successor_starts_only_after_predecessor_task_merge_and_exact_handoff() 
         harness.state.task_service.clone(),
     );
     let runtime_for_start = runtime.clone();
-    let mut coordinator_start =
-        tokio::spawn(async move { runtime_for_start.run_once(100).await });
+    let mut coordinator_start = tokio::spawn(async move { runtime_for_start.run_once(100).await });
     let (start_id, start_params) = next_coordinator_start_or_runtime_exit(
         &mut fake_harness,
         &mut coordinator_start,
