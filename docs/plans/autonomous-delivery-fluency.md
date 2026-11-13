@@ -421,3 +421,16 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
 - Revisión independiente del delta correctivo: **PASS estático**. La repetición
   del workflow se justifica por estos fallos; las suites de flujo seguirán sin
   aceptación hasta que se ejecuten sobre el SHA corregido.
+
+### Anexo CI 2 — ownership de eventos
+
+- SHA: `beee2c3fa5145483f47b97bf8a56853e70f62bfd`; run
+  [43472857759](https://github.com/AlRos14/forge/actions/runs/43472857759).
+- Web build, lint/tests y browser smoke **PASS** sobre ese SHA. Rust **FAIL**
+  por dos errores de ownership de `actor` y `now` entre los eventos de triage y
+  de request; las suites dependientes siguen bloqueadas por compilación.
+- Corrección mínima: tomar prestado el Actor y clonar su ID/timestamp para los
+  dos eventos. Conserva los mismos valores y la transacción existente.
+- La siguiente revalidación se justifica por este diagnóstico nuevo, que
+  quedaba oculto tras los errores de tipos anteriores. Ningún PASS parcial se
+  traslada al SHA siguiente.

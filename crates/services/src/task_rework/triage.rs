@@ -404,8 +404,8 @@ impl TaskReworkService {
         let event=DomainEventRepo::append_event_in_tx(&*self.db,&mut tx,&CreateDomainEvent {
             id:new_uuid_v4(),event_type:"task.review_triaged".to_owned(),entity_type:"artifact".to_owned(),entity_id:input.review_report_artifact_id.clone(),
             actor_type:match &actor {ActorRef::Agent(_)=>"agent",ActorRef::Human(_)=>"human"}.to_owned(),
-            actor_id:Some(match actor {ActorRef::Agent(id)|ActorRef::Human(id)=>id}),scope_type:"task".to_owned(),scope_id:task_id.clone(),correlation_id:task_id.clone(),causation_id:None,causation_depth:0,dedupe_key:Some(format!("review-triage:{}",input.review_report_artifact_id)),
-            payload_json:serde_json::json!({"task_id":task_id,"review_report_artifact_id":input.review_report_artifact_id,"disposition":disposition,"review_work_unit_id":review_id}).to_string(),created_at:now,
+            actor_id:Some(match &actor {ActorRef::Agent(id)|ActorRef::Human(id)=>id.clone()}),scope_type:"task".to_owned(),scope_id:task_id.clone(),correlation_id:task_id.clone(),causation_id:None,causation_depth:0,dedupe_key:Some(format!("review-triage:{}",input.review_report_artifact_id)),
+            payload_json:serde_json::json!({"task_id":task_id,"review_report_artifact_id":input.review_report_artifact_id,"disposition":disposition,"review_work_unit_id":review_id}).to_string(),created_at:now.clone(),
         }).await?;
         let request_event = DomainEventRepo::append_event_in_tx(
             &*self.db,
