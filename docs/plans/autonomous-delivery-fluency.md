@@ -597,3 +597,18 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
   mantienen la búsqueda del WorkUnit por id y `review: null`. Producto sin
   cambios.
 - Estado: pendiente de CI por SHA; sin compilación local.
+
+### Anexo CI 11 — A→B PASS; carrera en limpieza de Cursor
+
+- SHA: `eb78054a`; run [43609615508](https://github.com/AlRos14/forge/actions/runs/43609615508).
+- **PASS**: build, Clippy, runtime, coordinación, persistencia, Project Plan,
+  MCP, API e2e, superficie pública y la batería final, incluida A→B hasta merge
+  y handoff exacto.
+- **FAIL** independiente del ciclo: `cli-adapters`
+  `large_prompt_is_external_private_consumable_and_cleaned_without_worktree_changes`
+  (`failed to clean stale Cursor control files: ENOENT`). La limpieza de
+  directorios de control obsoletos abortaba si una entrada desaparecía entre
+  `read_dir` y su inspección/borrado (otra Execution o test concurrente la
+  elimina). Corrección: tolerar `NotFound` por entrada; otros errores de E/S se
+  siguen propagando.
+- Estado: pendiente de CI por SHA; sin compilación local.
