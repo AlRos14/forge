@@ -44,6 +44,7 @@ type RowSubject = (
     Option<String>,
     Option<String>,
 );
+type RowReviewReportProducer = (String, String, String, String);
 type RowTypedReviewRequest = (String, String, String, String, String, i64, Option<String>);
 type ObservedWakeAttempt = (String, Option<String>, Option<i64>);
 
@@ -1540,7 +1541,66 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         serde_json::from_str(&recheck_report_row.2).expect("recheck ReviewReport content is JSON");
     assert_eq!(first_report["verdict"], "request_changes");
     assert_eq!(second_report["verdict"], "request_changes");
-    assert_eq!(first_report["subject"], second_report["subject"]);
+    // Recheck preserves the exact reviewed result and subject while using a
+    // distinct formal-review Execution as the report producer.
+    let first_review_execution_id = first_report["subject"]["review_execution_id"]
+        .as_str()
+        .expect("first ReviewReport subject records its exact review Execution");
+    let second_review_execution_id = second_report["subject"]["review_execution_id"]
+        .as_str()
+        .expect("recheck ReviewReport subject records its exact review Execution");
+    assert_ne!(first_review_execution_id, second_review_execution_id);
+    let exact_report_producers: Vec<RowReviewReportProducer> = sqlx::query_as(
+        "SELECT report.id, execution.id, execution.status, execution.role
+         FROM artifact report
+         JOIN artifact_execution_producer producer
+           ON producer.artifact_id=report.id AND producer.task_id=report.task_id
+         JOIN execution
+           ON execution.id=producer.execution_id AND execution.task_id=producer.task_id
+         WHERE report.id IN (?,?) ORDER BY report.id",
+    )
+    .bind(&first_report_row.0)
+    .bind(&recheck_report_row.0)
+    .fetch_all(database.pool())
+    .await
+    .expect("original and recheck reports bind to their exact producer Executions");
+    assert_eq!(exact_report_producers.len(), 2);
+    let first_report_producer = exact_report_producers
+        .iter()
+        .find(|producer| producer.0 == first_report_row.0)
+        .expect("original report has its exact producer Execution");
+    let recheck_report_producer = exact_report_producers
+        .iter()
+        .find(|producer| producer.0 == recheck_report_row.0)
+        .expect("recheck report has its exact producer Execution");
+    assert_eq!(first_report_producer.1, first_review_execution_id);
+    assert_eq!(recheck_report_producer.1, second_review_execution_id);
+    assert_eq!(first_report_producer.2, "completed");
+    assert_eq!(recheck_report_producer.2, "completed");
+    assert_eq!(
+        first_typed_request.4, first_report_producer.1,
+        "the original typed request binds its exact ReviewReport producer"
+    );
+    assert_eq!(
+        second_typed_request.4, recheck_report_producer.1,
+        "the recheck typed request binds its exact ReviewReport producer"
+    );
+    let mut first_subject_without_only_review_execution = first_report["subject"].clone();
+    let mut second_subject_without_only_review_execution = second_report["subject"].clone();
+    assert!(first_subject_without_only_review_execution
+        .as_object_mut()
+        .expect("first ReviewReport subject is an object")
+        .remove("review_execution_id")
+        .is_some());
+    assert!(second_subject_without_only_review_execution
+        .as_object_mut()
+        .expect("recheck ReviewReport subject is an object")
+        .remove("review_execution_id")
+        .is_some());
+    assert_eq!(
+        first_subject_without_only_review_execution, second_subject_without_only_review_execution,
+        "recheck changes only the exact ReviewReport producer Execution"
+    );
 
     let rework_receipt: (String, String, String, String) = sqlx::query_as(
         "SELECT review_report_artifact_id,reviewed_work_unit_id,

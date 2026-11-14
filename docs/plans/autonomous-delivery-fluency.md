@@ -529,3 +529,19 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
   pero la vista lo marca obsoleto. La corrección usa una migración nueva y la
   autoridad congelada del Execution exacto, conservando el resto de checks y
   las migraciones históricas.
+
+### Anexo CI 7 — distinguir sujeto y productor del recheck
+
+- SHA: `afe564bdcacab20ff7ed0ee82225b8966a07bce4`; run
+  [43588618550](https://github.com/AlRos14/forge/actions/runs/43588618550).
+- Build completo y Clippy **PASS**. Runtime: **44 PASS, un FAIL**. El caso
+  batch supera la recuperación pausada y llega a cinco WorkUnits completados,
+  tres ReviewReports y dos requests `triaged` antes de fallar en una aserción
+  final; eso no equivale a PASS del test completo.
+- La comparación de los sujetos incluye `review_execution_id`, que pertenece
+  a la procedencia del nuevo informe y debe cambiar en un recheck. Se compara
+  el mismo sujeto/resultado congelado excluyendo únicamente ese identificador,
+  y se exige por separado que las Executions de revisión sean distintas y
+  correspondan a los productores durables de cada informe.
+- Las suites restantes continúan, incluida la regresión A→B de V169. La
+  siguiente repetición se justifica por esta aserción concreta del fixture.
