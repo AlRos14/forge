@@ -864,13 +864,24 @@ async fn successor_starts_only_after_predecessor_task_merge_and_exact_handoff() 
     let accepted_a = &handoff["direct_predecessors"][0];
     assert_eq!(accepted_a["task_id"], predecessor.id);
     assert_eq!(accepted_a["lifecycle_state"], "done");
+    let accepted_unit = accepted_a["work_units"]
+        .as_array()
+        .and_then(|units| {
+            units
+                .iter()
+                .find(|unit| unit["work_unit_id"] == work_unit.id.as_str())
+        })
+        .unwrap_or_else(|| panic!("handoff pins the exact implementer WorkUnit: {handoff}"));
     assert_eq!(
-        accepted_a["work_units"][0]["execution"]["execution_id"],
-        execution.id
+        accepted_unit["execution"]["execution_id"], execution.id,
+        "handoff: {handoff}"
     );
     assert_eq!(
-        accepted_a["work_units"][0]["integration"]["commit_sha"].as_str(),
-        integration.target_after_sha.as_deref()
+        accepted_unit["integration"]["commit_sha"].as_str(),
+        integration.target_after_sha.as_deref(),
+        "handoff: {handoff}"
     );
-    assert_eq!(accepted_a["work_units"][0]["review"]["verdict"], "pass");
+    // A was reviewed at the exact integrated Task Workspace, not through a
+    // WorkUnit review line, so the WorkUnit entry carries no review line.
+    assert!(accepted_unit["review"].is_null(), "handoff: {handoff}");
 }

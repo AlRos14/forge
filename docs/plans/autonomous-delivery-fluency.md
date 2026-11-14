@@ -569,3 +569,18 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
   INSERT); el guard de UPDATE exige el snapshot inmutable con `formal_review`.
   Cualquier otra Execution sin WorkUnit sigue prohibida en ese workspace.
 - Estado: pendiente de CI por SHA; no se compiló ni ejecutó nada localmente.
+
+### Anexo CI 9 — handoff exacto de A
+
+- SHA: `9b5e42fd`; run [43603696244](https://github.com/AlRos14/forge/actions/runs/43603696244).
+- V170 **PASS** en su efecto: la revisión formal del workspace de integración,
+  el Gate, `ReadyToMerge`, el merge y el desbloqueo de la sucesora ya pasan.
+- **FAIL** en la última comprobación de A→B: el fixture leía
+  `work_units[0]` del handoff y esa entrada no es el WorkUnit implementador
+  (`execution: null`, solo posible para un WorkUnit cancelado o sin
+  integración). La revisión estática confirma que el scheduler y su aritmética
+  `version - 1` son correctos.
+- Corrección del fixture: localizar el WorkUnit por su id exacto, imprimir el
+  handoff en cada aserción y exigir `review: null`, porque A se revisó en el
+  workspace de integración y no mediante una línea de revisión del WorkUnit.
+- Estado: pendiente de CI por SHA; sin compilación local.
