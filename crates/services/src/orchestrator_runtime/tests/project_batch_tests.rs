@@ -45,6 +45,7 @@ type RowSubject = (
     Option<String>,
 );
 type RowTypedReviewRequest = (String, String, String, String, String, i64, Option<String>);
+type ObservedWakeAttempt = (String, Option<String>, Option<i64>);
 
 #[derive(Clone)]
 struct ProjectBatchHarnessAdapter {
@@ -1128,11 +1129,47 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
         .execution_id
         .clone()
         .expect("started typed request records its coordinator Execution");
-    let provider_result = db::ExecutionRepo::get_by_id(&*database, &first_triage_execution_id)
-        .await
-        .expect("first ReviewFindings Execution reloads after the fake provider returns")
-        .expect("first ReviewFindings Execution remains durable");
-    assert_eq!(provider_result.status, db::ExecutionStatus::Completed);
+    // The embedded provider acknowledges Start after spawning run_execution.
+    // Releasing the fake Harness therefore does not make its durable Execution
+    // terminal synchronously with the batch pause; wait for that exact service
+    // result before testing recovery of the completed response.
+    let provider_terminal_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let provider_result = loop {
+        let current = db::ExecutionRepo::get_by_id(&*database, &first_triage_execution_id)
+            .await
+            .expect("first ReviewFindings Execution reloads after the fake provider returns")
+            .expect("first ReviewFindings Execution remains durable");
+        if current.status != db::ExecutionStatus::Running {
+            break current;
+        }
+        if tokio::time::Instant::now() >= provider_terminal_deadline {
+            let wake_attempt: Option<ObservedWakeAttempt> = sqlx::query_as(
+                "SELECT attempt.state,attempt.last_error,wake.current_attempt
+                 FROM orchestrator_wake wake
+                 JOIN orchestrator_wake_execution attempt ON attempt.wake_id=wake.id
+                 WHERE wake.id=? ORDER BY attempt.attempt_number DESC LIMIT 1",
+            )
+            .bind(
+                first_review_request
+                    .wake_id
+                    .as_deref()
+                    .expect("first ReviewFindings request has its exact wake"),
+            )
+            .fetch_optional(database.pool())
+            .await
+            .expect("first ReviewFindings wake attempt diagnostic loads");
+            panic!(
+                "the fake Harness result did not terminalize through TaskService before the bounded deadline; \
+                 request={first_review_request:?}; wake_attempt={wake_attempt:?}; execution={current:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        provider_result.status,
+        db::ExecutionStatus::Completed,
+        "exact provider Execution must complete through TaskService; request={first_review_request:?}; execution={provider_result:?}"
+    );
     let triage_count_while_paused: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM task_review_triage WHERE task_id=?")
             .bind(&task.id)

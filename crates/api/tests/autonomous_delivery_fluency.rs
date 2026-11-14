@@ -6,7 +6,8 @@ use api_types::{
     ProjectPlanBatchResponse, ProjectPlanGraphResponse, ProjectTaskRoleDefaultsResponse,
     SubmitReviewReportResponse, TaskLifecycleState, TaskResponse, WorkUnitIntegrationResponse,
     WorkUnitResponse, DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1,
-    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1, METHOD_EXECUTION_START,
+    DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1,
+    DAEMON_PROTOCOL_FEATURE_TASK_ROLE_CAPABILITIES_V1, METHOD_EXECUTION_START,
     METHOD_EXECUTION_TERMINAL, METHOD_PROTOCOL_CAPABILITIES,
 };
 use axum::http::{Method, StatusCode};
@@ -255,6 +256,7 @@ async fn next_coordinator_start_or_runtime_exit<T: Debug + Send + 'static>(
                                 features: vec![
                                     DAEMON_PROTOCOL_FEATURE_GENERIC_HARNESS_INVOCATION_V1.to_owned(),
                                     DAEMON_PROTOCOL_FEATURE_EXECUTION_ROLE_V1.to_owned(),
+                                    DAEMON_PROTOCOL_FEATURE_TASK_ROLE_CAPABILITIES_V1.to_owned(),
                                 ],
                             },
                         )

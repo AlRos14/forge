@@ -1990,12 +1990,36 @@ impl OrchestratorRuntime {
                     }
                     return Ok(DispatchOutcome::Retried);
                 }
-                tracing::warn!(
-                    task_id = %wake.task_id,
-                    request_id = %request.id,
-                    %error,
-                    "coordination request could not record its exact running attempt"
+                let reason = format!(
+                    "coordination request could not record its exact running attempt before Harness Start: {error}"
                 );
+                self.fail_start_execution_if_running(&execution, &reason)
+                    .await?;
+                let failed_attempt = OrchestratorWakeRepo::transition_orchestrator_wake_execution(
+                    &*self.db,
+                    db::TransitionOrchestratorWakeExecution {
+                        wake_id: wake.id.clone(),
+                        attempt_number: reserved.attempt_number,
+                        execution_id: reserved.execution_id.clone(),
+                        lease_owner: Some(self.lease_owner.clone()),
+                        expected_state: Some("reserved".to_owned()),
+                        state: "failed".to_owned(),
+                        last_error: Some(Some(reason.clone())),
+                        updated_at: now_rfc3339(),
+                    },
+                )
+                .await?;
+                if !failed_attempt {
+                    self.make_uncertain(
+                        &wake,
+                        &reserved,
+                        "coordination request attempt changed before its pre-Start failure was recorded",
+                    )
+                    .await?;
+                    return Ok(DispatchOutcome::Retried);
+                }
+                self.defer_wake_after_no_attempt(&wake, &reason).await?;
+                return Ok(DispatchOutcome::Retried);
             }
         }
         if !OrchestratorWakeRepo::transition_orchestrator_wake_execution(

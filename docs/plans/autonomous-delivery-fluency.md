@@ -480,3 +480,27 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
   diagnóstico del resultado del runtime y sus registros durables, sin cambiar
   el helper compartido ni los guards. La causa queda pendiente de confirmar en
   CI. El run completo concluyó **FAIL**; los PASS parciales no validan otro SHA.
+
+### Anexo CI 5 — reanudación técnica y protocolo del fixture
+
+- SHA: `9f203ac4f724a0eb69fdf4a6861d0dd188fb1cc8`; run
+  [43483962420](https://github.com/AlRos14/forge/actions/runs/43483962420),
+  conclusión **FAIL**. Build completo, web, navegador, Clippy y las suites
+  restantes de persistencia, coordinación, calidad, Project Plan, MCP y API
+  **PASS**, salvo runtime (43 PASS, dos FAIL) y el nuevo test A→B.
+- El test de pausa supera ahora la liberación del intento, pero la reanudación
+  expone que `task.coordination_turn_started` deduplica por request: un segundo
+  intento revierte su actualización de Execution al colisionar el evento. Se
+  corrige la identidad del evento por intento técnico, sin crear otro request
+  ni consumir otro turno de coordinación. Si el vínculo no puede persistirse,
+  el runtime detiene ese intento antes de Start, libera su capacidad y difiere
+  el Wake; no continúa con un request apuntando a otra Execution.
+- El caso batch llega al triage pausado, pero lee `Running` antes de que la
+  tarea asíncrona persista el terminal. El fixture espera el resultado exacto
+  con deadline y conserva la exigencia de `Completed`, sin fabricar recibos.
+- El diagnóstico nuevo de A→B demuestra que no era un timeout: el transporte
+  rechaza el daemon simulado porque no anuncia `task_role_capabilities_v1`,
+  requerido para la capacidad de coordinación. El fixture local anuncia esa
+  capacidad; se conserva el guard del transporte y la espera con diagnóstico.
+- La siguiente ejecución completa se justifica por estas tres causas
+  concretas. La aceptación funcional y el piloto real siguen pendientes.

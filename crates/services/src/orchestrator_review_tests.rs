@@ -543,6 +543,18 @@ async fn triage_fixture(
             .expect("resume admits a fresh technical attempt for the same request")
             .to_owned();
         assert_ne!(resumed_execution_id, execution_id);
+        for turn_execution_id in [execution_id.as_str(), resumed_execution_id.as_str()] {
+            assert!(DomainEventRepo::get_event_by_dedupe(
+                &**db,
+                &format!(
+                    "task.coordination_turn_started:{}:{turn_execution_id}",
+                    request.id
+                )
+            )
+            .await
+            .unwrap()
+            .is_some());
+        }
         let resumed_wake = db::OrchestratorWakeRepo::get_orchestrator_wake(&**db, &wake_id)
             .await
             .unwrap()

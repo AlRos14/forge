@@ -2543,7 +2543,7 @@ impl TaskCoordinationService {
         execution_id: &str,
     ) -> Result<()> {
         let now = now_rfc3339();
-        let event = self.event(
+        let mut event = self.event(
             "task.coordination_turn_started",
             "task_coordination_request",
             &request.id,
@@ -2558,6 +2558,10 @@ impl TaskCoordinationService {
             }),
             &now,
         );
+        event.dedupe_key = Some(format!(
+            "task.coordination_turn_started:{}:{execution_id}",
+            request.id
+        ));
         TaskCoordinationRepo::update_task_coordination_request(
             &*self.db,
             db::UpdateTaskCoordinationRequestState {
