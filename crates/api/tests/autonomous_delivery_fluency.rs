@@ -661,34 +661,44 @@ async fn successor_starts_only_after_predecessor_task_merge_and_exact_handoff() 
         api_types::WorkUnitIntegrationOutcome::Success
     );
 
-    let review_work_unit: WorkUnitResponse = json_request(
+    let reviewer_role = predecessor
+        .task_roles
+        .iter()
+        .find(|role| role.role == "quality_reviewer")
+        .expect("Task has its configured formal-review TaskRole");
+    assert!(reviewer_role
+        .configuration
+        .capabilities
+        .contains(&api_types::TaskRoleCapability::FormalReview));
+    let review_execution: api_types::ReviewExecutionResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/work-units", predecessor.id),
+        &format!("/api/v1/tasks/{}/review-executions", predecessor.id),
         json!({
-            "title": "Review A",
-            "scope": "Review the exact integrated result for A",
-            "role": "quality_reviewer",
-            "assigned_actor": {"kind":"human","id":"test-user-id"},
-            "requires_integration": false,
-            "review_subject": {"reviewed_work_unit_id": work_unit.id}
+            "task_role_id": reviewer_role.id,
+            "workspace_id": integration.target_workspace_id
         }),
-        StatusCode::CREATED,
+        StatusCode::OK,
     )
     .await;
+    assert_eq!(
+        review_execution.execution.workspace_id.as_deref(),
+        Some(integration.target_workspace_id.as_str()),
+        "Human Review Execution is scoped to the exact integration Workspace"
+    );
     let review: SubmitReviewReportResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/work-units/{}/review-report", review_work_unit.id),
+        &format!(
+            "/api/v1/review-executions/{}",
+            review_execution.execution.id
+        ),
         json!({
-            "expected_version": review_work_unit.version,
-            "report": {
-                "verdict": "pass",
-                "summary": "A satisfies the exact acceptance criteria.",
-                "criteria": ["The integrated implementation is present."],
-                "findings": [],
-                "questions": []
-            }
+            "verdict": "pass",
+            "summary": "The exact integrated result for A satisfies its acceptance criteria.",
+            "criteria": ["The integrated implementation is present."],
+            "findings": [],
+            "questions": []
         }),
         StatusCode::OK,
     )
@@ -702,15 +712,16 @@ async fn successor_starts_only_after_predecessor_task_merge_and_exact_handoff() 
     )
     .expect("ReviewReport content is JSON");
     let subject = &report["subject"];
-    let reviewed_result = json!({
-        "work_unit_id": subject["reviewed_work_unit_id"],
-        "work_unit_version": subject["reviewed_work_unit_version"],
-        "execution_id": subject["reviewed_result"]["execution_id"],
-        "artifact_id": subject["reviewed_result"]["artifact_id"],
-        "commit_sha": subject["reviewed_result"]["commit_sha"],
-        "workspace_id": subject["reviewed_result"]["workspace_id"],
-        "workspace_snapshot_digest": subject["reviewed_result"]["workspace_snapshot_digest"]
-    });
+    assert_eq!(
+        subject["workspace_id"].as_str(),
+        Some(integration.target_workspace_id.as_str())
+    );
+    assert_eq!(
+        subject["head_commit_sha"].as_str(),
+        integration.target_after_sha.as_deref(),
+        "ReviewReport binds the exact integrated target commit"
+    );
+    assert!(subject["workspace_snapshot_digest"].as_str().is_some());
 
     let dependency_digest = hex::encode(sha2::Sha256::digest(b"[]"));
     let gate_policy = json!({
@@ -731,8 +742,7 @@ async fn successor_starts_only_after_predecessor_task_merge_and_exact_handoff() 
                     "workspace_id": subject["workspace_id"],
                     "base_commit_sha": subject["base_commit_sha"],
                     "head_commit_sha": subject["head_commit_sha"],
-                    "workspace_snapshot_digest": subject["workspace_snapshot_digest"],
-                    "reviewed_result": reviewed_result
+                    "workspace_snapshot_digest": subject["workspace_snapshot_digest"]
                 }
             }]
         },

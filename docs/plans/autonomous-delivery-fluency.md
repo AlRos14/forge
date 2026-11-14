@@ -543,5 +543,13 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
   el mismo sujeto/resultado congelado excluyendo únicamente ese identificador,
   y se exige por separado que las Executions de revisión sean distintas y
   correspondan a los productores durables de cada informe.
-- Las suites restantes continúan, incluida la regresión A→B de V169. La
-  siguiente repetición se justifica por esta aserción concreta del fixture.
+- El run terminó **FAIL**. Persistencia/migraciones, coordinación/calidad,
+  Project Plan, MCP, API e2e y superficie pública **PASS**. A→B supera ahora
+  `ReadyToMerge`, confirmando el caso de V169, pero el merge rechaza un informe
+  sin sujeto de Workspace exacto. El fixture había revisado el resultado de un
+  WorkUnit, no el agregado de integración que exige el Gate de merge.
+- Se usa el flujo público existente `POST /tasks/{id}/review-executions` con el
+  TaskRole formal y `workspace_id` del target exacto de la integración, seguido
+  de la presentación del informe humano. El Gate conserva esa revisión formal;
+  no se añade inferencia source→target ni se relaja MergeService. La siguiente
+  repetición se justifica por estas dos correcciones concretas del fixture.
