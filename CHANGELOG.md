@@ -255,6 +255,10 @@ PR14 audit on 2026-10-16.
 
 ### Fixed
 
+- Merge-readiness currentness checks use the exact producer Execution's frozen
+  `formal_review` capability for ReviewReports from custom TaskRoles, matching
+  Gate evaluation and formal review admission.
+
 - Backported the upstream SQLx SQLite dependency-range fix to 0.8.6 and updated
   the bundled SQLite binding to `libsqlite3-sys 0.39.1`, resolving
   `RUSTSEC-2026-0459`.

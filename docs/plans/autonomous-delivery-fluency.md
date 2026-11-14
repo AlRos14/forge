@@ -517,5 +517,15 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
   vencimiento. Se corrige el snapshot desechable de lease caducada conservando
   el intento y la Execution completada reales; no se relaja ninguna restricción
   ni se fabrican resultados, receipts o decisiones.
-- Las suites restantes continúan. La siguiente repetición se justifica por
-  este fallo concreto de preparación; el ciclo batch completo sigue pendiente.
+- El run terminó **FAIL**. Persistencia/migraciones, coordinación/calidad,
+  Project Plan, MCP, API e2e y superficie pública **PASS**. El nuevo A→B supera
+  el arranque, la implementación y la review, pero **FAIL** al esperar
+  `ReadyToMerge` tras un Gate satisfecho. Se revisan los requisitos vigentes de
+  lifecycle y sus eventos durables antes de repetir el workflow. El resto de
+  regresiones API pasa. El ciclo batch completo sigue pendiente.
+- Causa de A→B confirmada: la vista de vigencia de V142 aún exige el nombre de
+  rol `reviewer`, mientras la admisión y evaluación actuales usan la capacidad
+  `formal_review`. El productor válido `quality_reviewer` satisface el Gate,
+  pero la vista lo marca obsoleto. La corrección usa una migración nueva y la
+  autoridad congelada del Execution exacto, conservando el resto de checks y
+  las migraciones históricas.

@@ -70,6 +70,10 @@ unsatisfied GateEvaluation or verified exact retry receipt can direct a
 merge-ready Task back to `active`; an Actor or legacy status transition cannot
 clear merge readiness.
 
+ReviewReport currentness checks the completed producer Execution and its frozen
+`formal_review` capability. The TaskRole's name does not grant or invalidate
+formal review authority.
+
 For merge readiness, ReviewReport and ValidationRun subjects must agree on
 Workspace, commit, and snapshot. WorkUnit-backed merges require an exact
 successful integration. Direct merge requires the completed source Execution

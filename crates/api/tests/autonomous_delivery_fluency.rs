@@ -36,6 +36,14 @@ type CoordinatorWakeDiagnostic = (
     Option<String>,
     Option<String>,
 );
+type StaleGateInputDiagnostic = (i64, String, String, i64, String, Option<String>);
+type ReviewProducerDiagnostic = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 async fn configure_project_delivery_roles(
     app: &axum::Router,
@@ -102,13 +110,14 @@ async fn configure_project_delivery_roles(
 }
 
 async fn wait_for_task_lifecycle(
-    app: &axum::Router,
+    harness: &common::Harness,
     task_id: &str,
     expected: TaskLifecycleState,
 ) -> TaskResponse {
+    let mut last_state = None;
     for _ in 0..200 {
         let task: TaskResponse = empty_request(
-            app,
+            &harness.app,
             Method::GET,
             &format!("/api/v1/tasks/{task_id}"),
             StatusCode::OK,
@@ -117,9 +126,65 @@ async fn wait_for_task_lifecycle(
         if task.lifecycle.state == expected {
             return task;
         }
+        last_state = Some(format!("{:?}", task.lifecycle.state));
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("Task {task_id} did not reach lifecycle {expected:?}");
+
+    let latest_gate = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT evaluation.id, evaluation.outcome, currentness.inputs_current
+         FROM gate_evaluation evaluation
+         JOIN gate_evaluation_currentness currentness
+           ON currentness.evaluation_id = evaluation.id
+         WHERE evaluation.task_id = ?
+         ORDER BY evaluation.evaluated_at DESC, evaluation.id DESC
+         LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_optional(harness.state.db.pool())
+    .await
+    .expect("latest Gate currentness loads for lifecycle timeout diagnostics");
+    let stale_inputs: Vec<StaleGateInputDiagnostic> =
+        if let Some((evaluation_id, _, _)) = &latest_gate {
+            sqlx::query_as(
+                "SELECT input.ordinal, input.input_kind, input.input_id,
+                    input.input_version, input.status, input.producer_ref
+             FROM gate_evaluation_stale_input stale
+             JOIN gate_evaluation_input input
+               ON input.evaluation_id = stale.evaluation_id
+              AND input.ordinal = stale.ordinal
+             WHERE stale.evaluation_id = ?
+             ORDER BY input.ordinal",
+            )
+            .bind(evaluation_id)
+            .fetch_all(harness.state.db.pool())
+            .await
+            .expect("stale Gate inputs load for lifecycle timeout diagnostics")
+        } else {
+            Vec::new()
+        };
+    let review_producers: Vec<ReviewProducerDiagnostic> =
+        if let Some((evaluation_id, _, _)) = &latest_gate {
+            sqlx::query_as(
+                "SELECT input.input_id, input.producer_ref, execution.role,
+                    execution.status, authority.capabilities_json
+             FROM gate_evaluation_input input
+             LEFT JOIN execution
+               ON execution.id = input.producer_ref AND execution.task_id = input.task_id
+             LEFT JOIN execution_task_role_authority authority
+               ON authority.execution_id = execution.id
+             WHERE input.evaluation_id = ? AND input.input_kind = 'review_report'
+             ORDER BY input.ordinal",
+            )
+            .bind(evaluation_id)
+            .fetch_all(harness.state.db.pool())
+            .await
+            .expect("ReviewReport producer authority loads for lifecycle timeout diagnostics")
+        } else {
+            Vec::new()
+        };
+    panic!(
+        "Task {task_id} did not reach lifecycle {expected:?}; last state={last_state:?}; latest Gate (id, outcome, inputs_current)={latest_gate:?}; stale inputs={stale_inputs:?}; ReviewReport producers (artifact_id, execution_id, role, status, capabilities_json)={review_producers:?}"
+    );
 }
 
 async fn wait_for_execution_completed(app: &axum::Router, task_id: &str, execution_id: &str) {
@@ -715,12 +780,7 @@ async fn successor_starts_only_after_predecessor_task_merge_and_exact_handoff() 
     .process_domain_event(evaluation_event)
     .await
     .expect("exact GateEvaluation applies its lifecycle transition");
-    wait_for_task_lifecycle(
-        &harness.app,
-        &predecessor.id,
-        TaskLifecycleState::ReadyToMerge,
-    )
-    .await;
+    wait_for_task_lifecycle(&harness, &predecessor.id, TaskLifecycleState::ReadyToMerge).await;
 
     assert!(scheduler_request_for(&harness, &batch.id, &successor.id)
         .await
@@ -755,7 +815,7 @@ async fn successor_starts_only_after_predecessor_task_merge_and_exact_handoff() 
     assert_eq!(merge.outcome, "done");
     assert!(merge.after_sha.is_some());
     let accepted =
-        wait_for_task_lifecycle(&harness.app, &predecessor.id, TaskLifecycleState::Done).await;
+        wait_for_task_lifecycle(&harness, &predecessor.id, TaskLifecycleState::Done).await;
     assert_eq!(accepted.lifecycle.state, TaskLifecycleState::Done);
 
     let successful_task_merges: i64 = sqlx::query_scalar(
