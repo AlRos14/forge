@@ -68,6 +68,7 @@ use std::{
 // V157 advances rework review lines by their exact result across parallel reports.
 // V168 preserves coordination requests and adds exact review-findings continuation sources.
 // V169 makes Gate ReviewReport currentness use the exact formal_review capability snapshot.
+// V170 lets formal_review Executions (only) bind to the Task integration workspace.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

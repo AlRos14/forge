@@ -255,6 +255,10 @@ PR14 audit on 2026-10-16.
 
 ### Fixed
 
+- Formal review Executions (`formal_review` capability) may bind to the Task
+  integration workspace to review the exact integrated result before merge;
+  other Executions remain barred from it on WorkUnit Tasks (V170).
+
 - Merge-readiness currentness checks use the exact producer Execution's frozen
   `formal_review` capability for ReviewReports from custom TaskRoles, matching
   Gate evaluation and formal review admission.

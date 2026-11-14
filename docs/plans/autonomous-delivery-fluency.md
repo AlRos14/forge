@@ -553,3 +553,19 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
   de la presentación del informe humano. El Gate conserva esa revisión formal;
   no se añade inferencia source→target ni se relaja MergeService. La siguiente
   repetición se justifica por estas dos correcciones concretas del fixture.
+
+### Anexo CI 8 — revisión formal del workspace de integración
+
+- SHA: `0f180f87`; run [43591918400](https://github.com/AlRos14/forge/actions/runs/43591918400).
+- **FAIL** en A→B: `POST /tasks/{id}/review-executions` con el `workspace_id` de
+  integración responde 500 (`code 1811`, "Task integration workspace is not a
+  worker workspace for WorkUnit Tasks"). Causa: los triggers
+  `execution_legacy_integration_workspace_guard_insert/_update` de V091 abortan
+  toda Execution sin WorkUnit ligada a ese workspace, incluida la revisión
+  formal documentada en `docs/api.md`.
+- Corrección: migración V170 (las históricas no se tocan). El guard de INSERT
+  exime solo a Executions cuyo rol/membresía activa porta la capacidad
+  `formal_review` (misma consulta que el snapshot V150, que se crea AFTER
+  INSERT); el guard de UPDATE exige el snapshot inmutable con `formal_review`.
+  Cualquier otra Execution sin WorkUnit sigue prohibida en ese workspace.
+- Estado: pendiente de CI por SHA; no se compiló ni ejecutó nada localmente.
