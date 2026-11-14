@@ -504,3 +504,18 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
   capacidad; se conserva el guard del transporte y la espera con diagnóstico.
 - La siguiente ejecución completa se justifica por estas tres causas
   concretas. La aceptación funcional y el piloto real siguen pendientes.
+
+### Anexo CI 6 — preparación de lease caducada
+
+- SHA: `2e262bb529840ad5751f7f2c2c6764edc56f31f9`; run
+  [43585428498](https://github.com/AlRos14/forge/actions/runs/43585428498).
+- Build completo y Clippy **PASS**. Runtime: **44 PASS, un FAIL**. La
+  reanudación del mismo request con Execution nueva y eventos distintos pasa.
+- El fallo restante aparece en la preparación del test batch: después de
+  completar el proveedor, el Wake está `running` sin lease. Cambiar solo
+  `lease_until` viola las restricciones que vinculan estado, propietario y
+  vencimiento. Se corrige el snapshot desechable de lease caducada conservando
+  el intento y la Execution completada reales; no se relaja ninguna restricción
+  ni se fabrican resultados, receipts o decisiones.
+- Las suites restantes continúan. La siguiente repetición se justifica por
+  este fallo concreto de preparación; el ciclo batch completo sigue pendiente.

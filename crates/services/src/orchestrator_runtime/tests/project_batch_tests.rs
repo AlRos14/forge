@@ -1177,18 +1177,57 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
             .await
             .expect("triage receipt count loads while the batch is paused");
     assert_eq!(triage_count_while_paused, 0);
-    // Simulate a long pause after the provider already completed. Recovery
-    // must retain this exact response even when the original wake lease ends.
-    sqlx::query("UPDATE orchestrator_wake SET lease_until='2000-01-01T00:00:00Z' WHERE id=?")
-        .bind(
-            first_review_request
-                .wake_id
-                .as_deref()
-                .expect("exact typed wake"),
-        )
-        .execute(database.pool())
-        .await
-        .expect("expire only the disposable completed-response wake lease");
+    // Model the crash window where the exact provider Execution completed
+    // while its dispatcher still held the wake lease. The normal resolved
+    // wake is running and unleased; change only this disposable snapshot to a
+    // structurally valid expired lease, without changing its attempt or any
+    // Execution, request, or provider receipts.
+    let exact_wake_id = first_review_request
+        .wake_id
+        .as_deref()
+        .expect("exact typed wake");
+    let wake_before_crash_snapshot =
+        db::OrchestratorWakeRepo::get_orchestrator_wake(&*database, exact_wake_id)
+            .await
+            .expect("exact completed-response wake reloads before crash snapshot")
+            .expect("exact completed-response wake remains durable");
+    assert_eq!(
+        wake_before_crash_snapshot.state,
+        db::OrchestratorWakeState::Running,
+        "the resolved provider Start leaves the wake running before simulating the crash window"
+    );
+    assert!(wake_before_crash_snapshot.lease_owner.is_none());
+    assert!(wake_before_crash_snapshot.lease_until.is_none());
+    let exact_attempt_number = wake_before_crash_snapshot
+        .current_attempt
+        .expect("completed provider response has its exact current wake attempt");
+    let expired_lease_snapshot = sqlx::query(
+        "UPDATE orchestrator_wake
+         SET state='leased', lease_owner=?, lease_until='2000-01-01T00:00:00Z',
+             version=version+1, updated_at=?
+         WHERE id=? AND state='running' AND current_attempt=?
+           AND lease_owner IS NULL AND lease_until IS NULL
+           AND EXISTS (
+               SELECT 1 FROM orchestrator_wake_execution attempt
+               WHERE attempt.wake_id=orchestrator_wake.id
+                 AND attempt.attempt_number=? AND attempt.execution_id=?
+                 AND attempt.state IN ('start_requested','running','uncertain')
+           )",
+    )
+    .bind("project-batch-expired-crash-fixture")
+    .bind(now_rfc3339())
+    .bind(exact_wake_id)
+    .bind(exact_attempt_number)
+    .bind(exact_attempt_number)
+    .bind(&first_triage_execution_id)
+    .execute(database.pool())
+    .await
+    .expect("write a valid expired-lease crash snapshot for the exact completed attempt");
+    assert_eq!(
+        expired_lease_snapshot.rows_affected(),
+        1,
+        "the crash snapshot only applies to the exact running wake and provider attempt"
+    );
     runtime
         .run_once(100)
         .await
