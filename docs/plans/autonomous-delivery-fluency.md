@@ -6,10 +6,12 @@ SHA `71c323701a9a953d92fcd41b563a4b37c2329162`. El run GitHub
 `43259664636` figura PASS para ese SHA. Este documento es un plan; no declara
 aceptación funcional del recorrido completo.
 
-**Estado de ejecución:** implementación autorizada por el usuario y en curso con
-subagentes Luna 6 Max. Revisión documental de dominio y aceptación **PASS**.
-Los estados por nodo y la evidencia se registran al integrar; pruebas nuevas y
-CI integrado **NOT RUN**. El piloto con proveedor real sigue **NOT RUN** y
+**Estado de ejecución:** implementación completada. CI integrado **PASS** en
+`6db87ea3` (run [43648809452](https://github.com/AlRos14/forge/actions/runs/43648809452)),
+incluidos el ciclo batch request_changes → recheck → corrección → nueva
+revisión y el recorrido A→B hasta merge y handoff exacto, con adapters fake
+deterministas. La aceptación visual completa y el piloto con proveedor real
+siguen **NOT RUN**; el piloto
 requiere autorización separada. No autoriza merge, despliegue ni trabajo sobre
 FirePOS real.
 
@@ -316,7 +318,7 @@ flowchart LR
 | F2F | Escribir regresiones separadas para contrato, autoridad/atomicidad, recovery, review/rework, retorno de verificación F2V, A→B y UX. Adapters fake son contrato determinista, no provider acceptance. | F1 | Solo test files/fixtures; interfaces congeladas | **ESCRITO / NOT RUN** |
 | F2G | Actualizar arquitectura/conceptos/API/CHANGELOG según contratos finales. Alinear `docs/concepts/work-units.md` con V162 y `actor_contributed_to_work_unit`; preparar guía/recibo de piloto. | F1, contratos finales | Solo docs/changelog | **ACTUALIZADO / recibo final pendiente** |
 | F3 | Verificar ownership map/handoffs F1; integrar lanes; review independiente del SHA integrado, fixes delegados y re-review. Check estático/formato/`git diff --check`, sin compilación local. Agente implementer/reviewer puede compartir Actor/profile solo con sesión/contexto role-isolated V162; Human contributor sigue ineligible. | F2A–F2G, F2U, F2V | Root integra; reviewer con contexto/sesión aislados según V162 | **PASS (revisión estática)** |
-| F4 | Lanzar el workflow GitHub tras integración completa; sin CI por nodo ni compilación local. Registrar SHA/run/artefactos y cada check PASS/FAIL/BLOCKED/NOT RUN. Si hay fallo, anexarlo, corregir y revalidar el cambio justificado; no trasladar PASS entre SHA. | F3 | Owner autorizado del workflow; GitHub CI únicamente | **FAIL / revalidación pendiente** |
+| F4 | Lanzar el workflow GitHub tras integración completa; sin CI por nodo ni compilación local. Registrar SHA/run/artefactos y cada check PASS/FAIL/BLOCKED/NOT RUN. Si hay fallo, anexarlo, corregir y revalidar el cambio justificado; no trasladar PASS entre SHA. | F3 | Owner autorizado del workflow; GitHub CI únicamente | **PASS** (`6db87ea3`, run 43648809452) |
 | F5 | Aceptación aislada con perfiles OpenCode/Opus reales, Project/repo/datos desechables, navegación y recibos de sesiones/providers. Requiere autorización previa para cuotas/costes, cambiar proveedor o acciones externas; sin fallback automático a proveedor de pago. | F4 y autorización explícita del piloto | Owner del entorno/provider; nada de Task/Repo FirePOS real | **TODO / NO AUTORIZADO** |
 
 Cada carril empieza al satisfacer sus dependencias y el contrato/ownership de
@@ -612,3 +614,11 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
   elimina). Corrección: tolerar `NotFound` por entrada; otros errores de E/S se
   siguen propagando.
 - Estado: pendiente de CI por SHA; sin compilación local.
+
+### Anexo CI 12 — cierre
+
+- SHA: `6db87ea3`; run [43648809452](https://github.com/AlRos14/forge/actions/runs/43648809452).
+- **PASS** completo: `build` y `rust-checks`, incluidos `cli-adapters` con la
+  limpieza tolerante a borrados concurrentes y la batería final con A→B.
+- El PASS pertenece a este SHA; los commits posteriores solo documentales no
+  cambian código. Aceptación visual y piloto con proveedor real: **NOT RUN**.
