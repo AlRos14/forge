@@ -584,3 +584,16 @@ compilación ni ejecución de las regresiones: queda pendiente el CI por SHA.
   handoff en cada aserción y exigir `review: null`, porque A se revisó en el
   workspace de integración y no mediante una línea de revisión del WorkUnit.
 - Estado: pendiente de CI por SHA; sin compilación local.
+
+### Anexo CI 10 — forma del handoff fijado
+
+- SHA: `5b2fa1e8`; run [43606586574](https://github.com/AlRos14/forge/actions/runs/43606586574).
+- **FAIL** en la misma aserción (línea 865): el diagnóstico del Anexo CI 9 era
+  incorrecto. El valor nulo es `task_id`: cada fila `project_plan_handoff`
+  guarda el contexto de un único predecesor, y `direct_predecessors` solo
+  envuelve el contexto agregado que recibe el coordinador. El fixture indexaba
+  `direct_predecessors[0]` sobre la fila individual.
+- Corrección del fixture: leer la fila como contexto del predecesor. Se
+  mantienen la búsqueda del WorkUnit por id y `review: null`. Producto sin
+  cambios.
+- Estado: pendiente de CI por SHA; sin compilación local.

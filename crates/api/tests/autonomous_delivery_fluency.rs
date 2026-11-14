@@ -861,7 +861,9 @@ async fn successor_starts_only_after_predecessor_task_merge_and_exact_handoff() 
     .await
     .expect("batch pins the exact accepted predecessor handoff");
     let handoff: Value = serde_json::from_str(&handoff).expect("handoff context is JSON");
-    let accepted_a = &handoff["direct_predecessors"][0];
+    // Each pinned row stores one predecessor context; `direct_predecessors`
+    // only wraps the aggregate coordinator context.
+    let accepted_a = &handoff;
     assert_eq!(accepted_a["task_id"], predecessor.id);
     assert_eq!(accepted_a["lifecycle_state"], "done");
     let accepted_unit = accepted_a["work_units"]
