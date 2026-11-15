@@ -609,11 +609,10 @@ Context: {context}",
         let mut created = 0;
         for id in ids {
             let outcome = match service.ensure_resume_request(&id).await {
-                Ok(ResumeOutcome::Deferred { code, .. })
-                    if code == "human_decision.batch_resume_unsupported" =>
-                {
-                    self.resume_batch_decision(&service, &id).await
-                }
+                Ok(ResumeOutcome::Deferred {
+                    code: "human_decision.batch_resume_unsupported",
+                    ..
+                }) => self.resume_batch_decision(&service, &id).await,
                 other => other,
             };
             match outcome {

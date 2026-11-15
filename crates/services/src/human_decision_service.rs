@@ -108,7 +108,7 @@ pub struct AnswerDecisionInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeOutcome {
     /// The exact `human_decision_resume` request now exists and is bound.
-    Created(TaskCoordinationRequest),
+    Created(Box<TaskCoordinationRequest>),
     /// The decision was already bound to its resume request.
     AlreadyBound(String),
     /// The answer is durable but the resume request cannot be created now
@@ -747,7 +747,7 @@ impl HumanDecisionService {
             }
             Err(error) => return Err(error.into()),
         }
-        Ok(ResumeOutcome::Created(request))
+        Ok(ResumeOutcome::Created(Box::new(request)))
     }
 
     async fn ensure_answer_authority(
