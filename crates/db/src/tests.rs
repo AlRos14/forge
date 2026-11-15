@@ -3395,7 +3395,7 @@ async fn pr8_validation_run_evidence_and_report_are_exact_atomic_and_actor_free(
         idempotency_key: idempotency_key.clone(),
         catalog_check_id: None,
         definition_digest: None,
-        run_origin: ValidationRunOrigin::LegacyCommand,
+        run_origin: crate::ValidationRunOrigin::LegacyCommand,
         check_request_id: None,
         started_at: started_at.clone(),
         created_at: started_at.clone(),
