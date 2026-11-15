@@ -251,6 +251,43 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
             &source,
             &["task_id", "intervention_id", "state", "failure_code"],
         ),
+        "validation_check_request.queued"
+        | "validation_check_request.completed"
+        | "validation_check_request.cancelled"
+        | "validation_check_request.failed_to_start"
+        | "task.validation_check_requested"
+        | "task.validation_check_completed" => project_validation_check(&source, &event.event_type),
+        "validation_comparison.recorded" | "task.validation_comparison_recorded" => project_fields(
+            event_details(&source),
+            &["task_id", "check_request_id", "candidate_run_id"],
+        ),
+        "task.human_decision_requested" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "decision_id",
+                "source_kind",
+                "source_id",
+                "authorization_version",
+                "max_authority_effect",
+                "resumes_request_id",
+                "state",
+            ],
+        ),
+        "task.human_decision_answered" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "decision_id",
+                "answered_option_id",
+                "authority_effect",
+                "state",
+                "resumes_request_id",
+            ],
+        ),
+        "task.human_decision_closed" => {
+            project_fields(&source, &["task_id", "decision_id", "state"])
+        }
         // In particular, legacy Review-row events are not current Review
         // authority and never enter the public stream.
         _ => return None,
@@ -350,8 +387,60 @@ fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
         "task.quality_request_resolved" => PublicEventType::TaskQualityRequestResolved,
         "task.intervention_recorded" => PublicEventType::TaskInterventionRecorded,
         "task.intervention_state_changed" => PublicEventType::TaskInterventionStateChanged,
+        "validation_check_request.queued" | "task.validation_check_requested" => {
+            PublicEventType::TaskValidationCheckRequested
+        }
+        "validation_check_request.completed"
+        | "validation_check_request.cancelled"
+        | "validation_check_request.failed_to_start"
+        | "task.validation_check_completed" => PublicEventType::TaskValidationCheckCompleted,
+        "validation_comparison.recorded" | "task.validation_comparison_recorded" => {
+            PublicEventType::TaskValidationComparisonRecorded
+        }
+        "task.human_decision_requested" => PublicEventType::TaskHumanDecisionRequested,
+        "task.human_decision_answered" => PublicEventType::TaskHumanDecisionAnswered,
+        "task.human_decision_closed" => PublicEventType::TaskHumanDecisionClosed,
         _ => return None,
     })
+}
+
+/// Validation events wrap their facts in `details`; direct payloads are
+/// accepted as-is.
+fn event_details(source: &Value) -> &Value {
+    source
+        .get("details")
+        .filter(|value| value.is_object())
+        .unwrap_or(source)
+}
+
+/// Ids, digests and states only: never commands, output tails or commit
+/// bodies. The queued event carries no `state`, so it is derived from the
+/// durable event name.
+fn project_validation_check(source: &Value, event_type: &str) -> Value {
+    let mut projected = project_fields(
+        event_details(source),
+        &[
+            "check_request_id",
+            "task_id",
+            "check_key",
+            "definition_digest",
+            "trigger",
+            "subject_kind",
+            "subject_id",
+            "subject_version",
+            "workspace_id",
+            "baseline",
+            "state",
+            "candidate_run_id",
+            "failure_code",
+        ],
+    );
+    if let Some(object) = projected.as_object_mut() {
+        if !object.contains_key("state") && event_type == "validation_check_request.queued" {
+            object.insert("state".to_owned(), json!("queued"));
+        }
+    }
+    projected
 }
 
 fn project_fields(source: &Value, fields: &[&str]) -> Value {

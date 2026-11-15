@@ -112,6 +112,17 @@ import type {
   Workspace,
   WorkUnitResponse,
   WorkUnitArtifactPackageResponse,
+  AnswerHumanDecisionRequest,
+  AnswerHumanDecisionResponse,
+  CreateValidationCheckRequest,
+  HumanDecisionListResponse,
+  HumanDecisionResponse,
+  RetireValidationCheckRequest,
+  ValidationCheckDefinitionResponse,
+  ValidationCheckListResponse,
+  ValidationCheckRequestListResponse,
+  ValidationCheckState,
+  ValidationComparisonListResponse,
 } from '@/types/generated'
 import { recordUserInitiatedTransition } from '@/lib/notification-toast-suppression'
 
@@ -719,6 +730,106 @@ export function useValidationsQuery(taskId: string) {
     queryKey: qk.validationRuns(taskId),
     queryFn: () => apiFetch<ValidationRunResponse[]>(`/tasks/${taskId}/validation-runs`),
     enabled: Boolean(taskId),
+  })
+}
+
+// --- Validation checks, comparisons and human decisions ---
+
+export function useProjectValidationChecksQuery(projectId: string, state?: ValidationCheckState) {
+  return useQuery({
+    queryKey: [...qk.projectValidationChecks(projectId), state ?? 'all'] as const,
+    queryFn: () =>
+      apiFetch<ValidationCheckListResponse>(
+        `/projects/${projectId}/validation-checks${state ? `?state=${state}` : ''}`,
+      ),
+    enabled: Boolean(projectId),
+  })
+}
+
+export function useCreateValidationCheck(projectId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (body: CreateValidationCheckRequest) =>
+      apiFetch<ValidationCheckDefinitionResponse>(`/projects/${projectId}/validation-checks`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: () =>
+      void queryClient.invalidateQueries({ queryKey: qk.projectValidationChecks(projectId) }),
+  })
+}
+
+export function useRetireValidationCheck(projectId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ checkId, body }: { checkId: string; body: RetireValidationCheckRequest }) =>
+      apiFetch<ValidationCheckDefinitionResponse>(`/validation-checks/${checkId}/retire`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSettled: () =>
+      void queryClient.invalidateQueries({ queryKey: qk.projectValidationChecks(projectId) }),
+  })
+}
+
+export function useTaskValidationCheckRequestsQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskValidationCheckRequests(taskId),
+    queryFn: () =>
+      apiFetch<ValidationCheckRequestListResponse>(`/tasks/${taskId}/validation-check-requests`),
+    enabled: Boolean(taskId),
+    refetchInterval: 5_000,
+  })
+}
+
+export function useTaskValidationComparisonsQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskValidationComparisons(taskId),
+    queryFn: () =>
+      apiFetch<ValidationComparisonListResponse>(`/tasks/${taskId}/validation-comparisons`),
+    enabled: Boolean(taskId),
+    refetchInterval: 5_000,
+  })
+}
+
+export function useTaskHumanDecisionsQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskHumanDecisions(taskId),
+    queryFn: () => apiFetch<HumanDecisionListResponse>(`/tasks/${taskId}/human-decisions`),
+    enabled: Boolean(taskId),
+    refetchInterval: 5_000,
+  })
+}
+
+export function useTaskHumanDecisionQuery(taskId: string, decisionId: string | null) {
+  return useQuery({
+    queryKey: [...qk.taskHumanDecisions(taskId), decisionId ?? ''] as const,
+    queryFn: () =>
+      apiFetch<HumanDecisionResponse>(`/tasks/${taskId}/human-decisions/${decisionId}`),
+    enabled: Boolean(taskId) && Boolean(decisionId),
+  })
+}
+
+export function useAnswerHumanDecision() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      decisionId,
+      body,
+    }: {
+      taskId: string
+      decisionId: string
+      body: AnswerHumanDecisionRequest
+    }) =>
+      apiFetch<AnswerHumanDecisionResponse>(
+        `/tasks/${taskId}/human-decisions/${decisionId}/answer`,
+        { method: 'POST', body: JSON.stringify(body) },
+      ),
+    onSettled: (_result, _error, variables) => {
+      void queryClient.invalidateQueries({ queryKey: qk.taskHumanDecisions(variables.taskId) })
+      invalidateTaskCoordinationQueries(queryClient, variables.taskId)
+    },
   })
 }
 

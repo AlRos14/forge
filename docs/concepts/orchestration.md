@@ -222,9 +222,8 @@ paths fail closed. See [OpenCode permissions](https://opencode.ai/docs/permissio
 Two typed coordinator outputs extend the bounded set (plan:
 [coordinator verification and PR loop](../plans/coordinator-verification-and-pr-loop.md)).
 They are implemented as pure parsers in `crates/services/src/coordinator_outputs/`
-and a durable service in `human_decision_service.rs`; the runtime wiring that
-accepts them from a turn is a separate step. Until it lands they are not reachable
-from a live coordinator turn.
+and a durable service in `human_decision_service.rs`. The runtime applies them
+only in typed coordination turns (see "Validation findings and resumes" below).
 
 - `request_validation` names one pinned catalog `check_key`, an exact subject
   (`work_unit_result`, or `task_integration` with the Task id and version), an
@@ -261,3 +260,46 @@ changed, the answer stays durable and the resume is deferred rather than
 performed under stale authority. A decision whose source went stale is closed as
 `superseded` or `cancelled`. Events carry identifiers and states only, never
 question text or notes.
+
+### Validation findings and resumes
+
+A terminal catalog check creates a durable `validation_findings` coordination
+request when its run is `failed`, `error` or `stale`, or when a baseline comparison
+is `regression` or `inconclusive` (`passed`, `fixed`, `both_pass` and
+`pre_existing_failure` never wake the coordinator). The request, its optional
+Project batch origin (`validation_triage`), the turn-budget charge (`turn_count`,
+the same counter `review_findings` uses) and the event are one repository
+transaction. Its exact source is the run or comparison id plus the run Evidence
+digest; the idempotency key is that source and the authorization version, so the
+durable scanner recreates missing requests after a restart without a second
+charge. Pause, revocation and restart behave as for `review_findings`: the
+completed provider response is retained and replayed after resume.
+
+The coordinator turn context carries the exact run (status, exit code, bounded
+stdout/stderr tails and their output digest), the comparison (classification,
+baseline status, exit code and output digest) and the check request subject.
+`review_findings` context also lists validation runs of the same reviewed
+workspace, commit and snapshot.
+
+The turn output is a `schema_version: 2` envelope with exactly one
+`validation_findings` decision (`correct`, `recheck` or `human`) and an optional
+`outputs` list (at most 4). `correct` creates one correction WorkUnit for the
+checked WorkUnit (only for a `work_unit_result` subject) in the triage
+transaction and consumes a rework round; `recheck` re-enqueues the pinned check
+on the current exact subject (an unchanged subject replays the existing request);
+`human` raises a `human_decision_request` (the coordinator's `ask_human`, or a
+deterministic two-option question) bound to the triaged request. `request_validation`
+outputs enqueue a `coordinator_request` check with the turn's request as
+`requested_by_request_id`. `request_validation` and `ask_human` are accepted only
+in typed turns because they need a request to anchor them; the event-driven
+`actions[]` channel parses and policy-gates them but rejects them with
+`coordination.output_not_permitted`.
+
+When a decision is answered, the reconcile scanner calls `ensure_resume_request`
+(or the batch variant with origin `human_decision_resume`) for answered decisions
+without a resume request. Creation charges the same turn budget and the durable
+`task.coordination_requested` event wakes the coordinator. A
+`human_decision_resume` turn must return the exact `resumes_request_id`,
+`human_decision_id` and `answered_option_id`, the paused kind's key
+(`validation_findings`, one `correct` or `recheck` decision) and an empty
+`outputs`. Only paused `validation_findings` requests are resumable in this phase.

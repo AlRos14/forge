@@ -35,6 +35,7 @@ use crate::{
     Result, ServiceError,
 };
 
+use crate::coordinator_outputs::{self, CoordinatorOutputKind};
 use db::HandoffIntent;
 use serde::{Deserialize, Serialize};
 
@@ -120,6 +121,11 @@ enum OrchestratorAction {
         target_version: Option<i64>,
         target_digest: Option<String>,
     },
+    /// Typed coordinator outputs (phase 1). They need a typed coordination
+    /// request to anchor the check/decision, so the event-driven channel
+    /// rejects them; they are applied in typed turns (`outputs`).
+    RequestValidation(coordinator_outputs::RequestValidationOutput),
+    AskHuman(coordinator_outputs::AskHumanOutput),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -130,6 +136,35 @@ enum OrchestratorActionKind {
     CreateWorkUnit,
     Proposal,
     ReviewFindings,
+    RequestValidation,
+    AskHuman,
+}
+
+/// New output kinds explicitly allowed by a policy; `None` denies them.
+fn coordinator_output_kinds(
+    policy: &TaskRoleOrchestratorPolicy,
+) -> Option<Vec<CoordinatorOutputKind>> {
+    policy.allowed_actions.as_ref().map(|allowed| {
+        allowed
+            .iter()
+            .filter_map(|kind| match kind {
+                OrchestratorActionKind::RequestValidation => {
+                    Some(CoordinatorOutputKind::RequestValidation)
+                }
+                OrchestratorActionKind::AskHuman => Some(CoordinatorOutputKind::AskHuman),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+fn is_typed_triage_kind(kind: db::TaskCoordinationRequestKind) -> bool {
+    matches!(
+        kind,
+        db::TaskCoordinationRequestKind::ReviewFindings
+            | db::TaskCoordinationRequestKind::ValidationFindings
+            | db::TaskCoordinationRequestKind::HumanDecisionResume
+    )
 }
 
 /// The only TaskRole policy understood by PR6. An empty object deliberately
@@ -187,9 +222,20 @@ impl TaskRoleOrchestratorPolicy {
     }
 
     fn permits(&self, action: &OrchestratorAction) -> bool {
+        let kind = action.policy_kind();
+        if matches!(
+            kind,
+            OrchestratorActionKind::RequestValidation | OrchestratorActionKind::AskHuman
+        ) {
+            // Asymmetric rule: new kinds are never implied by an absent list.
+            return self
+                .allowed_actions
+                .as_ref()
+                .is_some_and(|allowed| allowed.contains(&kind));
+        }
         self.allowed_actions
             .as_ref()
-            .is_none_or(|allowed| allowed.contains(&action.policy_kind()))
+            .is_none_or(|allowed| allowed.contains(&kind))
     }
 
     fn action_limit(&self) -> usize {
@@ -427,6 +473,20 @@ impl OrchestratorRuntime {
         )
         .process_pending_review_findings_requests(100)
         .await?;
+        {
+            // Terminal catalog checks and answered human decisions are durable
+            // sources; the request is the receipt, so retries charge no turn.
+            let coordination = crate::task_coordination::TaskCoordinationService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            );
+            coordination
+                .process_pending_validation_findings_requests(100)
+                .await?;
+            coordination
+                .process_pending_human_decision_resumes(100)
+                .await?;
+        }
         crate::task_quality::TaskQualityService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
@@ -436,6 +496,8 @@ impl OrchestratorRuntime {
 
         run.admitted_wakes += self.recover_unlinked_review_findings_requests(100).await?;
         run.processed_events += self.recover_completed_review_findings_requests(100).await?;
+        run.admitted_wakes += self.recover_unlinked_new_kind_requests(100).await?;
+        run.processed_events += self.recover_completed_new_kind_requests(100).await?;
 
         for _ in 0..16 {
             match self.dispatch_one().await? {
@@ -490,6 +552,94 @@ impl OrchestratorRuntime {
             }
         }
         Ok(admitted)
+    }
+
+    /// `validation_findings` / `human_decision_resume` requests whose wake was
+    /// not admitted (pause, crash): reuse the original durable request event.
+    async fn recover_unlinked_new_kind_requests(&self, limit: i64) -> Result<usize> {
+        let rows = sqlx::query(
+            "SELECT event.id AS event_id
+             FROM task_coordination_request request
+             JOIN task_coordination c ON c.task_id=request.task_id
+              AND c.authorization_version=request.authorization_version
+              AND c.revoked_at IS NULL AND c.team_stale=0 AND c.mode!='manual'
+             JOIN domain_event event
+               ON event.event_type='task.coordination_requested'
+              AND event.entity_type='task_coordination_request'
+              AND event.entity_id=request.id
+             WHERE request.kind IN ('validation_findings','human_decision_resume')
+               AND request.state='requested' AND request.wake_id IS NULL
+             ORDER BY event.sequence LIMIT ?",
+        )
+        .bind(limit.clamp(1, 100))
+        .fetch_all(self.db.pool())
+        .await?;
+        let mut admitted = 0;
+        for row in rows {
+            let event_id: String = row.try_get("event_id")?;
+            let result = async {
+                let Some(event) = DomainEventRepo::get_event(&*self.db, &event_id).await? else {
+                    return Ok(0);
+                };
+                let Some(signal) = self.classify_event(&event).await? else {
+                    return Ok(0);
+                };
+                self.admit_signal(&event, signal).await
+            }
+            .await;
+            match result {
+                Ok(count) => admitted += count,
+                Err(error) => tracing::warn!(
+                    event_id,
+                    %error,
+                    "unlinked typed coordination request remains pending after a source-local recovery error"
+                ),
+            }
+        }
+        Ok(admitted)
+    }
+
+    /// Replay a completed `validation_findings` / `human_decision_resume`
+    /// response through terminal reconciliation after a pause or restart.
+    async fn recover_completed_new_kind_requests(&self, limit: i64) -> Result<usize> {
+        let rows = sqlx::query(
+            "SELECT event.id AS event_id
+             FROM task_coordination_request request
+             JOIN task_coordination c ON c.task_id=request.task_id
+              AND c.authorization_version=request.authorization_version
+              AND c.revoked_at IS NULL AND c.team_stale=0 AND c.mode!='manual'
+             JOIN execution ON execution.id=request.execution_id
+              AND execution.task_id=request.task_id AND execution.status='completed'
+             JOIN domain_event event ON event.entity_type='execution'
+              AND event.entity_id=execution.id AND event.event_type='execution.completed'
+             WHERE request.kind IN ('validation_findings','human_decision_resume')
+               AND request.state IN ('running','uncertain')
+             ORDER BY event.sequence LIMIT ?",
+        )
+        .bind(limit.clamp(1, 100))
+        .fetch_all(self.db.pool())
+        .await?;
+        let mut recovered = 0;
+        for row in rows {
+            let event_id: String = row.try_get("event_id")?;
+            let result = async {
+                let Some(event) = DomainEventRepo::get_event(&*self.db, &event_id).await? else {
+                    return Ok(false);
+                };
+                self.reconcile_orchestrator_terminal(&event).await
+            }
+            .await;
+            match result {
+                Ok(true) => recovered += 1,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    event_id,
+                    %error,
+                    "completed typed coordination response remains pending after a source-local recovery error"
+                ),
+            }
+        }
+        Ok(recovered)
     }
 
     /// Retry an already completed ReviewFindings Execution after a paused
@@ -2259,8 +2409,8 @@ impl OrchestratorRuntime {
         role_policy: &TaskRoleOrchestratorPolicy,
         coordination_request: Option<&db::TaskCoordinationRequest>,
     ) -> Result<Value> {
-        if let Some(request) = coordination_request
-            .filter(|request| request.kind == db::TaskCoordinationRequestKind::ReviewFindings)
+        if let Some(request) =
+            coordination_request.filter(|request| is_typed_triage_kind(request.kind))
         {
             return self
                 .build_review_findings_context(wake, role, memberships, role_policy, request)
@@ -2563,12 +2713,55 @@ impl OrchestratorRuntime {
                 "ReviewFindings authorization changed before context load",
             ));
         }
-        let review_findings = crate::task_rework::TaskReworkService::new(
+        let coordination_service = crate::task_coordination::TaskCoordinationService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
-        )
-        .exact_review_findings_context(request)
-        .await?;
+        );
+        let (context_key, review_findings) = match request.kind {
+            db::TaskCoordinationRequestKind::ReviewFindings => {
+                let mut exact = crate::task_rework::TaskReworkService::new(
+                    Arc::clone(&self.db),
+                    Arc::clone(&self.event_bus),
+                )
+                .exact_review_findings_context(request)
+                .await?;
+                let result = exact["reviewed_result"].clone();
+                let text = |key: &str| result[key].as_str().map(str::to_owned);
+                if let (Some(workspace_id), Some(commit), Some(snapshot)) = (
+                    text("workspace_id"),
+                    text("commit_sha"),
+                    text("workspace_snapshot_digest"),
+                ) {
+                    let related = crate::task_coordination::related_validation_context(
+                        &self.db,
+                        &request.task_id,
+                        &workspace_id,
+                        &commit,
+                        &snapshot,
+                    )
+                    .await?;
+                    exact["related_validation_runs"] = related;
+                }
+                ("review_findings", exact)
+            }
+            db::TaskCoordinationRequestKind::ValidationFindings => (
+                "validation_findings",
+                coordination_service
+                    .exact_validation_findings_context(request)
+                    .await?,
+            ),
+            db::TaskCoordinationRequestKind::HumanDecisionResume => (
+                "human_decision_resume",
+                coordination_service
+                    .exact_human_decision_resume_context(request)
+                    .await?,
+            ),
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "unsupported typed coordination request kind",
+                ))
+            }
+        };
         let source_event = DomainEventRepo::get_event(&*self.db, &wake.event_id).await?;
         let source_event = source_event
             .ok_or_else(|| ServiceError::not_found("domain_event", wake.event_id.clone()))?;
@@ -2580,7 +2773,7 @@ impl OrchestratorRuntime {
                 "ReviewFindings wake is not attached to its exact durable request event",
             ));
         }
-        Ok(json!({
+        let mut context = json!({
             "task": {
                 "id": task.id,
                 "project_id": task.project_id,
@@ -2605,7 +2798,6 @@ impl OrchestratorRuntime {
                 .filter(|membership| membership.status == RoleMembershipStatus::Active)
                 .map(|membership| json!({"actor_kind": membership.actor_kind.to_string(), "actor_id": membership.actor_id}))
                 .collect::<Vec<_>>(),
-            "review_findings": review_findings,
             "wake": {
                 "id": wake.id,
                 "event_id": source_event.id,
@@ -2620,7 +2812,9 @@ impl OrchestratorRuntime {
                 "causation_depth": source_event.causation_depth,
                 "payload": parse_payload(&source_event),
             }
-        }))
+        });
+        context[context_key] = review_findings;
+        Ok(context)
     }
 
     async fn reconcile_orchestrator_terminal(&self, event: &DomainEvent) -> Result<bool> {
@@ -2724,9 +2918,10 @@ impl OrchestratorRuntime {
         };
         let now = now_rfc3339();
         if event.event_type == "execution.completed" {
+            let mut allowed_outputs: Option<Vec<CoordinatorOutputKind>> = None;
             if let Some(request) = coordination_request
                 .as_ref()
-                .filter(|request| request.kind == db::TaskCoordinationRequestKind::ReviewFindings)
+                .filter(|request| is_typed_triage_kind(request.kind))
             {
                 let dispatch =
                     TaskLifecycleRepo::get_task_dispatch(&*self.db, &request.task_id).await?;
@@ -2778,6 +2973,19 @@ impl OrchestratorRuntime {
                         "Current TaskRole policy excludes ReviewFindings",
                     ));
                 }
+                // New output kinds need explicit permission in both the
+                // admitting snapshot and the current policy.
+                let snapshot_kinds = coordinator_output_kinds(&snapshot_policy);
+                let current_kinds = coordinator_output_kinds(&current_policy);
+                allowed_outputs = match (snapshot_kinds, current_kinds) {
+                    (Some(snapshot), Some(current)) => Some(
+                        snapshot
+                            .into_iter()
+                            .filter(|kind| current.contains(kind))
+                            .collect(),
+                    ),
+                    _ => None,
+                };
             }
             let completed = if let Some(request) = coordination_request.as_ref() {
                 crate::task_coordination::TaskCoordinationService::new(
@@ -2787,7 +2995,7 @@ impl OrchestratorRuntime {
                 .with_work_unit_service(Arc::new(
                     self.task_service.orchestrator_work_unit_service(),
                 ))
-                .complete_turn(request, &execution)
+                .complete_turn_with_outputs(request, &execution, allowed_outputs.as_deref())
                 .await
             } else {
                 self.apply_completed_actions(&execution, &wake).await
@@ -3026,6 +3234,14 @@ impl OrchestratorRuntime {
                 .map_err(|_| invalid_action("orchestrator action cannot be serialized"))?;
             let action_digest = hex::encode(sha2::Sha256::digest(&action_json));
             let action_type = action.action_type();
+            if matches!(
+                action,
+                OrchestratorAction::RequestValidation(_) | OrchestratorAction::AskHuman(_)
+            ) {
+                return Err(crate::task_coordination::output_not_permitted(
+                    "request_validation and ask_human require a typed coordination request turn; the event-driven action channel has no request to anchor them",
+                ));
+            }
             if self
                 .completed_action_receipt_matches(
                     &execution.id,
@@ -3099,6 +3315,11 @@ impl OrchestratorRuntime {
             }
             let source = CollaborationActorSource::Execution(execution.id.clone());
             match action {
+                OrchestratorAction::RequestValidation(_) | OrchestratorAction::AskHuman(_) => {
+                    return Err(crate::task_coordination::output_not_permitted(
+                        "typed outputs require a typed coordination request turn",
+                    ));
+                }
                 OrchestratorAction::Message {
                     target,
                     work_unit_id,
@@ -3461,7 +3682,7 @@ impl OrchestratorRuntime {
         wake: &OrchestratorWake,
         request: &db::TaskCoordinationRequest,
     ) -> Result<bool> {
-        if request.kind != db::TaskCoordinationRequestKind::ReviewFindings
+        if !is_typed_triage_kind(request.kind)
             || request.state != TaskCoordinationRequestState::Running
             || request.wake_id.as_deref() != Some(wake.id.as_str())
         {
@@ -3774,6 +3995,8 @@ impl OrchestratorAction {
             Self::Handoff { .. } => OrchestratorActionKind::Handoff,
             Self::CreateWorkUnit { .. } => OrchestratorActionKind::CreateWorkUnit,
             Self::Proposal { .. } => OrchestratorActionKind::Proposal,
+            Self::RequestValidation(_) => OrchestratorActionKind::RequestValidation,
+            Self::AskHuman(_) => OrchestratorActionKind::AskHuman,
         }
     }
 
@@ -3783,6 +4006,8 @@ impl OrchestratorAction {
             Self::Handoff { .. } => "handoff",
             Self::CreateWorkUnit { .. } => "work_unit",
             Self::Proposal { .. } => "proposal",
+            Self::RequestValidation(_) => "request_validation",
+            Self::AskHuman(_) => "ask_human",
         }
     }
 }
@@ -8335,3 +8560,63 @@ mod tests {
 #[cfg(test)]
 #[path = "orchestrator_review_tests.rs"]
 mod review_triage_tests;
+
+#[cfg(test)]
+mod rt_policy_tests {
+    use super::*;
+
+    fn request_validation_action() -> OrchestratorAction {
+        serde_json::from_value(json!({
+            "type": "request_validation",
+            "check_key": "unit",
+            "subject": {"kind": "task_integration", "id": "task", "version": 2},
+            "baseline": false,
+            "reason": "after integration"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn rt_validation_policy_does_not_widen_existing_roles() {
+        let action = request_validation_action();
+        let default = TaskRoleOrchestratorPolicy::parse("{}").unwrap();
+        assert!(!default.permits(&action));
+        let legacy =
+            TaskRoleOrchestratorPolicy::parse(r#"{"allowed_actions":["message"]}"#).unwrap();
+        assert!(!legacy.permits(&action));
+        let explicit =
+            TaskRoleOrchestratorPolicy::parse(r#"{"allowed_actions":["request_validation"]}"#)
+                .unwrap();
+        assert!(explicit.permits(&action));
+        assert_eq!(
+            coordinator_output_kinds(&explicit),
+            Some(vec![CoordinatorOutputKind::RequestValidation])
+        );
+        assert_eq!(coordinator_output_kinds(&default), None);
+    }
+
+    #[test]
+    fn rt_validation_event_actions_reject_smuggled_commands() {
+        let smuggled = serde_json::from_value::<OrchestratorAction>(json!({
+            "type": "request_validation",
+            "check_key": "unit",
+            "subject": {"kind": "task_integration", "id": "task", "version": 2},
+            "reason": "x",
+            "command": "curl evil"
+        }));
+        assert!(smuggled.is_err());
+    }
+
+    #[test]
+    fn rt_human_decision_kinds_map_to_typed_triage() {
+        assert!(is_typed_triage_kind(
+            db::TaskCoordinationRequestKind::HumanDecisionResume
+        ));
+        assert!(is_typed_triage_kind(
+            db::TaskCoordinationRequestKind::ValidationFindings
+        ));
+        assert!(!is_typed_triage_kind(
+            db::TaskCoordinationRequestKind::WorkUnitPlan
+        ));
+    }
+}

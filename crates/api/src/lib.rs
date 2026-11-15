@@ -475,6 +475,35 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/validation-runs/{id}",
             get(routes::reviews::get_validation_run),
         )
+        .route(
+            "/api/v1/projects/{id}/validation-checks",
+            get(routes::validation_checks::list_project_checks)
+                .post(routes::validation_checks::create_project_check),
+        )
+        .route(
+            "/api/v1/validation-checks/{id}/retire",
+            post(routes::validation_checks::retire_check),
+        )
+        .route(
+            "/api/v1/tasks/{id}/validation-check-requests",
+            get(routes::validation_checks::list_task_check_requests),
+        )
+        .route(
+            "/api/v1/tasks/{id}/validation-comparisons",
+            get(routes::validation_checks::list_task_comparisons),
+        )
+        .route(
+            "/api/v1/tasks/{id}/human-decisions",
+            get(routes::human_decisions::list_task_decisions),
+        )
+        .route(
+            "/api/v1/tasks/{id}/human-decisions/{decision_id}",
+            get(routes::human_decisions::get_task_decision),
+        )
+        .route(
+            "/api/v1/tasks/{id}/human-decisions/{decision_id}/answer",
+            post(routes::human_decisions::answer_task_decision),
+        )
         .route("/api/v1/evidence/{id}", get(routes::reviews::get_evidence))
         .route(
             "/api/v1/notifications",

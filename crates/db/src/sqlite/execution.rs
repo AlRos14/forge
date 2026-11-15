@@ -1397,7 +1397,7 @@ impl ExecutionRepo for SqliteDb {
                                 AND coordination.mode != 'manual'
                                 AND coordination.authorization_version
                                     = request.authorization_version
-                                AND (request.kind='work_unit_plan' OR EXISTS(
+                                AND (request.kind IN ('work_unit_plan','validation_findings','human_decision_resume') OR EXISTS(
                                     SELECT 1 FROM task_review_coordination_request_current current
                                     WHERE current.request_id=request.id
                                 ))
@@ -1421,7 +1421,7 @@ impl ExecutionRepo for SqliteDb {
                                 AND NOT EXISTS (
                                     SELECT 1 FROM json_each(role.policy_json, '$.allowed_actions') AS action
                                     WHERE action.type <> 'text'
-                                       OR action.value NOT IN ('message', 'handoff', 'create_work_unit', 'proposal', 'review_findings')
+                                       OR action.value NOT IN ('message', 'handoff', 'create_work_unit', 'proposal', 'review_findings', 'request_validation', 'ask_human')
                                 )
                                 AND (SELECT COUNT(*) FROM json_each(role.policy_json, '$.allowed_actions'))
                                     = (SELECT COUNT(DISTINCT action.value)

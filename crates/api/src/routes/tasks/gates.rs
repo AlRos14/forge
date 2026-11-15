@@ -10,8 +10,22 @@ use db::{
     Gate, GateEvaluation, GateEvaluationInput, GatePolicyRevision, GateRepo, GateScopeKind,
     TaskLifecycleRepo, TaskLifecycleState as DbTaskLifecycleState, TaskRepo,
 };
-use services::gate_engine::GateEngine;
+use services::gate_engine::{GateEngine, GatePolicyDocumentV2};
 use std::sync::Arc;
+
+/// Policy schema 2 (`required_checks`) has its own document type; every other
+/// schema keeps the v1 path, which still fails closed on unknown schemas.
+fn is_policy_v2(policy: &serde_json::Value) -> bool {
+    policy
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        == Some(2)
+}
+
+fn parse_policy_v2(policy: serde_json::Value) -> ApiResult<GatePolicyDocumentV2> {
+    serde_json::from_value(policy)
+        .map_err(|error| ApiError::bad_request(format!("invalid Gate policy: {error}")))
+}
 
 fn gate_response(gate: Gate) -> TaskGateResponse {
     TaskGateResponse {
@@ -225,19 +239,31 @@ pub async fn create_task_gate(
     Json(request): Json<CreateTaskGateRequest>,
 ) -> ApiResult<Json<GateResponse>> {
     require_task_mutable(&state, &task_id, &user).await?;
-    let policy = serde_json::from_value(request.policy)
-        .map_err(|error| ApiError::bad_request(format!("invalid Gate policy: {error}")))?;
     let engine = GateEngine::new(Arc::clone(&state.db), Arc::clone(&state.event_bus));
-    let (gate, revision) = engine
-        .create_gate_with_initial_policy(
-            &task_id,
-            &request.gate_kind,
-            GateScopeKind::Task,
-            &task_id,
-            policy,
-        )
-        .await
-        .map_err(ApiError::from)?;
+    let (gate, revision) = if is_policy_v2(&request.policy) {
+        engine
+            .create_gate_with_initial_policy_v2(
+                &task_id,
+                &request.gate_kind,
+                GateScopeKind::Task,
+                &task_id,
+                parse_policy_v2(request.policy)?,
+            )
+            .await
+    } else {
+        let policy = serde_json::from_value(request.policy)
+            .map_err(|error| ApiError::bad_request(format!("invalid Gate policy: {error}")))?;
+        engine
+            .create_gate_with_initial_policy(
+                &task_id,
+                &request.gate_kind,
+                GateScopeKind::Task,
+                &task_id,
+                policy,
+            )
+            .await
+    }
+    .map_err(ApiError::from)?;
     Ok(Json(GateResponse {
         gate: gate_response(gate),
         active_policy: Some(policy_response(revision)?),
@@ -296,12 +322,23 @@ pub async fn revise_gate_policy(
         .await?
         .ok_or_else(|| ApiError::not_found("Gate", gate_id.clone()))?;
     require_task_mutable(&state, &gate.task_id, &user).await?;
-    let policy = serde_json::from_value(request.policy)
-        .map_err(|error| ApiError::bad_request(format!("invalid Gate policy: {error}")))?;
-    let revision = GateEngine::new(Arc::clone(&state.db), Arc::clone(&state.event_bus))
-        .revise_policy(&gate_id, request.expected_active_revision, policy)
-        .await
-        .map_err(ApiError::from)?;
+    let engine = GateEngine::new(Arc::clone(&state.db), Arc::clone(&state.event_bus));
+    let revision = if is_policy_v2(&request.policy) {
+        engine
+            .revise_policy_v2(
+                &gate_id,
+                request.expected_active_revision,
+                parse_policy_v2(request.policy)?,
+            )
+            .await
+    } else {
+        let policy = serde_json::from_value(request.policy)
+            .map_err(|error| ApiError::bad_request(format!("invalid Gate policy: {error}")))?;
+        engine
+            .revise_policy(&gate_id, request.expected_active_revision, policy)
+            .await
+    }
+    .map_err(ApiError::from)?;
     Ok(Json(policy_response(revision)?))
 }
 

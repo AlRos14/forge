@@ -24,6 +24,13 @@ export const qk = {
   reviewExecutions: (taskId: string) => ['tasks', taskId, 'review-executions'] as const,
   taskReworkAutomation: (taskId: string) => ['tasks', taskId, 'rework-automation'] as const,
   validationRuns: (taskId: string) => ['tasks', taskId, 'validation-runs'] as const,
+  taskValidationCheckRequests: (taskId: string) =>
+    ['tasks', taskId, 'validation-check-requests'] as const,
+  taskValidationComparisons: (taskId: string) =>
+    ['tasks', taskId, 'validation-comparisons'] as const,
+  taskHumanDecisions: (taskId: string) => ['tasks', taskId, 'human-decisions'] as const,
+  projectValidationChecks: (projectId: string) =>
+    ['projects', projectId, 'validation-checks'] as const,
   agents: ['agents'] as const,
   agentPages: (limit: number) => ['agents', 'pages', limit] as const,
   agent: (id: string) => ['agents', id] as const,

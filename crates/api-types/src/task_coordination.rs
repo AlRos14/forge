@@ -220,6 +220,10 @@ pub struct TaskCoordinationRequestResponse {
     pub review_report_artifact_id: Option<String>,
     pub review_report_digest: Option<String>,
     pub review_producer_execution_id: Option<String>,
+    pub source_subject_kind: Option<String>,
+    pub source_subject_id: Option<String>,
+    pub source_subject_digest: Option<String>,
+    pub resumes_request_id: Option<String>,
     pub mode: TaskCoordinationMode,
     pub state: TaskCoordinationRequestState,
     #[ts(type = "number")]

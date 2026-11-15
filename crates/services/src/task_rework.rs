@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 mod triage;
+mod validation_triage;
 pub(crate) use triage::ReviewFindingsDecision;
+pub(crate) use validation_triage::ValidationFindingsDecision;
 
 use crate::{
     collaboration_service::{CollaborationActorSource, CollaborationService},

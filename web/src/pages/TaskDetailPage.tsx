@@ -48,6 +48,7 @@ import { WorkUnitHumanReviewPanel } from '@/components/task-detail/work-unit-rev
 import { ActorIdentity } from '@/features/task-roles/ActorIdentity'
 import { CopyReferenceButton } from '@/components/ui/copy-reference-button'
 import { TaskCoordinationPanel } from '@/components/task-detail/task-coordination-panel'
+import { readRequiredChecks } from '@/components/task-detail/task-verification'
 import { TaskJourneyPanel } from '@/components/task-detail/task-journey-panel'
 import type {
   GateEvaluationResponse,
@@ -890,6 +891,9 @@ export function TaskDetailPage({
                       <Badge variant="outline">
                         policy revision {policy ? String(policy.revision) : 'unavailable'}
                       </Badge>
+                      {policy && policy.schema_version >= 2 ? (
+                        <Badge variant="outline">schema v{policy.schema_version}</Badge>
+                      ) : null}
                       <Button
                         size="sm"
                         variant="outline"
@@ -903,6 +907,19 @@ export function TaskDetailPage({
                         <code className="break-all">Gate {gate.id}</code>
                       </details>
                     </div>
+                    {readRequiredChecks(policy?.policy).length ? (
+                      <div className="text-xs text-muted-foreground">
+                        <p className="font-medium text-foreground">Required checks</p>
+                        <ul className="mt-1 list-disc space-y-1 pl-5">
+                          {readRequiredChecks(policy?.policy).map((check) => (
+                            <li key={`${check.check_key}:${check.definition_digest}`} className="break-all">
+                              {check.check_key} must have {check.required_outcome}
+                              {check.definition_digest ? ` (digest ${check.definition_digest})` : ''}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
                     {evaluation ? (
                       <div className="space-y-2">
                         <div className="flex flex-wrap items-center gap-2 text-xs">

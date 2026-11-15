@@ -196,6 +196,27 @@ export function routeSsePayload(
     }
   }
 
+  if (eventType.startsWith('task.validation_') || eventType.startsWith('task.human_decision_')) {
+    const taskId =
+      typeof facts.task_id === 'string'
+        ? facts.task_id
+        : payload.scope_type === 'task'
+          ? (payload.scope_id ?? undefined)
+          : undefined
+    if (taskId) {
+      void queryClient.invalidateQueries({ queryKey: qk.taskValidationCheckRequests(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskValidationComparisons(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskHumanDecisions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.validationRuns(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.gates(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskCoordination(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+    } else {
+      invalidateAllActiveQueries(queryClient)
+    }
+  }
+
   if (eventType.startsWith('task.intervention_')) {
     const taskId =
       typeof facts.task_id === 'string'
@@ -295,6 +316,12 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
             'task.quality_request_resolved',
             'task.intervention_recorded',
             'task.intervention_state_changed',
+            'task.validation_check_requested',
+            'task.validation_check_completed',
+            'task.validation_comparison_recorded',
+            'task.human_decision_requested',
+            'task.human_decision_answered',
+            'task.human_decision_closed',
             'project.created',
             'project.updated',
             'project.deleted',

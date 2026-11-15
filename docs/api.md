@@ -338,7 +338,10 @@ Public SSE events are `task.coordination_authorized`,
 `task.coordination_plan_proposed`, `task.coordination_plan_approved`,
 `task.coordination_plan_rejected`, `task.coordination_plan_materialized`,
 `task.quality_requested`, `task.quality_request_resolved`,
-`task.intervention_recorded`, and `task.intervention_state_changed`. They carry
+`task.intervention_recorded`, `task.intervention_state_changed`,
+`task.validation_check_requested`, `task.validation_check_completed`,
+`task.validation_comparison_recorded`, `task.human_decision_requested`,
+`task.human_decision_answered`, and `task.human_decision_closed`. They carry
 IDs, states, versions, digests, route counters, and safe escalation codes; never
 plan content, prompts, briefs, free-form escalation text, credentials, or paths.
 `task.quality_requested` carries `state`, `route_id`, `route_round`,
@@ -454,6 +457,33 @@ table does not authorize a decision or satisfy a Gate.
 | `GET /tasks/{task_id}/artifacts`, `POST /tasks/{task_id}/artifacts` | List or create generic Artifacts with exact provenance. |
 | `GET /artifacts/{id}` | Read one exact Artifact. |
 | `GET /tasks/{task_id}/review-lines` | Read stable review lines, current exact results, and immutable revision history. |
+
+### Validation catalog, check requests, and human decisions
+
+`ValidationRunResponse` also carries `run_origin`
+(`legacy_command|coordinator_request|after_integration|baseline`),
+`definition_digest`, `catalog_check_id`, and `check_request_id`. Coordination
+request responses carry `source_subject_kind/id/digest` and `resumes_request_id`.
+All lists below return `{items, next_cursor}` with opaque cursors (`cursor`,
+`limit` 1-100, newest first).
+
+| Method and path | Contract |
+| --- | --- |
+| `GET /projects/{id}/validation-checks` | Project members list catalog versions; optional `repo_id`, `state=active|retired`. |
+| `POST /projects/{id}/validation-checks` | Project owner/admin only (`403 validation.catalog_forbidden`). Body `{repo_id?, check_key, command, timeout_seconds, idempotency_key}` publishes the next immutable version and retires the previous one. A replay with identical content returns the active version. Pins in a Task envelope keep the old digest and become `validation.check_stale_pin`. |
+| `POST /validation-checks/{id}/retire` | Owner/admin. Body `{expected_state:"active"}`; an already retired definition is `409 validation.catalog_state_conflict`. |
+| `GET /tasks/{id}/validation-check-requests` | Runner queue/outcomes for the Task (`state` filter). There is no REST enqueue: requests come only from the coordinator or the after-integration hook. |
+| `GET /tasks/{id}/validation-comparisons` | Immutable baseline comparisons (`regression`, `pre_existing_failure`, `fixed`, `both_pass`, `inconclusive`). |
+| `GET /tasks/{id}/human-decisions`, `GET /tasks/{id}/human-decisions/{decision_id}` | Structured decisions with options, evidence links (kind, id, digest), recommendation and state. |
+| `POST /tasks/{id}/human-decisions/{decision_id}/answer` | Body `{expected_version, option_id, note?, idempotency_key}`; the answering user is always the authenticated user. An option whose `authority_effect` is not `none` needs a Project owner/admin. Errors: `409 human_decision.version_conflict`, `409 human_decision.not_open`, `403 human_decision.authority_required`, `422 human_decision.invalid_options`. The response carries the decision and `resume` (`created|already_bound|deferred`). `idempotency_key` is validated; replay safety comes from `expected_version` (a repeated answer is `not_open`). Project Copilot never answers. |
+
+Gate policy `schema_version: 2` adds `required_checks`
+(`[{check_key, definition_digest, required_outcome:"passed"}]`) on
+`POST /tasks/{id}/gates` and `PUT /gates/{id}/policy`; schema 1 keeps its
+behavior and rejects `required_checks`. Public error mapping: `*.not_authorized`
+and `validation.catalog_forbidden` 403; `validation.check_unknown`,
+`validation.subject_not_resolvable` and `human_decision.invalid_options|evidence_invalid`
+422; other `validation.*`/`human_decision.*` conflicts 409.
 
 ValidationRuns and Evidence are distinct from ReviewReports. A Gate consumes
 exact input facts and immutable evaluations; it never uses a latest Review or
@@ -680,6 +710,11 @@ The MCP server advertises only registered tools. The current tool names are:
   `forge_get_review_execution`, `forge_list_validation_runs`,
   `forge_get_validation_run`, `forge_get_evidence`,
   `forge_list_task_artifacts`.
+- Verification (read-only): `forge_list_validation_checks`,
+  `forge_list_task_validation_check_requests`,
+  `forge_list_task_validation_comparisons`, `forge_list_task_human_decisions`.
+  No MCP tool publishes a catalog version, answers a decision, or enqueues a
+  check, and none is in the Project Copilot allowlist.
 - Agents and collaboration: `forge_register_agent`, `forge_list_agents`,
   `forge_list_agent_profiles`, `forge_list_task_messages`,
   `forge_list_task_handoffs`, `forge_list_task_proposals`,

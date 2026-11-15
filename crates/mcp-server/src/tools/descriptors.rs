@@ -76,7 +76,11 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         tool_descriptor("forge_list_task_messages", "List generic task collaboration Messages.", json!({"task_id":{"type":"string"},"cursor":{"type":"string"},"limit":{"type":"integer"}}), &["task_id"]),
         tool_descriptor("forge_list_task_handoffs", "List generic task collaboration Handoffs.", json!({"task_id":{"type":"string"},"cursor":{"type":"string"},"limit":{"type":"integer"}}), &["task_id"]),
         tool_descriptor("forge_list_task_proposals", "List generic task Proposals.", json!({"task_id":{"type":"string"},"cursor":{"type":"string"},"limit":{"type":"integer"}}), &["task_id"]),
-        tool_descriptor("forge_list_task_decisions", "List generic task Decisions with exact proposal provenance.", json!({"task_id":{"type":"string"},"cursor":{"type":"string"},"limit":{"type":"integer"}}), &["task_id"])
+        tool_descriptor("forge_list_task_decisions", "List generic task Decisions with exact proposal provenance.", json!({"task_id":{"type":"string"},"cursor":{"type":"string"},"limit":{"type":"integer"}}), &["task_id"]),
+        tool_descriptor("forge_list_validation_checks", "List the versioned validation check catalog of a Project (read-only; only a Project owner or admin publishes versions over REST).", json!({"project_id":{"type":"string"},"repo_id":{"type":"string"},"state":{"type":"string","enum":["active","retired"]},"cursor":{"type":"string"},"limit":{"type":"integer"}}), &required(scoped_project,&["project_id"],&[])),
+        tool_descriptor("forge_list_task_validation_check_requests", "List exact validation check requests of a task (queued by the coordinator or after integration; read-only).", json!({"task_id":{"type":"string"},"state":{"type":"string","enum":["queued","running","completed","cancelled","failed_to_start"]},"cursor":{"type":"string"},"limit":{"type":"integer"}}), &["task_id"]),
+        tool_descriptor("forge_list_task_validation_comparisons", "List exact baseline comparisons of a task's validation checks (regression, pre_existing_failure, fixed, both_pass, inconclusive).", json!({"task_id":{"type":"string"},"cursor":{"type":"string"},"limit":{"type":"integer"}}), &["task_id"]),
+        tool_descriptor("forge_list_task_human_decisions", "List structured human decisions of a task. Answering is a human REST operation; no tool answers one.", json!({"task_id":{"type":"string"},"state":{"type":"string","enum":["open","answered","superseded","cancelled"]},"cursor":{"type":"string"},"limit":{"type":"integer"}}), &["task_id"])
     ])
 }
 

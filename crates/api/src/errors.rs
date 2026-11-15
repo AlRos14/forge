@@ -263,13 +263,23 @@ impl From<ServiceError> for ApiError {
             ),
             ServiceError::Conflict(message) => Self::conflict_with_code("conflict", message),
             ServiceError::Coordination { code, message } => {
-                let status = if code.ends_with("not_authorized") {
+                let status = if code.ends_with("not_authorized")
+                    || code == "validation.catalog_forbidden"
+                    || code == "human_decision.authority_required"
+                {
                     StatusCode::FORBIDDEN
                 } else if code.ends_with("host_unavailable") {
                     StatusCode::SERVICE_UNAVAILABLE
                 } else if code.ends_with("invalid_plan")
                     || code.ends_with("unsupported_plan_item")
                     || code.ends_with("human_turn_unsupported")
+                    || matches!(
+                        code,
+                        "validation.check_unknown"
+                            | "validation.subject_not_resolvable"
+                            | "human_decision.invalid_options"
+                            | "human_decision.evidence_invalid"
+                    )
                 {
                     StatusCode::UNPROCESSABLE_ENTITY
                 } else if code.ends_with("budget_exhausted") {

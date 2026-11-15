@@ -108,6 +108,24 @@ pub enum PublicEventType {
     #[serde(rename = "task.intervention_state_changed")]
     #[ts(rename = "task.intervention_state_changed")]
     TaskInterventionStateChanged,
+    #[serde(rename = "task.validation_check_requested")]
+    #[ts(rename = "task.validation_check_requested")]
+    TaskValidationCheckRequested,
+    #[serde(rename = "task.validation_check_completed")]
+    #[ts(rename = "task.validation_check_completed")]
+    TaskValidationCheckCompleted,
+    #[serde(rename = "task.validation_comparison_recorded")]
+    #[ts(rename = "task.validation_comparison_recorded")]
+    TaskValidationComparisonRecorded,
+    #[serde(rename = "task.human_decision_requested")]
+    #[ts(rename = "task.human_decision_requested")]
+    TaskHumanDecisionRequested,
+    #[serde(rename = "task.human_decision_answered")]
+    #[ts(rename = "task.human_decision_answered")]
+    TaskHumanDecisionAnswered,
+    #[serde(rename = "task.human_decision_closed")]
+    #[ts(rename = "task.human_decision_closed")]
+    TaskHumanDecisionClosed,
     #[serde(rename = "project.created")]
     #[ts(rename = "project.created")]
     ProjectCreated,
@@ -177,6 +195,12 @@ impl PublicEventType {
             Self::TaskQualityRequestResolved => "task.quality_request_resolved",
             Self::TaskInterventionRecorded => "task.intervention_recorded",
             Self::TaskInterventionStateChanged => "task.intervention_state_changed",
+            Self::TaskValidationCheckRequested => "task.validation_check_requested",
+            Self::TaskValidationCheckCompleted => "task.validation_check_completed",
+            Self::TaskValidationComparisonRecorded => "task.validation_comparison_recorded",
+            Self::TaskHumanDecisionRequested => "task.human_decision_requested",
+            Self::TaskHumanDecisionAnswered => "task.human_decision_answered",
+            Self::TaskHumanDecisionClosed => "task.human_decision_closed",
             Self::ProjectCreated => "project.created",
             Self::ProjectUpdated => "project.updated",
             Self::ProjectDeleted => "project.deleted",

@@ -84,6 +84,7 @@ const projectSettingsTabs = new Set<ProjectSettingsTab>([
   'repos',
   'members',
   'workers',
+  'validation',
   'mcp',
   'hooks',
   'danger',

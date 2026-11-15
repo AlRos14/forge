@@ -399,6 +399,7 @@ fn tool_accepts_project_id(tool_name: &str) -> bool {
             | "forge_read_project_repo_file"
             | "forge_update_project"
             | "forge_update_project_hooks"
+            | "forge_list_validation_checks"
     )
 }
 
@@ -433,7 +434,10 @@ fn task_scope_field(tool_name: &str) -> Option<&'static str> {
         | "forge_list_task_messages"
         | "forge_list_task_handoffs"
         | "forge_list_task_proposals"
-        | "forge_list_task_decisions" => Some("task_id"),
+        | "forge_list_task_decisions"
+        | "forge_list_task_validation_check_requests"
+        | "forge_list_task_validation_comparisons"
+        | "forge_list_task_human_decisions" => Some("task_id"),
         _ => None,
     }
 }

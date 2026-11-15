@@ -107,6 +107,10 @@ pub struct ValidationRunResponse {
     pub logs_ref: Option<String>,
     pub evidence_ids: Vec<String>,
     pub validation_report_artifact_id: Option<String>,
+    pub run_origin: crate::ValidationRunOrigin,
+    pub definition_digest: Option<String>,
+    pub catalog_check_id: Option<String>,
+    pub check_request_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

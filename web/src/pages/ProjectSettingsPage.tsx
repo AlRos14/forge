@@ -32,6 +32,7 @@ import { HooksTab } from '@/components/settings/HooksTab'
 import { MembersTab } from '@/components/settings/MembersTab'
 import { RepoDialog } from '@/components/settings/RepoDialog'
 import { ReposTab } from '@/components/settings/ReposTab'
+import { ValidationChecksTab } from '@/components/settings/ValidationChecksTab'
 import { ProjectWorkersTab } from '@/components/settings/ProjectWorkersTab'
 import { SettingsSection } from '@/components/settings/SettingsSection'
 import { settingsErrorMessage } from '@/components/settings/project-settings-utils'
@@ -56,6 +57,7 @@ export type ProjectSettingsTab =
   | 'repos'
   | 'members'
   | 'workers'
+  | 'validation'
   | 'mcp'
   | 'hooks'
   | 'danger'
@@ -70,6 +72,7 @@ const SETTINGS_TABS: Array<{
   { id: 'repos', label: 'Repos', icon: GitBranch },
   { id: 'members', label: 'Members', icon: Users },
   { id: 'workers', label: 'Team & workflow', icon: Users },
+  { id: 'validation', label: 'Validation checks', icon: Lightning },
   { id: 'mcp', label: 'MCP', icon: Plugs },
   { id: 'hooks', label: 'Hooks', icon: Lightning },
   { id: 'danger', label: 'Danger zone', icon: WarningOctagon, danger: true },
@@ -252,6 +255,8 @@ export function ProjectSettingsPage({
           {initialTab === 'members' && <MembersTab projectId={projectId} />}
 
           {initialTab === 'workers' && <ProjectWorkersTab projectId={projectId} />}
+
+          {initialTab === 'validation' && <ValidationChecksTab projectId={projectId} />}
 
           {initialTab === 'mcp' && <ProjectMcpTab projectId={projectId} />}
 

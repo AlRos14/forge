@@ -31,6 +31,12 @@ use crate::{
     Result, ServiceError,
 };
 
+mod turn_outputs;
+mod validation_findings;
+
+pub(crate) use turn_outputs::output_not_permitted;
+pub(crate) use validation_findings::related_validation_context;
+
 const MAX_PLAN_BYTES: usize = 256 * 1024;
 const MAX_BRIEF_BYTES: usize = 64 * 1024;
 const MAX_PLAN_WORK_UNITS: usize = 64;
@@ -2342,6 +2348,14 @@ impl TaskCoordinationService {
         if request.kind == TaskCoordinationRequestKind::ReviewFindings {
             return self.complete_review_findings_turn(request, execution).await;
         }
+        if matches!(
+            request.kind,
+            TaskCoordinationRequestKind::ValidationFindings
+                | TaskCoordinationRequestKind::HumanDecisionResume
+                | TaskCoordinationRequestKind::ExternalFeedback
+        ) {
+            return self.complete_new_kind_turn(request, execution).await;
+        }
         if let Some(existing) =
             TaskCoordinationRepo::list_task_coordination_plans(&*self.db, &request.task_id, 100)
                 .await?
@@ -2782,6 +2796,15 @@ impl TaskCoordinationService {
         request: &TaskCoordinationRequest,
         context: &Value,
     ) -> Result<String> {
+        match request.kind {
+            TaskCoordinationRequestKind::ValidationFindings => {
+                return self.render_validation_findings_prompt(request, context);
+            }
+            TaskCoordinationRequestKind::HumanDecisionResume => {
+                return self.render_human_decision_resume_prompt(request, context);
+            }
+            _ => {}
+        }
         if request.kind == TaskCoordinationRequestKind::ReviewFindings {
             let report_id = request
                 .review_report_artifact_id

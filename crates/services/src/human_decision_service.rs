@@ -554,6 +554,25 @@ impl HumanDecisionService {
     /// coordination turn budget, waking/dispatching the coordinator for the
     /// new request, and batch-bound resumes.
     pub async fn ensure_resume_request(&self, decision_id: &str) -> Result<ResumeOutcome> {
+        self.ensure_resume_request_inner(decision_id, None).await
+    }
+
+    /// Batch-bound resume: the caller (RT) resolved the exact Project batch
+    /// binding with the `HumanDecisionResume` origin.
+    pub async fn ensure_resume_request_for_batch(
+        &self,
+        decision_id: &str,
+        binding: db::ProjectPlanBatchRequestBinding,
+    ) -> Result<ResumeOutcome> {
+        self.ensure_resume_request_inner(decision_id, Some(binding))
+            .await
+    }
+
+    async fn ensure_resume_request_inner(
+        &self,
+        decision_id: &str,
+        batch_binding: Option<db::ProjectPlanBatchRequestBinding>,
+    ) -> Result<ResumeOutcome> {
         let decision = HumanDecisionRepo::get_human_decision_request(&*self.db, decision_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("human decision", decision_id))?;
@@ -605,11 +624,12 @@ impl HumanDecisionService {
                 "the coordination authorization changed since the decision was raised",
             );
         }
-        if TaskCoordinationRepo::has_current_project_plan_batch_coordination_authorization(
-            &*self.db,
-            &decision.task_id,
-        )
-        .await?
+        if batch_binding.is_none()
+            && TaskCoordinationRepo::has_current_project_plan_batch_coordination_authorization(
+                &*self.db,
+                &decision.task_id,
+            )
+            .await?
         {
             return deferred(
                 "human_decision.batch_resume_unsupported",
@@ -651,33 +671,43 @@ impl HumanDecisionService {
             "human-decision-resume-request:{}:{}",
             coordination.authorization_version, decision.id
         ));
-        let (request, request_event) = TaskCoordinationRepo::create_task_coordination_request(
-            &*self.db,
-            CreateTaskCoordinationRequestInput {
-                id: request_id,
-                task_id: task.id.clone(),
-                kind: TaskCoordinationRequestKind::HumanDecisionResume,
-                review_report_artifact_id: None,
-                review_report_digest: None,
-                review_producer_execution_id: None,
-                source_subject_kind: Some("human_decision".to_owned()),
-                source_subject_id: Some(decision.id.clone()),
-                source_subject_digest: Some(subject_digest),
-                resumes_request_id: Some(binding.request_id.clone()),
-                requested_by,
-                expected_task_version: task.version,
-                authorization_version: coordination.authorization_version,
-                mode: coordination.mode,
-                brief_json,
-                objective_digest,
-                request_digest,
-                idempotency_key,
-                created_at: now.clone(),
-                event,
-            },
-        )
-        .await
-        .map_err(|error| match error {
+        let create_input = CreateTaskCoordinationRequestInput {
+            id: request_id,
+            task_id: task.id.clone(),
+            kind: TaskCoordinationRequestKind::HumanDecisionResume,
+            review_report_artifact_id: None,
+            review_report_digest: None,
+            review_producer_execution_id: None,
+            source_subject_kind: Some("human_decision".to_owned()),
+            source_subject_id: Some(decision.id.clone()),
+            source_subject_digest: Some(subject_digest),
+            resumes_request_id: Some(binding.request_id.clone()),
+            requested_by,
+            expected_task_version: task.version,
+            authorization_version: coordination.authorization_version,
+            mode: coordination.mode,
+            brief_json,
+            objective_digest,
+            request_digest,
+            idempotency_key,
+            created_at: now.clone(),
+            event,
+        };
+        let write = match batch_binding {
+            Some(binding) => {
+                TaskCoordinationRepo::create_project_plan_batch_coordination_request(
+                    &*self.db,
+                    create_input,
+                    binding,
+                )
+                .await
+            }
+            None => {
+                TaskCoordinationRepo::create_task_coordination_request(&*self.db, create_input)
+                    .await
+            }
+        };
+        let (request, request_event) = write.map_err(|error| match error {
             db::DbError::VersionConflict | db::DbError::TaskVersionConflict { .. } => {
                 decision_error(
                     "coordination.authorization_stale",

@@ -137,6 +137,10 @@ jobs:
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib human_decision
       - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib rt_validation_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib rt_human_decision_
+      - if: ${{ !cancelled() }}
         run: cargo test --locked --no-fail-fast -p db --test pr2_execution_session --test pr5_workunit --test task_coordination_schema --test review_findings_migration --test file_backed_migration --test task_delete_integrity
       - id: rust_project_plan
         if: ${{ !cancelled() }}
@@ -157,6 +161,12 @@ jobs:
         run: cargo test --locked -p mcp-server --lib project_plan
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p mcp-server --lib mcp_project_copilot_lists_only_delegated_management_tools
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib mcp_validation_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib mcp_human_decision_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test coordinator_verification
       - id: rust_api_project_plan
         if: ${{ !cancelled() }}
         run: |

@@ -103,6 +103,16 @@ PR14 audit on 2026-10-16.
 
 ### Added
 
+- Phase 1 of coordinator verification (API lane): validation catalog REST
+  (`GET|POST /projects/{id}/validation-checks`, `POST /validation-checks/{id}/retire`),
+  read-only `GET /tasks/{id}/validation-check-requests` and
+  `/validation-comparisons`, human decisions (`GET /tasks/{id}/human-decisions[/{decision_id}]`,
+  `POST .../answer` with `expected_version`), Gate policy schema 2 with
+  `required_checks`, four read-only MCP tools, and public SSE events
+  `task.validation_check_requested|completed`, `task.validation_comparison_recorded`,
+  `task.human_decision_requested|answered|closed`. `ValidationRunResponse` and
+  coordination request responses gain additive fields. Contract:
+  `docs/plans/coordinator-verification-and-pr-loop.md`.
 - Add an optional Project DAG for work packets, typed proposals with source
   provenance, explicit owner/admin batch authorization, deterministic dependency
   admission, and bounded Project Copilot tools for free-form interpretation and

@@ -1,6 +1,7 @@
 mod descriptors;
 mod handlers;
 mod project_plan;
+mod verification;
 
 use serde_json::Value;
 
@@ -174,6 +175,18 @@ pub(crate) async fn dispatch_tool(
         "forge_list_task_handoffs" => handlers::forge_list_task_handoffs(state, arguments).await,
         "forge_list_task_proposals" => handlers::forge_list_task_proposals(state, arguments).await,
         "forge_list_task_decisions" => handlers::forge_list_task_decisions(state, arguments).await,
+        "forge_list_validation_checks" => {
+            verification::forge_list_validation_checks(state, arguments, context).await
+        }
+        "forge_list_task_validation_check_requests" => {
+            verification::forge_list_task_validation_check_requests(state, arguments).await
+        }
+        "forge_list_task_validation_comparisons" => {
+            verification::forge_list_task_validation_comparisons(state, arguments).await
+        }
+        "forge_list_task_human_decisions" => {
+            verification::forge_list_task_human_decisions(state, arguments).await
+        }
         _ => Err(McpToolError::new(-32601, "method not found")),
     }
 }

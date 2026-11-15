@@ -223,4 +223,29 @@ describe('routeSsePayload', () => {
       expect.objectContaining({ refetchType: 'active' }),
     )
   })
+
+  it('invalidates verification and decision queries for the new public events', () => {
+    for (const name of [
+      'task.validation_check_requested',
+      'task.validation_check_completed',
+      'task.validation_comparison_recorded',
+      'task.human_decision_requested',
+      'task.human_decision_answered',
+      'task.human_decision_closed',
+    ]) {
+      const { queryClient, invalidateQueries, dispatch } = createMocks()
+      routeSsePayload(
+        event(name, { scope_type: 'task', scope_id: 'task-1', payload: { task_id: 'task-1' } }),
+        queryClient,
+        { dispatch },
+      )
+      expect(invalidateQueries.mock.calls).toEqual(
+        expect.arrayContaining([
+          [{ queryKey: ['tasks', 'task-1', 'human-decisions'] }],
+          [{ queryKey: ['tasks', 'task-1', 'validation-check-requests'] }],
+          [{ queryKey: ['tasks', 'task-1', 'validation-comparisons'] }],
+        ]),
+      )
+    }
+  })
 })

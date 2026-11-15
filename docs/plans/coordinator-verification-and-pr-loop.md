@@ -1248,8 +1248,8 @@ Cualquier cambio de contrato vuelve a N0.
 | P2 | (Fase 2) Productor y contexto de triage `external_feedback` (atomicidad request+origen+presupuesto+evento, replay, pause/revoke/restart). | P1, A2, R1 | `task_coordination.rs` (vía RT) | **TODO** |
 | PS | (Fase 2) Spike de lifecycle: demostrar con prueba de servicio que `Merging → Blocked(pr_feedback) → Active` conserva el TaskMerge `remote_waiting` y que merge/cierre remoto durante rework converge. **Si no cabe, parar y preguntar al usuario** (D3); no se propone arista nueva por cuenta propia. | N0 | `task_lifecycle.rs` | **TODO** |
 | P3 | (Fase 2) Acciones `push_update` y `post_comment` (`pr_external_action`): Gate exacto, autorización por política congelada/Decisión (D5), idempotencia, `OutcomeUnknown`, recuperación; el merge nunca. | P0, PS, A3, C3 | `task_integration_operation.rs`, `pr_service.rs` | **TODO** |
-| RT | (Fases 1–3, una pasada por fase) Cableado único y ordenado de las salidas nuevas en el runtime y coordinación; contexto exacto de validación y feedback; políticas `allowed_actions`. | R1, D1, M1, C2, P2 | `orchestrator_runtime.rs`, `task_coordination.rs` | **TODO** |
-| API | (por fase) REST, MCP, SSE, DTOs, tipos generados, `forge-ctl` si procede. Ver «Contratos públicos». | RT, D1, C3, P3 | ver L6 | **TODO** |
+| RT | (Fases 1–3, una pasada por fase) Cableado único y ordenado de las salidas nuevas en el runtime y coordinación; contexto exacto de validación y feedback; políticas `allowed_actions`. | R1, D1, M1, C2, P2 | `orchestrator_runtime.rs`, `task_coordination.rs` | **Fase 1 IMPLEMENTADO / NOT RUN** (ver Anexo RT); fases 2–3 TODO |
+| API | (por fase) REST, MCP, SSE, DTOs, tipos generados, `forge-ctl` si procede. Ver «Contratos públicos». | RT, D1, C3, P3 | ver L6 | **FASE 1 IMPLEMENTADA / NOT RUN** (ver Anexo API fase 1); fases 2–3 TODO |
 | UI | (por fase) Paneles de decisión humana, checks (catálogo, solicitudes, comparación base), feedback de PR, estados de fallback/micro-fix en la journey. | API (fixtures desde N0) | ver L7 | **TODO** |
 | T | (por fase) Tests escritos contra interfaces congeladas (ver plan de pruebas). | N0 | ver L8 | **TODO** |
 | I | (por fase) Integración por ownership, revisión independiente estática, `cargo fmt --check` y `git diff --check` sin compilar. | todo lo anterior | root | **TODO** |
@@ -1588,3 +1588,66 @@ workflow en el nodo I). `cargo fmt --all` y `git diff --check` limpios.
 `ValidationCheckRequestRepo`/`ValidationComparisonRepo` para `validation_findings` (el runner no
 crea esa solicitud: run terminal `failed|error|stale` o comparación `regression|inconclusive`
 sigue siendo trabajo de RT).
+
+## Anexo API (fase 1) — REST, MCP, SSE y tipos (IMPLEMENTADO / NOT RUN)
+
+Escrito sin compilar ni ejecutar con cargo (solo CI). Rutas: las siete de fase 1 del
+contrato más `GET /tasks/{id}/human-decisions/{decision_id}`; sin enqueue REST de checks.
+Archivos: `api-types/src/{validation_catalog,human_decision}.rs`, `routes/{validation_checks,human_decisions}.rs`,
+`mcp-server/src/tools/verification.rs`, mapeo en `errors.rs`, proyección en `routes/events.rs`
+(eventos internos `validation_check_request.*` / `validation_comparison.recorded` se publican con
+los nombres públicos del contrato), Gate v2 en `routes/tasks/gates.rs`. Bindings TS escritos a
+mano con el formato de ts-rs (verificar con `pnpm generate:types`). Tests: `api --test coordinator_verification`,
+`mcp-server --lib mcp_validation_|mcp_human_decision_`. Pendiente: fixture de decisión humana
+con fila real (409 por versión) — no cubierto en API; `web/src/api/sse.ts` debe añadir los nombres
+nuevos a `namedEvents` (carril UI).
+
+## Anexo UI (fase 1) — web (IMPLEMENTADO / NOT RUN)
+
+Escrito sin ejecutar pnpm (solo CI). `api/sse.ts` (seis eventos nuevos en `namedEvents` e
+invalidación), `api/query-keys.ts`, `api/hooks.ts` (catálogo list/create/retire, requests,
+comparisons, human decisions list/get/answer). UI: `task-detail/task-human-decisions-panel.tsx`
+(tarjeta con opciones, badge de authority effect, recomendada, evidencia, respuesta con
+`expected_version` y mensaje de conflicto 409), `task-validation-panel.tsx` (requests,
+`check_key@version`, badges de comparación con explicación), `task-verification.ts` (mapeos
+puros), `settings/ValidationChecksTab.tsx` (pestaña `validation`, owner/admin gestionan,
+miembros lectura; ruta añadida en `router.tsx`), y `required_checks` de Gate v2 en solo
+lectura en `TaskDetailPage.tsx` (no hay editor de políticas). Tests: `task-verification.test.ts`,
+`task-human-decisions-panel.test.tsx`, `settings/__tests__/ValidationChecksTab.test.tsx`, caso en `sse.test.ts`.
+Pendiente: verificar en CI tipos, lint y los tests; los enlaces de evidencia solo muestran
+kind/id copiable (sin vista dedicada).
+
+## Anexo RT (fase 1) — cableado de runtime y coordinación (IMPLEMENTADO / NOT RUN)
+
+Fecha: 2026-11-15. Escrito sin compilar ni ejecutar (la CI de GitHub es la única
+verificación). Tests: `cargo test --locked -p services --lib rt_validation_` y
+`rt_human_decision_` (puros: pins del envelope, política asimétrica, forma de turnos).
+
+- **Archivos:** `services/src/task_coordination/{validation_findings,turn_outputs}.rs`
+  (nuevos), `task_rework/validation_triage.rs` (nuevo), ediciones en
+  `task_coordination.rs`, `task_rework.rs`, `orchestrator_runtime.rs`,
+  `human_decision_service.rs` (solo `ensure_resume_request_for_batch`),
+  `db/src/sqlite/{execution,orchestrator_wake}.rs` (el claim de Start y la admisión
+  del wake solo admitían `work_unit_plan`/`review_findings`; ahora también
+  `validation_findings`/`human_decision_resume`, y `allowed_actions` acepta
+  `request_validation`/`ask_human`), workflow y `docs/concepts/orchestration.md`.
+- **Salidas:** `OrchestratorAction::{RequestValidation, AskHuman}` + kinds de política
+  con regla asimétrica; `CheckPins for CoordinationEnvelope` (pin + `on_request`).
+  La tabla `orchestrator_action` solo admite 4 `action_type` (CHECK de V094, sin
+  migración autorizada) y `requested_by_request_id`/`ResumeBinding` exigen una
+  request tipada, así que el canal `actions[]` las parsea y las rechaza
+  (`coordination.output_not_permitted`); se aplican en `outputs` de turnos
+  `validation_findings` (idempotentes por su propia clave exacta).
+- **validation_findings:** productor + scanner (sin doble cargo: el repo de request
+  carga `turn_count`), contexto exacto, `correct` (WorkUnit de corrección, solo
+  sujeto `work_unit_result`, en la tx del triage), `recheck` (re-encola sobre el sujeto
+  actual; sujeto sin cambios = replay), `human` (raise antes del triage).
+- **Resume:** scanner de decisiones respondidas sin `resume_request_id`; batch con
+  origen `HumanDecisionResume`; turno con forma validada; `correct|recheck`.
+
+**Puntos de riesgo:** `correct` no crea revisión formal pareada (no hay ReviewReport
+fuente; `TaskReworkService::request_rework` no consume ValidationRun); el resume no
+escribe `task_validation_triage` (el guard exige el `execution_id` de la request
+original); `recheck` sobre sujeto idéntico no re-ejecuta; scanner sin guard SQL de
+batch pausado (reintenta cada ciclo); review_findings v2 con `outputs` no cableado;
+paused kinds distintos de `validation_findings` rechazados.
