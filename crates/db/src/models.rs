@@ -1224,6 +1224,11 @@ pub struct ValidationRun {
     pub started_at: String,
     pub finished_at: Option<String>,
     pub logs_ref: Option<String>,
+    /// Catalog provenance (V171). `LegacyCommand` rows carry no catalog identity.
+    pub catalog_check_id: Option<String>,
+    pub definition_digest: Option<String>,
+    pub run_origin: ValidationRunOrigin,
+    pub check_request_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1242,6 +1247,12 @@ pub struct CreateValidationRun {
     pub commit_sha: String,
     pub workspace_snapshot_digest: String,
     pub idempotency_key: String,
+    /// All-or-nothing with `check_request_id`/`definition_digest`; use
+    /// `ValidationRunOrigin::LegacyCommand` with `None` for the historical path.
+    pub catalog_check_id: Option<String>,
+    pub definition_digest: Option<String>,
+    pub run_origin: ValidationRunOrigin,
+    pub check_request_id: Option<String>,
     pub started_at: String,
     pub created_at: String,
     pub updated_at: String,
@@ -2757,11 +2768,17 @@ pub struct RevokeTaskCoordinationInput {
 pub enum TaskCoordinationRequestKind {
     WorkUnitPlan,
     ReviewFindings,
+    ValidationFindings,
+    ExternalFeedback,
+    HumanDecisionResume,
 }
 
 enum_strings!(TaskCoordinationRequestKind {
     WorkUnitPlan => "work_unit_plan",
     ReviewFindings => "review_findings",
+    ValidationFindings => "validation_findings",
+    ExternalFeedback => "external_feedback",
+    HumanDecisionResume => "human_decision_resume",
 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2807,6 +2824,13 @@ pub struct TaskCoordinationRequest {
     pub review_report_artifact_id: Option<String>,
     pub review_report_digest: Option<String>,
     pub review_producer_execution_id: Option<String>,
+    /// Exact non-review source of validation_findings / external_feedback /
+    /// human_decision_resume requests (V172). `None` for historical kinds.
+    pub source_subject_kind: Option<String>,
+    pub source_subject_id: Option<String>,
+    pub source_subject_digest: Option<String>,
+    /// The request a human_decision_resume request continues (V172).
+    pub resumes_request_id: Option<String>,
     pub authorization_version: i64,
     pub mode: TaskCoordinationMode,
     pub brief_json: String,
@@ -2833,6 +2857,10 @@ pub struct CreateTaskCoordinationRequestInput {
     pub review_report_artifact_id: Option<String>,
     pub review_report_digest: Option<String>,
     pub review_producer_execution_id: Option<String>,
+    pub source_subject_kind: Option<String>,
+    pub source_subject_id: Option<String>,
+    pub source_subject_digest: Option<String>,
+    pub resumes_request_id: Option<String>,
     pub requested_by: String,
     pub expected_task_version: i64,
     pub authorization_version: i64,
@@ -2876,6 +2904,13 @@ pub enum ProjectPlanBatchRequestOrigin {
     },
     ReviewTriage {
         source_artifact_id: String,
+        producer_execution_id: String,
+    },
+    /// The exact source lives in `task_coordination_request.source_subject_*`.
+    ValidationTriage,
+    ExternalFeedbackTriage,
+    HumanDecisionResume,
+    CoordinatorReplan {
         producer_execution_id: String,
     },
 }
@@ -3439,5 +3474,537 @@ pub struct TaskLifecycleTransitionWrite {
     pub transition_id: String,
     pub gate_evaluation_id: Option<String>,
     pub replayed: bool,
+    pub event: Option<DomainEvent>,
+}
+
+// ---------------------------------------------------------------------------
+// V171 validation check catalog, requests and comparison; V172 triage/replan;
+// V174 human decisions (coordinator-verification-and-pr-loop, Phase 1).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationRunOrigin {
+    LegacyCommand,
+    CoordinatorRequest,
+    AfterIntegration,
+    /// Reserved by the frozen enum; never inserted (baseline results live in
+    /// `validation_comparison`, decision C2).
+    Baseline,
+}
+
+enum_strings!(ValidationRunOrigin {
+    LegacyCommand => "legacy_command",
+    CoordinatorRequest => "coordinator_request",
+    AfterIntegration => "after_integration",
+    Baseline => "baseline",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationCheckState {
+    Active,
+    Retired,
+}
+
+enum_strings!(ValidationCheckState {
+    Active => "active",
+    Retired => "retired",
+});
+
+/// Trigger pinned in the coordination envelope (`validation_checks[].trigger`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvelopeCheckTrigger {
+    OnRequest,
+    AfterIntegration,
+}
+
+enum_strings!(EnvelopeCheckTrigger {
+    OnRequest => "on_request",
+    AfterIntegration => "after_integration",
+});
+
+/// Trigger stored on a `validation_check_request` row. `CoordinatorRequest`
+/// requires an `on_request` pin; `AfterIntegration` an `after_integration` pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationCheckRequestTrigger {
+    CoordinatorRequest,
+    AfterIntegration,
+}
+
+enum_strings!(ValidationCheckRequestTrigger {
+    CoordinatorRequest => "coordinator_request",
+    AfterIntegration => "after_integration",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationCheckSubjectKind {
+    WorkUnitResult,
+    TaskIntegration,
+}
+
+enum_strings!(ValidationCheckSubjectKind {
+    WorkUnitResult => "work_unit_result",
+    TaskIntegration => "task_integration",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationCheckRequestState {
+    Queued,
+    Running,
+    Completed,
+    Cancelled,
+    FailedToStart,
+}
+
+enum_strings!(ValidationCheckRequestState {
+    Queued => "queued",
+    Running => "running",
+    Completed => "completed",
+    Cancelled => "cancelled",
+    FailedToStart => "failed_to_start",
+});
+
+impl ValidationCheckRequestState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Cancelled | Self::FailedToStart
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationComparisonClass {
+    Regression,
+    PreExistingFailure,
+    Fixed,
+    BothPass,
+    Inconclusive,
+}
+
+enum_strings!(ValidationComparisonClass {
+    Regression => "regression",
+    PreExistingFailure => "pre_existing_failure",
+    Fixed => "fixed",
+    BothPass => "both_pass",
+    Inconclusive => "inconclusive",
+});
+
+impl ValidationComparisonClass {
+    /// Deterministic classification enforced by the V171 CHECK constraint.
+    pub fn classify(candidate: ValidationRunStatus, baseline: ValidationRunStatus) -> Self {
+        match (candidate, baseline) {
+            (ValidationRunStatus::Passed, ValidationRunStatus::Passed) => Self::BothPass,
+            (ValidationRunStatus::Failed, ValidationRunStatus::Passed) => Self::Regression,
+            (ValidationRunStatus::Failed, ValidationRunStatus::Failed) => Self::PreExistingFailure,
+            (ValidationRunStatus::Passed, ValidationRunStatus::Failed) => Self::Fixed,
+            _ => Self::Inconclusive,
+        }
+    }
+}
+
+/// Input of the frozen `definition_digest`:
+/// `sha256(serde_json::to_string(&ValidationCheckDigestInput))` with this exact
+/// field order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationCheckDigestInput {
+    pub check_key: String,
+    pub version: i64,
+    pub command: String,
+    pub timeout_seconds: i64,
+    pub env_policy: String,
+}
+
+/// Frozen digest of a catalog definition version (sha256, lowercase hex).
+pub fn validation_check_definition_digest(input: &ValidationCheckDigestInput) -> String {
+    use sha2::{Digest, Sha256};
+    // Serializing plain strings and integers cannot fail.
+    let json = serde_json::to_string(input).unwrap_or_default();
+    hex::encode(Sha256::digest(json.as_bytes()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationCheckDefinition {
+    pub id: String,
+    pub project_id: String,
+    pub repo_id: Option<String>,
+    pub check_key: String,
+    pub version: i64,
+    pub command: String,
+    pub timeout_seconds: i64,
+    pub env_policy: String,
+    pub definition_digest: String,
+    pub state: ValidationCheckState,
+    pub created_by: String,
+    pub created_at: String,
+    pub retired_at: Option<String>,
+}
+
+/// Publishes the next exact version of `(project_id, repo_id, check_key)`. The
+/// repository assigns `version`, computes `definition_digest`, and retires the
+/// previous active version in the same `BEGIN IMMEDIATE` transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishValidationCheckDefinition {
+    pub id: String,
+    pub project_id: String,
+    pub repo_id: Option<String>,
+    pub check_key: String,
+    pub command: String,
+    pub timeout_seconds: i64,
+    pub env_policy: String,
+    pub created_by: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationCheckRequest {
+    pub id: String,
+    pub task_id: String,
+    pub authorization_version: i64,
+    pub check_definition_id: String,
+    pub definition_digest: String,
+    pub trigger_kind: ValidationCheckRequestTrigger,
+    pub subject_kind: ValidationCheckSubjectKind,
+    pub subject_id: String,
+    pub subject_version: i64,
+    pub workspace_id: String,
+    pub commit_sha: String,
+    pub workspace_snapshot_digest: String,
+    pub baseline: bool,
+    pub baseline_commit_sha: Option<String>,
+    pub requested_by_request_id: Option<String>,
+    pub requested_by_execution_id: Option<String>,
+    pub reason: Option<String>,
+    pub idempotency_key: String,
+    pub state: ValidationCheckRequestState,
+    pub candidate_run_id: Option<String>,
+    pub failure_code: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateValidationCheckRequest {
+    pub id: String,
+    pub task_id: String,
+    pub authorization_version: i64,
+    pub check_definition_id: String,
+    pub definition_digest: String,
+    pub trigger_kind: ValidationCheckRequestTrigger,
+    pub subject_kind: ValidationCheckSubjectKind,
+    pub subject_id: String,
+    pub subject_version: i64,
+    pub workspace_id: String,
+    pub commit_sha: String,
+    pub workspace_snapshot_digest: String,
+    pub baseline: bool,
+    pub requested_by_request_id: Option<String>,
+    pub requested_by_execution_id: Option<String>,
+    pub reason: Option<String>,
+    pub idempotency_key: String,
+    pub created_at: String,
+}
+
+/// Forward-only transition guarded by `expected_version` (typed conflict).
+/// `candidate_run_id`/`baseline_commit_sha` may be set once while open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionValidationCheckRequest {
+    pub id: String,
+    pub expected_version: i64,
+    pub to_state: ValidationCheckRequestState,
+    pub candidate_run_id: Option<String>,
+    pub baseline_commit_sha: Option<String>,
+    pub failure_code: Option<String>,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationCheckRequestWrite {
+    pub request: ValidationCheckRequest,
+    /// `false` means an identical idempotent replay returned the existing row.
+    pub created: bool,
+    pub event: Option<DomainEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationComparison {
+    pub id: String,
+    pub task_id: String,
+    pub check_request_id: String,
+    pub candidate_run_id: String,
+    pub candidate_status: ValidationRunStatus,
+    pub candidate_output_digest: Option<String>,
+    pub baseline_commit_sha: String,
+    pub baseline_snapshot_digest: String,
+    pub baseline_provenance_json: String,
+    pub baseline_status: ValidationRunStatus,
+    pub baseline_exit_code: Option<i64>,
+    pub baseline_output_digest: Option<String>,
+    pub classification: ValidationComparisonClass,
+    pub same_output_digest: bool,
+    pub created_at: String,
+}
+
+/// `classification` and `same_output_digest` are derived by the repository from
+/// the statuses and digests (never trusted from the caller).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateValidationComparison {
+    pub id: String,
+    pub task_id: String,
+    pub check_request_id: String,
+    pub candidate_run_id: String,
+    pub candidate_output_digest: Option<String>,
+    pub baseline_commit_sha: String,
+    pub baseline_snapshot_digest: String,
+    pub baseline_provenance_json: String,
+    pub baseline_status: ValidationRunStatus,
+    pub baseline_exit_code: Option<i64>,
+    pub baseline_output_digest: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationComparisonWrite {
+    pub comparison: ValidationComparison,
+    pub created: bool,
+    pub event: Option<DomainEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationTriageDisposition {
+    Correct,
+    Recheck,
+    Human,
+}
+
+enum_strings!(ValidationTriageDisposition {
+    Correct => "correct",
+    Recheck => "recheck",
+    Human => "human",
+});
+
+/// Immutable decision of a `validation_findings` coordination request (V172).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskValidationTriage {
+    pub request_id: String,
+    pub task_id: String,
+    pub validation_run_id: String,
+    pub comparison_id: Option<String>,
+    pub run_digest: String,
+    pub execution_id: String,
+    pub authorization_version: i64,
+    pub disposition: ValidationTriageDisposition,
+    pub rationale: String,
+    pub instructions: String,
+    pub decision_digest: String,
+    pub review_work_unit_id: Option<String>,
+    pub rework_ref: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinatorReplanState {
+    Proposed,
+    Planning,
+    AwaitingHuman,
+    Approved,
+    Rejected,
+    Materialized,
+    Failed,
+}
+
+enum_strings!(CoordinatorReplanState {
+    Proposed => "proposed",
+    Planning => "planning",
+    AwaitingHuman => "awaiting_human",
+    Approved => "approved",
+    Rejected => "rejected",
+    Materialized => "materialized",
+    Failed => "failed",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinatorReplanClassification {
+    WithinEnvelope,
+    ScopeOrAuthorityChange,
+}
+
+enum_strings!(CoordinatorReplanClassification {
+    WithinEnvelope => "within_envelope",
+    ScopeOrAuthorityChange => "scope_or_authority_change",
+});
+
+/// Hard D6 limit: at most `MAX_COORDINATOR_REPLANS_PER_TASK` rows per Task.
+pub const MAX_COORDINATOR_REPLANS_PER_TASK: i64 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCoordinatorReplan {
+    pub id: String,
+    pub task_id: String,
+    pub ordinal: i64,
+    pub authorization_version: i64,
+    pub source_request_id: String,
+    pub producer_execution_id: String,
+    pub plan_request_id: Option<String>,
+    pub reason: String,
+    pub evidence_links_json: String,
+    pub classification: Option<CoordinatorReplanClassification>,
+    pub classification_facts_json: Option<String>,
+    pub human_decision_id: Option<String>,
+    pub state: CoordinatorReplanState,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The repository assigns `ordinal = max + 1` inside `BEGIN IMMEDIATE`; a third
+/// proposal fails with `DbError::CoordinatorReplanLimitReached`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateCoordinatorReplan {
+    pub id: String,
+    pub task_id: String,
+    pub authorization_version: i64,
+    pub source_request_id: String,
+    pub producer_execution_id: String,
+    pub reason: String,
+    pub evidence_links_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionCoordinatorReplan {
+    pub id: String,
+    pub expected_version: i64,
+    pub to_state: CoordinatorReplanState,
+    /// Each optional field may be set once (`None` keeps the stored value).
+    pub plan_request_id: Option<String>,
+    pub classification: Option<CoordinatorReplanClassification>,
+    pub classification_facts_json: Option<String>,
+    pub human_decision_id: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanDecisionState {
+    Open,
+    Answered,
+    Superseded,
+    Cancelled,
+}
+
+enum_strings!(HumanDecisionState {
+    Open => "open",
+    Answered => "answered",
+    Superseded => "superseded",
+    Cancelled => "cancelled",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanDecisionSourceKind {
+    CoordinationRequest,
+    QualityRequest,
+    GateEvaluation,
+    ValidationRun,
+    ExternalFeedback,
+    CoordinatorReplan,
+}
+
+enum_strings!(HumanDecisionSourceKind {
+    CoordinationRequest => "coordination_request",
+    QualityRequest => "quality_request",
+    GateEvaluation => "gate_evaluation",
+    ValidationRun => "validation_run",
+    ExternalFeedback => "external_feedback",
+    CoordinatorReplan => "coordinator_replan",
+});
+
+/// Ordered: `None < Scope < Authority`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityEffect {
+    None,
+    Scope,
+    Authority,
+}
+
+enum_strings!(AuthorityEffect {
+    None => "none",
+    Scope => "scope",
+    Authority => "authority",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HumanDecisionRequest {
+    pub id: String,
+    pub task_id: String,
+    pub source_kind: HumanDecisionSourceKind,
+    pub source_id: String,
+    pub raised_by_execution_id: Option<String>,
+    pub authorization_version: Option<i64>,
+    pub question: String,
+    pub options_json: String,
+    pub recommended_option_id: Option<String>,
+    pub recommendation_rationale: Option<String>,
+    pub evidence_links_json: String,
+    pub max_authority_effect: AuthorityEffect,
+    pub state: HumanDecisionState,
+    pub answered_by_user_id: Option<String>,
+    pub answered_option_id: Option<String>,
+    pub answer_note: Option<String>,
+    pub answered_at: Option<String>,
+    pub resume_request_id: Option<String>,
+    pub resume_binding_json: String,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateHumanDecisionRequest {
+    pub id: String,
+    pub task_id: String,
+    pub source_kind: HumanDecisionSourceKind,
+    pub source_id: String,
+    pub raised_by_execution_id: Option<String>,
+    pub authorization_version: Option<i64>,
+    pub question: String,
+    pub options_json: String,
+    pub recommended_option_id: Option<String>,
+    pub recommendation_rationale: Option<String>,
+    pub evidence_links_json: String,
+    pub max_authority_effect: AuthorityEffect,
+    pub resume_binding_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnswerHumanDecision {
+    pub id: String,
+    pub expected_version: i64,
+    pub option_id: String,
+    pub answered_by_user_id: String,
+    pub note: Option<String>,
+    pub answered_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HumanDecisionWrite {
+    pub decision: HumanDecisionRequest,
+    /// `false` means an identical idempotent replay returned the existing row.
+    pub created: bool,
     pub event: Option<DomainEvent>,
 }

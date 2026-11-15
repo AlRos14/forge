@@ -88,6 +88,18 @@ pub enum DbError {
     #[error("WorkUnit already has a Running Execution")]
     WorkUnitExecutionAlreadyRunning,
 
+    #[error("the validation check pin is stale, retired, or not part of the Task scope")]
+    ValidationCheckStalePin,
+
+    #[error("the validation check is not authorized by the current coordination envelope")]
+    ValidationCheckNotAuthorized,
+
+    #[error("the validation workspace has an active worker WorkspaceLease")]
+    ValidationWorkspaceLeased,
+
+    #[error("the Task already used its coordinator replan limit")]
+    CoordinatorReplanLimitReached,
+
     #[error("Coordinator turn budget exhausted; a Human may authorize extra rounds")]
     CoordinationTurnBudgetExhausted,
 

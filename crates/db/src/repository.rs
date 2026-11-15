@@ -2770,3 +2770,198 @@ pub trait SystemSettingRepo: Send + Sync {
     async fn list_settings(&self) -> Result<Vec<(String, String)>>;
     async fn delete_setting(&self, key: &str) -> Result<()>;
 }
+
+/// Versioned validation check catalog (V171). Rows are immutable except
+/// `active -> retired`; a new version is a new row.
+#[async_trait]
+pub trait ValidationCatalogRepo: Send + Sync {
+    /// Assign the next exact version, compute `definition_digest`
+    /// (`validation_check_definition_digest`), retire the previous active
+    /// version and insert the new one in one `BEGIN IMMEDIATE` transaction.
+    async fn publish_validation_check_definition(
+        &self,
+        input: PublishValidationCheckDefinition,
+    ) -> Result<ValidationCheckDefinition>;
+    /// `expected_state` must be `Active`; a definition that is no longer active
+    /// returns `DbError::VersionConflict`.
+    async fn retire_validation_check_definition(
+        &self,
+        id: &str,
+        expected_state: ValidationCheckState,
+        retired_at: &str,
+    ) -> Result<ValidationCheckDefinition>;
+    async fn get_validation_check_definition(
+        &self,
+        id: &str,
+    ) -> Result<Option<ValidationCheckDefinition>>;
+    async fn get_active_validation_check_definition(
+        &self,
+        project_id: &str,
+        repo_id: Option<&str>,
+        check_key: &str,
+    ) -> Result<Option<ValidationCheckDefinition>>;
+    async fn list_validation_check_definitions(
+        &self,
+        project_id: &str,
+        repo_id: Option<&str>,
+        state: Option<ValidationCheckState>,
+        page: &PageRequest,
+    ) -> Result<Page<ValidationCheckDefinition>>;
+}
+
+/// Queued/claimed/terminal check requests (V171). Transitions are guarded by
+/// `expected_version` and return `DbError::VersionConflict` on a stale write.
+#[async_trait]
+pub trait ValidationCheckRequestRepo: Send + Sync {
+    /// Insert queued, or return the identical existing row for the same
+    /// `idempotency_key` (`created == false`, no second event). A key bound to a
+    /// different exact subject is `DbError::IdempotencyConflict`.
+    async fn create_validation_check_request(
+        &self,
+        input: CreateValidationCheckRequest,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<ValidationCheckRequestWrite>;
+    async fn transition_validation_check_request(
+        &self,
+        input: TransitionValidationCheckRequest,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<ValidationCheckRequestWrite>;
+    async fn get_validation_check_request(
+        &self,
+        id: &str,
+    ) -> Result<Option<ValidationCheckRequest>>;
+    async fn get_validation_check_request_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<ValidationCheckRequest>>;
+    async fn list_validation_check_requests_by_task(
+        &self,
+        task_id: &str,
+        state: Option<ValidationCheckRequestState>,
+        page: &PageRequest,
+    ) -> Result<Page<ValidationCheckRequest>>;
+    /// Oldest first; used by the runner to claim (`queued`) or recover (`running`).
+    async fn list_validation_check_requests_by_state(
+        &self,
+        state: ValidationCheckRequestState,
+        limit: i64,
+    ) -> Result<Vec<ValidationCheckRequest>>;
+}
+
+#[async_trait]
+pub trait ValidationComparisonRepo: Send + Sync {
+    /// Immutable evidence; one per request. The repository derives
+    /// `classification` and `same_output_digest`. An identical replay returns
+    /// the stored row with `created == false`.
+    async fn create_validation_comparison(
+        &self,
+        input: CreateValidationComparison,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<ValidationComparisonWrite>;
+    async fn get_validation_comparison(&self, id: &str) -> Result<Option<ValidationComparison>>;
+    async fn get_validation_comparison_by_request(
+        &self,
+        check_request_id: &str,
+    ) -> Result<Option<ValidationComparison>>;
+    async fn list_validation_comparisons_by_task(
+        &self,
+        task_id: &str,
+        page: &PageRequest,
+    ) -> Result<Page<ValidationComparison>>;
+}
+
+/// Immutable coordinator decisions over a `validation_findings` request (V172).
+#[async_trait]
+pub trait TaskValidationTriageRepo: Send + Sync {
+    /// Idempotent per `request_id`: an identical `decision_digest` returns the
+    /// stored row, a different one is `DbError::IdempotencyConflict`.
+    async fn insert_task_validation_triage(
+        &self,
+        input: TaskValidationTriage,
+    ) -> Result<TaskValidationTriage>;
+    async fn get_task_validation_triage_by_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<TaskValidationTriage>>;
+    async fn get_task_validation_triage_for_run(
+        &self,
+        validation_run_id: &str,
+        authorization_version: i64,
+    ) -> Result<Option<TaskValidationTriage>>;
+    async fn list_task_validation_triage_by_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<TaskValidationTriage>>;
+}
+
+/// Coordinator replans with the hard limit of
+/// `MAX_COORDINATOR_REPLANS_PER_TASK` per Task (V172).
+#[async_trait]
+pub trait TaskCoordinatorReplanRepo: Send + Sync {
+    /// Assign `ordinal = max + 1` under `BEGIN IMMEDIATE`; beyond the limit
+    /// returns `DbError::CoordinatorReplanLimitReached`.
+    async fn create_coordinator_replan(
+        &self,
+        input: CreateCoordinatorReplan,
+    ) -> Result<TaskCoordinatorReplan>;
+    async fn transition_coordinator_replan(
+        &self,
+        input: TransitionCoordinatorReplan,
+    ) -> Result<TaskCoordinatorReplan>;
+    async fn get_coordinator_replan(&self, id: &str) -> Result<Option<TaskCoordinatorReplan>>;
+    async fn list_coordinator_replans_by_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<TaskCoordinatorReplan>>;
+}
+
+/// Structured human decision requests (V174).
+#[async_trait]
+pub trait HumanDecisionRepo: Send + Sync {
+    /// Insert open, or return the identical existing row for the same exact
+    /// `(source_kind, source_id, authorization_version)` (`created == false`).
+    /// A different question/options/binding for that source is
+    /// `DbError::IdempotencyConflict`.
+    async fn create_human_decision_request(
+        &self,
+        input: CreateHumanDecisionRequest,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<HumanDecisionWrite>;
+    /// `open -> answered`; stale version or a non-open request is
+    /// `DbError::VersionConflict`.
+    async fn answer_human_decision(
+        &self,
+        input: AnswerHumanDecision,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<HumanDecisionWrite>;
+    /// `open -> superseded|cancelled`.
+    async fn close_human_decision(
+        &self,
+        id: &str,
+        expected_version: i64,
+        to_state: HumanDecisionState,
+        updated_at: &str,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<HumanDecisionWrite>;
+    /// Record the exact `human_decision_resume` request once, on an answered row.
+    async fn bind_human_decision_resume_request(
+        &self,
+        id: &str,
+        expected_version: i64,
+        resume_request_id: &str,
+        updated_at: &str,
+    ) -> Result<HumanDecisionRequest>;
+    async fn get_human_decision_request(&self, id: &str) -> Result<Option<HumanDecisionRequest>>;
+    async fn get_human_decision_request_by_source(
+        &self,
+        source_kind: HumanDecisionSourceKind,
+        source_id: &str,
+        authorization_version: Option<i64>,
+    ) -> Result<Option<HumanDecisionRequest>>;
+    async fn list_human_decision_requests_by_task(
+        &self,
+        task_id: &str,
+        state: Option<HumanDecisionState>,
+        page: &PageRequest,
+    ) -> Result<Page<HumanDecisionRequest>>;
+}

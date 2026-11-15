@@ -22,6 +22,9 @@ pub enum TaskCoordinationMode {
 pub enum TaskCoordinationRequestKind {
     WorkUnitPlan,
     ReviewFindings,
+    ValidationFindings,
+    ExternalFeedback,
+    HumanDecisionResume,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]

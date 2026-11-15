@@ -1,5 +1,10 @@
 use super::*;
-use crate::{MaterializedWorkUnit, TaskCoordinationMode, UpdateTaskQualityRequestState};
+use crate::{
+    CoordinatorReplanClassification, CoordinatorReplanState, CreateCoordinatorReplan,
+    MaterializedWorkUnit, TaskCoordinationMode, TaskCoordinatorReplan, TaskCoordinatorReplanRepo,
+    TaskValidationTriage, TaskValidationTriageRepo, TransitionCoordinatorReplan,
+    UpdateTaskQualityRequestState, ValidationTriageDisposition, MAX_COORDINATOR_REPLANS_PER_TASK,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -390,6 +395,10 @@ async fn create_task_coordination_request_write(
             || existing.review_report_artifact_id != input.review_report_artifact_id
             || existing.review_report_digest != input.review_report_digest
             || existing.review_producer_execution_id != input.review_producer_execution_id
+            || existing.source_subject_kind != input.source_subject_kind
+            || existing.source_subject_id != input.source_subject_id
+            || existing.source_subject_digest != input.source_subject_digest
+            || existing.resumes_request_id != input.resumes_request_id
         {
             return Err(DbError::IdempotencyConflict);
         }
@@ -403,40 +412,7 @@ async fn create_task_coordination_request_write(
         match batch_binding.as_ref() {
             None if existing_is_batch_bound => return Err(DbError::ProjectPlanBatchInactive),
             Some(binding) => {
-                let expected_origin = match &binding.origin {
-                    ProjectPlanBatchRequestOrigin::Scheduler { claim_token } => {
-                        ("scheduler", Some(claim_token.as_str()), None, None, None)
-                    }
-                    ProjectPlanBatchRequestOrigin::QualityReplan {
-                        source_artifact_id,
-                        producer_execution_id,
-                    } => (
-                        "quality_replan",
-                        None,
-                        Some(source_artifact_id.as_str()),
-                        Some(producer_execution_id.as_str()),
-                        None,
-                    ),
-                    ProjectPlanBatchRequestOrigin::ReviewTriage {
-                        source_artifact_id,
-                        producer_execution_id,
-                    } => (
-                        "review_triage",
-                        None,
-                        Some(source_artifact_id.as_str()),
-                        Some(producer_execution_id.as_str()),
-                        None,
-                    ),
-                    ProjectPlanBatchRequestOrigin::HumanReplan {
-                        approved_plan_artifact_id,
-                    } => (
-                        "human_replan",
-                        None,
-                        None,
-                        None,
-                        Some(approved_plan_artifact_id.as_str()),
-                    ),
-                };
+                let expected_origin = batch_origin_columns(&binding.origin);
                 let matching: bool = sqlx::query_scalar(
                     "SELECT EXISTS(
                         SELECT 1 FROM project_plan_batch_coordination_request scope
@@ -529,40 +505,7 @@ async fn create_task_coordination_request_write(
             return Err(DbError::ProjectPlanBatchInactive);
         }
         validate_project_batch_request_binding_in_tx(&mut tx, &input, binding).await?;
-        let origin = match &binding.origin {
-            ProjectPlanBatchRequestOrigin::Scheduler { claim_token } => {
-                ("scheduler", Some(claim_token.as_str()), None, None, None)
-            }
-            ProjectPlanBatchRequestOrigin::QualityReplan {
-                source_artifact_id,
-                producer_execution_id,
-            } => (
-                "quality_replan",
-                None,
-                Some(source_artifact_id.as_str()),
-                Some(producer_execution_id.as_str()),
-                None,
-            ),
-            ProjectPlanBatchRequestOrigin::ReviewTriage {
-                source_artifact_id,
-                producer_execution_id,
-            } => (
-                "review_triage",
-                None,
-                Some(source_artifact_id.as_str()),
-                Some(producer_execution_id.as_str()),
-                None,
-            ),
-            ProjectPlanBatchRequestOrigin::HumanReplan {
-                approved_plan_artifact_id,
-            } => (
-                "human_replan",
-                None,
-                None,
-                None,
-                Some(approved_plan_artifact_id.as_str()),
-            ),
-        };
+        let origin = batch_origin_columns(&binding.origin);
         sqlx::query(
             "INSERT INTO project_plan_batch_coordination_request(
                 request_id,project_id,batch_id,task_id,authorization_version,authorized_by,
@@ -639,8 +582,9 @@ async fn create_task_coordination_request_write(
             id, task_id, authorization_version, mode, brief_json,
             objective_digest, request_digest, idempotency_key, state,
             version, created_at, updated_at, kind, review_report_artifact_id,
-            review_report_digest, review_producer_execution_id
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', 1, ?, ?, ?, ?, ?, ?)",
+            review_report_digest, review_producer_execution_id,
+            source_subject_kind, source_subject_id, source_subject_digest, resumes_request_id
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&input.id)
     .bind(&input.task_id)
@@ -656,6 +600,10 @@ async fn create_task_coordination_request_write(
     .bind(&input.review_report_artifact_id)
     .bind(&input.review_report_digest)
     .bind(&input.review_producer_execution_id)
+    .bind(&input.source_subject_kind)
+    .bind(&input.source_subject_id)
+    .bind(&input.source_subject_digest)
+    .bind(&input.resumes_request_id)
     .execute(&mut *tx)
     .await
     .map_err(check_error)?;
@@ -677,7 +625,11 @@ async fn create_task_coordination_request_write(
             }
             ProjectPlanBatchRequestOrigin::QualityReplan { .. }
             | ProjectPlanBatchRequestOrigin::HumanReplan { .. }
-            | ProjectPlanBatchRequestOrigin::ReviewTriage { .. } => {
+            | ProjectPlanBatchRequestOrigin::ReviewTriage { .. }
+            | ProjectPlanBatchRequestOrigin::ValidationTriage
+            | ProjectPlanBatchRequestOrigin::ExternalFeedbackTriage
+            | ProjectPlanBatchRequestOrigin::HumanDecisionResume
+            | ProjectPlanBatchRequestOrigin::CoordinatorReplan { .. } => {
                 sqlx::query(
                     "UPDATE project_plan_batch_task SET
                         coordination_request_id=COALESCE(coordination_request_id,?)
@@ -752,6 +704,44 @@ async fn validate_project_batch_request_binding_in_tx(
             .bind(&binding.batch_id)
             .bind(source_artifact_id)
             .bind(producer_execution_id)
+            .bind(&input.task_id)
+            .bind(binding.expected_coordination_version)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        ProjectPlanBatchRequestOrigin::ValidationTriage
+        | ProjectPlanBatchRequestOrigin::ExternalFeedbackTriage
+        | ProjectPlanBatchRequestOrigin::HumanDecisionResume => {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM project_plan_batch_task bt
+                 WHERE bt.batch_id=? AND bt.task_id=? AND bt.state='started'
+                   AND bt.coordination_snapshot_digest=?)",
+            )
+            .bind(&binding.batch_id)
+            .bind(&input.task_id)
+            .bind(&binding.coordination_snapshot_digest)
+            .fetch_one(&mut **tx)
+            .await?
+        }
+        ProjectPlanBatchRequestOrigin::CoordinatorReplan {
+            producer_execution_id,
+        } => {
+            sqlx::query_scalar(
+                "SELECT EXISTS(
+                SELECT 1 FROM project_plan_batch_task bt
+                WHERE bt.batch_id=? AND bt.task_id=? AND bt.state='started'
+                  AND bt.coordination_snapshot_digest=?
+            ) AND EXISTS(
+                SELECT 1 FROM project_plan_batch_execution exec_link
+                WHERE exec_link.execution_id=? AND exec_link.batch_id=?
+                  AND exec_link.task_id=? AND exec_link.authorization_version=?
+            )",
+            )
+            .bind(&binding.batch_id)
+            .bind(&input.task_id)
+            .bind(&binding.coordination_snapshot_digest)
+            .bind(producer_execution_id)
+            .bind(&binding.batch_id)
             .bind(&input.task_id)
             .bind(binding.expected_coordination_version)
             .fetch_one(&mut **tx)
@@ -1106,6 +1096,72 @@ fn map_task_coordination_receipt(row: SqliteRow) -> Result<TaskCoordinationRecei
     })
 }
 
+type BatchOriginColumns<'a> = (
+    &'static str,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+);
+
+/// `(origin_kind, claim_token, source_artifact_id, producer_execution_id,
+/// approved_plan_artifact_id)` exactly as stored in
+/// `project_plan_batch_coordination_request`.
+fn batch_origin_columns(origin: &ProjectPlanBatchRequestOrigin) -> BatchOriginColumns<'_> {
+    match origin {
+        ProjectPlanBatchRequestOrigin::Scheduler { claim_token } => {
+            ("scheduler", Some(claim_token.as_str()), None, None, None)
+        }
+        ProjectPlanBatchRequestOrigin::QualityReplan {
+            source_artifact_id,
+            producer_execution_id,
+        } => (
+            "quality_replan",
+            None,
+            Some(source_artifact_id.as_str()),
+            Some(producer_execution_id.as_str()),
+            None,
+        ),
+        ProjectPlanBatchRequestOrigin::ReviewTriage {
+            source_artifact_id,
+            producer_execution_id,
+        } => (
+            "review_triage",
+            None,
+            Some(source_artifact_id.as_str()),
+            Some(producer_execution_id.as_str()),
+            None,
+        ),
+        ProjectPlanBatchRequestOrigin::HumanReplan {
+            approved_plan_artifact_id,
+        } => (
+            "human_replan",
+            None,
+            None,
+            None,
+            Some(approved_plan_artifact_id.as_str()),
+        ),
+        ProjectPlanBatchRequestOrigin::ValidationTriage => {
+            ("validation_triage", None, None, None, None)
+        }
+        ProjectPlanBatchRequestOrigin::ExternalFeedbackTriage => {
+            ("external_feedback_triage", None, None, None, None)
+        }
+        ProjectPlanBatchRequestOrigin::HumanDecisionResume => {
+            ("human_decision_resume", None, None, None, None)
+        }
+        ProjectPlanBatchRequestOrigin::CoordinatorReplan {
+            producer_execution_id,
+        } => (
+            "coordinator_replan",
+            None,
+            None,
+            Some(producer_execution_id.as_str()),
+            None,
+        ),
+    }
+}
+
 fn map_task_coordination_request(row: SqliteRow) -> Result<TaskCoordinationRequest> {
     Ok(TaskCoordinationRequest {
         id: row.try_get("id")?,
@@ -1113,6 +1169,10 @@ fn map_task_coordination_request(row: SqliteRow) -> Result<TaskCoordinationReque
         review_report_artifact_id: row.try_get("review_report_artifact_id")?,
         review_report_digest: row.try_get("review_report_digest")?,
         review_producer_execution_id: row.try_get("review_producer_execution_id")?,
+        source_subject_kind: row.try_get("source_subject_kind")?,
+        source_subject_id: row.try_get("source_subject_id")?,
+        source_subject_digest: row.try_get("source_subject_digest")?,
+        resumes_request_id: row.try_get("resumes_request_id")?,
         task_id: row.try_get("task_id")?,
         authorization_version: row.try_get("authorization_version")?,
         mode: parse_enum(row.try_get("mode")?)?,
@@ -2866,5 +2926,267 @@ impl TaskCoordinationRepo for SqliteDb {
             .and_then(map_intervention)?;
         tx.commit().await?;
         Ok(intervention)
+    }
+}
+
+fn map_task_validation_triage(row: SqliteRow) -> Result<TaskValidationTriage> {
+    Ok(TaskValidationTriage {
+        request_id: row.try_get("request_id")?,
+        task_id: row.try_get("task_id")?,
+        validation_run_id: row.try_get("validation_run_id")?,
+        comparison_id: row.try_get("comparison_id")?,
+        run_digest: row.try_get("run_digest")?,
+        execution_id: row.try_get("execution_id")?,
+        authorization_version: row.try_get("authorization_version")?,
+        disposition: parse_enum::<ValidationTriageDisposition>(row.try_get("disposition")?)?,
+        rationale: row.try_get("rationale")?,
+        instructions: row.try_get("instructions")?,
+        decision_digest: row.try_get("decision_digest")?,
+        review_work_unit_id: row.try_get("review_work_unit_id")?,
+        rework_ref: row.try_get("rework_ref")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+#[async_trait]
+impl TaskValidationTriageRepo for SqliteDb {
+    async fn insert_task_validation_triage(
+        &self,
+        input: TaskValidationTriage,
+    ) -> Result<TaskValidationTriage> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let existing = sqlx::query("SELECT * FROM task_validation_triage WHERE request_id = ?")
+            .bind(&input.request_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_task_validation_triage)
+            .transpose()?;
+        if let Some(existing) = existing {
+            if existing.decision_digest != input.decision_digest {
+                return Err(DbError::IdempotencyConflict);
+            }
+            tx.commit().await?;
+            return Ok(existing);
+        }
+        sqlx::query(
+            "INSERT INTO task_validation_triage (
+                request_id, task_id, validation_run_id, comparison_id, run_digest,
+                execution_id, authorization_version, disposition, rationale, instructions,
+                decision_digest, review_work_unit_id, rework_ref, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&input.request_id)
+        .bind(&input.task_id)
+        .bind(&input.validation_run_id)
+        .bind(&input.comparison_id)
+        .bind(&input.run_digest)
+        .bind(&input.execution_id)
+        .bind(input.authorization_version)
+        .bind(input.disposition.to_string())
+        .bind(&input.rationale)
+        .bind(&input.instructions)
+        .bind(&input.decision_digest)
+        .bind(&input.review_work_unit_id)
+        .bind(&input.rework_ref)
+        .bind(&input.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(check_error)?;
+        let triage = sqlx::query("SELECT * FROM task_validation_triage WHERE request_id = ?")
+            .bind(&input.request_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(DbError::from)
+            .and_then(map_task_validation_triage)?;
+        tx.commit().await?;
+        Ok(triage)
+    }
+
+    async fn get_task_validation_triage_by_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<TaskValidationTriage>> {
+        sqlx::query("SELECT * FROM task_validation_triage WHERE request_id = ?")
+            .bind(request_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(map_task_validation_triage)
+            .transpose()
+    }
+
+    async fn get_task_validation_triage_for_run(
+        &self,
+        validation_run_id: &str,
+        authorization_version: i64,
+    ) -> Result<Option<TaskValidationTriage>> {
+        sqlx::query(
+            "SELECT * FROM task_validation_triage
+             WHERE validation_run_id = ? AND authorization_version = ?",
+        )
+        .bind(validation_run_id)
+        .bind(authorization_version)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(map_task_validation_triage)
+        .transpose()
+    }
+
+    async fn list_task_validation_triage_by_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<TaskValidationTriage>> {
+        sqlx::query(
+            "SELECT * FROM task_validation_triage WHERE task_id = ?
+             ORDER BY created_at ASC, request_id ASC",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_task_validation_triage)
+        .collect()
+    }
+}
+
+fn map_task_coordinator_replan(row: SqliteRow) -> Result<TaskCoordinatorReplan> {
+    let classification: Option<String> = row.try_get("classification")?;
+    Ok(TaskCoordinatorReplan {
+        id: row.try_get("id")?,
+        task_id: row.try_get("task_id")?,
+        ordinal: row.try_get("ordinal")?,
+        authorization_version: row.try_get("authorization_version")?,
+        source_request_id: row.try_get("source_request_id")?,
+        producer_execution_id: row.try_get("producer_execution_id")?,
+        plan_request_id: row.try_get("plan_request_id")?,
+        reason: row.try_get("reason")?,
+        evidence_links_json: row.try_get("evidence_links_json")?,
+        classification: classification
+            .map(parse_enum::<CoordinatorReplanClassification>)
+            .transpose()?,
+        classification_facts_json: row.try_get("classification_facts_json")?,
+        human_decision_id: row.try_get("human_decision_id")?,
+        state: parse_enum::<CoordinatorReplanState>(row.try_get("state")?)?,
+        version: row.try_get("version")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+#[async_trait]
+impl TaskCoordinatorReplanRepo for SqliteDb {
+    async fn create_coordinator_replan(
+        &self,
+        input: CreateCoordinatorReplan,
+    ) -> Result<TaskCoordinatorReplan> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let used: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(ordinal), 0) FROM task_coordinator_replan WHERE task_id = ?",
+        )
+        .bind(&input.task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if used >= MAX_COORDINATOR_REPLANS_PER_TASK {
+            return Err(DbError::CoordinatorReplanLimitReached);
+        }
+        sqlx::query(
+            "INSERT INTO task_coordinator_replan (
+                id, task_id, ordinal, authorization_version, source_request_id,
+                producer_execution_id, reason, evidence_links_json, state, version,
+                created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', 1, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(used + 1)
+        .bind(input.authorization_version)
+        .bind(&input.source_request_id)
+        .bind(&input.producer_execution_id)
+        .bind(&input.reason)
+        .bind(&input.evidence_links_json)
+        .bind(&input.created_at)
+        .bind(&input.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(check_error)?;
+        let replan = sqlx::query("SELECT * FROM task_coordinator_replan WHERE id = ?")
+            .bind(&input.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(DbError::from)
+            .and_then(map_task_coordinator_replan)?;
+        tx.commit().await?;
+        Ok(replan)
+    }
+
+    async fn transition_coordinator_replan(
+        &self,
+        input: TransitionCoordinatorReplan,
+    ) -> Result<TaskCoordinatorReplan> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let updated = sqlx::query(
+            "UPDATE task_coordinator_replan SET
+                state = ?,
+                plan_request_id = COALESCE(?, plan_request_id),
+                classification = COALESCE(?, classification),
+                classification_facts_json = COALESCE(?, classification_facts_json),
+                human_decision_id = COALESCE(?, human_decision_id),
+                version = version + 1,
+                updated_at = ?
+             WHERE id = ? AND version = ?",
+        )
+        .bind(input.to_state.to_string())
+        .bind(&input.plan_request_id)
+        .bind(input.classification.map(|value| value.to_string()))
+        .bind(&input.classification_facts_json)
+        .bind(&input.human_decision_id)
+        .bind(&input.updated_at)
+        .bind(&input.id)
+        .bind(input.expected_version)
+        .execute(&mut *tx)
+        .await
+        .map_err(check_error)?;
+        if updated.rows_affected() != 1 {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM task_coordinator_replan WHERE id = ?)",
+            )
+            .bind(&input.id)
+            .fetch_one(&mut *tx)
+            .await?;
+            return Err(if exists {
+                DbError::VersionConflict
+            } else {
+                DbError::NotFound
+            });
+        }
+        let replan = sqlx::query("SELECT * FROM task_coordinator_replan WHERE id = ?")
+            .bind(&input.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(DbError::from)
+            .and_then(map_task_coordinator_replan)?;
+        tx.commit().await?;
+        Ok(replan)
+    }
+
+    async fn get_coordinator_replan(&self, id: &str) -> Result<Option<TaskCoordinatorReplan>> {
+        sqlx::query("SELECT * FROM task_coordinator_replan WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(map_task_coordinator_replan)
+            .transpose()
+    }
+
+    async fn list_coordinator_replans_by_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<TaskCoordinatorReplan>> {
+        sqlx::query("SELECT * FROM task_coordinator_replan WHERE task_id = ? ORDER BY ordinal ASC")
+            .bind(task_id)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(map_task_coordinator_replan)
+            .collect()
     }
 }

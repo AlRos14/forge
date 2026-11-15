@@ -3393,6 +3393,10 @@ async fn pr8_validation_run_evidence_and_report_are_exact_atomic_and_actor_free(
         commit_sha: "b".repeat(40),
         workspace_snapshot_digest: snapshot_digest.clone(),
         idempotency_key: idempotency_key.clone(),
+        catalog_check_id: None,
+        definition_digest: None,
+        run_origin: ValidationRunOrigin::LegacyCommand,
+        check_request_id: None,
         started_at: started_at.clone(),
         created_at: started_at.clone(),
         updated_at: started_at.clone(),
@@ -8742,3 +8746,5 @@ async fn stale_interrupted_allocation_does_not_reserve_fresh_admission() {
     .await
     .expect("fresh exact allocation is no longer blocked by stale recovery");
 }
+
+mod v171_v174;

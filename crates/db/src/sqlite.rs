@@ -70,6 +70,7 @@ mod execution_usage;
 mod external_link;
 mod gate_lifecycle;
 mod harness_session;
+mod human_decision;
 mod integration;
 mod notification;
 mod oauth_authorization_code;
@@ -99,6 +100,7 @@ mod task_integration_operation;
 mod task_media;
 mod task_terminal_session;
 mod user_auth;
+mod validation_catalog;
 mod validation_run;
 mod work_unit;
 mod workspace;
@@ -226,9 +228,19 @@ fn check_error(error: sqlx::Error) -> DbError {
     if let sqlx::Error::Database(database_error) = &error {
         match database_error.message() {
             "FORGE_COORDINATION_REVIEW_SOURCE_STALE"
-            | "FORGE_COORDINATION_REVIEW_DECISION_STALE" => {
+            | "FORGE_COORDINATION_REVIEW_DECISION_STALE"
+            | "FORGE_COORDINATION_SOURCE_STALE"
+            | "FORGE_COORDINATION_VALIDATION_SOURCE_STALE"
+            | "FORGE_COORDINATION_VALIDATION_DECISION_STALE"
+            | "FORGE_COORDINATION_DECISION_STALE"
+            | "FORGE_COORDINATION_HUMAN_DECISION_STALE" => {
                 return DbError::VersionConflict;
             }
+            "FORGE_VALIDATION_CHECK_STALE_PIN" => return DbError::ValidationCheckStalePin,
+            "FORGE_VALIDATION_CHECK_NOT_AUTHORIZED" => {
+                return DbError::ValidationCheckNotAuthorized
+            }
+            "FORGE_VALIDATION_WORKSPACE_LEASED" => return DbError::ValidationWorkspaceLeased,
             "FORGE_PROJECT_PLAN_BATCH_INACTIVE" => return DbError::ProjectPlanBatchInactive,
             _ => {}
         }

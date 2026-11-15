@@ -69,6 +69,11 @@ use std::{
 // V168 preserves coordination requests and adds exact review-findings continuation sources.
 // V169 makes Gate ReviewReport currentness use the exact formal_review capability snapshot.
 // V170 lets formal_review Executions (only) bind to the Task integration workspace.
+// V171 adds the versioned validation check catalog, queued check requests, and exact
+// base-vs-candidate comparisons (baseline results live in the comparison, no workspace row).
+// V172 rebuilds coordination requests once for every phase's kinds/origins and adds
+// validation triage plus the hard-limited coordinator replan ledger.
+// V174 adds structured human decision requests and their exact resume continuation.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

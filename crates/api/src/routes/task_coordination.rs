@@ -255,6 +255,15 @@ fn request_response(
             db::TaskCoordinationRequestKind::ReviewFindings => {
                 api_types::TaskCoordinationRequestKind::ReviewFindings
             }
+            db::TaskCoordinationRequestKind::ValidationFindings => {
+                api_types::TaskCoordinationRequestKind::ValidationFindings
+            }
+            db::TaskCoordinationRequestKind::ExternalFeedback => {
+                api_types::TaskCoordinationRequestKind::ExternalFeedback
+            }
+            db::TaskCoordinationRequestKind::HumanDecisionResume => {
+                api_types::TaskCoordinationRequestKind::HumanDecisionResume
+            }
         },
         review_report_artifact_id: request.review_report_artifact_id,
         review_report_digest: request.review_report_digest,

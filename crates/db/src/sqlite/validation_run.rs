@@ -37,6 +37,10 @@ fn map_validation_run(row: SqliteRow) -> Result<ValidationRun> {
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
         logs_ref: row.try_get("logs_ref")?,
+        catalog_check_id: row.try_get("catalog_check_id")?,
+        definition_digest: row.try_get("definition_digest")?,
+        run_origin: parse_enum(row.try_get("run_origin")?)?,
+        check_request_id: row.try_get("check_request_id")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -143,6 +147,10 @@ fn same_validation_run_identity(left: &ValidationRun, right: &CreateValidationRu
         && left.commit_sha == right.commit_sha
         && left.workspace_snapshot_digest == right.workspace_snapshot_digest
         && left.idempotency_key == right.idempotency_key
+        && left.catalog_check_id == right.catalog_check_id
+        && left.definition_digest == right.definition_digest
+        && left.run_origin == right.run_origin
+        && left.check_request_id == right.check_request_id
 }
 
 fn same_evidence(existing: &[Evidence], proposed: &[CreateEvidence]) -> bool {
@@ -177,8 +185,9 @@ impl ValidationRunRepo for SqliteDb {
             "INSERT INTO validation_run (
                 id, task_id, work_unit_id, caused_by_execution_id, check_identity, command,
                 config_summary_json, config_digest, workspace_id, commit_sha,
-                workspace_snapshot_digest, idempotency_key, status, started_at, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+                workspace_snapshot_digest, idempotency_key, status, started_at, created_at, updated_at,
+                catalog_check_id, definition_digest, run_origin, check_request_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(idempotency_key) DO NOTHING",
         )
         .bind(&input.id)
@@ -196,8 +205,13 @@ impl ValidationRunRepo for SqliteDb {
         .bind(&input.started_at)
         .bind(&input.created_at)
         .bind(&input.updated_at)
+        .bind(&input.catalog_check_id)
+        .bind(&input.definition_digest)
+        .bind(input.run_origin.to_string())
+        .bind(&input.check_request_id)
         .execute(&mut *tx)
-        .await?
+        .await
+        .map_err(check_error)?
         .rows_affected();
 
         let record = sqlx::query("SELECT * FROM validation_run WHERE idempotency_key = ?")
