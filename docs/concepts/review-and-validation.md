@@ -40,6 +40,52 @@ WorkUnit work: for example, reproducing a failure, investigating its cause, or
 interpreting scanner output. That is distinct from the deterministic
 ValidationRun and may itself produce an Artifact or Evidence.
 
+### Catalog checks
+
+A Project owner or admin may publish versioned **catalog checks**
+(`validation_check_definition`): a slug `check_key`, a bounded shell command,
+a timeout up to one hour and the `captured_default` environment policy. A
+definition is immutable; publishing again creates the next version, retires the
+previous active one and changes the `definition_digest`. Agents and the
+coordinator never write the catalog.
+
+A Task can use a catalog check only when its coordination envelope (schema
+version 2) pins the exact `check_key` and `definition_digest` with a trigger:
+`on_request` (the coordinator may ask for it) or `after_integration` (Forge runs
+it after a successful WorkUnit integration). A later version never changes what
+an existing pin authorizes: the pin turns stale (`validation.check_stale_pin`)
+and must be re-authorized. A check without a pin is rejected with
+`validation.check_not_authorized`.
+
+Requests are durable `validation_check_request` rows consumed by the
+`ValidationCheckRunner` inside the Forge process, not in a coordinator turn or
+an Agent daemon. The runner resolves the exact subject (an accepted WorkUnit
+result or the Task integration Workspace), defers while a worker lease is
+active, takes the Workspace execution lock, and runs the pinned command through
+the same core as legacy checks. The resulting `ValidationRun` records
+`run_origin`, `catalog_check_id`, `definition_digest` and the request, with
+identity `catalog:{check_key}@{definition_digest[0..16]}`. If the Workspace
+changes after the request was queued, the request fails with
+`validation.subject_changed` instead of validating a different subject. A
+restart recovers requests left `running`.
+
+With `baseline=true` the runner also runs the same command in a runner-owned,
+disposable, detached git worktree at the exact base commit (no Workspace row,
+removed afterwards) and stores an immutable `validation_comparison`. Rust, not
+the model, classifies it: `regression`, `pre_existing_failure`, `fixed`,
+`both_pass` or `inconclusive`. A `pre_existing_failure` does not satisfy a PASS
+requirement.
+
+Gate policy schema version 2 adds `required_checks`
+(`{check_key, definition_digest, required_outcome: passed}`) for
+merge-readiness Gates. Each is resolved by the exact merge candidate (the
+integration Workspace commit and snapshot) and the pinned catalog identity, never
+by "latest"; no matching run is missing evidence and more than one matching run
+is an ambiguity. A `pre_existing_failure` is dispensed only by an exact approved
+Decision whose `policy_ref` is `validation_waiver:{check_key}@{digest[0..16]}`.
+Version 1 policies are unchanged and cannot carry `required_checks`; an unknown
+schema fails closed.
+
 Passing validation does not imply review passed. Validation may run without a
 review and review may be required even when no validation command exists.
 

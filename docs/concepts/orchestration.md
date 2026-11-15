@@ -216,3 +216,48 @@ the isolated runtime. Forge passes only the exact result/review Workspace roots
 through `review_read_paths`, and the daemon checks its registered root again.
 There is no global external-directory allow rule. Missing, root, or wildcard
 paths fail closed. See [OpenCode permissions](https://opencode.ai/docs/permissions).
+
+## Coordinator verification requests and human decisions
+
+Two typed coordinator outputs extend the bounded set (plan:
+[coordinator verification and PR loop](../plans/coordinator-verification-and-pr-loop.md)).
+They are implemented as pure parsers in `crates/services/src/coordinator_outputs/`
+and a durable service in `human_decision_service.rs`; the runtime wiring that
+accepts them from a turn is a separate step. Until it lands they are not reachable
+from a live coordinator turn.
+
+- `request_validation` names one pinned catalog `check_key`, an exact subject
+  (`work_unit_result`, or `task_integration` with the Task id and version), an
+  optional `baseline` flag and a `reason` (at most 1024 bytes). It carries no
+  command, path, commit, workspace or timeout; unknown fields are rejected.
+  The check must be pinned by the current authorization envelope
+  (`validation.check_not_authorized` otherwise) and a stale subject version is
+  rejected (`validation.subject_stale`). Forge resolves the subject and runs the
+  deterministic check; the coordinator never executes anything.
+- `ask_human` carries a question (at most 1024 bytes), 2 to 6 options
+  (`id` slug, `label`, `description`, `consequence`, mandatory `authority_effect`
+  of `none`, `scope` or `authority`), an optional recommendation that names one
+  option, and at most 16 typed evidence links (`artifact`, `review_report`,
+  `validation_run`, `validation_comparison`, `gate_evaluation`, `execution`,
+  `external_feedback`, `work_unit`; optional 64-hex digest). At most 4 new
+  outputs per turn.
+
+Policy is asymmetric: unlike the legacy actions, the new kinds are permitted only
+when listed explicitly in the role's `allowed_actions`. An absent list does not
+permit them (`coordination.output_not_permitted`), so existing roles are not widened.
+
+A human decision is a durable `human_decision_request` bound to one exact source
+and to the paused coordination request it resumes. Creation validates that the
+source and every evidence link belong to the Task (and that digests match where
+Forge stores one) and that the raising Execution is the current coordinator Actor
+under the exact authorization. Answering requires the expected version and one of
+the stored options. The authority needed depends on the chosen option's
+`authority_effect`: `none` needs authority to mutate the Task; `scope` or
+`authority` needs a Project owner or admin. Project Copilot never answers.
+Answering appends `task.human_decision_answered` in the same transaction and then
+creates the exact `human_decision_resume` coordination request for the same
+authorization, recorded once on the decision. If the authorization was revoked or
+changed, the answer stays durable and the resume is deferred rather than
+performed under stale authority. A decision whose source went stale is closed as
+`superseded` or `cancelled`. Events carry identifiers and states only, never
+question text or notes.

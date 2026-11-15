@@ -2107,7 +2107,24 @@ impl WorkUnitService {
         };
         let finish_result = operation.finish(operation_status).await;
         match (result, finish_result) {
-            (Ok(record), Ok(_)) => Ok(record),
+            (Ok(record), Ok(_)) => {
+                // C3 hook: queue the Task's pinned `after_integration` catalog
+                // checks against the exact integration Workspace. Best effort and
+                // idempotent; the durable request, not this call, is authoritative.
+                if record.outcome == WorkUnitIntegrationOutcome::Success {
+                    if let Err(error) =
+                        crate::validation_post_integration::enqueue_after_integration(
+                            &self.db,
+                            &self.event_bus,
+                            &record.task_id,
+                        )
+                        .await
+                    {
+                        tracing::warn!(task_id = %record.task_id, %error, "after-integration validation enqueue failed");
+                    }
+                }
+                Ok(record)
+            }
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }

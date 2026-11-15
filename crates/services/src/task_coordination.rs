@@ -91,6 +91,30 @@ pub struct CoordinationEnvelope {
     /// Missing on historical envelopes means the previously authorized direct route.
     #[serde(default)]
     pub orchestrator_reviews_findings: bool,
+    /// Envelope v2 (`schema_version == 2`): exact catalog check pins the
+    /// coordinator may request (`on_request`) or Forge runs after integration
+    /// (`after_integration`). Omitted when empty so v1 JSON and digests are
+    /// byte-identical to the historical serialization.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_checks: Vec<EnvelopeValidationCheck>,
+}
+
+/// One pinned catalog definition version authorized for a Task (envelope v2).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeValidationCheck {
+    pub check_key: String,
+    pub definition_digest: String,
+    pub trigger: db::EnvelopeCheckTrigger,
+}
+
+const MAX_ENVELOPE_VALIDATION_CHECKS: usize = 8;
+
+/// Scope against which envelope pins are resolved (`validate_pins`).
+pub struct EnvelopePinContext<'a> {
+    pub db: &'a SqliteDb,
+    pub project_id: &'a str,
+    pub repo_id: Option<&'a str>,
 }
 
 impl Default for CoordinationEnvelope {
@@ -108,17 +132,19 @@ impl Default for CoordinationEnvelope {
             allowed_review_roles: vec!["reviewer".to_owned()],
             require_independent_review: true,
             orchestrator_reviews_findings: true,
+            validation_checks: Vec::new(),
         }
     }
 }
 
 impl CoordinationEnvelope {
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 1 {
+        if !matches!(self.schema_version, 1 | 2) {
             return Err(unsupported_item(
-                "only envelope schema version 1 is supported",
+                "only envelope schema versions 1 and 2 are supported",
             ));
         }
+        self.validate_validation_checks()?;
         if self.max_work_units == 0 || self.max_work_units > MAX_PLAN_WORK_UNITS {
             return Err(unsupported_item(format!(
                 "max_work_units must be between 1 and {MAX_PLAN_WORK_UNITS}"
@@ -152,6 +178,75 @@ impl CoordinationEnvelope {
                     "allowed_review_roles contains a duplicate",
                 ));
             }
+        }
+        Ok(())
+    }
+}
+
+impl CoordinationEnvelope {
+    fn validate_validation_checks(&self) -> Result<()> {
+        if self.validation_checks.is_empty() {
+            return Ok(());
+        }
+        if self.schema_version < 2 {
+            return Err(unsupported_item(
+                "validation_checks require envelope schema_version 2",
+            ));
+        }
+        if self.validation_checks.len() > MAX_ENVELOPE_VALIDATION_CHECKS {
+            return Err(unsupported_item(format!(
+                "validation_checks accepts at most {MAX_ENVELOPE_VALIDATION_CHECKS} pins"
+            )));
+        }
+        let mut seen = HashSet::new();
+        let mut digests: HashMap<&str, &str> = HashMap::new();
+        for pin in &self.validation_checks {
+            if !crate::validation_catalog::is_valid_check_key(&pin.check_key) {
+                return Err(unsupported_item(
+                    "validation_checks check_key must be a slug of 1 to 64 [a-z0-9_-] bytes",
+                ));
+            }
+            if pin.definition_digest.len() != 64
+                || !pin
+                    .definition_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(unsupported_item(
+                    "validation_checks definition_digest must be 64 lowercase hex characters",
+                ));
+            }
+            if !seen.insert((pin.check_key.as_str(), pin.trigger.to_string())) {
+                return Err(unsupported_item(
+                    "validation_checks contains a duplicate check_key and trigger",
+                ));
+            }
+            if let Some(previous) =
+                digests.insert(pin.check_key.as_str(), pin.definition_digest.as_str())
+            {
+                if previous != pin.definition_digest {
+                    return Err(unsupported_item(
+                        "validation_checks pins one exact definition digest per check_key",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Asynchronous pin validation (`authorize_inner`): every pinned check must
+    /// exist in the Task scope, be `active`, and match its exact digest.
+    /// Typed codes: `validation.check_unknown`, `validation.check_stale_pin`.
+    pub async fn validate_pins(&self, ctx: &EnvelopePinContext<'_>) -> Result<()> {
+        for pin in &self.validation_checks {
+            crate::validation_catalog::resolve_pin(
+                ctx.db,
+                ctx.project_id,
+                ctx.repo_id,
+                &pin.check_key,
+                &pin.definition_digest,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -633,6 +728,13 @@ impl TaskCoordinationService {
         };
         if input.envelope.is_some() {
             envelope.validate()?;
+            envelope
+                .validate_pins(&EnvelopePinContext {
+                    db: &self.db,
+                    project_id: &task.project_id,
+                    repo_id: task.repo_id.as_deref(),
+                })
+                .await?;
         }
         if input.mode != TaskCoordinationMode::Manual
             && (input.coordinator_task_role_id.is_none() || input.coordinator_actor.is_none())
@@ -4578,6 +4680,81 @@ mod tests {
         let parsed: CoordinationEnvelope = serde_json::from_value(historical).unwrap();
         assert!(!parsed.orchestrator_reviews_findings);
         assert!(CoordinationEnvelope::default().orchestrator_reviews_findings);
+    }
+
+    #[test]
+    fn validation_catalog_envelope_v1_serialization_and_digest_are_unchanged() {
+        let envelope = CoordinationEnvelope::default();
+        let json = canonical_json(&envelope).expect("envelope serializes");
+        assert!(!json.contains("validation_checks"));
+        assert_eq!(
+            json,
+            "{\"schema_version\":1,\"max_work_units\":16,\"allow_new_task_roles\":false,\"allow_membership_changes\":false,\"allow_capability_changes\":false,\"allow_repository_write\":true,\"allow_external_actions\":false,\"allow_integration\":true,\"allow_merge\":false,\"allowed_review_roles\":[\"reviewer\"],\"require_independent_review\":true,\"orchestrator_reviews_findings\":true}"
+        );
+        let parsed: CoordinationEnvelope = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(parsed, envelope);
+    }
+
+    fn pin(
+        key: &str,
+        digest_char: char,
+        trigger: db::EnvelopeCheckTrigger,
+    ) -> EnvelopeValidationCheck {
+        EnvelopeValidationCheck {
+            check_key: key.to_owned(),
+            definition_digest: digest_char.to_string().repeat(64),
+            trigger,
+        }
+    }
+
+    #[test]
+    fn validation_catalog_envelope_pins_require_schema_v2_and_are_bounded() {
+        let mut envelope = CoordinationEnvelope {
+            validation_checks: vec![pin("tests", 'a', db::EnvelopeCheckTrigger::OnRequest)],
+            ..CoordinationEnvelope::default()
+        };
+        assert!(envelope.validate().is_err(), "v1 rejects pins");
+        envelope.schema_version = 2;
+        envelope.validate().expect("v2 accepts a pin");
+        assert!(canonical_json(&envelope)
+            .expect("json")
+            .contains("\"validation_checks\""));
+
+        envelope.validation_checks = (0..9)
+            .map(|index| {
+                pin(
+                    &format!("check-{index}"),
+                    'a',
+                    db::EnvelopeCheckTrigger::OnRequest,
+                )
+            })
+            .collect();
+        assert!(envelope.validate().is_err(), "more than 8 pins rejected");
+
+        envelope.validation_checks = vec![
+            pin("tests", 'a', db::EnvelopeCheckTrigger::OnRequest),
+            pin("tests", 'a', db::EnvelopeCheckTrigger::OnRequest),
+        ];
+        assert!(envelope.validate().is_err(), "duplicate pin rejected");
+
+        envelope.validation_checks = vec![
+            pin("tests", 'a', db::EnvelopeCheckTrigger::OnRequest),
+            pin("tests", 'b', db::EnvelopeCheckTrigger::AfterIntegration),
+        ];
+        assert!(envelope.validate().is_err(), "one digest per key");
+
+        envelope.validation_checks = vec![pin("Bad Key", 'a', db::EnvelopeCheckTrigger::OnRequest)];
+        assert!(envelope.validate().is_err(), "slug required");
+        envelope.validation_checks = vec![EnvelopeValidationCheck {
+            check_key: "tests".to_owned(),
+            definition_digest: "short".to_owned(),
+            trigger: db::EnvelopeCheckTrigger::OnRequest,
+        }];
+        assert!(envelope.validate().is_err(), "64 hex digest required");
+
+        envelope.validation_checks = vec![pin("tests", 'a', db::EnvelopeCheckTrigger::OnRequest)];
+        envelope.allow_merge = true;
+        assert!(envelope.validate().is_err(), "v2 still forbids merge");
     }
 
     #[test]

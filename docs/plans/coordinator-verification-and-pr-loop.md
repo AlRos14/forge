@@ -1236,11 +1236,11 @@ Cualquier cambio de contrato vuelve a N0.
 | A3 | (Fase 2) V173: referencia de credencial, `feedback_policy_json`/digest en config y admisión, `external_feedback_item`, `task_external_feedback_triage`, `pr_external_action` (sin reconstruir `task_integration_operation`; triggers V112/V116 revisados), guarda agent_profile↔github. | N0 | `V173__*.sql` | **TODO** |
 | A4 | (Fase 1) V174: `human_decision_request` + guards de versión/estado/evidencia. | N0 | `V174__human_decision_request.sql` | **IMPLEMENTADO / NOT RUN** (ver Anexo A1/A2/A4) |
 | A5 | (Fase 3) V175: `work_unit_fallback_receipt`, `micro_fix_receipt`. | N0 | `V175__*.sql` | **TODO** |
-| C1 | Servicio de catálogo (escritura owner/admin), validación de pins del envelope, extracción del núcleo de `run_command` con identidad de catálogo sin alterar el camino legacy. | A1 | `validation_service.rs`, `validation_catalog.rs` | **TODO** |
-| C2 | (Fase 1) `ValidationCheckRunner` (cola, claim, lease-free guard, lock de workspace), workspace de verificación en commit base, comparación determinista (baseline **incluido en v1**, D1). Decisión del lead (C2): el baseline es un worktree git desacoplado propiedad del runner, **sin fila `workspace` ni `workspace_scope`**; la fila `validation_comparison` guarda commit base, digest de snapshot y procedencia local, y el worktree se limpia tras la ejecución (ver «Decisiones del lead posteriores a N0»). | C1 | `validation_check_runner.rs`, `workspace` crate (solo uso), `workspace_cleanup.rs` | **TODO** |
-| C3 | (Fase 1) Gate policy schema v2 `required_checks` con resolución por clave exacta (D2 resuelta); trigger post-integración; sin cambiar v1. | C2 | `gate_engine.rs`, `validation_post_integration.rs` | **TODO** |
-| R1 | Parsers/validadores/aplicadores como módulos nuevos con tests unitarios. Fase 1: `request_validation`, `ask_human`; fase 2: `external_feedback`; fase 3: `micro_fix`, `propose_replan`. | A2 | `coordinator_outputs/*` | **TODO** |
-| D1 | (Fase 1) Servicio de `human_decision_request`: creación validando evidencia, respuesta con `expected_version`, autoridad por `authority_effect`, evento durable y reanudación exacta. | A4, A2 | `human_decision_service.rs` | **TODO** |
+| C1 | Servicio de catálogo (escritura owner/admin), validación de pins del envelope, extracción del núcleo de `run_command` con identidad de catálogo sin alterar el camino legacy. | A1 | `validation_service.rs`, `validation_catalog.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo C1–C3) |
+| C2 | (Fase 1) `ValidationCheckRunner` (cola, claim, lease-free guard, lock de workspace), workspace de verificación en commit base, comparación determinista (baseline **incluido en v1**, D1). Decisión del lead (C2): el baseline es un worktree git desacoplado propiedad del runner, **sin fila `workspace` ni `workspace_scope`**; la fila `validation_comparison` guarda commit base, digest de snapshot y procedencia local, y el worktree se limpia tras la ejecución (ver «Decisiones del lead posteriores a N0»). | C1 | `validation_check_runner.rs`, `workspace` crate (solo uso), `workspace_cleanup.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo C1–C3) |
+| C3 | (Fase 1) Gate policy schema v2 `required_checks` con resolución por clave exacta (D2 resuelta); trigger post-integración; sin cambiar v1. | C2 | `gate_engine.rs`, `validation_post_integration.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo C1–C3) |
+| R1 | Parsers/validadores/aplicadores como módulos nuevos con tests unitarios. Fase 1: `request_validation`, `ask_human`; fase 2: `external_feedback`; fase 3: `micro_fix`, `propose_replan`. | A2 | `coordinator_outputs/*` | **IMPLEMENTADO / NOT RUN** (fase 1: `request_validation`, `ask_human`; ver Anexo R1/D1) |
+| D1 | (Fase 1) Servicio de `human_decision_request`: creación validando evidencia, respuesta con `expected_version`, autoridad por `authority_effect`, evento durable y reanudación exacta. | A4, A2 | `human_decision_service.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo R1/D1) |
 | M1 | (Fase 3) Cálculo de bounds sobre diff, `micro_fix_bounds_exceeded`, presupuesto `max_per_task`, revisión formal con contexto delta. | A5, R1 | `task_rework*`, `diff.rs` (lectura) | **TODO** |
 | FB | (Fase 3) Fallback cross-Agent según F-c; cadena y perfiles solo si están en el envelope (D7); sin fallback del coordinador (D8). | A5 | `task_dispatcher/fallback.rs` | **TODO** |
 | P0 | (Fase 2) `GitHubPrProvider` real (`find/create/get_status`) con cliente HTTP, credencial desde `CredentialService` (D4), redacción de errores, pruebas contra servidor simulado local vía costura inyectable. | N0, A3 | `pr_github_client.rs`, `pr_service.rs` | **TODO** |
@@ -1455,3 +1455,136 @@ y `CreateTaskCoordinationRequestInput` (+`source_subject_*`, `resumes_request_id
 siga compilando: literales de `CreateValidationRun`/`CreateTaskCoordinationRequestInput`
 en `services`, variantes de `api_types::TaskCoordinationRequestKind` + mapeo en
 `routes/task_coordination.rs` + binding TS.
+
+## Anexo R1 (fase 1) y D1 — salidas tipadas y decisiones humanas (IMPLEMENTADO / NOT RUN)
+
+Fecha: 2026-11-15. Escrito sin compilar ni ejecutar con cargo (CI de GitHub es la
+única verificación). Tests: `cargo test --locked -p services --lib coordinator_outputs_`
+y `... human_decision_` (ya cubiertos por los filtros `coordinator_outputs` y
+`human_decision` del paso de fase 1).
+
+**R1** (`crates/services/src/coordinator_outputs/{mod,validation_request,ask_human,tests}.rs`):
+puro, sin I/O ni dependencia del tipo envelope. `CoordinatorOutput`
+(`#[serde(tag="type")]`: `request_validation`, `ask_human`), `parse_outputs(values, &pins,
+allowed_actions)`, `CoordinatorOutput::from_value`, `ensure_new_kind_permitted`
+(regla asimétrica: `None` o lista vacía ⇒ `coordination.output_not_permitted`),
+`trait CheckPins { fn pins_coordinator_request(&self, check_key) -> bool }` (impl para
+`[String]`, `Vec<String>`, `HashSet<String>`; RT lo implementa sobre el envelope v2 con
+pin + trigger `on_request`), `OutputError{code,message}` con `From<OutputError> for
+ServiceError` (⇒ `ServiceError::Coordination`). Límites: ≤ 4 salidas por turno,
+reason/question ≤ 1024 B, 2–6 opciones (id slug ≤ 32, label ≤ 80, description y
+consequence ≤ 512, `authority_effect` obligatorio), rationale ≤ 2048 B, ≤ 16 enlaces
+(kinds cerrados = V174, digest 64 hex minúscula). `AskHumanOutput::{options_json,
+evidence_links_json, max_authority_effect}` producen la forma canónica de almacenamiento.
+Los códigos de error de forma usan `coordination.invalid_plan`; `validation.subject_stale`
+y la resolución del sujeto quedan en el aplicador (RT/C2), no aquí.
+
+**D1** (`crates/services/src/human_decision_service.rs`, tests en
+`human_decision_service/tests.rs`): `HumanDecisionService::{new, get, list_by_task, raise,
+answer, close, ensure_resume_request}`; `ResumeBinding`, `RaiseHumanDecisionInput`,
+`AnswerDecisionInput`, `AnswerOutcome`, `ResumeOutcome::{Created, AlreadyBound, Deferred}`,
+`required_authority`. Eventos durables `task.human_decision_requested`,
+`task.human_decision_answered` y (no listado en el contrato; solo ids/estado)
+`task.human_decision_closed`; hint tras commit vía `DomainEventService::publish_committed`.
+Códigos: `human_decision.{not_open,version_conflict,authority_required,invalid_options,
+evidence_invalid}`. Sin tests con base de datos (fixtures pesadas): la verificación de
+fuente/evidencia/autoridad contra SQLite queda para CI (`api` happy path/tests de fase 1).
+
+**Qué debe cablear RT:** (1) parsear `actions[]`/`outputs[]` con `parse_outputs` y mapear
+`OrchestratorActionKind::{RequestValidation, AskHuman}` a `CoordinatorOutputKind` para
+`allowed_actions`; (2) tras `ask_human`, llamar `HumanDecisionService::raise` con la fuente
+exacta y `ResumeBinding` de la request pausada; (3) consumir el presupuesto de turnos y
+despertar/despachar al coordinador para el request `human_decision_resume` creado (D1 no
+lo hace); (4) llamar `ensure_resume_request` desde el escáner de reconciliación para
+decisiones `answered` sin `resume_request_id`; (5) resumes de requests ligadas a batch de
+Project: D1 devuelve `Deferred{human_decision.batch_resume_unsupported}`; RT debe usar
+`create_project_plan_batch_coordination_request` con origen `HumanDecisionResume`;
+(6) `complete_*_turn` de `human_decision_resume` valida la forma del kind pausado.
+
+## Anexo C1–C3 — catálogo, runner y Gate v2 (IMPLEMENTADO / NOT RUN)
+
+Fecha: 2026-11-15. Escrito sin compilar ni ejecutar con cargo (la CI de GitHub es la
+única verificación). Filtros de test: `cargo test --locked -p services --lib
+validation_catalog_`, `validation_check_runner_` y `gate_required_checks_` (a añadir al
+workflow en el nodo I). `cargo fmt --all` y `git diff --check` limpios.
+
+**C1 — catálogo y pins** (`validation_catalog.rs`, `validation_service.rs`,
+`task_coordination.rs`):
+- `ValidationCatalogService::{new, create_version(project_id, user_id, PublishCheckInput),
+  retire(project_id, user_id, definition_id), get, list}`. Escritura solo con membresía
+  explícita owner/admin (`project_authority::user_can_administer_project`, `AuthorizationDenied`);
+  lectura exige acceso de lectura (si no, `not_found`). Valida slug, comando 1–8192 B,
+  timeout 1–3600, `env_policy = captured_default`, repo dentro del Project.
+- `validation_catalog::resolve_pin(db, project_id, repo_id, check_key, digest)`: errores
+  tipados `validation.check_unknown` / `validation.check_stale_pin` (retirada o digest
+  distinto del activo).
+- Envelope v2: `CoordinationEnvelope.validation_checks: Vec<EnvelopeValidationCheck>` con
+  `#[serde(default, skip_serializing_if = "Vec::is_empty")]` (JSON y digest v1
+  byte-idénticos; golden en `validation_catalog_envelope_v1_serialization_and_digest_are_unchanged`).
+  `validate()` acepta `schema_version` 1|2 y rechaza pins con v1, más de 8, duplicados
+  `(key, trigger)`, un digest distinto por clave y slug/digest inválidos. Nuevo
+  `validate_pins(&EnvelopePinContext{db, project_id, repo_id})`, llamado desde
+  `authorize_inner` (una llamada tras `validate()`; el cableado de turnos sigue siendo de RT).
+  Solo se añadió `validation_checks`; `micro_fix`, `micro_fix_reviewer`, `fallback_agents` y
+  `allow_coordinator_replan` son de fase 3 y `deny_unknown_fields` los rechaza hasta entonces.
+- Núcleo extraído: `ValidationService::run_check_core(CheckRunInput)` (pub(crate)).
+  `run_command` valida, toma el lock y delega con `catalog: None`; su identidad
+  (`ci:{index}:{digest}`, `config_summary_json`, evidencia `check:{index}`, eventos) es la
+  histórica. `run_bounded_command` gana `timeout_seconds` y heartbeat opcional.
+- `DbError::{ValidationCheckStalePin, ValidationCheckNotAuthorized, ValidationWorkspaceLeased}`
+  se mapean a `ServiceError::Coordination` con códigos `validation.check_stale_pin`,
+  `validation.check_not_authorized` y `validation.workspace_leased` (`lib.rs`).
+
+**C2 — runner** (`validation_check_runner.rs`):
+- `enqueue_check_request(db, event_bus, EnqueueCheckRequest)` (y método del runner): exige
+  coordinación vigente (no revocada, no manual, team no stale), pin exacto del envelope para el
+  trigger (`on_request` ↔ `CoordinatorRequest`), `resolve_pin`, y resuelve el sujeto exacto
+  (`work_unit_result`: WorkUnit `Completed` en su versión y su workspace `Ready`;
+  `task_integration`: workspace de integración y versión de Task). Códigos
+  `validation.subject_stale` / `validation.subject_unavailable`. Idempotencia por
+  `(task, authorization_version, definición, trigger, sujeto, workspace, commit, snapshot, baseline)`.
+- `ValidationCheckRunner::{new(db, bus, locks, workspace_root), with_tick_interval,
+  spawn(shutdown_rx), tick, process_request(id)}`: reclama `queued` y recupera `running` ajenos
+  al proceso; difiere si hay `WorkspaceLease` de worker activo; toma
+  `WorkspaceExecutionLockManager`; ejecuta el comando pinneado con `expected_subject`
+  (commit+snapshot); si el sujeto cambió, `failed_to_start` con `validation.subject_changed`.
+  Identidad `catalog:{key}@{digest[0..16]}`, `run_origin` `coordinator_request|after_integration`.
+  Con `baseline=true`: base = `workspace.before_sha`, worktree git detached en
+  `<workspace_root>/validation-baselines/<request_id>`, mismo comando/entorno/cotas, limpieza
+  siempre (`worktree remove --force` + `prune`), `validation_comparison` clasificada por la
+  DB/Rust. Si el run del sujeto exacto y la definición ya existe por otra solicitud, la
+  solicitud pasa a `cancelled` (el run existente es la evidencia; la clave del run no incluye la
+  solicitud para que el Gate pueda recomputarla).
+- Registro: `forge-cli/src/main.rs` (junto al cleanup scheduler) con `state.workspace_exec_locks`.
+
+**C3 — Gate v2 y hook** (`gate_engine.rs`, `validation_post_integration.rs`,
+`work_unit_service.rs`):
+- Para no romper los ~14 literales existentes de `GatePolicyDocument` (incluido
+  `orchestrator_runtime.rs`, reservado a RT) la política v2 es un tipo nuevo,
+  `GatePolicyDocumentV2` (mismos campos + `required_checks: Vec<RequiredCheck>`);
+  `GatePolicyDocument` (v1) no cambia y no puede portar `required_checks`
+  (`deny_unknown_fields`). Nuevos `GateEngine::{create_gate_with_initial_policy_v2,
+  revise_policy_v2}`; los métodos v1 delegan en el mismo interno. La evaluación acepta schema
+  1|2; schema desconocido o digest roto sigue fallando cerrado.
+- `required_checks`: solo Gates `merge_readiness`; sujeto = workspace de integración `Ready`
+  (HEAD + snapshot actuales); busca runs de ese sujeto con identidad `catalog:{key}@{digest16}`,
+  `definition_digest` del pin y origen no legacy. 0 → `missing` `required_check:{key}`; más de 1 →
+  issue `required_check_ambiguous:{key}`; estado distinto del requerido →
+  `required_check_outcome_mismatch:{key}:{status}`. Congela `validation_run` y `evidence` como
+  entradas. Dispensa: run `failed` con comparación `pre_existing_failure` y una
+  `DecisionRequirement` con `policy_ref = validation_waiver:{key}@{digest16}` en la política
+  (su satisfacción la evalúa `evaluate_decisions`); el run dispensado se congela solo como
+  `evidence` porque el trigger V100 de admisión de TaskMerge exige `validation_run` `passed`.
+- Hook: `validation_post_integration::enqueue_after_integration(db, bus, task_id)` se llama,
+  best effort, en `work_unit_service.rs` justo tras `operation.finish(...)` cuando el outcome
+  de la integración es `Success` (rama `(Ok(record), Ok(_))`; no en
+  `task_integration_operation.rs`, que solo gestiona locks y estado de operaciones). Encola los
+  pins `after_integration` del envelope vigente sobre `task_integration` (versión de Task
+  actual, baseline=false).
+
+**Para RT/API:** `enqueue_check_request` y `ValidationCheckRunner::enqueue_check_request` para
+`request_validation` (trigger `CoordinatorRequest`, `requested_by_request_id` obligatorio);
+`ValidationCatalogService` para REST; `GateEngine::*_v2` para el REST de Gate; leer
+`ValidationCheckRequestRepo`/`ValidationComparisonRepo` para `validation_findings` (el runner no
+crea esa solicitud: run terminal `failed|error|stale` o comparación `regression|inconclusive`
+sigue siendo trabajo de RT).

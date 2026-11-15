@@ -41,6 +41,30 @@ pub struct ValidationCheckResult {
     pub evidence: Vec<Evidence>,
 }
 
+/// Catalog provenance of one run (V171). `None` is the legacy command path.
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogRunIdentity {
+    pub catalog_check_id: String,
+    pub check_key: String,
+    pub definition_digest: String,
+    pub run_origin: db::ValidationRunOrigin,
+    pub check_request_id: String,
+}
+
+/// Input of the shared execution core (`ValidationService::run_check_core`).
+pub(crate) struct CheckRunInput<'a> {
+    pub task_id: &'a str,
+    pub workspace_id: &'a str,
+    pub command: &'a str,
+    pub caused_by_execution_id: Option<&'a str>,
+    pub check_identity: String,
+    pub evidence_key: String,
+    pub timeout_seconds: u64,
+    pub catalog: Option<CatalogRunIdentity>,
+    /// Exact `(commit_sha, workspace_snapshot_digest)` that must still hold.
+    pub expected_subject: Option<(&'a str, &'a str)>,
+}
+
 impl ValidationService {
     pub fn new(db: Arc<db::SqliteDb>, event_bus: Arc<EventBus>) -> Self {
         Self { db, event_bus }
@@ -70,6 +94,39 @@ impl ValidationService {
             Some(locks) => Some(locks.acquire(workspace_id).await),
             None => None,
         };
+        let command_digest = hex::encode(Sha256::digest(command.as_bytes()));
+        self.run_check_core(CheckRunInput {
+            task_id,
+            workspace_id,
+            command,
+            caused_by_execution_id,
+            check_identity: format!("ci:{check_index}:{command_digest}"),
+            evidence_key: format!("check:{check_index}"),
+            timeout_seconds: COMMAND_TIMEOUT_SECONDS,
+            catalog: None,
+            expected_subject: None,
+        })
+        .await
+    }
+
+    /// Shared execution core of `run_command` and the catalog runner. The
+    /// caller owns the Workspace execution lock. Legacy callers pass
+    /// `catalog: None`, which produces exactly the historical run identity.
+    pub(crate) async fn run_check_core(
+        &self,
+        input: CheckRunInput<'_>,
+    ) -> Result<ValidationCheckResult> {
+        let CheckRunInput {
+            task_id,
+            workspace_id,
+            command,
+            caused_by_execution_id,
+            check_identity,
+            evidence_key,
+            timeout_seconds,
+            catalog,
+            expected_subject,
+        } = input;
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
@@ -91,16 +148,27 @@ impl ValidationService {
                 .map(|(key, value)| (key.as_str(), hex::encode(Sha256::digest(value.as_bytes()))))
                 .collect::<Vec<_>>(),
         )?;
-        let command_digest = hex::encode(Sha256::digest(command.as_bytes()));
-        let check_identity = format!("ci:{check_index}:{command_digest}");
-        let config_summary_json = serde_json::json!({
+        if let Some((expected_commit, expected_snapshot)) = expected_subject {
+            if expected_commit != initial_commit || expected_snapshot != initial_snapshot_digest {
+                return Err(ServiceError::Coordination {
+                    code: "validation.subject_stale",
+                    message: "the Workspace no longer matches the pinned commit and snapshot"
+                        .to_owned(),
+                });
+            }
+        }
+        let mut config_summary = serde_json::json!({
             "shell": "bash -c",
             "environment_digest": environment_digest,
             "environment_variables": environment.len(),
             "output_tail_bytes_per_stream": OUTPUT_TAIL_LIMIT,
-            "timeout_seconds": COMMAND_TIMEOUT_SECONDS,
-        })
-        .to_string();
+            "timeout_seconds": timeout_seconds,
+        });
+        if let Some(catalog) = catalog.as_ref() {
+            config_summary["definition_digest"] =
+                serde_json::Value::String(catalog.definition_digest.clone());
+        }
+        let config_summary_json = config_summary.to_string();
         if config_summary_json.len() > 8192 {
             return Err(ServiceError::invalid_operation(
                 "validation environment summary exceeds its storage bound",
@@ -156,10 +224,12 @@ impl ValidationService {
                 commit_sha: initial_commit.clone(),
                 workspace_snapshot_digest: initial_snapshot_digest.clone(),
                 idempotency_key: idempotency_key.clone(),
-                catalog_check_id: None,
-                definition_digest: None,
-                run_origin: db::ValidationRunOrigin::LegacyCommand,
-                check_request_id: None,
+                catalog_check_id: catalog.as_ref().map(|c| c.catalog_check_id.clone()),
+                definition_digest: catalog.as_ref().map(|c| c.definition_digest.clone()),
+                run_origin: catalog
+                    .as_ref()
+                    .map_or(db::ValidationRunOrigin::LegacyCommand, |c| c.run_origin),
+                check_request_id: catalog.as_ref().map(|c| c.check_request_id.clone()),
                 started_at: now.clone(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -171,15 +241,24 @@ impl ValidationService {
                 &task.id,
                 &task.project_id,
                 &format!("validation-run-started:{idempotency_key}"),
-                serde_json::json!({
-                    "validation_run_id": run_id,
-                    "task_id": task.id,
-                    "project_id": task.project_id,
-                    "workspace_id": workspace_id,
-                    "commit_sha": initial_commit,
-                    "workspace_snapshot_digest": initial_snapshot_digest,
-                    "check_identity": check_identity,
-                }),
+                {
+                    let mut payload = serde_json::json!({
+                        "validation_run_id": run_id,
+                        "task_id": task.id,
+                        "project_id": task.project_id,
+                        "workspace_id": workspace_id,
+                        "commit_sha": initial_commit,
+                        "workspace_snapshot_digest": initial_snapshot_digest,
+                        "check_identity": check_identity,
+                    });
+                    if let Some(catalog) = catalog.as_ref() {
+                        payload["check_request_id"] =
+                            serde_json::Value::String(catalog.check_request_id.clone());
+                        payload["run_origin"] =
+                            serde_json::Value::String(catalog.run_origin.to_string());
+                    }
+                    payload
+                },
                 &now,
             ),
         )
@@ -217,12 +296,13 @@ impl ValidationService {
         }
 
         let execution = run_bounded_command(
-            &self.db,
+            Some(&*self.db),
             &start.validation_run.id,
             &owner,
             &workspace.worktree_path,
             command,
             &environment,
+            timeout_seconds,
         )
         .await;
         let finished_at = now_rfc3339();
@@ -269,7 +349,7 @@ impl ValidationService {
                 ),
             };
         let evidence_id = new_uuid_v4();
-        let evidence_content = serde_json::json!({
+        let mut evidence_value = serde_json::json!({
             "validation_run_id": start.validation_run.id,
             "task_id": task.id,
             "check_identity": check_identity,
@@ -289,15 +369,21 @@ impl ValidationService {
             "stdout_bytes": stdout_bytes,
             "stderr_bytes": stderr_bytes,
             "spawn_error": spawn_error,
-        })
-        .to_string();
+        });
+        if let Some(catalog) = catalog.as_ref() {
+            evidence_value["check_key"] = serde_json::Value::String(catalog.check_key.clone());
+            evidence_value["definition_digest"] =
+                serde_json::Value::String(catalog.definition_digest.clone());
+            evidence_value["check_request_id"] =
+                serde_json::Value::String(catalog.check_request_id.clone());
+        }
+        let evidence_content = evidence_value.to_string();
         if evidence_content.len() > 32768 {
             return Err(ServiceError::invalid_operation(
                 "Validation Evidence content exceeds its durable storage bound",
             ));
         }
         let evidence_digest = hex::encode(Sha256::digest(evidence_content.as_bytes()));
-        let evidence_key = format!("check:{check_index}");
         let evidence = CreateEvidence {
             id: evidence_id.clone(),
             task_id: task_id.to_owned(),
@@ -414,7 +500,7 @@ impl ValidationService {
     }
 }
 
-struct CommandOutput {
+pub(crate) struct CommandOutput {
     exit_code: Option<i32>,
     stdout_tail: String,
     stderr_tail: String,
@@ -423,13 +509,92 @@ struct CommandOutput {
     spawn_error: Option<String>,
 }
 
+/// Result of a disposable baseline execution (no ValidationRun row exists).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BaselineExecution {
+    pub status: ValidationRunStatus,
+    pub exit_code: Option<i64>,
+    pub output_digest: String,
+    pub snapshot_digest: String,
+}
+
+/// Run `command` once in a runner-owned detached worktree, with the same
+/// environment capture, shell and output bounds as a catalog run, and classify
+/// the outcome with the same rules as the candidate run (stale when the
+/// worktree HEAD or snapshot changed). No claim or heartbeat: the worktree is
+/// disposable and no `validation_run` row is written.
+pub(crate) async fn run_baseline_command(
+    worktree_path: &str,
+    command: &str,
+    timeout_seconds: u64,
+) -> Result<BaselineExecution> {
+    let environment = capture_environment()?;
+    let initial_commit = read_head(worktree_path).await?;
+    let initial_snapshot = workspace_snapshot_digest(worktree_path).await?;
+    let execution = run_bounded_command(
+        None,
+        "",
+        "",
+        worktree_path,
+        command,
+        &environment,
+        timeout_seconds,
+    )
+    .await;
+    let observed_commit = read_head(worktree_path).await.ok();
+    let observed_snapshot = workspace_snapshot_digest(worktree_path).await.ok();
+    let (status, exit_code, output) = match execution {
+        Ok(result) => {
+            let status = match (
+                result.exit_code,
+                observed_commit.as_deref(),
+                observed_snapshot.as_deref(),
+            ) {
+                (_, Some(observed), _) if observed != initial_commit => ValidationRunStatus::Stale,
+                (_, _, Some(observed)) if observed != initial_snapshot => {
+                    ValidationRunStatus::Stale
+                }
+                (Some(0), Some(_), Some(_)) => ValidationRunStatus::Passed,
+                (Some(_), Some(_), Some(_)) => ValidationRunStatus::Failed,
+                _ => ValidationRunStatus::Error,
+            };
+            (
+                status,
+                result.exit_code.map(i64::from),
+                output_digest(&result.stdout_tail, &result.stderr_tail),
+            )
+        }
+        Err(error) => (
+            ValidationRunStatus::Error,
+            None,
+            output_digest("", &error.to_string()),
+        ),
+    };
+    Ok(BaselineExecution {
+        status,
+        exit_code,
+        output_digest: output,
+        snapshot_digest: initial_snapshot,
+    })
+}
+
+/// Digest of the bounded output tails; compares candidate and baseline output.
+pub(crate) fn output_digest(stdout_tail: &str, stderr_tail: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bounded(stdout_tail).as_bytes());
+    digest.update([0u8]);
+    digest.update(bounded(stderr_tail).as_bytes());
+    hex::encode(digest.finalize())
+}
+
 async fn run_bounded_command(
-    db: &db::SqliteDb,
+    db: Option<&db::SqliteDb>,
     run_id: &str,
     owner: &str,
     worktree_path: &str,
     command: &str,
     environment: &[(String, String)],
+    timeout_seconds: u64,
 ) -> std::result::Result<CommandOutput, std::io::Error> {
     let mut child = Command::new("bash")
         .arg("-c")
@@ -449,12 +614,13 @@ async fn run_bounded_command(
         Instant::now() + Duration::from_secs(HEARTBEAT_SECONDS),
         Duration::from_secs(HEARTBEAT_SECONDS),
     );
-    let timeout = tokio::time::sleep(Duration::from_secs(COMMAND_TIMEOUT_SECONDS));
+    let timeout = tokio::time::sleep(Duration::from_secs(timeout_seconds));
     tokio::pin!(timeout);
     let status = loop {
         tokio::select! {
             result = child.wait() => break Some(result?),
             _ = heartbeat.tick() => {
+                let Some(db) = db else { continue };
                 let now = now_rfc3339();
                 let until = timestamp_after(CLAIM_SECONDS);
                 let active = db::ValidationRunRepo::heartbeat_validation_run(
@@ -518,7 +684,7 @@ where
     Ok((String::from_utf8_lossy(&tail).into_owned(), total))
 }
 
-fn capture_environment() -> Result<Vec<(String, String)>> {
+pub(crate) fn capture_environment() -> Result<Vec<(String, String)>> {
     let mut environment = std::env::vars().collect::<Vec<_>>();
     environment.sort_by(|left, right| left.0.cmp(&right.0));
     if environment.len() > 2048 {
@@ -529,7 +695,7 @@ fn capture_environment() -> Result<Vec<(String, String)>> {
     Ok(environment)
 }
 
-async fn read_head(worktree_path: &str) -> Result<String> {
+pub(crate) async fn read_head(worktree_path: &str) -> Result<String> {
     let output = Command::new("git")
         .args(["rev-parse", "--verify", "HEAD"])
         .current_dir(worktree_path)
@@ -777,7 +943,7 @@ where
     Ok(total)
 }
 
-fn timestamp_after(seconds: i64) -> String {
+pub(crate) fn timestamp_after(seconds: i64) -> String {
     (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339()
 }
 
@@ -792,7 +958,7 @@ fn bounded(value: &str) -> String {
     value[start..].to_owned()
 }
 
-fn digest_json(value: &impl serde::Serialize) -> Result<String> {
+pub(crate) fn digest_json(value: &impl serde::Serialize) -> Result<String> {
     let encoded = serde_json::to_vec(value).map_err(|error| {
         ServiceError::invalid_operation(format!(
             "validation identity serialization failed: {error}"
@@ -802,7 +968,7 @@ fn digest_json(value: &impl serde::Serialize) -> Result<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn event(
+pub(crate) fn event(
     event_type: &str,
     entity_type: &str,
     entity_id: &str,

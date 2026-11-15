@@ -233,6 +233,16 @@ async fn main() {
         None,
     )
     .run();
+    // Catalog validation check requests run in the Forge process under the
+    // shared Workspace execution locks; running rows left by a crash are
+    // recovered by the first tick.
+    let _validation_check_runner_handle = Arc::new(services::ValidationCheckRunner::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+        Arc::clone(&state.workspace_exec_locks),
+        workspace_root.clone(),
+    ))
+    .spawn(state.shutdown_signal.subscribe());
     let shared_media_cleanup_handle =
         Arc::clone(&shared_media_cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
     let task_dispatcher = Arc::new(services::TaskDispatcher::new(

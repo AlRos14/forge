@@ -36,6 +36,108 @@ pub struct GatePolicyDocument {
     pub work_units: Vec<WorkUnitRequirement>,
 }
 
+/// One catalog check a merge-readiness Gate requires (policy schema v2). It is
+/// resolved by exact subject, never "latest": the run key is derived from the
+/// merge candidate (integration Workspace, commit, snapshot) and the pinned
+/// `catalog:{check_key}@{definition_digest[0..16]}` identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequiredCheck {
+    pub check_key: String,
+    pub definition_digest: String,
+    pub required_outcome: ValidationRunStatus,
+}
+
+/// Gate policy schema v2: the v1 requirements plus `required_checks`. v1
+/// documents (and `GatePolicyDocument`) are unchanged and cannot carry
+/// `required_checks`; an unknown schema still fails closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatePolicyDocumentV2 {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub scope_requirement: Option<GateScopeRequirement>,
+    #[serde(default)]
+    pub review: Option<ReviewSetPolicy>,
+    #[serde(default)]
+    pub validations: Vec<ValidationRequirement>,
+    #[serde(default)]
+    pub decisions: Vec<DecisionRequirement>,
+    #[serde(default)]
+    pub work_units: Vec<WorkUnitRequirement>,
+    #[serde(default)]
+    pub required_checks: Vec<RequiredCheck>,
+}
+
+const MAX_REQUIRED_CHECKS: usize = 16;
+
+impl GatePolicyDocumentV2 {
+    /// Split into the shared v1 requirements (schema_version 1 for the common
+    /// normalization and evaluators) and the v2 `required_checks`.
+    fn into_parts(self) -> Result<(GatePolicyDocument, Vec<RequiredCheck>)> {
+        if self.schema_version != 2 {
+            return Err(invalid("Gate policy v2 must use schema version 2"));
+        }
+        Ok((
+            GatePolicyDocument {
+                schema_version: 1,
+                scope_requirement: self.scope_requirement,
+                review: self.review,
+                validations: self.validations,
+                decisions: self.decisions,
+                work_units: self.work_units,
+            },
+            self.required_checks,
+        ))
+    }
+
+    fn from_parts(base: GatePolicyDocument, required_checks: Vec<RequiredCheck>) -> Self {
+        Self {
+            schema_version: 2,
+            scope_requirement: base.scope_requirement,
+            review: base.review,
+            validations: base.validations,
+            decisions: base.decisions,
+            work_units: base.work_units,
+            required_checks,
+        }
+    }
+}
+
+fn normalize_required_checks(mut checks: Vec<RequiredCheck>) -> Result<Vec<RequiredCheck>> {
+    if checks.len() > MAX_REQUIRED_CHECKS {
+        return Err(invalid("Gate policy accepts at most 16 required_checks"));
+    }
+    for check in &checks {
+        if !crate::validation_catalog::is_valid_check_key(&check.check_key) {
+            return Err(invalid(
+                "required_checks check_key must be a slug of 1 to 64 [a-z0-9_-] bytes",
+            ));
+        }
+        if check.definition_digest.len() != 64
+            || !check
+                .definition_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(invalid(
+                "required_checks definition_digest must be 64 lowercase hex characters",
+            ));
+        }
+        if check.required_outcome != ValidationRunStatus::Passed {
+            return Err(invalid("required_checks must require the passed outcome"));
+        }
+    }
+    checks.sort_by(|left, right| left.check_key.cmp(&right.check_key));
+    if checks
+        .windows(2)
+        .any(|pair| pair[0].check_key == pair[1].check_key)
+    {
+        return Err(invalid("required_checks contains a duplicate check_key"));
+    }
+    Ok(checks)
+}
+
 /// Operation-scoped Gates pin one exact merge operation or immutable
 /// lifecycle transition. Task and WorkUnit scopes use their typed input
 /// requirements instead.
@@ -251,12 +353,46 @@ impl GateEngine {
         gate_kind: &str,
         scope_kind: GateScopeKind,
         scope_id: &str,
+        policy: GatePolicyDocument,
+    ) -> Result<(Gate, GatePolicyRevision)> {
+        self.create_gate_with_policy(task_id, gate_kind, scope_kind, scope_id, policy, None)
+            .await
+    }
+
+    /// Create a Gate whose first policy revision is schema v2 (`required_checks`).
+    pub async fn create_gate_with_initial_policy_v2(
+        &self,
+        task_id: &str,
+        gate_kind: &str,
+        scope_kind: GateScopeKind,
+        scope_id: &str,
+        policy: GatePolicyDocumentV2,
+    ) -> Result<(Gate, GatePolicyRevision)> {
+        let (base, checks) = policy.into_parts()?;
+        self.create_gate_with_policy(task_id, gate_kind, scope_kind, scope_id, base, Some(checks))
+            .await
+    }
+
+    async fn create_gate_with_policy(
+        &self,
+        task_id: &str,
+        gate_kind: &str,
+        scope_kind: GateScopeKind,
+        scope_id: &str,
         mut policy: GatePolicyDocument,
+        required_checks: Option<Vec<RequiredCheck>>,
     ) -> Result<(Gate, GatePolicyRevision)> {
         validate_text("task_id", task_id, 128)?;
         validate_text("gate_kind", gate_kind, 64)?;
         validate_text("scope_id", scope_id, 128)?;
         normalize_policy(&mut policy)?;
+        let required_checks = required_checks.map(normalize_required_checks).transpose()?;
+        let has_required_checks = required_checks.as_ref().is_some_and(|c| !c.is_empty());
+        let schema_version = if required_checks.is_some() {
+            2
+        } else {
+            policy.schema_version
+        };
         let gate_id = new_uuid_v4();
         let now = now_rfc3339();
         let gate = Gate {
@@ -268,10 +404,10 @@ impl GateEngine {
             active_policy_revision: Some(1),
             created_at: now.clone(),
         };
-        self.validate_policy_scope(&gate, &policy).await?;
+        self.validate_policy_scope(&gate, &policy, has_required_checks)
+            .await?;
         self.validate_role_snapshots(&gate, &policy).await?;
-        let policy_json = serde_json::to_string(&policy)
-            .map_err(|error| invalid(format!("Gate policy cannot be serialized: {error}")))?;
+        let policy_json = serialize_policy(policy, required_checks)?;
         let policy_digest = sha256(policy_json.as_bytes());
         let policy_revision_id = format!("{gate_id}:policy:1");
         let gate_created_event = gate_event(
@@ -307,7 +443,7 @@ impl GateEngine {
                 gate_id,
                 expected_active_revision: None,
                 revision: 1,
-                schema_version: i64::from(policy.schema_version),
+                schema_version: i64::from(schema_version),
                 policy_json,
                 policy_digest,
                 created_at: now,
@@ -324,16 +460,46 @@ impl GateEngine {
         &self,
         gate_id: &str,
         expected_active_revision: Option<i64>,
+        policy: GatePolicyDocument,
+    ) -> Result<GatePolicyRevision> {
+        self.revise_gate_policy(gate_id, expected_active_revision, policy, None)
+            .await
+    }
+
+    /// Revise a Gate with a schema v2 policy (`required_checks`).
+    pub async fn revise_policy_v2(
+        &self,
+        gate_id: &str,
+        expected_active_revision: Option<i64>,
+        policy: GatePolicyDocumentV2,
+    ) -> Result<GatePolicyRevision> {
+        let (base, checks) = policy.into_parts()?;
+        self.revise_gate_policy(gate_id, expected_active_revision, base, Some(checks))
+            .await
+    }
+
+    async fn revise_gate_policy(
+        &self,
+        gate_id: &str,
+        expected_active_revision: Option<i64>,
         mut policy: GatePolicyDocument,
+        required_checks: Option<Vec<RequiredCheck>>,
     ) -> Result<GatePolicyRevision> {
         let gate = GateRepo::get_gate(&*self.db, gate_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("gate", gate_id.to_owned()))?;
         normalize_policy(&mut policy)?;
-        self.validate_policy_scope(&gate, &policy).await?;
+        let required_checks = required_checks.map(normalize_required_checks).transpose()?;
+        let has_required_checks = required_checks.as_ref().is_some_and(|c| !c.is_empty());
+        let schema_version = if required_checks.is_some() {
+            2
+        } else {
+            policy.schema_version
+        };
+        self.validate_policy_scope(&gate, &policy, has_required_checks)
+            .await?;
         self.validate_role_snapshots(&gate, &policy).await?;
-        let policy_json = serde_json::to_string(&policy)
-            .map_err(|error| invalid(format!("Gate policy cannot be serialized: {error}")))?;
+        let policy_json = serialize_policy(policy, required_checks)?;
         let policy_digest = sha256(policy_json.as_bytes());
         let revision = expected_active_revision.unwrap_or(0) + 1;
         let now = now_rfc3339();
@@ -353,7 +519,7 @@ impl GateEngine {
                 gate_id: gate_id.to_owned(),
                 expected_active_revision,
                 revision,
-                schema_version: i64::from(policy.schema_version),
+                schema_version: i64::from(schema_version),
                 policy_json,
                 policy_digest,
                 created_at: now,
@@ -398,12 +564,34 @@ impl GateEngine {
         let mut issues = Vec::new();
         let mut missing = Vec::new();
         let mut inputs = Vec::new();
-        let (outcome, policy) = if policy_revision.schema_version != 1 {
+        let mut required_checks: Vec<RequiredCheck> = Vec::new();
+        let (outcome, policy) = if !matches!(policy_revision.schema_version, 1 | 2) {
             issues.push("unknown_policy_schema".to_owned());
             (GateEvaluationOutcome::Indeterminate, None)
         } else if sha256(policy_revision.policy_json.as_bytes()) != policy_revision.policy_digest {
             issues.push("policy_digest_mismatch".to_owned());
             (GateEvaluationOutcome::Indeterminate, None)
+        } else if policy_revision.schema_version == 2 {
+            match serde_json::from_str::<GatePolicyDocumentV2>(&policy_revision.policy_json) {
+                Ok(policy) if policy.schema_version == 2 => match policy.into_parts() {
+                    Ok((base, checks)) => {
+                        required_checks = checks;
+                        (GateEvaluationOutcome::Unsatisfied, Some(base))
+                    }
+                    Err(_) => {
+                        issues.push("invalid_policy_shape".to_owned());
+                        (GateEvaluationOutcome::Indeterminate, None)
+                    }
+                },
+                Ok(_) => {
+                    issues.push("unknown_policy_schema".to_owned());
+                    (GateEvaluationOutcome::Indeterminate, None)
+                }
+                Err(_) => {
+                    issues.push("invalid_policy_shape".to_owned());
+                    (GateEvaluationOutcome::Indeterminate, None)
+                }
+            }
         } else {
             match serde_json::from_str::<GatePolicyDocument>(&policy_revision.policy_json) {
                 Ok(policy) if policy.schema_version == 1 => {
@@ -421,7 +609,7 @@ impl GateEngine {
         };
 
         if let Some(policy) = policy.as_ref() {
-            if !policy_has_requirements(policy) {
+            if !policy_has_requirements(policy) && required_checks.is_empty() {
                 issues.push("empty_policy".to_owned());
             } else {
                 self.evaluate_scope_requirement(
@@ -436,6 +624,15 @@ impl GateEngine {
                     .await?;
                 self.evaluate_validations(&gate, policy, &mut inputs, &mut missing, &mut issues)
                     .await?;
+                self.evaluate_required_checks(
+                    &gate,
+                    &required_checks,
+                    &policy.decisions,
+                    &mut inputs,
+                    &mut missing,
+                    &mut issues,
+                )
+                .await?;
                 self.evaluate_decisions(&gate, policy, &mut inputs, &mut missing, &mut issues)
                     .await?;
                 self.evaluate_work_units(&gate, policy, &mut inputs, &mut missing, &mut issues)
@@ -687,7 +884,12 @@ impl GateEngine {
         Ok(())
     }
 
-    async fn validate_policy_scope(&self, gate: &Gate, policy: &GatePolicyDocument) -> Result<()> {
+    async fn validate_policy_scope(
+        &self,
+        gate: &Gate,
+        policy: &GatePolicyDocument,
+        has_required_checks: bool,
+    ) -> Result<()> {
         match (&gate.scope_kind, &policy.scope_requirement) {
             (GateScopeKind::Task | GateScopeKind::WorkUnit, None) => {}
             (
@@ -762,7 +964,8 @@ impl GateEngine {
                 "WorkUnit-scoped Gate policy must pin that exact WorkUnit",
             ));
         }
-        if policy.review.is_none()
+        if !has_required_checks
+            && policy.review.is_none()
             && policy.validations.is_empty()
             && policy.decisions.is_empty()
             && policy.work_units.is_empty()
@@ -1490,6 +1693,172 @@ impl GateEngine {
         Ok(())
     }
 
+    /// Schema v2 `required_checks`: resolve each pinned catalog check by the
+    /// exact merge-candidate subject (integration Workspace, HEAD commit, snapshot
+    /// digest) and the exact `catalog:{key}@{digest[0..16]}` identity. More than
+    /// one matching run is ambiguous and never resolved by recency. A failed run
+    /// classified `pre_existing_failure` is dispensed only when the policy also
+    /// carries the exact `validation_waiver:{key}@{digest[0..16]}` Decision
+    /// requirement (evaluated independently); the dispensed run is frozen as
+    /// Evidence only, because merge admission requires every `validation_run`
+    /// input to be `passed`.
+    async fn evaluate_required_checks(
+        &self,
+        gate: &Gate,
+        required_checks: &[RequiredCheck],
+        decisions: &[DecisionRequirement],
+        inputs: &mut Vec<InputDraft>,
+        missing: &mut Vec<String>,
+        issues: &mut Vec<String>,
+    ) -> Result<()> {
+        if required_checks.is_empty() {
+            return Ok(());
+        }
+        if gate.gate_kind != "merge_readiness" {
+            issues.push("required_checks_require_merge_readiness".to_owned());
+            return Ok(());
+        }
+        let Some(workspace) =
+            db::WorkspaceRepo::get_integration_by_task_id(&*self.db, &gate.task_id).await?
+        else {
+            missing.push("integration_workspace".to_owned());
+            return Ok(());
+        };
+        if workspace.status != db::WorkspaceStatus::Ready {
+            issues.push(format!(
+                "required_check_subject_unavailable:{}",
+                workspace.id
+            ));
+            return Ok(());
+        }
+        let commit_sha = crate::validation_service::read_head(&workspace.worktree_path).await?;
+        let snapshot_digest =
+            crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?;
+        let runs = ValidationRunRepo::list_validation_runs_for_subject(
+            &*self.db,
+            &gate.task_id,
+            &workspace.id,
+            &commit_sha,
+            &snapshot_digest,
+            None,
+        )
+        .await?;
+        for check in required_checks {
+            let prefix: String = check.definition_digest.chars().take(16).collect();
+            let identity = format!("catalog:{}@{prefix}", check.check_key);
+            let matching: Vec<_> = runs
+                .iter()
+                .filter(|run| {
+                    run.check_identity == identity
+                        && run.definition_digest.as_deref()
+                            == Some(check.definition_digest.as_str())
+                        && run.run_origin != db::ValidationRunOrigin::LegacyCommand
+                })
+                .collect();
+            let run = match matching.as_slice() {
+                [] => {
+                    missing.push(format!("required_check:{}", check.check_key));
+                    continue;
+                }
+                [run] => *run,
+                _ => {
+                    issues.push(format!("required_check_ambiguous:{}", check.check_key));
+                    continue;
+                }
+            };
+            if run.status == ValidationRunStatus::Running {
+                missing.push(format!("required_check:{}", check.check_key));
+                continue;
+            }
+            let evidence = ValidationRunRepo::list_evidence_for_validation_run(&*self.db, &run.id)
+                .await?
+                .into_iter()
+                .find(|evidence| evidence.kind == "deterministic_check_output");
+            let Some(evidence) = evidence else {
+                missing.push(format!("required_check_evidence:{}", check.check_key));
+                continue;
+            };
+            let mut waived = false;
+            if run.status != check.required_outcome {
+                let comparison = match run.check_request_id.as_deref() {
+                    Some(request_id) => {
+                        db::ValidationComparisonRepo::get_validation_comparison_by_request(
+                            &*self.db, request_id,
+                        )
+                        .await?
+                    }
+                    None => None,
+                };
+                let waiver_ref = format!("validation_waiver:{}@{prefix}", check.check_key);
+                waived = comparison.is_some_and(|comparison| {
+                    comparison.candidate_run_id == run.id
+                        && comparison.classification
+                            == db::ValidationComparisonClass::PreExistingFailure
+                }) && decisions
+                    .iter()
+                    .any(|decision| decision.policy_ref.as_deref() == Some(waiver_ref.as_str()));
+                if !waived {
+                    issues.push(format!(
+                        "required_check_outcome_mismatch:{}:{}",
+                        check.check_key, run.status
+                    ));
+                }
+            }
+            let subject = json!({
+                "check_identity": run.check_identity,
+                "config_digest": run.config_digest,
+                "workspace_id": run.workspace_id,
+                "commit_sha": run.commit_sha,
+                "workspace_snapshot_digest": run.workspace_snapshot_digest,
+                "definition_digest": check.definition_digest,
+            });
+            let run_digest = sha256(
+                json!({
+                    "id": run.id,
+                    "task_id": run.task_id,
+                    "check_identity": run.check_identity,
+                    "config_digest": run.config_digest,
+                    "workspace_id": run.workspace_id,
+                    "commit_sha": run.commit_sha,
+                    "workspace_snapshot_digest": run.workspace_snapshot_digest,
+                    "status": run.status,
+                    "exit_code": run.exit_code,
+                    "finished_at": run.finished_at,
+                })
+                .to_string()
+                .as_bytes(),
+            );
+            if !waived {
+                inputs.push(InputDraft {
+                    input_kind: "validation_run".to_owned(),
+                    input_id: run.id.clone(),
+                    input_version: 1,
+                    input_digest: run_digest,
+                    producer_ref: None,
+                    subject_json: subject.to_string(),
+                    status: run.status.to_string(),
+                });
+            }
+            if evidence.producer_validation_run_id == run.id {
+                inputs.push(InputDraft {
+                    input_kind: "evidence".to_owned(),
+                    input_id: evidence.id,
+                    input_version: 1,
+                    input_digest: evidence.digest,
+                    producer_ref: Some(run.id.clone()),
+                    subject_json: subject.to_string(),
+                    status: run.status.to_string(),
+                });
+            } else {
+                issues.push(format!(
+                    "required_check_evidence_mismatch:{}",
+                    check.check_key
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn evaluate_decisions(
         &self,
         gate: &Gate,
@@ -1924,6 +2293,17 @@ fn normalize_policy(policy: &mut GatePolicyDocument) -> Result<()> {
         None => {}
     }
     Ok(())
+}
+
+fn serialize_policy(
+    policy: GatePolicyDocument,
+    required_checks: Option<Vec<RequiredCheck>>,
+) -> Result<String> {
+    let encoded = match required_checks {
+        None => serde_json::to_string(&policy),
+        Some(checks) => serde_json::to_string(&GatePolicyDocumentV2::from_parts(policy, checks)),
+    };
+    encoded.map_err(|error| invalid(format!("Gate policy cannot be serialized: {error}")))
 }
 
 fn policy_has_requirements(policy: &GatePolicyDocument) -> bool {

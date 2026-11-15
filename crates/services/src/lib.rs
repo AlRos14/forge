@@ -5,6 +5,7 @@ pub(crate) mod agent_capacity;
 pub mod agent_service;
 pub mod auth_service;
 pub mod collaboration_service;
+pub mod coordinator_outputs;
 pub mod copilot_mcp;
 pub mod credential_service;
 pub mod daemon_monitor;
@@ -18,6 +19,7 @@ pub mod embedded_daemon;
 pub mod external_api;
 pub mod external_sync;
 pub mod gate_engine;
+pub mod human_decision_service;
 pub mod integration_service;
 pub mod merge_service;
 pub mod notification_service;
@@ -52,6 +54,9 @@ pub mod task_role_configuration;
 pub mod task_service;
 pub mod terminal_service;
 pub mod types;
+pub mod validation_catalog;
+pub mod validation_check_runner;
+pub(crate) mod validation_post_integration;
 pub mod validation_service;
 pub mod work_unit_service;
 pub mod workspace_cleanup;
@@ -83,6 +88,7 @@ pub use diff::DiffService;
 pub use domain_event_service::DomainEventService;
 pub use embedded_daemon::EmbeddedDaemon;
 pub use external_sync::ExternalSyncService;
+pub use human_decision_service::HumanDecisionService;
 pub use integration_service::IntegrationService;
 pub use merge_service::{MergeOutcome, MergeService};
 pub use notification_service::NotificationService;
@@ -112,6 +118,10 @@ pub use task_rework::{
 pub use task_service::{NewSubtaskInput, TaskService};
 pub use terminal_service::{TerminalActivityTracker, TerminalService};
 pub use types::Assignee;
+pub use validation_catalog::{PublishCheckInput, ValidationCatalogService};
+pub use validation_check_runner::{
+    enqueue_check_request, EnqueueCheckRequest, ValidationCheckRunner,
+};
 pub use validation_service::{ValidationCheckResult, ValidationService};
 pub use work_unit_service::{CreateWorkUnitInput, WorkUnitReadiness, WorkUnitService};
 pub use workspace_cleanup::WorkspaceCleanupScheduler;
@@ -256,6 +266,18 @@ impl From<db::DbError> for ServiceError {
             db::DbError::QualityRequestBudgetExhausted => Self::Coordination {
                 code: "coordination.budget_exhausted",
                 message: "the Task quality-request budget is exhausted".to_owned(),
+            },
+            db::DbError::ValidationCheckStalePin => Self::Coordination {
+                code: "validation.check_stale_pin",
+                message: error.to_string(),
+            },
+            db::DbError::ValidationCheckNotAuthorized => Self::Coordination {
+                code: "validation.check_not_authorized",
+                message: error.to_string(),
+            },
+            db::DbError::ValidationWorkspaceLeased => Self::Coordination {
+                code: "validation.workspace_leased",
+                message: error.to_string(),
             },
             error => Self::Db(error),
         }
