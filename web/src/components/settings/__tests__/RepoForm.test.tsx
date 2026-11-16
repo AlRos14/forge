@@ -150,12 +150,13 @@ describe('RepoForm', () => {
     })
   })
 
-  it('lets the user select a connected GitHub credential for a pull request repo', () => {
+  it('lets the user select a connected GitHub credential for a pull request repo', async () => {
     const onSubmit = vi.fn()
     renderRepoForm({ ...localRepoForm, work_mode: 'pull_request' }, onSubmit)
 
+    await waitFor(() => expect(listScmCredentials).toHaveBeenCalled())
     fireEvent.click(screen.getByRole('button', { name: 'GitHub SCM credential' }))
-    fireEvent.click(screen.getByRole('option', { name: 'Forge GitHub' }))
+    fireEvent.click(await screen.findByRole('option', { name: 'Forge GitHub' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     expect(onSubmit).toHaveBeenCalledWith(

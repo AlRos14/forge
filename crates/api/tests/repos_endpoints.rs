@@ -259,7 +259,7 @@ async fn create_repo_attaches_owned_github_credential_in_the_create_transaction(
     )
     .await;
 
-    let status = repo.pr_provider_status.expect("provider status");
+    let status = repo.pr_provider_status.as_ref().expect("provider status");
     assert!(status.has_credential);
     assert_eq!(
         status.credential_handle_id.as_deref(),
