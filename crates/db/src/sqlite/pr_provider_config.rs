@@ -35,20 +35,30 @@ async fn load_config(pool: &SqlitePool, id: &str) -> Result<PrProviderConfig> {
 #[async_trait]
 impl PrProviderConfigRepo for SqliteDb {
     async fn create(&self, input: CreatePrProviderConfig) -> Result<PrProviderConfig> {
-        sqlx::query("INSERT INTO pr_provider_config (id, repo_id, provider_type, base_url, polling_interval_seconds, token_secret_ref, credential_handle_id, credential_owner_user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        // Without a credential reference keep the pre-V173 column list, so
+        // historical-schema migration tests can still seed provider configs.
+        let has_credential =
+            input.credential_handle_id.is_some() || input.credential_owner_user_id.is_some();
+        let sql = if has_credential {
+            "INSERT INTO pr_provider_config (id, repo_id, provider_type, base_url, polling_interval_seconds, token_secret_ref, created_at, updated_at, credential_handle_id, credential_owner_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        } else {
+            "INSERT INTO pr_provider_config (id, repo_id, provider_type, base_url, polling_interval_seconds, token_secret_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        };
+        let mut query = sqlx::query(sql)
             .bind(&input.id)
             .bind(&input.repo_id)
             .bind(&input.provider_type)
             .bind(&input.base_url)
             .bind(input.polling_interval_seconds)
             .bind(&input.token_secret_ref)
-            .bind(&input.credential_handle_id)
-            .bind(&input.credential_owner_user_id)
             .bind(&input.created_at)
-            .bind(&input.updated_at)
-            .execute(&self.pool)
-            .await
-            .map_err(check_error)?;
+            .bind(&input.updated_at);
+        if has_credential {
+            query = query
+                .bind(&input.credential_handle_id)
+                .bind(&input.credential_owner_user_id);
+        }
+        query.execute(&self.pool).await.map_err(check_error)?;
         PrProviderConfigRepo::get_by_repo_id(self, &input.repo_id)
             .await?
             .ok_or(DbError::NotFound)

@@ -150,6 +150,28 @@ fn action_response(row: SqliteRow) -> Result<PrExternalActionResponse, sqlx::Err
     })
 }
 
+fn action_model_response(action: db::PrExternalAction) -> PrExternalActionResponse {
+    PrExternalActionResponse {
+        id: action.id,
+        task_id: action.task_id,
+        admission_id: action.admission_id,
+        kind: action.kind.to_string(),
+        state: action.state.to_string(),
+        authorization_mode: action.authorization_mode.to_string(),
+        gate_evaluation_id: action.gate_evaluation_id,
+        subject_commit_sha: action.subject_commit_sha,
+        expected_remote_head_sha: action.expected_remote_head_sha,
+        summary_artifact_id: action.summary_artifact_id,
+        body_digest: action.body_digest,
+        proposal_id: action.proposal_id,
+        decision_id: action.decision_id,
+        version: action.version,
+        created_at: action.created_at,
+        updated_at: action.updated_at,
+        finished_at: action.finished_at,
+    }
+}
+
 fn supersession_response(row: SqliteRow) -> Result<PrReworkSupersessionResponse, sqlx::Error> {
     Ok(PrReworkSupersessionResponse {
         id: row.try_get("id")?,
@@ -342,7 +364,7 @@ async fn decide_task_action(
             .await
     }
     .map_err(map_action_error)?;
-    Ok(Json(action_response(decided)))
+    Ok(Json(action_model_response(decided)))
 }
 
 pub async fn get_repo_feedback_policy(
