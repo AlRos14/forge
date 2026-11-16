@@ -18,6 +18,9 @@ import type {
   TokenResponse,
   UnreadCountResponse,
   UpdateSettingsRequest,
+  ConnectScmCredentialRequest,
+  ProviderEntriesResponse,
+  ProviderEntryResponse,
 } from '@/types/generated'
 import type { ProjectHookRunsResponse } from '@/types/generated/bindings/ProjectHookRunsResponse'
 import { refreshAccess, useAuthStore } from '@/stores/auth'
@@ -127,6 +130,19 @@ export function listFsEntries(path: string, daemonId: string): Promise<FsListRes
 export function listBranches(path: string, daemonId: string): Promise<BranchListResponse> {
   return apiFetch<BranchListResponse>('/fs/branches', {
     search: { path, daemon_id: daemonId },
+  })
+}
+
+export function listScmCredentials(): Promise<ProviderEntriesResponse> {
+  return apiFetch<ProviderEntriesResponse>('/providers', { search: { purpose: 'scm' } })
+}
+
+export function connectScmCredential(
+  request: ConnectScmCredentialRequest,
+): Promise<ProviderEntryResponse> {
+  return apiFetch<ProviderEntryResponse>('/providers', {
+    method: 'POST',
+    body: JSON.stringify(request),
   })
 }
 

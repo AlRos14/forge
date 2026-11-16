@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowsClockwise,
   Check,
@@ -17,8 +17,9 @@ import {
   Timer,
   X,
 } from '@phosphor-icons/react'
-import { listBranches } from '@/api/client'
+import { apiFetch, listBranches } from '@/api/client'
 import {
+  useMembersQuery,
   useCreateRepo,
   useDaemonsQuery,
   useReposQuery,
@@ -29,6 +30,7 @@ import { qk } from '@/api/query-keys'
 import { ErrorBanner } from '@/components/error-banner'
 import { IntegrationsTab } from '@/components/settings/IntegrationsTab'
 import { RepoDialog } from '@/components/settings/RepoDialog'
+import { RepoPrFeedbackPolicyEditor } from '@/components/settings/RepoPrFeedbackPolicyEditor'
 import { emptyRepoForm, type RepoFormState } from '@/components/settings/RepoForm'
 import {
   repoFormFromRepo,
@@ -45,6 +47,9 @@ import type { CreateRepoRequest, Project, Repo, UpdateRepoRequest } from '@/type
 
 export function ReposTab({ project, projectId }: { project?: Project; projectId: string }) {
   const isAdmin = useAuthStore((s) => Boolean(s.user?.is_admin))
+  const userId = useAuthStore((s) => s.user?.id)
+  const membersQuery = useMembersQuery(projectId)
+  const queryClient = useQueryClient()
   const reposQuery = useReposQuery(projectId)
   const createRepo = useCreateRepo(projectId)
   const daemonsQuery = useDaemonsQuery(isAdmin)
@@ -61,12 +66,21 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
   const [repoDialogOpen, setRepoDialogOpen] = useState(false)
   const [repoForm, setRepoForm] = useState<RepoFormState>(emptyRepoForm)
   const [editingRepoId, setEditingRepoId] = useState<string | null>(null)
+  const [credentialAttachPending, setCredentialAttachPending] = useState(false)
 
   // Inline branch edit state
   const [branchEditMode, setBranchEditMode] = useState(false)
   const [branchDraft, setBranchDraft] = useState('')
 
   const repos = reposQuery.data?.items ?? []
+  const canManageRepo =
+    isAdmin ||
+    Boolean(project?.owner_id && project.owner_id === userId) ||
+    Boolean(
+      membersQuery.data?.some(
+        (member) => member.user_id === userId && ['owner', 'admin'].includes(member.role),
+      ),
+    )
   const primaryRepo = repos.find((repo) => repo.id === project?.primary_repo_id)
   const branchEditorDaemonId = daemons.find((daemon) => daemon.status === 'online')?.id
   const branchEditorDaemon = branchEditorDaemonId
@@ -187,7 +201,6 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
               base_url:
                 nextForm.pr_provider === 'github' ? null : nextForm.pr_base_url.trim() || null,
               polling_interval_seconds: pollingInterval,
-              ...(nextForm.pr_token.trim() ? { token: nextForm.pr_token.trim() } : {}),
             }
           : null,
     }
@@ -229,41 +242,73 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
               base_url:
                 nextForm.pr_provider === 'github' ? null : nextForm.pr_base_url.trim() || null,
               polling_interval_seconds: pollingInterval,
-              ...(nextForm.pr_token.trim() ? { token: nextForm.pr_token.trim() } : {}),
+              ...(nextForm.pr_provider === 'github' && nextForm.credential_id !== undefined
+                ? { credential_id: nextForm.credential_id }
+                : nextForm.pr_provider !== 'github'
+                  ? { credential_id: null }
+                  : {}),
             }
           : null,
     }
   }
 
-  const submitRepo = (nextForm = repoForm) => {
+  const submitRepo = async (nextForm = repoForm) => {
     if (editingRepoId) {
       const body = formToUpdateRequest(nextForm)
       if (!body) return
-      updateRepo.mutate(body, {
-        onError: (error) => toast.error(settingsErrorMessage(error, 'Repository update failed')),
-        onSuccess: () => {
-          setRepoDialogOpen(false)
-          setEditingRepoId(null)
-          setRepoForm(emptyRepoForm)
-        },
-      })
+      try {
+        await updateRepo.mutateAsync(body)
+        toast.success('Repository updated')
+        setRepoDialogOpen(false)
+        setEditingRepoId(null)
+        setRepoForm(emptyRepoForm)
+      } catch (error) {
+        toast.error(settingsErrorMessage(error, 'Repository update failed'))
+      }
     } else {
       const body = formToCreateRequest(nextForm)
       if (!body) return
-      createRepo.mutate(body, {
-        onError: (error) => toast.error(settingsErrorMessage(error, 'Repository creation failed')),
-        onSuccess: () => {
-          setRepoDialogOpen(false)
-          setRepoForm(emptyRepoForm)
-        },
-      })
+      try {
+        const created = await createRepo.mutateAsync(body)
+        let credentialAttachFailed = false
+        if (
+          nextForm.work_mode === 'pull_request' &&
+          nextForm.pr_provider === 'github' &&
+          typeof nextForm.credential_id === 'string'
+        ) {
+          setCredentialAttachPending(true)
+          try {
+            await apiFetch<Repo>(`/repos/${created.id}`, {
+              method: 'PATCH',
+              body: JSON.stringify({
+                pr_provider_config: { credential_id: nextForm.credential_id },
+              } satisfies UpdateRepoRequest),
+            })
+            void queryClient.invalidateQueries({ queryKey: qk.repos(projectId) })
+          } catch {
+            credentialAttachFailed = true
+            toast.error(
+              'Repository was created, but its GitHub credential could not be attached. Edit it to retry.',
+            )
+          } finally {
+            setCredentialAttachPending(false)
+          }
+        }
+        setRepoDialogOpen(false)
+        setRepoForm(emptyRepoForm)
+        if (!credentialAttachFailed) toast.success('Repository saved')
+      } catch (error) {
+        toast.error(settingsErrorMessage(error, 'Repository creation failed'))
+      }
     }
   }
 
   const workModeLabel = (mode: Repo['work_mode']) =>
     mode === 'pull_request' ? 'Pull request' : 'Direct merge'
 
-  const isPending = editingRepoId ? updateRepo.isPending : createRepo.isPending
+  const isPending = editingRepoId
+    ? updateRepo.isPending
+    : createRepo.isPending || credentialAttachPending
 
   return (
     <>
@@ -463,20 +508,22 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
                         'Not configured'}
                     </Badge>
                   </div>
+                  <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <Key size={12} />
+                    <span
+                      className={
+                        primaryRepo.pr_provider_status?.has_credential
+                          ? 'text-green-600 dark:text-green-400'
+                          : 'text-destructive'
+                      }
+                    >
+                      {primaryRepo.pr_provider_status?.has_credential
+                        ? 'Credential connected'
+                        : 'No credential'}
+                    </span>
+                  </div>
                   {primaryRepo.pr_provider_status ? (
                     <>
-                      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                        <Key size={12} />
-                        <span
-                          className={
-                            primaryRepo.pr_provider_status.has_token
-                              ? 'text-green-600 dark:text-green-400'
-                              : 'text-destructive'
-                          }
-                        >
-                          {primaryRepo.pr_provider_status.has_token ? 'Token saved' : 'No token'}
-                        </span>
-                      </div>
                       <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                         <Timer size={12} />
                         <span>
@@ -489,6 +536,9 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
               </div>
             ) : null}
           </div>
+          {primaryRepo.work_mode === 'pull_request' && canManageRepo ? (
+            <RepoPrFeedbackPolicyEditor key={primaryRepo.id} repoId={primaryRepo.id} />
+          ) : null}
           <IntegrationsTab embedded projectId={projectId} repoRemoteUrl={primaryRepo.remote_url} />
         </>
       ) : (

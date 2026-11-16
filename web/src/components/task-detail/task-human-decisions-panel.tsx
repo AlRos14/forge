@@ -67,7 +67,11 @@ export function TaskHumanDecisionCard({
   }
 
   return (
-    <article className="min-w-0 space-y-3 rounded-md border p-3" data-testid="human-decision-card">
+    <article
+      id={`human-decision-${decision.id}`}
+      className="min-w-0 space-y-3 rounded-md border p-3"
+      data-testid="human-decision-card"
+    >
       <div className="flex flex-wrap items-start justify-between gap-2">
         <p className="min-w-0 break-words text-sm font-medium">{decision.question}</p>
         <Badge variant={open ? 'secondary' : 'outline'}>{decisionStateLabels[decision.state]}</Badge>

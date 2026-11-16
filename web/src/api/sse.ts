@@ -196,6 +196,34 @@ export function routeSsePayload(
     }
   }
 
+  if (
+    eventType.startsWith('task.pr_feedback_') ||
+    eventType.startsWith('task.pr_rework_') ||
+    eventType.startsWith('task.pr_action_') ||
+    eventType === 'task.pr_followup_proposed'
+  ) {
+    const taskId =
+      typeof facts.task_id === 'string'
+        ? facts.task_id
+        : payload.scope_type === 'task'
+          ? (payload.scope_id ?? undefined)
+          : undefined
+    if (taskId) {
+      void queryClient.invalidateQueries({ queryKey: qk.taskPrFeedback(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskPrRework(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskPrActions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskHumanDecisions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
+      invalidateProjectTaskLists(queryClient)
+      void queryClient.invalidateQueries({
+        predicate: (query) => query.queryKey[0] === 'projects' && query.queryKey[2] === 'plan',
+      })
+    } else {
+      invalidateAllActiveQueries(queryClient)
+    }
+  }
+
   if (eventType.startsWith('task.validation_') || eventType.startsWith('task.human_decision_')) {
     const taskId =
       typeof facts.task_id === 'string'

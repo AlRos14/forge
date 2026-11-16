@@ -123,6 +123,13 @@ import type {
   ValidationCheckRequestListResponse,
   ValidationCheckState,
   ValidationComparisonListResponse,
+  ExternalFeedbackItemListResponse,
+  PrReworkListResponse,
+  PrExternalActionListResponse,
+  PrExternalActionResponse,
+  DecidePrExternalActionRequest,
+  PrFeedbackPolicy,
+  UpdatePrFeedbackPolicyRequest,
 } from '@/types/generated'
 import { recordUserInitiatedTransition } from '@/lib/notification-toast-suppression'
 
@@ -798,6 +805,101 @@ export function useTaskHumanDecisionsQuery(taskId: string) {
     queryFn: () => apiFetch<HumanDecisionListResponse>(`/tasks/${taskId}/human-decisions`),
     enabled: Boolean(taskId),
     refetchInterval: 5_000,
+  })
+}
+
+const TASK_PR_PAGE_SIZE = 50
+
+export function useTaskPrFeedbackQuery(taskId: string) {
+  return useInfiniteQuery({
+    queryKey: qk.taskPrFeedback(taskId),
+    queryFn: ({ pageParam }) =>
+      apiFetch<ExternalFeedbackItemListResponse>(`/tasks/${taskId}/pr-feedback`, {
+        search: { cursor: pageParam as string | undefined, limit: TASK_PR_PAGE_SIZE },
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useTaskPrReworkQuery(taskId: string) {
+  return useInfiniteQuery({
+    queryKey: qk.taskPrRework(taskId),
+    queryFn: ({ pageParam }) =>
+      apiFetch<PrReworkListResponse>(`/tasks/${taskId}/pr-rework`, {
+        search: { cursor: pageParam as string | undefined, limit: TASK_PR_PAGE_SIZE },
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useTaskPrActionsQuery(taskId: string) {
+  return useInfiniteQuery({
+    queryKey: qk.taskPrActions(taskId),
+    queryFn: ({ pageParam }) =>
+      apiFetch<PrExternalActionListResponse>(`/tasks/${taskId}/pr-actions`, {
+        search: { cursor: pageParam as string | undefined, limit: TASK_PR_PAGE_SIZE },
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useDecidePrExternalAction() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      actionId,
+      decision,
+      body,
+    }: {
+      taskId: string
+      actionId: string
+      decision: 'approve' | 'reject'
+      body: DecidePrExternalActionRequest
+    }) =>
+      apiFetch<PrExternalActionResponse>(
+        `/tasks/${taskId}/pr-actions/${actionId}/${decision}`,
+        { method: 'POST', body: JSON.stringify(body) },
+      ),
+    onSettled: (_result, _error, variables) => {
+      void queryClient.invalidateQueries({ queryKey: qk.taskPrActions(variables.taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(variables.taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(variables.taskId) })
+    },
+  })
+}
+
+export function useRepoPrFeedbackPolicyQuery(repoId: string, enabled = true) {
+  return useQuery({
+    queryKey: qk.repoPrFeedbackPolicy(repoId),
+    queryFn: () => apiFetch<PrFeedbackPolicy>(`/repos/${repoId}/pr-feedback-policy`),
+    enabled: Boolean(repoId) && enabled,
+  })
+}
+
+export function useUpdateRepoPrFeedbackPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      repoId,
+      body,
+    }: {
+      repoId: string
+      body: UpdatePrFeedbackPolicyRequest
+    }) =>
+      apiFetch<PrFeedbackPolicy>(`/repos/${repoId}/pr-feedback-policy`, {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: (policy, variables) => {
+      queryClient.setQueryData(qk.repoPrFeedbackPolicy(variables.repoId), policy)
+    },
   })
 }
 

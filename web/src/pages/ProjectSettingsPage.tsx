@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import type { Icon } from '@phosphor-icons/react'
 import {
@@ -14,6 +15,8 @@ import {
   WarningOctagon,
 } from '@phosphor-icons/react'
 import { toast } from 'sonner'
+import { apiFetch } from '@/api/client'
+import { qk } from '@/api/query-keys'
 import {
   useCreateRepo,
   useDaemonsQuery,
@@ -51,6 +54,7 @@ import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
 import { useAuthStore } from '@/stores/auth'
+import type { CreateRepoRequest, Repo, UpdateRepoRequest } from '@/types/generated'
 
 export type ProjectSettingsTab =
   | 'general'
@@ -319,10 +323,12 @@ function ProjectMcpTab({ projectId }: { projectId: string }) {
   const reposQuery = useReposQuery(projectId)
   const daemonsQuery = useDaemonsQuery(isAdmin)
   const createRepo = useCreateRepo(projectId)
+  const queryClient = useQueryClient()
 
   const [repoDialogOpen, setRepoDialogOpen] = useState(false)
   const [repoForm, setRepoForm] = useState<RepoFormState>(emptyRepoForm)
   const [selectedDaemonId, setSelectedDaemonId] = useState<string | undefined>(undefined)
+  const [credentialAttachPending, setCredentialAttachPending] = useState(false)
 
   const project = projectQuery.data
   const repos = reposQuery.data?.items ?? []
@@ -348,7 +354,7 @@ function ProjectMcpTab({ projectId }: { projectId: string }) {
     setRepoDialogOpen(true)
   }
 
-  const submitRepo = (nextForm = repoForm) => {
+  const submitRepo = async (nextForm = repoForm) => {
     const localPath = nextForm.local_path.trim()
     const remoteUrlInput = nextForm.remote_url.trim()
     if (nextForm.source_mode === 'local' && !localPath) {
@@ -361,24 +367,63 @@ function ProjectMcpTab({ projectId }: { projectId: string }) {
     }
     const remoteUrl =
       nextForm.source_mode === 'local' ? remoteUrlInput || localPath : remoteUrlInput
-    createRepo.mutate(
-      {
-        remote_url: remoteUrl,
-        name: nextForm.name.trim() || null,
-        local_path: nextForm.source_mode === 'local' ? localPath : null,
-        default_branch: nextForm.default_branch.trim() || 'main',
-        work_mode: nextForm.work_mode,
-        pr_provider: nextForm.work_mode === 'pull_request' ? nextForm.pr_provider : null,
-        pr_provider_config: null,
-      },
-      {
-        onError: (error) => toast.error(settingsErrorMessage(error, 'Repository creation failed')),
-        onSuccess: () => {
-          setRepoDialogOpen(false)
-          setRepoForm(emptyRepoForm)
-        },
-      },
-    )
+    const pollingIntervalInput = nextForm.pr_polling_interval_seconds.trim()
+    const pollingInterval = Number(pollingIntervalInput)
+    if (
+      nextForm.work_mode === 'pull_request' &&
+      (!pollingIntervalInput || !Number.isInteger(pollingInterval) || pollingInterval < 1)
+    ) {
+      toast.error('Polling interval must be 1 or greater')
+      return
+    }
+    const body: CreateRepoRequest = {
+      remote_url: remoteUrl,
+      name: nextForm.name.trim() || null,
+      local_path: nextForm.source_mode === 'local' ? localPath : null,
+      default_branch: nextForm.default_branch.trim() || 'main',
+      work_mode: nextForm.work_mode,
+      pr_provider: nextForm.work_mode === 'pull_request' ? nextForm.pr_provider : null,
+      pr_provider_config:
+        nextForm.work_mode === 'pull_request'
+          ? {
+              base_url:
+                nextForm.pr_provider === 'github' ? null : nextForm.pr_base_url.trim() || null,
+              polling_interval_seconds: pollingInterval,
+            }
+          : null,
+    }
+    try {
+      const created = await createRepo.mutateAsync(body)
+      let credentialAttachFailed = false
+      if (
+        nextForm.work_mode === 'pull_request' &&
+        nextForm.pr_provider === 'github' &&
+        typeof nextForm.credential_id === 'string'
+      ) {
+        setCredentialAttachPending(true)
+        try {
+          await apiFetch<Repo>(`/repos/${created.id}`, {
+            method: 'PATCH',
+            body: JSON.stringify({
+              pr_provider_config: { credential_id: nextForm.credential_id },
+            } satisfies UpdateRepoRequest),
+          })
+          void queryClient.invalidateQueries({ queryKey: qk.repos(projectId) })
+        } catch {
+          credentialAttachFailed = true
+          toast.error(
+            'Repository was created, but its GitHub credential could not be attached. Edit it to retry.',
+          )
+        } finally {
+          setCredentialAttachPending(false)
+        }
+      }
+      setRepoDialogOpen(false)
+      setRepoForm(emptyRepoForm)
+      if (!credentialAttachFailed) toast.success('Repository saved')
+    } catch (error) {
+      toast.error(settingsErrorMessage(error, 'Repository creation failed'))
+    }
   }
 
   const isLoading = projectQuery.isLoading || reposQuery.isLoading
@@ -455,7 +500,7 @@ function ProjectMcpTab({ projectId }: { projectId: string }) {
       <RepoDialog
         form={repoForm}
         open={repoDialogOpen}
-        pending={createRepo.isPending}
+        pending={createRepo.isPending || credentialAttachPending}
         daemons={daemons}
         daemonId={activeDaemonId}
         onDaemonChange={setSelectedDaemonId}

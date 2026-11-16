@@ -248,4 +248,32 @@ describe('routeSsePayload', () => {
       )
     }
   })
+
+  it('invalidates PR feedback, rework, action, and Task decision projections for PR events', () => {
+    for (const name of [
+      'task.pr_feedback_ingested',
+      'task.pr_feedback_triaged',
+      'task.pr_rework_superseded',
+      'task.pr_rework_resumed',
+      'task.pr_rework_converged',
+      'task.pr_followup_proposed',
+      'task.pr_action_requested',
+      'task.pr_action_completed',
+    ]) {
+      const { queryClient, invalidateQueries } = createMocks()
+      routeSsePayload(
+        event(name, { scope_type: 'task', scope_id: 'task-1', payload: { task_id: 'task-1' } }),
+        queryClient,
+        { dispatch: vi.fn() },
+      )
+      expect(invalidateQueries.mock.calls).toEqual(
+        expect.arrayContaining([
+          [{ queryKey: ['tasks', 'task-1', 'pr-feedback'] }],
+          [{ queryKey: ['tasks', 'task-1', 'pr-rework'] }],
+          [{ queryKey: ['tasks', 'task-1', 'pr-actions'] }],
+          [{ queryKey: ['tasks', 'task-1', 'human-decisions'] }],
+        ]),
+      )
+    }
+  })
 })

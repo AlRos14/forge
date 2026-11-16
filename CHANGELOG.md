@@ -8,6 +8,13 @@ PR14 audit on 2026-10-16.
 
 ## [Unreleased]
 
+### Added
+
+- Project repository settings can connect and select GitHub SCM credentials and
+  edit per-repository PR feedback policy. Task details show paginated PR
+  feedback, same-PR rework status, and proposed provider actions for owner/admin
+  decisions. Forge never offers a merge action.
+
 ### Breaking
 
 - PR provider credentials now use the SCM credential flow: connect GitHub with

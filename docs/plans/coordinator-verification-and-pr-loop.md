@@ -2522,3 +2522,25 @@ MCP `mcp_pr_feedback_`; el workflow los recoge. La prueba API de conflicto de
 versión usa una fila sintética para comprobar el preflight HTTP 409; no prueba
 una carrera entre el preflight y la transición del servicio. CI debe validar
 build, formatos ts-rs y tests antes de aceptación.
+
+## Anexo UI (fase 2) — web (IMPLEMENTADO / NOT RUN)
+
+La UI web usa los tipos generados actuales. `RepoForm` lista handles SCM,
+conecta credenciales GitHub con `POST /providers` y las referencia por
+`credential_id`; `ReposTab` muestra `has_credential` y edita la política para
+owner/admin. La creación envía primero el Repo y después hace `PATCH` para
+asociar el handle, porque `CreateRepoRequest` no acepta `credential_id`. Task
+detail incorpora feedback y rework paginados y acciones PR con aprobación o
+rechazo humanos; SSE invalida esas proyecciones. Tests añadidos:
+`RepoForm.test.tsx`, `RepoPrFeedbackPolicyEditor.test.tsx`,
+`task-pr-feedback-panel.test.tsx`, `task-pr-actions-panel.test.tsx` y el caso PR
+de `sse.test.ts`. No se ejecutaron pnpm ni Cargo; CI es la validación prevista.
+
+Limitación API: `GET /repos/{id}/pr-feedback-policy` devuelve solo
+`PrFeedbackPolicy`, sin el `updated_at` que acepta `expected_updated_at`. La UI
+envía el campo nullable como `null` y ofrece recarga ante
+`pr_feedback.policy_version_conflict`, pero no puede enviar una precondición de
+versión hasta que la API exponga ese timestamp. `RepoResponse` tampoco expone el
+`credential_id`; al editar se preserva el handle actual y se muestra su estado,
+pero no puede preseleccionarse su etiqueta. La creación usa un `PATCH` adicional
+porque `CreateRepoRequest` no acepta `credential_id`.

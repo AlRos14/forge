@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { ApiError, listBranches, listFsEntries } from '@/api/client'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import {
+  ApiError,
+  connectScmCredential,
+  listBranches,
+  listFsEntries,
+  listScmCredentials,
+} from '@/api/client'
 import { qk } from '@/api/query-keys'
 import { Button } from '@/components/ui/button'
 import { ComboSelect } from '@/components/ui/combo-select'
@@ -9,7 +16,7 @@ import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
-import type { Daemon, WorkMode } from '@/types/generated'
+import type { ConnectScmCredentialRequest, Daemon, WorkMode } from '@/types/generated'
 import {
   ArrowCounterClockwise,
   CaretRight,
@@ -31,7 +38,8 @@ export type RepoFormState = {
   work_mode: WorkMode
   pr_provider: string
   pr_base_url: string
-  pr_token: string
+  credential_id: string | null | undefined
+  credential_connected: boolean
   pr_polling_interval_seconds: string
 }
 
@@ -44,7 +52,8 @@ export const emptyRepoForm: RepoFormState = {
   work_mode: 'direct_merge',
   pr_provider: 'github',
   pr_base_url: '',
-  pr_token: '',
+  credential_id: undefined,
+  credential_connected: false,
   pr_polling_interval_seconds: '60',
 }
 
@@ -139,14 +148,36 @@ export function RepoForm({
   const [browsePath, setBrowsePath] = useState(() => form.local_path || '.')
   const [pathInput, setPathInput] = useState('')
   const [filter, setFilter] = useState('')
+  const [showCredentialForm, setShowCredentialForm] = useState(false)
+  const [credentialLabel, setCredentialLabel] = useState('')
+  const [credentialSecret, setCredentialSecret] = useState('')
+  const [credentialPending, setCredentialPending] = useState(false)
+  const queryClient = useQueryClient()
   const pathInputRef = useRef<HTMLInputElement>(null)
   const autoOriginRef = useRef<{ path: string; url: string } | null>(null)
   const selectedDaemon = daemonId ? daemons.find((daemon) => daemon.id === daemonId) : undefined
   const selectedDaemonOffline = selectedDaemon?.status === 'offline'
+  const showGitHubCredential = form.work_mode === 'pull_request' && form.pr_provider === 'github'
+
+  const scmCredentialsQuery = useQuery({
+    queryKey: qk.scmCredentials,
+    queryFn: listScmCredentials,
+    enabled: open && showGitHubCredential,
+  })
+  const scmCredentials = (scmCredentialsQuery.data?.items ?? []).filter(
+    (entry) => entry.provider === 'github' && entry.status === 'configured',
+  )
 
   useEffect(() => {
     setFilter('')
   }, [browsePath])
+
+  useEffect(() => {
+    if (showGitHubCredential) return
+    setShowCredentialForm(false)
+    setCredentialLabel('')
+    setCredentialSecret('')
+  }, [showGitHubCredential])
 
   const updateForm = useCallback(
     (patch: Partial<RepoFormState>) => onUpdate({ ...form, ...patch }),
@@ -227,6 +258,7 @@ export function RepoForm({
     branchOptions.includes(effectiveDefaultBranch)
   const canSave =
     !pending &&
+    !credentialPending &&
     !branchQuery.isFetching &&
     (form.source_mode === 'local'
       ? Boolean(form.local_path.trim())
@@ -278,6 +310,36 @@ export function RepoForm({
       remote_url: remoteUrl,
       default_branch: effectiveDefaultBranch || form.default_branch,
     })
+  }
+
+  const connectCredential = async () => {
+    const label = credentialLabel.trim()
+    const credential = credentialSecret
+    if (!label || !credential) {
+      toast.error('Credential label and GitHub credential are required')
+      return
+    }
+    setCredentialPending(true)
+    try {
+      const request: ConnectScmCredentialRequest = {
+        provider: 'github',
+        label,
+        credential,
+      }
+      const connection = connectScmCredential(request)
+      setCredentialSecret('')
+      const connected = await connection
+      updateForm({ credential_id: connected.id, credential_connected: true })
+      setCredentialLabel('')
+      setShowCredentialForm(false)
+      await queryClient.invalidateQueries({ queryKey: qk.scmCredentials })
+      toast.success('GitHub credential connected')
+    } catch {
+      toast.error('GitHub credential could not be connected')
+    } finally {
+      setCredentialSecret('')
+      setCredentialPending(false)
+    }
   }
 
   const crumbs = breadcrumbs(displayPath)
@@ -594,16 +656,112 @@ export function RepoForm({
                 />
               </div>
             ) : null}
-            <div className="space-y-1.5">
-              <Label htmlFor="repo-pr-token">Token</Label>
-              <Input
-                id="repo-pr-token"
-                type="password"
-                autoComplete="off"
-                value={form.pr_token}
-                onChange={(event) => updateForm({ pr_token: event.target.value })}
-              />
-            </div>
+            {showGitHubCredential ? (
+              <div className="space-y-3 rounded-md border border-border-subtle bg-background p-3">
+                <div className="space-y-1.5">
+                  <Label htmlFor="repo-pr-credential">GitHub SCM credential</Label>
+                  <Select
+                    id="repo-pr-credential"
+                    value={
+                      form.credential_id === undefined
+                        ? form.credential_connected
+                          ? '__current__'
+                          : ''
+                        : form.credential_id ?? ''
+                    }
+                    options={[
+                      { value: '', label: 'No credential' },
+                      ...(form.credential_connected && form.credential_id === undefined
+                        ? [{ value: '__current__', label: 'Current credential connected' }]
+                        : []),
+                      ...scmCredentials.map((entry) => ({
+                        value: entry.id,
+                        label: entry.label,
+                      })),
+                    ]}
+                    onChange={(value) => {
+                      if (value === '__current__') {
+                        updateForm({ credential_id: undefined, credential_connected: true })
+                      } else if (value) {
+                        updateForm({ credential_id: value, credential_connected: true })
+                      } else {
+                        updateForm({ credential_id: null, credential_connected: false })
+                      }
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {form.credential_connected ? 'Credential connected' : 'No credential'}
+                  </p>
+                  {scmCredentialsQuery.isError ? (
+                    <p role="alert" className="text-xs text-destructive">
+                      GitHub credentials could not be loaded.
+                    </p>
+                  ) : null}
+                  {!scmCredentialsQuery.isLoading &&
+                  !scmCredentialsQuery.isError &&
+                  scmCredentials.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      No configured GitHub credentials are available.
+                    </p>
+                  ) : null}
+                </div>
+                {showCredentialForm ? (
+                  <div className="space-y-2 rounded-md border p-3">
+                    <div className="space-y-1.5">
+                      <Label htmlFor="repo-pr-credential-label">Credential label</Label>
+                      <Input
+                        id="repo-pr-credential-label"
+                        autoComplete="off"
+                        value={credentialLabel}
+                        onChange={(event) => setCredentialLabel(event.target.value)}
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label htmlFor="repo-pr-credential-secret">GitHub credential</Label>
+                      <Input
+                        id="repo-pr-credential-secret"
+                        type="password"
+                        autoComplete="new-password"
+                        value={credentialSecret}
+                        onChange={(event) => setCredentialSecret(event.target.value)}
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={credentialPending || !credentialLabel.trim() || !credentialSecret}
+                        onClick={() => void connectCredential()}
+                      >
+                        {credentialPending ? 'Connecting…' : 'Connect credential'}
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={credentialPending}
+                        onClick={() => {
+                          setCredentialLabel('')
+                          setCredentialSecret('')
+                          setShowCredentialForm(false)
+                        }}
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setShowCredentialForm(true)}
+                  >
+                    Connect a new GitHub credential
+                  </Button>
+                )}
+              </div>
+            ) : null}
           </div>
         ) : null}
       </div>

@@ -18,7 +18,8 @@ export function repoFormFromRepo(repo: Repo): RepoFormState {
     work_mode: repo.work_mode,
     pr_provider: repo.pr_provider_status?.provider_type ?? repo.pr_provider ?? 'github',
     pr_base_url: '',
-    pr_token: '',
+    credential_id: undefined,
+    credential_connected: Boolean(repo.pr_provider_status?.has_credential),
     pr_polling_interval_seconds: String(repo.pr_provider_status?.polling_interval_seconds ?? 60),
   }
 }

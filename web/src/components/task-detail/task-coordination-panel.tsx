@@ -59,6 +59,8 @@ import { TaskInterventionsPanel } from './task-interventions-panel'
 import { TaskAutonomyLimitsPanel } from './task-autonomy-limits'
 import { TaskQualityRequestsPanel } from './task-quality-requests-panel'
 import { TaskHumanDecisionsPanel } from './task-human-decisions-panel'
+import { TaskPrActionsPanel } from './task-pr-actions-panel'
+import { TaskPrFeedbackPanel } from './task-pr-feedback-panel'
 import { TaskValidationPanel } from './task-validation-panel'
 
 type CoordinatorChoice = {
@@ -1593,6 +1595,8 @@ export function TaskCoordinationPanel({
       ) : null}
       <TaskHumanDecisionsPanel task={task} members={members} />
       <TaskValidationPanel task={task} />
+      <TaskPrFeedbackPanel task={task} />
+      <TaskPrActionsPanel task={task} members={members} />
       <TaskQualityRequestsPanel
         task={task}
         coordination={overview}

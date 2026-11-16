@@ -29,6 +29,9 @@ export const qk = {
   taskValidationComparisons: (taskId: string) =>
     ['tasks', taskId, 'validation-comparisons'] as const,
   taskHumanDecisions: (taskId: string) => ['tasks', taskId, 'human-decisions'] as const,
+  taskPrFeedback: (taskId: string) => ['tasks', taskId, 'pr-feedback'] as const,
+  taskPrRework: (taskId: string) => ['tasks', taskId, 'pr-rework'] as const,
+  taskPrActions: (taskId: string) => ['tasks', taskId, 'pr-actions'] as const,
   projectValidationChecks: (projectId: string) =>
     ['projects', projectId, 'validation-checks'] as const,
   agents: ['agents'] as const,
@@ -44,6 +47,8 @@ export const qk = {
   projectHookRunPages: (projectId: string, limit: number) =>
     ['projects', projectId, 'project-hook-runs', limit] as const,
   repos: (projectId: string) => ['projects', projectId, 'repos'] as const,
+  repoPrFeedbackPolicy: (repoId: string) => ['repos', repoId, 'pr-feedback-policy'] as const,
+  scmCredentials: ['providers', 'scm'] as const,
   mcpConfig: (agent: string, scope: string, projectId?: string) =>
     ['config', 'mcp', agent, scope, projectId ?? 'global'] as const,
   fsEntries: (path: string, daemonId: string) => ['fs', 'entries', daemonId, path] as const,
