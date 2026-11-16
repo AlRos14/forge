@@ -197,7 +197,8 @@ impl TaskCoordinationService {
               AND a.task_title=t.title AND a.task_description IS t.description
               AND a.task_repo_id IS t.repo_id AND a.task_parent_task_id IS t.parent_task_id
               AND EXISTS(SELECT 1 FROM task_lifecycle l WHERE l.task_id=t.id
-                         AND l.state NOT IN ('done','cancelled','merging'))
+                         AND (l.state NOT IN ('done','cancelled','merging')
+                              OR (l.state='merging' AND ?)))
               AND NOT EXISTS(SELECT 1 FROM task_dispatch d
                              WHERE d.task_id=t.id AND d.state='cancelled')",
         )
@@ -205,6 +206,12 @@ impl TaskCoordinationService {
         .bind(expected_task_version)
         .bind(user_id)
         .bind(expected_coordination_version)
+        // Only the external feedback origin triages while the PR is open
+        // (TaskLifecycle `Merging`); every other origin keeps the fence.
+        .bind(matches!(
+            origin,
+            ProjectPlanBatchRequestOrigin::ExternalFeedbackTriage
+        ))
         .fetch_all(self.db.pool())
         .await?;
         if rows.len() > 1 {

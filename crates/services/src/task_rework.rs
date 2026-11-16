@@ -11,6 +11,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
+mod external_feedback_triage;
 mod triage;
 mod validation_triage;
 pub(crate) use triage::ReviewFindingsDecision;

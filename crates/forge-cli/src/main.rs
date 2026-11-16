@@ -227,6 +227,8 @@ async fn main() {
     }
     let project_hook_service_handle = Arc::clone(&state.project_hook_service).start();
     let cleanup_handle = Arc::clone(&cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
+    // The reconciler tick also runs the durable PR external-action executor
+    // and read-only paused-rework watcher.
     let _pr_reconciler_handle = services::pr_service::PrReconciler::new(
         Arc::clone(&state.db),
         Arc::clone(&state.event_bus),

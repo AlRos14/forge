@@ -147,9 +147,15 @@ jobs:
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib pr_rework_
       - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib pr_external_action_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib pr_rework_watcher_
+      - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib rt_validation_
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib rt_human_decision_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib rt_external_feedback_
       - if: ${{ !cancelled() }}
         run: cargo test --locked --no-fail-fast -p db --test pr2_execution_session --test pr5_workunit --test task_coordination_schema --test review_findings_migration --test file_backed_migration --test task_delete_integrity
       - id: rust_project_plan

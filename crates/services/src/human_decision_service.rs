@@ -625,6 +625,15 @@ impl HumanDecisionService {
                 "the coordination authorization changed since the decision was raised",
             );
         }
+        // `external_feedback` decisions apply their effect directly (a
+        // follow-up Task or the remote-merge convergence, node RT phase 2);
+        // they never resume a coordinator turn.
+        if decision.source_kind == HumanDecisionSourceKind::ExternalFeedback {
+            return deferred(
+                "human_decision.direct_effect",
+                "an external_feedback decision applies its effect directly and has no resume turn",
+            );
+        }
         if batch_binding.is_none()
             && TaskCoordinationRepo::has_current_project_plan_batch_coordination_authorization(
                 &*self.db,

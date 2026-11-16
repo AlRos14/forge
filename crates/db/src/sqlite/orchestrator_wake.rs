@@ -55,7 +55,7 @@ async fn admit_orchestrator_wake_with_autonomy_fence(
         let source_current: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM task_coordination_request request
              WHERE request.id=? AND request.task_id=? AND
-              (request.kind IN ('work_unit_plan','validation_findings','human_decision_resume') OR EXISTS(
+              (request.kind IN ('work_unit_plan','validation_findings','human_decision_resume','external_feedback') OR EXISTS(
                 SELECT 1 FROM task_review_coordination_request_current current
                 WHERE current.request_id=request.id)))",
         )

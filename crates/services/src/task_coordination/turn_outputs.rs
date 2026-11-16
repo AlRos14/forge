@@ -109,6 +109,10 @@ impl TaskCoordinationService {
                 self.complete_human_decision_resume_turn(request, execution)
                     .await
             }
+            TaskCoordinationRequestKind::ExternalFeedback => {
+                self.complete_external_feedback_turn(request, execution, allowed_outputs)
+                    .await
+            }
             _ => self.complete_turn(request, execution).await,
         }
     }
@@ -126,6 +130,10 @@ impl TaskCoordinationService {
             }
             TaskCoordinationRequestKind::HumanDecisionResume => {
                 self.complete_human_decision_resume_turn(request, execution)
+                    .await
+            }
+            TaskCoordinationRequestKind::ExternalFeedback => {
+                self.complete_external_feedback_turn(request, execution, None)
                     .await
             }
             _ => Err(output_not_permitted(
@@ -598,6 +606,7 @@ Context: {context}",
             "SELECT d.id FROM human_decision_request d
              JOIN task_coordination c ON c.task_id=d.task_id
              WHERE d.state='answered' AND d.resume_request_id IS NULL
+               AND d.source_kind!='external_feedback'
                AND c.turn_count < c.max_turns AND c.mode!='manual'
                AND c.revoked_at IS NULL AND c.team_stale=0
              ORDER BY d.answered_at, d.id LIMIT ?",

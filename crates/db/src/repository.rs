@@ -165,6 +165,16 @@ pub trait TaskCoordinationRepo: Send + Sync {
         input: CreateTaskCoordinationRequestInput,
         binding: ProjectPlanBatchRequestBinding,
     ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)>;
+    /// RT phase 2: create an `external_feedback` request (optionally Project
+    /// batch-bound with the `ExternalFeedbackTriage` origin, which alone may
+    /// target a `merging` Task) with its exact <= 20 item set in the same
+    /// transaction as the budget charge and the request event.
+    async fn create_external_feedback_coordination_request(
+        &self,
+        input: CreateTaskCoordinationRequestInput,
+        binding: Option<ProjectPlanBatchRequestBinding>,
+        entries: Vec<ExternalFeedbackSetEntry>,
+    ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)>;
     async fn get_task_coordination_request(
         &self,
         id: &str,

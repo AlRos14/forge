@@ -303,3 +303,63 @@ without a resume request. Creation charges the same turn budget and the durable
 `human_decision_id` and `answered_option_id`, the paused kind's key
 (`validation_findings`, one `correct` or `recheck` decision) and an empty
 `outputs`. Only paused `validation_findings` requests are resumable in this phase.
+
+### External PR feedback triage and same-PR rework
+
+Trusted, current-head feedback ingested for an open remote PR admission (frozen
+policy `ingest = true`) becomes one `external_feedback` coordination request.
+The request names the admission as its exact source and the digest of the exact
+ordered set (at most 20 items) as its source digest; the set rows
+(`task_external_feedback_set_item`), the request, its optional Project batch
+origin (`external_feedback_triage`, the only origin accepted while the Task is
+`Merging`), the turn-budget charge and the event are one repository transaction.
+The idempotency key is the authorization version, the admission and the set
+digest, so the durable scanner recreates missing requests after a restart
+without a second charge. At most one request per admission is in flight; items a
+request consumed are never offered again (a `failed` request leaves them for a
+Human). Pause, revocation and restart behave as for `validation_findings`.
+While the Task is `Merging`, V178 admits a Running coordinator Execution only
+with `work_unit_id = NULL` and an `external_feedback` request for that Task in
+`requested`, `running` or `uncertain`; the request's `execution_id` must be null
+or match the Execution.
+
+The turn context carries each item (kind, author trust class, path and line,
+head state, body bounded to 2 KiB and flagged as untrusted third-party data), the
+pull request number, URL and head, and the facts about the Task's original scope
+(title, description, WorkUnit scopes, envelope limits, team). The turn output is a
+`schema_version: 2` envelope with exactly one disposition per item
+(`extend_task`, `propose_task`, `human` or `dismiss`), an optional
+`work_unit_plan` (required exactly when an `extend_task` exists) and one
+`ask_human` per `human` item. Forge, not the coordinator, classifies scope
+(`classify_rework_scope`): an `extend_task` classified `scope_change` fails
+validation with `pr_feedback.extend_out_of_scope`. The objective baseline is the
+Project batch authorization snapshot of the Task title and description; a Task
+outside a batch has no frozen baseline, so that single fact holds vacuously.
+
+After the per-item rows (V173 triage, V175 disposition) and the `triaged` receipt
+commit, the effects run idempotently and are retried by durable scanners:
+
+- `extend_task`: `PrReworkService::supersede_for_rework` pauses the admission
+  (TaskMerge `abandoned`, `Merging -> Blocked(pr_feedback_rework)`; the PR is not
+  touched) and `resume_after_supersession` returns the Task to `Active`. The
+  pending plan is the typed output of the completed coordinator Execution; it is
+  re-derived and materialized as WorkUnits with deterministic ids, `external`
+  provenance `external_feedback:{request_id}` and the exact item ids and body
+  digests appended to their instructions. Plan items with `review_subject_key` or
+  `artifact_inputs` are refused at validation. After the WorkUnits exist the Task
+  follows the normal implement, review, Gate and TaskMerge path.
+- `propose_task` and `human`: a `human_decision_request` (source `external_feedback`,
+  `source_id` the item id) is raised and bound to the disposition. Approving a
+  `propose_task` decision (`authority_effect = scope`) creates the dependent
+  follow-up Task through `FollowUpTaskService`; the current PR is unchanged. These
+  decisions never create a `human_decision_resume` request (the answer reports the
+  deferred code `human_decision.direct_effect`), and a `human` answer is recorded
+  without an automatic coordinator turn.
+- `dismiss`: the immutable disposition (with its reason) is the receipt.
+- A remote merge observed during rework raises a `rework:{id}` decision; when it
+  is answered the scanner calls `converge_remote_merged`, which cancels the
+  unstarted rework WorkUnits, abandons the pause and blocks the Task with
+  `pr_merged_externally`.
+
+The PR summary comment (`post_comment`) is a hook owned by the external action
+service and is not posted by the runtime yet.

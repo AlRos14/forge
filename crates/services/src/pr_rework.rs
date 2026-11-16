@@ -100,7 +100,7 @@ pub enum SupersedeOutcome {
     /// The request has no `extend_task` disposition: the PR keeps advancing.
     NotRequired,
     Superseded {
-        supersession: PrReworkSupersession,
+        supersession: Box<PrReworkSupersession>,
         /// `false` on an identical replay.
         created: bool,
     },
@@ -160,6 +160,13 @@ impl PrReworkService {
     pub fn with_effects(mut self, effects: Arc<dyn PrReworkEffects>) -> Self {
         self.effects = Some(effects);
         self
+    }
+
+    /// `true` once the WorkUnit effects are wired. Convergence of a remote
+    /// merge must not run without them (it would skip cancelling the
+    /// unstarted rework).
+    pub fn has_effects(&self) -> bool {
+        self.effects.is_some()
     }
 
     async fn emit(
@@ -250,7 +257,7 @@ impl PrReworkService {
             }
             self.project_superseded(&existing).await?;
             return Ok(SupersedeOutcome::Superseded {
-                supersession: existing,
+                supersession: Box::new(existing),
                 created: false,
             });
         }
@@ -287,7 +294,7 @@ impl PrReworkService {
         }
         self.project_superseded(&write.supersession).await?;
         Ok(SupersedeOutcome::Superseded {
-            supersession: write.supersession,
+            supersession: Box::new(write.supersession),
             created: write.created,
         })
     }
@@ -687,7 +694,7 @@ fn convergence_decision(supersession: &PrReworkSupersession) -> AskHumanOutput {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::credential_service::CredentialService;
     use crate::pr_service::{
@@ -779,21 +786,21 @@ mod tests {
         }
     }
 
-    struct World {
+    pub(crate) struct World {
         _temp: TempDir,
-        db: Arc<SqliteDb>,
-        bus: Arc<EventBus>,
-        task_id: String,
-        merge_id: String,
-        request_id: String,
+        pub(crate) db: Arc<SqliteDb>,
+        pub(crate) bus: Arc<EventBus>,
+        pub(crate) task_id: String,
+        pub(crate) merge_id: String,
+        pub(crate) request_id: String,
         provider: Arc<CountingProvider>,
-        service: PrReworkService,
+        pub(crate) service: PrReworkService,
     }
 
     /// A Task in `Merging` with an `open` PR admission (ingestion enabled) and
     /// a triaged `external_feedback` request over two trusted items; item 0 is
     /// `extend_task` when `extend`, otherwise both are dismissed.
-    async fn world(extend: bool) -> World {
+    pub(crate) async fn world(extend: bool) -> World {
         let temp = TempDir::new().expect("temporary directory");
         let url = format!("sqlite://{}", temp.path().join("rework.db").display());
         let fixture = fixture(&url, temp.path()).await;
@@ -1021,14 +1028,14 @@ mod tests {
             .expect("exists")
     }
 
-    async fn superseded(w: &World) -> PrReworkSupersession {
+    pub(crate) async fn superseded(w: &World) -> PrReworkSupersession {
         match w
             .service
             .supersede_for_rework(&w.request_id)
             .await
             .expect("supersede")
         {
-            SupersedeOutcome::Superseded { supersession, .. } => supersession,
+            SupersedeOutcome::Superseded { supersession, .. } => *supersession,
             SupersedeOutcome::NotRequired => panic!("an extend_task item pauses the PR"),
         }
     }

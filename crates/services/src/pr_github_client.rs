@@ -861,6 +861,26 @@ impl PrProvider for GitHubPrProvider {
             .map(|pull| self.record(&request.repo_remote_url, pull)))
     }
 
+    async fn find_open_pr_by_head(
+        &self,
+        repo_identity: &str,
+        source_branch: &str,
+        target_branch: &str,
+    ) -> std::result::Result<Option<PrRecord>, PrProviderError> {
+        let repo =
+            GitHubRepoRef::parse(repo_identity).map_err(|error| error.into_pr_error(false))?;
+        let found = self
+            .client
+            .find_pull_by_head(&repo, source_branch, Some(target_branch))
+            .await
+            .map_err(|error| error.into_pr_error(false))?;
+        // Exact branches and an `open` state; the head SHA is deliberately
+        // not part of the match (the PR is being reused across a rework).
+        Ok(found
+            .filter(|pull| pull.state == "open" && !pull.merged)
+            .map(|pull| self.record(repo_identity, pull)))
+    }
+
     async fn create_pr(
         &self,
         request: PrCreateRequest,

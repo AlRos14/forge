@@ -164,6 +164,7 @@ fn is_typed_triage_kind(kind: db::TaskCoordinationRequestKind) -> bool {
         db::TaskCoordinationRequestKind::ReviewFindings
             | db::TaskCoordinationRequestKind::ValidationFindings
             | db::TaskCoordinationRequestKind::HumanDecisionResume
+            | db::TaskCoordinationRequestKind::ExternalFeedback
     )
 }
 
@@ -487,6 +488,26 @@ impl OrchestratorRuntime {
                 .process_pending_human_decision_resumes(100)
                 .await?;
         }
+        {
+            // Phase 2: trusted PR feedback, the effects of triaged feedback
+            // and answered external-feedback decisions are durable sources
+            // too. The effect scanners drive WorkUnit materialization and
+            // convergence, so they carry the orchestrator WorkUnit service.
+            let coordination = crate::task_coordination::TaskCoordinationService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .with_work_unit_service(Arc::new(self.task_service.orchestrator_work_unit_service()));
+            coordination
+                .process_pending_external_feedback_requests(100)
+                .await?;
+            coordination
+                .process_pending_external_feedback_effects(100)
+                .await?;
+            coordination
+                .process_external_feedback_decision_effects(100)
+                .await?;
+        }
         crate::task_quality::TaskQualityService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
@@ -567,7 +588,7 @@ impl OrchestratorRuntime {
                ON event.event_type='task.coordination_requested'
               AND event.entity_type='task_coordination_request'
               AND event.entity_id=request.id
-             WHERE request.kind IN ('validation_findings','human_decision_resume')
+             WHERE request.kind IN ('validation_findings','human_decision_resume','external_feedback')
                AND request.state='requested' AND request.wake_id IS NULL
              ORDER BY event.sequence LIMIT ?",
         )
@@ -612,7 +633,7 @@ impl OrchestratorRuntime {
               AND execution.task_id=request.task_id AND execution.status='completed'
              JOIN domain_event event ON event.entity_type='execution'
               AND event.entity_id=execution.id AND event.event_type='execution.completed'
-             WHERE request.kind IN ('validation_findings','human_decision_resume')
+             WHERE request.kind IN ('validation_findings','human_decision_resume','external_feedback')
                AND request.state IN ('running','uncertain')
              ORDER BY event.sequence LIMIT ?",
         )
@@ -2754,6 +2775,12 @@ impl OrchestratorRuntime {
                 "human_decision_resume",
                 coordination_service
                     .exact_human_decision_resume_context(request)
+                    .await?,
+            ),
+            db::TaskCoordinationRequestKind::ExternalFeedback => (
+                "external_feedback",
+                coordination_service
+                    .exact_external_feedback_context(request)
                     .await?,
             ),
             _ => {
@@ -8617,6 +8644,13 @@ mod rt_policy_tests {
         ));
         assert!(!is_typed_triage_kind(
             db::TaskCoordinationRequestKind::WorkUnitPlan
+        ));
+    }
+
+    #[test]
+    fn rt_external_feedback_kind_is_a_typed_triage_turn() {
+        assert!(is_typed_triage_kind(
+            db::TaskCoordinationRequestKind::ExternalFeedback
         ));
     }
 }

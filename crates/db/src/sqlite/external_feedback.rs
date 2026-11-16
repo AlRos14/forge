@@ -163,7 +163,7 @@ async fn bind_disposition_link(
     Ok(updated)
 }
 
-async fn add_set_items(
+pub(super) async fn add_set_items(
     tx: &mut Transaction<'_, Sqlite>,
     request_id: &str,
     task_id: &str,

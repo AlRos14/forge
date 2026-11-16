@@ -1,11 +1,14 @@
-use crate::credential_service::CredentialService;
-use crate::pr_github_client::{DefaultPrProviderFactory, PrProviderFactory};
+use crate::credential_service::{CredentialService, Secret};
+use crate::pr_external_action::PrExternalActionService;
+use crate::pr_github_client::{DefaultPrProviderFactory, GitHubClient, PrProviderFactory};
+use crate::pr_rework::PrReworkService;
 use crate::{DomainEventService, Result, ServiceError};
 use async_trait::async_trait;
 use db::{
-    now_rfc3339, GateEvaluationOutcome, GateRepo, PrMetadata, PrMetadataRepo, RemotePrAdmission,
-    Repo, SqliteDb, Task, TaskIntegrationOperationKind, TaskIntegrationOperationRepo,
-    TaskLifecycleRepo, TaskLifecycleState, TaskMetadata, TaskRepo,
+    now_rfc3339, GateEvaluationOutcome, GateRepo, PrMetadata, PrMetadataRepo, PrReworkRepo,
+    PrReworkState, RemotePrAdmission, Repo, SqliteDb, Task, TaskIntegrationOperationKind,
+    TaskIntegrationOperationRepo, TaskLifecycleRepo, TaskLifecycleState, TaskMetadata, TaskRepo,
+    TransitionPrReworkSupersession,
 };
 use events::EventBus;
 use serde_json::json;
@@ -51,7 +54,7 @@ impl RemotePrStatus {
         }
     }
 
-    fn observation(&self) -> &PrObservation {
+    pub(crate) fn observation(&self) -> &PrObservation {
         match self {
             Self::Open(observation) | Self::Merged(observation) | Self::Closed(observation) => {
                 observation
@@ -108,6 +111,19 @@ pub trait PrProvider: Send + Sync {
         admission: &RemotePrAdmission,
         metadata: &PrMetadata,
     ) -> std::result::Result<RemotePrStatus, PrProviderError>;
+    /// The currently `open` PR whose head is exactly `source_branch` against
+    /// `target_branch`, without requiring a head SHA (same-PR re-admission,
+    /// plan 11.5). Providers that cannot answer fail closed.
+    async fn find_open_pr_by_head(
+        &self,
+        _repo_identity: &str,
+        _source_branch: &str,
+        _target_branch: &str,
+    ) -> std::result::Result<Option<PrRecord>, PrProviderError> {
+        Err(PrProviderError::Unavailable(
+            "provider cannot find an open PR by head branch".to_owned(),
+        ))
+    }
 }
 
 pub struct PublishedPr {
@@ -195,6 +211,11 @@ impl PrService {
                 ));
             }
         };
+        if admission.readmits_supersession_id.is_some() {
+            return self
+                .publish_readmission(task, &admission, &metadata, provider.as_ref())
+                .await;
+        }
         let request = create_request(&admission, task);
         let (record, create_attempted) = find_or_create(provider.as_ref(), request).await;
         match record {
@@ -230,6 +251,255 @@ impl PrService {
                 ))
             }
         }
+    }
+
+    /// External-action service sharing this service's credential source and
+    /// provider factory.
+    pub(crate) fn actions(&self) -> PrExternalActionService {
+        PrExternalActionService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+            self.clone(),
+        )
+    }
+
+    /// Raw GitHub client built from the admission's FROZEN credential.
+    pub(crate) async fn client_for(
+        &self,
+        admission: &RemotePrAdmission,
+    ) -> std::result::Result<GitHubClient, PrProviderError> {
+        let secret =
+            acquire_admission_secret(&self.db, self.credentials.as_deref(), admission).await?;
+        self.provider_factory
+            .build_client(
+                admission.provider_type.as_str(),
+                admission.provider_base_url.as_deref(),
+                secret,
+            )
+            .await
+    }
+
+    /// The admission's frozen credential, opened in memory only.
+    pub(crate) async fn secret_for(
+        &self,
+        admission: &RemotePrAdmission,
+    ) -> std::result::Result<Secret, PrProviderError> {
+        acquire_admission_secret(&self.db, self.credentials.as_deref(), admission).await
+    }
+
+    /// Re-admission of a paused PR (plan 11.5). The PR is reused, never
+    /// created: the admission stays `admitted` while the exact `push_update`
+    /// moves the PR head to the admitted SHA.
+    async fn publish_readmission(
+        &self,
+        task: &Task,
+        admission: &RemotePrAdmission,
+        metadata: &PrMetadata,
+        provider: &dyn PrProvider,
+    ) -> Result<PublishedPr> {
+        let supersession_id = admission
+            .readmits_supersession_id
+            .as_deref()
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("admission does not re-admit a paused PR")
+            })?;
+        let supersession = PrReworkRepo::get_supersession(&*self.db, supersession_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("pr rework supersession", supersession_id.to_owned())
+            })?;
+        let readmitted_by_this = supersession.state == PrReworkState::Readmitted
+            && supersession.readmission_merge_operation_id.as_deref()
+                == Some(admission.task_merge_operation_id.as_str());
+        if supersession.state != PrReworkState::Open && !readmitted_by_this {
+            return self
+                .readmission_blocked(
+                    admission,
+                    metadata,
+                    "pr_rework.supersession_open: the paused PR no longer awaits this re-admission",
+                )
+                .await;
+        }
+        if !readmitted_by_this {
+            match provider
+                .find_open_pr_by_head(
+                    &admission.remote_repo_identity,
+                    &admission.source_branch,
+                    &admission.target_branch,
+                )
+                .await
+            {
+                Ok(Some(record)) if record.provider_pr_id == supersession.provider_pr_id => {
+                    let observation = record.status.observation();
+                    if observation.remote_repo_identity != admission.remote_repo_identity
+                        || observation.source_branch != admission.source_branch
+                        || observation.target_branch != admission.target_branch
+                    {
+                        return self
+                            .readmission_blocked(
+                                admission,
+                                metadata,
+                                "provider PR identity differs from the frozen re-admission",
+                            )
+                            .await;
+                    }
+                    if !matches!(&record.status, RemotePrStatus::Open(_)) {
+                        if let Err(error) =
+                            PrReworkService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+                                .observe_remote(&supersession.id, &record.status)
+                                .await
+                        {
+                            tracing::warn!(%error, "could not record the remote PR change during re-admission");
+                        }
+                        return self
+                            .readmission_blocked(
+                                admission,
+                                metadata,
+                                "pr_rework.reuse_target_missing: the matching PR is not open",
+                            )
+                            .await;
+                    }
+                    let head = observation.head_sha.clone();
+                    if head == supersession.superseded_head_sha {
+                        if let Err(error) = self
+                            .actions()
+                            .ensure_push_update(&admission.task_merge_operation_id)
+                            .await
+                        {
+                            // The executor tick recreates a missing action.
+                            tracing::warn!(%error, "could not create the re-admission push_update yet");
+                        }
+                    } else if head == admission.admitted_source_sha {
+                        self.finalize_readmission(admission).await?;
+                    } else {
+                        return self
+                            .readmission_blocked(
+                                admission,
+                                metadata,
+                                "pr_action.remote_head_changed: the open PR head is neither the paused head nor the admitted head",
+                            )
+                            .await;
+                    }
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    if let Ok(status @ (RemotePrStatus::Closed(_) | RemotePrStatus::Merged(_))) =
+                        provider.get_pr_status(admission, metadata).await
+                    {
+                        if let Err(error) =
+                            PrReworkService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+                                .observe_remote(&supersession.id, &status)
+                                .await
+                        {
+                            tracing::warn!(%error, "could not record the remote PR change during re-admission");
+                        }
+                    }
+                    return self
+                        .readmission_blocked(
+                            admission,
+                            metadata,
+                            "pr_rework.reuse_target_missing: the paused PR is no longer open",
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    return self
+                        .readmission_blocked(admission, metadata, &error.to_string())
+                        .await;
+                }
+            }
+        }
+        let metadata = PrMetadataRepo::get_by_task_id(&*self.db, &task.id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("PR metadata", task.id.clone()))?;
+        set_task_awaiting_human_best_effort(&self.db, task, true).await;
+        Ok(PublishedPr {
+            pr_url: metadata.pr_url.clone(),
+            metadata,
+        })
+    }
+
+    async fn readmission_blocked(
+        &self,
+        admission: &RemotePrAdmission,
+        metadata: &PrMetadata,
+        reason: &str,
+    ) -> Result<PublishedPr> {
+        self.mark_reconciliation_required(admission, Some(metadata), reason)
+            .await?;
+        Err(ServiceError::conflict(
+            "the paused PR cannot be re-admitted; the admission remains in reconciliation",
+        ))
+    }
+
+    /// Complete a re-admission whose PR head already is the admitted SHA:
+    /// the admission becomes `open` and the pause `readmitted`. Idempotent;
+    /// every step is retried by the executor tick.
+    pub(crate) async fn finalize_readmission(&self, admission: &RemotePrAdmission) -> Result<()> {
+        let supersession_id = admission
+            .readmits_supersession_id
+            .as_deref()
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("admission does not re-admit a paused PR")
+            })?;
+        let supersession = PrReworkRepo::get_supersession(&*self.db, supersession_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("pr rework supersession", supersession_id.to_owned())
+            })?;
+        let fresh = TaskIntegrationOperationRepo::get_remote_pr_admission(
+            &*self.db,
+            &admission.task_merge_operation_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            ServiceError::not_found(
+                "remote PR admission",
+                admission.task_merge_operation_id.clone(),
+            )
+        })?;
+        if matches!(fresh.state.as_str(), "admitted" | "reconciliation_required") {
+            let metadata = PrMetadataRepo::get_by_task_id(&*self.db, &fresh.task_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("PR metadata", fresh.task_id.clone()))?;
+            self.persist_outcome(db::RecordRemotePrOutcome {
+                expected_task_id: fresh.task_id.clone(),
+                task_merge_operation_id: fresh.task_merge_operation_id.clone(),
+                publish_operation_id: fresh.publish_operation_id.clone(),
+                metadata_id: fresh.metadata_id.clone(),
+                provider_config_id: fresh.provider_config_id.clone(),
+                provider_config_digest: fresh.provider_config_digest.clone(),
+                remote_repo_identity: fresh.remote_repo_identity.clone(),
+                source_branch: fresh.source_branch.clone(),
+                target_branch: fresh.target_branch.clone(),
+                status: "open".to_owned(),
+                provider_event_id: Some(format!(
+                    "github-pr:{}:open:{}",
+                    supersession.provider_pr_id, fresh.admitted_source_sha
+                )),
+                provider_pr_id: Some(supersession.provider_pr_id.clone()),
+                pr_url: metadata.pr_url.clone(),
+                observed_head_sha: Some(fresh.admitted_source_sha.clone()),
+                merged_commit_sha: None,
+                reconciliation_reason: None,
+                updated_at: now_rfc3339(),
+            })
+            .await?;
+        }
+        if supersession.state == PrReworkState::Open {
+            PrReworkRepo::transition_supersession(
+                &*self.db,
+                TransitionPrReworkSupersession {
+                    id: supersession.id.clone(),
+                    expected_version: supersession.version,
+                    to_state: PrReworkState::Readmitted,
+                    readmission_merge_operation_id: Some(fresh.task_merge_operation_id.clone()),
+                    convergence_decision_id: None,
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn validate_admission(
@@ -389,7 +659,7 @@ impl PrService {
         .await
     }
 
-    async fn apply_publication_failure(
+    pub(crate) async fn apply_publication_failure(
         &self,
         admission: &RemotePrAdmission,
         metadata: &PrMetadata,
@@ -417,7 +687,7 @@ impl PrService {
         .await
     }
 
-    async fn mark_reconciliation_required(
+    pub(crate) async fn mark_reconciliation_required(
         &self,
         admission: &RemotePrAdmission,
         metadata: Option<&PrMetadata>,
@@ -515,6 +785,7 @@ pub struct PrReconciler {
     credentials: Option<Arc<CredentialService>>,
     provider_factory: Arc<dyn PrProviderFactory>,
     feedback: crate::pr_feedback::PrFeedbackIngestor,
+    watcher: crate::pr_rework_watcher::PrReworkWatcher,
     #[cfg(test)]
     provider_override: Option<Arc<dyn PrProvider>>,
 }
@@ -523,6 +794,8 @@ impl PrReconciler {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>, interval: Option<Duration>) -> Self {
         let lock_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let feedback = crate::pr_feedback::PrFeedbackIngestor::new(Arc::clone(&db));
+        let watcher =
+            crate::pr_rework_watcher::PrReworkWatcher::new(Arc::clone(&db), Arc::clone(&event_bus));
         Self {
             integration_operations:
                 crate::task_integration_operation::TaskIntegrationOperationManager::new(
@@ -535,6 +808,7 @@ impl PrReconciler {
             credentials: None,
             provider_factory: Arc::new(DefaultPrProviderFactory),
             feedback,
+            watcher,
             #[cfg(test)]
             provider_override: None,
         }
@@ -542,12 +816,20 @@ impl PrReconciler {
 
     pub fn with_credentials(mut self, credentials: Arc<CredentialService>) -> Self {
         self.feedback = self.feedback.with_credentials(Arc::clone(&credentials));
+        self.watcher = self
+            .watcher
+            .clone()
+            .with_credentials(Arc::clone(&credentials));
         self.credentials = Some(credentials);
         self
     }
 
     pub fn with_provider_factory(mut self, factory: Arc<dyn PrProviderFactory>) -> Self {
         self.feedback = self.feedback.with_provider_factory(Arc::clone(&factory));
+        self.watcher = self
+            .watcher
+            .clone()
+            .with_provider_factory(Arc::clone(&factory));
         self.provider_factory = factory;
         self
     }
@@ -591,6 +873,14 @@ impl PrReconciler {
         if let Err(error) = self.feedback.ingest_once().await {
             tracing::warn!(%error, "PR feedback ingestion pass failed");
         }
+        // Read-only convergence of paused same-PR reworks (plan 11.6) and the
+        // authorized external actions (re-admission push, summary comment).
+        if let Err(error) = self.watcher.watch_once().await {
+            tracing::warn!(%error, "PR rework watcher pass failed");
+        }
+        if let Err(error) = self.service().actions().run_once().await {
+            tracing::warn!(%error, "PR external action pass failed");
+        }
         Ok(())
     }
 
@@ -624,7 +914,26 @@ impl PrReconciler {
                 admission.task_merge_operation_id.clone(),
             )
         })?;
+        // A re-admission awaiting its exact `push_update` belongs to the
+        // external-action executor until its exact supersession is readmitted
+        // (plan 11.5). This includes `reconciliation_required`: polling here
+        // could overwrite an unresolved push with the old or newly moved PR
+        // head before the executor has recorded its action outcome.
+        let readmission_pending =
+            if let Some(supersession_id) = admission.readmits_supersession_id.as_deref() {
+                match PrReworkRepo::get_supersession(&*self.db, supersession_id).await? {
+                    Some(supersession) => {
+                        supersession.state != PrReworkState::Readmitted
+                            || supersession.readmission_merge_operation_id.as_deref()
+                                != Some(admission.task_merge_operation_id.as_str())
+                    }
+                    None => true,
+                }
+            } else {
+                false
+            };
         if admission.rework_outcome.is_some()
+            || readmission_pending
             || !matches!(
                 admission.state.as_str(),
                 "admitted" | "reconciliation_required" | "open"
@@ -831,7 +1140,7 @@ pub(crate) async fn acquire_admission_secret(
     Ok(secret)
 }
 
-async fn provider_for_admission(
+pub(crate) async fn provider_for_admission(
     db: &SqliteDb,
     credentials: Option<&CredentialService>,
     factory: &dyn PrProviderFactory,

@@ -102,6 +102,11 @@ async fn admit(
     let now = now_rfc3339();
     let policy = policy_json();
     let digest = crate::pr_feedback_policy_digest(&policy);
+    let provider_config_revision: String =
+        sqlx::query_scalar("SELECT updated_at FROM pr_provider_config WHERE id = ?")
+            .bind(&w.cfg)
+            .fetch_one(w.db.pool())
+            .await?;
     sqlx::query(
         "INSERT INTO remote_pr_admission (
             task_merge_operation_id, publish_operation_id, metadata_id, task_id,
@@ -109,7 +114,7 @@ async fn admit(
             provider_config_digest, remote_repo_identity, source_branch, target_branch,
             admitted_source_sha, state, created_at, updated_at, feedback_policy_json,
             feedback_policy_digest, readmits_supersession_id
-         ) VALUES (?, ?, ?, ?, ?, 'github', 'rev', 'digest', 'https://example.invalid/r.git',
+         ) VALUES (?, ?, ?, ?, ?, 'github', ?, 'digest', 'https://example.invalid/r.git',
                    'task/x', 'main', ?, 'admitted', ?, ?, ?, ?, ?)",
     )
     .bind(merge)
@@ -117,6 +122,7 @@ async fn admit(
     .bind(&w.meta)
     .bind(&w.task)
     .bind(&w.cfg)
+    .bind(&provider_config_revision)
     .bind(sha)
     .bind(&now)
     .bind(&now)
@@ -491,7 +497,7 @@ async fn v175_migration_applies_after_v174_and_only_recreates_listed_triggers() 
     // Additive only: these tables are untouched and remote_pr_admission only
     // gained its three columns (never rebuilt).
     for (name, before) in rebuilt_guard.iter().zip(&tables_before) {
-        assert_eq!(&table_sql(*name).await, before, "{name} was rebuilt");
+        assert_eq!(&table_sql(name).await, before, "{name} was rebuilt");
     }
     let admission_after = table_sql("remote_pr_admission").await;
     assert_ne!(admission_after, admission_before);

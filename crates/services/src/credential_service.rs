@@ -173,6 +173,16 @@ struct StoredCredential {
     plaintext: String,
 }
 
+struct CreateApiKeyInput<'a> {
+    id: &'a str,
+    owner_user_id: &'a str,
+    provider: &'a str,
+    label: &'a str,
+    secret: &'a Secret,
+    metadata_json: &'a str,
+    now: &'a str,
+}
+
 #[derive(Clone)]
 struct CredentialStore {
     db: Arc<SqliteDb>,
@@ -228,14 +238,17 @@ impl CredentialStore {
 
     async fn create_api_key(
         &self,
-        id: &str,
-        owner_user_id: &str,
-        provider: &str,
-        label: &str,
-        secret: &Secret,
-        metadata_json: &str,
-        now: &str,
+        input: CreateApiKeyInput<'_>,
     ) -> std::result::Result<CredentialHandle, CredentialError> {
+        let CreateApiKeyInput {
+            id,
+            owner_user_id,
+            provider,
+            label,
+            secret,
+            metadata_json,
+            now,
+        } = input;
         let (ciphertext, nonce) = self.seal(secret.expose().as_bytes())?;
         let mut transaction = self
             .db
@@ -755,15 +768,15 @@ impl CredentialService {
         let id = db::new_uuid_v4();
         let handle = self
             .store
-            .create_api_key(
-                &id,
-                &input.owner_user_id,
-                &input.provider,
-                &input.label,
-                &input.credential,
-                "{}",
-                &now,
-            )
+            .create_api_key(CreateApiKeyInput {
+                id: &id,
+                owner_user_id: &input.owner_user_id,
+                provider: &input.provider,
+                label: &input.label,
+                secret: &input.credential,
+                metadata_json: "{}",
+                now: &now,
+            })
             .await
             .map_err(credential_error_to_service)?;
         self.record_entry_base_url(&id, &base_url).await;
@@ -793,15 +806,15 @@ impl CredentialService {
         let now = db::now_rfc3339();
         let id = db::new_uuid_v4();
         self.store
-            .create_api_key(
-                &id,
-                &input.owner_user_id,
-                &input.provider,
-                input.label.trim(),
-                &input.credential,
-                r#"{"purpose":"scm"}"#,
-                &now,
-            )
+            .create_api_key(CreateApiKeyInput {
+                id: &id,
+                owner_user_id: &input.owner_user_id,
+                provider: &input.provider,
+                label: input.label.trim(),
+                secret: &input.credential,
+                metadata_json: r#"{"purpose":"scm"}"#,
+                now: &now,
+            })
             .await
             .map_err(credential_error_to_service)
     }

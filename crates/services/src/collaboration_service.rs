@@ -2020,6 +2020,13 @@ impl CollaborationService {
                     .ok_or_else(|| not_found("work_unit", target.id.clone()))?;
                 Ok(())
             }
+            ProposalTargetKind::PrExternalAction => {
+                db::PrExternalActionRepo::get_pr_external_action(&*self.db, &target.id)
+                    .await?
+                    .filter(|action| action.task_id == task.id)
+                    .ok_or_else(|| not_found("pr_external_action", target.id.clone()))?;
+                Ok(())
+            }
         }
     }
 

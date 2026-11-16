@@ -1397,7 +1397,7 @@ impl ExecutionRepo for SqliteDb {
                                 AND coordination.mode != 'manual'
                                 AND coordination.authorization_version
                                     = request.authorization_version
-                                AND (request.kind IN ('work_unit_plan','validation_findings','human_decision_resume') OR EXISTS(
+                                AND (request.kind IN ('work_unit_plan','validation_findings','human_decision_resume','external_feedback') OR EXISTS(
                                     SELECT 1 FROM task_review_coordination_request_current current
                                     WHERE current.request_id=request.id
                                 ))

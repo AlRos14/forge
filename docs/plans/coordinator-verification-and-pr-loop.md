@@ -11,8 +11,9 @@ tests localmente.
 2026-11-15; ver «Contratos congelados (N0)» y «Fases». A1 (V171), A2 (V172) y A4
 (V174) están **IMPLEMENTADO / NOT RUN** (migraciones y capa `db` escritas; validadas
 solo con SQLite vía Python y `cargo fmt`; nada compilado ni ejecutado con cargo,
-ver «Anexo A1/A2/A4»). Los demás nodos siguen **TODO**. D1–D8 están **RESUELTAS**
-(sección «Decisiones»).
+ver «Anexo A1/A2/A4»). El estado de P0–P3, PX y RT fase 2 figura en la matriz y
+sus anexos; P3 queda **IMPLEMENTADO / NOT RUN** (Anexo P3). D1–D8 están
+**RESUELTAS** (sección «Decisiones»).
 
 **Actualización 2026-11-16 (D3'):** el spike PS dio **NO VIABLE** para D3 y el usuario
 eligió el diseño D3' (triage por disposición `extend_task|propose_task|human|dismiss`,
@@ -1152,7 +1153,7 @@ Códigos de error (`ApiError::bad_request_with_code`/409 donde se indica):
 | P1 | 2 | `pr_feedback.rs`, `pr_service.rs` (registro en `PrReconciler`; consultas con `rework_outcome IS NULL` tras PX) | — |
 | PX | 2 (D3') | `V175__pr_rework_pause_and_feedback_disposition.sql`, `sqlite/{pr_rework.rs,external_feedback.rs}` (disposiciones), `models.rs` (sección PX), `services/src/pr_rework.rs`, `task_lifecycle.rs` (solo `LifecycleCause::PrFeedbackRework`), `tests/v175.rs` (`v175_*`) | `pr_service.rs`, `pr_external_action.rs`, `orchestrator_runtime.rs`, `task_coordination.rs` |
 | P2 | 2 (D3') | `coordinator_outputs/external_feedback.rs`, `pr_feedback_followup.rs`; (cableado de turno solo vía RT) | V175, `pr_rework.rs` |
-| P3 | 2 (D3') | `pr_external_action.rs`, `pr_service.rs` y `pr_github_client.rs` (`find_open_pr_by_head`, reutilización en `publish_pr`, `PrReworkWatcher`) | V175 |
+| P3 | 2 (D3') | `pr_external_action.rs`, `pr_service.rs` y `pr_github_client.rs` (`find_open_pr_by_head`, reutilización en `publish_pr`, `PrReworkWatcher`) | V175, V177 |
 | PS | 2 | solo pruebas `pr_lifecycle_spike_*` (se actualizan en PX) | — |
 | A5, M1, FB | 3 | `V176__fallback_and_micro_fix_receipts.sql`, `sqlite/fallback_receipt.rs`, `task_rework/micro_fix.rs`, `task_dispatcher/fallback.rs`, `task_dispatcher.rs` (solo `mod fallback;`) | `work_unit_service.rs` |
 | API | por fase | `crates/api-types/src/{validation_catalog,human_decision,pr_feedback}.rs` + ampliaciones indicadas, `crates/api/src/routes/{validation_checks,human_decisions,pr_feedback}.rs`, `routes/mod.rs`, `lib.rs` (rutas), `mcp-server` tools, `forge-cli` solo si hay flags | tipos generados a mano |
@@ -1619,8 +1620,8 @@ Cualquier cambio de contrato vuelve a N0.
 | P2 | (Fase 2, redefinido por D3') Triage `external_feedback` **por disposición** (`extend_task|propose_task|human|dismiss`, Congelado 11 §11.1/11.7): parser schema_version 2, `classify_rework_scope`, `apply_external_feedback_triage` (triage V173 con mapeo legado + disposición V175 + `human_decision` + `post_comment`), `FollowUpTaskService` para `propose_task` aprobado; productor/contexto del turno (atomicidad request+origen+presupuesto+evento, replay, pause/revoke/restart) vía RT. | P1, A2, R1, PX | `coordinator_outputs/external_feedback.rs`, `pr_feedback_followup.rs`, `task_coordination.rs` (vía RT) | **IMPLEMENTADO / NOT RUN** (ver Anexo P2; el cableado del turno sigue en RT) |
 | PS | (Fase 2) Spike de lifecycle D3. | N0 | pruebas `pr_lifecycle_spike_*` | **CERRADO**: veredicto NO VIABLE (Anexo PS); **resuelto por D3'** (usuario, 2026-11-16, opción 1 ampliada). Sus pruebas se actualizan en PX. |
 | PX | (Fase 2, nuevo por D3') Pausa no destructiva de admisión y base del rework: **V175** (`pr_rework_supersession`, columnas `rework_outcome`/`supersession_id`/`readmits_supersession_id` en `remote_pr_admission`, `task_external_feedback_disposition`, triggers recreados y nuevos de «Congelado 11» §11.2), repos `sqlite/pr_rework.rs`, `PrReworkService::{supersede_for_rework, resume_after_supersession, observe_remote}`, `LifecycleCause::PrFeedbackRework` (recibo `pr_feedback_rework`), exclusión `rework_outcome IS NULL` en selecciones de P1, actualización de `pr_lifecycle_spike_*`. Pruebas `v175_*` y `pr_rework_*`. | N0, A3, P0 | ver Congelado 10 | **IMPLEMENTADO / NOT RUN** (ver «Anexo PX») |
-| P3 | (Fase 2, redefinido por D3') Re-admisión sobre la misma PR (`find_open_pr_by_head`, `publish_pr` con `readmits_supersession_id`), `push_update` dentro de la admisión nueva (fast-forward, `expected_remote_head_sha`), `post_comment` del resumen de triage (también sobre admisión superseded), `PrReworkWatcher` (merge/cierre remoto durante rework, §11.6); Gate exacto, autorización por política congelada/Decisión (D5), idempotencia, `OutcomeUnknown`, recuperación; el merge nunca. | P0, PX, A3, C3 | `pr_external_action.rs`, `pr_service.rs`, `pr_github_client.rs` | **TODO** |
-| RT | (Fases 1–3, una pasada por fase) Cableado único y ordenado de las salidas nuevas en el runtime y coordinación; contexto exacto de validación y feedback; políticas `allowed_actions`. | R1, D1, M1, C2, P2 | `orchestrator_runtime.rs`, `task_coordination.rs` | **Fase 1 IMPLEMENTADO / NOT RUN** (ver Anexo RT); fases 2–3 TODO |
+| P3 | (Fase 2, redefinido por D3') Re-admisión sobre la misma PR (`find_open_pr_by_head`, `publish_pr` con `readmits_supersession_id`), `push_update` dentro de la admisión nueva (fast-forward, `expected_remote_head_sha`), `post_comment` del resumen de triage (también sobre admisión superseded), `PrReworkWatcher` (merge/cierre remoto durante rework, §11.6); Gate exacto, autorización por política congelada/Decisión (D5), idempotencia, `OutcomeUnknown`, recuperación; el merge nunca. | P0, PX, A3, C3 | `pr_external_action.rs`, `pr_service.rs`, `pr_github_client.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo P3) |
+| RT | (Fases 1–3, una pasada por fase) Cableado único y ordenado de las salidas nuevas en el runtime y coordinación; contexto exacto de validación y feedback; políticas `allowed_actions`. | R1, D1, M1, C2, P2 | `orchestrator_runtime.rs`, `task_coordination.rs` | **Fase 1 IMPLEMENTADO / NOT RUN** (ver Anexo RT); **fase 2 IMPLEMENTADO / NOT RUN** (ver Anexo RT fase 2; V178 añadida); fase 3 TODO |
 | API | (por fase) REST, MCP, SSE, DTOs, tipos generados, `forge-ctl` si procede. Ver «Contratos públicos». | RT, D1, C3, P3 | ver L6 | **FASE 1 IMPLEMENTADA / NOT RUN** (ver Anexo API fase 1); fases 2–3 TODO |
 | UI | (por fase) Paneles de decisión humana, checks (catálogo, solicitudes, comparación base), feedback de PR, estados de fallback/micro-fix en la journey. | API (fixtures desde N0) | ver L7 | **TODO** |
 | T | (por fase) Tests escritos contra interfaces congeladas (ver plan de pruebas). | N0 | ver L8 | **TODO** |
@@ -2138,6 +2139,54 @@ original); `recheck` sobre sujeto idéntico no re-ejecuta; scanner sin guard SQL
 batch pausado (reintenta cada ciclo); review_findings v2 con `outputs` no cableado;
 paused kinds distintos de `validation_findings` rechazados.
 
+## Anexo RT (fase 2) — triage `external_feedback` y rework en la misma PR (IMPLEMENTADO / NOT RUN)
+
+Fecha: 2026-11-16. Escrito sin compilar ni ejecutar (solo CI). Tests:
+`cargo test --locked -p services --lib rt_external_feedback_` (puros + un test DB sobre
+la fixture de `pr_rework`), añadido al workflow.
+
+- **Archivos:** `services/src/task_coordination/external_feedback.rs` (nuevo: productor,
+  scanner, contexto, prompt, finalización del turno, efectos, `PrReworkEffects`, scanners de
+  efectos y de decisiones), `task_rework/external_feedback_triage.rs` (nuevo: recibo
+  `triaged` con autoridad que admite `merging`), ediciones mínimas en `task_coordination.rs`,
+  `task_coordination/{turn_outputs,validation_findings}.rs`, `orchestrator_runtime.rs`,
+  `human_decision_service.rs`, `pr_rework.rs` (solo visibilidad de tests), `db`
+  (`TaskCoordinationRepo::create_external_feedback_coordination_request`, `add_set_items`
+  visible al módulo hermano, origen `external_feedback_triage` admite `merging`, kind
+  `external_feedback` en el claim de Start y en la admisión de wake), workflow y
+  `docs/concepts/orchestration.md`.
+- **Productor:** set exacto (`list_unconsumed_trusted_feedback`, ≤ 20), digest
+  `feedback_set_digest`, clave `external-feedback:{auth}:{admission}:{digest}`; request, set,
+  origen de batch, cargo de presupuesto y evento en una `BEGIN IMMEDIATE`. Una request en
+  vuelo por admisión. Scanner `process_pending_external_feedback_requests`.
+- **Turno:** parse `parse_external_feedback_v2`, medida de `TaskOriginalScope`,
+  `classify_rework_scope`, `apply_external_feedback_triage`, recibo `triaged`, efectos.
+- **Efectos (idempotentes, reintentados por scanner):** decisiones humanas
+  (`propose_task`/`human`) + `bind_decision_to_disposition`; `extend_task` →
+  `supersede_for_rework` + `resume_after_supersession` + materialización de WorkUnits (plan
+  re-derivado de la Execution del coordinador, ids deterministas, provenance
+  `external` + `external_feedback:{request_id}`); `dismiss` = fila inmutable; evento
+  `task.pr_feedback_triaged`. Decisiones respondidas: `FollowUpTaskService::apply_approved`
+  y `converge_remote_merged` por scanner.
+- **Decisiones de diseño/desviaciones:** (1) sin columna ni migración autorizada para el
+  provenance JSON del WorkUnit: se usa `provenance_kind='external'`,
+  `provenance_id='external_feedback:{request_id}'` y los `item_ids`/`body_digests` en las
+  instrucciones; (2) el plan pendiente no se persiste aparte: es la salida tipada de la
+  Execution completada; (3) se rechazan `review_subject_key` y `artifact_inputs` en el plan
+  de rework; (4) las decisiones `external_feedback` no crean `human_decision_resume`
+  (`ensure_resume_request` devuelve `Deferred human_decision.direct_effect`); una respuesta
+  `human` queda registrada sin turno automático; (5) el baseline de `objective_digest` es la
+  instantánea de la autorización de batch; sin batch el hecho es vacuo; (6) el hook
+  `request_pr_feedback_summary_comment` (RT_HOOK(P3)) crea el Summary Artifact y
+  solicita el `post_comment` durable de P3; autorización y ejecución siguen en
+  `PrExternalActionService`.
+- **V178** (`V178__coordinator_feedback_triage_during_merging.sql`, escrita / NOT RUN
+  con Cargo): recrea los guards V106 de INSERT y UPDATE. En `Merging` admite un Execution
+  `running` solo si `work_unit_id IS NULL` y la misma Task tiene una request
+  `external_feedback` en `requested|running|uncertain` cuyo `execution_id` es este Execution
+  o sigue sin enlazar; todos los demás estados de lifecycle conservan la condición V106.
+  `crates/db/src/tests/v178.rs` cubre las ramas admitidas y rechazadas de ambos guards.
+
 ### Anexo CI fase 1 — cierre
 
 - Diagnóstico intermedio `10bdfac6` (run 43716346691): build PASS; único fallo
@@ -2383,4 +2432,49 @@ Sin cargo local; CI (`-p db --lib v17`, `-p services --lib pr_rework_`, `pr_life
 - **DB**: `PrReworkRepo` (`sqlite/pr_rework.rs`), `ExternalFeedbackRepo::{record_external_feedback_disposition[_in_tx], list_external_feedback_dispositions, bind_external_feedback_disposition_decision|followup}`, modelos `PrReworkSupersession`, `FeedbackItemDisposition`, `FeedbackScopeClassification`, `FeedbackDismissReason`; `begin_pull_request_publication` rellena `readmits_supersession_id` y reutiliza/reinicia la proyección según la pausa; teardown; `DbError::PrReworkNotAuthorized`.
 - **Services**: `LifecycleCause::PrFeedbackRework`, `PrReworkService::{supersede_for_rework, resume_after_supersession, observe_remote, converge_remote_merged}` y trait `PrReworkEffects` (materializar plan / cancelar WorkUnits, cableado en RT); `rework_outcome IS NULL` en `PrReconciler` y `PrFeedbackIngestor`; `list_unconsumed_trusted_feedback`.
 - O1: remoto fusionado ⇒ decisión humana `rework:{id}` y, al responder, `Blocked(pr_merged_externally)` sin arista nueva.
-- Pendiente fuera de PX: P2/RT (materializar el plan, enlazar la decisión), P3 (`find_open_pr_by_head`, `push_update`, watcher, transición a `readmitted`).
+- Pendiente fuera de PX: el bloqueo V178 para iniciar el turno RT fase 2; P3
+  (`find_open_pr_by_head`, `push_update`, watcher y transición a `readmitted`)
+  está IMPLEMENTADO / NOT RUN (Anexo P3).
+
+## Anexo P3 (fase 2) — re-admisión, acciones externas y watcher (IMPLEMENTADO / NOT RUN)
+
+Escrito sin ejecutar Cargo localmente, según la regla de este trabajo. CI es la
+validación prevista; los pasos están en `.github/workflows/build-local-linux.yml`:
+`pr_external_action_` y `pr_rework_watcher_`.
+
+- `PrProvider::find_open_pr_by_head` y `GitHubPrProvider` buscan por repo, rama
+  fuente, rama destino y estado abierto. `publish_pr` con
+  `readmits_supersession_id` solo reutiliza el `provider_pr_id` de la supersesión:
+  head pausado → acción `push_update`; head admitido → finaliza la readmisión;
+  otra identidad o head → reconciliación, sin crear ni forzar otra PR.
+- `PrExternalActionService` crea acciones idempotentes según la política
+  congelada de la admisión. `automatic` nace `approved`; `human_approval` crea
+  Proposal exacta `target_kind='pr_external_action'` y la aprobación/rechazo
+  registra la Decision exacta con los servicios de colaboración existentes.
+  V177 amplía el guard de Proposal para aceptar únicamente ese nuevo target,
+  enlazado a la acción `proposed` de la misma Task.
+  `push_update` exige Gate satisfecho y actual, SHA admitido descendiente del
+  head pausado, y compare-and-swap del head remoto esperado. La credencial Git
+  solo viaja por `http.extraheader` en el entorno hijo; no va en URL, argv,
+  eventos ni errores. Las salidas Git se redactan antes de persistirlas.
+- `post_comment` usa `build_pr_feedback_summary`, un Summary Artifact inmutable
+  del Execution de triage y el marcador anti-bucle. La resolución del número PR
+  usa la supersesión o el historial exacto de esa admisión, no la proyección
+  mutable de otra admisión. Reintentos buscan el marcador antes de publicar.
+  RT completa `request_pr_feedback_summary_comment`; política `off` no crea
+  artefacto ni acción.
+- `PrReworkWatcher`, dentro del tick registrado de `PrReconciler` en
+  `forge-cli`, solo lee el estado de supersesiones `open` y llama
+  `PrReworkService::observe_remote`. El scanner de decisiones RT fase 2 es el
+  único que llama `converge_remote_merged` al contestarse la decisión; no se
+  duplica la transición de lifecycle. El mismo tick ejecuta/reconcilia las
+  acciones durables.
+- Tests `pr_external_action_*`: mock HTTP local, push compare-and-swap en bare
+  git local, política/Decision, cambio de head, `OutcomeUnknown`, restart y
+  marcador. Tests `pr_rework_watcher_*`: mock HTTP local, observación abierta,
+  fusionada y cerrada, solo GET, y espera de la decisión para converger.
+
+Límite de evidencia: no hay aceptación contra GitHub real ni resultado CI en
+este cambio. La política predeterminada mantiene `post_summary=off` y
+`push_corrections=human_approval`; acciones automáticas requieren configuración
+congelada explícita. El merge sigue siendo humano.

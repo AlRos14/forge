@@ -941,7 +941,7 @@ pub(crate) mod tests {
         )
         .await
         .expect("repository enters pull-request mode");
-        let provider_config = PrProviderConfigRepo::create(
+        let mut provider_config = PrProviderConfigRepo::create(
             &*fixture.db,
             CreatePrProviderConfig {
                 id: new_uuid_v4(),
@@ -975,7 +975,7 @@ pub(crate) mod tests {
             settings
                 .set_credential(&fixture.user_id, &fixture.repo_id, Some(&handle.id))
                 .await?;
-            settings
+            provider_config = settings
                 .set_feedback_policy(&fixture.user_id, &fixture.repo_id, setup.policy)
                 .await?;
         }

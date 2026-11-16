@@ -2316,6 +2316,8 @@ pub enum ProposalTargetKind {
     Execution,
     Workspace,
     WorkUnit,
+    /// A `human_approval` PR external action (V177; plan node P3).
+    PrExternalAction,
 }
 
 enum_strings!(ProposalTargetKind {
@@ -2323,6 +2325,7 @@ enum_strings!(ProposalTargetKind {
     Execution => "execution",
     Workspace => "workspace",
     WorkUnit => "work_unit",
+    PrExternalAction => "pr_external_action",
 });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

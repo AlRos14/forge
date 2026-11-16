@@ -8750,3 +8750,5 @@ async fn stale_interrupted_allocation_does_not_reserve_fresh_admission() {
 mod v171_v174;
 mod v173;
 mod v175;
+mod v177;
+mod v178;

@@ -79,6 +79,8 @@ use std::{
 // V175 adds the non-destructive PR admission pause (pr_rework_supersession, additive
 // remote_pr_admission columns, recreated V114/V116/V173 guards) and the per-item feedback
 // dispositions, so external-feedback rework runs on the same Task and the same open PR.
+// V177 lets a Proposal target a PR external action (human_approval for push_update/post_comment).
+// V178 admits only unallocated external-feedback triage Executions on Merging Tasks.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

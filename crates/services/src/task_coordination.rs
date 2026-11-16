@@ -31,6 +31,7 @@ use crate::{
     Result, ServiceError,
 };
 
+mod external_feedback;
 mod turn_outputs;
 mod validation_findings;
 
@@ -2802,6 +2803,9 @@ impl TaskCoordinationService {
             }
             TaskCoordinationRequestKind::HumanDecisionResume => {
                 return self.render_human_decision_resume_prompt(request, context);
+            }
+            TaskCoordinationRequestKind::ExternalFeedback => {
+                return self.render_external_feedback_prompt(request, context);
             }
             _ => {}
         }

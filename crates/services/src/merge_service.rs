@@ -408,7 +408,17 @@ impl MergeService {
         // Push the pinned source before persisting the PR admission. A crash
         // after admission therefore always leaves a provider-ready branch and
         // an atomic PublishPr plus metadata intent for startup recovery.
-        push_branch(worktree_path, &source_branch).await?;
+        //
+        // While a same-PR rework pause is open (plan 11.5) the update of the
+        // existing PR branch is the authorized `push_update` external action
+        // (frozen policy or Decision, expected remote head, no force), never
+        // this ambient push.
+        if db::PrReworkRepo::get_open_supersession_by_task(&*self.db, &task_id)
+            .await?
+            .is_none()
+        {
+            push_branch(worktree_path, &source_branch).await?;
+        }
         self.ensure_current_gate_evaluation(&task_id, &evaluation)
             .await?;
         let source_sha = self

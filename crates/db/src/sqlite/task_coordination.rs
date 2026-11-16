@@ -1,9 +1,10 @@
 use super::*;
 use crate::{
     CoordinatorReplanClassification, CoordinatorReplanState, CreateCoordinatorReplan,
-    MaterializedWorkUnit, TaskCoordinationMode, TaskCoordinatorReplan, TaskCoordinatorReplanRepo,
-    TaskValidationTriage, TaskValidationTriageRepo, TransitionCoordinatorReplan,
-    UpdateTaskQualityRequestState, ValidationTriageDisposition, MAX_COORDINATOR_REPLANS_PER_TASK,
+    ExternalFeedbackSetEntry, MaterializedWorkUnit, TaskCoordinationMode, TaskCoordinatorReplan,
+    TaskCoordinatorReplanRepo, TaskValidationTriage, TaskValidationTriageRepo,
+    TransitionCoordinatorReplan, UpdateTaskQualityRequestState, ValidationTriageDisposition,
+    MAX_COORDINATOR_REPLANS_PER_TASK,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -377,6 +378,7 @@ async fn create_task_coordination_request_write(
     db: &SqliteDb,
     input: CreateTaskCoordinationRequestInput,
     batch_binding: Option<ProjectPlanBatchRequestBinding>,
+    feedback_set: Option<&[ExternalFeedbackSetEntry]>,
 ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)> {
     let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await?;
     if let Some(existing) = sqlx::query(
@@ -607,6 +609,12 @@ async fn create_task_coordination_request_write(
     .execute(&mut *tx)
     .await
     .map_err(check_error)?;
+    if let Some(entries) = feedback_set {
+        // RT phase 2: the exact `external_feedback` set commits with the
+        // request, its budget charge and its event (one `BEGIN IMMEDIATE`).
+        super::external_feedback::add_set_items(&mut tx, &input.id, &input.task_id, entries)
+            .await?;
+    }
     if let Some(binding) = batch_binding.as_ref() {
         let update = match &binding.origin {
             ProjectPlanBatchRequestOrigin::Scheduler { claim_token } => {
@@ -825,7 +833,8 @@ async fn validate_project_batch_request_binding_in_tx(
               AND a.task_description IS t.description AND a.task_repo_id IS t.repo_id
               AND a.task_parent_task_id IS t.parent_task_id
               AND EXISTS(SELECT 1 FROM task_lifecycle l WHERE l.task_id=t.id
-                         AND l.state NOT IN ('done','cancelled','merging'))
+                         AND (l.state NOT IN ('done','cancelled','merging')
+                              OR (l.state='merging' AND ?)))
               AND NOT EXISTS(SELECT 1 FROM task_dispatch d
                              WHERE d.task_id=t.id AND d.state='cancelled')
         )",
@@ -841,6 +850,10 @@ async fn validate_project_batch_request_binding_in_tx(
     .bind(binding.expected_coordination_version)
     .bind(input.mode.to_string())
     .bind(&input.requested_by)
+    .bind(matches!(
+        binding.origin,
+        ProjectPlanBatchRequestOrigin::ExternalFeedbackTriage
+    ))
     .fetch_one(&mut **tx)
     .await?;
     if !current {
@@ -1575,7 +1588,7 @@ impl TaskCoordinationRepo for SqliteDb {
         &self,
         input: CreateTaskCoordinationRequestInput,
     ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)> {
-        create_task_coordination_request_write(self, input, None).await
+        create_task_coordination_request_write(self, input, None, None).await
     }
 
     async fn create_project_plan_batch_coordination_request(
@@ -1583,7 +1596,21 @@ impl TaskCoordinationRepo for SqliteDb {
         input: CreateTaskCoordinationRequestInput,
         binding: ProjectPlanBatchRequestBinding,
     ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)> {
-        create_task_coordination_request_write(self, input, Some(binding)).await
+        create_task_coordination_request_write(self, input, Some(binding), None).await
+    }
+
+    async fn create_external_feedback_coordination_request(
+        &self,
+        input: CreateTaskCoordinationRequestInput,
+        binding: Option<ProjectPlanBatchRequestBinding>,
+        entries: Vec<ExternalFeedbackSetEntry>,
+    ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)> {
+        if input.kind != TaskCoordinationRequestKind::ExternalFeedback {
+            return Err(DbError::Check(
+                "only an external_feedback request carries a feedback set".to_owned(),
+            ));
+        }
+        create_task_coordination_request_write(self, input, binding, Some(&entries)).await
     }
 
     async fn get_task_coordination_request(

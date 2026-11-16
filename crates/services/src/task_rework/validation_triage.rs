@@ -22,7 +22,7 @@ pub(crate) struct ValidationFindingsDecision {
     pub micro_fix: Option<serde_json::Value>,
 }
 
-const AUTHORITY_SQL: &str = "SELECT c.task_id,c.authorization_version,e.actor_kind,e.actor_id
+pub(super) const AUTHORITY_SQL: &str = "SELECT c.task_id,c.authorization_version,e.actor_kind,e.actor_id
     FROM task_coordination c JOIN task task ON task.id=c.task_id
     JOIN project project ON project.id=task.project_id
     JOIN execution e ON e.id=? AND e.task_id=c.task_id
