@@ -2955,6 +2955,42 @@ pub trait TaskCoordinatorReplanRepo: Send + Sync {
     ) -> Result<Vec<TaskCoordinatorReplan>>;
 }
 
+/// Durable evidence for a cross-Agent fallback on one exact WorkUnit attempt.
+#[async_trait]
+pub trait WorkUnitFallbackReceiptRepo: Send + Sync {
+    async fn create_work_unit_fallback_receipt(
+        &self,
+        input: CreateWorkUnitFallbackReceipt,
+    ) -> Result<WorkUnitFallbackReceipt>;
+    async fn get_work_unit_fallback_receipt_by_origin_execution(
+        &self,
+        origin_execution_id: &str,
+    ) -> Result<Option<WorkUnitFallbackReceipt>>;
+    async fn list_work_unit_fallback_receipts_by_work_unit(
+        &self,
+        work_unit_id: &str,
+    ) -> Result<Vec<WorkUnitFallbackReceipt>>;
+}
+
+/// Append-only micro-fix identity plus a single pending-to-terminal bounds update.
+#[async_trait]
+pub trait MicroFixReceiptRepo: Send + Sync {
+    /// Assigns the next per-Task ordinal under `BEGIN IMMEDIATE` and enforces
+    /// the hard product limit of `MAX_MICRO_FIX_PER_TASK`.
+    async fn create_micro_fix_receipt(
+        &self,
+        input: CreateMicroFixReceipt,
+    ) -> Result<MicroFixReceipt>;
+    /// Advances `bounds_outcome` exactly once from `pending` to either terminal
+    /// bounds result. A stale or repeated advance returns `DbError::VersionConflict`.
+    async fn advance_micro_fix_receipt_bounds(
+        &self,
+        input: AdvanceMicroFixReceiptBounds,
+    ) -> Result<MicroFixReceipt>;
+    async fn get_micro_fix_receipt(&self, id: &str) -> Result<Option<MicroFixReceipt>>;
+    async fn list_micro_fix_receipts_by_task(&self, task_id: &str) -> Result<Vec<MicroFixReceipt>>;
+}
+
 /// Structured human decision requests (V174).
 #[async_trait]
 pub trait HumanDecisionRepo: Send + Sync {

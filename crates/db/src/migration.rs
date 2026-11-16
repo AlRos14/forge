@@ -82,6 +82,8 @@ use std::{
 // V177 lets a Proposal target a PR external action (human_approval for push_update/post_comment).
 // V178 admits only unallocated external-feedback triage Executions on Merging Tasks.
 // V179 preserves the exact PR rework lifecycle receipt when a superseded PR closes remotely.
+// V180 adds the phase-3 fallback and micro-fix receipts (the frozen V176 block,
+// renumbered because V177-V179 already exist).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

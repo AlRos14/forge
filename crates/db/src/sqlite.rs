@@ -69,6 +69,7 @@ mod execution;
 mod execution_usage;
 mod external_feedback;
 mod external_link;
+mod fallback_receipt;
 mod gate_lifecycle;
 mod harness_session;
 mod human_decision;

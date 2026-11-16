@@ -5,7 +5,7 @@ use std::{
 
 use api_types::{ActorRef as ApiActorRef, TaskRoleCapability, TaskRoleConfiguration};
 use db::{
-    new_uuid_v4, now_rfc3339, ActorRef, AgentRepo, ArtifactKind, CollaborationRepo,
+    new_uuid_v4, now_rfc3339, ActorRef, AgentRepo, ArtifactKind, CollaborationRepo, CostClass,
     CreateDomainEvent, ProjectPlanBatchAuthorizationBinding, ProjectPlanBatchRequestBinding,
     ProjectPlanBatchRequestOrigin, RoleMembershipRepo, RoleMembershipStatus, SqliteDb, Task,
     TaskCoordination, TaskCoordinationMaterialization, TaskCoordinationMode, TaskCoordinationPlan,
@@ -13,7 +13,8 @@ use db::{
     TaskCoordinationRequestKind, TaskCoordinationRequestState, TaskCoordinationWrite,
     TaskIntervention, TaskInterventionKind, TaskInterventionState, TaskLifecycleRepo,
     TaskLifecycleState, TaskQualityCategory, TaskQualityRequest, TaskQualityState,
-    TaskQualityTargetKind, TaskRepo, TaskRoleRepo, UserRepo,
+    TaskQualityTargetKind, TaskRepo, TaskRoleRepo, UserRepo, MAX_MICRO_FIX_CHANGED_LINES,
+    MAX_MICRO_FIX_FILES, MAX_MICRO_FIX_PER_TASK,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -81,6 +82,10 @@ fn bounded(value: &str, max: usize) -> bool {
     !value.trim().is_empty() && value.len() <= max
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CoordinationEnvelope {
@@ -104,6 +109,18 @@ pub struct CoordinationEnvelope {
     /// byte-identical to the historical serialization.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validation_checks: Vec<EnvelopeValidationCheck>,
+    /// Envelope v2: explicitly enabled bounded correction routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub micro_fix: Option<EnvelopeMicroFix>,
+    /// Envelope v2: optional preauthorized formal reviewer profile grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub micro_fix_reviewer: Option<EnvelopeProfileGrant>,
+    /// Envelope v2: ordered, per-TaskRole fallback Agent candidates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_agents: Vec<EnvelopeFallbackAgent>,
+    /// Envelope v2: allow the coordinator to propose a bounded replan.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_coordinator_replan: bool,
 }
 
 /// One pinned catalog definition version authorized for a Task (envelope v2).
@@ -115,6 +132,37 @@ pub struct EnvelopeValidationCheck {
     pub trigger: db::EnvelopeCheckTrigger,
 }
 
+/// Bounded micro-fix limits authorized for one Task.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeMicroFix {
+    pub enabled: bool,
+    pub max_files: u32,
+    pub max_changed_lines: u32,
+    pub max_per_task: u32,
+    #[serde(default)]
+    pub extra_forbidden_globs: Vec<String>,
+}
+
+/// A TaskRole/Agent profile explicitly preauthorized for a formal review.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeProfileGrant {
+    pub task_role_id: String,
+    pub agent_id: String,
+    pub cost_class: CostClass,
+}
+
+/// One ordered fallback Agent candidate for a TaskRole.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeFallbackAgent {
+    pub task_role_id: String,
+    pub agent_id: String,
+    pub cost_class: CostClass,
+    pub max_wait_seconds: u32,
+}
+
 const MAX_ENVELOPE_VALIDATION_CHECKS: usize = 8;
 
 /// Scope against which envelope pins are resolved (`validate_pins`).
@@ -122,6 +170,14 @@ pub struct EnvelopePinContext<'a> {
     pub db: &'a SqliteDb,
     pub project_id: &'a str,
     pub repo_id: Option<&'a str>,
+}
+
+/// Exact Task and coordinator scope for phase-3 Agent grants in an envelope.
+pub struct EnvelopePhaseThreePinContext<'a> {
+    pub db: &'a SqliteDb,
+    pub project_id: &'a str,
+    pub task_id: Option<&'a str>,
+    pub coordinator_actor: Option<&'a ActorRef>,
 }
 
 impl Default for CoordinationEnvelope {
@@ -140,6 +196,10 @@ impl Default for CoordinationEnvelope {
             require_independent_review: true,
             orchestrator_reviews_findings: true,
             validation_checks: Vec::new(),
+            micro_fix: None,
+            micro_fix_reviewer: None,
+            fallback_agents: Vec::new(),
+            allow_coordinator_replan: false,
         }
     }
 }
@@ -152,6 +212,7 @@ impl CoordinationEnvelope {
             ));
         }
         self.validate_validation_checks()?;
+        self.validate_phase_three_fields()?;
         if self.max_work_units == 0 || self.max_work_units > MAX_PLAN_WORK_UNITS {
             return Err(unsupported_item(format!(
                 "max_work_units must be between 1 and {MAX_PLAN_WORK_UNITS}"
@@ -186,6 +247,94 @@ impl CoordinationEnvelope {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn validate_phase_three_fields(&self) -> Result<()> {
+        if self.schema_version < 2
+            && (self.micro_fix.is_some()
+                || self.micro_fix_reviewer.is_some()
+                || !self.fallback_agents.is_empty()
+                || self.allow_coordinator_replan)
+        {
+            return Err(unsupported_item(
+                "phase-3 coordination fields require envelope schema_version 2",
+            ));
+        }
+
+        if let Some(micro_fix) = &self.micro_fix {
+            if micro_fix.max_files == 0 || micro_fix.max_files > MAX_MICRO_FIX_FILES {
+                return Err(unsupported_item(format!(
+                    "micro_fix.max_files must be between 1 and {MAX_MICRO_FIX_FILES}"
+                )));
+            }
+            if micro_fix.max_changed_lines == 0
+                || micro_fix.max_changed_lines > MAX_MICRO_FIX_CHANGED_LINES
+            {
+                return Err(unsupported_item(format!(
+                    "micro_fix.max_changed_lines must be between 1 and {MAX_MICRO_FIX_CHANGED_LINES}"
+                )));
+            }
+            if micro_fix.max_per_task == 0 || micro_fix.max_per_task as i64 > MAX_MICRO_FIX_PER_TASK
+            {
+                return Err(unsupported_item(format!(
+                    "micro_fix.max_per_task must be between 1 and {MAX_MICRO_FIX_PER_TASK}"
+                )));
+            }
+            if micro_fix.extra_forbidden_globs.len() > 16 {
+                return Err(unsupported_item(
+                    "micro_fix.extra_forbidden_globs accepts at most 16 patterns",
+                ));
+            }
+        }
+
+        if self.micro_fix_reviewer.is_some()
+            && !self.micro_fix.as_ref().is_some_and(|value| value.enabled)
+        {
+            return Err(unsupported_item(
+                "micro_fix_reviewer requires an enabled micro_fix grant",
+            ));
+        }
+
+        let mut fallback_counts = HashMap::<&str, usize>::new();
+        let mut fallback_actors = HashSet::new();
+        for candidate in &self.fallback_agents {
+            if !bounded(&candidate.task_role_id, 128) || !bounded(&candidate.agent_id, 128) {
+                return Err(unsupported_item(
+                    "fallback_agents requires non-empty TaskRole and Agent ids",
+                ));
+            }
+            if candidate.max_wait_seconds > 86_400 {
+                return Err(unsupported_item(
+                    "fallback_agents.max_wait_seconds must not exceed 86400",
+                ));
+            }
+            if !fallback_actors
+                .insert((candidate.task_role_id.as_str(), candidate.agent_id.as_str()))
+            {
+                return Err(unsupported_item(
+                    "fallback_agents cannot repeat an Agent within a TaskRole chain",
+                ));
+            }
+            let count = fallback_counts
+                .entry(candidate.task_role_id.as_str())
+                .or_default();
+            *count += 1;
+            if *count > 3 {
+                return Err(unsupported_item(
+                    "fallback_agents accepts at most 3 Agents per TaskRole",
+                ));
+            }
+        }
+
+        for grant in self.micro_fix_reviewer.iter() {
+            if !bounded(&grant.task_role_id, 128) || !bounded(&grant.agent_id, 128) {
+                return Err(unsupported_item(
+                    "micro_fix_reviewer requires non-empty TaskRole and Agent ids",
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -257,6 +406,112 @@ impl CoordinationEnvelope {
         }
         Ok(())
     }
+
+    /// Validate phase-3 reviewer and fallback Agent grants against the exact
+    /// Task, Project owner, TaskRole memberships, and coordinator Actor.
+    pub async fn validate_phase_three_pins(
+        &self,
+        ctx: &EnvelopePhaseThreePinContext<'_>,
+    ) -> Result<()> {
+        if !self.fallback_agents.is_empty() || self.micro_fix_reviewer.is_some() {
+            let task_id = ctx.task_id.ok_or_else(|| {
+                unsupported_item("phase-3 Agent grants require an exact Task scope")
+            })?;
+            for candidate in &self.fallback_agents {
+                if ctx.coordinator_actor.is_some_and(|coordinator| {
+                    matches!(coordinator, ActorRef::Agent(id) if id == &candidate.agent_id)
+                }) {
+                    return Err(unsupported_item(
+                        "the coordinator Agent cannot appear in fallback_agents",
+                    ));
+                }
+                if !envelope_agent_is_active_task_role_member(
+                    ctx.db,
+                    task_id,
+                    ctx.project_id,
+                    &candidate.task_role_id,
+                    &candidate.agent_id,
+                    false,
+                )
+                .await?
+                {
+                    return Err(unsupported_item(format!(
+                        "fallback Agent {} must be an existing same-account active member of TaskRole {}",
+                        candidate.agent_id, candidate.task_role_id
+                    )));
+                }
+            }
+            if let Some(grant) = &self.micro_fix_reviewer {
+                let role_name: Option<String> =
+                    sqlx::query_scalar("SELECT role FROM task_role WHERE id = ? AND task_id = ?")
+                        .bind(&grant.task_role_id)
+                        .bind(task_id)
+                        .fetch_optional(ctx.db.pool())
+                        .await?;
+                if !role_name.as_deref().is_some_and(|role| {
+                    self.allowed_review_roles
+                        .iter()
+                        .any(|allowed| allowed == role)
+                }) || !envelope_agent_is_active_task_role_member(
+                    ctx.db,
+                    task_id,
+                    ctx.project_id,
+                    &grant.task_role_id,
+                    &grant.agent_id,
+                    true,
+                )
+                .await?
+                {
+                    return Err(unsupported_item(
+                        "micro_fix_reviewer must be an existing same-account active formal reviewer in an allowed review TaskRole",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn envelope_agent_is_active_task_role_member(
+    db: &SqliteDb,
+    task_id: &str,
+    project_id: &str,
+    task_role_id: &str,
+    agent_id: &str,
+    require_formal_review: bool,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM task_role role
+            JOIN task task_row ON task_row.id = role.task_id
+            JOIN project project_row ON project_row.id = task_row.project_id
+            JOIN role_membership membership ON membership.task_role_id = role.id
+            JOIN agent_identity agent ON agent.id = membership.actor_id
+            WHERE role.id = ? AND role.task_id = ? AND task_row.project_id = ?
+              AND membership.actor_kind = 'agent'
+              AND membership.actor_id = ? AND membership.status = 'active'
+              AND project_row.owner_id IS NOT NULL
+              AND agent.owner_id = project_row.owner_id
+              AND (
+                  ? = 0 OR EXISTS (
+                      SELECT 1
+                      FROM task_role_capability_configuration configuration,
+                           json_each(configuration.configuration_json, '$.capabilities') capability
+                      WHERE configuration.task_role_id = role.id
+                        AND capability.value = 'formal_review'
+                  )
+              )
+        )",
+    )
+    .bind(task_role_id)
+    .bind(task_id)
+    .bind(project_id)
+    .bind(agent_id)
+    .bind(if require_formal_review { 1_i64 } else { 0_i64 })
+    .fetch_one(db.pool())
+    .await?
+        != 0)
 }
 
 pub(crate) fn semantic_unconfigured_manual_default(
@@ -740,6 +995,14 @@ impl TaskCoordinationService {
                     db: &self.db,
                     project_id: &task.project_id,
                     repo_id: task.repo_id.as_deref(),
+                })
+                .await?;
+            envelope
+                .validate_phase_three_pins(&EnvelopePhaseThreePinContext {
+                    db: &self.db,
+                    project_id: &task.project_id,
+                    task_id: Some(&task.id),
+                    coordinator_actor: input.coordinator_actor.as_ref(),
                 })
                 .await?;
         }
@@ -4718,8 +4981,83 @@ mod tests {
             json,
             "{\"schema_version\":1,\"max_work_units\":16,\"allow_new_task_roles\":false,\"allow_membership_changes\":false,\"allow_capability_changes\":false,\"allow_repository_write\":true,\"allow_external_actions\":false,\"allow_integration\":true,\"allow_merge\":false,\"allowed_review_roles\":[\"reviewer\"],\"require_independent_review\":true,\"orchestrator_reviews_findings\":true}"
         );
+        assert_eq!(
+            sha256_hex(json.as_bytes()),
+            "1d51d9a985faa6240cc35108b94fadefd4882600fec0cec08abf7602ea5734a9"
+        );
         let parsed: CoordinationEnvelope = serde_json::from_str(&json).expect("round trip");
         assert_eq!(parsed, envelope);
+    }
+
+    #[test]
+    fn v180_envelope_phase_three_fields_are_bounded_and_omitted_when_unset() {
+        let serialized = canonical_json(&CoordinationEnvelope::default()).expect("default JSON");
+        for field in [
+            "micro_fix",
+            "micro_fix_reviewer",
+            "fallback_agents",
+            "allow_coordinator_replan",
+        ] {
+            assert!(!serialized.contains(field), "unset {field} is omitted");
+        }
+
+        let micro_fix = EnvelopeMicroFix {
+            enabled: true,
+            max_files: MAX_MICRO_FIX_FILES,
+            max_changed_lines: MAX_MICRO_FIX_CHANGED_LINES,
+            max_per_task: MAX_MICRO_FIX_PER_TASK as u32,
+            extra_forbidden_globs: vec!["*.toml".to_owned()],
+        };
+        let fallback = EnvelopeFallbackAgent {
+            task_role_id: "role-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            cost_class: CostClass::Economy,
+            max_wait_seconds: 86_400,
+        };
+        let mut envelope = CoordinationEnvelope {
+            schema_version: 2,
+            micro_fix: Some(micro_fix.clone()),
+            fallback_agents: vec![
+                fallback.clone(),
+                EnvelopeFallbackAgent {
+                    agent_id: "agent-2".to_owned(),
+                    ..fallback.clone()
+                },
+                EnvelopeFallbackAgent {
+                    agent_id: "agent-3".to_owned(),
+                    ..fallback.clone()
+                },
+            ],
+            allow_coordinator_replan: true,
+            ..CoordinationEnvelope::default()
+        };
+        envelope.validate().expect("product maxima are accepted");
+        let json = canonical_json(&envelope).expect("v2 JSON");
+        assert!(json.contains("\"cost_class\":\"economy\""));
+        assert!(json.contains("\"allow_coordinator_replan\":true"));
+
+        let mut v1 = envelope.clone();
+        v1.schema_version = 1;
+        assert!(v1.validate().is_err(), "v1 rejects phase-3 grants");
+
+        let mut over_files = envelope.clone();
+        over_files.micro_fix.as_mut().unwrap().max_files += 1;
+        assert!(over_files.validate().is_err());
+        let mut over_lines = envelope.clone();
+        over_lines.micro_fix.as_mut().unwrap().max_changed_lines += 1;
+        assert!(over_lines.validate().is_err());
+        let mut over_budget = envelope.clone();
+        over_budget.micro_fix.as_mut().unwrap().max_per_task += 1;
+        assert!(over_budget.validate().is_err());
+        let mut over_fallbacks = envelope.clone();
+        over_fallbacks.fallback_agents.push(EnvelopeFallbackAgent {
+            agent_id: "agent-4".to_owned(),
+            ..fallback.clone()
+        });
+        assert!(over_fallbacks.validate().is_err());
+        let mut duplicate_fallback = envelope;
+        duplicate_fallback.fallback_agents[1].agent_id = "agent-1".to_owned();
+        assert!(duplicate_fallback.validate().is_err());
     }
 
     fn pin(

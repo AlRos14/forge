@@ -129,6 +129,8 @@ jobs:
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p db --lib v17
       - if: ${{ !cancelled() }}
+        run: cargo test --locked -p db --lib v180_
+      - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib validation_
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib gate_required_checks_

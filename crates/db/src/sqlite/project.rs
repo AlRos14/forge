@@ -367,6 +367,10 @@ impl ProjectRepo for SqliteDb {
             .await?;
 
         for statement in [
+            "DELETE FROM work_unit_fallback_receipt WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM micro_fix_receipt WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM task_external_feedback_disposition WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM pr_rework_supersession WHERE task_id IN

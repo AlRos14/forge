@@ -85,6 +85,18 @@ revisions open a coordination turn. Quality-linked WorkUnits complete
 technically when their Execution finishes, but a delivery correction is never
 resolved by that completion alone.
 
+Coordination envelope v2 also accepts explicit phase-3 preauthorizations for
+bounded micro-fixes, formal reviewers, per-TaskRole fallback Agents, and
+coordinator replanning. Unset fields remain absent from canonical serialization,
+so historical v1 digests stay stable. Pin validation requires fallback/reviewer
+Agents to be active members of the exact TaskRole under the Project owner's
+account and excludes the coordinator Agent from fallback chains. V180 persists
+immutable fallback and micro-fix receipts; a micro-fix bounds receipt can move
+once from `pending` to a terminal outcome. The coordinator-replan ledger remains
+the V172 record. These records and grants are the phase-3 foundation; the
+fallback dispatcher, micro-fix application, and replan classifier are separate
+runtime work.
+
 Each quality chain also has a persisted quality-routing budget (four for
 historical Tasks, sixteen by default for new Tasks).
 Review requests on one `work_unit_review_line` share the same route identity
@@ -195,7 +207,7 @@ A Gate is a deterministic policy over exact durable records. Its immutable GateE
 
 ## Persistence and history
 
-SQLite is the current persistence layer. Numbered migrations V001–V168 and their receipts remain in migration order; do not edit historical migration files. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add the Task coordination authorization, turn, plan, materialization, quality-request, intervention, team-staleness, and quality-resolution records described by the PR0 contract. V161 adds persisted quality-route counters, exact cycle evidence, and inspectable Human-escalation reasons; it preserves historical request states. V167 adds optional Project plan versions and proposals, source and Task identity provenance, batch authorization, delivery readiness, and fail-closed guards for incomplete imports and provider starts.
+SQLite is the current persistence layer. Numbered migrations V001–V180 and their receipts remain in migration order; do not edit historical migration files (V176 is unused because V177–V179 already exist). PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add the Task coordination authorization, turn, plan, materialization, quality-request, intervention, team-staleness, and quality-resolution records described by the PR0 contract. V161 adds persisted quality-route counters, exact cycle evidence, and inspectable Human-escalation reasons; it preserves historical request states. V167 adds optional Project plan versions and proposals, source and Task identity provenance, batch authorization, delivery readiness, and fail-closed guards for incomplete imports and provider starts. V180 adds immutable fallback and micro-fix receipts; the coordinator-replan ledger was added in V172.
 
 Historical `agent_session_history`, immutable Execution records, ProjectRelease snapshots, Artifact and Evidence references, HarnessSession identities, cross-record IDs, migration decisions, ADRs, and upstream license attribution remain readable history. History does not regain runtime authority. ProjectRelease is a read-only historical snapshot and does not create a current Charter, milestone, readiness workflow, or release operation.
 

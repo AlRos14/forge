@@ -3875,6 +3875,171 @@ enum_strings!(CoordinatorReplanClassification {
 /// Hard D6 limit: at most `MAX_COORDINATOR_REPLANS_PER_TASK` rows per Task.
 pub const MAX_COORDINATOR_REPLANS_PER_TASK: i64 = 2;
 
+/// Product bounds shared by envelope validation and micro-fix persistence.
+pub const MAX_MICRO_FIX_FILES: u32 = 3;
+pub const MAX_MICRO_FIX_CHANGED_LINES: u32 = 60;
+pub const MAX_MICRO_FIX_PER_TASK: i64 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostClass {
+    Economy,
+    Standard,
+    Premium,
+}
+
+enum_strings!(CostClass {
+    Economy => "economy",
+    Standard => "standard",
+    Premium => "premium",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicroFixSourceKind {
+    ReviewFindings,
+    ValidationFindings,
+    ExternalFeedback,
+}
+
+enum_strings!(MicroFixSourceKind {
+    ReviewFindings => "review_findings",
+    ValidationFindings => "validation_findings",
+    ExternalFeedback => "external_feedback",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicroFixBoundsOutcome {
+    Pending,
+    WithinBounds,
+    BoundsExceeded,
+}
+
+enum_strings!(MicroFixBoundsOutcome {
+    Pending => "pending",
+    WithinBounds => "within_bounds",
+    BoundsExceeded => "bounds_exceeded",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicroFixBoundsViolation {
+    PathsOutsideDeclared,
+    ForbiddenGlob,
+    TooManyFiles,
+    TooManyLines,
+    NewDependency,
+}
+
+enum_strings!(MicroFixBoundsViolation {
+    PathsOutsideDeclared => "paths_outside_declared",
+    ForbiddenGlob => "forbidden_glob",
+    TooManyFiles => "too_many_files",
+    TooManyLines => "too_many_lines",
+    NewDependency => "new_dependency",
+});
+
+/// Immutable record of one preauthorized cross-Agent WorkUnit allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkUnitFallbackReceipt {
+    pub id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub work_unit_version_before: i64,
+    pub work_unit_version_after: i64,
+    pub origin_execution_id: String,
+    pub failure_class: String,
+    pub route_attempts_digest: String,
+    pub task_role_id: String,
+    pub from_actor_kind: ActorKind,
+    pub from_actor_id: String,
+    pub to_actor_kind: ActorKind,
+    pub to_actor_id: String,
+    pub chain_index: i64,
+    pub cost_class: CostClass,
+    pub authorization_version: i64,
+    pub envelope_digest: String,
+    pub new_execution_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkUnitFallbackReceipt {
+    pub id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub work_unit_version_before: i64,
+    pub work_unit_version_after: i64,
+    pub origin_execution_id: String,
+    pub failure_class: String,
+    pub route_attempts_digest: String,
+    pub task_role_id: String,
+    pub from_actor_kind: ActorKind,
+    pub from_actor_id: String,
+    pub to_actor_kind: ActorKind,
+    pub to_actor_id: String,
+    pub chain_index: i64,
+    pub cost_class: CostClass,
+    pub authorization_version: i64,
+    pub envelope_digest: String,
+    pub new_execution_id: Option<String>,
+    pub created_at: String,
+}
+
+/// Micro-fix bounds evidence starts pending and receives one result advance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicroFixReceipt {
+    pub id: String,
+    pub task_id: String,
+    pub request_id: String,
+    pub source_kind: MicroFixSourceKind,
+    pub finding_refs_json: String,
+    pub declared_paths_json: String,
+    pub fix_work_unit_id: String,
+    pub reviewed_commit_sha: String,
+    pub result_commit_sha: Option<String>,
+    pub changed_files: Option<i64>,
+    pub changed_lines: Option<i64>,
+    pub bounds_outcome: MicroFixBoundsOutcome,
+    pub bounds_violation: Option<MicroFixBoundsViolation>,
+    pub reviewer_cost_class: Option<CostClass>,
+    pub reviewer_actor_kind: Option<ActorKind>,
+    pub reviewer_actor_id: Option<String>,
+    pub envelope_digest: String,
+    pub ordinal: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateMicroFixReceipt {
+    pub id: String,
+    pub task_id: String,
+    pub request_id: String,
+    pub source_kind: MicroFixSourceKind,
+    pub finding_refs_json: String,
+    pub declared_paths_json: String,
+    pub fix_work_unit_id: String,
+    pub reviewed_commit_sha: String,
+    pub reviewer_cost_class: Option<CostClass>,
+    pub reviewer_actor_kind: Option<ActorKind>,
+    pub reviewer_actor_id: Option<String>,
+    pub envelope_digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvanceMicroFixReceiptBounds {
+    pub id: String,
+    pub result_commit_sha: String,
+    pub changed_files: i64,
+    pub changed_lines: i64,
+    pub bounds_outcome: MicroFixBoundsOutcome,
+    pub bounds_violation: Option<MicroFixBoundsViolation>,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCoordinatorReplan {
     pub id: String,

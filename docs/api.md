@@ -299,6 +299,24 @@ are in [the PR0 contract](plans/pr0-task-coordination-contract.md).
 | `POST /tasks/{id}/coordination/quality-requests/{request_id}/resolve` | Resolve, cancel, or escalate one exact request using its version. |
 | `GET/POST /tasks/{id}/coordination/interventions` | Read or create one versioned Human/Copilot intervention. Kinds are `instruction`, `decision`, `pause`, `resume`, `cancel`, `revoke_authorization`, and `request_replan`. Project Copilot may record an instruction through this same circuit; it cannot request a replan, pause, cancel, revoke, approve, or decide. |
 
+Coordination authorization envelopes default to schema version 1. Version 2 may
+include `micro_fix: {enabled, max_files, max_changed_lines, max_per_task,
+extra_forbidden_globs}`, `micro_fix_reviewer: {task_role_id, agent_id,
+cost_class}`, `fallback_agents: [{task_role_id, agent_id, cost_class,
+max_wait_seconds}]`, and `allow_coordinator_replan`. Product maxima are 3 files,
+60 changed lines, and 3 micro-fixes per Task; fallback accepts at most three
+Agents per TaskRole and a wait of at most 86400 seconds. `cost_class` is
+`economy`, `standard`, or `premium`. Authorization validates that fallback and
+reviewer Agents are active members of the exact TaskRole and belong to the
+Project owner's account; the coordinator Agent cannot be in a fallback chain,
+and a micro-fix reviewer needs `formal_review` in an allowed review role.
+
+Unset v2 fields are omitted from serialization, preserving the historical
+canonical JSON and digest for envelopes that do not use these fields. The A5
+phase-3 slice records these preauthorizations and adds immutable fallback and
+micro-fix receipts; dispatcher, micro-fix application, and coordinator-replan
+runtime handling are supplied by later phase-3 lanes.
+
 After atomic materialization commits, ready assigned Agent repository scopes
 are prepared through the existing WorkUnit workspace service before launch.
 Preparation failures are returned in `launch_blockers`; the plan receipt and

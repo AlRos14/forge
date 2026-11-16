@@ -10,12 +10,23 @@ PR14 audit on 2026-10-16.
 
 ### Added
 
+- Coordination envelope v2 accepts bounded micro-fix, reviewer, fallback-Agent,
+  and coordinator-replan preauthorizations. V180 adds immutable fallback and
+  micro-fix receipts, including the one-step bounds outcome transition. The
+  dispatcher, micro-fix application, and coordinator-replan runtime remain in
+  later phase-3 lanes.
+
 - Project repository settings can connect and select GitHub SCM credentials and
   edit per-repository PR feedback policy. Task details show paginated PR
   feedback, same-PR rework status, and proposed provider actions for owner/admin
   decisions. Forge never offers a merge action.
 
 ### Breaking
+
+- Rust callers constructing `services::task_coordination::CoordinationEnvelope`
+  with exhaustive struct literals must initialize the phase-3 fields
+  `micro_fix`, `micro_fix_reviewer`, `fallback_agents`, and
+  `allow_coordinator_replan`.
 
 - PR feedback policy GET and PUT now return `{policy, updated_at}` instead of a
   bare policy. Clients should send the returned `updated_at` as

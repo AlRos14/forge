@@ -18,9 +18,9 @@ sus anexos; P3 queda **IMPLEMENTADO / NOT RUN** (Anexo P3). D1–D8 están
 **Actualización 2026-11-16 (D3'):** el spike PS dio **NO VIABLE** para D3 y el usuario
 eligió el diseño D3' (triage por disposición `extend_task|propose_task|human|dismiss`,
 rework en la misma PR vía pausa no destructiva `superseded_for_rework`). Contratos en
-«Congelado 11»; la migración de pausa/disposiciones es **V175** (nodo PX) y la de
-fase 3 se renumera a **V176**. Estado de lo anterior: sin cambios de código en esta
-actualización (solo plan).
+«Congelado 11»; la migración de pausa/disposiciones es **V175** (nodo PX). El bloque
+de fase 3 que se había congelado con el número V176 se implementa como **V180**:
+V177–V179 ya existen y V176 queda sin usar.
 
 Este plan continúa [autonomous-delivery-fluency.md](autonomous-delivery-fluency.md)
 (cerrado) y respeta sus contratos: coordinador read-only, la intención no es
@@ -317,8 +317,8 @@ reautorizando el pin en el envelope.
 
 **F-c. Fallback de perfil/proveedor preautorizado.** Hoy: fallback solo *dentro*
 del mismo Agent y cuenta (B12); `ExecutorUnavailable` bloquea la Task. Diseño:
-envelope gana `fallback_agents: [{ task_role_id, actor: {agent_id}, cost_class,
-max_wait_seconds }]` (≤ 3 por rol), que es a la vez la autorización y lo que la UI
+envelope gana `fallback_agents: [{ task_role_id, agent_id, cost_class,
+max_wait_seconds }]` (≤ 3 por rol; forma plana según Congelado 1), que es a la vez la autorización y lo que la UI
 muestra (incluida clase de coste: la presencia en el envelope es la preautorización
 explícita). Disparo: Execution de WorkUnit terminal con
 `failure_class=executor_unavailable` y route agotada (todos los
@@ -331,7 +331,7 @@ que el Agent sea miembro activo del mismo rol con las mismas capacidades, mismo
 dueño de cuenta (regla de admisión de `docs/architecture.md`), independencia de
 review preservada (`reviewer_is_independent`) y credencial disponible. Nueva
 Execution con `HarnessSession` nueva (no hay reanudación entre harnesses). Recibo
-inmutable `work_unit_fallback_receipt` (V176): execution origen, clase de fallo,
+inmutable `work_unit_fallback_receipt` (V180): execution origen, clase de fallo,
 digest de `route_attempts`, actor origen/destino, índice de cadena, digest del
 envelope. Nunca escala autoridad: no cambia rol, scope, workspace ni lease; no
 toca el equipo del coordinador; cadena agotada → bloqueo durable existente
@@ -380,8 +380,9 @@ implementa contra esta sección; un cambio aquí vuelve a N0 y exige nota en el
 registro de decisiones. Los nombres se verificaron contra el código del baseline
 `8d89573b` (sin colisiones: no existen hoy `human_decision`, `external_feedback`,
 `validation_check`, `pr_feedback`, `micro_fix`, `fallback_receipt` ni
-`CoordinatorReplan` en `crates/` ni `web/src`). Las migraciones reales se
-numeran al implementar; la reserva es V171–V176 (último actual V170; **V175** = pausa de PR + disposiciones de feedback (D3'), **V176** = fallback/micro-fix de fase 3).
+`CoordinatorReplan` en `crates/` ni `web/src`). La reserva original fue V171–V176;
+el orden efectivo llega a V180 porque V177–V179 ya existen: V175 es pausa de PR +
+disposiciones de feedback (D3'), V176 queda sin usar y A5 usa V180.
 
 ### Fases y puertas de CI
 
@@ -392,7 +393,7 @@ integrado de esa fase; no se traslada PASS entre fases.
 |---|---|---|
 | **1** | A1, A2, A4, C1, C2, C3, R1 (solo `request_validation` y `ask_human`), D1, RT (fase 1), API/UI/T para estos | Catálogo, `RequestValidation`, runner, baseline, comparación, Gate v2, check tras integración, `validation_findings`, decisión humana estructurada y reanudación. Sin GitHub. |
 | **2** | A3, P0, P1, PX, P2, P3 (+ PS cerrado por D3'; R1 `external_feedback`, RT/API/UI/T) | Credencial GitHub cifrada, cliente PR real, ingesta, triage por disposición (D3'), pausa de admisión y rework en la misma PR, push/comentario, Task de seguimiento propuesta. |
-| **3** | A5 (V176), M1, FB, R1 `micro_fix` y `propose_replan`, replan | Micro-fix, fallback cross-Agent, replan del coordinador. |
+| **3** | A5 (V180), M1, FB, R1 `micro_fix` y `propose_replan`, replan | Micro-fix, fallback cross-Agent, replan del coordinador. |
 
 **A2 (V172) añade en UNA sola reconstrucción todos los kinds y orígenes de las tres
 fases** (incluidos los de fase 2 y 3) para que ninguna fase posterior reconstruya
@@ -503,14 +504,14 @@ Ejemplo v2 (solo S1 activa):
 Códigos: `validation.check_not_authorized`, `validation.check_unknown`,
 `validation.check_stale_pin` (clave retirada o digest distinto).
 
-### Congelado 2 — Migraciones V171–V176 (V175: ver «Congelado 11»)
+### Congelado 2 — Migraciones V171–V180 (V175: ver «Congelado 11»; V176 queda libre)
 
-Reglas comunes: solo hacia delante; no se edita V001–V170; inmutabilidad por
+Reglas comunes: solo hacia delante; no se edita V001–V179; inmutabilidad por
 triggers `BEFORE UPDATE/DELETE` con excepción de `project_deletion_guard` (patrón
 V164 `task_review_triage_immutable*`); ids/timestamps por la aplicación
 (`new_uuid_v4`, `now_rfc3339`); cada migración con tabla temporal `_vNNN_check`
 si reconstruye (patrón V168). Las pruebas viven en `crates/db/src/tests.rs` con
-prefijo de función `v171_`…`v176_` (necesario para el filtro del workflow).
+prefijos `v171_`…`v175_` y `v180_` (necesarios para los filtros del workflow).
 
 **V171 (A1, fase 1)** — catálogo y checks (el DDL de abajo es el borrador congelado; la «Forma final implementada de V171» más abajo y `V171__validation_check_catalog.sql` prevalecen donde difieren):
 
@@ -904,7 +905,7 @@ autorización exacta y `resumes_request_id` igual al de `resume_binding_json`).
 
 **V175 (PX, fase 2, D3')**: especificada en «Congelado 11» §11.2 (`V175__pr_rework_pause_and_feedback_disposition.sql`).
 
-**V176 (A5, fase 3; renumerada desde V175 por D3')**:
+**V180 (A5, fase 3; bloque congelado originalmente como V176)**:
 
 ```sql
 CREATE TABLE work_unit_fallback_receipt (
@@ -1096,7 +1097,7 @@ Push: `PrExternalActionService::push_update` hace fast-forward del branch fuente
 
 ### Congelado 8 — Fallback y micro-fix (fase 3)
 
-Fallback (D7/D8): disparo, límites y recibo exactos como en F-c y V176; la cadena sale de `envelope.fallback_agents` (por `task_role_id`, en orden); `cost_class` visible en UI y en el recibo; **nunca** aplica al coordinador (su cambio exige reautorización de equipo/digest). `max_wait_seconds` se compara con `retry_at`. `start_uncertain` no dispara fallback.
+Fallback (D7/D8): disparo, límites y recibo exactos como en F-c y V180 (bloque congelado originalmente como V176); la cadena sale de `envelope.fallback_agents` (por `task_role_id`, en orden); `cost_class` visible en UI y en el recibo; **nunca** aplica al coordinador (su cambio exige reautorización de equipo/digest). `max_wait_seconds` se compara con `retry_at`. `start_uncertain` no dispara fallback.
 Micro-fix (D7): solo con `envelope.micro_fix.enabled`; `micro_fix_reviewer` opcional y preautorizado con `cost_class`; la revisión sigue siendo formal con Gate fresco. Límites constantes de producto: 3 archivos, 60 líneas, `max_per_task ≤ 3`; manifiestos y migraciones siempre prohibidos. Violación ⇒ `micro_fix.bounds_exceeded` (`bounds_violation` tipado) y vuelta al triage ordinario/humano.
 Replan (D6): requiere `envelope.allow_coordinator_replan`; ≤ 2 por Task (`task_coordinator_replan.ordinal`); origen `coordinator_replan`; **clasificador determinista** `classify_replan(plan, envelope, original) -> {within_envelope | scope_or_authority_change}` con hechos medibles en `classification_facts_json`: `objective_digest` igual, roles ⊆ equipo actual, actores ⊆ equipo actual, `work_units.len() ≤ max_work_units`, repos/paths ⊆ alcance original, sin flags nuevos de envelope. Cualquier hecho falso ⇒ `scope_or_authority_change` ⇒ `human_decision_request(source_kind='coordinator_replan')` con opciones `approve_replan|reject|revise_scope`; sin materialización hasta responder. `within_envelope` ⇒ continúa por el camino normal de aprobación de plan vigente.
 
@@ -1155,7 +1156,7 @@ Códigos de error (`ApiError::bad_request_with_code`/409 donde se indica):
 | P2 | 2 (D3') | `coordinator_outputs/external_feedback.rs`, `pr_feedback_followup.rs`; (cableado de turno solo vía RT) | V175, `pr_rework.rs` |
 | P3 | 2 (D3') | `pr_external_action.rs`, `pr_service.rs` y `pr_github_client.rs` (`find_open_pr_by_head`, reutilización en `publish_pr`, `PrReworkWatcher`) | V175, V177 |
 | PS | 2 | solo pruebas `pr_lifecycle_spike_*` (se actualizan en PX) | — |
-| A5, M1, FB | 3 | `V176__fallback_and_micro_fix_receipts.sql`, `sqlite/fallback_receipt.rs`, `task_rework/micro_fix.rs`, `task_dispatcher/fallback.rs`, `task_dispatcher.rs` (solo `mod fallback;`) | `work_unit_service.rs` |
+| A5, M1, FB | 3 | `V180__phase3_fallback_and_micro_fix_receipts.sql`, `sqlite/fallback_receipt.rs`, `task_rework/micro_fix.rs`, `task_dispatcher/fallback.rs`, `task_dispatcher.rs` (solo `mod fallback;`) | `work_unit_service.rs` |
 | API | por fase | `crates/api-types/src/{validation_catalog,human_decision,pr_feedback}.rs` + ampliaciones indicadas, `crates/api/src/routes/{validation_checks,human_decisions,pr_feedback}.rs`, `routes/mod.rs`, `lib.rs` (rutas), `mcp-server` tools, `forge-cli` solo si hay flags | tipos generados a mano |
 | UI | por fase | `web/src/components/task-detail/{task-human-decisions-panel,task-validation-checks-panel,task-pr-feedback-panel}.tsx`, ediciones de `task-coordination-panel.tsx`, `task-journey*.ts`, `web/src/locales/**` | `web/src/types/generated/` |
 | T | por fase | ver «Plan de pruebas» y «Nota de workflow» | — |
@@ -1521,7 +1522,7 @@ fase añade, en pasos nuevos con `if: ${{ !cancelled() }}`:
 
 - Fase 1: `cargo test --locked -p db --lib v171_ v172_ v174_` (libtest admite varios filtros; un paso por crate/target), `cargo test --locked -p services --lib validation_catalog`, `... validation_check_runner`, `... human_decision`, `... coordinator_outputs`, `... validation_post_integration`, `cargo test --locked -p api --test coordinator_verification_pr_loop` (añadido a la lista `--test` del paso final de `api`), y los tests de `gate_engine_api` (`--test gate_engine_api` si no figura ya en la lista).
 - Fase 2: `-p db --lib v173_ v175_`, `-p services --lib pr_github_client`, `pr_feedback`, `pr_external_action`, `pr_rework_`, `pr_feedback_followup`, `-p api --test coordinator_verification_pr_loop` y `-p mcp-server --lib mcp_pr_feedback_`.
-- Fase 3: `-p db --lib v176_`, `-p services --lib fallback`, `micro_fix`.
+- Fase 3: `-p db --lib v180_`, `-p services --lib fallback`, `micro_fix`.
 - El job de clippy ya cubre `services db cli-adapters api api-types mcp-server executors`; no cambia. `pnpm lint/test` y el browser smoke ya incluyen los tests web nuevos si siguen el patrón `*.test.ts(x)`.
 - Todo test nuevo debe tener prefijo/nombre que coincida con su filtro; T lo verifica contra la lista del workflow.
 
@@ -1539,7 +1540,7 @@ flowchart LR
   N0 --> A2[A2 V172 kinds/origenes de request]
   N0 --> A3[A3 V173 feedback PR + operaciones]
   N0 --> A4[A4 V174 decisiones humanas]
-  N0 --> A5[A5 V176 fallback + micro-fix receipts]
+  N0 --> A5[A5 V180 fallback + micro-fix receipts]
   A3 --> PX[PX V175 pausa de PR + disposiciones + lifecycle]
   A1 --> C1[C1 Catálogo + núcleo de run]
   C1 --> C2[C2 Runner + baseline + comparación]
@@ -1583,7 +1584,7 @@ flowchart LR
 
 | Carril | Nodos | Paths propios (exclusivos) | Puede ir en paralelo con |
 |---|---|---|---|
-| L1 Persistencia | A1–A5, PX | `crates/db/migrations/V171..V176__*.sql`, `crates/db/src/models.rs` (secciones nuevas), `crates/db/src/sqlite/{validation_run,task_coordination,pr_metadata,pr_provider_config,task_integration_operation}.rs`, repos nuevos `human_decision.rs`, `external_feedback.rs`, `validation_catalog.rs` | Todos tras N0 (solo contrato) |
+| L1 Persistencia | A1–A5, PX | `crates/db/migrations/V171..V175__*.sql`, `V180__*.sql`, `crates/db/src/models.rs` (secciones nuevas), `crates/db/src/sqlite/{validation_run,task_coordination,pr_metadata,pr_provider_config,task_integration_operation}.rs`, repos nuevos `human_decision.rs`, `external_feedback.rs`, `validation_catalog.rs`, `fallback_receipt.rs` | Todos tras N0 (solo contrato) |
 | L2 Verificación | C1–C3 | `crates/services/src/validation_service.rs`, nuevos `validation_catalog.rs`, `validation_check_runner.rs`, `gate_engine.rs` (solo secciones de política v2) | L3 PR, L5 fallback, L6 UI sobre fixtures |
 | L3 PR | P0–P3, PX, PS | `crates/services/src/pr_service.rs`, nuevos `pr_feedback.rs`, `pr_github_client.rs`, `pr_rework.rs`, `pr_feedback_followup.rs`, `task_integration_operation.rs` (op. nuevas), `task_lifecycle.rs` (solo causa tipada) | L2, L5 |
 | L4 Coordinación | R1, D1, M1, RT | nuevos `crates/services/src/coordinator_outputs/{validation_request,micro_fix,ask_human,propose_replan,external_feedback}.rs`, `human_decision_service.rs`, `task_rework.rs`/`task_rework/` (micro-fix); **solo RT** edita `orchestrator_runtime.rs` y `task_coordination.rs`, en serie y una vez, tras R1/D1/M1/C2/P2 | R1/D1/M1 en paralelo entre sí |
@@ -1602,12 +1603,12 @@ Cualquier cambio de contrato vuelve a N0.
 
 | Nodo | Trabajo y criterio DONE | Depende | Archivos | Estado |
 |---|---|---|---|---|
-| N0 | Congelar: formas del catálogo, envelope v2 (`validation_checks`, `micro_fix`, `micro_fix_reviewer`, `fallback_agents`, `allow_coordinator_replan`), kinds nuevos (`validation_findings`, `external_feedback`, `human_decision_resume`), orígenes batch nuevos (`validation_triage`, `external_feedback_triage`, `human_decision_resume`, `coordinator_replan`), DTOs, códigos de error, eventos SSE, política de feedback, credencial GitHub, numeración V171–V176, fases y ownership. D1–D8 resueltas con el usuario. | — | Este plan («Contratos congelados (N0)») | **DONE (estático)** |
+| N0 | Congelar: formas del catálogo, envelope v2 (`validation_checks`, `micro_fix`, `micro_fix_reviewer`, `fallback_agents`, `allow_coordinator_replan`), kinds nuevos (`validation_findings`, `external_feedback`, `human_decision_resume`), orígenes batch nuevos (`validation_triage`, `external_feedback_triage`, `human_decision_resume`, `coordinator_replan`), DTOs, códigos de error, eventos SSE, política de feedback, credencial GitHub, numeración V171–V180 (V176 libre; V177–V179 existentes), fases y ownership. D1–D8 resueltas con el usuario. | — | Este plan («Contratos congelados (N0)») | **DONE (estático)** |
 | A1 | (Fase 1) V171: `validation_check_definition`, `validation_check_request`, `validation_comparison`; columnas aditivas de `validation_run`; triggers de inmutabilidad y de identidad; preservación de filas históricas. | N0 | `crates/db/migrations/V171__*.sql`, db repos | **IMPLEMENTADO / NOT RUN** (ver Anexo A1/A2/A4) |
 | A2 | (Fase 1) V172: **una sola** reconstrucción de `task_coordination_request` (patrón V168) que añade kinds y orígenes nuevos, revisando guards V167 de batch y vistas de autoridad vigentes. | N0 | `V172__*.sql`, `crates/db` | **IMPLEMENTADO / NOT RUN** (ver Anexo A1/A2/A4) |
 | A3 | (Fase 2) V173: referencia de credencial, `feedback_policy_json`/digest en config y admisión, `external_feedback_item`, `task_external_feedback_triage`, `pr_external_action` (sin reconstruir `task_integration_operation`; triggers V112/V116 revisados), guarda agent_profile↔github. | N0 | `V173__*.sql` | **IMPLEMENTADO / NOT RUN** (ver Anexo A3) |
 | A4 | (Fase 1) V174: `human_decision_request` + guards de versión/estado/evidencia. | N0 | `V174__human_decision_request.sql` | **IMPLEMENTADO / NOT RUN** (ver Anexo A1/A2/A4) |
-| A5 | (Fase 3) V176 (renumerada desde V175 por D3'): `work_unit_fallback_receipt`, `micro_fix_receipt`. | N0 | `V176__*.sql` | **TODO** |
+| A5 | (Fase 3) V180 (bloque congelado originalmente como V176): `work_unit_fallback_receipt`, `micro_fix_receipt`; `task_coordinator_replan` ya existe en V172. | N0 | `V180__phase3_fallback_and_micro_fix_receipts.sql`, modelos/repos DB, envelope v2 | **IMPLEMENTADO / NOT RUN** (ver Anexo A5) |
 | C1 | Servicio de catálogo (escritura owner/admin), validación de pins del envelope, extracción del núcleo de `run_command` con identidad de catálogo sin alterar el camino legacy. | A1 | `validation_service.rs`, `validation_catalog.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo C1–C3) |
 | C2 | (Fase 1) `ValidationCheckRunner` (cola, claim, lease-free guard, lock de workspace), workspace de verificación en commit base, comparación determinista (baseline **incluido en v1**, D1). Decisión del lead (C2): el baseline es un worktree git desacoplado propiedad del runner, **sin fila `workspace` ni `workspace_scope`**; la fila `validation_comparison` guarda commit base, digest de snapshot y procedencia local, y el worktree se limpia tras la ejecución (ver «Decisiones del lead posteriores a N0»). | C1 | `validation_check_runner.rs`, `workspace` crate (solo uso), `workspace_cleanup.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo C1–C3) |
 | C3 | (Fase 1) Gate policy schema v2 `required_checks` con resolución por clave exacta (D2 resuelta); trigger post-integración; sin cambiar v1. | C2 | `gate_engine.rs`, `validation_post_integration.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo C1–C3) |
@@ -1668,7 +1669,7 @@ deterministas, no aceptación con proveedor real.
 
 | Caso | Evidencia mínima | Archivo propuesto |
 |---|---|---|
-| Migraciones V171–V176 | Conservan todos los estados históricos y FKs; V172 preserva requests existentes (`work_unit_plan`, `review_findings`); `validation_run` históricos reciben `run_origin='legacy_command'`; triggers de inmutabilidad | `crates/db/src/tests.rs` |
+| Migraciones V171–V180 | Conservan todos los estados históricos y FKs; V172 preserva requests existentes (`work_unit_plan`, `review_findings`); `validation_run` históricos reciben `run_origin='legacy_command'`; triggers de inmutabilidad | `crates/db/src/tests.rs` |
 | Catálogo | Versiones inmutables; no-owner rechazado; pin desactualizado o clave ausente rechazado en `authorize`; envelope histórico sin campos nuevos conserva digest | `task_coordination.rs` tests, `crates/api/tests/coordinator_verification_pr_loop.rs` |
 | `RequestValidation` | Check no autorizado → `validation.check_not_authorized`; sujeto con lease activo rechazado; replay idempotente no duplica run ni cargo de presupuesto; coordinador no puede indicar comando/ruta/commit | `orchestrator_runtime/tests/` |
 | Run exacto y Stale | Run de catálogo sobre snapshot exacto; cambio de HEAD/snapshot durante la ejecución → `Stale`; timeout → `Error`; bound de tails | `task_service/tests/service_tests/cases/validation.rs` |
@@ -1753,7 +1754,8 @@ deterministas, no aceptación con proveedor real.
   El coordinador publica además un `post_comment` de resumen (D5, marcador anti-bucle).
   Convergencia: PR fusionada durante la pausa ⇒ registro + decisión humana; cerrada ⇒
   la Task continúa y la siguiente admisión crea PR nueva o pregunta. Contratos en
-  «Congelado 11»; migración V175; fase 3 renumerada a V176.
+  «Congelado 11»; migración V175; en esa versión del plan fase 3 estaba
+  numerada V176; se implementa como V180 porque V177–V179 ya existen.
   Pregunta abierta O1: no existe arista `Active→Done` sin merge Forge; el merge
   externo durante la pausa deja la Task `Blocked(pr_merged_externally)` hasta que el
   usuario decida si se añade esa arista.
@@ -1866,7 +1868,8 @@ idempotencia, Proposal/Decision exactas, teardown).
 
 **Numeración:** `run_migrations` aplica por versión no registrada (`is_applied`), así que
 V173 se aplica también sobre una BD ya migrada a V174. **No** se renumera V173. La
-fase 3 pasa de V175 a **V176** porque V175 es ahora la pausa de PR (D3', nodo PX).
+en ese momento fase 3 pasaba de V175 a **V176** porque V175 era la pausa de PR
+(D3', nodo PX); la decisión de numeración efectiva al cierre CI fase 2 es V180.
 
 **Forma implementada (autoritativo: `V173__pr_feedback_and_credential.sql`):**
 - `pr_provider_config`: `credential_handle_id`, `credential_owner_user_id` (FK RESTRICT),
@@ -2012,8 +2015,8 @@ workflow en el nodo I). `cargo fmt --all` y `git diff --check` limpios.
   `(key, trigger)`, un digest distinto por clave y slug/digest inválidos. Nuevo
   `validate_pins(&EnvelopePinContext{db, project_id, repo_id})`, llamado desde
   `authorize_inner` (una llamada tras `validate()`; el cableado de turnos sigue siendo de RT).
-  Solo se añadió `validation_checks`; `micro_fix`, `micro_fix_reviewer`, `fallback_agents` y
-  `allow_coordinator_replan` son de fase 3 y `deny_unknown_fields` los rechaza hasta entonces.
+  En C1 solo se añadió `validation_checks`; A5 añadió los grants fase 3 y su
+  `validate_phase_three_pins(&EnvelopePhaseThreePinContext{db, project_id, task_id, coordinator_actor})`.
 - Núcleo extraído: `ValidationService::run_check_core(CheckRunInput)` (pub(crate)).
   `run_command` valida, toma el lock y delega con `catalog: None`; su identidad
   (`ci:{index}:{digest}`, `config_summary_json`, evidencia `check:{index}`, eventos) es la
@@ -2251,7 +2254,7 @@ comportamiento actual y están pendientes de CI.
 
 ### Veredicto: **NO VIABLE con el esquema/lifecycle actuales** (D3: se detiene y se pregunta al usuario)
 
-> **Resolución (2026-11-16):** el usuario eligió la opción 1 ampliada como **D3'** (ver «Congelado 11»). Este anexo se conserva como evidencia del análisis; sus pruebas `pr_lifecycle_spike_*` fijan el comportamiento previo y las actualiza el nodo PX. Matices respecto a la opción 1 original: el terminal de pausa se modela con columnas aditivas y un recibo (`pr_rework_supersession`), TaskMerge `abandoned`, **sin** reconstruir `remote_pr_admission`/`remote_pr_history`; la numeración es V175 (pausa) y V176 (fase 3).
+> **Resolución (2026-11-16):** el usuario eligió la opción 1 ampliada como **D3'** (ver «Congelado 11»). Este anexo se conserva como evidencia del análisis; sus pruebas `pr_lifecycle_spike_*` fijan el comportamiento previo y las actualiza el nodo PX. Matices respecto a la opción 1 original: el terminal de pausa se modela con columnas aditivas y un recibo (`pr_rework_supersession`), TaskMerge `abandoned`, **sin** reconstruir `remote_pr_admission`/`remote_pr_history`; la numeración efectiva es V175 (pausa) y V180 (fase 3; V176 queda libre porque V177–V179 ya existen).
 
 La transición `Merging → Blocked(reason pr_feedback)` con TaskMerge `running`+`remote_waiting` es
 imposible por **tres** barreras independientes, y aunque se levantara la primera, el rework y la
@@ -2570,3 +2573,74 @@ la validación prevista.
   no V176, porque V177–V179 ya existen; V176 queda sin usar. El runner aplica
   por versión, pero mantener el orden monotónico evita divergencias entre bases
   nuevas y actualizadas.
+
+### Anexo A5 (fase 3) — recibos y envelope v2 (IMPLEMENTADO / NOT RUN)
+
+Alcance implementado en este nodo: V180 añade los recibos append-only de fallback
+y micro-fix; la capa DB expone sus modelos y repositorios; el envelope v2 acepta y
+valida las preautorizaciones fase 3 manteniendo idénticos el JSON canónico y el
+digest cuando los campos nuevos están ausentes. `task_coordinator_replan` y su repo
+ya existen en V172 y no se reconstruyen. El dispatcher FB, la aplicación M1 del
+micro-fix y sus bounds sobre diff, las salidas R1 y el clasificador/runtime de
+replan siguen siendo trabajo de sus carriles.
+
+**Migración y pruebas DB.** `V180__phase3_fallback_and_micro_fix_receipts.sql`
+crea `work_unit_fallback_receipt` y `micro_fix_receipt`, con guards de autoridad,
+inmutabilidad y excepción de borrado solo durante `project_deletion_guard`.
+`MicroFixReceiptRepo::advance_micro_fix_receipt_bounds` permite únicamente
+`pending → within_bounds|bounds_exceeded`; la clave única limita cada ejecución
+origen a un recibo de fallback. `crates/db/src/tests/v180.rs` añade pruebas
+`v180_*` para inmutabilidad, unicidad y avance terminal único. El filtro de CI es
+`cargo test --locked -p db --lib v180_` en `.github/workflows/build-local-linux.yml`.
+
+**Envelope y compatibilidad.** `services::task_coordination::CoordinationEnvelope`
+expone los campos `micro_fix: Option<EnvelopeMicroFix>`,
+`micro_fix_reviewer: Option<EnvelopeProfileGrant>`,
+`fallback_agents: Vec<EnvelopeFallbackAgent>` y
+`allow_coordinator_replan: bool`. `EnvelopeMicroFix` usa las constantes DB
+`MAX_MICRO_FIX_FILES` (3), `MAX_MICRO_FIX_CHANGED_LINES` (60) y
+`MAX_MICRO_FIX_PER_TASK` (3); fallback admite hasta tres Agents por TaskRole,
+rechaza duplicados y espera mayor de 86400 segundos. `CostClass` (`economy`,
+`standard`, `premium`) queda en el JSON del envelope para visibilidad. El pin
+asíncrono `CoordinationEnvelope::validate_phase_three_pins` con
+`EnvelopePhaseThreePinContext` exige Task exacta para grants, Agents existentes
+en membresía activa del TaskRole y cuenta del owner canónico del Project,
+reviewer formal en un rol permitido y exclusión del Agent coordinador de la
+cadena fallback. `CoordinationEnvelope::validate_pins` conserva la validación
+de pins del catálogo con su contexto existente. Los cuatro campos nuevos usan defaults y
+`skip_serializing_if`; la prueba de golden también fija el SHA-256 del JSON v1
+histórico.
+
+**API DB que deben usar los siguientes carriles.**
+
+- **FB fallback dispatcher:** `db::WorkUnitFallbackReceiptRepo` con
+  `create_work_unit_fallback_receipt(CreateWorkUnitFallbackReceipt)`,
+  `get_work_unit_fallback_receipt_by_origin_execution(&str)` y
+  `list_work_unit_fallback_receipts_by_work_unit(&str)`. El recibo usa
+  `WorkUnitFallbackReceipt`; el coste es `CostClass`. La lógica FB debe comprobar
+  route exhaustion y excluir `start_uncertain` antes de reasignar y crear el
+  recibo, con la misma cadena/TaskRole/envelope.
+- **M1 micro-fix:** `db::MicroFixReceiptRepo` con
+  `create_micro_fix_receipt(CreateMicroFixReceipt)`,
+  `advance_micro_fix_receipt_bounds(AdvanceMicroFixReceiptBounds)`,
+  `get_micro_fix_receipt(&str)` y `list_micro_fix_receipts_by_task(&str)`.
+  Modelos de resultado: `MicroFixReceipt`, `MicroFixBoundsOutcome` y
+  `MicroFixBoundsViolation`. La creación asigna `ordinal` bajo `BEGIN IMMEDIATE`
+  y hace cumplir el máximo producto; la transición de bounds es una sola vez.
+  `MicroFixSourceKind` coincide con `review_findings`, `validation_findings` y
+  `external_feedback`.
+- **M1/R1 replan:** reusar `db::TaskCoordinatorReplanRepo` de V172:
+  `create_coordinator_replan(CreateCoordinatorReplan)`,
+  `transition_coordinator_replan(TransitionCoordinatorReplan)`,
+  `get_coordinator_replan(&str)` y
+  `list_coordinator_replans_by_task(&str)`, sobre
+  `TaskCoordinatorReplan`/`CoordinatorReplanClassification`. Replan sigue
+  requiriendo `CoordinationEnvelope::allow_coordinator_replan`; el clasificador
+  `classify_replan(plan, envelope, original)` y la propuesta `propose_replan`
+  aún no forman parte de A5.
+
+**Estado de validación:** **IMPLEMENTADO / NOT RUN**. En esta sesión no se
+ejecutaron Cargo build/test/clippy ni pnpm; sí se ejecutó `cargo fmt --all`.
+La verificación local también aplicó en orden todas las migraciones a SQLite
+`:memory:` con Python 3 y ejecutó `git diff --check`; CI de GitHub sigue siendo
+la validación de compilación y pruebas.
