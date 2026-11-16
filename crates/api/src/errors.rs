@@ -498,6 +498,10 @@ impl From<DbError> for ApiError {
                 message: "repository cannot be deleted while Tasks reference it".to_owned(),
                 details: None,
             },
+            DbError::ProjectAlreadyHasPrimaryRepo => Self::conflict_with_code(
+                "project_already_has_primary_repo",
+                "Project already has a primary repository",
+            ),
             DbError::ProjectHasReleases => Self {
                 status: StatusCode::CONFLICT,
                 code: "project_has_releases",

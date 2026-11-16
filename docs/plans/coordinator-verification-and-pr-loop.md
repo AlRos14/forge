@@ -2487,16 +2487,23 @@ Implementación contra «Congelado 6», «Congelado 7», «Congelado 9» y
 `GET /tasks/{id}/pr-feedback`, `/pr-rework` y `/pr-actions`, y las decisiones
 humanas `POST /tasks/{id}/pr-actions/{action_id}/approve|reject`. Los listados
 devuelven `items` y cursor opaco. Las decisiones validan `expected_version` y
-delegan la Proposal/Decision exacta a `PrExternalActionService`.
+delegan la Proposal/Decision exacta a `PrExternalActionService`; el servicio
+lleva esa versión hasta el UPDATE compare-and-set para que una transición
+concurrente entre la lectura HTTP y la escritura devuelva
+`409 pr_action.version_conflict`.
 
 Credenciales SCM: `POST /providers` acepta `github` vía
 `CredentialService::connect_scm_credential`; `GET /providers?purpose=scm` lista
-solo handles SCM. `PATCH /repos/{id}` enlaza o limpia `credential_id` mediante
-`PrProviderSettingsService::set_credential`; `PrProviderStatus.has_credential`
-reemplaza `has_token`. `token` y `token_secret_ref` dan
+solo handles SCM. Tanto `POST /projects/{id}/repos` como `PATCH /repos/{id}`
+enlazan o limpian `credential_id`; la creación escribe Repo, provider config,
+handle y primary-Repo selection en una transacción. `PrProviderStatus` informa
+`has_credential`, `credential_handle_id` y `credential_label`, nunca el secreto.
+`token` y `token_secret_ref` dan
 `400 repo.pr_provider_token_retired`. La política usa
 `PrProviderSettingsService::set_feedback_policy`; handles ajenos son rechazados
-por la autoridad existente.
+por la autoridad existente. `GET/PUT /repos/{id}/pr-feedback-policy` devuelven
+`{policy, updated_at}` y comparan `expected_updated_at` en la escritura SQL; un
+timestamp obsoleto devuelve `409 pr_feedback.policy_version_conflict`.
 
 Lecturas y proyecciones: REST pagina por keyset `(created_at,id)` para rework y
 acciones y `(ingested_at,id)` para feedback; MCP reutiliza
@@ -2519,28 +2526,30 @@ siguen el formato ts-rs. `docs/api.md` y CHANGELOG Unreleased documentan el
 contrato y la ruptura de token. Tests añadidos/actualizados: API
 `coordinator_verification_pr_loop`, `pr12_public_surface` y `repos_endpoints`;
 MCP `mcp_pr_feedback_`; el workflow los recoge. La prueba API de conflicto de
-versión usa una fila sintética para comprobar el preflight HTTP 409; no prueba
-una carrera entre el preflight y la transición del servicio. CI debe validar
-build, formatos ts-rs y tests antes de aceptación.
+versión conserva el caso HTTP 409 y los tests de servicio fuerzan una transición
+posterior a la versión leída para verificar el rechazo de la versión obsoleta.
+El test del servicio de política hace dos escrituras con el mismo timestamp de
+origen y verifica que la segunda se rechaza. CI debe validar build, formatos
+ts-rs y tests antes de aceptación.
 
 ## Anexo UI (fase 2) — web (IMPLEMENTADO / NOT RUN)
 
 La UI web usa los tipos generados actuales. `RepoForm` lista handles SCM,
 conecta credenciales GitHub con `POST /providers` y las referencia por
-`credential_id`; `ReposTab` muestra `has_credential` y edita la política para
-owner/admin. La creación envía primero el Repo y después hace `PATCH` para
-asociar el handle, porque `CreateRepoRequest` no acepta `credential_id`. Task
-detail incorpora feedback y rework paginados y acciones PR con aprobación o
+`credential_id`; `ReposTab` preselecciona el handle actual por su ID/label,
+muestra `has_credential` y edita la política para owner/admin. La creación
+envía el `credential_id` en `CreateRepoRequest` junto con el provider config.
+Task detail incorpora feedback y rework paginados y acciones PR con aprobación o
 rechazo humanos; SSE invalida esas proyecciones. Tests añadidos:
 `RepoForm.test.tsx`, `RepoPrFeedbackPolicyEditor.test.tsx`,
-`task-pr-feedback-panel.test.tsx`, `task-pr-actions-panel.test.tsx` y el caso PR
+`project-settings-utils.test.ts`, `task-pr-feedback-panel.test.tsx`,
+`task-pr-actions-panel.test.tsx` y el caso PR
 de `sse.test.ts`. No se ejecutaron pnpm ni Cargo; CI es la validación prevista.
 
-Limitación API: `GET /repos/{id}/pr-feedback-policy` devuelve solo
-`PrFeedbackPolicy`, sin el `updated_at` que acepta `expected_updated_at`. La UI
-envía el campo nullable como `null` y ofrece recarga ante
-`pr_feedback.policy_version_conflict`, pero no puede enviar una precondición de
-versión hasta que la API exponga ese timestamp. `RepoResponse` tampoco expone el
-`credential_id`; al editar se preserva el handle actual y se muestra su estado,
-pero no puede preseleccionarse su etiqueta. La creación usa un `PATCH` adicional
-porque `CreateRepoRequest` no acepta `credential_id`.
+`GET/PUT /repos/{id}/pr-feedback-policy` devuelve la policy junto con
+`updated_at`; el editor manda ese timestamp y puede recargar cuando recibe
+`pr_feedback.policy_version_conflict`. `RepoResponse` expone el handle
+referenciado y su etiqueta sin exponer el secreto, de modo que el selector
+muestra el handle actual. API, frontend y service tests se actualizaron para
+estos contratos. Las validaciones locales Cargo y pnpm no se ejecutaron; CI es
+la validación prevista.

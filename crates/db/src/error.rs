@@ -13,6 +13,9 @@ pub enum DbError {
     #[error("repository has associated tasks")]
     RepoInUse,
 
+    #[error("Project already has a primary repository")]
+    ProjectAlreadyHasPrimaryRepo,
+
     #[error("Project has immutable Releases")]
     ProjectHasReleases,
 

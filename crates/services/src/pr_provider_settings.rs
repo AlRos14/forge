@@ -74,6 +74,7 @@ impl PrProviderSettingsService {
         &self,
         actor_user_id: &str,
         repo_id: &str,
+        expected_updated_at: Option<&str>,
         policy: PrFeedbackPolicy,
     ) -> Result<PrProviderConfig> {
         let policy = validate_policy(policy)?;
@@ -81,6 +82,7 @@ impl PrProviderSettingsService {
         Ok(PrProviderConfigRepo::set_feedback_policy(
             &*self.db,
             &config.id,
+            expected_updated_at,
             &policy.to_json(),
             &now_rfc3339(),
         )
@@ -187,6 +189,8 @@ mod tests {
                 base_url: None,
                 polling_interval_seconds: 60,
                 token_secret_ref: None,
+                credential_handle_id: None,
+                credential_owner_user_id: None,
                 created_at: now_rfc3339(),
                 updated_at: now_rfc3339(),
             },
@@ -328,6 +332,10 @@ mod tests {
     #[tokio::test]
     async fn scm_credential_feedback_policy_is_validated_and_admin_only() {
         let s = setup().await;
+        let initial = PrProviderConfigRepo::get_by_repo_id(&*s.db, &s.repo_id)
+            .await
+            .expect("load initial provider config")
+            .expect("provider config exists");
         let mut policy = PrFeedbackPolicy {
             ingest: true,
             trusted_logins: vec![" Alice ".to_owned(), "alice".to_owned(), "bob".to_owned()],
@@ -336,9 +344,26 @@ mod tests {
         };
         let config = s
             .settings
-            .set_feedback_policy(&s.owner, &s.repo_id, policy.clone())
+            .set_feedback_policy(
+                &s.owner,
+                &s.repo_id,
+                Some(&initial.updated_at),
+                policy.clone(),
+            )
             .await
             .expect("valid policy");
+        assert_ne!(config.updated_at, initial.updated_at);
+        assert!(matches!(
+            s.settings
+                .set_feedback_policy(
+                    &s.owner,
+                    &s.repo_id,
+                    Some(&initial.updated_at),
+                    PrFeedbackPolicy::default(),
+                )
+                .await,
+            Err(ServiceError::Db(db::DbError::VersionConflict))
+        ));
         let stored = PrFeedbackPolicy::from_json(&config.feedback_policy_json).expect("json");
         assert!(stored.ingest);
         assert_eq!(stored.trusted_logins, vec!["Alice", "bob"]);
@@ -346,30 +371,30 @@ mod tests {
 
         policy.max_items_per_poll = 0;
         s.settings
-            .set_feedback_policy(&s.owner, &s.repo_id, policy.clone())
+            .set_feedback_policy(&s.owner, &s.repo_id, None, policy.clone())
             .await
             .expect_err("cap below 1");
         policy.max_items_per_poll = 101;
         s.settings
-            .set_feedback_policy(&s.owner, &s.repo_id, policy.clone())
+            .set_feedback_policy(&s.owner, &s.repo_id, None, policy.clone())
             .await
             .expect_err("cap above 100");
         policy.max_items_per_poll = 10;
         policy.trusted_author_associations = vec!["STRANGER".to_owned()];
         s.settings
-            .set_feedback_policy(&s.owner, &s.repo_id, policy.clone())
+            .set_feedback_policy(&s.owner, &s.repo_id, None, policy.clone())
             .await
             .expect_err("unknown association");
         policy.trusted_author_associations = Vec::new();
         policy.trusted_logins = (0..33).map(|i| format!("user{i}")).collect();
         s.settings
-            .set_feedback_policy(&s.owner, &s.repo_id, policy)
+            .set_feedback_policy(&s.owner, &s.repo_id, None, policy)
             .await
             .expect_err("too many trusted logins");
 
         let member = second_user(&s, Some("member")).await;
         s.settings
-            .set_feedback_policy(&member, &s.repo_id, PrFeedbackPolicy::default())
+            .set_feedback_policy(&member, &s.repo_id, None, PrFeedbackPolicy::default())
             .await
             .expect_err("members cannot change the policy");
     }

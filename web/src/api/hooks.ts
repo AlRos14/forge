@@ -128,7 +128,7 @@ import type {
   PrExternalActionListResponse,
   PrExternalActionResponse,
   DecidePrExternalActionRequest,
-  PrFeedbackPolicy,
+  PrFeedbackPolicyResponse,
   UpdatePrFeedbackPolicyRequest,
 } from '@/types/generated'
 import { recordUserInitiatedTransition } from '@/lib/notification-toast-suppression'
@@ -878,7 +878,7 @@ export function useDecidePrExternalAction() {
 export function useRepoPrFeedbackPolicyQuery(repoId: string, enabled = true) {
   return useQuery({
     queryKey: qk.repoPrFeedbackPolicy(repoId),
-    queryFn: () => apiFetch<PrFeedbackPolicy>(`/repos/${repoId}/pr-feedback-policy`),
+    queryFn: () => apiFetch<PrFeedbackPolicyResponse>(`/repos/${repoId}/pr-feedback-policy`),
     enabled: Boolean(repoId) && enabled,
   })
 }
@@ -893,7 +893,7 @@ export function useUpdateRepoPrFeedbackPolicy() {
       repoId: string
       body: UpdatePrFeedbackPolicyRequest
     }) =>
-      apiFetch<PrFeedbackPolicy>(`/repos/${repoId}/pr-feedback-policy`, {
+      apiFetch<PrFeedbackPolicyResponse>(`/repos/${repoId}/pr-feedback-policy`, {
         method: 'PUT',
         body: JSON.stringify(body),
       }),

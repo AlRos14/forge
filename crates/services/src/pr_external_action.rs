@@ -81,9 +81,7 @@ fn map_db(error: DbError) -> ServiceError {
             CODE_NOT_AUTHORIZED,
             "the exact admission, frozen policy, Gate evaluation or Decision does not authorize this action",
         ),
-        DbError::VersionConflict => {
-            ServiceError::conflict("the PR external action changed concurrently")
-        }
+        DbError::VersionConflict => ServiceError::Db(DbError::VersionConflict),
         other => other.into(),
     }
 }
@@ -363,11 +361,13 @@ impl PrExternalActionService {
         &self,
         action_id: &str,
         actor_user_id: &str,
+        expected_version: i64,
         rationale: Option<String>,
     ) -> Result<PrExternalAction> {
         self.decide(
             action_id,
             actor_user_id,
+            expected_version,
             DecisionOutcome::Approve,
             rationale,
         )
@@ -381,16 +381,24 @@ impl PrExternalActionService {
         &self,
         action_id: &str,
         actor_user_id: &str,
+        expected_version: i64,
         rationale: Option<String>,
     ) -> Result<PrExternalAction> {
-        self.decide(action_id, actor_user_id, DecisionOutcome::Reject, rationale)
-            .await
+        self.decide(
+            action_id,
+            actor_user_id,
+            expected_version,
+            DecisionOutcome::Reject,
+            rationale,
+        )
+        .await
     }
 
     async fn decide(
         &self,
         action_id: &str,
         actor_user_id: &str,
+        expected_version: i64,
         outcome: DecisionOutcome,
         rationale: Option<String>,
     ) -> Result<PrExternalAction> {
@@ -406,6 +414,9 @@ impl PrExternalActionService {
         let action = PrExternalActionRepo::get_pr_external_action(&*self.db, action_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("pr external action", action_id.to_owned()))?;
+        if action.version != expected_version {
+            return Err(DbError::VersionConflict.into());
+        }
         let task = TaskRepo::get_by_id(&*self.db, &action.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", action.task_id.clone()))?;
@@ -430,6 +441,12 @@ impl PrExternalActionService {
             ));
         }
         let action = self.ensure_proposal(&action).await?;
+        // Proposal repair is itself versioned. A legacy action without its
+        // Proposal must be reloaded before the caller can decide it, so the
+        // final action UPDATE uses exactly the version the caller supplied.
+        if action.version != expected_version {
+            return Err(DbError::VersionConflict.into());
+        }
         let proposal_id = action.proposal_id.clone().ok_or_else(|| {
             ServiceError::invalid_operation("the action has no Proposal to decide")
         })?;

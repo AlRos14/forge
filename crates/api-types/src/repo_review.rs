@@ -101,6 +101,8 @@ pub struct RepoResponse {
 pub struct PrProviderStatus {
     pub provider_type: String,
     pub has_credential: bool,
+    pub credential_handle_id: Option<String>,
+    pub credential_label: Option<String>,
     #[ts(type = "number")]
     pub polling_interval_seconds: i64,
 }

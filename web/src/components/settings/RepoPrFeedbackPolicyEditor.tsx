@@ -11,6 +11,7 @@ import { Select } from '@/components/ui/select'
 import { getApiErrorCode, getApiErrorMessage, isApiStatus } from '@/lib/api-error'
 import type {
   PrFeedbackPolicy,
+  PrFeedbackPolicyResponse,
   PrFeedbackSummaryMode,
   UpdatePrFeedbackPolicyRequest,
 } from '@/types/generated'
@@ -35,8 +36,8 @@ export function RepoPrFeedbackPolicyEditor({ repoId }: { repoId: string }) {
 
   useEffect(() => {
     if (!query.data || draft) return
-    setDraft(query.data)
-    const fields = policyFields(query.data)
+    setDraft(query.data.policy)
+    const fields = policyFields(query.data.policy)
     setAssociationsText(fields.trusted_author_associations)
     setTrustedLoginsText(fields.trusted_logins)
     setMaxItemsText(fields.max_items_per_poll)
@@ -45,8 +46,8 @@ export function RepoPrFeedbackPolicyEditor({ repoId }: { repoId: string }) {
   const reloadLatest = async () => {
     const result = await query.refetch()
     if (!result.data) return
-    setDraft(result.data)
-    const fields = policyFields(result.data)
+    setDraft(result.data.policy)
+    const fields = policyFields(result.data.policy)
     setAssociationsText(fields.trusted_author_associations)
     setTrustedLoginsText(fields.trusted_logins)
     setMaxItemsText(fields.max_items_per_poll)
@@ -71,14 +72,14 @@ export function RepoPrFeedbackPolicyEditor({ repoId }: { repoId: string }) {
       max_items_per_poll: maxItems,
     }
     const body: UpdatePrFeedbackPolicyRequest = {
-      expected_updated_at: null,
+      expected_updated_at: query.data?.updated_at ?? null,
       policy,
     }
     setErrorMessage(null)
     try {
-      const saved = await updatePolicy.mutateAsync({ repoId, body })
-      setDraft(saved)
-      const fields = policyFields(saved)
+      const saved: PrFeedbackPolicyResponse = await updatePolicy.mutateAsync({ repoId, body })
+      setDraft(saved.policy)
+      const fields = policyFields(saved.policy)
       setAssociationsText(fields.trusted_author_associations)
       setTrustedLoginsText(fields.trusted_logins)
       setMaxItemsText(fields.max_items_per_poll)

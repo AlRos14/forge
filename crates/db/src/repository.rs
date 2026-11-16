@@ -1680,6 +1680,14 @@ pub trait ProjectHookRunRepo: Send + Sync {
 #[async_trait]
 pub trait RepoRepo: Send + Sync {
     async fn create(&self, input: CreateRepo) -> Result<Repo>;
+    /// Create the Project's primary Repo and its optional PR provider config
+    /// atomically. A concurrent primary Repo creation returns
+    /// `DbError::ProjectAlreadyHasPrimaryRepo` without leaving partial rows.
+    async fn create_primary_with_pr_provider_config(
+        &self,
+        input: CreateRepo,
+        provider_config: Option<CreatePrProviderConfig>,
+    ) -> Result<Repo>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Repo>>;
     async fn list_by_project(&self, project_id: &str, page: PageRequest) -> Result<Page<Repo>>;
     async fn update(&self, input: UpdateRepo) -> Result<Repo>;
@@ -1707,6 +1715,7 @@ pub trait PrProviderConfigRepo: Send + Sync {
     async fn set_feedback_policy(
         &self,
         id: &str,
+        expected_updated_at: Option<&str>,
         policy_json: &str,
         updated_at: &str,
     ) -> Result<PrProviderConfig>;
@@ -1892,6 +1901,8 @@ pub struct CreatePrProviderConfig {
     pub base_url: Option<String>,
     pub polling_interval_seconds: i64,
     pub token_secret_ref: Option<String>,
+    pub credential_handle_id: Option<String>,
+    pub credential_owner_user_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

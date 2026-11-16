@@ -17,6 +17,16 @@ PR14 audit on 2026-10-16.
 
 ### Breaking
 
+- PR feedback policy GET and PUT now return `{policy, updated_at}` instead of a
+  bare policy. Clients should send the returned `updated_at` as
+  `expected_updated_at`; the service compares it atomically and returns the
+  existing typed conflict when stale. Approve/reject actions carry
+  `expected_version` through the service to the compare-and-set write.
+  `PrProviderStatus` adds the referenced `credential_handle_id` and display
+  label, never the secret. Repo creation can include
+  `pr_provider_config.credential_id`, stored with the Repo and provider config
+  in the same transaction.
+
 - PR provider credentials now use the SCM credential flow: connect GitHub with
   `POST /providers`, then reference the owned handle with
   `pr_provider_config.credential_id`. `PrProviderStatus.has_token` is replaced

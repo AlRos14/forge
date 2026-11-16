@@ -7,8 +7,8 @@ use std::sync::Arc;
 use api_types::{
     DecidePrExternalActionRequest, ExternalFeedbackItemListResponse, ExternalFeedbackItemResponse,
     PrExternalActionListResponse, PrExternalActionResponse, PrFeedbackAuthorization,
-    PrFeedbackPolicy, PrFeedbackSummaryMode, PrReworkListResponse, PrReworkSupersessionResponse,
-    UpdatePrFeedbackPolicyRequest,
+    PrFeedbackPolicy, PrFeedbackPolicyResponse, PrFeedbackSummaryMode, PrReworkListResponse,
+    PrReworkSupersessionResponse, UpdatePrFeedbackPolicyRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -324,11 +324,21 @@ async fn decide_task_action(
         PrExternalActionService::new(Arc::clone(&state.db), Arc::clone(&state.event_bus), pr);
     let decided = if approve {
         service
-            .approve(&action_id, &user.user_id, request.note)
+            .approve(
+                &action_id,
+                &user.user_id,
+                request.expected_version,
+                request.note,
+            )
             .await
     } else {
         service
-            .reject(&action_id, &user.user_id, request.note)
+            .reject(
+                &action_id,
+                &user.user_id,
+                request.expected_version,
+                request.note,
+            )
             .await
     }
     .map_err(map_action_error)?;
@@ -339,14 +349,17 @@ pub async fn get_repo_feedback_policy(
     State(state): State<AppState>,
     Path(repo_id): Path<String>,
     user: AuthenticatedUser,
-) -> ApiResult<Json<PrFeedbackPolicy>> {
+) -> ApiResult<Json<PrFeedbackPolicyResponse>> {
     require_repo_admin(&state, &repo_id, &user).await?;
     let config = PrProviderConfigRepo::get_by_repo_id(&*state.db, &repo_id)
         .await?
         .ok_or_else(|| ApiError::not_found("pr_provider_config", repo_id.clone()))?;
     let policy = db::PrFeedbackPolicy::from_json(&config.feedback_policy_json)
         .map_err(|_| ApiError::internal("stored PR feedback policy is invalid"))?;
-    Ok(Json(api_policy(policy)))
+    Ok(Json(PrFeedbackPolicyResponse {
+        policy: api_policy(policy),
+        updated_at: config.updated_at,
+    }))
 }
 
 pub async fn set_repo_feedback_policy(
@@ -354,32 +367,27 @@ pub async fn set_repo_feedback_policy(
     Path(repo_id): Path<String>,
     user: AuthenticatedUser,
     Json(request): Json<UpdatePrFeedbackPolicyRequest>,
-) -> ApiResult<Json<PrFeedbackPolicy>> {
+) -> ApiResult<Json<PrFeedbackPolicyResponse>> {
     require_repo_admin(&state, &repo_id, &user).await?;
-    let config = PrProviderConfigRepo::get_by_repo_id(&*state.db, &repo_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("pr_provider_config", repo_id.clone()))?;
-    if request
-        .expected_updated_at
-        .as_deref()
-        .is_some_and(|expected| expected != config.updated_at)
-    {
-        return Err(ApiError::conflict_with_code(
-            "pr_feedback.policy_version_conflict",
-            "PR provider configuration changed before the policy update",
-        ));
-    }
     let policy = db_policy(request.policy);
     let updated = PrProviderSettingsService::new(
         Arc::clone(&state.db),
         Arc::clone(&state.credential_service),
     )
-    .set_feedback_policy(&user.user_id, &repo_id, policy)
+    .set_feedback_policy(
+        &user.user_id,
+        &repo_id,
+        request.expected_updated_at.as_deref(),
+        policy,
+    )
     .await
     .map_err(map_policy_error)?;
     let policy = db::PrFeedbackPolicy::from_json(&updated.feedback_policy_json)
         .map_err(|_| ApiError::internal("stored PR feedback policy is invalid"))?;
-    Ok(Json(api_policy(policy)))
+    Ok(Json(PrFeedbackPolicyResponse {
+        policy: api_policy(policy),
+        updated_at: updated.updated_at,
+    }))
 }
 
 async fn require_repo_admin(

@@ -102,9 +102,9 @@ the maximum is 100.
 | `POST /projects/{id}/plan/batches/{batch_id}` | A Project owner/admin sends `{ expected_version, action, idempotency_key }`, where `action` is `pause`, `resume`, or `revoke`. Copilot cannot authorize or change a batch. |
 | `DELETE /projects/{id}` | Delete a Project under the existing workspace cleanup contract. |
 | `POST /projects/{id}/pause`, `POST /projects/{id}/resume` | Pause or resume the Project. |
-| `GET /projects/{id}/repos`, `POST /projects/{id}/repos` | List or add repositories. |
-| `GET /repos/{id}`, `PATCH /repos/{id}`, `DELETE /repos/{id}`, `POST /repos/{id}/sync` | Read, update, remove, or sync a repository. `PATCH` can set `pr_provider`, polling/base URL configuration, and `pr_provider_config.credential_id`; setting the provider to `null` removes its configuration. The credential handle must be a GitHub SCM handle owned by the authenticated Project owner/admin. Responses expose `has_credential` and polling interval, never a secret. Sending `token` or `token_secret_ref` returns `400 repo.pr_provider_token_retired`. Deleting a Repo with any associated Task returns `409 repo_in_use` and leaves the Repo, primary-Repo selection, and Tasks intact. Deleting a Task-free Repo returns `204` and clears its primary-Repo selection atomically. |
-| `GET /repos/{id}/pr-feedback-policy`, `PUT /repos/{id}/pr-feedback-policy` | Read or replace the PR feedback policy; owner/admin only. PUT accepts `{expected_updated_at?, policy}` and validates schema version, polling limit, trusted associations and logins. Policy changes do not widen existing PR admissions. A stale timestamp returns `409 pr_feedback.policy_version_conflict`; invalid policy returns `400 pr_feedback.policy_invalid`. |
+| `GET /projects/{id}/repos`, `POST /projects/{id}/repos` | List or add repositories. Create accepts PR provider settings, including `pr_provider_config.credential_id`; a Repo, provider config, credential reference, and primary-Repo selection are committed atomically. The credential must be a configured GitHub SCM API key owned by the authenticated Project owner/admin. |
+| `GET /repos/{id}`, `PATCH /repos/{id}`, `DELETE /repos/{id}`, `POST /repos/{id}/sync` | Read, update, remove, or sync a repository. `PATCH` can set `pr_provider`, polling/base URL configuration, and `pr_provider_config.credential_id`; setting the provider to `null` removes its configuration. Responses expose `has_credential`, `credential_handle_id`, and the handle label, never a secret. Sending `token` or `token_secret_ref` returns `400 repo.pr_provider_token_retired`. Deleting a Repo with any associated Task returns `409 repo_in_use` and leaves the Repo, primary-Repo selection, and Tasks intact. Deleting a Task-free Repo returns `204` and clears its primary-Repo selection atomically. |
+| `GET /repos/{id}/pr-feedback-policy`, `PUT /repos/{id}/pr-feedback-policy` | Read or replace the PR feedback policy; owner/admin only. GET and PUT return `{policy, updated_at}`. PUT accepts `{expected_updated_at?, policy}` and atomically compares the supplied timestamp before writing; schema version, polling limit, trusted associations and logins are validated. Policy changes do not widen existing PR admissions. A stale timestamp returns `409 pr_feedback.policy_version_conflict`; invalid policy returns `400 pr_feedback.policy_invalid`. |
 | `GET /projects/{id}/project_hook_runs` | Read generic Project hook run history. |
 | `GET /projects/{id}/media`, `POST /projects/{id}/media` | List or upload Project media. |
 | `GET /projects/{id}/media/{asset_id}` | Read an exact media asset. |
@@ -501,16 +501,18 @@ available only through the Task read; SSE projections contain no provider text.
 | `GET /tasks/{id}/pr-feedback` | List feedback across the Task's PR admissions, including trust class, head state, disposition, dismiss reason, scope classification, human decision ID, and follow-up Task ID. |
 | `GET /tasks/{id}/pr-rework` | List PR rework supersessions with their state, PR identity, head, and exact convergence decision reference. |
 | `GET /tasks/{id}/pr-actions` | List durable external PR actions. Optional `state` filters by action state. Responses expose identifiers, digests, authorization/state and version; no provider result body or secret. |
-| `POST /tasks/{id}/pr-actions/{action_id}/approve`, `POST /tasks/{id}/pr-actions/{action_id}/reject` | Human owner/admin decision on a proposed `human_approval` action. Body `{expected_version, note?, idempotency_key}`. Forge records the exact Proposal Decision; the merge remains a human operation. Stale versions return `409 pr_action.version_conflict`; unauthorized or non-proposed actions return typed `403`/`409` errors. |
+| `POST /tasks/{id}/pr-actions/{action_id}/approve`, `POST /tasks/{id}/pr-actions/{action_id}/reject` | Human owner/admin decision on a proposed `human_approval` action. Body `{expected_version, note?, idempotency_key}`. Forge passes the expected version to the service and compares it in the version-guarded action write. It records the exact Proposal Decision; the merge remains a human operation. Stale versions return `409 pr_action.version_conflict`; unauthorized or non-proposed actions return typed `403`/`409` errors. |
 
 `POST /providers` accepts `provider: "github"` to connect a GitHub SCM
 credential. The `credential` is accepted only in the request body and is never
 returned. `GET /providers?purpose=scm` lists SCM handles; the unfiltered model
 provider list excludes them. A repository references a handle with
-`PATCH /repos/{id}` and `pr_provider_config.credential_id`; Forge checks both
-Project administration and credential ownership. `PrProviderStatus` now reports
-`has_credential`. The retired PR token fields are rejected with
-`400 repo.pr_provider_token_retired`.
+`POST /projects/{id}/repos` or `PATCH /repos/{id}` and
+`pr_provider_config.credential_id`; Forge checks both Project administration
+and credential ownership. `PrProviderStatus` reports `has_credential`,
+`credential_handle_id`, and `credential_label`. The handle ID and label are
+display metadata only; the secret is never returned. The retired PR token
+fields are rejected with `400 repo.pr_provider_token_retired`.
 
 The REST and MCP error codes include `credential.invalid`,
 `credential.purpose_invalid`, `credential.owner_not_authorized`,

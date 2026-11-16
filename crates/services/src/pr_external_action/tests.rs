@@ -771,21 +771,34 @@ async fn pr_external_action_push_requires_policy_or_decision() {
     );
 
     // Only a Project owner/admin decides.
-    assert!(r.service.approve(&action.id, "nobody", None).await.is_err());
+    assert!(r
+        .service
+        .approve(&action.id, "nobody", action.version, None)
+        .await
+        .is_err());
     let approved = r
         .service
-        .approve(&action.id, &r.owner, Some("Looks right".to_owned()))
+        .approve(
+            &action.id,
+            &r.owner,
+            action.version,
+            Some("Looks right".to_owned()),
+        )
         .await
         .expect("approve");
     assert_eq!(approved.state, PrExternalActionState::Approved);
     assert!(approved.decision_id.is_some());
     let replay = r
         .service
-        .approve(&action.id, &r.owner, None)
+        .approve(&action.id, &r.owner, approved.version, None)
         .await
         .expect("idempotent approval");
     assert_eq!(replay.version, approved.version);
-    assert!(r.service.reject(&action.id, &r.owner, None).await.is_err());
+    assert!(r
+        .service
+        .reject(&action.id, &r.owner, approved.version, None)
+        .await
+        .is_err());
 
     r.service.run_once().await.expect("executor pass");
     assert_eq!(
@@ -805,13 +818,38 @@ async fn pr_external_action_rejected_push_fails_the_readmission() {
         .expect("push_update");
     let rejected = r
         .service
-        .reject(&action.id, &r.owner, None)
+        .reject(&action.id, &r.owner, action.version, None)
         .await
         .expect("reject");
     assert_eq!(rejected.state, PrExternalActionState::Rejected);
     assert_eq!(r.admission_state().await, "publication_failed");
     assert_eq!(r.repos.remote_head(), r.repos.old_sha);
     assert_eq!(r.supersession_state().await.state, PrReworkState::Open);
+}
+
+#[tokio::test]
+async fn pr_external_action_decision_rejects_version_changed_after_caller_read() {
+    let r = rig("human_approval", "off").await;
+    let action = r
+        .service
+        .ensure_push_update(&r.merge2)
+        .await
+        .expect("push_update");
+    let caller_version = action.version;
+
+    let concurrently_changed = r
+        .service
+        .transition(&action, PrExternalActionState::Abandoned, None, None, None)
+        .await
+        .expect("concurrent writer advances the action");
+    assert_ne!(concurrently_changed.version, caller_version);
+
+    assert!(matches!(
+        r.service
+            .approve(&action.id, &r.owner, caller_version, None)
+            .await,
+        Err(ServiceError::Db(DbError::VersionConflict))
+    ));
 }
 
 #[tokio::test]
@@ -1101,7 +1139,12 @@ async fn pr_external_action_post_comment_requires_its_exact_human_decision() {
 
     let approved = r
         .service
-        .approve(&action.id, &r.owner, Some("Post the summary".to_owned()))
+        .approve(
+            &action.id,
+            &r.owner,
+            action.version,
+            Some("Post the summary".to_owned()),
+        )
         .await
         .expect("owner approval");
     assert_eq!(approved.state, PrExternalActionState::Approved);

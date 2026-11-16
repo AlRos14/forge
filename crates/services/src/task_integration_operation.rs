@@ -950,6 +950,8 @@ pub(crate) mod tests {
                 base_url: Some("https://github.example.invalid".to_owned()),
                 polling_interval_seconds: 1,
                 token_secret_ref: None,
+                credential_handle_id: None,
+                credential_owner_user_id: None,
                 created_at: now_rfc3339(),
                 updated_at: now_rfc3339(),
             },
@@ -976,7 +978,7 @@ pub(crate) mod tests {
                 .set_credential(&fixture.user_id, &fixture.repo_id, Some(&handle.id))
                 .await?;
             provider_config = settings
-                .set_feedback_policy(&fixture.user_id, &fixture.repo_id, setup.policy)
+                .set_feedback_policy(&fixture.user_id, &fixture.repo_id, None, setup.policy)
                 .await?;
         }
 

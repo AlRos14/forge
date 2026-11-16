@@ -27,6 +27,8 @@ const localRepoForm: RepoFormState = {
   pr_provider: 'github',
   pr_base_url: '',
   credential_id: undefined,
+  credential_handle_id: null,
+  credential_label: null,
   credential_connected: false,
   pr_polling_interval_seconds: '60',
 }
@@ -159,6 +161,24 @@ describe('RepoForm', () => {
     expect(onSubmit).toHaveBeenCalledWith(
       expect.objectContaining({ credential_id: 'scm-credential-1', credential_connected: true }),
     )
+  })
+
+  it('shows the referenced credential as the current selection when editing a repo', () => {
+    renderRepoForm(
+      {
+        ...localRepoForm,
+        work_mode: 'pull_request',
+        credential_handle_id: 'scm-credential-1',
+        credential_label: 'Forge GitHub',
+        credential_connected: true,
+      },
+      vi.fn(),
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'GitHub SCM credential' }))
+    const currentOption = screen.getByRole('option', { name: 'Current: Forge GitHub' })
+    expect(currentOption).toBeTruthy()
+    expect(currentOption.getAttribute('aria-selected')).toBe('true')
   })
 
   it('connects a credential in the request body and clears the password input after submit', async () => {

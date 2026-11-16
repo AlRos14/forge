@@ -1,11 +1,11 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '@/api/client'
-import type { PrFeedbackPolicy } from '@/types/generated'
+import type { PrFeedbackPolicy, PrFeedbackPolicyResponse } from '@/types/generated'
 import { RepoPrFeedbackPolicyEditor } from '@/components/settings/RepoPrFeedbackPolicyEditor'
 
 const policyQuery = vi.hoisted(() => ({
-  data: undefined as PrFeedbackPolicy | undefined,
+  data: undefined as PrFeedbackPolicyResponse | undefined,
   isLoading: false,
   isError: false,
   refetch: vi.fn(),
@@ -26,10 +26,14 @@ const initialPolicy: PrFeedbackPolicy = {
   push_corrections: 'human_approval',
   post_summary: 'off',
 }
+const initialResponse: PrFeedbackPolicyResponse = {
+  policy: initialPolicy,
+  updated_at: '2026-11-16T10:00:00Z',
+}
 
 describe('RepoPrFeedbackPolicyEditor', () => {
   beforeEach(() => {
-    policyQuery.data = initialPolicy
+    policyQuery.data = initialResponse
     policyQuery.isLoading = false
     policyQuery.isError = false
     policyQuery.refetch.mockReset()
@@ -38,7 +42,10 @@ describe('RepoPrFeedbackPolicyEditor', () => {
   })
 
   it('saves the generated policy shape with expected_updated_at', async () => {
-    policyMutation.mutateAsync.mockResolvedValue({ ...initialPolicy, ingest: true })
+    policyMutation.mutateAsync.mockResolvedValue({
+      policy: { ...initialPolicy, ingest: true },
+      updated_at: '2026-11-16T10:01:00Z',
+    })
     render(<RepoPrFeedbackPolicyEditor repoId="repo-1" />)
 
     fireEvent.click(screen.getByLabelText('Ingest pull request feedback'))
@@ -51,7 +58,7 @@ describe('RepoPrFeedbackPolicyEditor', () => {
     expect(policyMutation.mutateAsync).toHaveBeenCalledWith({
       repoId: 'repo-1',
       body: {
-        expected_updated_at: null,
+        expected_updated_at: initialResponse.updated_at,
         policy: { ...initialPolicy, ingest: true, max_items_per_poll: 25 },
       },
     })
@@ -65,7 +72,9 @@ describe('RepoPrFeedbackPolicyEditor', () => {
       ),
     )
     const latestPolicy = { ...initialPolicy, ingest: true, max_items_per_poll: 30 }
-    policyQuery.refetch.mockResolvedValue({ data: latestPolicy })
+    policyQuery.refetch.mockResolvedValue({
+      data: { policy: latestPolicy, updated_at: '2026-11-16T10:02:00Z' },
+    })
     render(<RepoPrFeedbackPolicyEditor repoId="repo-1" />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Save policy' }))

@@ -4,7 +4,7 @@ mod common;
 
 use api_types::{
     ErrorResponse, ExternalFeedbackItemListResponse, PrExternalActionListResponse,
-    PrFeedbackPolicy, PrReworkListResponse, ProviderEntriesResponse, ProviderEntryResponse,
+    PrFeedbackPolicyResponse, PrReworkListResponse, ProviderEntriesResponse, ProviderEntryResponse,
     RepoResponse, TaskResponse,
 };
 use axum::http::{Method, StatusCode};
@@ -229,7 +229,7 @@ async fn repo_tokens_are_retired_and_feedback_policy_is_validated() {
             .contains("legacy-secret"));
     }
 
-    let initial: PrFeedbackPolicy = common::empty_request_with_bearer(
+    let initial: PrFeedbackPolicyResponse = common::empty_request_with_bearer(
         &f.harness.app,
         Method::GET,
         &format!("/api/v1/repos/{}/pr-feedback-policy", f.repo_id),
@@ -237,23 +237,43 @@ async fn repo_tokens_are_retired_and_feedback_policy_is_validated() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(initial.max_items_per_poll, 50);
-    assert_eq!(initial.post_summary, api_types::PrFeedbackSummaryMode::Off);
+    assert_eq!(initial.policy.max_items_per_poll, 50);
+    assert_eq!(
+        initial.policy.post_summary,
+        api_types::PrFeedbackSummaryMode::Off
+    );
 
-    let mut enabled = initial.clone();
+    let mut enabled = initial.policy.clone();
     enabled.ingest = true;
-    let saved: PrFeedbackPolicy = json_request_with_bearer(
+    let saved: PrFeedbackPolicyResponse = json_request_with_bearer(
         &f.harness.app,
         Method::PUT,
         &format!("/api/v1/repos/{}/pr-feedback-policy", f.repo_id),
         &f.token,
-        json!({"expected_updated_at": null, "policy": enabled}),
+        json!({"expected_updated_at": initial.updated_at, "policy": enabled}),
         StatusCode::OK,
     )
     .await;
-    assert!(saved.ingest);
+    assert!(saved.policy.ingest);
 
-    let mut invalid = saved;
+    let stale: ErrorResponse = json_request_with_bearer(
+        &f.harness.app,
+        Method::PUT,
+        &format!("/api/v1/repos/{}/pr-feedback-policy", f.repo_id),
+        &f.token,
+        json!({
+            "expected_updated_at": initial.updated_at,
+            "policy": { "schema_version": 1, "ingest": false,
+                "trusted_author_associations": [], "trusted_logins": [],
+                "max_items_per_poll": 50, "push_corrections": "human_approval",
+                "post_summary": "off" }
+        }),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(stale.code, "pr_feedback.policy_version_conflict");
+
+    let mut invalid = saved.policy;
     invalid.max_items_per_poll = 0;
     let error: ErrorResponse = json_request_with_bearer(
         &f.harness.app,

@@ -95,6 +95,8 @@ async fn fixture() -> Fixture {
             base_url: None,
             polling_interval_seconds: 60,
             token_secret_ref: None,
+            credential_handle_id: None,
+            credential_owner_user_id: None,
             created_at: now.clone(),
             updated_at: now,
         },
@@ -320,15 +322,21 @@ async fn v173_feedback_policy_is_validated_and_agent_profiles_reject_scm_credent
     ];
     for bad in &invalid_policies {
         assert!(
-            PrProviderConfigRepo::set_feedback_policy(&f.db, &f.config_id, bad, &now_rfc3339())
-                .await
-                .is_err(),
+            PrProviderConfigRepo::set_feedback_policy(
+                &f.db,
+                &f.config_id,
+                None,
+                bad,
+                &now_rfc3339(),
+            )
+            .await
+            .is_err(),
             "{bad} is rejected"
         );
     }
     let good = policy(true, "automatic", "human_approval");
     let config =
-        PrProviderConfigRepo::set_feedback_policy(&f.db, &f.config_id, &good, &now_rfc3339())
+        PrProviderConfigRepo::set_feedback_policy(&f.db, &f.config_id, None, &good, &now_rfc3339())
             .await
             .expect("valid policy");
     assert_eq!(config.feedback_policy_json, good);

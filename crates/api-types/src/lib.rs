@@ -151,6 +151,7 @@ fn export_typescript() {
     PrFeedbackAuthorization::export().expect("export PrFeedbackAuthorization");
     PrFeedbackSummaryMode::export().expect("export PrFeedbackSummaryMode");
     PrFeedbackPolicy::export().expect("export PrFeedbackPolicy");
+    PrFeedbackPolicyResponse::export().expect("export PrFeedbackPolicyResponse");
     UpdatePrFeedbackPolicyRequest::export().expect("export UpdatePrFeedbackPolicyRequest");
     ExternalFeedbackItemResponse::export().expect("export ExternalFeedbackItemResponse");
     ExternalFeedbackItemListResponse::export().expect("export ExternalFeedbackItemListResponse");

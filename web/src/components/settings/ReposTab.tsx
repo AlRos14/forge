@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import {
   ArrowsClockwise,
   Check,
@@ -17,7 +17,7 @@ import {
   Timer,
   X,
 } from '@phosphor-icons/react'
-import { apiFetch, listBranches } from '@/api/client'
+import { listBranches } from '@/api/client'
 import {
   useMembersQuery,
   useCreateRepo,
@@ -26,7 +26,6 @@ import {
   useSyncRepo,
   useUpdateRepo,
 } from '@/api/hooks'
-import { qk } from '@/api/query-keys'
 import { ErrorBanner } from '@/components/error-banner'
 import { IntegrationsTab } from '@/components/settings/IntegrationsTab'
 import { RepoDialog } from '@/components/settings/RepoDialog'
@@ -34,6 +33,7 @@ import { RepoPrFeedbackPolicyEditor } from '@/components/settings/RepoPrFeedback
 import { emptyRepoForm, type RepoFormState } from '@/components/settings/RepoForm'
 import {
   repoFormFromRepo,
+  repoPrProviderConfigFromForm,
   settingsErrorMessage,
 } from '@/components/settings/project-settings-utils'
 import { Badge } from '@/components/ui/badge'
@@ -49,7 +49,6 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
   const isAdmin = useAuthStore((s) => Boolean(s.user?.is_admin))
   const userId = useAuthStore((s) => s.user?.id)
   const membersQuery = useMembersQuery(projectId)
-  const queryClient = useQueryClient()
   const reposQuery = useReposQuery(projectId)
   const createRepo = useCreateRepo(projectId)
   const daemonsQuery = useDaemonsQuery(isAdmin)
@@ -66,7 +65,6 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
   const [repoDialogOpen, setRepoDialogOpen] = useState(false)
   const [repoForm, setRepoForm] = useState<RepoFormState>(emptyRepoForm)
   const [editingRepoId, setEditingRepoId] = useState<string | null>(null)
-  const [credentialAttachPending, setCredentialAttachPending] = useState(false)
 
   // Inline branch edit state
   const [branchEditMode, setBranchEditMode] = useState(false)
@@ -195,14 +193,7 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
       default_branch: defaultBranch,
       work_mode: nextForm.work_mode,
       pr_provider: nextForm.work_mode === 'pull_request' ? nextForm.pr_provider : null,
-      pr_provider_config:
-        nextForm.work_mode === 'pull_request'
-          ? {
-              base_url:
-                nextForm.pr_provider === 'github' ? null : nextForm.pr_base_url.trim() || null,
-              polling_interval_seconds: pollingInterval,
-            }
-          : null,
+      pr_provider_config: repoPrProviderConfigFromForm(nextForm),
     }
   }
 
@@ -269,34 +260,10 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
       const body = formToCreateRequest(nextForm)
       if (!body) return
       try {
-        const created = await createRepo.mutateAsync(body)
-        let credentialAttachFailed = false
-        if (
-          nextForm.work_mode === 'pull_request' &&
-          nextForm.pr_provider === 'github' &&
-          typeof nextForm.credential_id === 'string'
-        ) {
-          setCredentialAttachPending(true)
-          try {
-            await apiFetch<Repo>(`/repos/${created.id}`, {
-              method: 'PATCH',
-              body: JSON.stringify({
-                pr_provider_config: { credential_id: nextForm.credential_id },
-              } satisfies UpdateRepoRequest),
-            })
-            void queryClient.invalidateQueries({ queryKey: qk.repos(projectId) })
-          } catch {
-            credentialAttachFailed = true
-            toast.error(
-              'Repository was created, but its GitHub credential could not be attached. Edit it to retry.',
-            )
-          } finally {
-            setCredentialAttachPending(false)
-          }
-        }
+        await createRepo.mutateAsync(body)
         setRepoDialogOpen(false)
         setRepoForm(emptyRepoForm)
-        if (!credentialAttachFailed) toast.success('Repository saved')
+        toast.success('Repository saved')
       } catch (error) {
         toast.error(settingsErrorMessage(error, 'Repository creation failed'))
       }
@@ -308,7 +275,7 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
 
   const isPending = editingRepoId
     ? updateRepo.isPending
-    : createRepo.isPending || credentialAttachPending
+    : createRepo.isPending
 
   return (
     <>

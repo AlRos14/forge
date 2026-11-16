@@ -252,6 +252,8 @@ pub struct PrProviderConfigRequest {
     #[ts(type = "number | null")]
     #[ts(optional = nullable)]
     pub polling_interval_seconds: Option<i64>,
+    #[ts(optional = nullable)]
+    pub credential_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

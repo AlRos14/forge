@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import type { Icon } from '@phosphor-icons/react'
 import {
@@ -15,8 +14,6 @@ import {
   WarningOctagon,
 } from '@phosphor-icons/react'
 import { toast } from 'sonner'
-import { apiFetch } from '@/api/client'
-import { qk } from '@/api/query-keys'
 import {
   useCreateRepo,
   useDaemonsQuery,
@@ -38,7 +35,10 @@ import { ReposTab } from '@/components/settings/ReposTab'
 import { ValidationChecksTab } from '@/components/settings/ValidationChecksTab'
 import { ProjectWorkersTab } from '@/components/settings/ProjectWorkersTab'
 import { SettingsSection } from '@/components/settings/SettingsSection'
-import { settingsErrorMessage } from '@/components/settings/project-settings-utils'
+import {
+  repoPrProviderConfigFromForm,
+  settingsErrorMessage,
+} from '@/components/settings/project-settings-utils'
 import { emptyRepoForm, type RepoFormState } from '@/components/settings/RepoForm'
 import { Button } from '@/components/ui/button'
 import { CopyReferenceButton } from '@/components/ui/copy-reference-button'
@@ -54,7 +54,7 @@ import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
 import { useAuthStore } from '@/stores/auth'
-import type { CreateRepoRequest, Repo, UpdateRepoRequest } from '@/types/generated'
+import type { CreateRepoRequest } from '@/types/generated'
 
 export type ProjectSettingsTab =
   | 'general'
@@ -323,12 +323,10 @@ function ProjectMcpTab({ projectId }: { projectId: string }) {
   const reposQuery = useReposQuery(projectId)
   const daemonsQuery = useDaemonsQuery(isAdmin)
   const createRepo = useCreateRepo(projectId)
-  const queryClient = useQueryClient()
 
   const [repoDialogOpen, setRepoDialogOpen] = useState(false)
   const [repoForm, setRepoForm] = useState<RepoFormState>(emptyRepoForm)
   const [selectedDaemonId, setSelectedDaemonId] = useState<string | undefined>(undefined)
-  const [credentialAttachPending, setCredentialAttachPending] = useState(false)
 
   const project = projectQuery.data
   const repos = reposQuery.data?.items ?? []
@@ -383,44 +381,13 @@ function ProjectMcpTab({ projectId }: { projectId: string }) {
       default_branch: nextForm.default_branch.trim() || 'main',
       work_mode: nextForm.work_mode,
       pr_provider: nextForm.work_mode === 'pull_request' ? nextForm.pr_provider : null,
-      pr_provider_config:
-        nextForm.work_mode === 'pull_request'
-          ? {
-              base_url:
-                nextForm.pr_provider === 'github' ? null : nextForm.pr_base_url.trim() || null,
-              polling_interval_seconds: pollingInterval,
-            }
-          : null,
+      pr_provider_config: repoPrProviderConfigFromForm(nextForm),
     }
     try {
-      const created = await createRepo.mutateAsync(body)
-      let credentialAttachFailed = false
-      if (
-        nextForm.work_mode === 'pull_request' &&
-        nextForm.pr_provider === 'github' &&
-        typeof nextForm.credential_id === 'string'
-      ) {
-        setCredentialAttachPending(true)
-        try {
-          await apiFetch<Repo>(`/repos/${created.id}`, {
-            method: 'PATCH',
-            body: JSON.stringify({
-              pr_provider_config: { credential_id: nextForm.credential_id },
-            } satisfies UpdateRepoRequest),
-          })
-          void queryClient.invalidateQueries({ queryKey: qk.repos(projectId) })
-        } catch {
-          credentialAttachFailed = true
-          toast.error(
-            'Repository was created, but its GitHub credential could not be attached. Edit it to retry.',
-          )
-        } finally {
-          setCredentialAttachPending(false)
-        }
-      }
+      await createRepo.mutateAsync(body)
       setRepoDialogOpen(false)
       setRepoForm(emptyRepoForm)
-      if (!credentialAttachFailed) toast.success('Repository saved')
+      toast.success('Repository saved')
     } catch (error) {
       toast.error(settingsErrorMessage(error, 'Repository creation failed'))
     }
@@ -500,7 +467,7 @@ function ProjectMcpTab({ projectId }: { projectId: string }) {
       <RepoDialog
         form={repoForm}
         open={repoDialogOpen}
-        pending={createRepo.isPending || credentialAttachPending}
+        pending={createRepo.isPending}
         daemons={daemons}
         daemonId={activeDaemonId}
         onDaemonChange={setSelectedDaemonId}

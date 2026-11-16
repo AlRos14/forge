@@ -39,6 +39,8 @@ export type RepoFormState = {
   pr_provider: string
   pr_base_url: string
   credential_id: string | null | undefined
+  credential_handle_id: string | null
+  credential_label: string | null
   credential_connected: boolean
   pr_polling_interval_seconds: string
 }
@@ -53,6 +55,8 @@ export const emptyRepoForm: RepoFormState = {
   pr_provider: 'github',
   pr_base_url: '',
   credential_id: undefined,
+  credential_handle_id: null,
+  credential_label: null,
   credential_connected: false,
   pr_polling_interval_seconds: '60',
 }
@@ -329,7 +333,11 @@ export function RepoForm({
       const connection = connectScmCredential(request)
       setCredentialSecret('')
       const connected = await connection
-      updateForm({ credential_id: connected.id, credential_connected: true })
+      updateForm({
+        credential_id: connected.id,
+        credential_label: connected.label,
+        credential_connected: true,
+      })
       setCredentialLabel('')
       setShowCredentialForm(false)
       await queryClient.invalidateQueries({ queryKey: qk.scmCredentials })
@@ -665,27 +673,46 @@ export function RepoForm({
                     value={
                       form.credential_id === undefined
                         ? form.credential_connected
-                          ? '__current__'
+                          ? (form.credential_handle_id ?? '__current__')
                           : ''
                         : form.credential_id ?? ''
                     }
                     options={[
                       { value: '', label: 'No credential' },
                       ...(form.credential_connected && form.credential_id === undefined
-                        ? [{ value: '__current__', label: 'Current credential connected' }]
+                        ? [{
+                            value: form.credential_handle_id ?? '__current__',
+                            label: form.credential_label
+                              ? `Current: ${form.credential_label}`
+                              : 'Current credential connected',
+                          }]
                         : []),
-                      ...scmCredentials.map((entry) => ({
-                        value: entry.id,
-                        label: entry.label,
-                      })),
+                      ...scmCredentials
+                        .filter((entry) => entry.id !== form.credential_handle_id)
+                        .map((entry) => ({
+                          value: entry.id,
+                          label: entry.label,
+                        })),
                     ]}
                     onChange={(value) => {
-                      if (value === '__current__') {
+                      if (
+                        form.credential_connected &&
+                        form.credential_id === undefined &&
+                        value === (form.credential_handle_id ?? '__current__')
+                      ) {
                         updateForm({ credential_id: undefined, credential_connected: true })
                       } else if (value) {
-                        updateForm({ credential_id: value, credential_connected: true })
+                        const selected = scmCredentials.find((entry) => entry.id === value)
+                        updateForm({
+                          credential_id: value,
+                          credential_label: selected?.label ?? null,
+                          credential_connected: true,
+                        })
                       } else {
-                        updateForm({ credential_id: null, credential_connected: false })
+                        updateForm({
+                          credential_id: null,
+                          credential_connected: false,
+                        })
                       }
                     }}
                   />

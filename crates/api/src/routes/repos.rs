@@ -7,9 +7,9 @@ use axum::{
     Json,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, CreatePrProviderConfig, CreateRepo, PrProviderConfigRepo,
-    ProjectRepo, Repo, RepoRepo, SqliteDb, UpdatePrProviderConfig, UpdateProject, UpdateRepo,
-    WorkMode,
+    new_uuid_v4, now_rfc3339, CreatePrProviderConfig, CreateRepo, CredentialHandleRepo, DbError,
+    PrProviderConfigRepo, ProjectRepo, Repo, RepoRepo, SqliteDb, UpdatePrProviderConfig,
+    UpdateRepo, WorkMode,
 };
 use serde_json::Value;
 use services::{pr_provider_settings::PrProviderSettingsService, ServiceError};
@@ -60,11 +60,57 @@ pub async fn create_repo(
     let name = request
         .name
         .unwrap_or_else(|| repo_name_from_remote_url(&request.remote_url));
+    let credential = if let Some(credential_id) = request
+        .pr_provider_config
+        .as_ref()
+        .and_then(|config| config.credential_id.as_deref())
+    {
+        if request.pr_provider.as_deref() != Some("github") {
+            return Err(ApiError::bad_request_with_code(
+                "repo.pr_provider_credential_invalid",
+                "SCM credential references require pr_provider=github",
+            ));
+        }
+        let credential = state
+            .credential_service
+            .require_owned_entry(&user.user_id, credential_id)
+            .await
+            .map_err(map_repo_credential_error)?;
+        if credential.provider != "github" || credential.credential_method != "api_key" {
+            return Err(ApiError::bad_request_with_code(
+                "repo.pr_provider_credential_invalid",
+                "credential_id must reference a configured GitHub SCM API key owned by the caller",
+            ));
+        }
+        Some(credential)
+    } else {
+        None
+    };
     let now = now_rfc3339();
-    let repo = RepoRepo::create(
+    let repo_id = new_uuid_v4();
+    let provider_config = request.pr_provider.as_ref().map(|provider| {
+        let config = request.pr_provider_config.as_ref();
+        CreatePrProviderConfig {
+            id: new_uuid_v4(),
+            repo_id: repo_id.clone(),
+            provider_type: provider.clone(),
+            base_url: config.and_then(|config| config.base_url.clone()),
+            polling_interval_seconds: config
+                .and_then(|config| config.polling_interval_seconds)
+                .unwrap_or(300),
+            token_secret_ref: None,
+            credential_handle_id: credential.as_ref().map(|handle| handle.id.clone()),
+            credential_owner_user_id: credential
+                .as_ref()
+                .map(|handle| handle.owner_user_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        }
+    });
+    let repo = RepoRepo::create_primary_with_pr_provider_config(
         &*state.db,
         CreateRepo {
-            id: new_uuid_v4(),
+            id: repo_id,
             project_id: project_id.clone(),
             name,
             local_path,
@@ -77,40 +123,16 @@ pub async fn create_repo(
             created_at: now.clone(),
             updated_at: now,
         },
+        provider_config,
     )
-    .await?;
-    if let Some(pr_provider) = &request.pr_provider {
-        let pr_config = request.pr_provider_config.as_ref();
-        let now = now_rfc3339();
-        PrProviderConfigRepo::create(
-            &*state.db,
-            CreatePrProviderConfig {
-                id: new_uuid_v4(),
-                repo_id: repo.id.clone(),
-                provider_type: pr_provider.clone(),
-                base_url: pr_config.and_then(|c| c.base_url.clone()),
-                polling_interval_seconds: pr_config
-                    .and_then(|c| c.polling_interval_seconds)
-                    .unwrap_or(300),
-                token_secret_ref: None,
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await?;
-    }
-    ProjectRepo::update(
-        &*state.db,
-        UpdateProject {
-            id: project_id,
-            name: None,
-            settings: None,
-            primary_repo_id: Some(Some(repo.id.clone())),
-            paused_at: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await?;
+    .await
+    .map_err(|error| match error {
+        DbError::ProjectAlreadyHasPrimaryRepo => ApiError::conflict_with_code(
+            "project_already_has_primary_repo",
+            format!("project {project_id} already has a primary repo"),
+        ),
+        other => other.into(),
+    })?;
     Ok(Json(repo_with_provider(&state.db, repo).await?))
 }
 
@@ -259,10 +281,19 @@ pub async fn update_repo(
 async fn repo_with_provider(db: &SqliteDb, repo: Repo) -> ApiResult<RepoResponse> {
     let mut response = repo_response(repo);
     if let Some(config) = PrProviderConfigRepo::get_by_repo_id(db, &response.id).await? {
+        let credential_label = if let Some(credential_id) = config.credential_handle_id.as_deref() {
+            CredentialHandleRepo::get_credential_handle(db, credential_id)
+                .await?
+                .map(|credential| credential.label)
+        } else {
+            None
+        };
         response.pr_provider = Some(config.provider_type.clone());
         response.pr_provider_status = Some(api_types::PrProviderStatus {
             provider_type: config.provider_type,
             has_credential: config.credential_handle_id.is_some(),
+            credential_handle_id: config.credential_handle_id,
+            credential_label,
             polling_interval_seconds: config.polling_interval_seconds,
         });
     }
@@ -362,6 +393,8 @@ async fn update_pr_provider_config(
                     .and_then(|config| config.polling_interval_seconds)
                     .unwrap_or(300),
                 token_secret_ref: None,
+                credential_handle_id: None,
+                credential_owner_user_id: None,
                 created_at: now_rfc3339(),
                 updated_at: now_rfc3339(),
             },

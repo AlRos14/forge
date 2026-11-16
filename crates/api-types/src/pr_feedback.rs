@@ -34,6 +34,13 @@ pub struct PrFeedbackPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct PrFeedbackPolicyResponse {
+    pub policy: PrFeedbackPolicy,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct UpdatePrFeedbackPolicyRequest {

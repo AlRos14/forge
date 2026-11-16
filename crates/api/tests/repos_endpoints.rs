@@ -7,7 +7,7 @@ use std::{
 };
 
 use api::{build_router, AppState};
-use api_types::{ProjectResponse, RepoResponse};
+use api_types::{ProjectResponse, ProviderEntryResponse, RepoResponse};
 use axum::{
     body::{to_bytes, Body},
     http::{Method, Request, StatusCode},
@@ -208,6 +208,82 @@ async fn create_pull_request_repo_persists_provider_config() {
         .pr_provider_status
         .as_ref()
         .is_some_and(|status| !status.has_credential));
+    assert!(repo
+        .pr_provider_status
+        .as_ref()
+        .is_some_and(
+            |status| status.credential_handle_id.is_none() && status.credential_label.is_none()
+        ));
+}
+
+#[tokio::test]
+async fn create_repo_attaches_owned_github_credential_in_the_create_transaction() {
+    let (app, db) = test_app_with_db().await;
+    let project: ProjectResponse = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({ "name": "repo-pr-credential-create" }),
+        StatusCode::OK,
+    )
+    .await;
+    let credential: ProviderEntryResponse = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/providers",
+        json!({
+            "provider": "github",
+            "label": "Create-time GitHub",
+            "credential": "ghp-create-time-secret"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let repo: RepoResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name": "credential-repo",
+            "remote_url": "https://github.com/acme/credential-repo.git",
+            "default_branch": "main",
+            "work_mode": "pull_request",
+            "pr_provider": "github",
+            "pr_provider_config": {
+                "credential_id": credential.id.clone(),
+                "polling_interval_seconds": 42
+            }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let status = repo.pr_provider_status.expect("provider status");
+    assert!(status.has_credential);
+    assert_eq!(
+        status.credential_handle_id.as_deref(),
+        Some(credential.id.as_str())
+    );
+    assert_eq!(
+        status.credential_label.as_deref(),
+        Some("Create-time GitHub")
+    );
+    assert!(!serde_json::to_string(&repo)
+        .expect("repo serializes")
+        .contains("ghp-create-time-secret"));
+    let config = PrProviderConfigRepo::get_by_repo_id(&*db, &repo.id)
+        .await
+        .expect("load provider config")
+        .expect("provider config exists");
+    assert_eq!(
+        config.credential_handle_id.as_deref(),
+        Some(credential.id.as_str())
+    );
+    assert_eq!(
+        config.credential_owner_user_id.as_deref(),
+        Some("test-user-id")
+    );
 }
 
 #[tokio::test]
