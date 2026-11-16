@@ -837,13 +837,6 @@ mod tests {
         let temp = TempDir::new().expect("temporary directory");
         let url = format!("sqlite://{}", temp.path().join("feedback.db").display());
         let fixture = fixture(&url, temp.path()).await;
-        sqlx::query(
-            "UPDATE repo SET remote_url = 'https://github.com/acme/widgets.git' WHERE id = ?",
-        )
-        .bind(&fixture.repo_id)
-        .execute(fixture.db.pool())
-        .await
-        .expect("GitHub-shaped remote");
         let bus = Arc::new(EventBus::new(32));
         let credentials = Arc::new(CredentialService::new(
             Arc::clone(&fixture.db),
@@ -864,6 +857,29 @@ mod tests {
         let merge_id = merge.id().to_owned();
         drop(publish);
         drop(merge);
+        // The shared admission fixture binds the admission to the repository's
+        // original `https://example.invalid/repo.git` URL. Rebind both sides
+        // only after that real admission path has passed its exact identity
+        // guard; this test then exercises GitHub's owner/repo URL parsing.
+        sqlx::query("DROP TRIGGER remote_pr_admission_identity_immutable")
+            .execute(fixture.db.pool())
+            .await
+            .expect("temporarily relax fixture admission identity");
+        sqlx::query("UPDATE repo SET remote_url = ? WHERE id = ?")
+            .bind("https://github.com/acme/widgets.git")
+            .bind(&fixture.repo_id)
+            .execute(fixture.db.pool())
+            .await
+            .expect("GitHub-shaped remote");
+        sqlx::query(
+            "UPDATE remote_pr_admission SET remote_repo_identity = ?
+             WHERE task_merge_operation_id = ?",
+        )
+        .bind("https://github.com/acme/widgets.git")
+        .bind(&merge_id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("GitHub-shaped admitted remote");
         crate::pr_service::PrReconciler::new(Arc::clone(&fixture.db), bus, None)
             .with_provider_for_test(Arc::new(NumberedProvider))
             .reconcile_once()

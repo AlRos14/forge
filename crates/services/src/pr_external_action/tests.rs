@@ -959,21 +959,55 @@ async fn pr_external_action_executor_creates_the_missing_readmission_push() {
 
 async fn summary_artifact(r: &Rig) -> (String, String) {
     let id = new_uuid_v4();
+    let producer_execution_id = new_uuid_v4();
     let summary = build_pr_feedback_summary(&[], &id);
-    exec(
-        &r.w.db,
+    let actor_id: String = sqlx::query_scalar(
+        "SELECT project.owner_id FROM task
+         JOIN project ON project.id = task.project_id WHERE task.id = ?",
+    )
+    .bind(&r.w.task_id)
+    .fetch_one(r.w.db.pool())
+    .await
+    .expect("Task's valid Human actor");
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO execution (
+            id, task_id, status, created_at, updated_at, actor_kind, actor_id
+         ) VALUES (?, ?, 'completed', ?, ?, 'human', ?)",
+    )
+    .bind(&producer_execution_id)
+    .bind(&r.w.task_id)
+    .bind(&now)
+    .bind(&now)
+    .bind(&actor_id)
+    .execute(r.w.db.pool())
+    .await
+    .expect("summary producer Execution");
+    let mut tx = r.w.db.pool().begin().await.expect("Artifact transaction");
+    sqlx::query(
+        "INSERT INTO artifact_execution_producer (artifact_id, execution_id, task_id)
+         VALUES (?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&producer_execution_id)
+    .bind(&r.w.task_id)
+    .execute(&mut *tx)
+    .await
+    .expect("Artifact producer");
+    sqlx::query(
         "INSERT INTO artifact (id, task_id, kind, storage_kind, content, metadata_json,
             digest, created_at)
          VALUES (?, ?, 'summary', 'inline', ?, '{}', ?, ?)",
-        &[
-            &id,
-            &r.w.task_id,
-            &summary.text,
-            &summary.digest,
-            &now_rfc3339(),
-        ],
     )
-    .await;
+    .bind(&id)
+    .bind(&r.w.task_id)
+    .bind(&summary.text)
+    .bind(&summary.digest)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .expect("summary Artifact");
+    tx.commit().await.expect("Artifact and producer commit");
     (id, summary.text)
 }
 

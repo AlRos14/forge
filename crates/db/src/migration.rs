@@ -81,6 +81,7 @@ use std::{
 // dispositions, so external-feedback rework runs on the same Task and the same open PR.
 // V177 lets a Proposal target a PR external action (human_approval for push_update/post_comment).
 // V178 admits only unallocated external-feedback triage Executions on Merging Tasks.
+// V179 preserves the exact PR rework lifecycle receipt when a superseded PR closes remotely.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
