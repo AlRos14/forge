@@ -186,8 +186,7 @@ async fn create_pull_request_repo_persists_provider_config() {
             "pr_provider": "gitlab",
             "pr_provider_config": {
                 "base_url": "https://gitlab.example.com",
-                "polling_interval_seconds": 42,
-                "token": "test-token"
+                "polling_interval_seconds": 42
             }
         }),
         StatusCode::OK,
@@ -204,7 +203,11 @@ async fn create_pull_request_repo_persists_provider_config() {
         Some("https://gitlab.example.com")
     );
     assert_eq!(config.polling_interval_seconds, 42);
-    assert_eq!(config.token_secret_ref.as_deref(), Some("test-token"));
+    assert!(config.token_secret_ref.is_none());
+    assert!(repo
+        .pr_provider_status
+        .as_ref()
+        .is_some_and(|status| !status.has_credential));
 }
 
 #[tokio::test]

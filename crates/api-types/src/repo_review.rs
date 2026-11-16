@@ -100,7 +100,7 @@ pub struct RepoResponse {
 #[ts(export)]
 pub struct PrProviderStatus {
     pub provider_type: String,
-    pub has_token: bool,
+    pub has_credential: bool,
     #[ts(type = "number")]
     pub polling_interval_seconds: i64,
 }

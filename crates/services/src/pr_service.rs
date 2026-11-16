@@ -4,13 +4,15 @@ use crate::pr_github_client::{DefaultPrProviderFactory, GitHubClient, PrProvider
 use crate::pr_rework::PrReworkService;
 use crate::{DomainEventService, Result, ServiceError};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use db::{
-    now_rfc3339, GateEvaluationOutcome, GateRepo, PrMetadata, PrMetadataRepo, PrReworkRepo,
-    PrReworkState, RemotePrAdmission, Repo, SqliteDb, Task, TaskIntegrationOperationKind,
-    TaskIntegrationOperationRepo, TaskLifecycleRepo, TaskLifecycleState, TaskMetadata, TaskRepo,
-    TransitionPrReworkSupersession,
+    now_rfc3339, DbError, GateEvaluationOutcome, GateRepo, PrMetadata, PrMetadataRepo,
+    PrReworkRepo, PrReworkState, RemotePrAdmission, Repo, SqliteDb, Task,
+    TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskLifecycleRepo,
+    TaskLifecycleState, TaskMetadata, TaskRepo, TransitionPrReworkSupersession,
 };
 use events::EventBus;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
 use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
@@ -141,6 +143,42 @@ pub struct PrService {
     provider_override: Option<Arc<dyn PrProvider>>,
 }
 
+/// Task-wide feedback read projection. The underlying feedback repository is
+/// keyed by PR admission, while the public API and MCP contracts are Task-wide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskPrFeedbackItem {
+    pub id: String,
+    pub task_id: String,
+    pub admission_id: String,
+    pub provider_item_id: String,
+    pub kind: String,
+    pub author_login: String,
+    pub author_association: String,
+    pub review_state: Option<String>,
+    pub path: Option<String>,
+    pub line: Option<i64>,
+    pub commit_sha: Option<String>,
+    pub body: String,
+    pub body_truncated: bool,
+    pub body_digest: String,
+    pub provider_url: Option<String>,
+    pub trust_class: String,
+    pub head_state: String,
+    pub disposition: Option<String>,
+    pub dismiss_reason: Option<String>,
+    pub scope_classification: Option<String>,
+    pub human_decision_id: Option<String>,
+    pub followup_task_id: Option<String>,
+    pub ingested_at: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TaskPrFeedbackCursor {
+    ingested_at: String,
+    id: String,
+}
+
 impl PrService {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
         Self {
@@ -151,6 +189,124 @@ impl PrService {
             #[cfg(test)]
             provider_override: None,
         }
+    }
+
+    /// List all provider feedback for a Task across its PR admissions. This
+    /// read accessor is needed because the durable feedback repository is
+    /// intentionally scoped to one admission at a time.
+    pub async fn list_task_external_feedback(
+        &self,
+        task_id: &str,
+        cursor: Option<String>,
+        requested_limit: i64,
+    ) -> Result<db::Page<TaskPrFeedbackItem>> {
+        let after = match cursor {
+            Some(cursor) => {
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(cursor)
+                    .map_err(|_| ServiceError::Db(DbError::InvalidCursor))?;
+                let value: TaskPrFeedbackCursor = serde_json::from_slice(&bytes)
+                    .map_err(|_| ServiceError::Db(DbError::InvalidCursor))?;
+                if value.ingested_at.trim().is_empty() || value.id.trim().is_empty() {
+                    return Err(ServiceError::Db(DbError::InvalidCursor));
+                }
+                Some(value)
+            }
+            None => None,
+        };
+        let limit = requested_limit.clamp(1, 100);
+        let query = "SELECT i.id, i.task_id, i.admission_id, i.provider_item_id, i.kind,
+                    i.author_login, i.author_association, i.review_state, i.path, i.line,
+                    i.commit_sha, i.body, i.body_truncated, i.body_digest, i.provider_url,
+                    i.trust_class, i.head_state, i.ingested_at,
+                    d.disposition, d.dismiss_reason, d.scope_classification,
+                    d.human_decision_id, d.followup_task_id
+             FROM external_feedback_item i
+             LEFT JOIN task_external_feedback_disposition d ON d.id = (
+                 SELECT latest.id FROM task_external_feedback_disposition latest
+                 WHERE latest.feedback_item_id = i.id
+                 ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+             )
+             WHERE i.task_id = ?";
+        let sql = if after.is_some() {
+            format!(
+                "{query} AND (i.ingested_at < ? OR (i.ingested_at = ? AND i.id < ?))
+                 ORDER BY i.ingested_at DESC, i.id DESC LIMIT ?"
+            )
+        } else {
+            format!("{query} ORDER BY i.ingested_at DESC, i.id DESC LIMIT ?")
+        };
+        let mut query = sqlx::query(&sql).bind(task_id);
+        if let Some(after) = &after {
+            query = query
+                .bind(&after.ingested_at)
+                .bind(&after.ingested_at)
+                .bind(&after.id);
+        }
+        let rows = query
+            .bind(limit + 1)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(DbError::from)?;
+        let has_more = rows.len() > limit as usize;
+        let items = rows
+            .into_iter()
+            .take(limit as usize)
+            .map(|row| {
+                Ok(TaskPrFeedbackItem {
+                    id: row.try_get("id").map_err(DbError::from)?,
+                    task_id: row.try_get("task_id").map_err(DbError::from)?,
+                    admission_id: row.try_get("admission_id").map_err(DbError::from)?,
+                    provider_item_id: row.try_get("provider_item_id").map_err(DbError::from)?,
+                    kind: row.try_get("kind").map_err(DbError::from)?,
+                    author_login: row.try_get("author_login").map_err(DbError::from)?,
+                    author_association: row.try_get("author_association").map_err(DbError::from)?,
+                    review_state: row.try_get("review_state").map_err(DbError::from)?,
+                    path: row.try_get("path").map_err(DbError::from)?,
+                    line: row.try_get("line").map_err(DbError::from)?,
+                    commit_sha: row.try_get("commit_sha").map_err(DbError::from)?,
+                    body: row.try_get("body").map_err(DbError::from)?,
+                    body_truncated: row
+                        .try_get::<i64, _>("body_truncated")
+                        .map_err(DbError::from)?
+                        != 0,
+                    body_digest: row.try_get("body_digest").map_err(DbError::from)?,
+                    provider_url: row.try_get("provider_url").map_err(DbError::from)?,
+                    trust_class: row.try_get("trust_class").map_err(DbError::from)?,
+                    head_state: row.try_get("head_state").map_err(DbError::from)?,
+                    disposition: row.try_get("disposition").map_err(DbError::from)?,
+                    dismiss_reason: row.try_get("dismiss_reason").map_err(DbError::from)?,
+                    scope_classification: row
+                        .try_get("scope_classification")
+                        .map_err(DbError::from)?,
+                    human_decision_id: row.try_get("human_decision_id").map_err(DbError::from)?,
+                    followup_task_id: row.try_get("followup_task_id").map_err(DbError::from)?,
+                    ingested_at: row.try_get("ingested_at").map_err(DbError::from)?,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, DbError>>()?;
+        let next_cursor = if has_more {
+            let last = items
+                .last()
+                .ok_or_else(|| ServiceError::Db(DbError::InvalidCursor))?;
+            let cursor = TaskPrFeedbackCursor {
+                ingested_at: last.ingested_at.clone(),
+                id: last.id.clone(),
+            };
+            Some(
+                URL_SAFE_NO_PAD.encode(
+                    serde_json::to_vec(&cursor)
+                        .map_err(|_| ServiceError::Db(DbError::InvalidCursor))?,
+                ),
+            )
+        } else {
+            None
+        };
+        Ok(db::Page {
+            items,
+            next_cursor,
+            total_count: None,
+        })
     }
 
     /// Credential source for the frozen admission's GitHub handle. Without

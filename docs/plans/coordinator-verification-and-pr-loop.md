@@ -1520,7 +1520,7 @@ plan). Los pasos están en una lista enfocada de `cargo test` (jobs `build` y
 fase añade, en pasos nuevos con `if: ${{ !cancelled() }}`:
 
 - Fase 1: `cargo test --locked -p db --lib v171_ v172_ v174_` (libtest admite varios filtros; un paso por crate/target), `cargo test --locked -p services --lib validation_catalog`, `... validation_check_runner`, `... human_decision`, `... coordinator_outputs`, `... validation_post_integration`, `cargo test --locked -p api --test coordinator_verification_pr_loop` (añadido a la lista `--test` del paso final de `api`), y los tests de `gate_engine_api` (`--test gate_engine_api` si no figura ya en la lista).
-- Fase 2: `-p db --lib v173_ v175_`, `-p services --lib pr_github_client`, `pr_feedback`, `pr_external_action`, `pr_rework_`, `pr_feedback_followup`, y el mismo `--test coordinator_verification_pr_loop`.
+- Fase 2: `-p db --lib v173_ v175_`, `-p services --lib pr_github_client`, `pr_feedback`, `pr_external_action`, `pr_rework_`, `pr_feedback_followup`, `-p api --test coordinator_verification_pr_loop` y `-p mcp-server --lib mcp_pr_feedback_`.
 - Fase 3: `-p db --lib v176_`, `-p services --lib fallback`, `micro_fix`.
 - El job de clippy ya cubre `services db cli-adapters api api-types mcp-server executors`; no cambia. `pnpm lint/test` y el browser smoke ya incluyen los tests web nuevos si siguen el patrón `*.test.ts(x)`.
 - Todo test nuevo debe tener prefijo/nombre que coincida con su filtro; T lo verifica contra la lista del workflow.
@@ -1622,7 +1622,7 @@ Cualquier cambio de contrato vuelve a N0.
 | PX | (Fase 2, nuevo por D3') Pausa no destructiva de admisión y base del rework: **V175** (`pr_rework_supersession`, columnas `rework_outcome`/`supersession_id`/`readmits_supersession_id` en `remote_pr_admission`, `task_external_feedback_disposition`, triggers recreados y nuevos de «Congelado 11» §11.2), repos `sqlite/pr_rework.rs`, `PrReworkService::{supersede_for_rework, resume_after_supersession, observe_remote}`, `LifecycleCause::PrFeedbackRework` (recibo `pr_feedback_rework`), exclusión `rework_outcome IS NULL` en selecciones de P1, actualización de `pr_lifecycle_spike_*`. Pruebas `v175_*` y `pr_rework_*`. | N0, A3, P0 | ver Congelado 10 | **IMPLEMENTADO / NOT RUN** (ver «Anexo PX») |
 | P3 | (Fase 2, redefinido por D3') Re-admisión sobre la misma PR (`find_open_pr_by_head`, `publish_pr` con `readmits_supersession_id`), `push_update` dentro de la admisión nueva (fast-forward, `expected_remote_head_sha`), `post_comment` del resumen de triage (también sobre admisión superseded), `PrReworkWatcher` (merge/cierre remoto durante rework, §11.6); Gate exacto, autorización por política congelada/Decisión (D5), idempotencia, `OutcomeUnknown`, recuperación; el merge nunca. | P0, PX, A3, C3 | `pr_external_action.rs`, `pr_service.rs`, `pr_github_client.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo P3) |
 | RT | (Fases 1–3, una pasada por fase) Cableado único y ordenado de las salidas nuevas en el runtime y coordinación; contexto exacto de validación y feedback; políticas `allowed_actions`. | R1, D1, M1, C2, P2 | `orchestrator_runtime.rs`, `task_coordination.rs` | **Fase 1 IMPLEMENTADO / NOT RUN** (ver Anexo RT); **fase 2 IMPLEMENTADO / NOT RUN** (ver Anexo RT fase 2; V178 añadida); fase 3 TODO |
-| API | (por fase) REST, MCP, SSE, DTOs, tipos generados, `forge-ctl` si procede. Ver «Contratos públicos». | RT, D1, C3, P3 | ver L6 | **FASE 1 IMPLEMENTADA / NOT RUN** (ver Anexo API fase 1); fases 2–3 TODO |
+| API | (por fase) REST, MCP, SSE, DTOs, tipos generados, `forge-ctl` si procede. Ver «Contratos públicos». | RT, D1, C3, P3 | ver L6 | **FASE 1 IMPLEMENTADA / NOT RUN** (ver Anexo API fase 1); **FASE 2 IMPLEMENTADA / NOT RUN** (ver Anexo API fase 2); fase 3 TODO |
 | UI | (por fase) Paneles de decisión humana, checks (catálogo, solicitudes, comparación base), feedback de PR, estados de fallback/micro-fix en la journey. | API (fixtures desde N0) | ver L7 | **TODO** |
 | T | (por fase) Tests escritos contra interfaces congeladas (ver plan de pruebas). | N0 | ver L8 | **TODO** |
 | I | (por fase) Integración por ownership, revisión independiente estática, `cargo fmt --check` y `git diff --check` sin compilar. | todo lo anterior | root | **TODO** |
@@ -2478,3 +2478,47 @@ Límite de evidencia: no hay aceptación contra GitHub real ni resultado CI en
 este cambio. La política predeterminada mantiene `post_summary=off` y
 `push_corrections=human_approval`; acciones automáticas requieren configuración
 congelada explícita. El merge sigue siendo humano.
+
+## Anexo API (fase 2) — REST, MCP, SSE y tipos (IMPLEMENTADO / NOT RUN)
+
+Implementación contra «Congelado 6», «Congelado 7», «Congelado 9» y
+«Congelado 11» §§11.8–11.9; no se ejecutó Cargo ni pnpm localmente. REST usa
+`GET/PUT /repos/{id}/pr-feedback-policy`, los listados de Task
+`GET /tasks/{id}/pr-feedback`, `/pr-rework` y `/pr-actions`, y las decisiones
+humanas `POST /tasks/{id}/pr-actions/{action_id}/approve|reject`. Los listados
+devuelven `items` y cursor opaco. Las decisiones validan `expected_version` y
+delegan la Proposal/Decision exacta a `PrExternalActionService`.
+
+Credenciales SCM: `POST /providers` acepta `github` vía
+`CredentialService::connect_scm_credential`; `GET /providers?purpose=scm` lista
+solo handles SCM. `PATCH /repos/{id}` enlaza o limpia `credential_id` mediante
+`PrProviderSettingsService::set_credential`; `PrProviderStatus.has_credential`
+reemplaza `has_token`. `token` y `token_secret_ref` dan
+`400 repo.pr_provider_token_retired`. La política usa
+`PrProviderSettingsService::set_feedback_policy`; handles ajenos son rechazados
+por la autoridad existente.
+
+Lecturas y proyecciones: REST pagina por keyset `(created_at,id)` para rework y
+acciones y `(ingested_at,id)` para feedback; MCP reutiliza
+`PrReworkRepo::list_supersessions_by_task` y
+`PrExternalActionRepo::list_pr_external_actions_by_task`. Un accessor de solo
+lectura `PrService::list_task_external_feedback` permite la vista Task-wide
+(el repositorio de feedback existente está limitado a una admisión). SSE
+proyecta `task.pr_feedback_ingested`, `task.pr_feedback_triaged`,
+`task.pr_action_requested`, `task.pr_action_completed`,
+`task.pr_rework_superseded`, `task.pr_rework_resumed`,
+`task.pr_rework_converged` y `task.pr_followup_proposed`, con allowlist de ids,
+digests, heads y estados. MCP incorpora los tres listados congelados:
+`forge_list_task_pr_feedback`, `forge_list_task_pr_actions` y
+`forge_list_task_pr_rework`; siguen siendo de solo lectura y pasan por el scope
+exacto de Task.
+
+Los DTOs de `api-types/src/pr_feedback.rs` están registrados en el export list
+de `api-types/src/lib.rs`; los bindings de `web/src/types/generated/bindings`
+siguen el formato ts-rs. `docs/api.md` y CHANGELOG Unreleased documentan el
+contrato y la ruptura de token. Tests añadidos/actualizados: API
+`coordinator_verification_pr_loop`, `pr12_public_surface` y `repos_endpoints`;
+MCP `mcp_pr_feedback_`; el workflow los recoge. La prueba API de conflicto de
+versión usa una fila sintética para comprobar el preflight HTTP 409; no prueba
+una carrera entre el preflight y la transición del servicio. CI debe validar
+build, formatos ts-rs y tests antes de aceptación.

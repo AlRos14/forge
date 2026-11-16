@@ -504,6 +504,31 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/tasks/{id}/human-decisions/{decision_id}/answer",
             post(routes::human_decisions::answer_task_decision),
         )
+        .route(
+            "/api/v1/tasks/{id}/pr-feedback",
+            get(routes::pr_feedback::list_task_feedback),
+        )
+        .route(
+            "/api/v1/tasks/{id}/pr-rework",
+            get(routes::pr_feedback::list_task_rework),
+        )
+        .route(
+            "/api/v1/tasks/{id}/pr-actions",
+            get(routes::pr_feedback::list_task_actions),
+        )
+        .route(
+            "/api/v1/tasks/{id}/pr-actions/{action_id}/approve",
+            post(routes::pr_feedback::approve_task_action),
+        )
+        .route(
+            "/api/v1/tasks/{id}/pr-actions/{action_id}/reject",
+            post(routes::pr_feedback::reject_task_action),
+        )
+        .route(
+            "/api/v1/repos/{id}/pr-feedback-policy",
+            get(routes::pr_feedback::get_repo_feedback_policy)
+                .put(routes::pr_feedback::set_repo_feedback_policy),
+        )
         .route("/api/v1/evidence/{id}", get(routes::reviews::get_evidence))
         .route(
             "/api/v1/notifications",

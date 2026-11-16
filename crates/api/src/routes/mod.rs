@@ -36,6 +36,7 @@ pub mod members;
 pub mod notifications;
 pub mod oauth;
 pub mod operations;
+pub mod pr_feedback;
 pub mod project_copilot;
 pub mod project_media;
 pub mod project_plan;

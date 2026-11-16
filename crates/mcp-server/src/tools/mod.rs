@@ -187,6 +187,15 @@ pub(crate) async fn dispatch_tool(
         "forge_list_task_human_decisions" => {
             verification::forge_list_task_human_decisions(state, arguments).await
         }
+        "forge_list_task_pr_feedback" => {
+            verification::forge_list_task_pr_feedback(state, arguments).await
+        }
+        "forge_list_task_pr_actions" => {
+            verification::forge_list_task_pr_actions(state, arguments).await
+        }
+        "forge_list_task_pr_rework" => {
+            verification::forge_list_task_pr_rework(state, arguments).await
+        }
         _ => Err(McpToolError::new(-32601, "method not found")),
     }
 }

@@ -288,6 +288,70 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
         "task.human_decision_closed" => {
             project_fields(&source, &["task_id", "decision_id", "state"])
         }
+        "task.pr_feedback_ingested" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "feedback_item_id",
+                "admission_id",
+                "body_digest",
+                "trust_class",
+                "head_state",
+            ],
+        ),
+        "task.pr_feedback_triaged" => project_fields(
+            &source,
+            &["task_id", "request_id", "admission_id", "set_digest"],
+        ),
+        "task.pr_rework_superseded" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "supersession_id",
+                "request_id",
+                "task_merge_operation_id",
+                "provider_pr_id",
+                "superseded_head_sha",
+                "triage_set_digest",
+            ],
+        ),
+        "task.pr_rework_resumed" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "supersession_id",
+                "request_id",
+                "state",
+                "readmission_merge_operation_id",
+            ],
+        ),
+        "task.pr_rework_converged" => project_fields(
+            &source,
+            &["task_id", "supersession_id", "outcome", "decision_id"],
+        ),
+        "task.pr_followup_proposed" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "disposition_id",
+                "human_decision_id",
+                "followup_task_id",
+                "state",
+            ],
+        ),
+        "pr.external_action_created"
+        | "pr.external_action_approved"
+        | "pr.external_action_running"
+        | "pr.external_action_outcome_unknown" => {
+            project_fields(&source, &["task_id", "action_id", "admission_id", "state"])
+        }
+        "pr.external_action_rejected"
+        | "pr.external_action_succeeded"
+        | "pr.external_action_failed"
+        | "pr.external_action_reconciliation_required"
+        | "pr.external_action_abandoned" => {
+            project_fields(&source, &["task_id", "action_id", "admission_id", "state"])
+        }
         // In particular, legacy Review-row events are not current Review
         // authority and never enter the public stream.
         _ => return None,
@@ -400,6 +464,21 @@ fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
         "task.human_decision_requested" => PublicEventType::TaskHumanDecisionRequested,
         "task.human_decision_answered" => PublicEventType::TaskHumanDecisionAnswered,
         "task.human_decision_closed" => PublicEventType::TaskHumanDecisionClosed,
+        "task.pr_feedback_ingested" => PublicEventType::TaskPrFeedbackIngested,
+        "task.pr_feedback_triaged" => PublicEventType::TaskPrFeedbackTriaged,
+        "task.pr_rework_superseded" => PublicEventType::TaskPrReworkSuperseded,
+        "task.pr_rework_resumed" => PublicEventType::TaskPrReworkResumed,
+        "task.pr_rework_converged" => PublicEventType::TaskPrReworkConverged,
+        "task.pr_followup_proposed" => PublicEventType::TaskPrFollowupProposed,
+        "pr.external_action_created"
+        | "pr.external_action_approved"
+        | "pr.external_action_running"
+        | "pr.external_action_outcome_unknown" => PublicEventType::TaskPrActionRequested,
+        "pr.external_action_rejected"
+        | "pr.external_action_succeeded"
+        | "pr.external_action_failed"
+        | "pr.external_action_reconciliation_required"
+        | "pr.external_action_abandoned" => PublicEventType::TaskPrActionCompleted,
         _ => return None,
     })
 }
@@ -598,6 +677,32 @@ mod tests {
         assert_eq!(payload["plan_artifact_id"], "artifact-1");
         assert!(payload.get("content").is_none());
         assert!(payload.get("objective").is_none());
+    }
+
+    #[test]
+    fn pr_feedback_and_action_events_project_only_safe_facts() {
+        let action = domain_event(
+            "pr.external_action_created",
+            r#"{"task_id":"task-1","action_id":"action-1","admission_id":"admission-1","state":"proposed","body":"provider text","token":"secret"}"#,
+        );
+        let projected = project_domain_event(&action).expect("PR action event is public");
+        assert_eq!(projected.event_type, PublicEventType::TaskPrActionRequested);
+        let payload = projected.payload.expect("action payload");
+        assert_eq!(payload["action_id"], "action-1");
+        assert_eq!(payload["state"], "proposed");
+        assert!(payload.get("body").is_none());
+        assert!(payload.get("token").is_none());
+
+        let triage = domain_event(
+            "task.pr_feedback_triaged",
+            r#"{"task_id":"task-1","request_id":"request-1","admission_id":"admission-1","set_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","rationale":"private rationale","body":"provider text"}"#,
+        );
+        let projected = project_domain_event(&triage).expect("PR triage event is public");
+        assert_eq!(projected.event_type, PublicEventType::TaskPrFeedbackTriaged);
+        let payload = projected.payload.expect("triage payload");
+        assert_eq!(payload["set_digest"], json!("a".repeat(64)));
+        assert!(payload.get("rationale").is_none());
+        assert!(payload.get("body").is_none());
     }
 
     #[test]

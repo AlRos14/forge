@@ -864,6 +864,9 @@ fn tools_list_returns_descriptors() {
             "forge_list_task_validation_check_requests",
             "forge_list_task_validation_comparisons",
             "forge_list_task_human_decisions",
+            "forge_list_task_pr_feedback",
+            "forge_list_task_pr_actions",
+            "forge_list_task_pr_rework",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -881,6 +884,29 @@ fn tools_list_returns_descriptors() {
             .expect("follow-up required params are an array")
             .iter()
             .any(|required| required == "idempotency_key"));
+    });
+}
+
+#[test]
+fn mcp_pr_feedback_tools_return_empty_task_scoped_pages() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+
+        for tool in [
+            "forge_list_task_pr_feedback",
+            "forge_list_task_pr_actions",
+            "forge_list_task_pr_rework",
+        ] {
+            let result = call_tool(
+                &state,
+                tool,
+                json!({"task_id": task.id.clone(), "limit": 1}),
+            )
+            .await;
+            assert_eq!(result["items"].as_array().map(Vec::len), Some(0));
+            assert!(result["next_cursor"].is_null());
+        }
     });
 }
 

@@ -103,7 +103,8 @@ the maximum is 100.
 | `DELETE /projects/{id}` | Delete a Project under the existing workspace cleanup contract. |
 | `POST /projects/{id}/pause`, `POST /projects/{id}/resume` | Pause or resume the Project. |
 | `GET /projects/{id}/repos`, `POST /projects/{id}/repos` | List or add repositories. |
-| `GET /repos/{id}`, `PATCH /repos/{id}`, `DELETE /repos/{id}`, `POST /repos/{id}/sync` | Read, update, remove, or sync a repository. `PATCH` can set `pr_provider` and its polling/base URL configuration; setting the provider to `null` removes the provider configuration. Blank token input leaves the saved credential unchanged. Responses expose provider type, token presence, and polling interval without returning the secret. Deleting a Repo with any associated Task returns `409 repo_in_use` and leaves the Repo, primary-Repo selection, and Tasks intact. Deleting a Task-free Repo returns `204` and clears its primary-Repo selection atomically. |
+| `GET /repos/{id}`, `PATCH /repos/{id}`, `DELETE /repos/{id}`, `POST /repos/{id}/sync` | Read, update, remove, or sync a repository. `PATCH` can set `pr_provider`, polling/base URL configuration, and `pr_provider_config.credential_id`; setting the provider to `null` removes its configuration. The credential handle must be a GitHub SCM handle owned by the authenticated Project owner/admin. Responses expose `has_credential` and polling interval, never a secret. Sending `token` or `token_secret_ref` returns `400 repo.pr_provider_token_retired`. Deleting a Repo with any associated Task returns `409 repo_in_use` and leaves the Repo, primary-Repo selection, and Tasks intact. Deleting a Task-free Repo returns `204` and clears its primary-Repo selection atomically. |
+| `GET /repos/{id}/pr-feedback-policy`, `PUT /repos/{id}/pr-feedback-policy` | Read or replace the PR feedback policy; owner/admin only. PUT accepts `{expected_updated_at?, policy}` and validates schema version, polling limit, trusted associations and logins. Policy changes do not widen existing PR admissions. A stale timestamp returns `409 pr_feedback.policy_version_conflict`; invalid policy returns `400 pr_feedback.policy_invalid`. |
 | `GET /projects/{id}/project_hook_runs` | Read generic Project hook run history. |
 | `GET /projects/{id}/media`, `POST /projects/{id}/media` | List or upload Project media. |
 | `GET /projects/{id}/media/{asset_id}` | Read an exact media asset. |
@@ -489,6 +490,36 @@ ValidationRuns and Evidence are distinct from ReviewReports. A Gate consumes
 exact input facts and immutable evaluations; it never uses a latest Review or
 ValidationRun lookup.
 
+### PR feedback, rework, and external actions
+
+All Task lists below return `{items, next_cursor}` with opaque keyset cursors and
+`limit` from 1 to 100. Reads require Task visibility. Feedback bodies are
+available only through the Task read; SSE projections contain no provider text.
+
+| Method and path | Contract |
+| --- | --- |
+| `GET /tasks/{id}/pr-feedback` | List feedback across the Task's PR admissions, including trust class, head state, disposition, dismiss reason, scope classification, human decision ID, and follow-up Task ID. |
+| `GET /tasks/{id}/pr-rework` | List PR rework supersessions with their state, PR identity, head, and exact convergence decision reference. |
+| `GET /tasks/{id}/pr-actions` | List durable external PR actions. Optional `state` filters by action state. Responses expose identifiers, digests, authorization/state and version; no provider result body or secret. |
+| `POST /tasks/{id}/pr-actions/{action_id}/approve`, `POST /tasks/{id}/pr-actions/{action_id}/reject` | Human owner/admin decision on a proposed `human_approval` action. Body `{expected_version, note?, idempotency_key}`. Forge records the exact Proposal Decision; the merge remains a human operation. Stale versions return `409 pr_action.version_conflict`; unauthorized or non-proposed actions return typed `403`/`409` errors. |
+
+`POST /providers` accepts `provider: "github"` to connect a GitHub SCM
+credential. The `credential` is accepted only in the request body and is never
+returned. `GET /providers?purpose=scm` lists SCM handles; the unfiltered model
+provider list excludes them. A repository references a handle with
+`PATCH /repos/{id}` and `pr_provider_config.credential_id`; Forge checks both
+Project administration and credential ownership. `PrProviderStatus` now reports
+`has_credential`. The retired PR token fields are rejected with
+`400 repo.pr_provider_token_retired`.
+
+The REST and MCP error codes include `credential.invalid`,
+`credential.purpose_invalid`, `credential.owner_not_authorized`,
+`repo.pr_provider_forbidden`, `repo.pr_provider_credential_invalid`,
+`repo.pr_provider_token_retired`, `pr_feedback.policy_invalid`,
+`pr_feedback.policy_forbidden`, `pr_rework.not_authorized`,
+`pr_action.not_authorized`, `pr_action.version_conflict`, and typed `409`
+conflicts for changed policies or actions.
+
 ## WorkUnits and generic collaboration
 
 | Method and path | Contract |
@@ -611,6 +642,12 @@ Public durable event types are:
 - generic collaboration events `message.created`, `handoff.created`,
   `handoff.status_changed`, `proposal.created`, `proposal.withdrawn`, and
   `decision.recorded`.
+- PR feedback events `task.pr_feedback_ingested` and
+  `task.pr_feedback_triaged`; rework events `task.pr_rework_superseded`,
+  `task.pr_rework_resumed`, `task.pr_rework_converged`, and
+  `task.pr_followup_proposed`; external action events
+  `task.pr_action_requested` and `task.pr_action_completed`. Their payloads
+  contain only allowlisted identifiers, digests, heads, kinds and states.
 
 Runtime hint names are `project.created`, `project.updated`, `project.deleted`,
 `project.paused`, `project.resumed`, `project_hook.run_changed`,
@@ -712,7 +749,9 @@ The MCP server advertises only registered tools. The current tool names are:
   `forge_list_task_artifacts`.
 - Verification (read-only): `forge_list_validation_checks`,
   `forge_list_task_validation_check_requests`,
-  `forge_list_task_validation_comparisons`, `forge_list_task_human_decisions`.
+  `forge_list_task_validation_comparisons`, `forge_list_task_human_decisions`,
+  `forge_list_task_pr_feedback`, `forge_list_task_pr_actions`,
+  `forge_list_task_pr_rework`.
   No MCP tool publishes a catalog version, answers a decision, or enqueues a
   check, and none is in the Project Copilot allowlist.
 - Agents and collaboration: `forge_register_agent`, `forge_list_agents`,

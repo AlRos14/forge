@@ -20,6 +20,16 @@ pub enum AgentProviderId {
     OpenAiCompatible,
 }
 
+/// SCM provider name accepted by the provider-entry connection endpoint.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ScmCredentialProvider {
+    #[serde(rename = "github")]
+    #[ts(rename = "github")]
+    Github,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -249,6 +259,19 @@ pub struct CreateProviderEntryRequest {
     pub credential: String,
     /// Required for `openai_compatible`; defaults to the provider's
     /// documented endpoint otherwise.
+    pub base_url: Option<String>,
+}
+
+/// GitHub SCM credential input for `POST /providers`. The token is accepted
+/// only in the request and is never returned in a provider-entry response.
+#[derive(Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ConnectScmCredentialRequest {
+    pub provider: ScmCredentialProvider,
+    pub label: String,
+    pub credential: String,
+    /// Accepted for request compatibility and ignored for SCM handles.
+    #[ts(optional = nullable)]
     pub base_url: Option<String>,
 }
 

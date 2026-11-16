@@ -10,6 +10,13 @@ PR14 audit on 2026-10-16.
 
 ### Breaking
 
+- PR provider credentials now use the SCM credential flow: connect GitHub with
+  `POST /providers`, then reference the owned handle with
+  `pr_provider_config.credential_id`. `PrProviderStatus.has_token` is replaced
+  by `has_credential`. Sending `token` or `token_secret_ref` in repository PR
+  configuration returns `400 repo.pr_provider_token_retired`; remove those
+  fields from clients before updating a repository.
+
 - Task coordination request responses now expose `kind` (`work_unit_plan` or
   `review_findings`) and exact nullable ReviewReport source identifiers/digest.
   Clients must handle the new terminal `triaged` request state; it records a
@@ -112,6 +119,13 @@ PR14 audit on 2026-10-16.
   `task.validation_check_requested|completed`, `task.validation_comparison_recorded`,
   `task.human_decision_requested|answered|closed`. `ValidationRunResponse` and
   coordination request responses gain additive fields. Contract:
+  `docs/plans/coordinator-verification-and-pr-loop.md`.
+- Phase 2 of coordinator verification (API lane): GitHub SCM credential
+  connection and repository credential references; PR feedback policy,
+  task-wide feedback/rework/action reads, human approval/rejection routes,
+  three read-only MCP listing tools, and public PR feedback/rework/action SSE
+  projections. API coverage and focused workflow steps are added; local Cargo
+  and web checks were not run under the phase's validation rule. Contract:
   `docs/plans/coordinator-verification-and-pr-loop.md`.
 - Add an optional Project DAG for work packets, typed proposals with source
   provenance, explicit owner/admin batch authorization, deterministic dependency

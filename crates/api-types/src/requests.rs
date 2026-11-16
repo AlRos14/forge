@@ -252,8 +252,6 @@ pub struct PrProviderConfigRequest {
     #[ts(type = "number | null")]
     #[ts(optional = nullable)]
     pub polling_interval_seconds: Option<i64>,
-    #[ts(optional = nullable)]
-    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -269,7 +267,7 @@ pub struct UpdatePrProviderConfigRequest {
     #[serde(default, deserialize_with = "deserialize_optional_update_field")]
     #[ts(type = "string | null")]
     #[ts(optional)]
-    pub token: Option<Option<String>>,
+    pub credential_id: Option<Option<String>>,
 }
 
 #[cfg(test)]

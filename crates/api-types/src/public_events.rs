@@ -126,6 +126,30 @@ pub enum PublicEventType {
     #[serde(rename = "task.human_decision_closed")]
     #[ts(rename = "task.human_decision_closed")]
     TaskHumanDecisionClosed,
+    #[serde(rename = "task.pr_feedback_ingested")]
+    #[ts(rename = "task.pr_feedback_ingested")]
+    TaskPrFeedbackIngested,
+    #[serde(rename = "task.pr_feedback_triaged")]
+    #[ts(rename = "task.pr_feedback_triaged")]
+    TaskPrFeedbackTriaged,
+    #[serde(rename = "task.pr_rework_superseded")]
+    #[ts(rename = "task.pr_rework_superseded")]
+    TaskPrReworkSuperseded,
+    #[serde(rename = "task.pr_rework_resumed")]
+    #[ts(rename = "task.pr_rework_resumed")]
+    TaskPrReworkResumed,
+    #[serde(rename = "task.pr_rework_converged")]
+    #[ts(rename = "task.pr_rework_converged")]
+    TaskPrReworkConverged,
+    #[serde(rename = "task.pr_followup_proposed")]
+    #[ts(rename = "task.pr_followup_proposed")]
+    TaskPrFollowupProposed,
+    #[serde(rename = "task.pr_action_requested")]
+    #[ts(rename = "task.pr_action_requested")]
+    TaskPrActionRequested,
+    #[serde(rename = "task.pr_action_completed")]
+    #[ts(rename = "task.pr_action_completed")]
+    TaskPrActionCompleted,
     #[serde(rename = "project.created")]
     #[ts(rename = "project.created")]
     ProjectCreated,
@@ -201,6 +225,14 @@ impl PublicEventType {
             Self::TaskHumanDecisionRequested => "task.human_decision_requested",
             Self::TaskHumanDecisionAnswered => "task.human_decision_answered",
             Self::TaskHumanDecisionClosed => "task.human_decision_closed",
+            Self::TaskPrFeedbackIngested => "task.pr_feedback_ingested",
+            Self::TaskPrFeedbackTriaged => "task.pr_feedback_triaged",
+            Self::TaskPrReworkSuperseded => "task.pr_rework_superseded",
+            Self::TaskPrReworkResumed => "task.pr_rework_resumed",
+            Self::TaskPrReworkConverged => "task.pr_rework_converged",
+            Self::TaskPrFollowupProposed => "task.pr_followup_proposed",
+            Self::TaskPrActionRequested => "task.pr_action_requested",
+            Self::TaskPrActionCompleted => "task.pr_action_completed",
             Self::ProjectCreated => "project.created",
             Self::ProjectUpdated => "project.updated",
             Self::ProjectDeleted => "project.deleted",

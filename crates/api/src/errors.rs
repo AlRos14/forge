@@ -266,6 +266,7 @@ impl From<ServiceError> for ApiError {
                 let status = if code.ends_with("not_authorized")
                     || code == "validation.catalog_forbidden"
                     || code == "human_decision.authority_required"
+                    || code == "pr_feedback.policy_forbidden"
                 {
                     StatusCode::FORBIDDEN
                 } else if code.ends_with("host_unavailable") {
@@ -279,6 +280,8 @@ impl From<ServiceError> for ApiError {
                             | "validation.subject_not_resolvable"
                             | "human_decision.invalid_options"
                             | "human_decision.evidence_invalid"
+                            | "pr_feedback.extend_out_of_scope"
+                            | "pr_feedback.plan_without_extend"
                     )
                 {
                     StatusCode::UNPROCESSABLE_ENTITY
@@ -629,6 +632,14 @@ impl From<DbError> for ApiError {
                 message: "invalid pagination cursor".to_owned(),
                 details: None,
             },
+            DbError::PrActionNotAuthorized => Self::forbidden_with_code(
+                "pr_action.not_authorized",
+                "the exact PR admission, frozen policy or Decision does not authorize this action",
+            ),
+            DbError::PrReworkNotAuthorized => Self::forbidden_with_code(
+                "pr_rework.not_authorized",
+                "the exact feedback request and PR admission do not authorize this rework",
+            ),
             DbError::Check(message) => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "check_constraint",
