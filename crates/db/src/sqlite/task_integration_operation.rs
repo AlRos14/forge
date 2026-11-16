@@ -35,10 +35,19 @@ fn map_remote_pr_admission(row: SqliteRow) -> Result<RemotePrAdmission> {
         source_branch: row.try_get("source_branch")?,
         target_branch: row.try_get("target_branch")?,
         admitted_source_sha: row.try_get("admitted_source_sha")?,
-        credential_handle_id: row.try_get("credential_handle_id")?,
-        credential_owner_user_id: row.try_get("credential_owner_user_id")?,
-        feedback_policy_json: row.try_get("feedback_policy_json")?,
-        feedback_policy_digest: row.try_get("feedback_policy_digest")?,
+        rework_outcome: crate::sqlite::try_get_v173_text(&row, "rework_outcome")?,
+        supersession_id: crate::sqlite::try_get_v173_text(&row, "supersession_id")?,
+        readmits_supersession_id: crate::sqlite::try_get_v173_text(
+            &row,
+            "readmits_supersession_id",
+        )?,
+        credential_handle_id: crate::sqlite::try_get_v173_text(&row, "credential_handle_id")?,
+        credential_owner_user_id: crate::sqlite::try_get_v173_text(
+            &row,
+            "credential_owner_user_id",
+        )?,
+        feedback_policy_json: crate::sqlite::try_get_v173_text(&row, "feedback_policy_json")?,
+        feedback_policy_digest: crate::sqlite::try_get_v173_text(&row, "feedback_policy_digest")?,
         state: row.try_get("state")?,
         provider_status: row.try_get("provider_status")?,
         result_classification: row.try_get("result_classification")?,
@@ -483,6 +492,32 @@ async fn finish_merge_lifecycle_in_tx(
     Ok(Some(transition_event))
 }
 
+async fn reset_pr_metadata_for_new_pr(
+    tx: &mut Transaction<'_, Sqlite>,
+    metadata: &CreatePrMetadata,
+    metadata_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE pr_metadata
+         SET provider_type = ?, provider_pr_id = NULL, pr_url = NULL,
+             source_branch = ?, target_branch = ?, pr_state = 'publishing',
+             merge_status = 'pending', task_merge_operation_id = ?,
+             publish_operation_id = ?, last_synced_at = NULL, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&metadata.provider_type)
+    .bind(&metadata.source_branch)
+    .bind(&metadata.target_branch)
+    .bind(&metadata.task_merge_operation_id)
+    .bind(&metadata.publish_operation_id)
+    .bind(&metadata.updated_at)
+    .bind(metadata_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(check_error)?;
+    Ok(())
+}
+
 async fn insert_operation(
     tx: &mut Transaction<'_, Sqlite>,
     input: &CreateTaskIntegrationOperation,
@@ -720,38 +755,65 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                 if previous_admission.task_id != metadata.task_id
                     || previous_admission.metadata_id != metadata_id
                     || previous_admission.publish_operation_id != previous_publish_id
-                    || !matches!(
-                        previous_admission.state.as_str(),
-                        "merged" | "closed" | "head_mismatch" | "publication_failed"
-                    )
                 {
                     return Err(DbError::InvalidTransition);
                 }
-                snapshot_terminal_remote_pr_in_tx(
-                    &mut tx,
-                    &metadata.task_id,
-                    &metadata_id,
-                    &metadata.updated_at,
-                )
-                .await?;
-                sqlx::query(
-                    "UPDATE pr_metadata
-                     SET provider_type = ?, provider_pr_id = NULL, pr_url = NULL,
-                         source_branch = ?, target_branch = ?, pr_state = 'publishing',
-                         merge_status = 'pending', task_merge_operation_id = ?,
-                         publish_operation_id = ?, last_synced_at = NULL, updated_at = ?
-                     WHERE id = ?",
-                )
-                .bind(&metadata.provider_type)
-                .bind(&metadata.source_branch)
-                .bind(&metadata.target_branch)
-                .bind(&metadata.task_merge_operation_id)
-                .bind(&metadata.publish_operation_id)
-                .bind(&metadata.updated_at)
-                .bind(&metadata_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(check_error)?;
+                // V175: an admission paused for rework has no remote result and
+                // no history. While the pause is open the SAME PR stays bound
+                // (provider PR id, URL and state are kept); after the PR was
+                // closed remotely the projection is reset for a new PR.
+                let pause_state: Option<String> = if previous_admission.rework_outcome.is_some() {
+                    match previous_admission.supersession_id.as_deref() {
+                        Some(supersession_id) => sqlx::query_scalar(
+                            "SELECT state FROM pr_rework_supersession WHERE id = ? AND task_id = ?",
+                        )
+                        .bind(supersession_id)
+                        .bind(&metadata.task_id)
+                        .fetch_optional(&mut *tx)
+                        .await?,
+                        None => return Err(DbError::InvalidTransition),
+                    }
+                } else {
+                    None
+                };
+                match pause_state.as_deref() {
+                    Some("open") => {
+                        sqlx::query(
+                            "UPDATE pr_metadata
+                             SET task_merge_operation_id = ?, publish_operation_id = ?,
+                                 updated_at = ?
+                             WHERE id = ?",
+                        )
+                        .bind(&metadata.task_merge_operation_id)
+                        .bind(&metadata.publish_operation_id)
+                        .bind(&metadata.updated_at)
+                        .bind(&metadata_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(check_error)?;
+                    }
+                    Some("remote_closed") => {
+                        reset_pr_metadata_for_new_pr(&mut tx, &metadata, &metadata_id).await?;
+                    }
+                    Some(_) => return Err(DbError::InvalidTransition),
+                    None => {
+                        if !matches!(
+                            previous_admission.state.as_str(),
+                            "merged" | "closed" | "head_mismatch" | "publication_failed"
+                        ) || previous_admission.rework_outcome.is_some()
+                        {
+                            return Err(DbError::InvalidTransition);
+                        }
+                        snapshot_terminal_remote_pr_in_tx(
+                            &mut tx,
+                            &metadata.task_id,
+                            &metadata_id,
+                            &metadata.updated_at,
+                        )
+                        .await?;
+                        reset_pr_metadata_for_new_pr(&mut tx, &metadata, &metadata_id).await?;
+                    }
+                }
                 metadata_id
             }
         } else {
@@ -775,6 +837,14 @@ impl TaskIntegrationOperationRepo for SqliteDb {
             frozen.try_get("credential_owner_user_id")?;
         let frozen_policy_json: String = frozen.try_get("feedback_policy_json")?;
         let frozen_policy_digest = crate::pr_feedback_policy_digest(&frozen_policy_json);
+        // V175: while a pause is open the admission MUST re-admit it (the insert
+        // guard rejects any other admission); otherwise the column stays NULL.
+        let readmits_supersession_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM pr_rework_supersession WHERE task_id = ? AND state = 'open'",
+        )
+        .bind(&remote_admission.task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO remote_pr_admission (
                 task_merge_operation_id, publish_operation_id, metadata_id, task_id,
@@ -784,9 +854,9 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                 state, reconciliation_reason, provider_event_id, observed_head_sha,
                 merged_commit_sha, result_event_id, created_at, updated_at,
                 credential_handle_id, credential_owner_user_id, feedback_policy_json,
-                feedback_policy_digest
+                feedback_policy_digest, readmits_supersession_id
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', NULL,
-                       NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)",
+                       NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&remote_admission.task_merge_operation_id)
         .bind(&remote_admission.publish_operation_id)
@@ -808,6 +878,7 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         .bind(frozen_credential_owner_user_id.as_deref())
         .bind(&frozen_policy_json)
         .bind(&frozen_policy_digest)
+        .bind(readmits_supersession_id.as_deref())
         .execute(&mut *tx)
         .await
         .map_err(check_error)?;

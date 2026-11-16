@@ -1,5 +1,6 @@
 //! Typed coordinator outputs (plan: coordinator-verification-and-pr-loop,
-//! Congelado 4, node R1). Phase 1 covers `request_validation` and `ask_human`.
+//! Congelado 4, node R1). Phase 1 covers `request_validation` and `ask_human`; phase 2 adds the
+//! `external_feedback` triage turn (D3', node P2).
 //!
 //! This module is pure: it parses and validates the frozen JSON shapes and
 //! evaluates the asymmetric action-policy rule. It performs no I/O and does not
@@ -9,11 +10,24 @@
 //! `human_decision_service`.
 
 mod ask_human;
+mod external_feedback;
 mod validation_request;
 
 pub use ask_human::{
     AskHumanOutput, EvidenceKind, EvidenceLink, HumanDecisionOption, MAX_ASK_HUMAN_EVIDENCE_LINKS,
     MAX_ASK_HUMAN_OPTIONS, MAX_QUESTION_BYTES, MIN_ASK_HUMAN_OPTIONS,
+};
+pub use external_feedback::{
+    actor_key, apply_external_feedback_triage, bind_decision_to_disposition,
+    build_pr_feedback_summary, classify_rework_scope, ensure_extend_within_scope,
+    parse_external_feedback_v2, propose_task_ask, ApplyExternalFeedbackTriage, DismissReason,
+    DismissReceipt, ExpectedFeedbackItem, ExpectedFeedbackSet, ExternalFeedbackEntry,
+    ExternalFeedbackPlan, ExternalFeedbackPlanItem, ExternalFeedbackTriageEffects,
+    FeedbackDisposition, FollowUpProposal, HumanItemAsk, HumanItemEffect, ParsedExternalFeedback,
+    PlanProvenance, PrFeedbackSummary, ProposeTaskEffect, RecordedDisposition,
+    ReworkClassification, ReworkScope, ReworkScopeFacts, TaskOriginalScope,
+    CODE_EXTEND_OUT_OF_SCOPE, CODE_PLAN_WITHOUT_EXTEND, MAX_PR_SUMMARY_BYTES,
+    PROPOSAL_OPTION_APPROVE, PROPOSAL_OPTION_REJECT,
 };
 pub use validation_request::{
     CheckPins, RequestValidationOutput, ValidationSubject, ValidationSubjectKind, MAX_REASON_BYTES,

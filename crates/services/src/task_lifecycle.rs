@@ -5,9 +5,9 @@ use std::{collections::HashSet, sync::Arc};
 use api_types::{Actor, SystemComponent};
 use db::{
     new_uuid_v4, now_rfc3339, AgentRepo, CreateDomainEvent, DomainEventRepo, ExecutionRepo,
-    GateEvaluationOutcome, GateRepo, SqliteDb, Task, TaskDispatch, TaskDispatchOperation,
-    TaskDispatchState, TaskDispatchWrite, TaskIntegrationOperationRepo, TaskLifecycle,
-    TaskLifecycleRepo, TaskLifecycleState, TaskLifecycleTransitionWrite, TaskRepo,
+    GateEvaluationOutcome, GateRepo, PrReworkRepo, SqliteDb, Task, TaskDispatch,
+    TaskDispatchOperation, TaskDispatchState, TaskDispatchWrite, TaskIntegrationOperationRepo,
+    TaskLifecycle, TaskLifecycleRepo, TaskLifecycleState, TaskLifecycleTransitionWrite, TaskRepo,
     TransitionTaskDispatch, ValidationRunRepo, WorkUnitIntegrationOutcome, WorkUnitRepo,
     WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceStatus,
 };
@@ -101,6 +101,15 @@ pub enum LifecycleCause {
     MergeOperation(String),
     DomainEvent(String),
     System(SystemComponent),
+    /// D3' same-PR rework pause (`reason_kind = pr_feedback_rework`). The exact
+    /// persisted cause depends on the edge and is resolved from the durable
+    /// `pr_rework_supersession` receipt: `Merging -> Blocked` is caused by its
+    /// abandoned TaskMerge (`merge_operation`) and `Blocked -> Active` by its
+    /// `pr.admission_superseded` event (`domain_event`). The caller must pass
+    /// `reason_kind = pr_feedback_rework` and `reason_ref = supersession_id`.
+    PrFeedbackRework {
+        supersession_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -888,11 +897,52 @@ impl TaskLifecycleService {
             .await
     }
 
+    /// Resolve [`LifecycleCause::PrFeedbackRework`] into the exact durable
+    /// cause of its edge. Every other cause is returned unchanged.
+    async fn resolve_pr_feedback_rework(
+        &self,
+        mut input: TransitionLifecycleInput,
+    ) -> Result<TransitionLifecycleInput> {
+        let LifecycleCause::PrFeedbackRework { supersession_id } = &input.cause else {
+            return Ok(input);
+        };
+        let supersession = PrReworkRepo::get_supersession(&*self.db, supersession_id)
+            .await?
+            .filter(|supersession| supersession.task_id == input.task_id)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "pr_feedback_rework requires its exact supersession of this Task",
+                )
+            })?;
+        if input.reason_kind.as_deref() != Some(db::PR_FEEDBACK_REWORK_REASON_KIND)
+            || input.reason_ref.as_deref() != Some(supersession.id.as_str())
+        {
+            return Err(ServiceError::invalid_operation(
+                "pr_feedback_rework must name its supersession as the reason",
+            ));
+        }
+        input.cause = match input.to_state {
+            TaskLifecycleState::Blocked => {
+                LifecycleCause::MergeOperation(supersession.task_merge_operation_id.clone())
+            }
+            TaskLifecycleState::Active => {
+                LifecycleCause::DomainEvent(supersession.result_event_id.clone())
+            }
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "pr_feedback_rework admits only Merging -> Blocked and Blocked -> Active",
+                ));
+            }
+        };
+        Ok(input)
+    }
+
     async fn transition_inner(
         &self,
         input: TransitionLifecycleInput,
         expected_lifecycle_version: Option<i64>,
     ) -> Result<TaskLifecycleTransitionResult> {
+        let input = self.resolve_pr_feedback_rework(input).await?;
         match (&input.reason_kind, &input.reason_ref) {
             (None, None) => {}
             (Some(kind), Some(reference))
@@ -1152,6 +1202,8 @@ impl TaskLifecycleService {
             LifecycleCause::DomainEvent(id) => DomainEventRepo::get_event(&*self.db, id)
                 .await?
                 .is_some_and(|event| event.scope_type == "task" && event.scope_id == task_id),
+            // Resolved to its exact edge cause before validation.
+            LifecycleCause::PrFeedbackRework { .. } => false,
         };
         if matches_task {
             Ok(())
@@ -1276,6 +1328,11 @@ fn lifecycle_cause(cause: LifecycleCause) -> CauseFields {
         LifecycleCause::WorkUnit(id) => fact_cause("work_unit", id),
         LifecycleCause::MergeOperation(id) => fact_cause("merge_operation", id),
         LifecycleCause::DomainEvent(id) => fact_cause("domain_event", id),
+        // Unreachable after `resolve_pr_feedback_rework`; the receipt trigger
+        // rejects this cause if it ever reaches the database.
+        LifecycleCause::PrFeedbackRework { supersession_id } => {
+            fact_cause("pr_feedback_rework", supersession_id)
+        }
         LifecycleCause::System(component) => CauseFields {
             kind: "system".to_owned(),
             cause_ref: Some(component.to_string()),

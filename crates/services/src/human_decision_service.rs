@@ -16,10 +16,11 @@ use std::sync::Arc;
 use db::{
     new_uuid_v4, now_rfc3339, AnswerHumanDecision, AuthorityEffect, CollaborationRepo,
     CreateDomainEvent, CreateHumanDecisionRequest, CreateTaskCoordinationRequestInput,
-    ExecutionRepo, GateRepo, HumanDecisionRepo, HumanDecisionRequest, HumanDecisionSourceKind,
-    HumanDecisionState, Page, PageRequest, SqliteDb, TaskCoordination, TaskCoordinationMode,
-    TaskCoordinationRepo, TaskCoordinationRequest, TaskCoordinationRequestKind, TaskRepo,
-    ValidationComparisonRepo, ValidationRunRepo, WorkUnitRepo,
+    ExecutionRepo, ExternalFeedbackRepo, GateRepo, HumanDecisionRepo, HumanDecisionRequest,
+    HumanDecisionSourceKind, HumanDecisionState, Page, PageRequest, SqliteDb, TaskCoordination,
+    TaskCoordinationMode, TaskCoordinationRepo, TaskCoordinationRequest,
+    TaskCoordinationRequestKind, TaskRepo, ValidationComparisonRepo, ValidationRunRepo,
+    WorkUnitRepo,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -816,8 +817,22 @@ impl HumanDecisionService {
                     .await?
                     .map(|source| source.task_id)
             }
-            HumanDecisionSourceKind::ExternalFeedback
-            | HumanDecisionSourceKind::CoordinatorReplan => {
+            // P2: the source is the exact ingested feedback item. The
+            // `rework:{supersession_id}` sources of the convergence decision
+            // (D3', 11.6) are validated by their own node (PX/P3).
+            HumanDecisionSourceKind::ExternalFeedback => {
+                if let Some(supersession_id) = source_id.strip_prefix("rework:") {
+                    // PX: the remote-merge convergence decision of a paused PR.
+                    db::PrReworkRepo::get_supersession(&*self.db, supersession_id)
+                        .await?
+                        .map(|supersession| supersession.task_id)
+                } else {
+                    ExternalFeedbackRepo::get_external_feedback_item(&*self.db, source_id)
+                        .await?
+                        .map(|item| item.task_id)
+                }
+            }
+            HumanDecisionSourceKind::CoordinatorReplan => {
                 return Err(ServiceError::invalid_operation(format!(
                     "human decision source {kind} is not available in this phase"
                 )));
@@ -884,9 +899,12 @@ impl HumanDecisionService {
                 None,
             ),
             EvidenceKind::ExternalFeedback => {
-                return Err(invalid(
-                    "external_feedback evidence is not available in this phase",
-                ));
+                let item =
+                    ExternalFeedbackRepo::get_external_feedback_item(&*self.db, &link.id).await?;
+                (
+                    item.as_ref().map(|item| item.task_id.clone()),
+                    item.map(|item| item.body_digest),
+                )
             }
         };
         if found_task.as_deref() != Some(task_id) {

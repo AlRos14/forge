@@ -76,6 +76,9 @@ use std::{
 // V173 adds the GitHub credential reference, the frozen PR feedback policy, the immutable external
 // feedback ledger/set/triage, and PR external actions (applies by version, also after V174).
 // V174 adds structured human decision requests and their exact resume continuation.
+// V175 adds the non-destructive PR admission pause (pr_rework_supersession, additive
+// remote_pr_admission columns, recreated V114/V116/V173 guards) and the per-item feedback
+// dispositions, so external-feedback rework runs on the same Task and the same open PR.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

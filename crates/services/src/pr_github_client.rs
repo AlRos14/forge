@@ -602,7 +602,7 @@ impl GitHubClient {
             .into_iter()
             .map(GitHubPullRequest::from)
             .filter(|pull| pull.head_ref == head_branch)
-            .filter(|pull| base_branch.map_or(true, |base| pull.base_ref == base))
+            .filter(|pull| base_branch.is_none_or(|base| pull.base_ref == base))
             .collect();
         if let Some(position) = pulls.iter().position(|pull| pull.state == "open") {
             return Ok(Some(pulls.swap_remove(position)));

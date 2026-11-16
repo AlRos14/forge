@@ -82,6 +82,7 @@ mod personal_access_token;
 mod pr_external_action;
 mod pr_metadata;
 mod pr_provider_config;
+mod pr_rework;
 mod project;
 mod project_copilot;
 mod project_hook_run;
@@ -241,6 +242,7 @@ fn check_error(error: sqlx::Error) -> DbError {
                 return DbError::VersionConflict;
             }
             "FORGE_PR_ACTION_NOT_AUTHORIZED" => return DbError::PrActionNotAuthorized,
+            "FORGE_PR_REWORK_NOT_AUTHORIZED" => return DbError::PrReworkNotAuthorized,
             "FORGE_VALIDATION_CHECK_STALE_PIN" => return DbError::ValidationCheckStalePin,
             "FORGE_VALIDATION_CHECK_NOT_AUTHORIZED" => {
                 return DbError::ValidationCheckNotAuthorized
@@ -255,6 +257,7 @@ fn check_error(error: sqlx::Error) -> DbError {
             || message.starts_with("SCM credentials cannot back")
             || message.starts_with("SCM credential handle identity")
             || message.starts_with("external feedback requires")
+            || message.starts_with("external feedback disposition")
         {
             return DbError::Check(message.to_owned());
         }
@@ -351,6 +354,16 @@ fn map_repo(row: SqliteRow) -> Result<Repo> {
     })
 }
 
+/// Reads an optional text column added by V173. File-backed historical
+/// migration fixtures map these rows before V173 exists; absence is `None`.
+pub(crate) fn try_get_v173_text(row: &SqliteRow, column: &str) -> Result<Option<String>> {
+    match row.try_get::<Option<String>, _>(column) {
+        Ok(value) => Ok(value),
+        Err(sqlx::Error::ColumnNotFound(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn map_pr_provider_config(row: SqliteRow) -> Result<PrProviderConfig> {
     Ok(PrProviderConfig {
         id: row.try_get("id")?,
@@ -359,9 +372,10 @@ fn map_pr_provider_config(row: SqliteRow) -> Result<PrProviderConfig> {
         base_url: row.try_get("base_url")?,
         polling_interval_seconds: row.try_get("polling_interval_seconds")?,
         token_secret_ref: row.try_get("token_secret_ref")?,
-        credential_handle_id: row.try_get("credential_handle_id")?,
-        credential_owner_user_id: row.try_get("credential_owner_user_id")?,
-        feedback_policy_json: row.try_get("feedback_policy_json")?,
+        credential_handle_id: try_get_v173_text(&row, "credential_handle_id")?,
+        credential_owner_user_id: try_get_v173_text(&row, "credential_owner_user_id")?,
+        feedback_policy_json: try_get_v173_text(&row, "feedback_policy_json")?
+            .unwrap_or_else(|| crate::DEFAULT_PR_FEEDBACK_POLICY_JSON.to_owned()),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

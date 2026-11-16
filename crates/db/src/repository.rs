@@ -3060,6 +3060,102 @@ pub trait ExternalFeedbackRepo: Send + Sync {
         &self,
         feedback_item_id: &str,
     ) -> Result<Option<ExternalFeedbackTriage>>;
+    /// Record the real per-item disposition (V175) next to the V173 triage
+    /// row `input.triage_id` (write both in ONE transaction; the legacy mapping
+    /// is derived from the disposition). Idempotent per `(request, item)`: an
+    /// identical replay returns the existing row, a different one is
+    /// `DbError::IdempotencyConflict`.
+    async fn record_external_feedback_disposition(
+        &self,
+        input: CreateExternalFeedbackDisposition,
+    ) -> Result<ExternalFeedbackDispositionRecord>;
+    async fn record_external_feedback_disposition_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: CreateExternalFeedbackDisposition,
+    ) -> Result<ExternalFeedbackDispositionRecord>;
+    /// The request's dispositions, in item-set order.
+    async fn list_external_feedback_dispositions(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ExternalFeedbackDispositionRecord>>;
+    /// Set-once link to the `human_decision_request` of a `propose_task` or
+    /// `human` item. A different earlier link is `DbError::IdempotencyConflict`.
+    async fn bind_external_feedback_disposition_decision(
+        &self,
+        disposition_id: &str,
+        human_decision_id: &str,
+    ) -> Result<ExternalFeedbackDispositionRecord>;
+    /// Set-once link to the follow-up Task of an approved `propose_task`.
+    async fn bind_external_feedback_disposition_followup(
+        &self,
+        disposition_id: &str,
+        followup_task_id: &str,
+    ) -> Result<ExternalFeedbackDispositionRecord>;
+}
+
+/// Non-destructive pause of an open remote PR admission for same-PR rework
+/// (V175, D3'). These are the only paths that write `pr_rework_supersession`
+/// and the admission pause marker.
+#[async_trait]
+pub trait PrReworkRepo: Send + Sync {
+    /// ONE caller-owned transaction (use `begin_with("BEGIN IMMEDIATE")`):
+    /// verifies the triaged `external_feedback` request (>= 1 `extend_task`),
+    /// the Task's `Merging` lifecycle and its `running` + `remote_waiting`
+    /// TaskMerge with an `open` admission, appends `pr.admission_superseded`,
+    /// inserts the receipt, marks the admission, abandons the TaskMerge and
+    /// moves the Task `Merging -> Blocked` (`pr_feedback_rework`). The PR is
+    /// not touched. Idempotent per TaskMerge (an existing receipt for the same
+    /// request is returned with `created == false`). Rejects with
+    /// `DbError::PrReworkNotAuthorized` / `DbError::VersionConflict`.
+    async fn supersede_admission_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: SupersedeAdmission,
+    ) -> Result<SupersedeAdmissionWrite>;
+    async fn create_supersession(
+        &self,
+        input: SupersedeAdmission,
+    ) -> Result<SupersedeAdmissionWrite>;
+    async fn get_supersession(&self, id: &str) -> Result<Option<PrReworkSupersession>>;
+    async fn get_supersession_by_task_merge(
+        &self,
+        task_merge_operation_id: &str,
+    ) -> Result<Option<PrReworkSupersession>>;
+    /// The Task's single `open` supersession, if any.
+    async fn get_open_supersession_by_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<PrReworkSupersession>>;
+    /// The Task's most recent supersession in any state.
+    async fn get_latest_supersession_by_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<PrReworkSupersession>>;
+    async fn list_supersessions_by_task(
+        &self,
+        task_id: &str,
+        page: &PageRequest,
+    ) -> Result<Page<PrReworkSupersession>>;
+    /// Supersessions in `state` (recovery / watcher sweeps), oldest first.
+    async fn list_supersessions_in_state(
+        &self,
+        state: PrReworkState,
+        limit: i64,
+    ) -> Result<Vec<PrReworkSupersession>>;
+    /// Version-guarded `open -> readmitted|remote_merged|remote_closed|abandoned`
+    /// and `remote_merged -> abandoned`; all other edges are rejected by
+    /// trigger. Idempotent when the receipt already is in `to_state` with the
+    /// same links.
+    async fn transition_supersession(
+        &self,
+        input: TransitionPrReworkSupersession,
+    ) -> Result<PrReworkSupersession>;
+    async fn transition_supersession_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: TransitionPrReworkSupersession,
+    ) -> Result<PrReworkSupersession>;
 }
 
 /// `push_update` / `post_comment` actions against the admitted remote PR (V173).

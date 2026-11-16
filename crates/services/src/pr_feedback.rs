@@ -187,6 +187,7 @@ impl PrFeedbackIngestor {
              FROM remote_pr_admission admission
              LEFT JOIN pr_provider_config config ON config.id = admission.provider_config_id
              WHERE admission.state = 'open'
+               AND admission.rework_outcome IS NULL
                AND admission.feedback_policy_json IS NOT NULL
                AND json_extract(admission.feedback_policy_json, '$.ingest') = 1",
         )

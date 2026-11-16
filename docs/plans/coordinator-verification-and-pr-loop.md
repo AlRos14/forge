@@ -1616,9 +1616,9 @@ Cualquier cambio de contrato vuelve a N0.
 | FB | (Fase 3) Fallback cross-Agent según F-c; cadena y perfiles solo si están en el envelope (D7); sin fallback del coordinador (D8). | A5 | `task_dispatcher/fallback.rs` | **TODO** |
 | P0 | (Fase 2) `GitHubPrProvider` real (`find/create/get_status`) con cliente HTTP, credencial desde `CredentialService` (D4), redacción de errores, pruebas contra servidor simulado local vía costura inyectable. | N0, A3 | `pr_github_client.rs`, `pr_service.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo P0) |
 | P1 | (Fase 2) `PrFeedbackIngestor` + clasificación de confianza + anti-bucle + `stale_head`. | P0, A3 | `pr_feedback.rs`, `pr_service.rs` (registro en `PrReconciler`) | **IMPLEMENTADO / NOT RUN** (ver Anexo P1) |
-| P2 | (Fase 2, redefinido por D3') Triage `external_feedback` **por disposición** (`extend_task|propose_task|human|dismiss`, Congelado 11 §11.1/11.7): parser schema_version 2, `classify_rework_scope`, `apply_external_feedback_triage` (triage V173 con mapeo legado + disposición V175 + `human_decision` + `post_comment`), `FollowUpTaskService` para `propose_task` aprobado; productor/contexto del turno (atomicidad request+origen+presupuesto+evento, replay, pause/revoke/restart) vía RT. | P1, A2, R1, PX | `coordinator_outputs/external_feedback.rs`, `pr_feedback_followup.rs`, `task_coordination.rs` (vía RT) | **TODO** |
+| P2 | (Fase 2, redefinido por D3') Triage `external_feedback` **por disposición** (`extend_task|propose_task|human|dismiss`, Congelado 11 §11.1/11.7): parser schema_version 2, `classify_rework_scope`, `apply_external_feedback_triage` (triage V173 con mapeo legado + disposición V175 + `human_decision` + `post_comment`), `FollowUpTaskService` para `propose_task` aprobado; productor/contexto del turno (atomicidad request+origen+presupuesto+evento, replay, pause/revoke/restart) vía RT. | P1, A2, R1, PX | `coordinator_outputs/external_feedback.rs`, `pr_feedback_followup.rs`, `task_coordination.rs` (vía RT) | **IMPLEMENTADO / NOT RUN** (ver Anexo P2; el cableado del turno sigue en RT) |
 | PS | (Fase 2) Spike de lifecycle D3. | N0 | pruebas `pr_lifecycle_spike_*` | **CERRADO**: veredicto NO VIABLE (Anexo PS); **resuelto por D3'** (usuario, 2026-11-16, opción 1 ampliada). Sus pruebas se actualizan en PX. |
-| PX | (Fase 2, nuevo por D3') Pausa no destructiva de admisión y base del rework: **V175** (`pr_rework_supersession`, columnas `rework_outcome`/`supersession_id`/`readmits_supersession_id` en `remote_pr_admission`, `task_external_feedback_disposition`, triggers recreados y nuevos de «Congelado 11» §11.2), repos `sqlite/pr_rework.rs`, `PrReworkService::{supersede_for_rework, resume_after_supersession, observe_remote}`, `LifecycleCause::PrFeedbackRework` (recibo `pr_feedback_rework`), exclusión `rework_outcome IS NULL` en selecciones de P1, actualización de `pr_lifecycle_spike_*`. Pruebas `v175_*` y `pr_rework_supersede_*`. | N0, A3, P0 | ver Congelado 10 | **TODO** |
+| PX | (Fase 2, nuevo por D3') Pausa no destructiva de admisión y base del rework: **V175** (`pr_rework_supersession`, columnas `rework_outcome`/`supersession_id`/`readmits_supersession_id` en `remote_pr_admission`, `task_external_feedback_disposition`, triggers recreados y nuevos de «Congelado 11» §11.2), repos `sqlite/pr_rework.rs`, `PrReworkService::{supersede_for_rework, resume_after_supersession, observe_remote}`, `LifecycleCause::PrFeedbackRework` (recibo `pr_feedback_rework`), exclusión `rework_outcome IS NULL` en selecciones de P1, actualización de `pr_lifecycle_spike_*`. Pruebas `v175_*` y `pr_rework_*`. | N0, A3, P0 | ver Congelado 10 | **IMPLEMENTADO / NOT RUN** (ver «Anexo PX») |
 | P3 | (Fase 2, redefinido por D3') Re-admisión sobre la misma PR (`find_open_pr_by_head`, `publish_pr` con `readmits_supersession_id`), `push_update` dentro de la admisión nueva (fast-forward, `expected_remote_head_sha`), `post_comment` del resumen de triage (también sobre admisión superseded), `PrReworkWatcher` (merge/cierre remoto durante rework, §11.6); Gate exacto, autorización por política congelada/Decisión (D5), idempotencia, `OutcomeUnknown`, recuperación; el merge nunca. | P0, PX, A3, C3 | `pr_external_action.rs`, `pr_service.rs`, `pr_github_client.rs` | **TODO** |
 | RT | (Fases 1–3, una pasada por fase) Cableado único y ordenado de las salidas nuevas en el runtime y coordinación; contexto exacto de validación y feedback; políticas `allowed_actions`. | R1, D1, M1, C2, P2 | `orchestrator_runtime.rs`, `task_coordination.rs` | **Fase 1 IMPLEMENTADO / NOT RUN** (ver Anexo RT); fases 2–3 TODO |
 | API | (por fase) REST, MCP, SSE, DTOs, tipos generados, `forge-ctl` si procede. Ver «Contratos públicos». | RT, D1, C3, P3 | ver L6 | **FASE 1 IMPLEMENTADA / NOT RUN** (ver Anexo API fase 1); fases 2–3 TODO |
@@ -2335,3 +2335,52 @@ Estado: escrito sin compilar ni ejecutar localmente; validación solo CI
   `POST /providers` `provider:"github"`) usar `PrProviderSettingsService` y
   `CredentialService::connect_scm_credential`; la lista de proveedores debe filtrar
   `metadata_json.purpose=scm`.
+
+## Anexo P2 (fase 2, D3') — triage `external_feedback` por disposición y Task de seguimiento (IMPLEMENTADO / NOT RUN)
+
+Estado: escrito sin compilar ni ejecutar (solo CI). Pruebas: `coordinator_outputs_external_feedback_*`
+(filtro existente `coordinator_outputs_`) y `pr_feedback_followup_*` (cubierto por el filtro
+existente `pr_feedback_`, que es subcadena; no se añadió paso de workflow).
+
+- `coordinator_outputs/external_feedback.rs` (R1/P2): `parse_external_feedback_v2(value, &ExpectedFeedbackSet,
+  allowed_actions)` (≤ 64 KiB, `deny_unknown_fields`, una entrada por ítem con id y `body_digest` exactos,
+  `work_unit_plan` ⇔ ≥ 1 `extend_task` con `pr_feedback.plan_without_extend`, provenance `item_ids` ⊆ `extend_task`
+  y cobertura total, `dismiss_reason` solo en `dismiss`, `proposal` solo en `propose_task`, `micro_fix` null,
+  un `ask_human` por ítem `human` con evidencia `external_feedback` de ese ítem). `classify_rework_scope(plan,
+  envelope, &TaskOriginalScope)` mide los hechos de 11.1 (objective digest, roles/actores ⊆ equipo con
+  `actor_key`, total de WorkUnits ≤ `max_work_units`, rutas ⊆ unión de `scope` de WorkUnits previos con tokens
+  que contienen `/` y sin `..`, flags de envelope no ampliados, `allow_new_task_roles=false`) y devuelve
+  `ReworkClassification{scope, facts}` (`facts_json()` para `classification_facts_json`).
+  `ensure_extend_within_scope` ⇒ `pr_feedback.extend_out_of_scope`.
+- `apply_external_feedback_triage(db, ApplyExternalFeedbackTriage{request_id, task_id, execution_id, parsed,
+  classification})`: una `BEGIN IMMEDIATE` con fila V173 por ítem (mapeo legado, `decision_digest` sobre la
+  disposición real) y fila V175 `task_external_feedback_disposition` (idempotente por `(request_id,
+  feedback_item_id)`), y devuelve `ExternalFeedbackTriageEffects` (`extend_item_ids`, `work_unit_plan`,
+  `body_digests` para provenance, `proposals` con `ask_human` sintetizado `approve=scope`/`reject=none`,
+  `human_asks`, `dismissals`). La decisión humana la levanta RT con `HumanDecisionService::raise` (su propia
+  transacción; idempotente por fuente exacta) y la enlaza con `bind_decision_to_disposition`. La disposición
+  se escribe con SQL directo en un único punto (`upsert_disposition_row`): sustituir por
+  `ExternalFeedbackRepo::record_external_feedback_disposition_in_tx` cuando PX lo aporte.
+  `propose_task` guarda como `scope_classification` la clasificación del turno (el CHECK la exige no nula).
+- `human_decision_service.rs`: `source_kind=external_feedback` (source_id = id del ítem) y evidencia
+  `external_feedback` (digest = `body_digest`) dejan de rechazarse; las fuentes `rework:{id}` siguen sin
+  validar (PX/P3).
+- `build_pr_feedback_summary(entries, summary_artifact_id)`: texto determinista ≤ 16 KiB, una línea por ítem con
+  frases fijas (+ motivo de `dismiss_reason`), sin cuerpos ni texto libre del coordinador, terminado en
+  `forge_comment_marker(artifact_id, digest)` (digest = SHA-256 del texto sin marcador).
+- `pr_feedback_followup.rs`: `FollowUpTaskService::apply_approved(decision_id)` (decisión `answered`,
+  `external_feedback`; `reject` ⇒ `Rejected`; `approve` ⇒ propuesta de plan = documento vigente + nodo nuevo +
+  arista Task actual → nueva, `ProjectPlanService::propose/apply` con claves deterministas
+  `sha256("followup|"+disposition_id)` (propuesta) y `sha256("followup|apply|"+disposition_id)` (apply), reanuda
+  una propuesta existente, y fija `followup_task_id` set-once). Usuario = quien respondió.
+
+## Anexo PX (fase 2) — pausa no destructiva de admisión y disposiciones (IMPLEMENTADO / NOT RUN)
+
+Sin cargo local; CI (`-p db --lib v17`, `-p services --lib pr_rework_`, `pr_lifecycle_spike_`) pendiente. El SQL se validó aplicando V001..V175 en SQLite en memoria (`integrity_check`/`foreign_key_check` limpios) con pruebas de comportamiento de cada trigger recreado y nuevo.
+
+- **V175** `V175__pr_rework_pause_and_feedback_disposition.sql`: tablas `pr_rework_supersession`, `task_external_feedback_disposition`; columnas aditivas `rework_outcome|supersession_id|readmits_supersession_id`; triggers nuevos (disposición, supersesión, marcador de admisión, `task_lifecycle_pr_feedback_rework_guard`); recreados `task_integration_operation_provider_result_guard`, `pr_metadata_merge_admission_guard_update`, `remote_pr_admission_insert_guard`, los tres de feedback y los tres de acciones. Sin conflicto con V115/V117 (solo `merge_failure_rework`) ni con `task_lifecycle_retry_exhaustion_guard`.
+- Desviaciones/precisiones: (1) el `cause_ref` de `Blocked→Active` es `pr_rework_supersession.result_event_id` (evento `pr.admission_superseded`); (2) `set_item_guard` también exige admisión sin `rework_outcome`; (3) `push_update` sobre una re-admisión excluye de la exclusión de operaciones `running` su propio `publish_pr` hijo (si no, P3 no podría empujar con `PublishPr` en curso); (4) el rebind de `pr_metadata` acepta supersesión `open` (misma PR, conserva `provider_pr_id`) o `remote_closed` (PR nueva, reset de proyección); (5) el evento de lifecycle de la pausa no lleva `task_merge_status` y `task_failure_retry` ignora `reason_kind=pr_feedback_rework`, para que la pausa nunca cree un recibo de reintento de TaskMerge.
+- **DB**: `PrReworkRepo` (`sqlite/pr_rework.rs`), `ExternalFeedbackRepo::{record_external_feedback_disposition[_in_tx], list_external_feedback_dispositions, bind_external_feedback_disposition_decision|followup}`, modelos `PrReworkSupersession`, `FeedbackItemDisposition`, `FeedbackScopeClassification`, `FeedbackDismissReason`; `begin_pull_request_publication` rellena `readmits_supersession_id` y reutiliza/reinicia la proyección según la pausa; teardown; `DbError::PrReworkNotAuthorized`.
+- **Services**: `LifecycleCause::PrFeedbackRework`, `PrReworkService::{supersede_for_rework, resume_after_supersession, observe_remote, converge_remote_merged}` y trait `PrReworkEffects` (materializar plan / cancelar WorkUnits, cableado en RT); `rework_outcome IS NULL` en `PrReconciler` y `PrFeedbackIngestor`; `list_unconsumed_trusted_feedback`.
+- O1: remoto fusionado ⇒ decisión humana `rework:{id}` y, al responder, `Blocked(pr_merged_externally)` sin arista nueva.
+- Pendiente fuera de PX: P2/RT (materializar el plan, enlazar la decisión), P3 (`find_open_pr_by_head`, `push_update`, watcher, transición a `readmitted`).

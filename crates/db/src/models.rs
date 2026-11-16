@@ -399,6 +399,13 @@ pub struct RemotePrAdmission {
     pub source_branch: String,
     pub target_branch: String,
     pub admitted_source_sha: String,
+    /// `Some("superseded_for_rework")` once the admission was paused for
+    /// same-PR rework (V175); `state` then stays at the last provider-observed
+    /// value and the admission is excluded from every "open admission" query.
+    pub rework_outcome: Option<String>,
+    pub supersession_id: Option<String>,
+    /// The paused `pr_rework_supersession` this admission re-admits (V175).
+    pub readmits_supersession_id: Option<String>,
     /// Credential reference frozen at admission (V173). `None` on historical
     /// admissions and when the repo had no credential configured.
     pub credential_handle_id: Option<String>,
@@ -4397,4 +4404,187 @@ pub struct PrExternalActionWrite {
     /// `false` means an identical idempotent replay returned the existing row.
     pub created: bool,
     pub event: Option<DomainEvent>,
+}
+
+// ---------------------------------------------------------------------------
+// V175 (coordinator-verification-and-pr-loop, Phase 2, node PX, D3'):
+// non-destructive PR pause for same-PR rework and per-item feedback
+// dispositions.
+// ---------------------------------------------------------------------------
+
+/// `remote_pr_admission.rework_outcome` marker of a paused admission.
+pub const REWORK_OUTCOME_SUPERSEDED: &str = "superseded_for_rework";
+/// `reason_kind` of the `Merging -> Blocked` and `Blocked -> Active` receipts.
+pub const PR_FEEDBACK_REWORK_REASON_KIND: &str = "pr_feedback_rework";
+/// Domain event recorded when an open admission is paused for rework.
+pub const PR_ADMISSION_SUPERSEDED_EVENT: &str = "pr.admission_superseded";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrReworkState {
+    Open,
+    Readmitted,
+    RemoteMerged,
+    RemoteClosed,
+    Abandoned,
+}
+
+enum_strings!(PrReworkState {
+    Open => "open",
+    Readmitted => "readmitted",
+    RemoteMerged => "remote_merged",
+    RemoteClosed => "remote_closed",
+    Abandoned => "abandoned",
+});
+
+/// Immutable receipt of one paused admission (also the lifecycle receipt
+/// `reason_ref` of the `pr_feedback_rework` edges). Only `state`,
+/// `readmission_merge_operation_id`, `convergence_decision_id`, `version` and
+/// `updated_at` ever change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrReworkSupersession {
+    pub id: String,
+    pub task_id: String,
+    pub task_merge_operation_id: String,
+    pub publish_operation_id: String,
+    pub metadata_id: String,
+    pub request_id: String,
+    pub triage_set_digest: String,
+    pub provider_pr_id: String,
+    pub superseded_head_sha: String,
+    pub result_event_id: String,
+    pub state: PrReworkState,
+    pub readmission_merge_operation_id: Option<String>,
+    pub convergence_decision_id: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Input of [`PrReworkRepo::supersede_admission_in_tx`]. Everything else
+/// (admission, metadata, request digest, provider PR id, head SHA, event) is
+/// read and verified inside the transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersedeAdmission {
+    pub id: String,
+    pub task_merge_operation_id: String,
+    pub request_id: String,
+    pub now: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersedeAdmissionWrite {
+    pub supersession: PrReworkSupersession,
+    /// `false`: an identical earlier supersession was returned (replay).
+    pub created: bool,
+    /// Domain events committed by this call (`pr.admission_superseded`, the
+    /// `task.lifecycle_changed` of `Merging -> Blocked`); empty on replay.
+    pub events: Vec<DomainEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionPrReworkSupersession {
+    pub id: String,
+    pub expected_version: i64,
+    pub to_state: PrReworkState,
+    /// Required (and only allowed) for `readmitted`.
+    pub readmission_merge_operation_id: Option<String>,
+    /// Only allowed for `remote_merged` / `abandoned`; set once.
+    pub convergence_decision_id: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackItemDisposition {
+    ExtendTask,
+    ProposeTask,
+    Human,
+    Dismiss,
+}
+
+enum_strings!(FeedbackItemDisposition {
+    ExtendTask => "extend_task",
+    ProposeTask => "propose_task",
+    Human => "human",
+    Dismiss => "dismiss",
+});
+
+impl FeedbackItemDisposition {
+    /// Mandatory mapping onto the V173 triage row.
+    pub fn legacy(self) -> ExternalFeedbackDisposition {
+        match self {
+            Self::ExtendTask => ExternalFeedbackDisposition::Correct,
+            Self::ProposeTask | Self::Human => ExternalFeedbackDisposition::Human,
+            Self::Dismiss => ExternalFeedbackDisposition::Dismiss,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackScopeClassification {
+    WithinTaskScope,
+    ScopeChange,
+}
+
+enum_strings!(FeedbackScopeClassification {
+    WithinTaskScope => "within_task_scope",
+    ScopeChange => "scope_change",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackDismissReason {
+    NotActionable,
+    Disagree,
+    Duplicate,
+    AlreadyAddressed,
+    OutOfDate,
+}
+
+enum_strings!(FeedbackDismissReason {
+    NotActionable => "not_actionable",
+    Disagree => "disagree",
+    Duplicate => "duplicate",
+    AlreadyAddressed => "already_addressed",
+    OutOfDate => "out_of_date",
+});
+
+/// Real per-item disposition recorded next to the V173 triage row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFeedbackDispositionRecord {
+    pub id: String,
+    pub task_id: String,
+    pub triage_id: String,
+    pub request_id: String,
+    pub feedback_item_id: String,
+    pub body_digest: String,
+    pub disposition: FeedbackItemDisposition,
+    pub legacy_disposition: ExternalFeedbackDisposition,
+    pub scope_classification: Option<FeedbackScopeClassification>,
+    pub classification_facts_json: Option<String>,
+    pub dismiss_reason: Option<FeedbackDismissReason>,
+    pub proposal_json: Option<String>,
+    pub human_decision_id: Option<String>,
+    pub followup_task_id: Option<String>,
+    pub created_at: String,
+}
+
+/// `legacy_disposition` is derived from `disposition` and written to the
+/// matching V173 triage row (`triage_id`) by the caller in the same transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateExternalFeedbackDisposition {
+    pub id: String,
+    pub task_id: String,
+    pub triage_id: String,
+    pub request_id: String,
+    pub feedback_item_id: String,
+    pub body_digest: String,
+    pub disposition: FeedbackItemDisposition,
+    pub scope_classification: Option<FeedbackScopeClassification>,
+    pub classification_facts_json: Option<String>,
+    pub dismiss_reason: Option<FeedbackDismissReason>,
+    pub proposal_json: Option<String>,
+    pub created_at: String,
 }

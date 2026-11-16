@@ -41,6 +41,128 @@ fn map_external_feedback_triage(row: SqliteRow) -> Result<ExternalFeedbackTriage
     })
 }
 
+fn map_external_feedback_disposition(row: SqliteRow) -> Result<ExternalFeedbackDispositionRecord> {
+    let scope: Option<String> = row.try_get("scope_classification")?;
+    let dismiss: Option<String> = row.try_get("dismiss_reason")?;
+    Ok(ExternalFeedbackDispositionRecord {
+        id: row.try_get("id")?,
+        task_id: row.try_get("task_id")?,
+        triage_id: row.try_get("triage_id")?,
+        request_id: row.try_get("request_id")?,
+        feedback_item_id: row.try_get("feedback_item_id")?,
+        body_digest: row.try_get("body_digest")?,
+        disposition: parse_enum(row.try_get::<String, _>("disposition")?)?,
+        legacy_disposition: parse_enum(row.try_get::<String, _>("legacy_disposition")?)?,
+        scope_classification: scope.map(parse_enum).transpose()?,
+        classification_facts_json: row.try_get("classification_facts_json")?,
+        dismiss_reason: dismiss.map(parse_enum).transpose()?,
+        proposal_json: row.try_get("proposal_json")?,
+        human_decision_id: row.try_get("human_decision_id")?,
+        followup_task_id: row.try_get("followup_task_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+async fn record_disposition(
+    tx: &mut Transaction<'_, Sqlite>,
+    input: &CreateExternalFeedbackDisposition,
+) -> Result<ExternalFeedbackDispositionRecord> {
+    if let Some(existing) = sqlx::query(
+        "SELECT * FROM task_external_feedback_disposition
+         WHERE request_id = ? AND feedback_item_id = ?",
+    )
+    .bind(&input.request_id)
+    .bind(&input.feedback_item_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(map_external_feedback_disposition)
+    .transpose()?
+    {
+        if existing.body_digest != input.body_digest
+            || existing.disposition != input.disposition
+            || existing.triage_id != input.triage_id
+            || existing.scope_classification != input.scope_classification
+            || existing.dismiss_reason != input.dismiss_reason
+            || existing.proposal_json != input.proposal_json
+        {
+            return Err(DbError::IdempotencyConflict);
+        }
+        return Ok(existing);
+    }
+    sqlx::query(
+        "INSERT INTO task_external_feedback_disposition (
+            id, task_id, triage_id, request_id, feedback_item_id, body_digest,
+            disposition, legacy_disposition, scope_classification,
+            classification_facts_json, dismiss_reason, proposal_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&input.id)
+    .bind(&input.task_id)
+    .bind(&input.triage_id)
+    .bind(&input.request_id)
+    .bind(&input.feedback_item_id)
+    .bind(&input.body_digest)
+    .bind(input.disposition.to_string())
+    .bind(input.disposition.legacy().to_string())
+    .bind(input.scope_classification.map(|value| value.to_string()))
+    .bind(&input.classification_facts_json)
+    .bind(input.dismiss_reason.map(|value| value.to_string()))
+    .bind(&input.proposal_json)
+    .bind(&input.created_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(check_error)?;
+    sqlx::query("SELECT * FROM task_external_feedback_disposition WHERE id = ?")
+        .bind(&input.id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(DbError::from)
+        .and_then(map_external_feedback_disposition)
+}
+
+async fn bind_disposition_link(
+    pool: &SqlitePool,
+    disposition_id: &str,
+    column: &'static str,
+    value: &str,
+) -> Result<ExternalFeedbackDispositionRecord> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let existing = sqlx::query("SELECT * FROM task_external_feedback_disposition WHERE id = ?")
+        .bind(disposition_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(map_external_feedback_disposition)
+        .transpose()?
+        .ok_or(DbError::NotFound)?;
+    let current = if column == "human_decision_id" {
+        existing.human_decision_id.clone()
+    } else {
+        existing.followup_task_id.clone()
+    };
+    match current.as_deref() {
+        Some(current) if current == value => return Ok(existing),
+        Some(_) => return Err(DbError::IdempotencyConflict),
+        None => {}
+    }
+    // `column` is one of two compile-time literals.
+    sqlx::query(&format!(
+        "UPDATE task_external_feedback_disposition SET {column} = ? WHERE id = ?"
+    ))
+    .bind(value)
+    .bind(disposition_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(check_error)?;
+    let updated = sqlx::query("SELECT * FROM task_external_feedback_disposition WHERE id = ?")
+        .bind(disposition_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(DbError::from)
+        .and_then(map_external_feedback_disposition)?;
+    tx.commit().await?;
+    Ok(updated)
+}
+
 async fn add_set_items(
     tx: &mut Transaction<'_, Sqlite>,
     request_id: &str,
@@ -273,6 +395,9 @@ impl ExternalFeedbackRepo for SqliteDb {
             "SELECT i.* FROM external_feedback_item i
              WHERE i.admission_id = ? AND i.trust_class = 'trusted'
                AND i.head_state = 'current'
+               AND EXISTS (SELECT 1 FROM remote_pr_admission a
+                           WHERE a.task_merge_operation_id = i.admission_id
+                             AND a.rework_outcome IS NULL)
                AND NOT EXISTS (SELECT 1 FROM task_external_feedback_set_item s
                                WHERE s.feedback_item_id = i.id)
              ORDER BY i.ingested_at, i.id LIMIT ?",
@@ -392,5 +517,69 @@ impl ExternalFeedbackRepo for SqliteDb {
         .await?
         .map(map_external_feedback_triage)
         .transpose()
+    }
+
+    async fn record_external_feedback_disposition(
+        &self,
+        input: CreateExternalFeedbackDisposition,
+    ) -> Result<ExternalFeedbackDispositionRecord> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let record = record_disposition(&mut tx, &input).await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    async fn record_external_feedback_disposition_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: CreateExternalFeedbackDisposition,
+    ) -> Result<ExternalFeedbackDispositionRecord> {
+        record_disposition(tx, &input).await
+    }
+
+    async fn list_external_feedback_dispositions(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ExternalFeedbackDispositionRecord>> {
+        sqlx::query(
+            "SELECT d.* FROM task_external_feedback_disposition d
+             LEFT JOIN task_external_feedback_set_item s
+               ON s.request_id = d.request_id AND s.feedback_item_id = d.feedback_item_id
+             WHERE d.request_id = ? ORDER BY s.position, d.created_at, d.id",
+        )
+        .bind(request_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_external_feedback_disposition)
+        .collect()
+    }
+
+    async fn bind_external_feedback_disposition_decision(
+        &self,
+        disposition_id: &str,
+        human_decision_id: &str,
+    ) -> Result<ExternalFeedbackDispositionRecord> {
+        bind_disposition_link(
+            &self.pool,
+            disposition_id,
+            "human_decision_id",
+            human_decision_id,
+        )
+        .await
+    }
+
+    async fn bind_external_feedback_disposition_followup(
+        &self,
+        disposition_id: &str,
+        followup_task_id: &str,
+    ) -> Result<ExternalFeedbackDispositionRecord> {
+        bind_disposition_link(
+            &self.pool,
+            disposition_id,
+            "followup_task_id",
+            followup_task_id,
+        )
+        .await
     }
 }

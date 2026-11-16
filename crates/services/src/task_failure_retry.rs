@@ -927,6 +927,9 @@ impl TaskFailureRetryService {
                     && failed_status
                     && !provider_closed
                     && !remote_head_mismatch
+                    // A PR paused for same-PR rework (V175) is not a merge failure.
+                    && payload.get("reason_kind").and_then(Value::as_str)
+                        != Some(db::PR_FEEDBACK_REWORK_REASON_KIND)
                 {
                     failures.push(FailureFact {
                         kind: "task_merge_failed",

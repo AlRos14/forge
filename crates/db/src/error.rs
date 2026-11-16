@@ -100,6 +100,9 @@ pub enum DbError {
     #[error("the PR external action is not authorized by the frozen admission policy or exact current inputs")]
     PrActionNotAuthorized,
 
+    #[error("the PR rework supersession is not authorized by the exact triaged request, open admission, and Merging lifecycle")]
+    PrReworkNotAuthorized,
+
     #[error("the Task already used its coordinator replan limit")]
     CoordinatorReplanLimitReached,
 

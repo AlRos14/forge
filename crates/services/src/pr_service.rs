@@ -624,10 +624,12 @@ impl PrReconciler {
                 admission.task_merge_operation_id.clone(),
             )
         })?;
-        if !matches!(
-            admission.state.as_str(),
-            "admitted" | "reconciliation_required" | "open"
-        ) {
+        if admission.rework_outcome.is_some()
+            || !matches!(
+                admission.state.as_str(),
+                "admitted" | "reconciliation_required" | "open"
+            )
+        {
             return Ok(());
         }
         let task = TaskRepo::get_by_id(&*self.db, &admission.task_id, false)
@@ -856,6 +858,7 @@ async fn pending_remote_pr_admissions(
          JOIN task_integration_operation publish_op
            ON publish_op.id = admission.publish_operation_id
          WHERE admission.state IN ('admitted', 'reconciliation_required', 'open')
+           AND admission.rework_outcome IS NULL
            AND merge_op.kind = 'task_merge' AND merge_op.status = 'running'
            AND merge_op.remote_waiting = 1
            AND publish_op.kind = 'publish_pr'

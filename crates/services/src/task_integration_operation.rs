@@ -5303,9 +5303,10 @@ pub(crate) mod tests {
         assert_eq!(history.7, admission1.admitted_source_sha);
     }
 
-    // Spike PS (plan: "Anexo PS"). These tests pin what the CURRENT lifecycle
-    // and schema allow while a remote_waiting TaskMerge owns an open PR. They
-    // are evidence for the verdict, not a feature.
+    // Spike PS (plan: "Anexo PS"), updated by PX (D3'). These tests pin what the
+    // generic lifecycle and schema allow while a remote_waiting TaskMerge owns
+    // an open PR: only the typed pause of `pr_rework_*` leaves Merging for
+    // same-PR rework; every generic path stays rejected.
     async fn pr_lifecycle_spike_open_admission(
         temp: &TempDir,
         name: &str,
@@ -5403,6 +5404,20 @@ pub(crate) mod tests {
             ))
             .await
             .is_err());
+        pr_lifecycle_spike_assert_still_waiting(&fixture, &merge_id).await;
+        // (a4) V175/D3': the only way out of Merging for same-PR rework is the
+        // typed pause (PrReworkService::supersede_for_rework). The receipt kind
+        // without its durable supersession is rejected; a waiting TaskMerge is
+        // never abandoned by a generic transition.
+        let mut pause = attempt(
+            crate::task_lifecycle::LifecycleCause::PrFeedbackRework {
+                supersession_id: new_uuid_v4(),
+            },
+            "spike-pr-feedback-rework",
+            task_version,
+        );
+        pause.reason_kind = Some("pr_feedback_rework".to_owned());
+        assert!(service.transition(pause).await.is_err());
         pr_lifecycle_spike_assert_still_waiting(&fixture, &merge_id).await;
         // (a3) Merging -> Active has no edge at all.
         let mut to_active = attempt(
