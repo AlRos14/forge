@@ -1651,3 +1651,17 @@ escribe `task_validation_triage` (el guard exige el `execution_id` de la request
 original); `recheck` sobre sujeto idéntico no re-ejecuta; scanner sin guard SQL de
 batch pausado (reintenta cada ciclo); review_findings v2 con `outputs` no cableado;
 paused kinds distintos de `validation_findings` rechazados.
+
+### Anexo CI fase 1 — cierre
+
+- Diagnóstico intermedio `10bdfac6` (run 43716346691): build PASS; único fallo
+  de compilación en el fixture db (`ValidationRunOrigin`), corregido en `0037e985`.
+- `bc1368a1` (run 43754317703): build, web y todas las suites Rust PASS; Clippy
+  FAIL (`large_enum_variant` en `ResumeOutcome`, `redundant_guards`).
+- **PASS completo** en `96ae3e1f` (run [43758742054](https://github.com/AlRos14/forge/actions/runs/43758742054)).
+- Limitaciones conocidas que pasan a fases siguientes: `correct` de
+  `validation_findings` crea WorkUnit de corrección sin revisión formal pareada
+  y solo para sujetos `work_unit_result`; `ask_human` solo en turnos de triage
+  de validación (no aún en `review_findings` v2); `recheck` sobre sujeto
+  idéntico reutiliza el run; tests RT solo unitarios (sin recorrido con DB);
+  escáner de validación sin guard SQL para lotes pausados.
