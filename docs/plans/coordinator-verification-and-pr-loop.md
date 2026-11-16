@@ -2553,3 +2553,20 @@ referenciado y su etiqueta sin exponer el secreto, de modo que el selector
 muestra el handle actual. API, frontend y service tests se actualizaron para
 estos contratos. Las validaciones locales Cargo y pnpm no se ejecutaron; CI es
 la validación prevista.
+
+### Anexo CI fase 2 — cierre
+
+- `fd54a846` (run 43907816371): compilación PASS; 11 tests de servicios FAIL
+  (fixtures de admisión y Artifact; guard V175 que impedía reanudar tras
+  `remote_closed`). Corregido en `bb4daea6` (V179, bug real de producción) y
+  `57db4cef` (fixtures de `post_comment` sin re-admisión pendiente); `57db4cef`
+  PASS completo (run 43937394310).
+- API/UI fase 2 (`5dcdb944`, `c49a24b7`) y cierre de huecos (`4d573747`:
+  versiones atómicas de acción/política, credencial al crear Repo, referencia
+  de credencial expuesta): fallos de compilación/tipos corregidos en `88fac851`
+  y `b65b15c3`.
+- **PASS completo** en `b65b15c3` (run [43967779108](https://github.com/AlRos14/forge/actions/runs/43967779108)).
+- Decisión de numeración: la migración de fase 3 (A5) se crea como **V180**,
+  no V176, porque V177–V179 ya existen; V176 queda sin usar. El runner aplica
+  por versión, pero mantener el orden monotónico evita divergencias entre bases
+  nuevas y actualizadas.
