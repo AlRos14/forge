@@ -860,7 +860,7 @@ impl TaskIntegrationOperationRepo for SqliteDb {
             table_has_column(&mut tx, "remote_pr_admission", "readmits_supersession_id").await?;
         // V175: while a pause is open the admission MUST re-admit it (the insert
         // guard rejects any other admission); otherwise the column stays NULL.
-        let readmits_supersession_id = if has_v175_column {
+        let readmits_supersession_id: Option<String> = if has_v175_column {
             sqlx::query_scalar(
                 "SELECT id FROM pr_rework_supersession WHERE task_id = ? AND state = 'open'",
             )

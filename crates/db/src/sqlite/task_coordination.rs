@@ -1605,7 +1605,7 @@ impl TaskCoordinationRepo for SqliteDb {
         binding: Option<ProjectPlanBatchRequestBinding>,
         entries: Vec<ExternalFeedbackSetEntry>,
     ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)> {
-        if input.kind != TaskCoordinationRequestKind::ExternalFeedback {
+        if input.kind != crate::TaskCoordinationRequestKind::ExternalFeedback {
             return Err(DbError::Check(
                 "only an external_feedback request carries a feedback set".to_owned(),
             ));
