@@ -14,6 +14,13 @@ solo con SQLite vía Python y `cargo fmt`; nada compilado ni ejecutado con cargo
 ver «Anexo A1/A2/A4»). Los demás nodos siguen **TODO**. D1–D8 están **RESUELTAS**
 (sección «Decisiones»).
 
+**Actualización 2026-11-16 (D3'):** el spike PS dio **NO VIABLE** para D3 y el usuario
+eligió el diseño D3' (triage por disposición `extend_task|propose_task|human|dismiss`,
+rework en la misma PR vía pausa no destructiva `superseded_for_rework`). Contratos en
+«Congelado 11»; la migración de pausa/disposiciones es **V175** (nodo PX) y la de
+fase 3 se renumera a **V176**. Estado de lo anterior: sin cambios de código en esta
+actualización (solo plan).
+
 Este plan continúa [autonomous-delivery-fluency.md](autonomous-delivery-fluency.md)
 (cerrado) y respeta sus contratos: coordinador read-only, la intención no es
 ejecución, `request_changes` no es PASS, sin autoridad implícita de GitHub. No
@@ -229,6 +236,12 @@ confiable**: solo ítems `trusted` entran al contexto del coordinador, citados e
 bloques de datos con digest; los `untrusted` son visibles a humanos y no activan
 turnos. Un ítem de un head SHA distinto al actual se marca `stale_head`.
 
+> **Nota D3' (2026-11-16):** P3 (triage) y P4 (rework/lifecycle) de este apartado quedan
+> **sustituidos** por «Congelado 11»: las disposiciones son `extend_task|propose_task|human|dismiss`
+> (no `correct|recheck|human|dismiss`) y el camino de lifecycle es la pausa
+> `superseded_for_rework`, no el TaskMerge `running` bloqueado. P1, P2, P5 y P6 siguen vigentes
+> (P5 aplica a la admisión nueva).
+
 **P3. Triage.** Nuevo kind de request `external_feedback` (origen batch tipado
 `ExternalFeedback`): fuente = conjunto exacto y acotado (≤ 20) de ítems
 `trusted` + head SHA + admisión + autorización; respuesta tipada por ítem
@@ -317,7 +330,7 @@ que el Agent sea miembro activo del mismo rol con las mismas capacidades, mismo
 dueño de cuenta (regla de admisión de `docs/architecture.md`), independencia de
 review preservada (`reviewer_is_independent`) y credencial disponible. Nueva
 Execution con `HarnessSession` nueva (no hay reanudación entre harnesses). Recibo
-inmutable `work_unit_fallback_receipt` (V175): execution origen, clase de fallo,
+inmutable `work_unit_fallback_receipt` (V176): execution origen, clase de fallo,
 digest de `route_attempts`, actor origen/destino, índice de cadena, digest del
 envelope. Nunca escala autoridad: no cambia rol, scope, workspace ni lease; no
 toca el equipo del coordinador; cadena agotada → bloqueo durable existente
@@ -367,7 +380,7 @@ registro de decisiones. Los nombres se verificaron contra el código del baselin
 `8d89573b` (sin colisiones: no existen hoy `human_decision`, `external_feedback`,
 `validation_check`, `pr_feedback`, `micro_fix`, `fallback_receipt` ni
 `CoordinatorReplan` en `crates/` ni `web/src`). Las migraciones reales se
-numeran al implementar; la reserva es V171–V175 (último actual V170).
+numeran al implementar; la reserva es V171–V176 (último actual V170; **V175** = pausa de PR + disposiciones de feedback (D3'), **V176** = fallback/micro-fix de fase 3).
 
 ### Fases y puertas de CI
 
@@ -377,8 +390,8 @@ integrado de esa fase; no se traslada PASS entre fases.
 | Fase | Nodos | Entrega |
 |---|---|---|
 | **1** | A1, A2, A4, C1, C2, C3, R1 (solo `request_validation` y `ask_human`), D1, RT (fase 1), API/UI/T para estos | Catálogo, `RequestValidation`, runner, baseline, comparación, Gate v2, check tras integración, `validation_findings`, decisión humana estructurada y reanudación. Sin GitHub. |
-| **2** | A3, P0, P1, P2, PS, P3 (+ R1 `external_feedback`, RT/API/UI/T) | Credencial GitHub cifrada, cliente PR real, ingesta, triage, rework de PR, push/comentario. |
-| **3** | A5, M1, FB, R1 `micro_fix` y `propose_replan`, replan | Micro-fix, fallback cross-Agent, replan del coordinador. |
+| **2** | A3, P0, P1, PX, P2, P3 (+ PS cerrado por D3'; R1 `external_feedback`, RT/API/UI/T) | Credencial GitHub cifrada, cliente PR real, ingesta, triage por disposición (D3'), pausa de admisión y rework en la misma PR, push/comentario, Task de seguimiento propuesta. |
+| **3** | A5 (V176), M1, FB, R1 `micro_fix` y `propose_replan`, replan | Micro-fix, fallback cross-Agent, replan del coordinador. |
 
 **A2 (V172) añade en UNA sola reconstrucción todos los kinds y orígenes de las tres
 fases** (incluidos los de fase 2 y 3) para que ninguna fase posterior reconstruya
@@ -389,8 +402,7 @@ u origen aún sin productor lo rechaza el servicio con
 ### Decisiones resueltas que condicionan los contratos
 
 Ver «Decisiones» al final. Resumen operativo: baseline en v1 (D1); Gate v2
-`required_checks` (D2); `Merging → Blocked(pr_feedback) → Active` vía spike PS y
-**parar y preguntar si falla** (D3); credencial GitHub en `CredentialService`
+`required_checks` (D2); D3' (sustituye a D3): triage por disposición y rework en la misma PR con pausa no destructiva `superseded_for_rework` (spike PS: D3 no viable; ver «Congelado 11»); credencial GitHub en `CredentialService`
 cifrado, nunca variable de entorno (D4); push/comentario `human_approval` por
 defecto, `automatic` por política de repo owner/admin, merge siempre humano (D5);
 origen `CoordinatorReplan`, máximo 2 por Task, aprobación humana solo si el
@@ -490,14 +502,14 @@ Ejemplo v2 (solo S1 activa):
 Códigos: `validation.check_not_authorized`, `validation.check_unknown`,
 `validation.check_stale_pin` (clave retirada o digest distinto).
 
-### Congelado 2 — Migraciones V171–V175
+### Congelado 2 — Migraciones V171–V176 (V175: ver «Congelado 11»)
 
 Reglas comunes: solo hacia delante; no se edita V001–V170; inmutabilidad por
 triggers `BEFORE UPDATE/DELETE` con excepción de `project_deletion_guard` (patrón
 V164 `task_review_triage_immutable*`); ids/timestamps por la aplicación
 (`new_uuid_v4`, `now_rfc3339`); cada migración con tabla temporal `_vNNN_check`
 si reconstruye (patrón V168). Las pruebas viven en `crates/db/src/tests.rs` con
-prefijo de función `v171_`…`v175_` (necesario para el filtro del workflow).
+prefijo de función `v171_`…`v176_` (necesario para el filtro del workflow).
 
 **V171 (A1, fase 1)** — catálogo y checks (el DDL de abajo es el borrador congelado; la «Forma final implementada de V171» más abajo y `V171__validation_check_catalog.sql` prevalecen donde difieren):
 
@@ -889,7 +901,9 @@ request `human_decision_resume` exacto. V174 añade además
 `task_coordination_request` (decisión `answered`, sin reanudar, misma Task,
 autorización exacta y `resumes_request_id` igual al de `resume_binding_json`).
 
-**V175 (A5, fase 3)**:
+**V175 (PX, fase 2, D3')**: especificada en «Congelado 11» §11.2 (`V175__pr_rework_pause_and_feedback_disposition.sql`).
+
+**V176 (A5, fase 3; renumerada desde V175 por D3')**:
 
 ```sql
 CREATE TABLE work_unit_fallback_receipt (
@@ -1076,12 +1090,12 @@ Diseño congelado:
 `max_items_per_poll` (1..=100), `push_corrections ∈ human_approval|automatic` (default `human_approval`),
 `post_summary ∈ human_approval|automatic|off` (default `off`). Escritura: `PUT /api/v1/repos/{id}/pr-feedback-policy` (owner/admin). Se congela en la admisión (ver V173); cambiar la política no amplía admisiones emitidas.
 Autorización (D5): `automatic` solo si la política **congelada** lo dice. `human_approval` ⇒ `pr_external_action` en `proposed` + `Proposal` colaborativo (`target_kind='pr_external_action'`) y `Decision` humana al aprobar vía `POST /tasks/{id}/pr-actions/{action_id}/approve`. El merge nunca lo invoca Forge.
-Lifecycle (D3): `Merging → Blocked` con `reason_kind='pr_feedback'`, `reason_ref=<request_id>`, `cause_kind='domain_event'` (valor ya permitido por el CHECK de V100), y `Blocked → Active`. Sin arista nueva. **Spike PS** prueba con test de servicio que el `TaskMerge` queda `running`+`remote_waiting` y que merge/cierre remoto durante el rework converge. **Si falla, no se inventa otra arista: se detiene el nodo y se pregunta al usuario.**
+Lifecycle (**D3' sustituye al texto original de D3**): `Merging → Blocked` y `Blocked → Active` con `reason_kind='pr_feedback_rework'`, `reason_ref=<pr_rework_supersession.id>`; la primera arista usa `LifecycleCause::MergeOperation` con el TaskMerge ya `abandoned` (el servicio y V100 lo exigen), la segunda `domain_event`. Sin arista nueva en `allowed_transition`. El spike PS (Anexo PS) demostró que mantener el TaskMerge `running` es imposible; D3' lo termina de forma no destructiva (`superseded_for_rework`, PR abierta). Contrato completo en «Congelado 11». El push/comentario de este apartado se aplica a la admisión **nueva** (push) o a la superseded (comentario).
 Push: `PrExternalActionService::push_update` hace fast-forward del branch fuente con condición *remote head == `expected_remote_head_sha`* (admitido o último empujado); sin force; head remoto distinto ⇒ `pr_action.remote_head_changed` y `reconciliation_required`. Comentario: plantilla determinista desde el Artifact exacto (≤ 16 KiB, redactada), marcador `forge:artifact=<id> digest=<d>` también usado para anti-bucle de ingesta; búsqueda previa del marcador resuelve `OutcomeUnknown`.
 
 ### Congelado 8 — Fallback y micro-fix (fase 3)
 
-Fallback (D7/D8): disparo, límites y recibo exactos como en F-c y V175; la cadena sale de `envelope.fallback_agents` (por `task_role_id`, en orden); `cost_class` visible en UI y en el recibo; **nunca** aplica al coordinador (su cambio exige reautorización de equipo/digest). `max_wait_seconds` se compara con `retry_at`. `start_uncertain` no dispara fallback.
+Fallback (D7/D8): disparo, límites y recibo exactos como en F-c y V176; la cadena sale de `envelope.fallback_agents` (por `task_role_id`, en orden); `cost_class` visible en UI y en el recibo; **nunca** aplica al coordinador (su cambio exige reautorización de equipo/digest). `max_wait_seconds` se compara con `retry_at`. `start_uncertain` no dispara fallback.
 Micro-fix (D7): solo con `envelope.micro_fix.enabled`; `micro_fix_reviewer` opcional y preautorizado con `cost_class`; la revisión sigue siendo formal con Gate fresco. Límites constantes de producto: 3 archivos, 60 líneas, `max_per_task ≤ 3`; manifiestos y migraciones siempre prohibidos. Violación ⇒ `micro_fix.bounds_exceeded` (`bounds_violation` tipado) y vuelta al triage ordinario/humano.
 Replan (D6): requiere `envelope.allow_coordinator_replan`; ≤ 2 por Task (`task_coordinator_replan.ordinal`); origen `coordinator_replan`; **clasificador determinista** `classify_replan(plan, envelope, original) -> {within_envelope | scope_or_authority_change}` con hechos medibles en `classification_facts_json`: `objective_digest` igual, roles ⊆ equipo actual, actores ⊆ equipo actual, `work_units.len() ≤ max_work_units`, repos/paths ⊆ alcance original, sin flags nuevos de envelope. Cualquier hecho falso ⇒ `scope_or_authority_change` ⇒ `human_decision_request(source_kind='coordinator_replan')` con opciones `approve_replan|reject|revise_scope`; sin materialización hasta responder. `within_envelope` ⇒ continúa por el camino normal de aprobación de plan vigente.
 
@@ -1108,16 +1122,17 @@ REST (rutas finales; nuevas salvo indicación; todas con paginación por cursor 
 | `POST /api/v1/tasks/{id}/coordination/authorize` (existente) | 1 | envelope v2 |
 | `GET /api/v1/tasks/{id}/pr-feedback` | 2 | lectura de la Task |
 | `GET /api/v1/tasks/{id}/pr-actions` | 2 | lectura de la Task |
+| `GET /api/v1/tasks/{id}/pr-rework` | 2 (D3') | lectura de la Task |
 | `POST /api/v1/tasks/{id}/pr-actions/{action_id}/approve` y `/reject` | 2 | Human con autoridad de mutar la Task (+ owner/admin si `post_comment` automático desactivado por política) |
 | `GET/PUT /api/v1/repos/{id}/pr-feedback-policy` | 2 | owner/admin |
 | `POST /api/v1/providers` con `provider:"github"`, `PATCH /api/v1/repos/{id}` con `credential_id` (existentes) | 2 | dueño del handle + owner/admin |
 
 Archivos de rutas (nodo API es dueño; `routes/mod.rs` y `lib.rs` los edita solo API):
 `routes/validation_checks.rs`, `routes/human_decisions.rs`, `routes/pr_feedback.rs`.
-MCP (solo lectura, `crates/mcp-server/src/tools/{descriptors,handlers}.rs`, nodo API): `forge_list_validation_checks`, `forge_list_task_validation_check_requests`, `forge_list_task_validation_comparisons`, `forge_list_task_human_decisions` (fase 1), `forge_list_task_pr_feedback`, `forge_list_task_pr_actions` (fase 2). Ninguna herramienta responde decisiones, aprueba ni publica en GitHub; Project Copilot sin acceso a escritura.
-SSE (`crates/api-types/src/public_events.rs`, nombres exactos; payload solo ids, digests, estados, nunca cuerpos ni tokens): fase 1 `task.validation_check_requested`, `task.validation_check_completed`, `task.validation_comparison_recorded`, `task.human_decision_requested`, `task.human_decision_answered`; fase 2 `task.pr_feedback_ingested`, `task.pr_action_requested`, `task.pr_action_completed`; fase 3 `task.work_unit_fallback`, `task.micro_fix_bounds_exceeded`, `task.coordinator_replan_proposed`. (Los eventos `validation_run.started|completed` existentes no cambian.)
+MCP (solo lectura, `crates/mcp-server/src/tools/{descriptors,handlers}.rs`, nodo API): `forge_list_validation_checks`, `forge_list_task_validation_check_requests`, `forge_list_task_validation_comparisons`, `forge_list_task_human_decisions` (fase 1), `forge_list_task_pr_feedback`, `forge_list_task_pr_actions`, `forge_list_task_pr_rework` (fase 2). Ninguna herramienta responde decisiones, aprueba ni publica en GitHub; Project Copilot sin acceso a escritura.
+SSE (`crates/api-types/src/public_events.rs`, nombres exactos; payload solo ids, digests, estados, nunca cuerpos ni tokens): fase 1 `task.validation_check_requested`, `task.validation_check_completed`, `task.validation_comparison_recorded`, `task.human_decision_requested`, `task.human_decision_answered`; fase 2 `task.pr_feedback_ingested`, `task.pr_action_requested`, `task.pr_action_completed`, y los de D3' (`task.pr_feedback_triaged`, `task.pr_rework_superseded`, `task.pr_rework_resumed`, `task.pr_rework_converged`, `task.pr_followup_proposed`; ver «Congelado 11» §11.9); fase 3 `task.work_unit_fallback`, `task.micro_fix_bounds_exceeded`, `task.coordinator_replan_proposed`. (Los eventos `validation_run.started|completed` existentes no cambian.)
 Códigos de error (`ApiError::bad_request_with_code`/409 donde se indica):
-`validation.check_not_authorized`, `validation.check_unknown`, `validation.check_stale_pin`, `validation.subject_not_resolvable`, `validation.subject_stale`, `validation.workspace_leased`, `validation.baseline_unavailable`, `validation.catalog_forbidden`, `human_decision.invalid_options`, `human_decision.evidence_invalid`, `human_decision.version_conflict` (409), `human_decision.authority_required`, `human_decision.not_open`, `coordination.output_not_permitted`, `coordination.replan_limit_reached`, `pr_feedback.policy_forbidden`, `pr_action.not_authorized`, `pr_action.remote_head_changed`, `pr_provider.credential_not_configured`, `credential.owner_not_authorized`, `repo.pr_provider_token_retired`, `micro_fix.bounds_exceeded`, `fallback.not_authorized`.
+`validation.check_not_authorized`, `validation.check_unknown`, `validation.check_stale_pin`, `validation.subject_not_resolvable`, `validation.subject_stale`, `validation.workspace_leased`, `validation.baseline_unavailable`, `validation.catalog_forbidden`, `human_decision.invalid_options`, `human_decision.evidence_invalid`, `human_decision.version_conflict` (409), `human_decision.authority_required`, `human_decision.not_open`, `coordination.output_not_permitted`, `coordination.replan_limit_reached`, `pr_feedback.policy_forbidden`, `pr_action.not_authorized`, `pr_action.remote_head_changed`, `pr_provider.credential_not_configured`, `credential.owner_not_authorized`, `repo.pr_provider_token_retired`, `micro_fix.bounds_exceeded`, `fallback.not_authorized`; fase 2 D3': `pr_feedback.extend_out_of_scope`, `pr_feedback.plan_without_extend`, `pr_rework.not_authorized`, `pr_rework.stale_request`, `pr_rework.not_fast_forward`, `pr_rework.reuse_target_missing`, `pr_rework.supersession_open`.
 
 ### Congelado 10 — Ownership y archivos por nodo
 
@@ -1134,8 +1149,12 @@ Códigos de error (`ApiError::bad_request_with_code`/409 donde se indica):
 | RT | 1/2/3 | **único** editor de `orchestrator_runtime.rs` y de los `complete_*_turn`/productores de `task_coordination.rs`; `orchestrator_runtime/tests/` | — |
 | A3 | 2 | `V173__pr_feedback_and_credential.sql`, `sqlite/{external_feedback.rs,pr_provider_config.rs,pr_metadata.rs}`, `credential_service.rs` (`connect_scm_credential`, `acquire_scm_secret`), `tests.rs` (`v173_*`) | `task_integration_operation` (no se reconstruye) |
 | P0 | 2 | `services/src/pr_github_client.rs`, `pr_service.rs` (`GitHubPrProvider`, `provider_for_admission`) | — |
-| P1, P2, P3, PS | 2 | `pr_feedback.rs`, `pr_external_action.rs`, `task_lifecycle.rs` (solo causa tipada) | — |
-| A5, M1, FB | 3 | `V175__fallback_and_micro_fix_receipts.sql`, `sqlite/fallback_receipt.rs`, `task_rework/micro_fix.rs`, `task_dispatcher/fallback.rs`, `task_dispatcher.rs` (solo `mod fallback;`) | `work_unit_service.rs` |
+| P1 | 2 | `pr_feedback.rs`, `pr_service.rs` (registro en `PrReconciler`; consultas con `rework_outcome IS NULL` tras PX) | — |
+| PX | 2 (D3') | `V175__pr_rework_pause_and_feedback_disposition.sql`, `sqlite/{pr_rework.rs,external_feedback.rs}` (disposiciones), `models.rs` (sección PX), `services/src/pr_rework.rs`, `task_lifecycle.rs` (solo `LifecycleCause::PrFeedbackRework`), `tests/v175.rs` (`v175_*`) | `pr_service.rs`, `pr_external_action.rs`, `orchestrator_runtime.rs`, `task_coordination.rs` |
+| P2 | 2 (D3') | `coordinator_outputs/external_feedback.rs`, `pr_feedback_followup.rs`; (cableado de turno solo vía RT) | V175, `pr_rework.rs` |
+| P3 | 2 (D3') | `pr_external_action.rs`, `pr_service.rs` y `pr_github_client.rs` (`find_open_pr_by_head`, reutilización en `publish_pr`, `PrReworkWatcher`) | V175 |
+| PS | 2 | solo pruebas `pr_lifecycle_spike_*` (se actualizan en PX) | — |
+| A5, M1, FB | 3 | `V176__fallback_and_micro_fix_receipts.sql`, `sqlite/fallback_receipt.rs`, `task_rework/micro_fix.rs`, `task_dispatcher/fallback.rs`, `task_dispatcher.rs` (solo `mod fallback;`) | `work_unit_service.rs` |
 | API | por fase | `crates/api-types/src/{validation_catalog,human_decision,pr_feedback}.rs` + ampliaciones indicadas, `crates/api/src/routes/{validation_checks,human_decisions,pr_feedback}.rs`, `routes/mod.rs`, `lib.rs` (rutas), `mcp-server` tools, `forge-cli` solo si hay flags | tipos generados a mano |
 | UI | por fase | `web/src/components/task-detail/{task-human-decisions-panel,task-validation-checks-panel,task-pr-feedback-panel}.tsx`, ediciones de `task-coordination-panel.tsx`, `task-journey*.ts`, `web/src/locales/**` | `web/src/types/generated/` |
 | T | por fase | ver «Plan de pruebas» y «Nota de workflow» | — |
@@ -1143,6 +1162,353 @@ Códigos de error (`ApiError::bad_request_with_code`/409 donde se indica):
 
 Reglas: un cambio de contrato congelado vuelve a N0; si dos nodos necesitan el
 mismo archivo, un handoff registrado en este plan fija el orden.
+
+### Congelado 11 — D3': triage por disposición y rework en la misma PR (fase 2)
+
+Estado: **congelado el 2026-11-16 (revisión estática, nada compilado)**, tras el
+veredicto NO VIABLE del Anexo PS y la decisión del usuario (D3', sustituye a D3).
+Todo carril de fase 2 que toque PR/feedback implementa contra esta sección; un
+cambio aquí vuelve a N0. Hechos del código verificados al congelar (baseline
+`0af41f92`): V173 `task_external_feedback_triage.disposition` es un CHECK de
+columna `IN ('correct','recheck','human','dismiss')` (**no admite** `extend_task`
+ni `propose_task`); `remote_pr_admission.state` es CHECK de columna (V112) y la
+admisión terminal es inmutable (V114); `task_integration_operation.status` ya
+admite `abandoned`; el trigger V100 `task_lifecycle_transition_guard_insert` ya
+acepta `Merging→Blocked` con un TaskMerge `conflict|failed|abandoned`.
+
+#### 11.1 Disposiciones por ítem
+
+Cada ítem `trusted` y `current` del conjunto exacto de la request `external_feedback`
+recibe **exactamente una** de:
+
+| Disposición | Significado | Efecto | Autoridad |
+|---|---|---|---|
+| `extend_task` | Dentro del alcance original (bug, caso límite o petición del revisor sobre lo entregado) | Rework en la misma Task y la misma PR (11.4–11.6) | Ninguna humana, salvo que la política congelada de push sea `human_approval` (D5) |
+| `propose_task` | Ampliación de alcance | Propuesta de Task de seguimiento en el DAG del Project, dependiente de la actual, con su propia PR futura; la PR actual sigue intacta | `human_decision` (V174) con `max_authority_effect = scope`; sin respuesta no se crea nada |
+| `human` | El coordinador pregunta | `human_decision` (`authority_effect` por opción) | Humana |
+| `dismiss` | No accionable / no se comparte / duplicado | Registro inmutable con `dismiss_reason` y `rationale` | Ninguna |
+
+Regla `extend_task` vs `propose_task`: la clasifica **Rust**, no el coordinador.
+`classify_rework_scope(items_plan, envelope, task_original) -> {within_task_scope | scope_change}`
+(módulo `coordinator_outputs/external_feedback.rs`, mismos hechos medibles que
+`classify_replan` de Congelado 8, que lo reutilizará en fase 3): `objective_digest`
+de la Task igual; roles y actores del plan ⊆ equipo vigente; `work_units` totales
+(existentes no cancelados + nuevos) ≤ `max_work_units`; repos/paths ⊆ alcance
+original (unión de paths de WorkUnits previos); sin flags nuevos de envelope;
+`allow_new_task_roles=false`. Cualquier hecho falso ⇒ `scope_change`. Si el
+clasificador dice `scope_change` el servicio **rechaza** `extend_task`
+(`pr_feedback.extend_out_of_scope`); el coordinador debe emitir `propose_task` o
+`human` (no hay reintento ciego: la request queda `failed_validation` como el resto
+de turnos tipados inválidos). Si el clasificador dice `within_task_scope`, un
+`propose_task` sigue siendo válido (el coordinador puede preferir otra Task) pero
+exige la misma decisión humana.
+
+Resumen en el PR: tras registrar el triage el servicio crea una `pr_external_action`
+`post_comment` con plantilla determinista (≤ 16 KiB, redactada) del resultado por
+ítem (disposición y razón corta; nunca cuerpos de terceros), autorizada según D5 con
+la política **congelada de la admisión** que se está cerrando (`post_summary`),
+marcador `pr_feedback::forge_comment_marker(artifact_id, digest)` (anti-bucle).
+
+#### 11.2 Migración V175 — `V175__pr_rework_pause_and_feedback_disposition.sql` (nodo PX)
+
+Reglas: solo hacia delante; **sin reconstruir** `remote_pr_admission`,
+`remote_pr_history`, `pr_metadata`, `task_integration_operation` ni
+`task_external_feedback_triage` (los CHECK de columna no se tocan). El resultado
+terminal de pausa se modela con **columnas aditivas + tabla recibo**:
+
+```sql
+-- (1) Recibo inmutable de la supersesión; es también el recibo de lifecycle.
+CREATE TABLE pr_rework_supersession (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES task(id) ON DELETE RESTRICT,
+  task_merge_operation_id TEXT NOT NULL UNIQUE
+      REFERENCES remote_pr_admission(task_merge_operation_id) ON DELETE RESTRICT,
+  publish_operation_id TEXT NOT NULL,
+  metadata_id TEXT NOT NULL,
+  request_id TEXT NOT NULL REFERENCES task_coordination_request(id) ON DELETE RESTRICT,
+  triage_set_digest TEXT NOT NULL CHECK (length(triage_set_digest) = 64),
+  provider_pr_id TEXT NOT NULL CHECK (length(trim(provider_pr_id)) > 0),
+  superseded_head_sha TEXT NOT NULL CHECK (length(trim(superseded_head_sha)) BETWEEN 7 AND 128),
+  result_event_id TEXT NOT NULL REFERENCES domain_event(id) ON DELETE RESTRICT,
+  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN
+      ('open','readmitted','remote_merged','remote_closed','abandoned')),
+  readmission_merge_operation_id TEXT,       -- fijado una vez en 'readmitted'
+  convergence_decision_id TEXT,              -- human_decision en 'remote_merged'
+  version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(id, task_id),
+  CHECK ((state = 'readmitted') = (readmission_merge_operation_id IS NOT NULL)));
+CREATE UNIQUE INDEX idx_pr_rework_supersession_open ON pr_rework_supersession(task_id)
+  WHERE state = 'open';                        -- una pausa abierta por Task
+
+-- (2) Marca aditiva de "terminal por pausa" en la admisión (state NO cambia: sigue 'open').
+ALTER TABLE remote_pr_admission ADD COLUMN rework_outcome TEXT
+  CHECK (rework_outcome IS NULL OR rework_outcome = 'superseded_for_rework');
+ALTER TABLE remote_pr_admission ADD COLUMN supersession_id TEXT;
+ALTER TABLE remote_pr_admission ADD COLUMN readmits_supersession_id TEXT;
+
+-- (3) Disposición real por ítem (el CHECK V173 queda con su mapeo legado).
+CREATE TABLE task_external_feedback_disposition (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES task(id) ON DELETE RESTRICT,
+  triage_id TEXT NOT NULL UNIQUE REFERENCES task_external_feedback_triage(id) ON DELETE RESTRICT,
+  request_id TEXT NOT NULL, feedback_item_id TEXT NOT NULL, body_digest TEXT NOT NULL CHECK (length(body_digest)=64),
+  disposition TEXT NOT NULL CHECK (disposition IN ('extend_task','propose_task','human','dismiss')),
+  legacy_disposition TEXT NOT NULL CHECK (legacy_disposition IN ('correct','human','dismiss')),
+  scope_classification TEXT CHECK (scope_classification IN ('within_task_scope','scope_change')),
+  classification_facts_json TEXT CHECK (classification_facts_json IS NULL OR json_valid(classification_facts_json)),
+  dismiss_reason TEXT CHECK (dismiss_reason IN
+      ('not_actionable','disagree','duplicate','already_addressed','out_of_date')),
+  proposal_json TEXT CHECK (proposal_json IS NULL OR json_valid(proposal_json)),  -- propose_task
+  human_decision_id TEXT, followup_task_id TEXT,                                   -- set-once
+  created_at TEXT NOT NULL,
+  UNIQUE(request_id, feedback_item_id),
+  FOREIGN KEY (feedback_item_id, task_id) REFERENCES external_feedback_item(id, task_id) ON DELETE RESTRICT,
+  CHECK ((disposition='extend_task' AND legacy_disposition='correct' AND scope_classification='within_task_scope')
+      OR (disposition='propose_task' AND legacy_disposition='human' AND scope_classification IS NOT NULL
+          AND proposal_json IS NOT NULL)
+      OR (disposition='human' AND legacy_disposition='human')
+      OR (disposition='dismiss' AND legacy_disposition='dismiss' AND dismiss_reason IS NOT NULL)));
+```
+
+Mapeo legado obligatorio al escribir la fila V173 del triage (misma transacción):
+`extend_task→correct`, `propose_task→human`, `human→human`, `dismiss→dismiss`
+(`recheck` no se usa en `external_feedback`; sigue permitido por el CHECK pero el
+parser lo rechaza). La fila V173 conserva `rationale`/`instructions`/`decision_digest`
+(el digest cubre la disposición real: `sha256(disposition|body_digest|rationale|instructions)`).
+Triggers de `task_external_feedback_disposition`: inserción exige la fila V173 del
+mismo `request_id`/`feedback_item_id`/`body_digest` y el mapeo legado coherente;
+inmutable salvo `human_decision_id` y `followup_task_id` (set-once, el segundo solo
+con la decisión `answered` y opción `approve`); delete solo en teardown
+(`project_deletion_guard`). `propose_task` y `human` exigen `human_decision_id` en
+la misma transacción de aplicación del turno (comprobado por el servicio, no por
+trigger, porque la decisión se crea después de la fila).
+
+**Triggers a eliminar y recrear (lista cerrada; cuerpo vigente + el cambio indicado):**
+
+| Origen | Trigger | Cambio |
+|---|---|---|
+| V114 | `task_integration_operation_provider_result_guard` | Nueva rama del `OR`: `kind='task_merge'`, `remote_waiting=1`, `OLD.status='running'`, `NEW.status='abandoned'`, admisión con `rework_outcome='superseded_for_rework'` y `state='open'`, `supersession_id` = `pr_rework_supersession` exacta (misma Task/merge/publish/metadata), `event.event_type='pr.admission_superseded'` (entity `pr_metadata`, payload `{task_id, pr_metadata_id, task_merge_operation_id, publish_operation_id, supersession_id, provider_pr_id, superseded_head_sha}`), `event.id = supersession.result_event_id`. Las ramas `merged|closed|head_mismatch|publication_failed` no cambian. |
+| V116 | `pr_metadata_merge_admission_guard_update` | La exigencia «admisión anterior terminal **con** `remote_pr_history`» gana alternativa: admisión anterior `rework_outcome='superseded_for_rework'` + supersesión `state='open'` cuya `readmission_merge_operation_id` se fijará al nuevo TaskMerge en la misma transacción. El resto (nuevo TaskMerge `running`+`remote_waiting`, publish hijo, mismo Gate) igual. `provider_pr_id`/`pr_url`/`pr_state` de la proyección se **conservan** (la PR sigue abierta). |
+| V173 (sobre V112) | `remote_pr_admission_insert_guard` | Nueva comprobación: si existe supersesión `open` de la Task, la admisión nueva **debe** llevar `readmits_supersession_id` = esa supersesión (misma `source_branch`, `target_branch`, `remote_repo_identity`); si no existe supersesión `open`, `readmits_supersession_id` debe ser NULL; con supersesión `remote_closed` la admisión nace sin `readmits_supersession_id` (PR nueva); con `remote_merged` no se admite hasta que la supersesión sea `abandoned`. |
+| V173 | `external_feedback_item_insert_guard`, `task_external_feedback_set_item_guard`, `task_coordination_request_external_feedback_source_guard` | Añadir `AND admission.rework_outcome IS NULL` al predicado «admisión `open`». |
+| V173 | `pr_external_action_insert_guard`, `pr_external_action_scope_guard`, `pr_external_action_start_guard` | `push_update`: admisión `open` **o** (`admitted` con `readmits_supersession_id` no nulo y supersesión `open`), siempre `rework_outcome IS NULL`; exclusión y Gate exacto sin cambios. `post_comment`: admisión `open` con `rework_outcome IS NULL` **o** `rework_outcome='superseded_for_rework'` (la PR sigue abierta y el comentario no muta workspace); la exclusión de operaciones `running` aplica solo a `push_update`. |
+| V100/V109 | `task_lifecycle_transition_guard_insert`, `task_merge_closed_provider_transition_guard`, `task_integration_operation_remote_admission_guard`, `pr_metadata_merge_admission_guard_insert` | **Sin cambios** (verificado: un TaskMerge `abandoned` ya satisface V100; el guard de cierre solo atiende `reason_kind='pr_closed_without_merge'`; tras `running→abandoned` el índice `idx_task_integration_operation_active_task` y el guard V109 de operaciones `remote_waiting=0` dejan de bloquear). |
+| V112/V114 | `remote_pr_admission_identity_immutable`, `remote_pr_admission_terminal_result_immutable`, `remote_pr_admission_delete_guard`, `remote_pr_history_*` | **Sin cambios**; las supersesiones no generan `remote_pr_history` (no hay resultado remoto). |
+
+**Triggers nuevos:**
+- `remote_pr_admission_rework_guard` (BEFORE UPDATE OF `rework_outcome`, `supersession_id`): solo `NULL→'superseded_for_rework'` con `state='open'`, supersesión exacta `open` de la misma Task/merge/publish/metadata y `supersession_id` igual; `readmits_supersession_id` solo se escribe en la inserción.
+- `remote_pr_admission_superseded_immutable` (BEFORE UPDATE): con `OLD.rework_outcome IS NOT NULL` ninguna columna cambia (delete solo en teardown, ya cubierto por V112).
+- `pr_rework_supersession_insert_guard`: request `external_feedback` de la misma Task en `triaged`; ≥ 1 fila de disposición `extend_task` en ella y `triage_set_digest` = digest del conjunto; admisión `open`/`rework_outcome IS NULL`; TaskMerge `running`+`remote_waiting`; el `result_event_id` exacto (`pr.admission_superseded`); `superseded_head_sha = admission.admitted_source_sha`; Task en `merging` con `reason_ref = task_merge_operation_id`.
+- `pr_rework_supersession_update_guard`: `version+1`; transiciones `open→readmitted|remote_merged|remote_closed|abandoned`, `remote_merged→abandoned`; `readmitted`/`remote_closed`/`abandoned` terminales; `readmitted` exige que la admisión nueva tenga `readmits_supersession_id=id`; delete solo en teardown.
+- `task_lifecycle_pr_feedback_rework_guard` (BEFORE INSERT ON `task_lifecycle_transition`, `reason_kind='pr_feedback_rework'`): solo dos aristas. `merging→blocked`: `cause_kind='merge_operation'`, `cause_ref` = TaskMerge de la supersesión con `status='abandoned'`, `reason_ref=supersession.id`, supersesión `open`. `blocked→active`: `cause_kind='domain_event'`, `reason_ref=supersession.id`, la transición vigente es la anterior (`blocked`, mismo `reason_ref`), supersesión `open`, request `triaged` con ≥ 1 `extend_task`. Cualquier otra arista con ese `reason_kind` se rechaza.
+
+Recibo de lifecycle: `reason_kind='pr_feedback_rework'` (Merging→Blocked y Blocked→Active; **sin arista nueva**
+en `allowed_transition`). `TaskLifecycleService` gana
+`LifecycleCause::PrFeedbackRework { supersession_id }` con la validación análoga a
+`merge_failure_rework` (`task_lifecycle.rs`, solo causa tipada: nodo PX). La causa de
+`Merging→Blocked` sigue siendo `MergeOperation(task_merge_id)` (el servicio ya lo exige
+para esa arista); no se usa `cause_kind='domain_event'` ahí (corrige Congelado 7).
+
+Pruebas de migración `v175_*` (en `crates/db/src/tests/v175.rs`): V001..V175 en
+memoria; BD ya en V174 aplica V175; `sqlite_master` sin objetos eliminados salvo los
+triggers recreados; `foreign_key_check`/`integrity_check` limpios; histórico de
+admisiones `merged|closed|head_mismatch|publication_failed` intacto; matriz de
+cada trigger de la tabla (acepta el caso exacto, rechaza uno adyacente).
+
+#### 11.3 Fuera de V175 (no se hace)
+
+No se añade `superseded_for_rework` al CHECK de `remote_pr_admission.state` ni de
+`task_integration_operation.status`: el terminal de pausa es `status='abandoned'`
+del TaskMerge **más** `rework_outcome='superseded_for_rework'` + recibo
+`pr_rework_supersession`; `state` de la admisión permanece `open` (último estado
+observado del proveedor). Compromiso aceptado a cambio de no reconstruir tablas con
+FKs y triggers de V109–V116. Consecuencia obligatoria en Rust: toda consulta que
+selecciona admisiones «abiertas» (`PrReconciler::pending_remote_pr_admissions`,
+`PrFeedbackIngestor`, `list_unconsumed_trusted_feedback`, vistas de la UI) añade
+`rework_outcome IS NULL`; una prueba `pr_rework_selection_excludes_superseded`
+fija la lista.
+
+#### 11.4 Flujo del caso `extend_task`
+
+1. Turno `external_feedback` (11.7) completa; Rust valida y registra triage +
+   disposiciones (V173 + V175) y, si hay `extend_task`, el `work_unit_plan` queda
+   **almacenado pendiente** en el batch de origen `external_feedback_triage` (origen ya
+   admitido por V172; sin materializar).
+2. `PrReworkService::supersede_for_rework(request_id)` (una `BEGIN IMMEDIATE`):
+   revalida request `triaged`, autorización vigente, TaskMerge `running`+`remote_waiting`,
+   lifecycle `Merging` con `reason_ref=TaskMerge`, admisión `open`; inserta evento
+   `pr.admission_superseded`, la fila `pr_rework_supersession`, marca la admisión
+   (`rework_outcome`, `supersession_id`), finaliza el TaskMerge `running→abandoned` y
+   transiciona `Merging→Blocked(reason_kind='pr_feedback_rework', reason_ref=supersession.id)`.
+   La PR **no** se cierra ni se toca en GitHub. Idempotente por `supersession` única por `task_merge_operation_id`.
+3. Mismo servicio, transacción siguiente (reintentable): `Blocked→Active` con el
+   recibo exacto (`pr_feedback_rework`) y, con la Task `Active`, materializa el plan del
+   batch con el materializador existente (WorkUnits nuevos en la misma Task; cada uno
+   guarda `provenance = {"kind":"external_feedback","item_ids":[…],"body_digests":[…]}`).
+   Sin `ExternalFeedbackTriage` materializable (plan inválido en frontera) la Task queda
+   `Active` sin WorkUnits y la request `failed_validation` (humano decide; no hay
+   reintento ciego).
+4. Flujo normal: implement → review formal → Gate nuevo (`ReadyToMerge`) → TaskMerge
+   nuevo → `PublishPr` con admisión nueva (11.5). Aplican los límites de presupuesto
+   existentes (`max_turns`, rondas); agotarlos bloquea como siempre.
+
+Los ítems `dismiss`/`human`/`propose_task` del mismo turno **no** esperan al rework:
+sus efectos (registro, `human_decision`, `post_comment`) se producen en el paso 1.
+Si el turno solo contiene `propose_task`/`human`/`dismiss`, no hay supersesión: la
+Task sigue en `Merging` y la PR avanza (la `human_decision` de `propose_task` no
+bloquea la PR actual).
+
+#### 11.5 Re-admisión y `PublishPr` reutilizando la PR
+
+- `PrProvider` gana `find_open_pr_by_head(repo_identity, source_branch, target_branch) -> Option<PrRecord>`
+  (sin exigir SHA; `GitHubPrProvider` usa `find_pull_by_head` con rama exacta y estado
+  `open`). `find_pr` y `create_pr` no cambian.
+- `MergeService` admite el nuevo TaskMerge normalmente; el repositorio rellena
+  `readmits_supersession_id` dentro de la misma transacción de admisión (como hace con
+  credencial/política): ante supersesión `open` es obligatorio (trigger 11.2). Política,
+  credencial y digest se **re-congelan** (11.2 no copia los de la admisión anterior).
+- `publish_pr` con `readmits_supersession_id`: (a) `find_open_pr_by_head`; sin PR abierta
+  con `provider_pr_id` = el de la supersesión ⇒ no se crea PR: supersesión
+  `remote_closed` o `reconciliation_required` según la observación (11.6);
+  (b) head remoto = `superseded_head_sha` ⇒ la admisión permanece `admitted` y se
+  crea la `pr_external_action` `push_update` (D5: `automatic` por política congelada, o
+  `human_approval` con Proposal/Decision); (c) head remoto distinto ⇒
+  `pr_action.remote_head_changed` y `reconciliation_required` (humano; no se fuerza).
+- `push_update` hace fast-forward de la rama fuente con `expected_remote_head_sha =
+  superseded_head_sha`; el nuevo head debe descender del anterior
+  (`compare_commits`), si no `pr_rework.not_fast_forward`. Éxito ⇒ la admisión pasa a
+  `open` con `observed_head_sha` = nuevo `admitted_source_sha` y la supersesión a
+  `readmitted` en la misma transacción. Fallo definitivo/rechazo/`abandoned` de la
+  acción ⇒ admisión `publication_failed` (terminal existente) y el camino ya existente
+  `merge_failure_rework`. `OutcomeUnknown` ⇒ reconciliación existente (consulta de
+  head remoto antes de reintentar).
+- `PrReconciler` no clasifica `head_mismatch` en admisiones con
+  `readmits_supersession_id` mientras su `push_update` esté en estado no terminal.
+- Nunca merge desde Forge; GitHub puede cerrar o fusionar en cualquier momento.
+
+#### 11.6 Convergencia con el remoto durante el rework
+
+`PrReworkWatcher` (pestaña del tick de `PrReconciler`, solo lectura vía `get_pull`)
+observa cada supersesión `open`:
+- PR **fusionada** remotamente ⇒ supersesión `remote_merged`, evento
+  `pr.rework_remote_merged` y `human_decision` (`source_kind='external_feedback'`,
+  `source_id='rework:{supersession_id}'`, `max_authority_effect=scope`, opciones
+  `follow_up_task` y `cancel_rework`). Respuesta ⇒ cancelación de WorkUnits de rework
+  no iniciados (servicios existentes), supersesión `abandoned` y Task `Blocked` con
+  `reason_kind='pr_merged_externally'`, `reason_ref=decision_id`. **Límite
+  declarado:** no existe arista `Active→Done` sin TaskMerge `succeeded`; Forge no la
+  inventa (pregunta abierta O1).
+- PR **cerrada** sin merge ⇒ supersesión `remote_closed`; la Task continúa en su
+  rework; la admisión siguiente nace **sin** `readmits_supersession_id`, crea PR
+  nueva (`create_pr`) o, si la política lo exige, antes pide `human_decision`
+  (`recreate_pr|stop`).
+- PR abierta con head distinto de `superseded_head_sha` ⇒ no se actúa; se detecta en 11.5(c).
+Reinicios: el watcher es idempotente (estado en `pr_rework_supersession`); no duplica
+eventos ni decisiones (`idx_human_decision_exact_source`).
+
+#### 11.7 Salida del coordinador — turno `external_feedback` (`schema_version: 2`)
+
+Parser `coordinator_outputs/external_feedback.rs` (`deny_unknown_fields`, ≤ 64 KiB,
+≤ 20 ítems; exactamente una entrada por ítem del conjunto; `body_digest` debe
+coincidir; ítem desconocido o repetido ⇒ `coordination.output_not_permitted`):
+
+```json
+{"schema_version":2,"request_id":"<id>","task_id":"<id>","authorization_version":3,
+ "external_feedback":[
+  {"feedback_item_id":"<id>","body_digest":"<64hex>","disposition":"extend_task",
+   "rationale":"El caso límite es un fallo de lo entregado.","instructions":"Cubrir entrada vacía.",
+   "scope_assessment":"within_task_scope","dismiss_reason":null,"proposal":null,"micro_fix":null},
+  {"feedback_item_id":"<id>","body_digest":"<64hex>","disposition":"propose_task",
+   "rationale":"Pide soporte nuevo, fuera del objetivo.","instructions":"",
+   "scope_assessment":"scope_change","dismiss_reason":null,
+   "proposal":{"title":"Soportar X","description":"…","acceptance_criteria":["…"]},"micro_fix":null},
+  {"feedback_item_id":"<id>","body_digest":"<64hex>","disposition":"human",
+   "rationale":"Ambiguo.","instructions":"","scope_assessment":null,"dismiss_reason":null,"proposal":null,"micro_fix":null},
+  {"feedback_item_id":"<id>","body_digest":"<64hex>","disposition":"dismiss",
+   "rationale":"No se comparte: contradice el diseño aprobado.","instructions":"",
+   "scope_assessment":null,"dismiss_reason":"disagree","proposal":null,"micro_fix":null}],
+ "work_unit_plan":{ "items":[ /* forma vigente de work_unit_plan + provenance */ ] },
+ "outputs":[ /* ask_human (≤ 4) para los ítems `human`; mismas reglas que Congelado 4 */ ]}
+```
+Reglas: `work_unit_plan` es obligatorio ⇔ hay ≥ 1 `extend_task`, y prohibido si no
+(`pr_feedback.plan_without_extend`); cada ítem del plan declara
+`provenance:{"kind":"external_feedback","item_ids":["…"]}` con ids ⊆ ítems `extend_task`,
+y cada `extend_task` queda cubierto por ≥ 1 WorkUnit; `scope_assessment` es consejo del
+coordinador, el `scope_classification` autoritativo es el de Rust (11.1); `instructions`
+≤ 4 KiB; `rationale` ≤ 1 KiB; `proposal.title` ≤ 120, `description` ≤ 2 KiB,
+`acceptance_criteria` ≤ 8 de ≤ 256; `dismiss_reason` obligatorio solo en `dismiss`;
+`micro_fix` sigue `null` (fase 3). Cada ítem `human` exige un `ask_human` en `outputs`
+con `evidence_links` al `external_feedback` (V174, `source_kind='external_feedback'`,
+`source_id=feedback_item_id`). Un `extend_task` con `scope_classification=scope_change`
+⇒ `pr_feedback.extend_out_of_scope` y la request falla validación.
+
+#### 11.8 `propose_task` — aplicación
+
+`FollowUpTaskService::apply_approved(human_decision_id)` (módulo `pr_feedback_followup.rs`,
+nodo P2): al responder `approve` crea, con los servicios existentes de plan de Project
+(`ProjectPlanService` propuesta + apply idempotente y versionado; `add_dependency_versioned`
+Task actual → nueva) y creación de Task, la Task de seguimiento **dependiente de la actual**
+(la nueva no empieza hasta que la actual esté `Done`); escribe
+`task_external_feedback_disposition.followup_task_id` (set-once). Idempotente por
+`idempotency_key = sha256("followup|"+disposition_id)`. `reject` registra la decisión y
+no crea nada. La PR actual avanza sin cambios mientras la decisión está abierta o tras
+cualquier respuesta. Autoridad: respuesta humana con `authority_effect=scope` exige
+owner/admin (regla V174 ya existente); Copilot nunca.
+
+#### 11.9 Servicios, owners y firmas
+
+| Servicio / función | Archivo (owner) | Contrato |
+|---|---|---|
+| `classify_rework_scope`, `parse_external_feedback_v2`, `apply_external_feedback_triage` | `coordinator_outputs/external_feedback.rs` (R1/P2) | puras salvo `apply_*` (una transacción: triage V173 + disposición V175 + decisiones + `post_comment`) |
+| `ExternalFeedbackRepo::{record_external_feedback_disposition[_in_tx], list_external_feedback_dispositions}` | `crates/db/src/sqlite/external_feedback.rs` (PX) | repos nuevos sobre V175 |
+| `PrReworkRepo::{create_supersession_in_tx, get_/get_open_supersession_by_task, transition_supersession, supersede_admission_in_tx}` | `crates/db/src/sqlite/pr_rework.rs` (PX) | las únicas rutas que escriben V175 |
+| `PrReworkService::{supersede_for_rework, resume_after_supersession, observe_remote(supersession_id)}` | `crates/services/src/pr_rework.rs` (PX) | 11.4 y 11.6; emite `task.pr_rework_*` |
+| `LifecycleCause::PrFeedbackRework` | `task_lifecycle.rs` (PX, solo causa tipada) | 11.2 |
+| `PrProvider::find_open_pr_by_head`, `publish_pr` con reutilización, `PrReworkWatcher` | `pr_service.rs`, `pr_github_client.rs` (P3) | 11.5/11.6 |
+| `PrExternalActionService::{push_update, post_comment, approve, reject}` | `pr_external_action.rs` (P3) | Congelado 7 + 11.1/11.5 |
+| `FollowUpTaskService::apply_approved` | `pr_feedback_followup.rs` (P2) | 11.8 |
+| Productor/contexto del turno `external_feedback`, cableado de `PrReworkService` | `orchestrator_runtime.rs`, `task_coordination.rs` (**solo RT**) | atomicidad request+origen+presupuesto+evento |
+
+Eventos SSE nuevos (solo ids/digests/estados): `task.pr_feedback_triaged`,
+`task.pr_rework_superseded`, `task.pr_rework_resumed`, `task.pr_rework_converged`,
+`task.pr_followup_proposed`. Domain event `pr.admission_superseded` y
+`pr.rework_remote_merged` no son SSE públicos.
+
+Códigos de error nuevos: `pr_feedback.extend_out_of_scope`, `pr_feedback.plan_without_extend`,
+`pr_rework.not_authorized`, `pr_rework.stale_request`, `pr_rework.not_fast_forward`,
+`pr_rework.reuse_target_missing`, `pr_rework.supersession_open`.
+
+REST/MCP (API, fase 2): `GET /api/v1/tasks/{id}/pr-feedback` (ya previsto) añade
+`disposition`, `dismiss_reason`, `scope_classification`, `human_decision_id`,
+`followup_task_id`; `GET /api/v1/tasks/{id}/pr-rework` lista supersesiones (estado,
+head, `provider_pr_id`, decisión de convergencia); sin POST nuevo (todo avanza por
+Rust, decisión humana por `.../human-decisions/{id}/answer` y acciones por
+`.../pr-actions/{id}/approve|reject`). MCP solo lectura:
+`forge_list_task_pr_rework`. DTOs: `ExternalFeedbackItemResponse` +campos,
+`PrReworkSupersessionResponse`, `PrReworkListResponse {items, next_cursor}` en `pr_feedback.rs`.
+UI (`task-pr-feedback-panel.tsx`): disposición por ítem, enlace a la decisión, estado de
+pausa («PR abierta en GitHub, rework en curso»), comentarios publicados; textos en `web/src/locales/**`.
+
+#### 11.10 Pruebas (prefijo `pr_rework_`)
+
+Servicios (`cargo test --locked -p services --lib pr_rework_`): `pr_rework_classifier_*`
+(hechos de alcance, `extend_task` rechazado ante `scope_change`);
+`pr_rework_parse_*` (una entrada por ítem, digests, plan obligatorio/prohibido);
+`pr_rework_supersede_atomic` (abandona TaskMerge + marca admisión + Merging→Blocked, PR sin cierre);
+`pr_rework_resume_materializes_plan` (Blocked→Active con recibo exacto y WorkUnits con provenance);
+`pr_rework_replay_and_restart_idempotent`; `pr_rework_readmit_reuses_open_pr` (sin `create_pr`);
+`pr_rework_push_update_fast_forward_and_head_conflict`; `pr_rework_push_requires_policy_or_decision`;
+`pr_rework_selection_excludes_superseded`; `pr_rework_remote_merged_routes_to_decision`;
+`pr_rework_remote_closed_new_pr`; `pr_rework_propose_task_requires_decision` y
+`pr_rework_followup_created_on_approve_depends_on_current`; `pr_rework_dismiss_recorded_immutable`;
+`pr_rework_comment_marker_not_reingested`; actualizar las pruebas `pr_lifecycle_spike_*`
+(fijaban el bloqueo; pasan a afirmar la ruta supersedida). API:
+`crates/api/tests/coordinator_verification_pr_loop.rs` (funciones `pr_rework_*`,
+servidor GitHub simulado local): ciclo completo extend → PR misma número → Gate → push;
+propose_task con aprobación y con rechazo; `GET /pr-feedback` y `/pr-rework`; merge desde Forge inexistente.
+DB: `v175_*` (11.2). Workflow (nodo I fase 2): `-p db --lib v175_`, `-p services --lib pr_rework_`,
+`pr_feedback_followup` y el mismo `--test coordinator_verification_pr_loop`.
 
 ### Nota de workflow (CI) — pasos a añadir en el nodo I de cada fase
 
@@ -1153,8 +1519,8 @@ plan). Los pasos están en una lista enfocada de `cargo test` (jobs `build` y
 fase añade, en pasos nuevos con `if: ${{ !cancelled() }}`:
 
 - Fase 1: `cargo test --locked -p db --lib v171_ v172_ v174_` (libtest admite varios filtros; un paso por crate/target), `cargo test --locked -p services --lib validation_catalog`, `... validation_check_runner`, `... human_decision`, `... coordinator_outputs`, `... validation_post_integration`, `cargo test --locked -p api --test coordinator_verification_pr_loop` (añadido a la lista `--test` del paso final de `api`), y los tests de `gate_engine_api` (`--test gate_engine_api` si no figura ya en la lista).
-- Fase 2: `-p db --lib v173_`, `-p services --lib pr_github_client`, `pr_feedback`, `pr_external_action`, y el mismo `--test coordinator_verification_pr_loop`.
-- Fase 3: `-p db --lib v175_`, `-p services --lib fallback`, `micro_fix`.
+- Fase 2: `-p db --lib v173_ v175_`, `-p services --lib pr_github_client`, `pr_feedback`, `pr_external_action`, `pr_rework_`, `pr_feedback_followup`, y el mismo `--test coordinator_verification_pr_loop`.
+- Fase 3: `-p db --lib v176_`, `-p services --lib fallback`, `micro_fix`.
 - El job de clippy ya cubre `services db cli-adapters api api-types mcp-server executors`; no cambia. `pnpm lint/test` y el browser smoke ya incluyen los tests web nuevos si siguen el patrón `*.test.ts(x)`.
 - Todo test nuevo debe tener prefijo/nombre que coincida con su filtro; T lo verifica contra la lista del workflow.
 
@@ -1172,7 +1538,8 @@ flowchart LR
   N0 --> A2[A2 V172 kinds/origenes de request]
   N0 --> A3[A3 V173 feedback PR + operaciones]
   N0 --> A4[A4 V174 decisiones humanas]
-  N0 --> A5[A5 V175 fallback + micro-fix receipts]
+  N0 --> A5[A5 V176 fallback + micro-fix receipts]
+  A3 --> PX[PX V175 pausa de PR + disposiciones + lifecycle]
   A1 --> C1[C1 Catálogo + núcleo de run]
   C1 --> C2[C2 Runner + baseline + comparación]
   C2 --> C3[C3 Gate schema v2 required_checks]
@@ -1187,10 +1554,14 @@ flowchart LR
   A3 --> P0[P0 GitHubPrProvider real]
   P0 --> P1[P1 Ingesta + trust]
   A3 --> P1
-  P1 --> P2[P2 Triage external_feedback]
+  P1 --> P2[P2 Triage external_feedback por disposición]
+  PX --> P2
+  R1 --> P2
   P2 --> RT
-  N0 --> PS[PS Spike lifecycle Merging->Blocked->Active]
-  PS --> P3[P3 PushPrUpdate + PostPrComment]
+  PX --> RT
+  N0 --> PS[PS Spike NO VIABLE -> D3']
+  PS --> PX
+  PX --> P3[P3 Re-admisión misma PR + push_update + post_comment + convergencia]
   A3 --> P3
   C3 --> P3
   RT --> API[API/MCP/DTO]
@@ -1211,9 +1582,9 @@ flowchart LR
 
 | Carril | Nodos | Paths propios (exclusivos) | Puede ir en paralelo con |
 |---|---|---|---|
-| L1 Persistencia | A1–A5 | `crates/db/migrations/V171..V175__*.sql`, `crates/db/src/models.rs` (secciones nuevas), `crates/db/src/sqlite/{validation_run,task_coordination,pr_metadata,pr_provider_config,task_integration_operation}.rs`, repos nuevos `human_decision.rs`, `external_feedback.rs`, `validation_catalog.rs` | Todos tras N0 (solo contrato) |
+| L1 Persistencia | A1–A5, PX | `crates/db/migrations/V171..V176__*.sql`, `crates/db/src/models.rs` (secciones nuevas), `crates/db/src/sqlite/{validation_run,task_coordination,pr_metadata,pr_provider_config,task_integration_operation}.rs`, repos nuevos `human_decision.rs`, `external_feedback.rs`, `validation_catalog.rs` | Todos tras N0 (solo contrato) |
 | L2 Verificación | C1–C3 | `crates/services/src/validation_service.rs`, nuevos `validation_catalog.rs`, `validation_check_runner.rs`, `gate_engine.rs` (solo secciones de política v2) | L3 PR, L5 fallback, L6 UI sobre fixtures |
-| L3 PR | P0–P3, PS | `crates/services/src/pr_service.rs`, nuevos `pr_feedback.rs`, `pr_github_client.rs`, `task_integration_operation.rs` (op. nuevas), `task_lifecycle.rs` (solo causa tipada) | L2, L5 |
+| L3 PR | P0–P3, PX, PS | `crates/services/src/pr_service.rs`, nuevos `pr_feedback.rs`, `pr_github_client.rs`, `pr_rework.rs`, `pr_feedback_followup.rs`, `task_integration_operation.rs` (op. nuevas), `task_lifecycle.rs` (solo causa tipada) | L2, L5 |
 | L4 Coordinación | R1, D1, M1, RT | nuevos `crates/services/src/coordinator_outputs/{validation_request,micro_fix,ask_human,propose_replan,external_feedback}.rs`, `human_decision_service.rs`, `task_rework.rs`/`task_rework/` (micro-fix); **solo RT** edita `orchestrator_runtime.rs` y `task_coordination.rs`, en serie y una vez, tras R1/D1/M1/C2/P2 | R1/D1/M1 en paralelo entre sí |
 | L5 Dispatcher | FB | `crates/services/src/task_dispatcher/fallback.rs`, `task_dispatcher.rs` (registro del módulo), `work_unit_service.rs` (solo reutiliza `allocate`, sin edición salvo hook acordado) | L2, L3, L4 |
 | L6 API/MCP/tipos | API | `crates/api-types/src/{task_coordination,review_validation}.rs` y nuevos (`human_decision.rs`, `validation_catalog.rs`, `pr_feedback.rs`), `crates/api/src/routes/{validation_checks,human_decisions,pr_feedback}.rs` nuevos, `routes/mod.rs`, `crates/mcp-server/src/tools/{descriptors,handlers}.rs`, `crates/forge-cli` (flags si aplica), tipos generados por `ts-rs` (no a mano) | Tras DTO freeze de N0 |
@@ -1230,12 +1601,12 @@ Cualquier cambio de contrato vuelve a N0.
 
 | Nodo | Trabajo y criterio DONE | Depende | Archivos | Estado |
 |---|---|---|---|---|
-| N0 | Congelar: formas del catálogo, envelope v2 (`validation_checks`, `micro_fix`, `micro_fix_reviewer`, `fallback_agents`, `allow_coordinator_replan`), kinds nuevos (`validation_findings`, `external_feedback`, `human_decision_resume`), orígenes batch nuevos (`validation_triage`, `external_feedback_triage`, `human_decision_resume`, `coordinator_replan`), DTOs, códigos de error, eventos SSE, política de feedback, credencial GitHub, numeración V171–V175, fases y ownership. D1–D8 resueltas con el usuario. | — | Este plan («Contratos congelados (N0)») | **DONE (estático)** |
+| N0 | Congelar: formas del catálogo, envelope v2 (`validation_checks`, `micro_fix`, `micro_fix_reviewer`, `fallback_agents`, `allow_coordinator_replan`), kinds nuevos (`validation_findings`, `external_feedback`, `human_decision_resume`), orígenes batch nuevos (`validation_triage`, `external_feedback_triage`, `human_decision_resume`, `coordinator_replan`), DTOs, códigos de error, eventos SSE, política de feedback, credencial GitHub, numeración V171–V176, fases y ownership. D1–D8 resueltas con el usuario. | — | Este plan («Contratos congelados (N0)») | **DONE (estático)** |
 | A1 | (Fase 1) V171: `validation_check_definition`, `validation_check_request`, `validation_comparison`; columnas aditivas de `validation_run`; triggers de inmutabilidad y de identidad; preservación de filas históricas. | N0 | `crates/db/migrations/V171__*.sql`, db repos | **IMPLEMENTADO / NOT RUN** (ver Anexo A1/A2/A4) |
 | A2 | (Fase 1) V172: **una sola** reconstrucción de `task_coordination_request` (patrón V168) que añade kinds y orígenes nuevos, revisando guards V167 de batch y vistas de autoridad vigentes. | N0 | `V172__*.sql`, `crates/db` | **IMPLEMENTADO / NOT RUN** (ver Anexo A1/A2/A4) |
 | A3 | (Fase 2) V173: referencia de credencial, `feedback_policy_json`/digest en config y admisión, `external_feedback_item`, `task_external_feedback_triage`, `pr_external_action` (sin reconstruir `task_integration_operation`; triggers V112/V116 revisados), guarda agent_profile↔github. | N0 | `V173__*.sql` | **IMPLEMENTADO / NOT RUN** (ver Anexo A3) |
 | A4 | (Fase 1) V174: `human_decision_request` + guards de versión/estado/evidencia. | N0 | `V174__human_decision_request.sql` | **IMPLEMENTADO / NOT RUN** (ver Anexo A1/A2/A4) |
-| A5 | (Fase 3) V175: `work_unit_fallback_receipt`, `micro_fix_receipt`. | N0 | `V175__*.sql` | **TODO** |
+| A5 | (Fase 3) V176 (renumerada desde V175 por D3'): `work_unit_fallback_receipt`, `micro_fix_receipt`. | N0 | `V176__*.sql` | **TODO** |
 | C1 | Servicio de catálogo (escritura owner/admin), validación de pins del envelope, extracción del núcleo de `run_command` con identidad de catálogo sin alterar el camino legacy. | A1 | `validation_service.rs`, `validation_catalog.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo C1–C3) |
 | C2 | (Fase 1) `ValidationCheckRunner` (cola, claim, lease-free guard, lock de workspace), workspace de verificación en commit base, comparación determinista (baseline **incluido en v1**, D1). Decisión del lead (C2): el baseline es un worktree git desacoplado propiedad del runner, **sin fila `workspace` ni `workspace_scope`**; la fila `validation_comparison` guarda commit base, digest de snapshot y procedencia local, y el worktree se limpia tras la ejecución (ver «Decisiones del lead posteriores a N0»). | C1 | `validation_check_runner.rs`, `workspace` crate (solo uso), `workspace_cleanup.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo C1–C3) |
 | C3 | (Fase 1) Gate policy schema v2 `required_checks` con resolución por clave exacta (D2 resuelta); trigger post-integración; sin cambiar v1. | C2 | `gate_engine.rs`, `validation_post_integration.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo C1–C3) |
@@ -1245,9 +1616,10 @@ Cualquier cambio de contrato vuelve a N0.
 | FB | (Fase 3) Fallback cross-Agent según F-c; cadena y perfiles solo si están en el envelope (D7); sin fallback del coordinador (D8). | A5 | `task_dispatcher/fallback.rs` | **TODO** |
 | P0 | (Fase 2) `GitHubPrProvider` real (`find/create/get_status`) con cliente HTTP, credencial desde `CredentialService` (D4), redacción de errores, pruebas contra servidor simulado local vía costura inyectable. | N0, A3 | `pr_github_client.rs`, `pr_service.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo P0) |
 | P1 | (Fase 2) `PrFeedbackIngestor` + clasificación de confianza + anti-bucle + `stale_head`. | P0, A3 | `pr_feedback.rs`, `pr_service.rs` (registro en `PrReconciler`) | **IMPLEMENTADO / NOT RUN** (ver Anexo P1) |
-| P2 | (Fase 2) Productor y contexto de triage `external_feedback` (atomicidad request+origen+presupuesto+evento, replay, pause/revoke/restart). | P1, A2, R1 | `task_coordination.rs` (vía RT) | **TODO** |
-| PS | (Fase 2) Spike de lifecycle: demostrar con prueba de servicio que `Merging → Blocked(pr_feedback) → Active` conserva el TaskMerge `remote_waiting` y que merge/cierre remoto durante rework converge. **Si no cabe, parar y preguntar al usuario** (D3); no se propone arista nueva por cuenta propia. | N0 | `task_lifecycle.rs` | **SPIKE HECHO / NO VIABLE tal cual (D3): parar y preguntar** (ver Anexo PS) |
-| P3 | (Fase 2) Acciones `push_update` y `post_comment` (`pr_external_action`): Gate exacto, autorización por política congelada/Decisión (D5), idempotencia, `OutcomeUnknown`, recuperación; el merge nunca. | P0, PS, A3, C3 | `task_integration_operation.rs`, `pr_service.rs` | **TODO** |
+| P2 | (Fase 2, redefinido por D3') Triage `external_feedback` **por disposición** (`extend_task|propose_task|human|dismiss`, Congelado 11 §11.1/11.7): parser schema_version 2, `classify_rework_scope`, `apply_external_feedback_triage` (triage V173 con mapeo legado + disposición V175 + `human_decision` + `post_comment`), `FollowUpTaskService` para `propose_task` aprobado; productor/contexto del turno (atomicidad request+origen+presupuesto+evento, replay, pause/revoke/restart) vía RT. | P1, A2, R1, PX | `coordinator_outputs/external_feedback.rs`, `pr_feedback_followup.rs`, `task_coordination.rs` (vía RT) | **TODO** |
+| PS | (Fase 2) Spike de lifecycle D3. | N0 | pruebas `pr_lifecycle_spike_*` | **CERRADO**: veredicto NO VIABLE (Anexo PS); **resuelto por D3'** (usuario, 2026-11-16, opción 1 ampliada). Sus pruebas se actualizan en PX. |
+| PX | (Fase 2, nuevo por D3') Pausa no destructiva de admisión y base del rework: **V175** (`pr_rework_supersession`, columnas `rework_outcome`/`supersession_id`/`readmits_supersession_id` en `remote_pr_admission`, `task_external_feedback_disposition`, triggers recreados y nuevos de «Congelado 11» §11.2), repos `sqlite/pr_rework.rs`, `PrReworkService::{supersede_for_rework, resume_after_supersession, observe_remote}`, `LifecycleCause::PrFeedbackRework` (recibo `pr_feedback_rework`), exclusión `rework_outcome IS NULL` en selecciones de P1, actualización de `pr_lifecycle_spike_*`. Pruebas `v175_*` y `pr_rework_supersede_*`. | N0, A3, P0 | ver Congelado 10 | **TODO** |
+| P3 | (Fase 2, redefinido por D3') Re-admisión sobre la misma PR (`find_open_pr_by_head`, `publish_pr` con `readmits_supersession_id`), `push_update` dentro de la admisión nueva (fast-forward, `expected_remote_head_sha`), `post_comment` del resumen de triage (también sobre admisión superseded), `PrReworkWatcher` (merge/cierre remoto durante rework, §11.6); Gate exacto, autorización por política congelada/Decisión (D5), idempotencia, `OutcomeUnknown`, recuperación; el merge nunca. | P0, PX, A3, C3 | `pr_external_action.rs`, `pr_service.rs`, `pr_github_client.rs` | **TODO** |
 | RT | (Fases 1–3, una pasada por fase) Cableado único y ordenado de las salidas nuevas en el runtime y coordinación; contexto exacto de validación y feedback; políticas `allowed_actions`. | R1, D1, M1, C2, P2 | `orchestrator_runtime.rs`, `task_coordination.rs` | **Fase 1 IMPLEMENTADO / NOT RUN** (ver Anexo RT); fases 2–3 TODO |
 | API | (por fase) REST, MCP, SSE, DTOs, tipos generados, `forge-ctl` si procede. Ver «Contratos públicos». | RT, D1, C3, P3 | ver L6 | **FASE 1 IMPLEMENTADA / NOT RUN** (ver Anexo API fase 1); fases 2–3 TODO |
 | UI | (por fase) Paneles de decisión humana, checks (catálogo, solicitudes, comparación base), feedback de PR, estados de fallback/micro-fix en la journey. | API (fixtures desde N0) | ver L7 | **TODO** |
@@ -1295,7 +1667,7 @@ deterministas, no aceptación con proveedor real.
 
 | Caso | Evidencia mínima | Archivo propuesto |
 |---|---|---|
-| Migraciones V171–V175 | Conservan todos los estados históricos y FKs; V172 preserva requests existentes (`work_unit_plan`, `review_findings`); `validation_run` históricos reciben `run_origin='legacy_command'`; triggers de inmutabilidad | `crates/db/src/tests.rs` |
+| Migraciones V171–V176 | Conservan todos los estados históricos y FKs; V172 preserva requests existentes (`work_unit_plan`, `review_findings`); `validation_run` históricos reciben `run_origin='legacy_command'`; triggers de inmutabilidad | `crates/db/src/tests.rs` |
 | Catálogo | Versiones inmutables; no-owner rechazado; pin desactualizado o clave ausente rechazado en `authorize`; envelope histórico sin campos nuevos conserva digest | `task_coordination.rs` tests, `crates/api/tests/coordinator_verification_pr_loop.rs` |
 | `RequestValidation` | Check no autorizado → `validation.check_not_authorized`; sujeto con lease activo rechazado; replay idempotente no duplica run ni cargo de presupuesto; coordinador no puede indicar comando/ruta/commit | `orchestrator_runtime/tests/` |
 | Run exacto y Stale | Run de catálogo sobre snapshot exacto; cambio de HEAD/snapshot durante la ejecución → `Stale`; timeout → `Error`; bound de tails | `task_service/tests/service_tests/cases/validation.rs` |
@@ -1309,7 +1681,7 @@ deterministas, no aceptación con proveedor real.
 | Replan | `within_envelope` continúa sin humano; cambio de objetivo/rol/actor/repos o exceso de WorkUnits → `human_decision_request` y sin materialización hasta responder | servicio |
 | PR provider | `find/create/get_status` contra servidor simulado local (`base_url`); token solo en cabecera y nunca en logs/errores/eventos (aserción sobre capturas); `OutcomeUnknown` reconciliable | `pr_service.rs` tests |
 | Ingesta | Dedupe por id+digest; edición crea fila nueva; `untrusted` no activa turnos; comentarios con marcador Forge excluidos; `stale_head`; cuerpo truncado marcado; contenido externo no puede inyectar acciones (solo dato citado) | servicio |
-| Triage y rework PR | `correct|recheck|human|dismiss` por ítem; rework → review → Gate nuevo → `PushPrUpdate` con ff y remote head esperado; remote head cambiado → `reconciliation_required`; PR fusionado/cerrado durante rework converge | `crates/api/tests/coordinator_verification_pr_loop.rs` |
+| Triage y rework PR (D3') | `extend_task|propose_task|human|dismiss` por ítem; `extend_task` fuera de alcance rechazado; pausa `superseded_for_rework` (PR abierta), `Merging→Blocked→Active` con recibo `pr_feedback_rework`, WorkUnits nuevos con provenance, review → Gate nuevo → TaskMerge nuevo → `push_update` ff sobre la MISMA PR con head esperado; remote head cambiado → `reconciliation_required`; PR fusionada → decisión humana, cerrada → PR nueva; `propose_task` solo tras decisión humana. Lista completa en «Congelado 11» §11.10 (prefijo `pr_rework_`) | `crates/api/tests/coordinator_verification_pr_loop.rs` |
 | Comentario de resumen | Plantilla determinista, redacción, idempotencia por marcador, `OutcomeUnknown`; sin política/Decisión no se publica | idem |
 | Frontera de merge | Ninguna ruta de Forge llama a merge de GitHub; `allow_merge`/`allow_external_actions` siguen rechazados en envelope | idem |
 | UI | Vitest de journey/paneles; e2e con servidor desechable: tarjeta de decisión, check con comparación, feedback de PR, bloqueo por fallback agotado | `web/**`, `web/e2e` |
@@ -1360,9 +1732,30 @@ deterministas, no aceptación con proveedor real.
 - **D2 Requisitos de checks en el Gate — RESUELTA: schema v2 `required_checks`**
   resueltos por clave exacta (no `latest`); v1 sin cambios; schema desconocido falla
   cerrado. Propagada a C7, Congelado 5 y nodo C3.
-- **D3 Lifecycle durante rework de PR — RESUELTA:** `Merging → Blocked(pr_feedback)
-  → Active` mediante el spike PS. **Si el spike falla, se detiene y se pregunta al
-  usuario**; no se añade arista por cuenta propia.
+- **D3 Lifecycle durante rework de PR — SUSTITUIDA por D3' (2026-11-16).** Texto
+  original: `Merging → Blocked(pr_feedback) → Active` mediante el spike PS; si fallaba,
+  parar y preguntar. El spike falló (Anexo PS, NO VIABLE) y se preguntó.
+- **D3' Triage por disposición y rework en la misma PR — RESUELTA (usuario, 2026-11-16).**
+  El coordinador triagea cada ítem `trusted` del feedback con una de cuatro
+  disposiciones: (1) `extend_task` (dentro del alcance original): se cierra de forma
+  no destructiva la admisión/TaskMerge en espera como `superseded_for_rework` (PR
+  abierta en GitHub), Task `Merging → Blocked(pr_feedback_rework) → Active` con recibo
+  exacto, WorkUnits nuevos en la misma Task desde el feedback (`work_unit_plan` con
+  provenance `external_feedback`), implement → review → Gate, TaskMerge/admisión nuevos
+  y `push_update` a la MISMA PR (`find_open_pr_by_head`); sin aprobación humana salvo
+  política de push `human_approval` (D5); (2) `propose_task` (ampliación de alcance):
+  Task de seguimiento propuesta en el DAG, dependiente de la actual, con su PR futura;
+  requiere `human_decision` (`authority_effect=scope`) y la PR actual sigue intacta;
+  (3) `human` (preguntar); (4) `dismiss` (con razón), registro inmutable. Clasifica
+  extend vs propose el clasificador determinista de alcance (misma familia que el de
+  replan) más la propuesta del coordinador: `scope_change` ⇒ `extend_task` rechazado.
+  El coordinador publica además un `post_comment` de resumen (D5, marcador anti-bucle).
+  Convergencia: PR fusionada durante la pausa ⇒ registro + decisión humana; cerrada ⇒
+  la Task continúa y la siguiente admisión crea PR nueva o pregunta. Contratos en
+  «Congelado 11»; migración V175; fase 3 renumerada a V176.
+  Pregunta abierta O1: no existe arista `Active→Done` sin merge Forge; el merge
+  externo durante la pausa deja la Task `Blocked(pr_merged_externally)` hasta que el
+  usuario decida si se añade esa arista.
 - **D4 Credencial de GitHub — RESUELTA: `CredentialService` cifrado, no variable
   de entorno.** Diseño en «Congelado 6»: alta por `POST /providers` con
   `provider:"github"`, referencia `credential_id` en el repo, congelada en la
@@ -1471,8 +1864,8 @@ por ítem, guard de `triaged`, acciones: política congelada, exclusión, transi
 idempotencia, Proposal/Decision exactas, teardown).
 
 **Numeración:** `run_migrations` aplica por versión no registrada (`is_applied`), así que
-V173 se aplica también sobre una BD ya migrada a V174. **No** se renumera; V175 (fase 3)
-sigue igual.
+V173 se aplica también sobre una BD ya migrada a V174. **No** se renumera V173. La
+fase 3 pasa de V175 a **V176** porque V175 es ahora la pausa de PR (D3', nodo PX).
 
 **Forma implementada (autoritativo: `V173__pr_feedback_and_credential.sql`):**
 - `pr_provider_config`: `credential_handle_id`, `credential_owner_user_id` (FK RESTRICT),
@@ -1809,6 +2202,8 @@ comportamiento actual y están pendientes de CI.
 
 ### Veredicto: **NO VIABLE con el esquema/lifecycle actuales** (D3: se detiene y se pregunta al usuario)
 
+> **Resolución (2026-11-16):** el usuario eligió la opción 1 ampliada como **D3'** (ver «Congelado 11»). Este anexo se conserva como evidencia del análisis; sus pruebas `pr_lifecycle_spike_*` fijan el comportamiento previo y las actualiza el nodo PX. Matices respecto a la opción 1 original: el terminal de pausa se modela con columnas aditivas y un recibo (`pr_rework_supersession`), TaskMerge `abandoned`, **sin** reconstruir `remote_pr_admission`/`remote_pr_history`; la numeración es V175 (pausa) y V176 (fase 3).
+
 La transición `Merging → Blocked(reason pr_feedback)` con TaskMerge `running`+`remote_waiting` es
 imposible por **tres** barreras independientes, y aunque se levantara la primera, el rework y la
 convergencia siguen bloqueados por las otras dos.
@@ -1866,7 +2261,7 @@ proveedor nunca se persiste. Aunque se persistiera, la finalización del TaskMer
 atascada, o PR cerrada con TaskMerge eternamente `running`.
 
 ### Opciones mínimas (requieren decisión del usuario; ninguna se implementa)
-1. **Pausa explícita de admisión (recomendada)**: V175+ añade un resultado terminal no destructivo
+1. **Pausa explícita de admisión (ELEGIDA como D3', ver «Congelado 11»)**: V175 añade un resultado terminal no destructivo
    `superseded_for_rework` (PR queda abierta, sin merge ni cierre) para `remote_pr_admission`/TaskMerge
    (`failed`/`abandoned` con evento `pr.status_changed` de procedencia propia), un recibo `pr_feedback`
    para `Blocked→Active`, y el cambio de `PublishPr` para **reutilizar** la PR existente (`find_pr` ya
