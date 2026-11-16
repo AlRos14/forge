@@ -206,6 +206,18 @@ impl AgentService {
             resolve_daemon_for_account(&self.db, &owner_id, &executor_type, Some(daemon_id))
                 .await?;
         }
+        if let Some(credential_id) = credential_ref.as_deref() {
+            let handle = db::CredentialHandleRepo::get_credential_handle(&*self.db, credential_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("credential_handle", credential_id.to_owned())
+                })?;
+            if crate::credential_service::is_scm_handle(&handle) {
+                return Err(ServiceError::invalid_operation(
+                    "SCM credentials cannot be assigned to an Agent profile",
+                ));
+            }
+        }
         validate_positive("max_concurrent", max_concurrent.unwrap_or(1))?;
         validate_positive("heartbeat_interval", heartbeat_interval.unwrap_or(30))?;
         validate_positive("max_missed", max_missed.unwrap_or(3))?;

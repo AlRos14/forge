@@ -514,6 +514,7 @@ pub struct PrReconciler {
     interval: Duration,
     credentials: Option<Arc<CredentialService>>,
     provider_factory: Arc<dyn PrProviderFactory>,
+    feedback: crate::pr_feedback::PrFeedbackIngestor,
     #[cfg(test)]
     provider_override: Option<Arc<dyn PrProvider>>,
 }
@@ -521,6 +522,7 @@ pub struct PrReconciler {
 impl PrReconciler {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>, interval: Option<Duration>) -> Self {
         let lock_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let feedback = crate::pr_feedback::PrFeedbackIngestor::new(Arc::clone(&db));
         Self {
             integration_operations:
                 crate::task_integration_operation::TaskIntegrationOperationManager::new(
@@ -532,17 +534,20 @@ impl PrReconciler {
             interval: interval.unwrap_or(Duration::from_secs(60)),
             credentials: None,
             provider_factory: Arc::new(DefaultPrProviderFactory),
+            feedback,
             #[cfg(test)]
             provider_override: None,
         }
     }
 
     pub fn with_credentials(mut self, credentials: Arc<CredentialService>) -> Self {
+        self.feedback = self.feedback.with_credentials(Arc::clone(&credentials));
         self.credentials = Some(credentials);
         self
     }
 
     pub fn with_provider_factory(mut self, factory: Arc<dyn PrProviderFactory>) -> Self {
+        self.feedback = self.feedback.with_provider_factory(Arc::clone(&factory));
         self.provider_factory = factory;
         self
     }
@@ -580,6 +585,11 @@ impl PrReconciler {
             if let Err(error) = self.reconcile_metadata(metadata, admission).await {
                 tracing::warn!(%error, "remote PR admission reconciliation failed");
             }
+        }
+        // External feedback ingestion shares the tick but never blocks or
+        // fails reconciliation.
+        if let Err(error) = self.feedback.ingest_once().await {
+            tracing::warn!(%error, "PR feedback ingestion pass failed");
         }
         Ok(())
     }
@@ -772,12 +782,14 @@ async fn find_or_create(
     }
 }
 
-async fn provider_for_admission(
+/// Open the frozen credential of an admission and verify that its owner still
+/// holds owner/admin authority over the Project. The secret exists only in
+/// memory for the caller.
+pub(crate) async fn acquire_admission_secret(
     db: &SqliteDb,
     credentials: Option<&CredentialService>,
-    factory: &dyn PrProviderFactory,
     admission: &RemotePrAdmission,
-) -> std::result::Result<Arc<dyn PrProvider>, PrProviderError> {
+) -> std::result::Result<crate::credential_service::Secret, PrProviderError> {
     let unavailable = |reason: &str| PrProviderError::Unavailable(reason.to_owned());
     let (Some(handle_id), Some(owner_id)) = (
         admission
@@ -814,6 +826,16 @@ async fn provider_for_admission(
     if owner_authorized == 0 {
         return Err(unavailable("credential.owner_not_authorized"));
     }
+    Ok(secret)
+}
+
+async fn provider_for_admission(
+    db: &SqliteDb,
+    credentials: Option<&CredentialService>,
+    factory: &dyn PrProviderFactory,
+    admission: &RemotePrAdmission,
+) -> std::result::Result<Arc<dyn PrProvider>, PrProviderError> {
+    let secret = acquire_admission_secret(db, credentials, admission).await?;
     factory
         .build(
             admission.provider_type.as_str(),

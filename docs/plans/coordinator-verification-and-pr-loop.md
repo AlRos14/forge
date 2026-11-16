@@ -1244,9 +1244,9 @@ Cualquier cambio de contrato vuelve a N0.
 | M1 | (Fase 3) Cálculo de bounds sobre diff, `micro_fix_bounds_exceeded`, presupuesto `max_per_task`, revisión formal con contexto delta. | A5, R1 | `task_rework*`, `diff.rs` (lectura) | **TODO** |
 | FB | (Fase 3) Fallback cross-Agent según F-c; cadena y perfiles solo si están en el envelope (D7); sin fallback del coordinador (D8). | A5 | `task_dispatcher/fallback.rs` | **TODO** |
 | P0 | (Fase 2) `GitHubPrProvider` real (`find/create/get_status`) con cliente HTTP, credencial desde `CredentialService` (D4), redacción de errores, pruebas contra servidor simulado local vía costura inyectable. | N0, A3 | `pr_github_client.rs`, `pr_service.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo P0) |
-| P1 | (Fase 2) `PrFeedbackIngestor` + clasificación de confianza + anti-bucle + `stale_head`. | P0, A3 | `pr_feedback.rs`, `pr_service.rs` (registro en `PrReconciler`) | **TODO** |
+| P1 | (Fase 2) `PrFeedbackIngestor` + clasificación de confianza + anti-bucle + `stale_head`. | P0, A3 | `pr_feedback.rs`, `pr_service.rs` (registro en `PrReconciler`) | **IMPLEMENTADO / NOT RUN** (ver Anexo P1) |
 | P2 | (Fase 2) Productor y contexto de triage `external_feedback` (atomicidad request+origen+presupuesto+evento, replay, pause/revoke/restart). | P1, A2, R1 | `task_coordination.rs` (vía RT) | **TODO** |
-| PS | (Fase 2) Spike de lifecycle: demostrar con prueba de servicio que `Merging → Blocked(pr_feedback) → Active` conserva el TaskMerge `remote_waiting` y que merge/cierre remoto durante rework converge. **Si no cabe, parar y preguntar al usuario** (D3); no se propone arista nueva por cuenta propia. | N0 | `task_lifecycle.rs` | **TODO** |
+| PS | (Fase 2) Spike de lifecycle: demostrar con prueba de servicio que `Merging → Blocked(pr_feedback) → Active` conserva el TaskMerge `remote_waiting` y que merge/cierre remoto durante rework converge. **Si no cabe, parar y preguntar al usuario** (D3); no se propone arista nueva por cuenta propia. | N0 | `task_lifecycle.rs` | **SPIKE HECHO / NO VIABLE tal cual (D3): parar y preguntar** (ver Anexo PS) |
 | P3 | (Fase 2) Acciones `push_update` y `post_comment` (`pr_external_action`): Gate exacto, autorización por política congelada/Decisión (D5), idempotencia, `OutcomeUnknown`, recuperación; el merge nunca. | P0, PS, A3, C3 | `task_integration_operation.rs`, `pr_service.rs` | **TODO** |
 | RT | (Fases 1–3, una pasada por fase) Cableado único y ordenado de las salidas nuevas en el runtime y coordinación; contexto exacto de validación y feedback; políticas `allowed_actions`. | R1, D1, M1, C2, P2 | `orchestrator_runtime.rs`, `task_coordination.rs` | **Fase 1 IMPLEMENTADO / NOT RUN** (ver Anexo RT); fases 2–3 TODO |
 | API | (por fase) REST, MCP, SSE, DTOs, tipos generados, `forge-ctl` si procede. Ver «Contratos públicos». | RT, D1, C3, P3 | ver L6 | **FASE 1 IMPLEMENTADA / NOT RUN** (ver Anexo API fase 1); fases 2–3 TODO |
@@ -1545,9 +1545,9 @@ HeadState,Disposition}`, `PrExternalAction{Kind,State}`, `PrFeedbackAuthorizatio
 `PrFeedbackSummaryMode`. Teardown de Project actualizado. Pruebas: `v173_*` en
 `crates/db/src/tests/v173.rs`.
 
-**Pendiente de servicios (fuera de A3):** `CredentialService::{connect_scm_credential,
-acquire_scm_secret}`, comprobación de servicio agent_profile↔github, y la
-autorización/Proposal/Decision de acciones.
+**Servicios (ver Anexo P1):** `connect_scm_credential`, comprobación de servicio
+agent_profile↔github y servicio de ajustes (credencial/política) implementados;
+`acquire_scm_secret` en P0. **Pendiente:** autorización/Proposal/Decision de acciones (P2/PS).
 
 ## Anexo R1 (fase 1) y D1 — salidas tipadas y decisiones humanas (IMPLEMENTADO / NOT RUN)
 
@@ -1799,3 +1799,144 @@ Estado: implementado sin compilar ni ejecutar localmente; la validación es solo
   (V173), CHANGELOG *Breaking*, actualización de `pr12_public_surface.rs` y
   `repos_endpoints.rs`, y fixtures de `task_integration_operation.rs` que dependían del
   placeholder/`TestTokenEnv`.
+
+## Anexo PS (fase 2) — spike de lifecycle `Merging → Blocked(pr_feedback) → Active` (NOT RUN)
+
+Fecha: 2026-11-16. Análisis estático exacto de código y triggers más dos pruebas de servicio
+(`pr_lifecycle_spike_*`, módulo `tests` de `task_integration_operation.rs`; paso añadido al workflow:
+`cargo test --locked -p services --lib pr_lifecycle_spike_`). Sin cargo local; las pruebas fijan el
+comportamiento actual y están pendientes de CI.
+
+### Veredicto: **NO VIABLE con el esquema/lifecycle actuales** (D3: se detiene y se pregunta al usuario)
+
+La transición `Merging → Blocked(reason pr_feedback)` con TaskMerge `running`+`remote_waiting` es
+imposible por **tres** barreras independientes, y aunque se levantara la primera, el rework y la
+convergencia siguen bloqueados por las otras dos.
+
+**(a) ¿Se permite hoy?** No.
+- `allowed_transition` (`task_lifecycle.rs`) sí contiene `(Merging, Blocked)`, pero
+  `transition_inner` exige para `Merging→Blocked` `cause.kind == "merge_operation"`
+  ("failed merge lifecycle transition requires its exact TaskMerge operation"). `cause_kind='domain_event'`
+  (lo que dice Congelado 7) se rechaza en el servicio.
+- Con `LifecycleCause::MergeOperation(merge_id)` el trigger V100 `task_lifecycle_transition_guard_insert`
+  (no reemplazado por ninguna migración posterior) exige `op.kind='task_merge' AND op.status IN
+  ('conflict','failed','abandoned')`: el TaskMerge `running` es rechazado. `reason_kind` es libre (no hay
+  allow-list), pero el estado terminal del TaskMerge es obligatorio. `Merging → Active` no tiene arista.
+- Solo hay dos salidas de `Merging`: `Done` (TaskMerge `succeeded`) y `Blocked` (TaskMerge terminal). El
+  recibo/rework existente (`merge_failure_rework`, V105/V115/V117, `Blocked→Active` con
+  `cause_kind='domain_event'` sobre un `task_failure_retry_receipt`) opera **solo después** de que el
+  TaskMerge terminó (`closed`, `head_mismatch`, `publication_failed`), es decir, tras perder la admisión.
+
+**(b) ¿Algo cancela o falla el TaskMerge/admisión al salir de Merging?** Nada, porque no se puede salir
+sin terminalizarlo. Terminalizar un TaskMerge `remote_waiting` solo es posible con resultado exacto del
+proveedor (`task_integration_operation_provider_result_guard`, V114: `succeeded` con `merged`;
+`failed` con `closed`, `head_mismatch` o `publication_failed`, cada uno con `remote_pr_admission` terminal
+y `result_event_id` exacto). `abandoned`/`conflict` sobre un waiting están prohibidos
+(`finish` genérico falla; `abandon_stale` lo excluye; las pruebas existentes lo cubren y la nueva lo
+reafirma). La admisión terminal es inmutable (`remote_pr_admission_terminal_result_immutable`) y
+`task_merge_closed_provider_transition_guard` ata `Merging→Blocked(pr_closed_without_merge)` al evento
+de cierre. No existe estado `paused/superseded` de admisión.
+
+**(c) ¿Se pueden crear WorkUnits/integraciones con TaskMerge `running`?** No.
+`task_integration_operation_remote_admission_guard` (V109) rechaza todo INSERT con `remote_waiting=0`
+mientras exista un TaskMerge waiting `running` salvo su propio `publish_pr`. Las operaciones
+`work_unit_create`, `work_unit_workspace_prepare`, `work_unit_integration` e
+`integration_workspace_cleanup` son todas `remote_waiting=0` (`work_unit_service.rs` las adquiere
+vía `acquire`), así que **no se pueden crear, preparar ni integrar WorkUnits de rework bajo la misma
+admisión**. V106/V168 además excluyen `merging` de la admisión de Executions. El trigger V173
+`pr_external_action` sí admite solo la TaskMerge waiting de la propia admisión (no comprueba lifecycle),
+lo cual es consistente pero no ayuda: el rework en sí no puede ejecutarse.
+
+**(d) PushPrUpdate y regreso a Merging.** `pr_external_action` (V173) no exige `Merging`: exige
+admisión `open`, política congelada, ninguna operación `running` distinta de la TaskMerge de la
+admisión y Gate `satisfied` con `inputs_current=1`. Un push es por tanto posible mientras la admisión
+siga abierta, pero el contenido a empujar solo existe tras un rework que (c) impide. Volver a `Merging`
+solo ocurre con un TaskMerge nuevo (`ReadyToMerge→Merging` vía `merge_operation`); `ReadyToMerge`
+solo se alcanza con GateEvaluation exacta desde `Active`, y un TaskMerge waiting previo bloquea la
+admisión de otro (`active_remote_pr_admission_blocks_a_second_admission`; índice/guard V109).
+`publish_pr` exige lifecycle `merging` con `reason_ref = TaskMerge`.
+
+**(e) Merge/cierre remoto durante el rework.** No converge. `PrReconciler::pending_remote_pr_admissions`
+sigue seleccionando la admisión (TaskMerge `running`), pero `reconcile_metadata` llama a
+`validate_admission`, que exige `lifecycle.state == Merging && reason_ref == merge.id`; con la Task en
+Blocked/Active devuelve `invalid_operation`, solo se registra `warn` por ciclo y el resultado del
+proveedor nunca se persiste. Aunque se persistiera, la finalización del TaskMerge
+(`task_integration_operation.rs` en db, `lifecycle.state != Merging → InvalidTransition`) y
+`Done` (`allowed_transition` solo desde `Merging`) fallan. Resultado: PR fusionada remotamente y Task
+atascada, o PR cerrada con TaskMerge eternamente `running`.
+
+### Opciones mínimas (requieren decisión del usuario; ninguna se implementa)
+1. **Pausa explícita de admisión (recomendada)**: V175+ añade un resultado terminal no destructivo
+   `superseded_for_rework` (PR queda abierta, sin merge ni cierre) para `remote_pr_admission`/TaskMerge
+   (`failed`/`abandoned` con evento `pr.status_changed` de procedencia propia), un recibo `pr_feedback`
+   para `Blocked→Active`, y el cambio de `PublishPr` para **reutilizar** la PR existente (`find_pr` ya
+   hace match por rama + SHA). Tras el rework se admite un TaskMerge nuevo (Gate nuevo, política
+   re-congelada) y el `push_update` ocurre dentro de la nueva admisión. Convergencia clara: cada
+   admisión termina o por resultado remoto o por supersesión; el reconciliador no se toca. Coste:
+   migración de CHECK/triggers V109/V112/V114/V116 (snapshot de historia) y lifecycle/recibos.
+2. **Rework dentro de `Merging`**: relajar V109/V106/V168 para permitir operaciones de WorkUnit y
+   Executions con TaskMerge waiting. Contradice la semántica de `Merging` (estado de merge exclusivo) y
+   el invariante de que el Gate evalúa insumos exactos; mayor superficie, no recomendada.
+3. **Sin rework en Forge para feedback abierto**: el feedback se ingiere y se muestra/decide (Decisión
+   humana), pero el rework sigue siendo humano fuera de Forge (push manual → `head_mismatch` ya existente
+   → rework vía recibo). Sin migración de lifecycle; P3 `push_update` se descarta y queda solo
+   `post_comment`.
+4. **Cerrar la PR remota y reabrir**: descartada (destructiva, pierde hilo de revisión; Forge no cierra PR).
+
+Impacto en el plan: P3 (`push_update`) y la parte de rework de P2/RT fase 2 quedan **bloqueados** hasta que
+el usuario elija; P0/P1/A3, `post_comment` e ingesta no dependen de PS.
+
+## Anexo P1 (fase 2) — ingesta de feedback externo y credencial SCM (IMPLEMENTADO / NOT RUN)
+
+Estado: escrito sin compilar ni ejecutar localmente; validación solo CI
+(`cargo test --locked -p services --lib pr_feedback_` y `scm_credential_`, añadidos al workflow).
+
+- `CredentialService::connect_scm_credential(ConnectScmCredential{owner_user_id,
+  provider:"github", label, credential})`: handle `api_key`, cifrado igual que los de
+  proveedor de modelo, `metadata_json={"purpose":"scm"}`, sin validación DNS/base_url.
+  `require_model_credential(id)` y `is_scm_handle` rechazan handles `github` donde se
+  exige credencial de modelo; `AgentService::register` lo aplica a `credential_ref`
+  (el trigger V173 sigue como respaldo).
+- `pr_provider_settings.rs` `PrProviderSettingsService::{set_credential(actor, repo_id,
+  Option<credential_id>), set_feedback_policy(actor, repo_id, PrFeedbackPolicy)}`: exige
+  owner/admin del Project; el handle debe ser `github`/`api_key`/`configured` y del
+  llamante (`require_owned_entry`); delega en `PrProviderConfigRepo::{set_credential,
+  set_feedback_policy}`. `validate_policy` normaliza (asociaciones únicas ⊆ enum,
+  logins ≤ 32 de ≤ 128 caracteres sin duplicados case-insensitive, `max_items_per_poll`
+  1..=100).
+- Admisión: `task_integration_operation.rs` ya no usa `token_secret_ref` en el digest de
+  config (ahora `credential_handle_id`, `credential_owner_user_id` y digest de política);
+  el repositorio congela credencial y política en la misma transacción (A3). El campo
+  `token_secret_ref` de `CreateRemotePrAdmission` se copia verbatim **solo** porque el
+  guard V173 exige igualdad con la fila de config; no se usa para autenticar.
+- `pr_feedback.rs` `PrFeedbackIngestor` (se ejecuta en cada tick de `PrReconciler`; el
+  cableado de `forge-cli` ya lo incluye vía `with_credentials`): para cada admisión
+  `open` con `ingest=true` en la política **congelada** y respetando
+  `polling_interval_seconds`, consulta `get_pull` (si no está `open`, no hace nada),
+  marca `stale_head` los ítems con otro commit, y lista comentarios inline, comentarios
+  de issue y reviews con `since` (cursor en memoria con 1 s de solape; un reinicio
+  relee y el insert idempotente absorbe la repetición). `PENDING` y reviews `COMMENTED`
+  sin texto se omiten. Confianza: lista `trusted_logins` (case-insensitive) → `trusted`;
+  login `*[bot]` → `untrusted`; asociación en la lista → `trusted`; resto `untrusted`
+  (autor ausente → `ghost`/`NONE`). Comentarios con marcador `forge:artifact=<id>
+  digest=<hex>` (`forge_comment_marker`/`is_forge_authored`) no se almacenan (anti-bucle).
+  Cuerpo ≤ 16 KiB con marca `[truncated by Forge]` y `body_truncated=1`; `body_digest` =
+  SHA-256 del cuerpo almacenado; `provider_item_id` = `<kind>:<id>`. Comentarios de issue
+  (sin commit) se atribuyen al head observado en la ingesta. Rate limit: se aparca la
+  admisión hasta `retry_after` (máx. 1 h) sin dormir; el siguiente tick la salta. Nunca se
+  registran cuerpos ni token. `max_items_per_poll` acota el lote por orden de
+  actualización y el cursor solo avanza hasta el último ítem considerado.
+- `PrProviderFactory::build_client` (nuevo, con implementación por defecto que falla
+  cerrada) devuelve el `GitHubClient` crudo; los tests inyectan una fábrica hacia un
+  servidor local. `pr_service::acquire_admission_secret` es el único lugar donde se abre
+  la credencial congelada y se verifica que su dueño siga siendo owner/admin.
+- Pruebas de `task_integration_operation.rs`: se retiró `TestTokenEnv`; las que dependían
+  del proveedor placeholder usan `MetadataEchoPrProvider` (mismo comportamiento) mediante
+  `with_provider_for_test`. El módulo `tests` es ahora `pub(crate)` con
+  `prepare_pr_admission_with_config` para los tests de P1.
+- **Para P2/API:** `ExternalFeedbackRepo::list_unconsumed_trusted_feedback` es la fuente de
+  candidatos; `PrFeedbackIngestor::ingest_once()` devuelve `PrFeedbackIngestStats`. Para
+  REST (`PATCH /repos/{id}` `credential_id`, `PUT /repos/{id}/pr-feedback-policy`,
+  `POST /providers` `provider:"github"`) usar `PrProviderSettingsService` y
+  `CredentialService::connect_scm_credential`; la lista de proveedores debe filtrar
+  `metadata_json.purpose=scm`.

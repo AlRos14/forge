@@ -919,19 +919,31 @@ pub trait PrProviderFactory: Send + Sync {
         base_url: Option<&str>,
         token: Secret,
     ) -> std::result::Result<Arc<dyn PrProvider>, PrProviderError>;
+
+    /// Build the raw client (feedback ingestion reads reviews and comments,
+    /// which the `PrProvider` trait does not expose). Factories that cannot
+    /// provide one fail closed.
+    async fn build_client(
+        &self,
+        _provider_type: &str,
+        _base_url: Option<&str>,
+        _token: Secret,
+    ) -> std::result::Result<GitHubClient, PrProviderError> {
+        Err(PrProviderError::Unavailable(
+            "provider factory does not support feedback ingestion".to_owned(),
+        ))
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultPrProviderFactory;
 
-#[async_trait]
-impl PrProviderFactory for DefaultPrProviderFactory {
-    async fn build(
-        &self,
+impl DefaultPrProviderFactory {
+    async fn client(
         provider_type: &str,
         base_url: Option<&str>,
         token: Secret,
-    ) -> std::result::Result<Arc<dyn PrProvider>, PrProviderError> {
+    ) -> std::result::Result<GitHubClient, PrProviderError> {
         if provider_type != "github" {
             return Err(PrProviderError::Unavailable(format!(
                 "unsupported frozen provider type: {provider_type}"
@@ -956,9 +968,29 @@ impl PrProviderFactory for DefaultPrProviderFactory {
                 }
             }
         };
-        let client = GitHubClient::new_unvalidated(&resolved, token)
-            .map_err(|error| error.into_pr_error(false))?;
+        GitHubClient::new_unvalidated(&resolved, token).map_err(|error| error.into_pr_error(false))
+    }
+}
+
+#[async_trait]
+impl PrProviderFactory for DefaultPrProviderFactory {
+    async fn build(
+        &self,
+        provider_type: &str,
+        base_url: Option<&str>,
+        token: Secret,
+    ) -> std::result::Result<Arc<dyn PrProvider>, PrProviderError> {
+        let client = Self::client(provider_type, base_url, token).await?;
         Ok(Arc::new(GitHubPrProvider::new(client)))
+    }
+
+    async fn build_client(
+        &self,
+        provider_type: &str,
+        base_url: Option<&str>,
+        token: Secret,
+    ) -> std::result::Result<GitHubClient, PrProviderError> {
+        Self::client(provider_type, base_url, token).await
     }
 }
 

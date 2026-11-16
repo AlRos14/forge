@@ -28,7 +28,9 @@ pub mod operator_status;
 pub mod operator_status_emitter;
 pub mod orchestrator_runtime;
 pub mod plan_artifact;
+pub mod pr_feedback;
 pub mod pr_github_client;
+pub mod pr_provider_settings;
 pub mod pr_service;
 pub(crate) mod project_actor_scope;
 pub mod project_authority;
@@ -70,9 +72,9 @@ pub use collaboration_service::{
     CreateHandoffInput, CreateMessageInput, CreateProposalInput,
 };
 pub use credential_service::{
-    ConnectApiKeyCredential, ConnectOAuthCredential, CredentialError, CredentialRevocationOutcome,
-    CredentialService, OAuthCredentialBundle, ProviderEntryTestOutcome, ProviderUsageOutcome,
-    ProviderUsageWindowOutcome, Secret,
+    ConnectApiKeyCredential, ConnectOAuthCredential, ConnectScmCredential, CredentialError,
+    CredentialRevocationOutcome, CredentialService, OAuthCredentialBundle,
+    ProviderEntryTestOutcome, ProviderUsageOutcome, ProviderUsageWindowOutcome, Secret,
 };
 pub use daemon_monitor::DaemonMonitor;
 pub use daemon_service::{
