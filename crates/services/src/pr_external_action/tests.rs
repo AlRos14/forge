@@ -1,11 +1,10 @@
 use super::*;
-use crate::coordinator_outputs::external_feedback::build_pr_feedback_summary;
+use crate::coordinator_outputs::build_pr_feedback_summary;
 use crate::credential_service::CredentialService;
 use crate::pr_github_client::{GitHubPrProvider, PrProviderFactory};
 use crate::pr_rework::tests::{superseded, world, World};
 use crate::pr_service::{PrProvider, PrProviderError};
 use async_trait::async_trait;
-use base64::Engine as _;
 use db::{PrReworkSupersession, RepoRepo, TaskRepo};
 use std::process::Command as StdCommand;
 use std::sync::Mutex;

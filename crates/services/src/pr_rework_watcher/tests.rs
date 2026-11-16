@@ -2,7 +2,7 @@ use super::*;
 use crate::pr_github_client::{GitHubClient, GitHubPrProvider};
 use crate::pr_rework::tests::{superseded, world, World};
 use crate::Secret;
-use db::{HumanDecisionRepo, PrReworkRepo};
+use db::{HumanDecisionRepo, PrReworkRepo, PrReworkSupersession};
 use serde_json::json;
 use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
