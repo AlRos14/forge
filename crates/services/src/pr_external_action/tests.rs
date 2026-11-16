@@ -957,6 +957,20 @@ async fn pr_external_action_executor_creates_the_missing_readmission_push() {
 // post_comment
 // ---------------------------------------------------------------------
 
+/// Post-comment executor tests need a paused PR with no pending re-admission:
+/// otherwise the executor first creates the re-admission `push_update`, and a
+/// not yet started `post_comment` yields its single open slot to it (covered by
+/// `pr_external_action_post_comment_yields_to_the_push_update`).
+async fn without_pending_readmission(r: &Rig) {
+    exec(
+        &r.w.db,
+        "UPDATE remote_pr_admission SET readmits_supersession_id = NULL
+         WHERE task_merge_operation_id = ?",
+        &[&r.merge2],
+    )
+    .await;
+}
+
 async fn summary_artifact(r: &Rig) -> (String, String) {
     let id = new_uuid_v4();
     let producer_execution_id = new_uuid_v4();
@@ -1025,6 +1039,7 @@ async fn pr_external_action_post_comment_off_creates_nothing() {
 #[tokio::test]
 async fn pr_external_action_post_comment_is_posted_once_with_the_marker() {
     let r = rig("automatic", "automatic").await;
+    without_pending_readmission(&r).await;
     let (artifact_id, text) = summary_artifact(&r).await;
     // The Task projection may already be bound to a later admission. The
     // supersession receipt must keep this comment on the original PR number.
@@ -1071,6 +1086,7 @@ async fn pr_external_action_post_comment_is_posted_once_with_the_marker() {
 #[tokio::test]
 async fn pr_external_action_post_comment_requires_its_exact_human_decision() {
     let r = rig("automatic", "human_approval").await;
+    without_pending_readmission(&r).await;
     let (artifact_id, text) = summary_artifact(&r).await;
     let action = r
         .service
@@ -1101,6 +1117,7 @@ async fn pr_external_action_post_comment_requires_its_exact_human_decision() {
 #[tokio::test]
 async fn pr_external_action_post_comment_unknown_outcome_is_resolved_by_the_marker() {
     let r = rig("automatic", "automatic").await;
+    without_pending_readmission(&r).await;
     let (artifact_id, text) = summary_artifact(&r).await;
     r.mock.state.lock().expect("state").post_status = 500;
     let action = r
