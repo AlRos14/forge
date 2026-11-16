@@ -1,4 +1,15 @@
 use super::*;
+use crate::PrProviderCredentialRef;
+
+async fn load_config(pool: &SqlitePool, id: &str) -> Result<PrProviderConfig> {
+    sqlx::query("SELECT * FROM pr_provider_config WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .map(map_pr_provider_config)
+        .transpose()?
+        .ok_or(DbError::NotFound)
+}
 
 #[async_trait]
 impl PrProviderConfigRepo for SqliteDb {
@@ -61,6 +72,55 @@ impl PrProviderConfigRepo for SqliteDb {
             .await
             .map_err(check_error)?;
         Ok(config)
+    }
+
+    async fn set_credential(
+        &self,
+        id: &str,
+        credential: Option<PrProviderCredentialRef>,
+        updated_at: &str,
+    ) -> Result<PrProviderConfig> {
+        let updated = sqlx::query(
+            "UPDATE pr_provider_config
+             SET credential_handle_id = ?, credential_owner_user_id = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(credential.as_ref().map(|value| value.handle_id.as_str()))
+        .bind(
+            credential
+                .as_ref()
+                .map(|value| value.owner_user_id.as_str()),
+        )
+        .bind(updated_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(check_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(DbError::NotFound);
+        }
+        load_config(&self.pool, id).await
+    }
+
+    async fn set_feedback_policy(
+        &self,
+        id: &str,
+        policy_json: &str,
+        updated_at: &str,
+    ) -> Result<PrProviderConfig> {
+        let updated = sqlx::query(
+            "UPDATE pr_provider_config SET feedback_policy_json = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(policy_json)
+        .bind(updated_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(check_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(DbError::NotFound);
+        }
+        load_config(&self.pool, id).await
     }
 
     async fn delete(&self, id: &str) -> Result<()> {

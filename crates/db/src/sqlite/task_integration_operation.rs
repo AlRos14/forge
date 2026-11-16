@@ -35,6 +35,10 @@ fn map_remote_pr_admission(row: SqliteRow) -> Result<RemotePrAdmission> {
         source_branch: row.try_get("source_branch")?,
         target_branch: row.try_get("target_branch")?,
         admitted_source_sha: row.try_get("admitted_source_sha")?,
+        credential_handle_id: row.try_get("credential_handle_id")?,
+        credential_owner_user_id: row.try_get("credential_owner_user_id")?,
+        feedback_policy_json: row.try_get("feedback_policy_json")?,
+        feedback_policy_digest: row.try_get("feedback_policy_digest")?,
         state: row.try_get("state")?,
         provider_status: row.try_get("provider_status")?,
         result_classification: row.try_get("result_classification")?,
@@ -755,6 +759,22 @@ impl TaskIntegrationOperationRepo for SqliteDb {
             metadata.id.clone()
         };
         remote_admission.metadata_id = metadata_id.clone();
+        // V173: freeze the credential reference and feedback policy that the
+        // repo config carries in this same transaction; the admission insert
+        // guard verifies the copy is exactly the current config.
+        let frozen = sqlx::query(
+            "SELECT credential_handle_id, credential_owner_user_id, feedback_policy_json
+             FROM pr_provider_config WHERE id = ?",
+        )
+        .bind(&remote_admission.provider_config_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DbError::InvalidTransition)?;
+        let frozen_credential_handle_id: Option<String> = frozen.try_get("credential_handle_id")?;
+        let frozen_credential_owner_user_id: Option<String> =
+            frozen.try_get("credential_owner_user_id")?;
+        let frozen_policy_json: String = frozen.try_get("feedback_policy_json")?;
+        let frozen_policy_digest = crate::pr_feedback_policy_digest(&frozen_policy_json);
         sqlx::query(
             "INSERT INTO remote_pr_admission (
                 task_merge_operation_id, publish_operation_id, metadata_id, task_id,
@@ -762,9 +782,11 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                 provider_config_digest, provider_base_url, token_secret_ref,
                 remote_repo_identity, source_branch, target_branch, admitted_source_sha,
                 state, reconciliation_reason, provider_event_id, observed_head_sha,
-                merged_commit_sha, result_event_id, created_at, updated_at
+                merged_commit_sha, result_event_id, created_at, updated_at,
+                credential_handle_id, credential_owner_user_id, feedback_policy_json,
+                feedback_policy_digest
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', NULL,
-                       NULL, NULL, NULL, NULL, ?, ?)",
+                       NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&remote_admission.task_merge_operation_id)
         .bind(&remote_admission.publish_operation_id)
@@ -782,6 +804,10 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         .bind(&remote_admission.admitted_source_sha)
         .bind(&remote_admission.created_at)
         .bind(&remote_admission.updated_at)
+        .bind(frozen_credential_handle_id.as_deref())
+        .bind(frozen_credential_owner_user_id.as_deref())
+        .bind(&frozen_policy_json)
+        .bind(&frozen_policy_digest)
         .execute(&mut *tx)
         .await
         .map_err(check_error)?;

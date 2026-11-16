@@ -812,6 +812,24 @@ impl CredentialService {
         Ok(handle)
     }
 
+    /// Open the in-memory secret of an SCM (`github`) API-key credential for
+    /// one call. Only the handle owner can open it and it must be
+    /// `configured`; the plaintext is never persisted or logged. Callers must
+    /// separately verify the owner still holds Project authority.
+    pub async fn acquire_scm_secret(&self, owner_user_id: &str, handle_id: &str) -> Result<Secret> {
+        let stored = self
+            .store
+            .load_stored(handle_id, owner_user_id)
+            .await
+            .map_err(credential_error_to_service)?;
+        if stored.provider != "github" || stored.method != "api_key" {
+            return Err(ServiceError::invalid_operation(
+                "credential is not a GitHub API key",
+            ));
+        }
+        Ok(Secret::new(stored.plaintext))
+    }
+
     /// Resolve the credential identity frozen into an Execution
     /// invocation snapshot and add its secret to the in-memory runtime env.
     /// The current Agent is consulted only as an ownership fence; its selected
@@ -1319,6 +1337,13 @@ async fn provider_url_addresses(
         return Err("base_url must not target a private or local address");
     }
     Ok((parsed, addresses))
+}
+
+/// Apply the provider SSRF policy (https, public addresses only) to a base URL.
+pub(crate) async fn validate_provider_base_url(
+    base_url: &str,
+) -> std::result::Result<(), &'static str> {
+    provider_url_addresses(base_url).await.map(|_| ())
 }
 
 fn restricted_provider_hostname(host: &str) -> bool {

@@ -73,6 +73,8 @@ use std::{
 // base-vs-candidate comparisons (baseline results live in the comparison, no workspace row).
 // V172 rebuilds coordination requests once for every phase's kinds/origins and adds
 // validation triage plus the hard-limited coordinator replan ledger.
+// V173 adds the GitHub credential reference, the frozen PR feedback policy, the immutable external
+// feedback ledger/set/triage, and PR external actions (applies by version, also after V174).
 // V174 adds structured human decision requests and their exact resume continuation.
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 

@@ -232,6 +232,7 @@ async fn main() {
         Arc::clone(&state.event_bus),
         None,
     )
+    .with_credentials(Arc::clone(&state.credential_service))
     .run();
     // Catalog validation check requests run in the Forge process under the
     // shared Workspace execution locks; running rows left by a crash are

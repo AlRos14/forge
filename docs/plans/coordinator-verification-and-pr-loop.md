@@ -1233,7 +1233,7 @@ Cualquier cambio de contrato vuelve a N0.
 | N0 | Congelar: formas del catálogo, envelope v2 (`validation_checks`, `micro_fix`, `micro_fix_reviewer`, `fallback_agents`, `allow_coordinator_replan`), kinds nuevos (`validation_findings`, `external_feedback`, `human_decision_resume`), orígenes batch nuevos (`validation_triage`, `external_feedback_triage`, `human_decision_resume`, `coordinator_replan`), DTOs, códigos de error, eventos SSE, política de feedback, credencial GitHub, numeración V171–V175, fases y ownership. D1–D8 resueltas con el usuario. | — | Este plan («Contratos congelados (N0)») | **DONE (estático)** |
 | A1 | (Fase 1) V171: `validation_check_definition`, `validation_check_request`, `validation_comparison`; columnas aditivas de `validation_run`; triggers de inmutabilidad y de identidad; preservación de filas históricas. | N0 | `crates/db/migrations/V171__*.sql`, db repos | **IMPLEMENTADO / NOT RUN** (ver Anexo A1/A2/A4) |
 | A2 | (Fase 1) V172: **una sola** reconstrucción de `task_coordination_request` (patrón V168) que añade kinds y orígenes nuevos, revisando guards V167 de batch y vistas de autoridad vigentes. | N0 | `V172__*.sql`, `crates/db` | **IMPLEMENTADO / NOT RUN** (ver Anexo A1/A2/A4) |
-| A3 | (Fase 2) V173: referencia de credencial, `feedback_policy_json`/digest en config y admisión, `external_feedback_item`, `task_external_feedback_triage`, `pr_external_action` (sin reconstruir `task_integration_operation`; triggers V112/V116 revisados), guarda agent_profile↔github. | N0 | `V173__*.sql` | **TODO** |
+| A3 | (Fase 2) V173: referencia de credencial, `feedback_policy_json`/digest en config y admisión, `external_feedback_item`, `task_external_feedback_triage`, `pr_external_action` (sin reconstruir `task_integration_operation`; triggers V112/V116 revisados), guarda agent_profile↔github. | N0 | `V173__*.sql` | **IMPLEMENTADO / NOT RUN** (ver Anexo A3) |
 | A4 | (Fase 1) V174: `human_decision_request` + guards de versión/estado/evidencia. | N0 | `V174__human_decision_request.sql` | **IMPLEMENTADO / NOT RUN** (ver Anexo A1/A2/A4) |
 | A5 | (Fase 3) V175: `work_unit_fallback_receipt`, `micro_fix_receipt`. | N0 | `V175__*.sql` | **TODO** |
 | C1 | Servicio de catálogo (escritura owner/admin), validación de pins del envelope, extracción del núcleo de `run_command` con identidad de catálogo sin alterar el camino legacy. | A1 | `validation_service.rs`, `validation_catalog.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo C1–C3) |
@@ -1243,7 +1243,7 @@ Cualquier cambio de contrato vuelve a N0.
 | D1 | (Fase 1) Servicio de `human_decision_request`: creación validando evidencia, respuesta con `expected_version`, autoridad por `authority_effect`, evento durable y reanudación exacta. | A4, A2 | `human_decision_service.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo R1/D1) |
 | M1 | (Fase 3) Cálculo de bounds sobre diff, `micro_fix_bounds_exceeded`, presupuesto `max_per_task`, revisión formal con contexto delta. | A5, R1 | `task_rework*`, `diff.rs` (lectura) | **TODO** |
 | FB | (Fase 3) Fallback cross-Agent según F-c; cadena y perfiles solo si están en el envelope (D7); sin fallback del coordinador (D8). | A5 | `task_dispatcher/fallback.rs` | **TODO** |
-| P0 | (Fase 2) `GitHubPrProvider` real (`find/create/get_status`) con cliente HTTP, credencial desde `CredentialService` (D4), redacción de errores, pruebas contra servidor simulado local vía costura inyectable. | N0, A3 | `pr_github_client.rs`, `pr_service.rs` | **TODO** |
+| P0 | (Fase 2) `GitHubPrProvider` real (`find/create/get_status`) con cliente HTTP, credencial desde `CredentialService` (D4), redacción de errores, pruebas contra servidor simulado local vía costura inyectable. | N0, A3 | `pr_github_client.rs`, `pr_service.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo P0) |
 | P1 | (Fase 2) `PrFeedbackIngestor` + clasificación de confianza + anti-bucle + `stale_head`. | P0, A3 | `pr_feedback.rs`, `pr_service.rs` (registro en `PrReconciler`) | **TODO** |
 | P2 | (Fase 2) Productor y contexto de triage `external_feedback` (atomicidad request+origen+presupuesto+evento, replay, pause/revoke/restart). | P1, A2, R1 | `task_coordination.rs` (vía RT) | **TODO** |
 | PS | (Fase 2) Spike de lifecycle: demostrar con prueba de servicio que `Merging → Blocked(pr_feedback) → Active` conserva el TaskMerge `remote_waiting` y que merge/cierre remoto durante rework converge. **Si no cabe, parar y preguntar al usuario** (D3); no se propone arista nueva por cuenta propia. | N0 | `task_lifecycle.rs` | **TODO** |
@@ -1402,8 +1402,8 @@ Fecha: 2026-11-15. Estado: código y SQL escritos, **no compilados ni ejecutados
 cargo** (regla de la sesión: la CI de GitHub es la única verificación).
 
 **Validado localmente (solo SQLite vía Python `sqlite3` 3.46, sin cargo):**
-- Todas las migraciones V001..V174 se aplican en memoria sin error (V173 reservado
-  para A3; el hueco es inocuo: el ejecutor aplica por versión no registrada).
+- Todas las migraciones V001..V174 se aplican en memoria sin error (V173 estaba reservado
+  para A3, ya implementada; el ejecutor aplica por versión no registrada).
 - V172 sobre datos: 8 filas históricas de `task_coordination_request` (todos los
   estados) idénticas antes/después en sus 22 columnas originales; nuevas columnas
   NULL; `pragma foreign_key_check` vacío; `integrity_check` ok; ninguna referencia
@@ -1455,6 +1455,99 @@ y `CreateTaskCoordinationRequestInput` (+`source_subject_*`, `resumes_request_id
 siga compilando: literales de `CreateValidationRun`/`CreateTaskCoordinationRequestInput`
 en `services`, variantes de `api_types::TaskCoordinationRequestKind` + mapeo en
 `routes/task_coordination.rs` + binding TS.
+
+## Anexo A3 (fase 2) — V173: credencial GitHub, política de feedback, feedback externo, acciones PR (IMPLEMENTADO / NOT RUN)
+
+Fecha: 2026-11-16. Código y SQL escritos; **sin cargo local** (solo CI). Validado con
+Python `sqlite3` 3.46: V001..V174 con V173 en orden y **V173 aplicada después de V174**
+producen el mismo `sqlite_master`; cero objetos eliminados; cambian solo
+`pr_provider_config`, `remote_pr_admission` (columnas) y los triggers recreados
+`remote_pr_admission_insert_guard`, `remote_pr_admission_identity_immutable`,
+`task_coordination_request_triaged_guard`; `foreign_key_check` e `integrity_check`
+limpios; 44 objetos nuevos. Triggers/CHECK probados por comportamiento (credencial y
+política, `agent_profile`↔github, admisión inmutable, ingesta solo con admisión `open`
+y `ingest` congelado, ítems inmutables salvo `current→stale_head`, conjunto y triage
+por ítem, guard de `triaged`, acciones: política congelada, exclusión, transiciones,
+idempotencia, Proposal/Decision exactas, teardown).
+
+**Numeración:** `run_migrations` aplica por versión no registrada (`is_applied`), así que
+V173 se aplica también sobre una BD ya migrada a V174. **No** se renumera; V175 (fase 3)
+sigue igual.
+
+**Forma implementada (autoritativo: `V173__pr_feedback_and_credential.sql`):**
+- `pr_provider_config`: `credential_handle_id`, `credential_owner_user_id` (FK RESTRICT),
+  `feedback_policy_json` (default del plan). Triggers: par credencial coherente y handle
+  `provider='github'`, `status='configured'`, mismo dueño (solo al cambiar la referencia);
+  forma de la política (enums cerrados, `max_items_per_poll` 1..200); un handle
+  referenciado no cambia de `provider`/dueño.
+- `agent_profile`: triggers insert/update-of-`credential_ref` que rechazan handles `github`.
+- `remote_pr_admission`: 4 columnas nuevas (NULL en admisiones históricas). El guard de
+  inserción exige que coincidan exactamente con la config y que json/digest sean ambos
+  NULL o ambos no NULL; las 4 son inmutables. **El repositorio las rellena dentro de la
+  misma transacción** desde `pr_provider_config` (digest = SHA-256 hex del JSON
+  exacto), de modo que `CreateRemotePrAdmission` **no cambió** (sin ajustes en servicios).
+- Snapshot V116 (`remote_pr_history`): **decisión: no se copian** las 4 columnas. La
+  fila de historia mantiene FK RESTRICT a su admisión, que conserva las columnas de forma
+  inmutable (delete solo en teardown). Evita reescribir el trigger de inserción V116.
+- `external_feedback_item`: forma congelada; trigger de inserción exige la admisión
+  `open` de la misma Task con `$.ingest = true` en su política **congelada**; inmutable
+  salvo `head_state current→stale_head`; delete solo en teardown.
+- `task_external_feedback_set_item` (nueva, decisión de diseño): conjunto exacto (≤ 20,
+  posiciones 0..19) de una request `external_feedback` en `requested`; el ítem debe ser
+  `trusted`, `current`, de la admisión indicada en `source_subject_id` y con el mismo
+  digest. `source_subject_id` de la request = `task_merge_operation_id` de la admisión;
+  `source_subject_digest` = digest del conjunto (lo calcula el servicio).
+- `task_external_feedback_triage`: una decisión por (request, ítem); inserción exige
+  request vigente (`running|uncertain`, misma Execution, autorización/equipo vigentes) y
+  pertenencia al conjunto con el mismo `body_digest`; inmutable.
+- Guard de fuente `task_coordination_request_external_feedback_source_guard` (admisión
+  `open` de la Task con `ingest` congelado) y **`task_coordination_request_triaged_guard`
+  sustituido**: conserva las ramas V172 y añade `external_feedback` (conjunto no vacío y
+  cada ítem con su triage, misma Execution). `human_decision_resume` mantiene la rama
+  genérica (`execution_id` no nulo) y su guard de fuente V174.
+- `pr_external_action` (+ `idx_pr_external_action_open`: una abierta por Task):
+  trigger de nacimiento (admisión `open` con política congelada no nula; `automatic` solo
+  si la política congelada del tipo lo dice; `post_comment` no con `post_summary=off`;
+  nace `proposed`, o `approved` solo si `automatic`), exclusión (ninguna
+  `task_integration_operation` en `running` distinta de la TaskMerge de la propia
+  admisión) y `push_update` exige `GateEvaluation` de la Task `satisfied` con
+  `gate_evaluation_currentness.inputs_current=1`; identidad inmutable; `version+1` y grafo
+  de transiciones (proposed→approved|rejected|abandoned; approved→running|abandoned;
+  running→succeeded|failed|outcome_unknown|reconciliation_required;
+  outcome_unknown→succeeded|failed|reconciliation_required;
+  reconciliation_required→succeeded|failed|abandoned; terminales finales; sin reintento
+  ciego); `finished_at` ⇔ estado terminal; la Proposal se adjunta una vez (`target_kind=
+  'pr_external_action'`, `target_id=id`) y la Decision debe ser la exacta de esa
+  Proposal (`approve`↔approved, `reject`↔rejected); entrar a `running` re-verifica
+  admisión abierta, exclusión y Gate exacto. Delete solo en teardown.
+- Marcadores nuevos en `check_error`: `FORGE_COORDINATION_EXTERNAL_FEEDBACK_STALE` y
+  `FORGE_PR_ACTION_STALE` → `DbError::VersionConflict`; `FORGE_PR_ACTION_NOT_AUTHORIZED`
+  → `DbError::PrActionNotAuthorized` (variante nueva); los mensajes de credencial/política
+  /ingesta → `DbError::Check`.
+
+**API Rust para los carriles de servicio (crate `db`):**
+`PrProviderConfig{credential_handle_id, credential_owner_user_id, feedback_policy_json}`;
+`RemotePrAdmission{credential_handle_id, credential_owner_user_id, feedback_policy_json,
+feedback_policy_digest}`; `PrProviderConfigRepo::{set_credential(id, Option<PrProviderCredentialRef>,
+updated_at), set_feedback_policy(id, json, updated_at)}`; `PrFeedbackPolicy` (+`Default`,
+`from_json`, `to_json`), `DEFAULT_PR_FEEDBACK_POLICY_JSON`, `pr_feedback_policy_digest`,
+`MAX_EXTERNAL_FEEDBACK_SET_ITEMS`; trait `ExternalFeedbackRepo`
+(`ingest_external_feedback`, `get_/list_external_feedback_item(s)`,
+`list_unconsumed_trusted_feedback`, `mark_external_feedback_stale_head`,
+`add_external_feedback_set_items[_in_tx]`, `list_external_feedback_set`,
+`record_external_feedback_triage[_in_tx]`, `list_external_feedback_triage`,
+`latest_external_feedback_triage_for_item`); trait `PrExternalActionRepo`
+(`create_pr_external_action`, `attach_pr_external_action_proposal`,
+`transition_pr_external_action`, `get_pr_external_action[_by_idempotency_key]`,
+`get_open_pr_external_action`, `list_pr_external_actions_by_task`,
+`list_pr_external_actions_in_states`); enums `ExternalFeedback{Kind,ReviewState,TrustClass,
+HeadState,Disposition}`, `PrExternalAction{Kind,State}`, `PrFeedbackAuthorization`,
+`PrFeedbackSummaryMode`. Teardown de Project actualizado. Pruebas: `v173_*` en
+`crates/db/src/tests/v173.rs`.
+
+**Pendiente de servicios (fuera de A3):** `CredentialService::{connect_scm_credential,
+acquire_scm_secret}`, comprobación de servicio agent_profile↔github, y la
+autorización/Proposal/Decision de acciones.
 
 ## Anexo R1 (fase 1) y D1 — salidas tipadas y decisiones humanas (IMPLEMENTADO / NOT RUN)
 
@@ -1665,3 +1758,44 @@ paused kinds distintos de `validation_findings` rechazados.
   de validación (no aún en `review_findings` v2); `recheck` sobre sujeto
   idéntico reutiliza el run; tests RT solo unitarios (sin recorrido con DB);
   escáner de validación sin guard SQL para lotes pausados.
+
+## Anexo P0 (fase 2) — cliente GitHub real de PR (IMPLEMENTADO / NOT RUN)
+
+Estado: implementado sin compilar ni ejecutar localmente; la validación es solo CI
+(`cargo test --locked -p services --lib pr_github_client_`, añadido al workflow).
+
+- `crates/services/src/pr_github_client.rs`: `GitHubClient` (reqwest, `Authorization:
+  Bearer` marcado sensible, `User-Agent: forge`, `X-GitHub-Api-Version`, connect 10 s /
+  total 30 s, **sin seguir redirecciones**, respuesta máx. 8 MiB), `base_url` por defecto
+  `https://api.github.com`. Primitivas: `find_pull_by_head`, `create_pull` (con `draft`),
+  `get_pull` (state, merged, head sha, mergeable), `list_review_comments`,
+  `list_issue_comments`, `list_reviews` (paginadas por número de página derivado de
+  `Link`, nunca se siguen URLs del proveedor; `since` nativo en comentarios y filtrado en
+  cliente en reviews), `create_issue_comment`, `compare_commits`.
+- Errores tipados `GitHubClientError` (`RateLimited{retry_after_seconds}` para 429 y 403 con
+  `Retry-After`/`X-RateLimit-Remaining: 0`/mensaje de rate limit; sin sleep interno),
+  mensajes truncados a 200 caracteres y con el token depurado; `Debug` no expone el token.
+  `into_pr_error(mutating)`: 4xx/404 → `DefinitiveRejection`; 5xx/transporte/decode en
+  mutaciones → `OutcomeUnknown`; connect fallido, 401/403, rate limit y lecturas →
+  `Unavailable`. `From<GitHubClientError> for ServiceError` (RateLimited, NotFound,
+  AuthorizationDenied, InvalidOperation, Domain).
+- `GitHubPrProvider` (placeholder retirado de `pr_service.rs`) usa el cliente. `find_pr`
+  exige coincidencia del SHA admitido; `provider_pr_id` = número de PR.
+- Costura SSRF: `trait PrProviderFactory` + `DefaultPrProviderFactory` (valida `base_url`
+  con `validate_provider_base_url`, que envuelve `provider_url_addresses`/`restricted_provider_ip`;
+  `https://github.com` se normaliza a la API pública). `PrService`/`PrReconciler` ganan
+  `with_credentials` y `with_provider_factory`; los tests inyectan una fábrica/cliente
+  hacia un servidor local (`GitHubClient::new_unvalidated` es `pub(crate)`); no existe
+  ajuste de configuración que relaje la política.
+- Credencial (D4): `provider_for_admission` exige `credential_handle_id` y
+  `credential_owner_user_id` congelados (si faltan: `pr_provider.credential_not_configured`),
+  abre el secreto en memoria con el nuevo `CredentialService::acquire_scm_secret`
+  (`provider='github'`, `api_key`, `configured`) y comprueba que el dueño siga siendo
+  owner/admin del Project (`credential.owner_not_authorized`). `MergeService` recibe
+  `set_credential_service` (cableado en `AppState` y `PrReconciler` en `forge-cli`).
+- Pendiente fuera de P0 (carril API/DB/T): `connect_scm_credential` y `provider:"github"`
+  en `POST /providers`, `credential_id` y 400 `repo.pr_provider_token_retired` en
+  `PATCH /repos/{id}`, `has_credential`, congelado de las columnas en `remote_pr_admission`
+  (V173), CHANGELOG *Breaking*, actualización de `pr12_public_surface.rs` y
+  `repos_endpoints.rs`, y fixtures de `task_integration_operation.rs` que dependían del
+  placeholder/`TestTokenEnv`.

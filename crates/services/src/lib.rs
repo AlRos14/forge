@@ -28,6 +28,7 @@ pub mod operator_status;
 pub mod operator_status_emitter;
 pub mod orchestrator_runtime;
 pub mod plan_artifact;
+pub mod pr_github_client;
 pub mod pr_service;
 pub(crate) mod project_actor_scope;
 pub mod project_authority;

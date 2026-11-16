@@ -367,6 +367,14 @@ impl ProjectRepo for SqliteDb {
             .await?;
 
         for statement in [
+            "DELETE FROM task_external_feedback_triage WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_external_feedback_set_item WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM pr_external_action WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM external_feedback_item WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM task_validation_triage WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM task_coordinator_replan WHERE task_id IN

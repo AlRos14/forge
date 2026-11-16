@@ -97,6 +97,9 @@ pub enum DbError {
     #[error("the validation workspace has an active worker WorkspaceLease")]
     ValidationWorkspaceLeased,
 
+    #[error("the PR external action is not authorized by the frozen admission policy or exact current inputs")]
+    PrActionNotAuthorized,
+
     #[error("the Task already used its coordinator replan limit")]
     CoordinatorReplanLimitReached,
 

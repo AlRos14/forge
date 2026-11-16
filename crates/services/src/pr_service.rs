@@ -1,3 +1,5 @@
+use crate::credential_service::CredentialService;
+use crate::pr_github_client::{DefaultPrProviderFactory, PrProviderFactory};
 use crate::{DomainEventService, Result, ServiceError};
 use async_trait::async_trait;
 use db::{
@@ -108,107 +110,6 @@ pub trait PrProvider: Send + Sync {
     ) -> std::result::Result<RemotePrStatus, PrProviderError>;
 }
 
-#[derive(Debug, Clone)]
-pub struct GitHubPrProvider {
-    provider_type: String,
-    base_url: Option<String>,
-    token: String,
-}
-
-impl GitHubPrProvider {
-    fn new(provider_type: String, base_url: Option<String>, token: String) -> Self {
-        Self {
-            provider_type,
-            base_url,
-            token,
-        }
-    }
-}
-
-#[async_trait]
-impl PrProvider for GitHubPrProvider {
-    async fn find_pr(
-        &self,
-        request: &PrCreateRequest,
-    ) -> std::result::Result<Option<PrRecord>, PrProviderError> {
-        tracing::info!(
-            repo = %request.repo_remote_url,
-            source_branch = %request.source_branch,
-            target_branch = %request.target_branch,
-            source_sha = %request.source_sha,
-            provider = %self.provider_type,
-            "placeholder GitHub PR lookup"
-        );
-        let _ = self.token.len();
-        Ok(None)
-    }
-
-    async fn create_pr(
-        &self,
-        request: PrCreateRequest,
-    ) -> std::result::Result<PrRecord, PrProviderError> {
-        tracing::info!(
-            repo = %request.repo_remote_url,
-            source_branch = %request.source_branch,
-            target_branch = %request.target_branch,
-            source_sha = %request.source_sha,
-            provider = %self.provider_type,
-            "placeholder GitHub PR create"
-        );
-        let _ = self.token.len();
-        Ok(PrRecord {
-            provider_pr_id: format!("placeholder-{}", request.idempotency_key),
-            pr_url: Some(format!(
-                "{}/pull/{}",
-                self.base_url
-                    .as_deref()
-                    .unwrap_or("https://github.com/forge-placeholder"),
-                request.idempotency_key
-            )),
-            status: RemotePrStatus::Open(PrObservation {
-                provider_event_id: format!("placeholder-create:{}", request.idempotency_key),
-                remote_repo_identity: request.repo_remote_url,
-                source_branch: request.source_branch,
-                target_branch: request.target_branch,
-                head_sha: request.source_sha,
-                merged_commit_sha: None,
-            }),
-        })
-    }
-
-    async fn get_pr_status(
-        &self,
-        admission: &RemotePrAdmission,
-        metadata: &PrMetadata,
-    ) -> std::result::Result<RemotePrStatus, PrProviderError> {
-        tracing::info!(
-            task_id = %metadata.task_id,
-            provider_pr_id = ?metadata.provider_pr_id,
-            provider = %self.provider_type,
-            "placeholder GitHub PR status read"
-        );
-        let _ = self.token.len();
-        let observation = PrObservation {
-            provider_event_id: format!(
-                "placeholder-status:{}:{}",
-                metadata.provider_pr_id.as_deref().unwrap_or("unknown"),
-                metadata.pr_state
-            ),
-            remote_repo_identity: admission.remote_repo_identity.clone(),
-            source_branch: admission.source_branch.clone(),
-            target_branch: admission.target_branch.clone(),
-            head_sha: admission.admitted_source_sha.clone(),
-            merged_commit_sha: (metadata.pr_state == "merged")
-                .then(|| format!("placeholder-merge:{}", admission.admitted_source_sha)),
-        };
-        Ok(match metadata.pr_state.as_str() {
-            "merged" => RemotePrStatus::Merged(observation),
-            "closed" => RemotePrStatus::Closed(observation),
-            _ => RemotePrStatus::Open(observation),
-        })
-    }
-}
-
 pub struct PublishedPr {
     pub metadata: PrMetadata,
     pub pr_url: Option<String>,
@@ -218,6 +119,8 @@ pub struct PublishedPr {
 pub struct PrService {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
+    credentials: Option<Arc<CredentialService>>,
+    provider_factory: Arc<dyn PrProviderFactory>,
     #[cfg(test)]
     provider_override: Option<Arc<dyn PrProvider>>,
 }
@@ -227,9 +130,24 @@ impl PrService {
         Self {
             db,
             event_bus,
+            credentials: None,
+            provider_factory: Arc::new(DefaultPrProviderFactory),
             #[cfg(test)]
             provider_override: None,
         }
+    }
+
+    /// Credential source for the frozen admission's GitHub handle. Without
+    /// it every provider resolution fails closed as unavailable.
+    pub fn with_credentials(mut self, credentials: Arc<CredentialService>) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    /// Replace the provider factory (tests point it at a local server).
+    pub fn with_provider_factory(mut self, factory: Arc<dyn PrProviderFactory>) -> Self {
+        self.provider_factory = factory;
+        self
     }
 
     pub(crate) async fn publish_pr(
@@ -267,7 +185,7 @@ impl PrService {
             ));
         }
 
-        let provider = match self.provider_for(&admission) {
+        let provider = match self.provider_for(&admission).await {
             Ok(provider) => provider,
             Err(error) => {
                 self.mark_reconciliation_required(&admission, Some(&metadata), &error.to_string())
@@ -571,7 +489,7 @@ impl PrService {
         Ok(())
     }
 
-    fn provider_for(
+    async fn provider_for(
         &self,
         admission: &RemotePrAdmission,
     ) -> std::result::Result<Arc<dyn PrProvider>, PrProviderError> {
@@ -579,7 +497,13 @@ impl PrService {
         if let Some(provider) = &self.provider_override {
             return Ok(Arc::clone(provider));
         }
-        provider_for_admission(admission)
+        provider_for_admission(
+            &self.db,
+            self.credentials.as_deref(),
+            self.provider_factory.as_ref(),
+            admission,
+        )
+        .await
     }
 }
 
@@ -588,6 +512,8 @@ pub struct PrReconciler {
     event_bus: Arc<EventBus>,
     integration_operations: crate::task_integration_operation::TaskIntegrationOperationManager,
     interval: Duration,
+    credentials: Option<Arc<CredentialService>>,
+    provider_factory: Arc<dyn PrProviderFactory>,
     #[cfg(test)]
     provider_override: Option<Arc<dyn PrProvider>>,
 }
@@ -604,9 +530,30 @@ impl PrReconciler {
             db,
             event_bus,
             interval: interval.unwrap_or(Duration::from_secs(60)),
+            credentials: None,
+            provider_factory: Arc::new(DefaultPrProviderFactory),
             #[cfg(test)]
             provider_override: None,
         }
+    }
+
+    pub fn with_credentials(mut self, credentials: Arc<CredentialService>) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    pub fn with_provider_factory(mut self, factory: Arc<dyn PrProviderFactory>) -> Self {
+        self.provider_factory = factory;
+        self
+    }
+
+    fn service(&self) -> PrService {
+        let mut service = PrService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+            .with_provider_factory(Arc::clone(&self.provider_factory));
+        if let Some(credentials) = &self.credentials {
+            service = service.with_credentials(Arc::clone(credentials));
+        }
+        service
     }
 
     #[cfg(test)]
@@ -685,11 +632,11 @@ impl PrReconciler {
                         admission.publish_operation_id.clone(),
                     )
                 })?;
-        PrService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+        self.service()
             .validate_admission(&task, &admission, &metadata, &publish_operation.id)
             .await?;
 
-        let provider = match self.provider_for(&admission) {
+        let provider = match self.provider_for(&admission).await {
             Ok(provider) => provider,
             Err(error) => {
                 self.mark_reconciliation_required(&admission, &metadata, &error.to_string())
@@ -746,7 +693,7 @@ impl PrReconciler {
         metadata: &PrMetadata,
         record: PrRecord,
     ) -> Result<()> {
-        let service = PrService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+        let service = self.service();
         service.apply_record(admission, metadata, record).await
     }
 
@@ -756,7 +703,7 @@ impl PrReconciler {
         metadata: &PrMetadata,
         status: RemotePrStatus,
     ) -> Result<()> {
-        let service = PrService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+        let service = self.service();
         service.apply_status(admission, metadata, status).await
     }
 
@@ -766,7 +713,7 @@ impl PrReconciler {
         metadata: &PrMetadata,
         reason: &str,
     ) -> Result<()> {
-        let service = PrService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+        let service = self.service();
         service
             .apply_publication_failure(admission, metadata, reason)
             .await
@@ -778,13 +725,13 @@ impl PrReconciler {
         metadata: &PrMetadata,
         reason: &str,
     ) -> Result<()> {
-        let service = PrService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
+        let service = self.service();
         service
             .mark_reconciliation_required(admission, Some(metadata), reason)
             .await
     }
 
-    fn provider_for(
+    async fn provider_for(
         &self,
         admission: &RemotePrAdmission,
     ) -> std::result::Result<Arc<dyn PrProvider>, PrProviderError> {
@@ -792,7 +739,13 @@ impl PrReconciler {
         if let Some(provider) = &self.provider_override {
             return Ok(Arc::clone(provider));
         }
-        provider_for_admission(admission)
+        provider_for_admission(
+            &self.db,
+            self.credentials.as_deref(),
+            self.provider_factory.as_ref(),
+            admission,
+        )
+        .await
     }
 }
 
@@ -819,30 +772,55 @@ async fn find_or_create(
     }
 }
 
-fn provider_for_admission(
+async fn provider_for_admission(
+    db: &SqliteDb,
+    credentials: Option<&CredentialService>,
+    factory: &dyn PrProviderFactory,
     admission: &RemotePrAdmission,
 ) -> std::result::Result<Arc<dyn PrProvider>, PrProviderError> {
-    let token_ref = admission
-        .token_secret_ref
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            PrProviderError::Unavailable("frozen token secret reference is missing".to_owned())
-        })?;
-    let token = std::env::var(token_ref).map_err(|_| {
-        PrProviderError::Unavailable("frozen provider credential is unavailable".to_owned())
-    })?;
-    match admission.provider_type.as_str() {
-        "github" => Ok(Arc::new(GitHubPrProvider::new(
-            admission.provider_type.clone(),
-            admission.provider_base_url.clone(),
-            token,
-        ))),
-        provider_type => Err(PrProviderError::Unavailable(format!(
-            "unsupported frozen provider type: {provider_type}"
-        ))),
+    let unavailable = |reason: &str| PrProviderError::Unavailable(reason.to_owned());
+    let (Some(handle_id), Some(owner_id)) = (
+        admission
+            .credential_handle_id
+            .as_deref()
+            .filter(|value| !value.is_empty()),
+        admission
+            .credential_owner_user_id
+            .as_deref()
+            .filter(|value| !value.is_empty()),
+    ) else {
+        return Err(unavailable("pr_provider.credential_not_configured"));
+    };
+    let credentials =
+        credentials.ok_or_else(|| unavailable("pr_provider.credential_not_configured"))?;
+    let secret = credentials
+        .acquire_scm_secret(owner_id, handle_id)
+        .await
+        .map_err(|_| unavailable("frozen provider credential is unavailable"))?;
+    let owner_authorized = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(
+             SELECT 1 FROM remote_pr_admission admission
+             JOIN task ON task.id = admission.task_id
+             JOIN project_member member ON member.project_id = task.project_id
+             WHERE admission.task_merge_operation_id = ?
+               AND member.user_id = ?
+               AND member.role IN ('owner', 'admin'))",
+    )
+    .bind(&admission.task_merge_operation_id)
+    .bind(owner_id)
+    .fetch_one(db.pool())
+    .await
+    .map_err(|_| unavailable("credential owner authority could not be verified"))?;
+    if owner_authorized == 0 {
+        return Err(unavailable("credential.owner_not_authorized"));
     }
+    factory
+        .build(
+            admission.provider_type.as_str(),
+            admission.provider_base_url.as_deref(),
+            secret,
+        )
+        .await
 }
 
 async fn pending_remote_pr_admissions(

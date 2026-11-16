@@ -137,6 +137,8 @@ jobs:
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib human_decision
       - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib pr_github_client_
+      - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib rt_validation_
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib rt_human_decision_

@@ -348,7 +348,15 @@ pub struct PrProviderConfig {
     pub provider_type: String,
     pub base_url: Option<String>,
     pub polling_interval_seconds: i64,
+    /// Retired for PR use (historical data); the PR credential is
+    /// `credential_handle_id` (V173, D4).
     pub token_secret_ref: Option<String>,
+    /// `credential_handle` (`provider = 'github'`) whose secret authenticates
+    /// PR provider calls; always set together with `credential_owner_user_id`.
+    pub credential_handle_id: Option<String>,
+    pub credential_owner_user_id: Option<String>,
+    /// Versioned feedback policy JSON (schema_version 1); see `PrFeedbackPolicy`.
+    pub feedback_policy_json: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -391,6 +399,14 @@ pub struct RemotePrAdmission {
     pub source_branch: String,
     pub target_branch: String,
     pub admitted_source_sha: String,
+    /// Credential reference frozen at admission (V173). `None` on historical
+    /// admissions and when the repo had no credential configured.
+    pub credential_handle_id: Option<String>,
+    pub credential_owner_user_id: Option<String>,
+    /// Feedback policy frozen at admission (V173); `None` on historical
+    /// admissions (no ingestion, no external action is authorized for them).
+    pub feedback_policy_json: Option<String>,
+    pub feedback_policy_digest: Option<String>,
     pub state: String,
     /// The outcome the provider reported, independent from Forge's integrity
     /// classification of whether it affected the admitted subject.
@@ -4004,6 +4020,380 @@ pub struct AnswerHumanDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HumanDecisionWrite {
     pub decision: HumanDecisionRequest,
+    /// `false` means an identical idempotent replay returned the existing row.
+    pub created: bool,
+    pub event: Option<DomainEvent>,
+}
+
+// ---------------------------------------------------------------------------
+// V173 (coordinator-verification-and-pr-loop, Phase 2): PR feedback policy,
+// external feedback ledger and triage, PR external actions.
+// ---------------------------------------------------------------------------
+
+/// Default feedback policy JSON stored on every `pr_provider_config` row.
+pub const DEFAULT_PR_FEEDBACK_POLICY_JSON: &str = r#"{"schema_version":1,"ingest":false,"trusted_author_associations":["OWNER","MEMBER","COLLABORATOR"],"trusted_logins":[],"max_items_per_poll":50,"push_corrections":"human_approval","post_summary":"off"}"#;
+
+/// Maximum number of items one `external_feedback` coordination request triages.
+pub const MAX_EXTERNAL_FEEDBACK_SET_ITEMS: usize = 20;
+
+/// Lower-case SHA-256 hex of the exact stored policy JSON (what is frozen in
+/// `remote_pr_admission.feedback_policy_digest`).
+pub fn pr_feedback_policy_digest(policy_json: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(policy_json.as_bytes()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrFeedbackAuthorization {
+    HumanApproval,
+    Automatic,
+}
+
+enum_strings!(PrFeedbackAuthorization {
+    HumanApproval => "human_approval",
+    Automatic => "automatic",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrFeedbackSummaryMode {
+    HumanApproval,
+    Automatic,
+    Off,
+}
+
+enum_strings!(PrFeedbackSummaryMode {
+    HumanApproval => "human_approval",
+    Automatic => "automatic",
+    Off => "off",
+});
+
+/// Typed view of `feedback_policy_json` (schema_version 1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrFeedbackPolicy {
+    pub schema_version: i64,
+    pub ingest: bool,
+    pub trusted_author_associations: Vec<String>,
+    pub trusted_logins: Vec<String>,
+    pub max_items_per_poll: i64,
+    pub push_corrections: PrFeedbackAuthorization,
+    pub post_summary: PrFeedbackSummaryMode,
+}
+
+impl Default for PrFeedbackPolicy {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            ingest: false,
+            trusted_author_associations: vec![
+                "OWNER".to_owned(),
+                "MEMBER".to_owned(),
+                "COLLABORATOR".to_owned(),
+            ],
+            trusted_logins: Vec::new(),
+            max_items_per_poll: 50,
+            push_corrections: PrFeedbackAuthorization::HumanApproval,
+            post_summary: PrFeedbackSummaryMode::Off,
+        }
+    }
+}
+
+impl PrFeedbackPolicy {
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        serde_json::from_str(json).map_err(|error| format!("invalid feedback policy: {error}"))
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("feedback policy serializes")
+    }
+}
+
+/// Reference to a `credential_handle` (`provider = 'github'`) and its owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrProviderCredentialRef {
+    pub handle_id: String,
+    pub owner_user_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalFeedbackKind {
+    Review,
+    ReviewComment,
+    IssueComment,
+}
+
+enum_strings!(ExternalFeedbackKind {
+    Review => "review",
+    ReviewComment => "review_comment",
+    IssueComment => "issue_comment",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalFeedbackReviewState {
+    #[serde(rename = "CHANGES_REQUESTED")]
+    ChangesRequested,
+    #[serde(rename = "COMMENTED")]
+    Commented,
+    #[serde(rename = "APPROVED")]
+    Approved,
+    #[serde(rename = "DISMISSED")]
+    Dismissed,
+}
+
+enum_strings!(ExternalFeedbackReviewState {
+    ChangesRequested => "CHANGES_REQUESTED",
+    Commented => "COMMENTED",
+    Approved => "APPROVED",
+    Dismissed => "DISMISSED",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalFeedbackTrustClass {
+    Trusted,
+    Untrusted,
+    ForgeAuthored,
+}
+
+enum_strings!(ExternalFeedbackTrustClass {
+    Trusted => "trusted",
+    Untrusted => "untrusted",
+    ForgeAuthored => "forge_authored",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalFeedbackHeadState {
+    Current,
+    StaleHead,
+}
+
+enum_strings!(ExternalFeedbackHeadState {
+    Current => "current",
+    StaleHead => "stale_head",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalFeedbackDisposition {
+    Correct,
+    Recheck,
+    Human,
+    Dismiss,
+}
+
+enum_strings!(ExternalFeedbackDisposition {
+    Correct => "correct",
+    Recheck => "recheck",
+    Human => "human",
+    Dismiss => "dismiss",
+});
+
+/// Immutable provider-authored item ingested for an open remote PR admission.
+/// `body` is untrusted data; never treat it as an instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFeedbackItem {
+    pub id: String,
+    pub task_id: String,
+    pub admission_id: String,
+    pub provider_item_id: String,
+    pub kind: ExternalFeedbackKind,
+    pub author_login: String,
+    pub author_association: String,
+    pub review_state: Option<ExternalFeedbackReviewState>,
+    pub path: Option<String>,
+    pub line: Option<i64>,
+    pub commit_sha: Option<String>,
+    pub body: String,
+    pub body_truncated: bool,
+    pub body_digest: String,
+    pub provider_url: Option<String>,
+    pub trust_class: ExternalFeedbackTrustClass,
+    pub head_state: ExternalFeedbackHeadState,
+    pub ingested_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateExternalFeedbackItem {
+    pub id: String,
+    pub task_id: String,
+    pub admission_id: String,
+    pub provider_item_id: String,
+    pub kind: ExternalFeedbackKind,
+    pub author_login: String,
+    pub author_association: String,
+    pub review_state: Option<ExternalFeedbackReviewState>,
+    pub path: Option<String>,
+    pub line: Option<i64>,
+    pub commit_sha: Option<String>,
+    /// At most 16 KiB; truncate and set `body_truncated` before calling.
+    pub body: String,
+    pub body_truncated: bool,
+    pub body_digest: String,
+    pub provider_url: Option<String>,
+    pub trust_class: ExternalFeedbackTrustClass,
+    pub head_state: ExternalFeedbackHeadState,
+    pub ingested_at: String,
+}
+
+/// One entry of the exact set an `external_feedback` request triages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFeedbackSetEntry {
+    pub feedback_item_id: String,
+    pub body_digest: String,
+}
+
+/// Immutable coordinator decision about one feedback item of one request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFeedbackTriage {
+    pub id: String,
+    pub task_id: String,
+    pub request_id: String,
+    pub feedback_item_id: String,
+    pub body_digest: String,
+    pub disposition: ExternalFeedbackDisposition,
+    pub rationale: String,
+    pub instructions: String,
+    pub decision_digest: String,
+    pub execution_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateExternalFeedbackTriage {
+    pub id: String,
+    pub task_id: String,
+    pub request_id: String,
+    pub feedback_item_id: String,
+    pub body_digest: String,
+    pub disposition: ExternalFeedbackDisposition,
+    pub rationale: String,
+    pub instructions: String,
+    pub decision_digest: String,
+    pub execution_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrExternalActionKind {
+    PushUpdate,
+    PostComment,
+}
+
+enum_strings!(PrExternalActionKind {
+    PushUpdate => "push_update",
+    PostComment => "post_comment",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrExternalActionState {
+    Proposed,
+    Approved,
+    Running,
+    Succeeded,
+    Failed,
+    OutcomeUnknown,
+    ReconciliationRequired,
+    Rejected,
+    Abandoned,
+}
+
+enum_strings!(PrExternalActionState {
+    Proposed => "proposed",
+    Approved => "approved",
+    Running => "running",
+    Succeeded => "succeeded",
+    Failed => "failed",
+    OutcomeUnknown => "outcome_unknown",
+    ReconciliationRequired => "reconciliation_required",
+    Rejected => "rejected",
+    Abandoned => "abandoned",
+});
+
+impl PrExternalActionState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Rejected | Self::Abandoned
+        )
+    }
+
+    /// States counted by the one-open-action-per-Task unique index.
+    pub fn is_open(self) -> bool {
+        matches!(
+            self,
+            Self::Proposed
+                | Self::Approved
+                | Self::Running
+                | Self::OutcomeUnknown
+                | Self::ReconciliationRequired
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrExternalAction {
+    pub id: String,
+    pub task_id: String,
+    pub admission_id: String,
+    pub kind: PrExternalActionKind,
+    pub state: PrExternalActionState,
+    pub authorization_mode: PrFeedbackAuthorization,
+    pub gate_evaluation_id: Option<String>,
+    pub subject_commit_sha: Option<String>,
+    pub expected_remote_head_sha: Option<String>,
+    pub summary_artifact_id: Option<String>,
+    pub body_digest: Option<String>,
+    pub proposal_id: Option<String>,
+    pub decision_id: Option<String>,
+    pub idempotency_key: String,
+    pub provider_event_id: Option<String>,
+    pub provider_result_json: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
+}
+
+/// Birth of an action: always `proposed`, or `approved` for an `automatic`
+/// action whose frozen admission policy says so. `push_update` requires the
+/// Gate evaluation and both SHAs; `post_comment` the summary Artifact and
+/// body digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePrExternalAction {
+    pub id: String,
+    pub task_id: String,
+    pub admission_id: String,
+    pub kind: PrExternalActionKind,
+    pub authorization_mode: PrFeedbackAuthorization,
+    pub gate_evaluation_id: Option<String>,
+    pub subject_commit_sha: Option<String>,
+    pub expected_remote_head_sha: Option<String>,
+    pub summary_artifact_id: Option<String>,
+    pub body_digest: Option<String>,
+    pub idempotency_key: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionPrExternalAction {
+    pub id: String,
+    pub expected_version: i64,
+    pub to_state: PrExternalActionState,
+    /// Required for `proposed -> approved|rejected` under `human_approval`.
+    pub decision_id: Option<String>,
+    pub provider_event_id: Option<String>,
+    pub provider_result_json: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrExternalActionWrite {
+    pub action: PrExternalAction,
     /// `false` means an identical idempotent replay returned the existing row.
     pub created: bool,
     pub event: Option<DomainEvent>,

@@ -1681,6 +1681,25 @@ pub trait PrProviderConfigRepo: Send + Sync {
     async fn create(&self, input: CreatePrProviderConfig) -> Result<PrProviderConfig>;
     async fn get_by_repo_id(&self, repo_id: &str) -> Result<Option<PrProviderConfig>>;
     async fn update(&self, input: UpdatePrProviderConfig) -> Result<PrProviderConfig>;
+    /// Set (`Some`) or clear (`None`) the GitHub credential reference (V173).
+    /// The handle must be a configured `provider = 'github'` handle owned by
+    /// `owner_user_id`; otherwise the guard rejects the write
+    /// (`DbError::Check`/database error). Advances `updated_at` (the config
+    /// revision), so previously issued admissions keep their frozen copy.
+    async fn set_credential(
+        &self,
+        id: &str,
+        credential: Option<PrProviderCredentialRef>,
+        updated_at: &str,
+    ) -> Result<PrProviderConfig>;
+    /// Replace the feedback policy JSON (schema_version 1, validated by a
+    /// trigger). Advances `updated_at`; never alters issued admissions.
+    async fn set_feedback_policy(
+        &self,
+        id: &str,
+        policy_json: &str,
+        updated_at: &str,
+    ) -> Result<PrProviderConfig>;
     async fn delete(&self, id: &str) -> Result<()>;
 }
 
@@ -2964,4 +2983,138 @@ pub trait HumanDecisionRepo: Send + Sync {
         state: Option<HumanDecisionState>,
         page: &PageRequest,
     ) -> Result<Page<HumanDecisionRequest>>;
+}
+
+/// Immutable external PR feedback ledger, request sets and triage (V173).
+#[async_trait]
+pub trait ExternalFeedbackRepo: Send + Sync {
+    /// Insert each item atomically; the `(admission, provider_item_id,
+    /// body_digest)` identity makes replays no-ops (`created == false`, existing
+    /// row returned). The admission must be the Task's `open` admission whose
+    /// frozen policy has `ingest = true`; otherwise the whole batch is rejected.
+    async fn ingest_external_feedback(
+        &self,
+        items: Vec<CreateExternalFeedbackItem>,
+    ) -> Result<Vec<(ExternalFeedbackItem, bool)>>;
+    async fn get_external_feedback_item(&self, id: &str) -> Result<Option<ExternalFeedbackItem>>;
+    async fn list_external_feedback_items(
+        &self,
+        admission_id: &str,
+        trust_class: Option<ExternalFeedbackTrustClass>,
+        head_state: Option<ExternalFeedbackHeadState>,
+        page: &PageRequest,
+    ) -> Result<Page<ExternalFeedbackItem>>;
+    /// Trusted, current-head items of the admission that no request set has
+    /// consumed yet, oldest first (the next triage candidates).
+    async fn list_unconsumed_trusted_feedback(
+        &self,
+        admission_id: &str,
+        limit: i64,
+    ) -> Result<Vec<ExternalFeedbackItem>>;
+    /// One-way `current -> stale_head` for items whose commented commit differs
+    /// from `current_head_sha`. Returns the number of rows marked.
+    async fn mark_external_feedback_stale_head(
+        &self,
+        admission_id: &str,
+        current_head_sha: &str,
+    ) -> Result<u64>;
+    /// Add the exact (<= 20) set to a `requested` `external_feedback` request.
+    /// Idempotent for identical entries; positions follow the given order. Use
+    /// the `_in_tx` form to commit with the request creation.
+    async fn add_external_feedback_set_items(
+        &self,
+        request_id: &str,
+        task_id: &str,
+        entries: &[ExternalFeedbackSetEntry],
+    ) -> Result<()>;
+    async fn add_external_feedback_set_items_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        request_id: &str,
+        task_id: &str,
+        entries: &[ExternalFeedbackSetEntry],
+    ) -> Result<()>;
+    /// The request's set, in position order.
+    async fn list_external_feedback_set(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ExternalFeedbackItem>>;
+    /// Insert once per `(request, item)`; an identical replay returns the
+    /// existing row, a different decision is `DbError::IdempotencyConflict`.
+    /// Rejects stale authorization/execution/digest (`DbError::VersionConflict`).
+    async fn record_external_feedback_triage(
+        &self,
+        input: CreateExternalFeedbackTriage,
+    ) -> Result<ExternalFeedbackTriage>;
+    async fn record_external_feedback_triage_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: CreateExternalFeedbackTriage,
+    ) -> Result<ExternalFeedbackTriage>;
+    async fn list_external_feedback_triage(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ExternalFeedbackTriage>>;
+    /// Latest decision recorded for the item (any request), if any.
+    async fn latest_external_feedback_triage_for_item(
+        &self,
+        feedback_item_id: &str,
+    ) -> Result<Option<ExternalFeedbackTriage>>;
+}
+
+/// `push_update` / `post_comment` actions against the admitted remote PR (V173).
+/// All transitions are version-guarded and enforced by triggers; a stale
+/// version, a non-open admission, an exclusion by a running integration
+/// operation or a policy mismatch is rejected atomically.
+#[async_trait]
+pub trait PrExternalActionRepo: Send + Sync {
+    /// Idempotent by `idempotency_key`: an identical existing action returns
+    /// `created == false`; a different one is `DbError::IdempotencyConflict`.
+    /// Only the Task's `open` admission with a frozen policy can host actions;
+    /// `automatic` requires the frozen policy to say `automatic` for the kind.
+    async fn create_pr_external_action(
+        &self,
+        input: CreatePrExternalAction,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<PrExternalActionWrite>;
+    /// Attach the collaborative Proposal (`target_kind = 'pr_external_action'`,
+    /// `target_id = action.id`) once, while `proposed`.
+    async fn attach_pr_external_action_proposal(
+        &self,
+        id: &str,
+        expected_version: i64,
+        proposal_id: &str,
+        updated_at: &str,
+    ) -> Result<PrExternalAction>;
+    /// Move along the allowed graph:
+    /// proposed -> approved|rejected|abandoned; approved -> running|abandoned;
+    /// running -> succeeded|failed|outcome_unknown|reconciliation_required;
+    /// outcome_unknown -> succeeded|failed|reconciliation_required;
+    /// reconciliation_required -> succeeded|failed|abandoned. Terminal states
+    /// (succeeded, failed, rejected, abandoned) set `finished_at` and are final.
+    /// `running` re-checks the open admission, exclusion and exact Gate inputs.
+    async fn transition_pr_external_action(
+        &self,
+        input: TransitionPrExternalAction,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<PrExternalActionWrite>;
+    async fn get_pr_external_action(&self, id: &str) -> Result<Option<PrExternalAction>>;
+    async fn get_pr_external_action_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<PrExternalAction>>;
+    /// The Task's single open action, if any.
+    async fn get_open_pr_external_action(&self, task_id: &str) -> Result<Option<PrExternalAction>>;
+    async fn list_pr_external_actions_by_task(
+        &self,
+        task_id: &str,
+        state: Option<PrExternalActionState>,
+        page: &PageRequest,
+    ) -> Result<Page<PrExternalAction>>;
+    /// Actions in any of `states` (recovery sweep), oldest first.
+    async fn list_pr_external_actions_in_states(
+        &self,
+        states: &[PrExternalActionState],
+        limit: i64,
+    ) -> Result<Vec<PrExternalAction>>;
 }

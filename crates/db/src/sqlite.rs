@@ -67,6 +67,7 @@ mod domain_event;
 mod embedded_agent;
 mod execution;
 mod execution_usage;
+mod external_feedback;
 mod external_link;
 mod gate_lifecycle;
 mod harness_session;
@@ -78,6 +79,7 @@ mod oauth_client;
 mod oauth_refresh_token;
 mod orchestrator_wake;
 mod personal_access_token;
+mod pr_external_action;
 mod pr_metadata;
 mod pr_provider_config;
 mod project;
@@ -233,9 +235,12 @@ fn check_error(error: sqlx::Error) -> DbError {
             | "FORGE_COORDINATION_VALIDATION_SOURCE_STALE"
             | "FORGE_COORDINATION_VALIDATION_DECISION_STALE"
             | "FORGE_COORDINATION_DECISION_STALE"
-            | "FORGE_COORDINATION_HUMAN_DECISION_STALE" => {
+            | "FORGE_COORDINATION_HUMAN_DECISION_STALE"
+            | "FORGE_COORDINATION_EXTERNAL_FEEDBACK_STALE"
+            | "FORGE_PR_ACTION_STALE" => {
                 return DbError::VersionConflict;
             }
+            "FORGE_PR_ACTION_NOT_AUTHORIZED" => return DbError::PrActionNotAuthorized,
             "FORGE_VALIDATION_CHECK_STALE_PIN" => return DbError::ValidationCheckStalePin,
             "FORGE_VALIDATION_CHECK_NOT_AUTHORIZED" => {
                 return DbError::ValidationCheckNotAuthorized
@@ -243,6 +248,15 @@ fn check_error(error: sqlx::Error) -> DbError {
             "FORGE_VALIDATION_WORKSPACE_LEASED" => return DbError::ValidationWorkspaceLeased,
             "FORGE_PROJECT_PLAN_BATCH_INACTIVE" => return DbError::ProjectPlanBatchInactive,
             _ => {}
+        }
+        let message = database_error.message();
+        if message.starts_with("PR provider credential must be")
+            || message.starts_with("invalid PR feedback policy")
+            || message.starts_with("SCM credentials cannot back")
+            || message.starts_with("SCM credential handle identity")
+            || message.starts_with("external feedback requires")
+        {
+            return DbError::Check(message.to_owned());
         }
         if database_error
             .message()
@@ -345,6 +359,9 @@ fn map_pr_provider_config(row: SqliteRow) -> Result<PrProviderConfig> {
         base_url: row.try_get("base_url")?,
         polling_interval_seconds: row.try_get("polling_interval_seconds")?,
         token_secret_ref: row.try_get("token_secret_ref")?,
+        credential_handle_id: row.try_get("credential_handle_id")?,
+        credential_owner_user_id: row.try_get("credential_owner_user_id")?,
+        feedback_policy_json: row.try_get("feedback_policy_json")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
