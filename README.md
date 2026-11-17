@@ -47,10 +47,6 @@ The container runs as an unprivileged forge user and Compose binds to loopback
 by default. See [deployment](docs/deployment.md) before changing network
 exposure.
 
-The inherited npx-cli, npm, and Homebrew release references belong to
-ForgeAILab/forge; they do not distribute this fork. See [upstream and
-attribution](docs/upstream.md).
-
 ## Documentation
 
 - [Architecture](docs/architecture.md)

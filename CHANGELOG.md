@@ -77,6 +77,9 @@ replanning extend delivery while keeping merge a Human decision.
   changes wait for the exact Human decision before materialization.
 - Keep Project and Task views tied to durable receipts for validation, Human
   decisions, PR feedback and rework, fallback, micro-fixes, and replans.
+- Remove upstream-era research reports, retired feature specs and the upstream
+  npm bootstrapper (`npx-cli`) with its CI/release jobs; they remain in Git
+  history.
 - Keep TaskLifecycle as the sole aggregate Task progress authority. Dispatch
   intent, WorkUnit and Execution state, formal review, validation, Gate
   evaluation, integration, PR actions, and merge remain separate facts.

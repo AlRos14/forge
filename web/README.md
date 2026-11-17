@@ -2,7 +2,7 @@
 
 The React and TypeScript frontend for Forge. It uses Vite, TanStack Query and Router, Tailwind, and shadcn/ui, and calls the Rust API under `/api/v1`.
 
-The public routes and navigation are defined in `src/router.tsx` and `src/components/app-shell.tsx`. They include Project board and Task list, Task detail and Execution history, Agent and daemon administration, Operations, Project and server settings, and historical ProjectRelease snapshots. The web UI does not currently create WorkUnits; use REST or MCP.
+Routes and navigation are defined in `src/router.tsx` and `src/components/app-shell.tsx`. They include Project board, plan, and Task list; Task details and Execution history; the Project Copilot dock; Agent administration; administrator-only daemon and Operations pages; Project and server settings; and read-only historical ProjectRelease snapshots. The web UI does not currently create WorkUnits; create and allocate them through REST or MCP.
 
 ## Develop
 
@@ -31,7 +31,7 @@ pnpm test
 pnpm run e2e
 ```
 
-The production build is written to `web/dist/`. The `forge` binary serves assets from that checkout path, then from its installed `share/forge/web/dist` path. `FORGE_WEB_DIST_DIR` overrides asset discovery. The Rust build script invokes the locked pnpm install and build unless `FORGE_SKIP_WEB_BUILD=1` is set.
+The production build is written to `dist/`. The `forge` binary serves assets from the checkout's `web/dist/`, then from its installed `share/forge/web/dist` path. `FORGE_WEB_DIST_DIR` overrides asset discovery. The Rust build script invokes the locked pnpm install and build unless `FORGE_SKIP_WEB_BUILD=1` is set.
 
 ## Package layout
 

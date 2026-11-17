@@ -8,17 +8,16 @@
 
 ## Checklist
 
-- [ ] `cargo fmt --all -- --check` passes
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [ ] `cargo test --workspace --all-targets` passes
-- [ ] Frontend changes: `pnpm lint && pnpm typecheck && pnpm test && pnpm build` pass
-- [ ] Browser-facing changes: Playwright smoke test passes
-- [ ] Breaking changes are noted below (or N/A)
+- [ ] Relevant checks from `./scripts/ci-rust.sh` and/or `./scripts/ci-web.sh` are reported as PASS, FAIL, or NOT RUN.
+- [ ] Browser-facing changes: `pnpm run e2e` from `web/` is reported.
+- [ ] Database changes use new numbered forward-only migrations and preserve installed data.
+- [ ] Documentation is updated for behavior or public-contract changes.
+- [ ] Breaking public changes are recorded in `CHANGELOG.md`.
 
 ## Breaking Changes
 
 <!-- Describe any breaking changes, or write "None" -->
 
-## Test Plan
+## Validation
 
-<!-- How did you verify this change? -->
+<!-- List checks and results as PASS, FAIL, or NOT RUN. Explain any NOT RUN checks. -->

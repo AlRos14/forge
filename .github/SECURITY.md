@@ -1,6 +1,6 @@
 # Security Policy
 
-This repository has no verified published release artifacts as of the PR14 documentation audit. For source issues, the maintained source is the current `main` branch.
+The maintained source is this repository. Releases are built by this repository's workflow for `v*` tags; no published GitHub release has been verified as of 2026-11-17. A version in the source tree does not establish that a release artifact exists.
 
 ## Reporting a vulnerability
 

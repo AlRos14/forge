@@ -25,7 +25,7 @@ Use `forge-ctl logout` to remove the saved token. Avoid putting passwords or pro
 | `login`, `logout`, `whoami` | Authenticate and inspect the saved login. |
 | `project` | `create`, `list`. |
 | `repo` | `create`, `list`. |
-| `task` | `create`, `list`, `get`, `role list/create/add-member`, `launch`, `pause`, `resume`, `cancel`, `transition`. |
+| `task` | `create`, `list`, `get`, `role list/create/add-member`, `coordination show/authorize/revoke/request/approve/materialize`, `launch`, `pause`, `resume`, `cancel`, `transition`. |
 | `agent` | `register`, `list`, `get`, `profile list/select`. |
 | `provider` | `list`, `add`, `login`, `rename`, `remove`. |
 | `daemon` | `link`, `start`, `report`. |
@@ -35,10 +35,11 @@ Use `forge-ctl <command> --help` for the arguments and enum values of that comma
 
 ## Task and WorkUnit workflow
 
-The CLI creates a Project, Repo, Task, TaskRole, and RoleMembership. It does not
-currently create a WorkUnit. Create and allocate the WorkUnit through the REST
-or MCP API, prepare its repository Workspace, and then launch the Task. Optional
-WorkUnit `execution_instructions` are passed to the assigned harness.
+The CLI can create Projects, Repos, and Tasks, and provides commands to create
+TaskRoles and add RoleMemberships. It does not currently create WorkUnits.
+Create and allocate a WorkUnit through the REST or MCP API, prepare its
+repository Workspace, and then launch the Task. Optional WorkUnit
+`execution_instructions` are passed to the assigned harness.
 
 The current CLI role commands do not edit capability or rework configuration.
 Use the versioned REST TaskRole endpoints or `forge_create_task_role` /
@@ -77,8 +78,9 @@ forge-ctl task coordination materialize <task> --plan <artifact-id> \
   --expected-request-version N --idempotency-key <key>
 ```
 
-`proposal` waits for the exact plan decision. `prepare_and_execute` materializes
-only an in-envelope plan; a plan outside the envelope becomes a Proposal.
+`proposal` waits for the exact plan decision. The CLI mode spelling
+`prepare-and-execute` materializes only an in-envelope plan; a plan outside the
+envelope becomes a Proposal.
 Materialization creates the real WorkUnits and records the normal launch intent;
 the dispatcher still revalidates assignments, capabilities, and leases.
 
