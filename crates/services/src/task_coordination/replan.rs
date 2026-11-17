@@ -12,6 +12,16 @@ use db::{
     TransitionCoordinatorReplan, WorkUnitRepo,
 };
 
+pub(super) struct RaiseReplanScopeDecisionInput<'a> {
+    pub(super) request: &'a TaskCoordinationRequest,
+    pub(super) execution: &'a db::Execution,
+    pub(super) artifact_id: &'a str,
+    pub(super) artifact_digest: &'a str,
+    pub(super) replan_id: &'a str,
+    pub(super) classification: ReplanClassification,
+    pub(super) facts_json: String,
+}
+
 fn replan_actor_key(actor: &db::ActorRef) -> String {
     match actor {
         db::ActorRef::Human(id) => format!("human:{id}"),
@@ -565,15 +575,15 @@ impl TaskCoordinationService {
             if plan_row.state == TaskCoordinationPlanState::Approved {
                 return Err(invalid_plan("out-of-envelope replan was already approved"));
             }
-            self.raise_replan_scope_decision(
+            self.raise_replan_scope_decision(RaiseReplanScopeDecisionInput {
                 request,
                 execution,
-                &plan_row.artifact_id,
-                &plan_row.plan_digest,
-                &replan_id,
-                classification.classification,
-                classification.classification_facts_json(),
-            )
+                artifact_id: &plan_row.artifact_id,
+                artifact_digest: &plan_row.plan_digest,
+                replan_id: &replan_id,
+                classification: classification.classification,
+                facts_json: classification.classification_facts_json(),
+            })
             .await?;
             return Ok(true);
         }
@@ -594,14 +604,17 @@ impl TaskCoordinationService {
 
     pub(super) async fn raise_replan_scope_decision(
         &self,
-        request: &TaskCoordinationRequest,
-        execution: &db::Execution,
-        artifact_id: &str,
-        artifact_digest: &str,
-        replan_id: &str,
-        classification: ReplanClassification,
-        facts_json: String,
+        input: RaiseReplanScopeDecisionInput<'_>,
     ) -> Result<()> {
+        let RaiseReplanScopeDecisionInput {
+            request,
+            execution,
+            artifact_id,
+            artifact_digest,
+            replan_id,
+            classification,
+            facts_json,
+        } = input;
         let row = TaskCoordinatorReplanRepo::get_coordinator_replan(&*self.db, replan_id)
             .await?
             .filter(|row| row.task_id == request.task_id)

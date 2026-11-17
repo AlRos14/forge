@@ -2838,15 +2838,15 @@ impl TaskCoordinationService {
                     result.classification == ReplanClassification::ScopeOrAuthorityChange
                 })
             {
-                self.raise_replan_scope_decision(
+                self.raise_replan_scope_decision(replan::RaiseReplanScopeDecisionInput {
                     request,
                     execution,
-                    &artifact_id,
-                    &plan_digest,
+                    artifact_id: &artifact_id,
+                    artifact_digest: &plan_digest,
                     replan_id,
-                    result.classification,
-                    result.classification_facts_json(),
-                )
+                    classification: result.classification,
+                    facts_json: result.classification_facts_json(),
+                })
                 .await?;
                 return Ok(());
             }
@@ -3385,11 +3385,38 @@ impl TaskCoordinationService {
                 .review_report_digest
                 .as_deref()
                 .ok_or_else(|| invalid_plan("ReviewFindings request has no exact report digest"))?;
+            let coordination = self.require_coordination(&request.task_id).await?;
+            let envelope = self.envelope(&coordination)?;
+            let action_is_allowed = |action: &str| {
+                context
+                    .pointer("/task_role/pr6_policy/allowed_actions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|allowed| {
+                        allowed.iter().any(|value| value.as_str() == Some(action))
+                    })
+            };
+            let micro_fix_enabled = envelope
+                .micro_fix
+                .as_ref()
+                .is_some_and(|grant| grant.enabled)
+                && action_is_allowed("micro_fix");
+            let propose_replan_enabled =
+                envelope.allow_coordinator_replan && action_is_allowed("propose_replan");
+            let micro_fix_instruction = if micro_fix_enabled {
+                "Optional `micro_fix` is permitted only with `correct`; use exact report findings and up to 3 paths explicitly named in those findings. It requests a bounded correction and never supplies a patch."
+            } else {
+                "Set `micro_fix` to null because this TaskRole and envelope do not preauthorize a micro-fix."
+            };
+            let outputs_instruction = if propose_replan_enabled {
+                "The `outputs` array may contain up to 4 entries and may use `propose_replan` with `reason`, `evidence_links`, and `plan_request.instructions` (<= 4 KiB)."
+            } else {
+                "Keep `outputs` empty; `propose_replan` is not preauthorized by this TaskRole and envelope."
+            };
             return Ok(format!(
                 r#"You are the selected Task coordinator reviewing one exact request-changes ReviewReport. This execution is read-only and cannot change the report, its verdict, the reviewed result, or a Gate.
 Return exactly one JSON object matching:
 {{"schema_version":2,"request_id":{request_id},"task_id":{task_id},"authorization_version":{authorization_version},"review_findings":[{{"authorization_version":{authorization_version},"review_report_artifact_id":{report_id},"report_digest":{report_digest},"disposition":"correct|recheck|human","rationale":"...","instructions":"...","micro_fix":null}}],"outputs":[]}}
-Return exactly one decision. `correct` confirms a reproducible defect and gives a bounded correction; `recheck` asks for a fresh formal review of the same frozen subject; `human` identifies the concrete decision that needs a Human. Optional `micro_fix` (schema 2 only) is valid only with `correct` and has `finding_refs` (exact report findings), `instructions` (<= 4 KiB) and `paths` (up to 3 paths explicitly named in those findings). It requests a bounded correction and never supplies a patch. Optional `outputs` (up to 4) may contain `propose_replan` with `reason`, `evidence_links`, and `plan_request.instructions` (<= 4 KiB); it requires an explicitly permitted TaskRole action and `envelope.allow_coordinator_replan`. Do not combine micro_fix with propose_replan. Never include commands, commits, workspace IDs, or arbitrary paths. Keep rationale under 8 KiB and decision instructions under 16 KiB.
+Return exactly one decision and no `actions` field. `correct` confirms a reproducible defect and gives a bounded correction; `recheck` asks for a fresh formal review of the same frozen subject; `human` identifies the concrete decision that needs a Human. {micro_fix_instruction} {outputs_instruction} Do not combine `micro_fix` with `propose_replan`. Never include commands, commits, workspace IDs, or arbitrary paths. Keep rationale under 8 KiB and decision instructions under 16 KiB.
 Exact report: {report_id} ({report_digest})
 Task context: {context}"#,
                 request_id = serde_json::to_string(&request.id).unwrap(),
@@ -3397,6 +3424,8 @@ Task context: {context}"#,
                 authorization_version = request.authorization_version,
                 report_id = serde_json::to_string(report_id).unwrap(),
                 report_digest = serde_json::to_string(report_digest).unwrap(),
+                micro_fix_instruction = micro_fix_instruction,
+                outputs_instruction = outputs_instruction,
                 context = serde_json::to_string(context).unwrap_or_else(|_| "{}".to_owned()),
             ));
         }

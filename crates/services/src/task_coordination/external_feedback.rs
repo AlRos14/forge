@@ -1411,15 +1411,15 @@ Exact source: admission {admission_id} ({digest})\nContext: {context}",
                 Arc::clone(&self.db),
                 Arc::clone(&self.event_bus),
             )
-            .ensure_micro_fix_source_receipt(
+            .ensure_micro_fix_source_receipt(crate::task_rework::MicroFixSourceReceiptInput {
                 task_id,
-                &request.id,
-                request.authorization_version,
-                MicroFixSourceKind::ExternalFeedback,
-                &fix_work_unit_id,
+                request_id: &request.id,
+                authorization_version: request.authorization_version,
+                source_kind: MicroFixSourceKind::ExternalFeedback,
+                correction_work_unit_id: &fix_work_unit_id,
                 reviewed_commit_sha,
                 micro_fix,
-            )
+            })
             .await?;
         }
         if created {

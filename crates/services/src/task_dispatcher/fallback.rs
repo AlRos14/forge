@@ -518,9 +518,8 @@ impl TaskDispatcher {
             .clone()
             .filter(|instructions| !instructions.trim().is_empty())
             .unwrap_or_else(|| {
-                format!(
-                    "Retry the same WorkUnit using its currently assigned Agent profile after the provider retry deadline. Keep the existing TaskRole and WorkUnit scope. Do not switch to a different Agent."
-                )
+                "Retry the same WorkUnit using its currently assigned Agent profile after the provider retry deadline. Keep the existing TaskRole and WorkUnit scope. Do not switch to a different Agent."
+                    .to_owned()
             });
         let execution = self
             .task_service
@@ -936,12 +935,10 @@ impl TaskDispatcher {
             }
         }
         let actor = api_types::ActorRef::Agent(agent.id.clone());
-        if !crate::task_rework::reviewer_is_independent(&self.db, &context.work_unit_id, &actor)
-            .await?
-        {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(
+            crate::task_rework::reviewer_is_independent(&self.db, &context.work_unit_id, &actor)
+                .await?,
+        )
     }
 }
 

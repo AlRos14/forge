@@ -93,7 +93,7 @@ pub fn classify_replan(
         && items
             .iter()
             .all(|item| !item.requires_integration || original.repo_id.is_some());
-    let no_new_envelope_flags = no_new_envelope_flags(&envelope, &original.original_envelope);
+    let no_new_envelope_flags = no_new_envelope_flags(envelope, &original.original_envelope);
     let facts = ReplanClassificationFacts {
         objective_digest_unchanged: original.objective_digest == original.current_objective_digest,
         roles_within_team,
@@ -179,8 +179,8 @@ fn micro_fix_grant_within_original(
 fn path_tokens(scope: &str) -> Vec<String> {
     scope
         .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '`' | '"' | '\'' | '(' | ')'))
-        .map(|token| token.trim_start_matches("./").trim_end_matches('/'))
         .filter(|token| token.contains('/'))
+        .map(|token| token.trim_start_matches("./").trim_end_matches('/'))
         .map(str::to_owned)
         .collect()
 }
@@ -248,8 +248,10 @@ mod tests {
 
     #[test]
     fn coordinator_replan_classifier_accepts_measured_in_envelope_plan() {
-        let mut envelope = CoordinationEnvelope::default();
-        envelope.max_work_units = 2;
+        let envelope = CoordinationEnvelope {
+            max_work_units: 2,
+            ..CoordinationEnvelope::default()
+        };
         let result = classify_replan(
             &plan("src/module.rs", "implementer", None),
             &envelope,
@@ -264,8 +266,10 @@ mod tests {
 
     #[test]
     fn coordinator_replan_classifier_marks_scope_and_authority_deltas() {
-        let mut envelope = CoordinationEnvelope::default();
-        envelope.max_work_units = 2;
+        let mut envelope = CoordinationEnvelope {
+            max_work_units: 2,
+            ..CoordinationEnvelope::default()
+        };
         assert_eq!(
             classify_replan(
                 &plan("outside/file.rs", "implementer", None),

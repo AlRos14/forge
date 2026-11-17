@@ -53,6 +53,27 @@ struct ReviewFindingsTurn {
     outputs: Vec<Value>,
 }
 
+pub(crate) struct MicroFixSourceReceiptInput<'a> {
+    pub(crate) task_id: &'a str,
+    pub(crate) request_id: &'a str,
+    pub(crate) authorization_version: i64,
+    pub(crate) source_kind: MicroFixSourceKind,
+    pub(crate) correction_work_unit_id: &'a str,
+    pub(crate) reviewed_commit_sha: &'a str,
+    pub(crate) micro_fix: &'a MicroFixOutput,
+}
+
+struct MicroFixReviewWorkUnitInput<'a> {
+    receipt: &'a MicroFixReceipt,
+    result_execution_id: &'a str,
+    result_work_unit_version: i64,
+    result_commit_sha: &'a str,
+    result_workspace_id: &'a str,
+    snapshot_digest: &'a str,
+    coordination: &'a TaskCoordination,
+    envelope: &'a CoordinationEnvelope,
+}
+
 impl TaskReworkService {
     pub(super) async fn micro_fix_request(
         &self,
@@ -331,14 +352,17 @@ impl TaskReworkService {
 
     pub(crate) async fn ensure_micro_fix_source_receipt(
         &self,
-        task_id: &str,
-        request_id: &str,
-        authorization_version: i64,
-        source_kind: MicroFixSourceKind,
-        correction_work_unit_id: &str,
-        reviewed_commit_sha: &str,
-        micro_fix: &MicroFixOutput,
+        input: MicroFixSourceReceiptInput<'_>,
     ) -> Result<()> {
+        let MicroFixSourceReceiptInput {
+            task_id,
+            request_id,
+            authorization_version,
+            source_kind,
+            correction_work_unit_id,
+            reviewed_commit_sha,
+            micro_fix,
+        } = input;
         micro_fix
             .validate()
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
@@ -437,15 +461,15 @@ impl TaskReworkService {
             .await?
             .filter(|run| run.task_id == task_id)
             .ok_or_else(|| ServiceError::not_found("validation_run", run_id.to_owned()))?;
-        self.ensure_micro_fix_source_receipt(
+        self.ensure_micro_fix_source_receipt(MicroFixSourceReceiptInput {
             task_id,
             request_id,
             authorization_version,
-            MicroFixSourceKind::ValidationFindings,
-            &correction_work_unit_id,
-            &run.commit_sha,
+            source_kind: MicroFixSourceKind::ValidationFindings,
+            correction_work_unit_id: &correction_work_unit_id,
+            reviewed_commit_sha: &run.commit_sha,
             micro_fix,
-        )
+        })
         .await
     }
 
@@ -779,21 +803,21 @@ impl TaskReworkService {
             }
             review_work_unit_id
         } else {
-            self.ensure_micro_fix_review_work_unit(
+            self.ensure_micro_fix_review_work_unit(MicroFixReviewWorkUnitInput {
                 receipt,
-                &execution.id,
-                execution
+                result_execution_id: &execution.id,
+                result_work_unit_version: execution
                     .work_unit_version
                     .expect("completed WorkUnit Execution is versioned"),
-                receipt
+                result_commit_sha: receipt
                     .result_commit_sha
                     .as_deref()
                     .expect("bounds receipt has result commit"),
-                &workspace.id,
-                &snapshot_digest,
-                &coordination,
-                &envelope,
-            )
+                result_workspace_id: &workspace.id,
+                snapshot_digest: &snapshot_digest,
+                coordination: &coordination,
+                envelope: &envelope,
+            })
             .await?
         };
 
@@ -894,15 +918,18 @@ impl TaskReworkService {
 
     async fn ensure_micro_fix_review_work_unit(
         &self,
-        receipt: &MicroFixReceipt,
-        result_execution_id: &str,
-        result_work_unit_version: i64,
-        result_commit_sha: &str,
-        result_workspace_id: &str,
-        snapshot_digest: &str,
-        coordination: &TaskCoordination,
-        envelope: &CoordinationEnvelope,
+        input: MicroFixReviewWorkUnitInput<'_>,
     ) -> Result<String> {
+        let MicroFixReviewWorkUnitInput {
+            receipt,
+            result_execution_id,
+            result_work_unit_version,
+            result_commit_sha,
+            result_workspace_id,
+            snapshot_digest,
+            coordination,
+            envelope,
+        } = input;
         let id = format!("micro-fix-review:{}", receipt.id);
         if let Some(existing) = WorkUnitRepo::get_by_id(&*self.db, &id).await? {
             if existing.task_id != receipt.task_id
@@ -1308,13 +1335,6 @@ fn classify_bounds_violation(
     max_files: u32,
     max_changed_lines: u32,
 ) -> Option<MicroFixBoundsViolation> {
-    if entries.iter().any(|entry| {
-        !declared_paths
-            .iter()
-            .any(|declared| path_is_within(&entry.path, declared))
-    }) {
-        return Some(MicroFixBoundsViolation::PathsOutsideDeclared);
-    }
     if entries
         .iter()
         .any(|entry| is_dependency_manifest(&entry.path))
@@ -1330,6 +1350,13 @@ fn classify_bounds_violation(
     }) {
         return Some(MicroFixBoundsViolation::ForbiddenGlob);
     }
+    if entries.iter().any(|entry| {
+        !declared_paths
+            .iter()
+            .any(|declared| path_is_within(&entry.path, declared))
+    }) {
+        return Some(MicroFixBoundsViolation::PathsOutsideDeclared);
+    }
     if changed_files > i64::from(max_files) || changed_files > i64::from(db::MAX_MICRO_FIX_FILES) {
         return Some(MicroFixBoundsViolation::TooManyFiles);
     }
@@ -1342,7 +1369,7 @@ fn classify_bounds_violation(
 }
 
 fn is_always_forbidden_control_path(path: &str) -> bool {
-    path == "CLAUDE.md" || path.starts_with(".github/")
+    matches!(path, "CLAUDE.md" | "AGENTS.md") || path.starts_with(".github/")
 }
 
 fn path_is_within(path: &str, declared: &str) -> bool {

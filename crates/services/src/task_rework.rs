@@ -15,6 +15,7 @@ mod external_feedback_triage;
 mod micro_fix;
 mod triage;
 mod validation_triage;
+pub(crate) use micro_fix::MicroFixSourceReceiptInput;
 pub(crate) use triage::ReviewFindingsDecision;
 pub(crate) use validation_triage::ValidationFindingsDecision;
 
