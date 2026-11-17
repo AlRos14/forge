@@ -35,14 +35,15 @@ jobs:
             os: ubuntu-latest
             artifact: forge-aarch64-linux-musl
             builder: cross
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            artifact: forge-x86_64-macos
-            builder: cargo
+          # One macOS runner builds both Apple targets: x86_64 is a cross
+          # target on the arm64 runner, and a second macOS job was repeatedly
+          # left without a hosted runner.
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: forge-aarch64-macos
             builder: cargo
+            extra_target: x86_64-apple-darwin
+            extra_artifact: forge-x86_64-macos
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -50,7 +51,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.extra_target && format('{0},{1}', matrix.target, matrix.extra_target) || matrix.target }}
 
       - name: Enable Corepack
         run: corepack enable
@@ -119,6 +120,31 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.tar.gz
+
+      - name: Build extra target binaries
+        if: matrix.extra_target
+        env:
+          FORGE_SKIP_WEB_BUILD: "1"
+        run: |
+          cargo build -p forge-cli --release --target ${{ matrix.extra_target }}
+          cargo build -p forge-client --release --target ${{ matrix.extra_target }}
+
+      - name: Package extra target binaries
+        if: matrix.extra_target
+        run: |
+          rm -rf dist-extra
+          mkdir -p dist-extra/web
+          cp target/${{ matrix.extra_target }}/release/forge dist-extra/
+          cp target/${{ matrix.extra_target }}/release/forge-ctl dist-extra/
+          cp -R web/dist dist-extra/web/dist
+          tar -czf ${{ matrix.extra_artifact }}.tar.gz -C dist-extra forge forge-ctl web
+
+      - name: Upload extra target artifact
+        if: matrix.extra_target
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.extra_artifact }}
+          path: ${{ matrix.extra_artifact }}.tar.gz
 
   release:
     name: Create Release
