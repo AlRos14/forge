@@ -13,12 +13,12 @@ use std::{
 };
 
 use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
     aead::{Aead, AeadCore, KeyInit, OsRng},
+    XChaCha20Poly1305, XNonce,
 };
 use db::{CredentialHandle, CredentialHandleRepo, SqliteDb};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::sync::Mutex;
@@ -1472,8 +1472,8 @@ fn restricted_provider_ip(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
     use db::{
-        AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile, SelectAgentProfile,
-        create_sqlite_pool, run_migrations,
+        create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgentIdentity,
+        CreateAgentProfile, SelectAgentProfile,
     };
     use serde_json::json;
 
@@ -1635,11 +1635,9 @@ mod tests {
             adapter_snapshot["runtime_env"]["OPENAI_API_KEY"],
             json!(secret)
         );
-        assert!(
-            !adapter_snapshot
-                .to_string()
-                .contains("replacement-profile-secret")
-        );
+        assert!(!adapter_snapshot
+            .to_string()
+            .contains("replacement-profile-secret"));
 
         let profile_c_id = "credential-harness-profile-c".to_owned();
         db::AgentProfileRepo::create_profile(
