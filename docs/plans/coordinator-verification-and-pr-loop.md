@@ -2776,3 +2776,34 @@ fase 3, pruebas Vitest de ambos paneles y proyección SSE, y su registro en el
 workflow API. Esas pruebas quedan **NOT RUN** por el límite de validación de
 esta sesión; no se ejecutaron Cargo tests/build/clippy ni pnpm. No se añadió ni
 editó ninguna migración.
+
+## Anexo CI fase 3 — cierre
+
+Fase 3 queda validada en CI completo (`build-local-linux.yml`,
+`run_checks=true`) con resultado **PASS** en `71f23006`
+(run `44104391111`). Las pruebas marcadas NOT RUN en el anexo anterior
+(`coordinator_phase3`, `v180_`, `fallback_`, `micro_fix_`,
+`coordinator_replan_`, lecturas MCP fase 3, Vitest de paneles y SSE) se
+ejecutaron en ese run, junto con clippy `-D warnings`, fmt y el build web.
+
+Correcciones necesarias hasta el PASS (commits `62502267`, `e4296940`,
+`71f23006`):
+
+- lifetime del cursor de paginación de receipts y mock de los hooks fase 3 en
+  `TaskDetailPage.test.tsx`;
+- clippy: structs de parámetros para replan/micro-fix, `needless_question_mark`
+  en fallback y asignaciones fuera de inicializador en tests;
+- micro-fix: `CLAUDE.md`, `AGENTS.md` y `.github/` se rechazan como
+  `forbidden_glob` antes de comprobar las rutas declaradas;
+- clasificador de replan: los tokens de ruta se filtran por `/` antes de
+  recortar (`src/` sigue siendo un scope válido); los tests parten de un
+  envelope restrictivo porque el envelope por defecto ya concede escritura en
+  repositorio y revisión de hallazgos;
+- prompt de `review_findings`: exige exactamente una decisión y ningún campo
+  `actions`, con instrucciones de micro-fix solo cuando el envelope lo concede;
+- `micro_fix_request`: un summary que no es un turno ReviewFindings no concede
+  micro-fix y cae a la corrección ordinaria en vez de abortar el rework
+  automático (fail-closed hacia el camino ya autorizado).
+
+La aceptación con un proveedor GitHub real sigue **NOT RUN** y requiere
+autorización separada.
