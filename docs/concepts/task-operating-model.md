@@ -9,6 +9,12 @@ Baseline de análisis: `fd599647`. El contrato de runtime actual sigue en
 [Architecture](../architecture.md). La transición se detalla en el
 [plan de implementación](../plans/task-coordination-and-guided-experience.md).
 
+> Estado 0.9.0 (2026-11-17): el carril de verificación del coordinador, las
+> decisiones humanas, el ciclo de feedback de PR y los carriles de fluidez
+> (fallback entre Agents, micro-fix acotado y replan del coordinador) están
+> implementados. Ver [Entrega orquestada](delivery-fluency.md) y
+> [Ciclo de feedback de PR](pr-feedback-loop.md).
+
 ## Objetivo
 
 El usuario expresa un resultado, sus restricciones y el grado de autonomía que

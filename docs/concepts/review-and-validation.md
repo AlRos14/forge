@@ -1,9 +1,6 @@
 # Review and validation
 
-> Diseño objetivo aprobado, todavía pendiente de implementación:
-> [modelo operativo de tareas y UX](task-operating-model.md). Define la
-> separación Copilot/Orquestador, preparación desde objetivo y rutas de calidad.
-> El resto de este documento describe el contrato actual salvo indicación expresa.
+This page describes the current separation between formal review, deterministic validation, and Gate evaluation. The [task operating model](task-operating-model.md) and [delivery fluency](delivery-fluency.md) pages summarize how these records fit into Task delivery.
 
 
 Validation and review are separate kinds of work and separate sources of
@@ -68,6 +65,8 @@ identity `catalog:{check_key}@{definition_digest[0..16]}`. If the Workspace
 changes after the request was queued, the request fails with
 `validation.subject_changed` instead of validating a different subject. A
 restart recovers requests left `running`.
+
+A coordinator may request only a check key and definition digest pinned by the current Task authorization; it cannot supply a command, path, or timeout. Failed, error, or stale runs, and regression or inconclusive baseline comparisons, can create a source-bound validation_findings request. The coordinator can request a correction, recheck the same pinned subject, or raise a Human decision. These paths use the same durable budget and replay rules as other coordination requests. Structured Human decisions bind the exact source and evidence, require the expected version to answer, and resume only the matching authorized request.
 
 With `baseline=true` the runner also runs the same command in a runner-owned,
 disposable, detached git worktree at the exact base commit (no Workspace row,
@@ -172,3 +171,8 @@ Quality requests are durable routing records, not ReviewReports. A
 responsible implementation route; it does not fabricate a reviewer verdict or
 a ValidationRun. Review independence remains enforced by the existing review
 line, Human contributor checks, and Agent role-session isolation.
+
+
+## Related delivery concepts
+
+See the [coordinator orchestration contract](orchestration.md), [Gate policy](gates.md), and [PR feedback loop](pr-feedback-loop.md).

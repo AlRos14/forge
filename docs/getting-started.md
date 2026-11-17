@@ -141,6 +141,18 @@ absolute path from the execution host. Forge prepares the exact WorkUnit
 Workspace and lease for a repository WorkUnit that requires integration. Do
 not copy a Workspace path from another Task or daemon.
 
+### Optional: connect a GitHub SCM credential and PR feedback policy
+
+For a repository with a GitHub pull request workflow, connect the SCM credential and configure the repository policy before admitting a remote PR.
+
+1. Connect a GitHub credential with `POST /api/v1/providers`. The request body contains `provider: "github"`, `label`, and `credential`; the secret is accepted only for connection and is never returned. Authenticate this and other REST requests with `Authorization: Bearer <access-token>`. Never put the GitHub credential in a URL or saved example.
+2. Read `GET /api/v1/providers?purpose=scm` and select the owned credential handle. The Repositories settings form can connect and select this handle.
+3. Set the Repo PR provider to GitHub and reference the handle with `pr_provider_config.credential_id` when creating the Repo or through `PATCH /api/v1/repos/{id}`. Forge checks Project owner/admin authority and credential ownership.
+4. Read `GET /api/v1/repos/{id}/pr-feedback-policy` for `policy` and `updated_at`. Update with `PUT /api/v1/repos/{id}/pr-feedback-policy`, sending the current `expected_updated_at` and the replacement policy.
+5. Ingestion defaults off. The default trusted associations are `OWNER`, `MEMBER`, and `COLLABORATOR`; `max_items_per_poll` defaults to 50. Push corrections default to `human_approval` and summary comments default to `off`. An owner/admin can explicitly choose automatic push or summary actions. Each setting is frozen into a new PR admission, so changing policy does not widen an existing admission.
+
+Task readers can inspect feedback, same-PR rework, and external action records. Authorized Project owners/admins can approve or reject proposed actions using the exact action version. Forge does not expose a merge action; merge remains a Human operation. See the [PR feedback loop](concepts/pr-feedback-loop.md) for policy and lifecycle details.
+
 ## 5. Guided Task flow in the web UI
 
 For ordinary work, start with the Project team and the outcome instead of
@@ -154,7 +166,7 @@ creating WorkUnits by hand:
    an active Task.
 3. In the Task overview, check the copied team and the server's coordination
    state. When Forge reports that authorization is available, select an active
-   Codex CLI Agent in a role with orchestration capability, then choose
+   supported harness-bound Agent in a role with orchestration capability, then choose
    **Prepare a proposal** or **Prepare and execute**. Forge revalidates the
    exact Actor and host before admitting a coordination turn.
 4. A proposal shows its exact work plan, roles, assignments, dependencies, and
@@ -170,11 +182,11 @@ creating WorkUnits by hand:
    intervention inbox. Project Copilot instructions appear there too; Copilot
    cannot authorize or decide for a Human.
 
-If the Task has no eligible coordinator, the overview names the missing team
-requirement and links to **Advanced work**. That path also keeps manual role,
-membership, and WorkUnit editing available. The initial coordination runtime
-supports the Codex CLI path only; other harnesses are not offered as working
-coordinators by this walkthrough.
+If the Task has no eligible coordinator, the overview names the missing team requirement and links to Advanced work. The UI offers only coordinator candidates whose current harness adapter and host satisfy the capability checks; unsupported combinations fail before the turn is admitted.
+
+### Coordinator verification and Human decisions
+
+A coordinator can request deterministic validation only for a check key and definition digest already pinned in the Task authorization envelope. Forge runs the immutable catalog command against the exact accepted result or integration subject; the coordinator cannot supply a command or report a passing result. A schema-version-2 Gate can require a passing run for exact pinned checks. When a check or comparison needs review, Forge creates a source-bound coordinator request. A Human decision is answered through the Task interface or the versioned Human decision REST route.
 
 ## 6. REST fallback: create a TaskRole and RoleMembership
 

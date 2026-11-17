@@ -49,28 +49,14 @@ dispatch or execute its action.
 
 ## Decision
 
-A Decision resolves a Proposal. It records one or more Human and/or Agent
-deciders, policy evidence, outcome, rationale, timestamp, and the Proposal
-version resolved. PR4 outcomes are `approve`, `reject`, and `supersede`; a
-counterproposal is a `supersede` Decision followed by a new Proposal. A
-Decision records a choice and never executes the Proposal or grants permission.
-`Proposal.status = resolved` means an `approve` or `reject` Decision exists; it
-does not mean the proposed action ran. PR4 records the deciders and policy
-reference/snapshot evidence but does not evaluate whether those deciders satisfy
-the TaskRole coordination policy. A future deterministic consumer must check
-that policy before executing an action.
+A Decision resolves a Proposal. It records the deciders, outcome, rationale, timestamp, and exact Proposal version. A generic Decision records a choice; it does not itself execute the Proposal or grant blanket permission. A policy-aware domain service may consume an exact Decision only when that service separately verifies the operation's authority and current policy. The PR external-action service is one such explicit consumer for actions tied to a frozen repository policy.
 
 The system does not infer approval from silence, chat tone, model confidence,
 or an unrelated Task transition.
 
 ## Coordination and events
 
-TaskRole coordination modes and policy describe the coordination contract.
-PR4 does not enforce member, leader, majority, unanimity, or Human requirements
-when recording a Decision. A deterministic consumer must evaluate the relevant
-policy before any action executes. Proposal and Decision never grant authority
-by themselves; there is no global two-person consensus rule or expression-
-language DSL in PR4.
+TaskRole coordination modes and policy describe the coordination contract. The generic collaboration surface does not enforce member, leader, majority, unanimity, or Human requirements when recording a Decision. A domain service must evaluate the relevant policy before any protected effect. PR external actions use their dedicated service, versioned action record, frozen repository policy, and Human decision routes; generic Proposal and Decision records do not create a second path to those effects. There is no global two-person consensus rule or expression-language DSL in PR4.
 
 Creation and lifecycle changes append records to the shared durable
 `domain_event` ledger in the same transaction as the mutation. EventBus is

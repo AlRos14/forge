@@ -36,6 +36,8 @@ WorkUnit requirements pin the exact WorkUnit version, dependency state,
 Execution result, and, when required, exact WorkUnitIntegration. WorkUnit
 completion is not integration.
 
+Gate policy schema version 2 may include required_checks. Each entry pins an exact check_key and definition_digest with required_outcome=passed. Evaluation resolves the run against the exact candidate Workspace, commit, and snapshot. Missing, stale, failed, ambiguous, or differently pinned runs do not satisfy the requirement; Gate never substitutes a latest run. Schema version 1 keeps its existing behavior and does not accept required_checks.
+
 ## Review policy
 
 The bounded reviewer policy supports one acceptable reviewer, all required

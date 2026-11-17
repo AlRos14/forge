@@ -212,6 +212,11 @@ and admission as well. Exhaustion or
 an unavailable independent reviewer leaves an explicit human decision instead
 of an automatic approval.
 
+## Preauthorized fallback and micro-fix
+
+A fallback changes only the Actor assignment for the same WorkUnit and TaskRole. It is available only from the Task's explicit coordination envelope after an eligible executor_unavailable route is exhausted and retry timing is absent or outside the configured wait bound. A future retry within the bound stays with the same Agent; an uncertain Provider Start is not a fallback trigger. The dispatcher rechecks membership, account ownership, role version, envelope, pause state, and ordinary Provider Start authority before admitting the replacement.
+
+A micro-fix is an exact finding-bound correction WorkUnit. Its paths must come from the cited findings, and Forge measures the result diff against the reviewed commit. The current limits are three changed files, sixty changed lines, and at most three micro-fixes per Task. Dependency changes and protected control files are out of bounds. A bounds violation does not accept the result: it returns through ordinary correction/review triage. Every micro-fix requires an independent formal review and a fresh Gate evaluation.
 ## Isolation
 
 The Task has an integration workspace; each repository-mutating WorkUnit has

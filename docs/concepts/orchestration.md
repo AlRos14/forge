@@ -1,9 +1,6 @@
 # Orchestration
 
-> Diseño objetivo aprobado, todavía pendiente de implementación:
-> [modelo operativo de tareas y UX](task-operating-model.md). Define la
-> separación Copilot/Orquestador, preparación desde objetivo y rutas de calidad.
-> El resto de este documento describe el contrato actual salvo indicación expresa.
+This page describes the current event-driven Orchestrator and typed Task coordination lanes. The [task operating model](task-operating-model.md) and [delivery fluency](delivery-fluency.md) summarize the full delivery path.
 
 
 An orchestrator is an Actor admitted under a TaskRole with the `orchestration`
@@ -50,20 +47,7 @@ consumers idempotent.
 An Agent wake creates a fresh Execution under the exact orchestration-capable
 TaskRole and uses a read-only Harness Start. PR6 does not infer or resume a previous session. A
 Human wake stays durable as pending Human work and creates no HarnessSession.
-The current typed output set is Message, Handoff, bounded WorkUnit creation,
-Proposal, and exact-report review findings triage (described below). A `create_work_unit` action targeting a TaskRole with
-`formal_review` supplies
-`review_subject: { "reviewed_work_unit_id": "..." }`. The service verifies the
-same-Task source and freezes its accepted result; the orchestrator does not
-choose a result version or grant review authority by describing it in text.
-WorkUnit creation goes through `WorkUnitService`, carries stable
-action identity and wake provenance, and does not allocate a workspace or
-start work. WorkUnit-scoped actions stay inside that exact WorkUnit. Steering,
-stopping, reassigning, merging, and other protected mutations are not
-automatically executed by this PR6 action adapter. Proposal and Decision
-records remain intent and resolution records with no implicit side effect.
-Direct Harness steering has no typed PR6 operation; Message and Handoff record
-communication intent without claiming native, emulated, or queued steering.
+Generic event-driven outputs remain bounded to Messages, Handoffs, limited WorkUnit creation, Proposals, and exact-report review triage. Typed Task coordination turns separately support work_unit_plan, review_findings, validation_findings, external_feedback, ask_human, request_validation, phase-3 micro_fix, and propose_replan outputs under their exact authorization and source checks. Cross-Agent fallback is applied by the dispatcher, not emitted as a coordinator action.
 
 Execution lifecycle events from an Execution admitted with `orchestration` are
 classified separately and never generically wake another orchestrator. Creating a
@@ -361,5 +345,13 @@ commit, the effects run idempotently and are retried by durable scanners:
   unstarted rework WorkUnits, abandons the pause and blocks the Task with
   `pr_merged_externally`.
 
-The PR summary comment (`post_comment`) is a hook owned by the external action
-service and is not posted by the runtime yet.
+The external action service supports post_comment for a deterministic feedback summary Artifact. It creates a durable action under the admission's frozen policy; the action is Human-approved by default, automatic only when the repository policy explicitly permits it, and off when post_summary=off. The service checks the anti-loop marker before posting and reconciles uncertain outcomes.
+
+
+## Preauthorized fallback, micro-fix, and replan
+
+Coordination envelope v2 may preauthorize up to three fallback Agents per TaskRole, a bounded micro-fix route and formal reviewer, and coordinator replanning. The dispatcher considers fallback only after an eligible executor_unavailable route is exhausted. A future retry within the configured wait bound retries the same Agent; an uncertain Provider Start never triggers fallback. Substitution keeps the same WorkUnit, TaskRole, scope, and Workspace, and writes an immutable receipt.
+
+A micro-fix must cite findings and paths from its exact source report. The diff is measured from the reviewed commit and is limited to three files, sixty changed lines, and at most three micro-fixes per Task; undeclared paths, dependency changes, and protected control files fail the bounds check. Every result goes through an independent formal review and a fresh Gate.
+
+A coordinator replan is classified in Rust against the objective, current team, existing and proposed WorkUnits, budget, repository/path scope, and envelope grants. At most two replans are recorded per Task. If classification detects a scope or authority change, an exact Human decision is required before that plan can be materialized. See [delivery fluency](delivery-fluency.md) and the [coordinator verification and PR loop plan](../plans/coordinator-verification-and-pr-loop.md).

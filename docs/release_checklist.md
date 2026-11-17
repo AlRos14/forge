@@ -2,7 +2,7 @@
 
 This checklist describes the release workflow in this repository. Verify live repository settings and release artifacts again before each tagged release.
 
-At the PR14 audit on 2026-10-16, `AlRos14/forge` had no published GitHub Releases. The workspace source version is `0.8.0` and is not evidence that an installable artifact was published. GitHub private vulnerability reporting was disabled. Before publishing a release, the owner should enable it or add a private contact method to `.github/SECURITY.md`. Until this repository has a verified release channel, source builds are the supported installation path.
+As of 2026-11-17, the workspace source version is `0.9.0` and this repository has no verified published GitHub Release. The version is not evidence that an installable artifact was published. Until this repository has a verified release channel, source builds are the supported installation path.
 
 ## Checks before tagging
 

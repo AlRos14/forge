@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the current implementation after PR15. The ordered migration contract and invariants are in [Architecture V2](migration/architecture-v2.md); domain details are in [concepts](concepts/).
+This document describes the 0.9.0 source implementation, including the current schema through V180. The ordered migration contract and invariants are in [Architecture V2](migration/architecture-v2.md); domain details are in [concepts](concepts/).
 
 > The Orchestrator owns work boundaries. The harness owns cognition.
 
@@ -50,7 +50,7 @@ describe the intended outcome; they do not select repository capability.
 
 TaskRole and RoleMembership govern eligibility. WorkUnit allocation names the executable Actor and Role. A current active RoleMembership is required for an assigned Agent to run. Membership alone does not grant access to another WorkUnit's Workspace, lease, terminal, or repository scope.
 
-Forge's Orchestrator reacts to durable domain events. Its implemented output set is bounded to Messages, Handoffs, limited WorkUnit creation, and Proposals. It does not directly steer or stop a harness, reassign work, merge repositories, or execute a Proposal or Decision. Human and Agent actions remain subject to the same domain authority.
+Forge's event-driven Orchestrator reacts to durable domain events through bounded outputs. Dedicated Task coordination turns have separate typed contracts for plans, review and validation findings, Human decisions, and external PR feedback. The coordinator does not grant its own authority, change a review verdict, or merge a repository. The dispatcher may apply only a preauthorized fallback Agent after the exact route and retry checks; this is a separate domain operation, not an Orchestrator side effect.
 
 Task coordination adds a bounded preparation turn over the same durable wake and
 Execution machinery. A Human authorizes a mode, exact coordinator TaskRole and
@@ -84,6 +84,9 @@ review verdict to pass. Specialist requests create linked WorkUnits; plan
 revisions open a coordination turn. Quality-linked WorkUnits complete
 technically when their Execution finishes, but a delivery correction is never
 resolved by that completion alone.
+Coordinator verification uses exact pins in the current authorization envelope. The ValidationCheckRunner executes catalog checks against an accepted WorkUnit result or Task integration subject; optional baseline runs produce deterministic comparisons. Failed or inconclusive checks can wake a source-bound coordinator request. A structured Human decision records exact evidence, option, version, and resume binding. Forge never runs a command supplied by the coordinator.
+
+The GitHub PR feedback loop uses a Project owner/admin-configured policy and an owned SCM credential handle. Policy and credential references are frozen for each remote PR admission. External feedback is stored as untrusted provider data; only trusted, current-head items enter coordinator triage, while public SSE events omit provider-authored bodies. Same-PR rework returns through normal WorkUnit, review, Gate, and integration checks. Push or summary actions default to Human approval; automatic execution requires an owner/admin repository policy. Forge does not provide a merge action.
 
 Coordination envelope v2 also accepts explicit phase-3 preauthorizations for
 bounded micro-fixes, formal reviewers, per-TaskRole fallback Agents, and
@@ -141,11 +144,7 @@ revocation, and team staleness are revalidated again inside the same
 result, so a revocation or mode change winning the race leaves zero automatic
 effect. Completion is not approval.
 
-The delivered coordination slice covers PR1–PR2, the PR4 quality-routing
-circuit with per-route budgets and pending-role cycle escalation, technical
-completion of plan deliveries, and automatic review Gate linkage. Remaining
-product scope is PR6 joint UI and provider/host acceptance. The program must not
-be presented as PR1–PR6 complete.
+The current product includes Task coordination, quality routing, coordinator verification, PR feedback and same-PR rework, and the phase-3 fallback, micro-fix, and replan paths. Phase-specific implementation and verification evidence is recorded in the [coordinator verification and PR loop plan](plans/coordinator-verification-and-pr-loop.md) and [delivery fluency plan](plans/autonomous-delivery-fluency.md). The phase-3 plan records its new tests and builds as NOT RUN; implementation presence does not establish full-branch CI or real-provider acceptance.
 
 Automatic Orchestrator execution requires the Agent owner and Task Project owner to be the same account, with a current Project owner/admin/member membership. Global Agent visibility supports discovery and TaskRole membership; it does not grant cross-account execution. Forge has no cross-account Agent execution grants, so a missing or mismatched owner or membership fails closed at Execution admission and the transactional Provider Start claim.
 
@@ -208,13 +207,13 @@ a generic wake racing with batch authorization fails closed.
 
 Formal review is an Execution admitted under a TaskRole snapshot with `formal_review`. Its ReviewReport is an Artifact with exact Execution provenance. Review judgment remains distinct from deterministic checks. A durable review line follows the source result and each correction; a typed approval requirement is satisfied only by a favorable report for the line's latest result.
 
-A ValidationRun represents a deterministic command or check and its exact workspace, commit, status, output, and Evidence. In this implementation snapshot the public REST, MCP, CLI, and web surfaces expose ValidationRuns for reading; they do not expose a command to start one. Agent validation-related cognition is ordinary WorkUnit work, not deterministic validation evidence.
+A ValidationRun represents a deterministic command or check and its exact workspace, commit, status, output, and Evidence. Project owners/admins publish immutable validation-check catalog versions; an authorized coordinator can request only an exact check pinned in the Task envelope, and Forge can run configured checks after integration. Optional baseline comparisons distinguish regressions from existing failures. Agent validation-related cognition remains ordinary WorkUnit work, not deterministic validation evidence.
 
-A Gate is a deterministic policy over exact durable records. Its immutable GateEvaluation records the exact policy revision, inputs, and outcome. A Gate does not run a test, perform a review, integrate a WorkUnit, or merge a Repo. Lifecycle transitions and merge admission use the exact current evaluation where required.
+A Gate is a deterministic policy over exact durable records. Its immutable GateEvaluation records the exact policy revision, inputs, and outcome. Policy schema 2 can require passing ValidationRuns for pinned check keys and definition digests; each check resolves against the exact candidate subject. A Gate does not run a test, perform a review, integrate a WorkUnit, or merge a Repo. Lifecycle transitions and merge admission use the exact current evaluation where required. See [review and validation](concepts/review-and-validation.md) and [Gates](concepts/gates.md).
 
 ## Persistence and history
 
-SQLite is the current persistence layer. Numbered migrations V001–V180 and their receipts remain in migration order; do not edit historical migration files (V176 is unused because V177–V179 already exist). PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add the Task coordination authorization, turn, plan, materialization, quality-request, intervention, team-staleness, and quality-resolution records described by the PR0 contract. V161 adds persisted quality-route counters, exact cycle evidence, and inspectable Human-escalation reasons; it preserves historical request states. V167 adds optional Project plan versions and proposals, source and Task identity provenance, batch authorization, delivery readiness, and fail-closed guards for incomplete imports and provider starts. V180 adds immutable fallback and micro-fix receipts; the coordinator-replan ledger was added in V172.
+SQLite is the current persistence layer. Numbered migrations V001–V180 and their receipts remain in migration order; do not edit historical migration files (V176 is unused because V177–V179 already exist). PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add Task coordination, plans, materialization, quality requests, interventions, and resolution records; V161 adds durable quality-route counters and Human-escalation evidence. V167 adds optional Project plans and batch authorization. V171–V172 add the validation catalog, request kinds, and coordinator-replan ledger; V173–V175 add SCM credential references, PR feedback, Human decisions, and same-PR rework records. V180 adds immutable fallback and micro-fix receipts.
 
 Historical `agent_session_history`, immutable Execution records, ProjectRelease snapshots, Artifact and Evidence references, HarnessSession identities, cross-record IDs, migration decisions, ADRs, and upstream license attribution remain readable history. History does not regain runtime authority. ProjectRelease is a read-only historical snapshot and does not create a current Charter, milestone, readiness workflow, or release operation.
 
@@ -295,33 +294,12 @@ ownership for historical records during a container migration.
 
 Forge originated from [ForgeAILab/forge](upstream.md). The origin and MIT attribution remain. This repository is independently maintained and does not promise architectural or release compatibility with upstream. See [upstream relationship](upstream.md).
 
-## Task operating model — backend implemented, UI acceptance pending
+## Task operating model and delivery
 
-The owner-approved [task operating model](concepts/task-operating-model.md)
-separates Project Copilot assistance from end-to-end Task coordination and makes
-objective, team, and authorization the primary user journey. Worker WorkUnits,
-leases, exact evidence, and TaskLifecycle authority remain mandatory. This is a
-target contract, not a claim that the current runtime supports the whole journey.
-The [PR0 contract](plans/pr0-task-coordination-contract.md) and
-[ADR 0016](adr/0016-task-coordination-turn.md) fix the coordination start,
-authority matrix, durable records, recovery rules, and UX states. The backend
-vertical slice (V158–V161, services, REST/MCP/CLI/SSE, generated types) is
-implemented. The guided UI is integrated; joint acceptance remains in progress. See the
-[system review and implementation sequence](plans/task-coordination-and-guided-experience.md).
+The [task operating model](concepts/task-operating-model.md) describes the current relationship between Project setup, explicit Task authorization, coordinator turns, assigned WorkUnits, review, validation, Human decisions, and delivery. Project Copilot remains a separate Project-scoped assistant and does not gain worker Execution or Task coordination authority. The [delivery fluency concept](concepts/delivery-fluency.md) summarizes the autonomous delivery path and its boundaries.
 
-### Guided delivery extensions (V162–V166)
+### Guided delivery and verification
 
-Review independence is Task/role HarnessSession isolation for Agents; Human
-self-review remains forbidden. Same saved Agent profiles can fill several roles.
-The current coordinator may triage exact immutable findings through bounded typed
-outputs, without becoming the approval authority. New guided authorizations use
-this mediation; historical envelopes retain their stored behavior. Autonomy
-limits, human extensions and triage receipts are durable and versioned. See
-[orchestration](concepts/orchestration.md), [sessions](concepts/sessions.md) and
-[the Task operating model](concepts/task-operating-model.md).
+Agent review independence is enforced through Task/role HarnessSession isolation; Human contributors cannot review their own result. Coordinators triage exact immutable findings through bounded typed outputs without becoming the approval authority. Validation checks, Human decisions, PR feedback, fallback, micro-fixes, and replans retain their own durable receipts and budgets. See [orchestration](concepts/orchestration.md), [review and validation](concepts/review-and-validation.md), [PR feedback](concepts/pr-feedback-loop.md), and [WorkUnits](concepts/work-units.md).
 
-These extensions touch INV-003/006/010 (harness-bound Agent identity and explicit
-role-isolated sessions), INV-019/020/029/031 (Agent-owned coordination and review
-feedback without coordinator verdict authority), and INV-030/033 (deterministic
-authority and immutable audit history). INV-017 workspace isolation and separate
-integration authority remain enforced. See the [invariants contract](migration/architecture-v2.md).
+Phase 1 and phase 2 full CI results and the phase 3 NOT RUN boundary are recorded in the linked implementation plans. Acceptance with a real GitHub provider is not inferred from implementation or fixture evidence. The authority invariants remain in [Architecture V2](migration/architecture-v2.md).

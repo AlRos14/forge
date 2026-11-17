@@ -19,11 +19,7 @@ own workspace. Gate evaluation verifies the report against the durable
 review-subject relation and source attempt. A WorkUnit-scoped review Gate
 targets the reviewed WorkUnit, rather than its separate reviewer WorkUnit.
 
-Forge exposes the versioned REST API at `/api/v1`. This reference describes
-the post-PR13 public contract for Project, Task,
-Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit,
-Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and
-TaskLifecycle records.
+Forge exposes the versioned REST API at `/api/v1`. This reference describes the 0.9.0 public contract through migration V180 for Project, Task, Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and TaskLifecycle records.
 
 > The orchestrator owns work. The harness owns cognition.
 
@@ -508,78 +504,56 @@ table does not authorize a decision or satisfy a Gate.
 
 ### Validation catalog, check requests, and human decisions
 
-`ValidationRunResponse` also carries `run_origin`
-(`legacy_command|coordinator_request|after_integration|baseline`),
-`definition_digest`, `catalog_check_id`, and `check_request_id`. Coordination
-request responses carry `source_subject_kind/id/digest` and `resumes_request_id`.
-All lists below return `{items, next_cursor}` with opaque cursors (`cursor`,
-`limit` 1-100, newest first).
+Validation definitions are immutable Project catalog versions. A check request may come from an authorized coordinator turn or the after-integration hook; REST does not expose an arbitrary command enqueue. Catalog commands are run by the core `ValidationCheckRunner` against the exact accepted WorkUnit result or Task integration subject. Optional baselines create immutable comparisons. All lists return `{items, next_cursor}` with opaque keyset cursors and `limit` from 1 to 100.
 
 | Method and path | Contract |
 | --- | --- |
-| `GET /projects/{id}/validation-checks` | Project members list catalog versions; optional `repo_id`, `state=active|retired`. |
-| `POST /projects/{id}/validation-checks` | Project owner/admin only (`403 validation.catalog_forbidden`). Body `{repo_id?, check_key, command, timeout_seconds, idempotency_key}` publishes the next immutable version and retires the previous one. A replay with identical content returns the active version. Pins in a Task envelope keep the old digest and become `validation.check_stale_pin`. |
-| `POST /validation-checks/{id}/retire` | Owner/admin. Body `{expected_state:"active"}`; an already retired definition is `409 validation.catalog_state_conflict`. |
-| `GET /tasks/{id}/validation-check-requests` | Runner queue/outcomes for the Task (`state` filter). There is no REST enqueue: requests come only from the coordinator or the after-integration hook. |
-| `GET /tasks/{id}/validation-comparisons` | Immutable baseline comparisons (`regression`, `pre_existing_failure`, `fixed`, `both_pass`, `inconclusive`). |
-| `GET /tasks/{id}/human-decisions`, `GET /tasks/{id}/human-decisions/{decision_id}` | Structured decisions with options, evidence links (kind, id, digest), recommendation and state. |
-| `POST /tasks/{id}/human-decisions/{decision_id}/answer` | Body `{expected_version, option_id, note?, idempotency_key}`; the answering user is always the authenticated user. An option whose `authority_effect` is not `none` needs a Project owner/admin. This route also answers `source_kind: coordinator_replan` decisions; their exact options are `approve_replan`, `reject`, and `revise_scope`, and a scope/authority-changing approval requires owner/admin authority. Errors: `409 human_decision.version_conflict`, `409 human_decision.not_open`, `403 human_decision.authority_required`, `422 human_decision.invalid_options`. The response carries the decision and `resume` (`created|already_bound|deferred`). `idempotency_key` is validated; replay safety comes from `expected_version` (a repeated answer is `not_open`). Project Copilot never answers. |
+| `GET /projects/{id}/validation-checks` | Project members list catalog versions; optional `repo_id` and `state` (`active` or `retired`) filters. |
+| `POST /projects/{id}/validation-checks` | Project owner/admin publishes a version using repo_id?, check_key, command, timeout_seconds, and idempotency_key. A new version retires the old active version. Existing envelope pins remain tied to their definition digest. |
+| `POST /validation-checks/{id}/retire` | Owner/admin retires a check with {expected_state:"active"}. |
+| `GET /tasks/{id}/validation-check-requests` | Read the Task's queued and terminal runner requests; optional state filter. |
+| `GET /tasks/{id}/validation-comparisons` | Read immutable baseline classifications: regression, pre_existing_failure, fixed, both_pass, or inconclusive. |
+| `GET /tasks/{id}/human-decisions` | Read structured Human decisions, evidence links, recommendation, state, and version. |
+| `GET /tasks/{id}/human-decisions/{decision_id}` | Read one exact Task decision. |
+| `POST /tasks/{id}/human-decisions/{decision_id}/answer` | Answer one stored option with expected_version, option_id, optional note, and idempotency_key. The authenticated Human is the answerer. Options with authority_effect=scope or authority require Project owner/admin authority. |
+
+ValidationRunResponse includes run_origin (legacy_command|coordinator_request|after_integration|baseline), definition_digest, catalog_check_id, and check_request_id. Coordination request responses include exact nullable source_subject_kind/id/digest and resumes_request_id fields.
+
+A terminal run in failed, error, or stale state, or a baseline comparison in regression or inconclusive state, can create an exact validation_findings coordinator request. The coordinator may choose correct, recheck, or human. A recheck stays on the pinned check and subject. Passing checks and non-regression comparisons do not wake the coordinator. Answering a resumable decision creates at most one resume request for its original authorization; Project Copilot never answers Human decisions.
+
+Gate policy schema_version 2 adds required_checks entries with check_key, definition_digest, and required_outcome=passed. POST /tasks/{id}/gates and PUT /gates/{id}/policy accept the schema-2 policy. A required check is resolved for the exact Gate candidate and pinned definition; a latest or mismatched run cannot satisfy it. Schema 1 behavior is unchanged and does not accept required_checks.
 
 ### Fallback, micro-fix, and coordinator replan receipts
 
-All three phase-3 reads require Task visibility and use `{items, next_cursor}`
-with opaque keyset cursors and `limit` from 1 to 100. Fallback receipts are
-ordered newest first; micro-fixes and replans are ordered by their Task-local
-ordinal. `failure_class` is the fallback reason class. Replan
-`classification_facts` is the stored deterministic fact set, and
-`human_decision_id` links to the corresponding decision under the same Task.
-Read-only MCP mirrors are `forge_list_task_fallback_receipts`,
-`forge_list_task_micro_fixes`, and `forge_list_task_coordinator_replans`.
-Decision answers remain Human REST operations.
-
-Gate policy `schema_version: 2` adds `required_checks`
-(`[{check_key, definition_digest, required_outcome:"passed"}]`) on
-`POST /tasks/{id}/gates` and `PUT /gates/{id}/policy`; schema 1 keeps its
-behavior and rejects `required_checks`. Public error mapping: `*.not_authorized`
-and `validation.catalog_forbidden` 403; `validation.check_unknown`,
-`validation.subject_not_resolvable` and `human_decision.invalid_options|evidence_invalid`
-422; other `validation.*`/`human_decision.*` conflicts 409.
-
-ValidationRuns and Evidence are distinct from ReviewReports. A Gate consumes
-exact input facts and immutable evaluations; it never uses a latest Review or
-ValidationRun lookup.
-
-### PR feedback, rework, and external actions
-
-All Task lists below return `{items, next_cursor}` with opaque keyset cursors and
-`limit` from 1 to 100. Reads require Task visibility. Feedback bodies are
-available only through the Task read; SSE projections contain no provider text.
+All phase-3 reads require Task visibility and return {items, next_cursor} with opaque keyset cursors and limit from 1 to 100. Fallback receipts are newest first; micro-fixes and replans use Task-local ordinal order.
 
 | Method and path | Contract |
 | --- | --- |
-| `GET /tasks/{id}/pr-feedback` | List feedback across the Task's PR admissions, including trust class, head state, disposition, dismiss reason, scope classification, human decision ID, and follow-up Task ID. |
-| `GET /tasks/{id}/pr-rework` | List PR rework supersessions with their state, PR identity, head, and exact convergence decision reference. |
-| `GET /tasks/{id}/pr-actions` | List durable external PR actions. Optional `state` filters by action state. Responses expose identifiers, digests, authorization/state and version; no provider result body or secret. |
-| `POST /tasks/{id}/pr-actions/{action_id}/approve`, `POST /tasks/{id}/pr-actions/{action_id}/reject` | Human owner/admin decision on a proposed `human_approval` action. Body `{expected_version, note?, idempotency_key}`. Forge passes the expected version to the service and compares it in the version-guarded action write. It records the exact Proposal Decision; the merge remains a human operation. Stale versions return `409 pr_action.version_conflict`; unauthorized or non-proposed actions return typed `403`/`409` errors. |
+| `GET /tasks/{id}/fallback-receipts` | Read exact Agent substitutions or blocked fallback outcomes, with the route reason, chain index, cost class, and authorization digests. |
+| `GET /tasks/{id}/micro-fixes` | Read correction receipts, declared findings and paths, diff bounds, outcome, and formal reviewer evidence. |
+| `GET /tasks/{id}/coordinator-replans` | Read deterministic classifications and facts, state, and any linked Human decision. |
 
-`POST /providers` accepts `provider: "github"` to connect a GitHub SCM
-credential. The `credential` is accepted only in the request body and is never
-returned. `GET /providers?purpose=scm` lists SCM handles; the unfiltered model
-provider list excludes them. A repository references a handle with
-`POST /projects/{id}/repos` or `PATCH /repos/{id}` and
-`pr_provider_config.credential_id`; Forge checks both Project administration
-and credential ownership. `PrProviderStatus` reports `has_credential`,
-`credential_handle_id`, and `credential_label`. The handle ID and label are
-display metadata only; the secret is never returned. The retired PR token
-fields are rejected with `400 repo.pr_provider_token_retired`.
+Read-only MCP mirrors are forge_list_task_fallback_receipts, forge_list_task_micro_fixes, and forge_list_task_coordinator_replans. Decision answers remain Human REST operations.
 
-The REST and MCP error codes include `credential.invalid`,
-`credential.purpose_invalid`, `credential.owner_not_authorized`,
-`repo.pr_provider_forbidden`, `repo.pr_provider_credential_invalid`,
-`repo.pr_provider_token_retired`, `pr_feedback.policy_invalid`,
-`pr_feedback.policy_forbidden`, `pr_rework.not_authorized`,
-`pr_action.not_authorized`, `pr_action.version_conflict`, and typed `409`
-conflicts for changed policies or actions.
+### PR feedback, rework, and external actions
+
+Task lists below return {items, next_cursor} with opaque keyset cursors and limit from 1 to 100. Reads require Task visibility. Feedback bodies are available only through the Task read; SSE projections contain no provider-authored text.
+
+| Method and path | Contract |
+| --- | --- |
+| `GET /tasks/{id}/pr-feedback` | Read feedback across the Task's PR admissions, including trust class, head state, disposition, scope classification, Human decision, and follow-up Task references. |
+| `GET /tasks/{id}/pr-rework` | Read same-PR rework supersessions, state, PR identity, head, and convergence decision reference. |
+| `GET /tasks/{id}/pr-actions` | Read durable external PR actions; optional state filters the list. Responses expose identifiers, digests, authorization/state, and version, not provider result bodies or secrets. |
+| `POST /tasks/{id}/pr-actions/{action_id}/approve` | Project owner/admin approves a proposed action with expected_version, optional note, and idempotency_key. |
+| `POST /tasks/{id}/pr-actions/{action_id}/reject` | Project owner/admin rejects a proposed action with expected_version, optional note, and idempotency_key. Stale versions return pr_action.version_conflict. |
+| `GET /repos/{id}/pr-feedback-policy` | Read {policy, updated_at}; owner/admin only. |
+| `PUT /repos/{id}/pr-feedback-policy` | Replace the versioned policy with {expected_updated_at?, policy}; owner/admin only. The timestamp is compared atomically. Policy changes do not widen an existing remote PR admission. |
+
+The policy schema is version 1. Its defaults are ingest=false, trusted_author_associations=[OWNER,MEMBER,COLLABORATOR], trusted_logins=[], max_items_per_poll=50, push_corrections=human_approval, and post_summary=off. Project owners/admins may select automatic push corrections or summary comments in repository policy. The active policy is frozen into a remote PR admission. Feedback is untrusted external data; only trusted items on the current PR head enter coordinator context. A coordinator can extend the authorized Task in the same PR, propose a follow-up Task for separate scope, ask for a Human decision, or dismiss an item. Forge records the decision and normal Task/review/Gate path; it has no merge action.
+
+Connect GitHub with `POST /providers` using the `provider`, `label`, and `credential` request fields. The secret is accepted for connection and is never returned. `GET /providers?purpose=scm` lists SCM handles; the ordinary provider list excludes them. Set `pr_provider_config.credential_id` when creating `POST /projects/{id}/repos` or updating `PATCH /repos/{id}`. Both Project administration and credential ownership are checked. Responses expose `has_credential`, `credential_handle_id`, and `credential_label`, never the secret. The retired `token` and `token_secret_ref` PR configuration fields return `repo.pr_provider_token_retired`.
+
+The REST and MCP error codes include credential.invalid, credential.purpose_invalid, credential.owner_not_authorized, repo.pr_provider_forbidden, repo.pr_provider_credential_invalid, repo.pr_provider_token_retired, pr_feedback.policy_invalid, pr_feedback.policy_forbidden, pr_rework.not_authorized, pr_action.not_authorized, and pr_action.version_conflict. See the [PR feedback loop](concepts/pr-feedback-loop.md) for the lifecycle and policy boundaries.
 
 ## WorkUnits and generic collaboration
 
@@ -703,19 +677,9 @@ Public durable event types are:
 - generic collaboration events `message.created`, `handoff.created`,
   `handoff.status_changed`, `proposal.created`, `proposal.withdrawn`, and
   `decision.recorded`.
-- PR feedback events `task.pr_feedback_ingested` and
-  `task.pr_feedback_triaged`; rework events `task.pr_rework_superseded`,
-  `task.pr_rework_resumed`, `task.pr_rework_converged`, and
-  `task.pr_followup_proposed`; external action events
-  `task.pr_action_requested` and `task.pr_action_completed`. Their payloads
-  contain only allowlisted identifiers, digests, heads, kinds and states.
-- `task.work_unit_fallback` reports a preauthorized WorkUnit Agent reassignment
-  or a durable blocked outcome using only allowlisted IDs, digests, cost class,
-  chain index, outcome, and safe reason code.
-- `task.micro_fix_bounds_exceeded` carries the exact receipt, WorkUnit, result
-  commit, and typed bounds violation. `task.coordinator_replan_proposed` carries
-  the replan/request IDs, ordinal, authorization version, and envelope digest.
-  Neither event includes paths, plan contents, prompts, or free-form reasons.
+- Coordinator verification events: `task.validation_check_requested`, `task.validation_check_completed`, `task.validation_comparison_recorded`, `task.human_decision_requested`, `task.human_decision_answered`, and `task.human_decision_closed`.
+- PR feedback events: `task.pr_feedback_ingested` and `task.pr_feedback_triaged`; rework events: `task.pr_rework_superseded`, `task.pr_rework_resumed`, `task.pr_rework_converged`, and `task.pr_followup_proposed`; external action events: `task.pr_action_requested` and `task.pr_action_completed`. Their payloads contain only allowlisted identifiers, digests, heads, kinds, and states.
+- Phase-3 events: `task.work_unit_fallback`, `task.micro_fix_bounds_exceeded`, and `task.coordinator_replan_proposed` carry allowlisted receipt and authorization facts. They omit provider text, paths, plan contents, prompts, and free-form reasons.
 
 Runtime hint names are `project.created`, `project.updated`, `project.deleted`,
 `project.paused`, `project.resumed`, `project_hook.run_changed`,
@@ -880,6 +844,8 @@ forms use the same TaskService structural transaction as REST.
 - [Architecture](architecture.md)
 - [Architecture V2 migration register](migration/architecture-v2.md)
 - [Plan PR12 public-surface ledger](migration/plan-pr12-public-surface-alignment.md)
+- [Orchestrated delivery](concepts/delivery-fluency.md)
+- [PR feedback loop](concepts/pr-feedback-loop.md)
 
 ### Task autonomy and review triage
 
