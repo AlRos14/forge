@@ -234,6 +234,7 @@ fn proposal_target_to_db(value: ApiProposalTarget) -> ProposalTarget {
             ApiProposalTargetKind::Execution => ProposalTargetKind::Execution,
             ApiProposalTargetKind::Workspace => ProposalTargetKind::Workspace,
             ApiProposalTargetKind::WorkUnit => ProposalTargetKind::WorkUnit,
+            ApiProposalTargetKind::PrExternalAction => ProposalTargetKind::PrExternalAction,
         },
         id: value.id,
     }
@@ -246,6 +247,7 @@ fn proposal_target_to_api(value: ProposalTarget) -> ApiProposalTarget {
             ProposalTargetKind::Execution => ApiProposalTargetKind::Execution,
             ProposalTargetKind::Workspace => ApiProposalTargetKind::Workspace,
             ProposalTargetKind::WorkUnit => ApiProposalTargetKind::WorkUnit,
+            ProposalTargetKind::PrExternalAction => ApiProposalTargetKind::PrExternalAction,
         },
         id: value.id,
     }

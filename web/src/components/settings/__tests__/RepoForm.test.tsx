@@ -1,9 +1,21 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useState } from 'react'
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { connectScmCredential, listScmCredentials } from '@/api/client'
 import { RepoForm, type RepoFormState } from '@/components/settings/RepoForm'
-import type { Daemon } from '@/types/generated/api'
+import type { Daemon, ProviderEntryResponse } from '@/types/generated'
+
+const scmCredentialApi = vi.hoisted(() => ({ list: vi.fn(), connect: vi.fn() }))
+
+vi.mock('@/api/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/client')>()
+  return {
+    ...actual,
+    listScmCredentials: scmCredentialApi.list,
+    connectScmCredential: scmCredentialApi.connect,
+  }
+})
 
 const localRepoForm: RepoFormState = {
   source_mode: 'local',
@@ -14,8 +26,26 @@ const localRepoForm: RepoFormState = {
   work_mode: 'direct_merge',
   pr_provider: 'github',
   pr_base_url: '',
-  pr_token: '',
+  credential_id: undefined,
+  credential_handle_id: null,
+  credential_label: null,
+  credential_connected: false,
   pr_polling_interval_seconds: '60',
+}
+
+const connectedCredential: ProviderEntryResponse = {
+  id: 'scm-credential-1',
+  provider: 'github',
+  label: 'Forge GitHub',
+  credential_method: 'api_key',
+  status: 'configured',
+  base_url: null,
+  provider_account_id: null,
+  used_by: [],
+  last_used_at: null,
+  version: 1,
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z',
 }
 
 const daemons: Daemon[] = [
@@ -95,6 +125,11 @@ function renderRepoForm(initialForm: RepoFormState, onSubmit: (form: RepoFormSta
 }
 
 describe('RepoForm', () => {
+  beforeEach(() => {
+    vi.mocked(listScmCredentials).mockResolvedValue({ items: [connectedCredential], cli_runtimes: [] })
+    vi.mocked(connectScmCredential).mockResolvedValue(connectedCredential)
+  })
+
   it('allows saving a local repo remote URL without selecting a daemon', () => {
     const onSubmit = vi.fn()
 
@@ -113,5 +148,67 @@ describe('RepoForm', () => {
       remote_url: 'https://github.com/acme/forge-renamed.git',
       default_branch: 'main',
     })
+  })
+
+  it('lets the user select a connected GitHub credential for a pull request repo', async () => {
+    const onSubmit = vi.fn()
+    renderRepoForm({ ...localRepoForm, work_mode: 'pull_request' }, onSubmit)
+
+    await waitFor(() => expect(listScmCredentials).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'GitHub SCM credential' }))
+    fireEvent.click(await screen.findByRole('option', { name: 'Forge GitHub' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({ credential_id: 'scm-credential-1', credential_connected: true }),
+    )
+  })
+
+  it('shows the referenced credential as the current selection when editing a repo', () => {
+    renderRepoForm(
+      {
+        ...localRepoForm,
+        work_mode: 'pull_request',
+        credential_handle_id: 'scm-credential-1',
+        credential_label: 'Forge GitHub',
+        credential_connected: true,
+      },
+      vi.fn(),
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'GitHub SCM credential' }))
+    const currentOption = screen.getByRole('option', { name: 'Current: Forge GitHub' })
+    expect(currentOption).toBeTruthy()
+    expect(currentOption.getAttribute('aria-selected')).toBe('true')
+  })
+
+  it('connects a credential in the request body and clears the password input after submit', async () => {
+    const onSubmit = vi.fn()
+    const form = { ...localRepoForm, work_mode: 'pull_request' as const }
+    renderRepoForm(form, onSubmit)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Connect a new GitHub credential' }))
+    fireEvent.change(screen.getByLabelText('Credential label'), {
+      target: { value: 'Forge GitHub' },
+    })
+    fireEvent.change(screen.getByLabelText('GitHub credential'), {
+      target: { value: 'secret-value' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect credential' }))
+
+    await waitFor(() =>
+      expect(vi.mocked(connectScmCredential)).toHaveBeenCalledWith({
+        provider: 'github',
+        label: 'Forge GitHub',
+        credential: 'secret-value',
+      }),
+    )
+    await waitFor(() => expect(screen.queryByLabelText('GitHub credential')).toBeNull())
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({ credential_id: 'scm-credential-1' }),
+    )
+    expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty('credential')
   })
 })

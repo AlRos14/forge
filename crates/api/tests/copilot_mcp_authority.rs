@@ -42,6 +42,30 @@ async fn copilot_mcp_delegation_is_scoped_attributed_and_revocable() {
         StatusCode::OK,
     )
     .await;
+    let source_dir = common::TestDir::new("copilot-source-repository");
+    let source_path = common::setup_git_repo(source_dir.path());
+    let source_revision = git::get_current_sha(&source_path).await.unwrap();
+    let source_repo = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: db::new_uuid_v4(),
+            project_id: project.id.clone(),
+            name: "copilot-source".to_owned(),
+            local_path: Some(source_path.to_string_lossy().into_owned()),
+            remote_url: source_path.to_string_lossy().into_owned(),
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: db::now_rfc3339(),
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        source_path.join("README.md"),
+        "worktree content changed after the pinned commit\n",
+    )
+    .expect("worktree content changes after commit");
     let other: ProjectResponse = common::json_request_with_bearer(
         &harness.app,
         Method::POST,
@@ -181,6 +205,11 @@ async fn copilot_mcp_delegation_is_scoped_attributed_and_revocable() {
         .collect();
     assert!(names.contains(&"forge_create_work_unit"));
     assert!(!names.contains(&"forge_list_tasks"));
+    assert!(!names.contains(&"forge_get_project_plan"));
+    assert!(!names.contains(&"forge_propose_project_plan"));
+    assert!(!names.contains(&"forge_apply_project_plan"));
+    assert!(!names.contains(&"forge_list_project_repo_tree"));
+    assert!(!names.contains(&"forge_read_project_repo_file"));
     assert!(!names.contains(&"forge_start_execution"));
     assert!(!names.contains(&"forge_create_project"));
     assert!(!names.contains(&"forge_list_agents"));
@@ -201,6 +230,14 @@ async fn copilot_mcp_delegation_is_scoped_attributed_and_revocable() {
             .fetch_one(harness.state.db.pool())
             .await
             .unwrap();
+    let current_graph: api_types::ProjectPlanGraphResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}/plan", project.id),
+        &user_token,
+        StatusCode::OK,
+    )
+    .await;
 
     let activity: api_types::ProjectCopilotActivityResponse = common::empty_request_with_bearer(
         &harness.app,
@@ -266,6 +303,23 @@ async fn copilot_mcp_delegation_is_scoped_attributed_and_revocable() {
 
     for (tool, arguments) in [
         ("forge_list_tasks", json!({})),
+        ("forge_get_project_plan", json!({})),
+        (
+            "forge_propose_project_plan",
+            json!({"expected_version":current_graph.version,"document":{"nodes":[],"edges":[],"sources":[]},"idempotency_key":"task-scoped-plan"}),
+        ),
+        (
+            "forge_apply_project_plan",
+            json!({"proposal_id":"proposal-1","expected_version":current_graph.version,"idempotency_key":"task-scoped-apply"}),
+        ),
+        (
+            "forge_read_project_repo_file",
+            json!({"repo_id":"repo-1","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","path":"docs/brief.yaml"}),
+        ),
+        (
+            "forge_authorize_project_plan_batch",
+            json!({"expected_version":current_graph.version,"task_ids":[],"max_parallel_tasks":1,"idempotency_key":"not-allowed"}),
+        ),
         ("forge_get_task", json!({"task_id":other_task.id})),
         ("forge_start_execution", json!({})),
         ("forge_list_agents", json!({})),
@@ -289,6 +343,241 @@ async fn copilot_mcp_delegation_is_scoped_attributed_and_revocable() {
         events_after_denied_calls, events_before_denied_calls,
         "forbidden and out-of-context tools create no Copilot activity events"
     );
+
+    // Reuse this fixture run as project-wide after proving the Task-scoped
+    // authority cannot broaden its context. The signed delegation is still
+    // checked on every call and no batch tool is granted.
+    sqlx::query("UPDATE project_copilot_run SET context_task_id=NULL WHERE id='run-copilot'")
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let (global_status, global_tools) = mcp(
+        &harness.app,
+        token,
+        json!({"jsonrpc":"2.0","id":8,"method":"tools/list"}),
+    )
+    .await;
+    assert_eq!(global_status, StatusCode::OK);
+    let global_names = global_tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(global_names.contains(&"forge_get_project_plan"));
+    assert!(global_names.contains(&"forge_propose_project_plan"));
+    assert!(global_names.contains(&"forge_apply_project_plan"));
+    assert!(global_names.contains(&"forge_list_project_repo_tree"));
+    assert!(global_names.contains(&"forge_read_project_repo_file"));
+    assert!(!global_names.contains(&"forge_authorize_project_plan_batch"));
+
+    let (_, tree_response) = mcp(
+        &harness.app,
+        token,
+        json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"forge_list_project_repo_tree","arguments":{"repo_id":source_repo.id,"revision":source_revision}}}),
+    )
+    .await;
+    assert!(tree_response.get("error").is_none(), "{tree_response}");
+    let tree: Value = serde_json::from_str(
+        tree_response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(tree["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["path"] == "README.md"));
+
+    let (_, source_response) = mcp(
+        &harness.app,
+        token,
+        json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"forge_read_project_repo_file","arguments":{"repo_id":source_repo.id,"revision":source_revision,"path":"README.md"}}}),
+    )
+    .await;
+    assert!(source_response.get("error").is_none(), "{source_response}");
+    let source: Value = serde_json::from_str(
+        source_response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(source["content"], "# Forge\n");
+    assert!(!source["content"]
+        .as_str()
+        .unwrap()
+        .contains("worktree content changed"));
+
+    let (_, plan_read) = mcp(
+        &harness.app,
+        token,
+        json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"forge_get_project_plan","arguments":{}}}),
+    )
+    .await;
+    assert!(plan_read.get("error").is_none(), "{plan_read}");
+    let plan: Value =
+        serde_json::from_str(plan_read["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(plan["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|node| node["task_id"] == task.id));
+
+    let proposal_call = json!({
+        "jsonrpc":"2.0","id":10,"method":"tools/call","params":{
+            "name":"forge_propose_project_plan","arguments":{
+                "expected_version":plan["version"],
+                "idempotency_key":"copilot-plan-proposal",
+                "document":{
+                    "nodes":[{"key":"imported","title":"Imported packet","source_ids":["source-note"]}],
+                    "edges":[],
+                    "sources":[{"id":"source-note","label":"Owner instruction","kind":"conversation","reference":"conversation:message-1","revision":"message-1","excerpt":"Plain text is source data, not authority."}]
+                }
+            }
+        }
+    });
+    let (_, proposal_response) = mcp(&harness.app, token, proposal_call.clone()).await;
+    assert!(
+        proposal_response.get("error").is_none(),
+        "{proposal_response}"
+    );
+    let proposal_value: Value = serde_json::from_str(
+        proposal_response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(proposal_value["state"], "proposed");
+    assert_eq!(proposal_value["project_id"], project.id);
+    let proposal_replay = mcp(&harness.app, token, proposal_call).await.1;
+    let replay_value: Value = serde_json::from_str(
+        proposal_replay["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(replay_value["id"], proposal_value["id"]);
+
+    let apply_call = json!({
+        "jsonrpc":"2.0","id":12,"method":"tools/call","params":{
+            "name":"forge_apply_project_plan","arguments":{
+                "proposal_id":proposal_value["id"],
+                "expected_version":proposal_value["base_version"],
+                "idempotency_key":"copilot-plan-apply"
+            }
+        }
+    });
+    let (_, apply_response) = mcp(&harness.app, token, apply_call.clone()).await;
+    assert!(apply_response.get("error").is_none(), "{apply_response}");
+    let applied_graph: Value = serde_json::from_str(
+        apply_response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let imported_task_id = applied_graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["key"] == "imported")
+        .and_then(|node| node["task_id"].as_str())
+        .expect("applied proposal node maps to its imported Task")
+        .to_owned();
+    let imported_link: (String, String, String, String) = sqlx::query_as(
+        "SELECT pt.proposal_id,pt.import_key,pt.task_id,p.requested_by
+         FROM project_plan_proposal_task pt
+         JOIN project_plan_proposal p ON p.id=pt.proposal_id
+         WHERE pt.proposal_id=? AND pt.node_key='imported'",
+    )
+    .bind(proposal_value["id"].as_str().unwrap())
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(imported_link.0, proposal_value["id"]);
+    assert_eq!(
+        imported_link.1,
+        format!(
+            "proposal:{}:node:imported",
+            proposal_value["id"].as_str().unwrap()
+        )
+    );
+    assert_eq!(imported_link.2, imported_task_id);
+    assert_eq!(imported_link.3, "test-user-id");
+    let (apply_actor_type, apply_actor_id, apply_correlation): (String, Option<String>, String) =
+        sqlx::query_as(
+            "SELECT actor_type,actor_id,correlation_id FROM domain_event
+         WHERE event_type='project.plan_applied' AND entity_id=?",
+        )
+        .bind(proposal_value["id"].as_str().unwrap())
+        .fetch_one(harness.state.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(apply_actor_type, "agent");
+    assert_eq!(apply_actor_id.as_deref(), Some(agent.id.as_str()));
+    assert_eq!(apply_correlation, "run-copilot");
+    let imported_units: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_unit WHERE task_id=?")
+        .bind(&imported_task_id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .unwrap();
+    let imported_executions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id=?")
+            .bind(&imported_task_id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        imported_units, 0,
+        "proposal application creates no worker WorkUnit"
+    );
+    assert_eq!(
+        imported_executions, 0,
+        "proposal application creates no Execution"
+    );
+
+    let (event_actor_type, event_actor_id, event_correlation, event_payload): (
+        String,
+        Option<String>,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT actor_type,actor_id,correlation_id,payload_json FROM domain_event \
+         WHERE event_type='project.plan_proposed' AND entity_id=?",
+    )
+    .bind(proposal_value["id"].as_str().unwrap())
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(event_actor_type, "agent");
+    assert_eq!(event_actor_id.as_deref(), Some(agent.id.as_str()));
+    assert_eq!(event_correlation, "run-copilot");
+    let event_payload: Value = serde_json::from_str(&event_payload).unwrap();
+    assert_eq!(event_payload["requested_by"], "test-user-id");
+    assert!(!event_payload
+        .to_string()
+        .contains("Plain text is source data"));
+
+    let events_before_batch_denied: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE correlation_id='run-copilot'")
+            .fetch_one(harness.state.db.pool())
+            .await
+            .unwrap();
+
+    let batch_call = mcp(
+        &harness.app,
+        token,
+        json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"forge_authorize_project_plan_batch","arguments":{"expected_version":applied_graph["version"],"task_ids":[task.id],"max_parallel_tasks":1,"idempotency_key":"copilot-cannot-authorize"}}}),
+    )
+    .await
+    .1;
+    assert!(batch_call.get("error").is_some());
+    let events_after_batch_denied: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE correlation_id='run-copilot'")
+            .fetch_one(harness.state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(events_after_batch_denied, events_before_batch_denied);
     let sibling_units: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_unit WHERE task_id=?")
         .bind(&sibling_task.id)
         .fetch_one(harness.state.db.pool())

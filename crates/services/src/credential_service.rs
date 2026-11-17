@@ -13,7 +13,7 @@ use std::{
 };
 
 use chacha20poly1305::{
-    aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
+    aead::{Aead, AeadCore, KeyInit, OsRng},
     XChaCha20Poly1305, XNonce,
 };
 use db::{CredentialHandle, CredentialHandleRepo, SqliteDb};
@@ -99,6 +99,17 @@ pub struct ConnectApiKeyCredential {
     pub base_url: Option<String>,
 }
 
+/// A source-control (GitHub) personal access token. Never usable by a model
+/// harness Agent; it only authenticates PR provider calls (D4).
+#[derive(Clone)]
+pub struct ConnectScmCredential {
+    pub owner_user_id: String,
+    /// Only `github` is supported.
+    pub provider: String,
+    pub label: String,
+    pub credential: Secret,
+}
+
 #[derive(Clone)]
 pub struct ConnectOAuthCredential {
     pub owner_user_id: String,
@@ -162,6 +173,16 @@ struct StoredCredential {
     plaintext: String,
 }
 
+struct CreateApiKeyInput<'a> {
+    id: &'a str,
+    owner_user_id: &'a str,
+    provider: &'a str,
+    label: &'a str,
+    secret: &'a Secret,
+    metadata_json: &'a str,
+    now: &'a str,
+}
+
 #[derive(Clone)]
 struct CredentialStore {
     db: Arc<SqliteDb>,
@@ -193,11 +214,10 @@ impl CredentialStore {
     }
 
     fn seal(&self, plaintext: &[u8]) -> std::result::Result<(Vec<u8>, Vec<u8>), CredentialError> {
-        let mut nonce = [0_u8; 24];
-        OsRng.fill_bytes(&mut nonce);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let ciphertext = self
             .cipher
-            .encrypt(XNonce::from_slice(&nonce), plaintext)
+            .encrypt(&nonce, plaintext)
             .map_err(|_| CredentialError::Persistence)?;
         Ok((ciphertext, nonce.to_vec()))
     }
@@ -217,13 +237,17 @@ impl CredentialStore {
 
     async fn create_api_key(
         &self,
-        id: &str,
-        owner_user_id: &str,
-        provider: &str,
-        label: &str,
-        secret: &Secret,
-        now: &str,
+        input: CreateApiKeyInput<'_>,
     ) -> std::result::Result<CredentialHandle, CredentialError> {
+        let CreateApiKeyInput {
+            id,
+            owner_user_id,
+            provider,
+            label,
+            secret,
+            metadata_json,
+            now,
+        } = input;
         let (ciphertext, nonce) = self.seal(secret.expose().as_bytes())?;
         let mut transaction = self
             .db
@@ -235,12 +259,13 @@ impl CredentialStore {
             "INSERT INTO credential_handle (
                 id, owner_user_id, provider, label, status,
                 credential_method, metadata_json, version, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, 'configured', 'api_key', '{}', 1, ?, ?)",
+             ) VALUES (?, ?, ?, ?, 'configured', 'api_key', ?, 1, ?, ?)",
         )
         .bind(id)
         .bind(owner_user_id)
         .bind(provider)
         .bind(label)
+        .bind(metadata_json)
         .bind(now)
         .bind(now)
         .execute(&mut *transaction)
@@ -259,7 +284,7 @@ impl CredentialStore {
             label: label.to_owned(),
             status: "configured".to_owned(),
             credential_method: "api_key".to_owned(),
-            metadata_json: "{}".to_owned(),
+            metadata_json: metadata_json.to_owned(),
             version: 1,
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
@@ -701,9 +726,10 @@ impl std::fmt::Debug for CredentialService {
 
 impl CredentialService {
     pub fn new(db: Arc<SqliteDb>, key_material: &[u8]) -> Self {
-        let digest = Sha256::digest(key_material);
-        let mut master_key = [0_u8; 32];
-        master_key.copy_from_slice(&digest);
+        let master_key: [u8; 32] = Sha256::digest(key_material)
+            .as_slice()
+            .try_into()
+            .expect("SHA-256 output is 32 bytes");
         Self {
             store: CredentialStore::new(Arc::clone(&db), master_key, 1),
             db,
@@ -742,14 +768,15 @@ impl CredentialService {
         let id = db::new_uuid_v4();
         let handle = self
             .store
-            .create_api_key(
-                &id,
-                &input.owner_user_id,
-                &input.provider,
-                &input.label,
-                &input.credential,
-                &now,
-            )
+            .create_api_key(CreateApiKeyInput {
+                id: &id,
+                owner_user_id: &input.owner_user_id,
+                provider: &input.provider,
+                label: &input.label,
+                secret: &input.credential,
+                metadata_json: "{}",
+                now: &now,
+            })
             .await
             .map_err(credential_error_to_service)?;
         self.record_entry_base_url(&id, &base_url).await;
@@ -757,6 +784,55 @@ impl CredentialService {
             metadata_json: json!({"base_url": base_url}).to_string(),
             ..handle
         })
+    }
+
+    /// Create a `provider = 'github'` API-key handle for PR calls, encrypted
+    /// like model-provider credentials. Does no DNS or base-URL validation:
+    /// the base URL belongs to the repo PR provider config.
+    pub async fn connect_scm_credential(
+        &self,
+        input: ConnectScmCredential,
+    ) -> Result<CredentialHandle> {
+        if input.label.trim().is_empty() || input.credential.expose().trim().is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "label and credential are required",
+            ));
+        }
+        if input.provider != "github" {
+            return Err(ServiceError::invalid_operation(
+                "SCM credential provider must be github",
+            ));
+        }
+        let now = db::now_rfc3339();
+        let id = db::new_uuid_v4();
+        self.store
+            .create_api_key(CreateApiKeyInput {
+                id: &id,
+                owner_user_id: &input.owner_user_id,
+                provider: &input.provider,
+                label: input.label.trim(),
+                secret: &input.credential,
+                metadata_json: r#"{"purpose":"scm"}"#,
+                now: &now,
+            })
+            .await
+            .map_err(credential_error_to_service)
+    }
+
+    /// Reject an SCM (`github`) handle where a model-provider credential is
+    /// required (Agent profiles).
+    pub async fn require_model_credential(&self, credential_id: &str) -> Result<CredentialHandle> {
+        let handle = CredentialHandleRepo::get_credential_handle(&*self.db, credential_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("credential_handle", credential_id.to_owned())
+            })?;
+        if is_scm_handle(&handle) {
+            return Err(ServiceError::invalid_operation(
+                "SCM credentials cannot be assigned to an Agent profile",
+            ));
+        }
+        Ok(handle)
     }
 
     pub async fn connect_oauth_credential(
@@ -810,6 +886,24 @@ impl CredentialService {
             ));
         }
         Ok(handle)
+    }
+
+    /// Open the in-memory secret of an SCM (`github`) API-key credential for
+    /// one call. Only the handle owner can open it and it must be
+    /// `configured`; the plaintext is never persisted or logged. Callers must
+    /// separately verify the owner still holds Project authority.
+    pub async fn acquire_scm_secret(&self, owner_user_id: &str, handle_id: &str) -> Result<Secret> {
+        let stored = self
+            .store
+            .load_stored(handle_id, owner_user_id)
+            .await
+            .map_err(credential_error_to_service)?;
+        if stored.provider != "github" || stored.method != "api_key" {
+            return Err(ServiceError::invalid_operation(
+                "credential is not a GitHub API key",
+            ));
+        }
+        Ok(Secret::new(stored.plaintext))
     }
 
     /// Resolve the credential identity frozen into an Execution
@@ -1031,7 +1125,7 @@ impl CredentialService {
                 return Ok(ProviderUsageOutcome::unsupported(
                     entry.provider,
                     "provider credential could not be refreshed",
-                ))
+                ));
             }
         };
         let account_id = entry_provider_account_id(&entry);
@@ -1044,7 +1138,7 @@ impl CredentialService {
                 return Ok(ProviderUsageOutcome::unsupported(
                     entry.provider,
                     "usage probe client unavailable",
-                ))
+                ));
             }
         };
         let mut request = client
@@ -1157,6 +1251,11 @@ fn provider_env_variable(provider: &str) -> Option<&'static str> {
         "openrouter" => Some("OPENROUTER_API_KEY"),
         _ => None,
     }
+}
+
+/// `true` for source-control handles (`provider = 'github'`).
+pub fn is_scm_handle(handle: &CredentialHandle) -> bool {
+    handle.provider == "github"
 }
 
 pub fn default_api_key_base_url(provider: &str) -> Option<&'static str> {
@@ -1319,6 +1418,13 @@ async fn provider_url_addresses(
         return Err("base_url must not target a private or local address");
     }
     Ok((parsed, addresses))
+}
+
+/// Apply the provider SSRF policy (https, public addresses only) to a base URL.
+pub(crate) async fn validate_provider_base_url(
+    base_url: &str,
+) -> std::result::Result<(), &'static str> {
+    provider_url_addresses(base_url).await.map(|_| ())
 }
 
 fn restricted_provider_hostname(host: &str) -> bool {
@@ -1635,5 +1741,142 @@ mod tests {
             .expect_err("retired snapshots cannot receive provider credentials");
         assert!(error.to_string().contains("retired"));
         assert!(retired_snapshot.get("runtime_env").is_none());
+    }
+
+    async fn scm_db_with_users() -> Arc<SqliteDb> {
+        let pool = create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(SqliteDb::new(pool));
+        let now = db::now_rfc3339();
+        for user in ["scm-owner", "scm-other"] {
+            sqlx::query(
+                "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
+                 VALUES (?, ?, 'test', NULL, ?, ?)",
+            )
+            .bind(user)
+            .bind(format!("{user}@example.test"))
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .expect("user creates");
+        }
+        db
+    }
+
+    #[tokio::test]
+    async fn scm_credential_is_encrypted_scoped_to_its_owner_and_marked_scm() {
+        let db = scm_db_with_users().await;
+        let credentials = CredentialService::new(Arc::clone(&db), b"scm-credential-test-key");
+        let secret = "ghp_scm_secret_must_not_be_stored_in_clear";
+        let handle = credentials
+            .connect_scm_credential(ConnectScmCredential {
+                owner_user_id: "scm-owner".to_owned(),
+                provider: "github".to_owned(),
+                label: "  work PAT  ".to_owned(),
+                credential: Secret::new(secret.to_owned()),
+            })
+            .await
+            .expect("github credential stores");
+        assert_eq!(handle.provider, "github");
+        assert_eq!(handle.credential_method, "api_key");
+        assert_eq!(handle.label, "work PAT");
+        assert_eq!(handle.metadata_json, r#"{"purpose":"scm"}"#);
+
+        let ciphertext: Vec<u8> = sqlx::query_scalar(
+            "SELECT ciphertext FROM protected_credential_secret WHERE handle_id = ?",
+        )
+        .bind(&handle.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("ciphertext exists");
+        assert!(!String::from_utf8_lossy(&ciphertext).contains(secret));
+        let stored_metadata: String =
+            sqlx::query_scalar("SELECT metadata_json FROM credential_handle WHERE id = ?")
+                .bind(&handle.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("metadata");
+        assert!(!stored_metadata.contains(secret));
+
+        let opened = credentials
+            .acquire_scm_secret("scm-owner", &handle.id)
+            .await
+            .expect("owner opens the secret");
+        assert_eq!(opened.expose(), secret);
+        assert!(!format!("{opened:?}").contains(secret));
+        credentials
+            .acquire_scm_secret("scm-other", &handle.id)
+            .await
+            .expect_err("another user cannot open the handle");
+    }
+
+    #[tokio::test]
+    async fn scm_credential_rejects_non_github_providers_and_blank_input() {
+        let db = scm_db_with_users().await;
+        let credentials = CredentialService::new(db, b"scm-credential-test-key");
+        for (provider, label, token) in [
+            ("openai", "model key", "sk-test"),
+            ("github", "   ", "ghp_x"),
+            ("github", "label", "   "),
+        ] {
+            credentials
+                .connect_scm_credential(ConnectScmCredential {
+                    owner_user_id: "scm-owner".to_owned(),
+                    provider: provider.to_owned(),
+                    label: label.to_owned(),
+                    credential: Secret::new(token.to_owned()),
+                })
+                .await
+                .expect_err("invalid SCM credential input is refused");
+        }
+        // The model-provider path does not accept github either.
+        credentials
+            .connect_api_key_credential(ConnectApiKeyCredential {
+                owner_user_id: "scm-owner".to_owned(),
+                provider: "github".to_owned(),
+                label: "not a model provider".to_owned(),
+                credential: Secret::new("ghp_x".to_owned()),
+                base_url: Some("https://8.8.8.8/v1".to_owned()),
+            })
+            .await
+            .expect_err("github is not a model provider");
+    }
+
+    #[tokio::test]
+    async fn scm_credential_cannot_be_used_by_an_agent_profile() {
+        let db = scm_db_with_users().await;
+        let credentials = CredentialService::new(Arc::clone(&db), b"scm-credential-test-key");
+        let handle = credentials
+            .connect_scm_credential(ConnectScmCredential {
+                owner_user_id: "scm-owner".to_owned(),
+                provider: "github".to_owned(),
+                label: "pat".to_owned(),
+                credential: Secret::new("ghp_profile_guard".to_owned()),
+            })
+            .await
+            .expect("github credential stores");
+        let error = credentials
+            .require_model_credential(&handle.id)
+            .await
+            .expect_err("service rejects an SCM handle for model use");
+        assert!(error.to_string().contains("SCM credentials"));
+
+        let model = credentials
+            .connect_api_key_credential(ConnectApiKeyCredential {
+                owner_user_id: "scm-owner".to_owned(),
+                provider: "openai".to_owned(),
+                label: "model".to_owned(),
+                credential: Secret::new("sk-model".to_owned()),
+                base_url: Some("https://8.8.8.8/v1".to_owned()),
+            })
+            .await
+            .expect("model credential stores");
+        credentials
+            .require_model_credential(&model.id)
+            .await
+            .expect("model credentials remain usable");
     }
 }

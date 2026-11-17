@@ -17,6 +17,14 @@ The architectural decision recorded in Plan PR0 is now explicit:
 * domain-model, orchestration, cognition, and public-surface changes are
   designed here first and are not upstream synchronization work.
 
+## 0.9.0 documentation and bootstrapper cleanup
+
+In 0.9.0, this fork removed upstream-era research reports, retired feature
+specification packages, and the upstream npm bootstrapper (`npx-cli`) with its
+CI and release jobs. The removed material remains available in Git history.
+These removals do not affect the MIT license or this repository's attribution
+to ForgeAILab and its contributors.
+
 The preserved areas are primarily daemon/process integration, harness
 adapters, Git, workspaces, configuration, local SQLite deployment, logs,
 events, REST, MCP, CLI, and web infrastructure. The target architecture

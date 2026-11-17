@@ -66,6 +66,24 @@ use std::{
 // and per-Task access settings while keeping Task data and repository authority
 // checks current.
 // V157 advances rework review lines by their exact result across parallel reports.
+// V168 preserves coordination requests and adds exact review-findings continuation sources.
+// V169 makes Gate ReviewReport currentness use the exact formal_review capability snapshot.
+// V170 lets formal_review Executions (only) bind to the Task integration workspace.
+// V171 adds the versioned validation check catalog, queued check requests, and exact
+// base-vs-candidate comparisons (baseline results live in the comparison, no workspace row).
+// V172 rebuilds coordination requests once for every phase's kinds/origins and adds
+// validation triage plus the hard-limited coordinator replan ledger.
+// V173 adds the GitHub credential reference, the frozen PR feedback policy, the immutable external
+// feedback ledger/set/triage, and PR external actions (applies by version, also after V174).
+// V174 adds structured human decision requests and their exact resume continuation.
+// V175 adds the non-destructive PR admission pause (pr_rework_supersession, additive
+// remote_pr_admission columns, recreated V114/V116/V173 guards) and the per-item feedback
+// dispositions, so external-feedback rework runs on the same Task and the same open PR.
+// V177 lets a Proposal target a PR external action (human_approval for push_update/post_comment).
+// V178 admits only unallocated external-feedback triage Executions on Merging Tasks.
+// V179 preserves the exact PR rework lifecycle receipt when a superseded PR closes remotely.
+// V180 adds the phase-3 fallback and micro-fix receipts (the frozen V176 block,
+// renumbered because V177-V179 already exist).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]

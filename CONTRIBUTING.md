@@ -38,7 +38,7 @@ The repository CI workflows and local scripts are the source for current checks:
 ./scripts/ci-web.sh
 ```
 
-The Rust script runs formatting, clippy, workspace check, and workspace tests with the web build skipped. The web script installs from `web/pnpm-lock.yaml` and runs lint, typecheck, unit tests, and build. Its Playwright smoke is run by GitHub Actions after the web checks. Use the focused package or surface checks appropriate to a change; do not run a full workspace suite for documentation-only edits.
+The Rust script runs formatting, Clippy, workspace check, and workspace tests with the web build skipped. The web script installs from `web/pnpm-lock.yaml` and runs lint, typecheck, unit tests, and build. GitHub Actions runs the Playwright smoke after those web checks; for browser-facing changes, run `pnpm run e2e` from `web/`. Use focused checks appropriate to a change, and mark checks NOT RUN when they do not apply or were not run. Documentation-only changes do not need a Rust or web build.
 
 For an API response change, update the route handler, `api-types`, generated TypeScript types, and `docs/api.md` together. For domain changes, read [Architecture](docs/architecture.md) and [Architecture V2](docs/migration/architecture-v2.md), name the affected invariants, and preserve lifecycle and authority boundaries.
 
@@ -50,6 +50,7 @@ For an API response change, update the route handler, `api-types`, generated Typ
 - Use optimistic versions for concurrent updates. Version conflicts return HTTP 409.
 - REST pagination is keyset-based and returns `items`, `has_more`, and an opaque cursor.
 - Add numbered forward migrations; never rewrite historical migrations or silently discard installed data.
+- Update affected documentation when behavior or a public contract changes. Record breaking public changes in the Unreleased section of `CHANGELOG.md`.
 - TaskLifecycle is the only current Task state authority. WorkUnit allocation and RoleMembership are distinct; do not infer assignment from membership.
 - A WorkUnit must be explicitly created and allocated before Agent Execution. `forge-ctl` currently has no WorkUnit creation command.
 - Durable domain records are authoritative; SSE is a filtered projection.

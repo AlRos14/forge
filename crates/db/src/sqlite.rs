@@ -39,12 +39,14 @@ use crate::{
 use crate::{
     AuthorizeTaskCoordinationInput, CompleteTaskCoordinationTurnInput,
     CreateTaskCoordinationRequestInput, CreateTaskInterventionInput, CreateTaskQualityRequestInput,
-    MaterializeTaskCoordinationPlanInput, RevokeTaskCoordinationInput, TaskCoordination,
-    TaskCoordinationMaterialization, TaskCoordinationOperation, TaskCoordinationPlan,
-    TaskCoordinationPlanState, TaskCoordinationPlanWrite, TaskCoordinationReceipt,
-    TaskCoordinationRepo, TaskCoordinationRequest, TaskCoordinationRequestState,
-    TaskCoordinationWrite, TaskIntervention, TaskInterventionState, TaskInterventionWrite,
-    TaskQualityRequest, TaskQualityState, TaskQualityWrite, UpdateTaskCoordinationRequestState,
+    MaterializeTaskCoordinationPlanInput, ProjectPlanBatchAuthorizationBinding,
+    ProjectPlanBatchRequestBinding, ProjectPlanBatchRequestOrigin, RevokeTaskCoordinationInput,
+    TaskCoordination, TaskCoordinationMaterialization, TaskCoordinationOperation,
+    TaskCoordinationPlan, TaskCoordinationPlanState, TaskCoordinationPlanWrite,
+    TaskCoordinationReceipt, TaskCoordinationRepo, TaskCoordinationRequest,
+    TaskCoordinationRequestState, TaskCoordinationWrite, TaskIntervention, TaskInterventionState,
+    TaskInterventionWrite, TaskQualityRequest, TaskQualityState, TaskQualityWrite,
+    UpdateTaskCoordinationRequestState,
 };
 use crate::{
     ClaimOrchestratorWake, CoordinationMode, CreateOrchestratorWake, OrchestratorActionRecord,
@@ -65,9 +67,12 @@ mod domain_event;
 mod embedded_agent;
 mod execution;
 mod execution_usage;
+mod external_feedback;
 mod external_link;
+mod fallback_receipt;
 mod gate_lifecycle;
 mod harness_session;
+mod human_decision;
 mod integration;
 mod notification;
 mod oauth_authorization_code;
@@ -75,8 +80,10 @@ mod oauth_client;
 mod oauth_refresh_token;
 mod orchestrator_wake;
 mod personal_access_token;
+mod pr_external_action;
 mod pr_metadata;
 mod pr_provider_config;
+mod pr_rework;
 mod project;
 mod project_copilot;
 mod project_hook_run;
@@ -97,6 +104,7 @@ mod task_integration_operation;
 mod task_media;
 mod task_terminal_session;
 mod user_auth;
+mod validation_catalog;
 mod validation_run;
 mod work_unit;
 mod workspace;
@@ -110,6 +118,12 @@ pub struct SqliteDb {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Cursor {
     offset: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PhaseThreeKeysetCursor {
+    sort_value: String,
+    id: String,
 }
 
 impl SqliteDb {
@@ -139,6 +153,53 @@ fn decode_offset(cursor: &Option<String>) -> Result<i64> {
 fn encode_offset(offset: i64) -> Result<String> {
     let bytes = serde_json::to_vec(&Cursor { offset }).map_err(|_| DbError::InvalidCursor)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_phase_three_cursor(cursor: &Option<String>) -> Result<Option<PhaseThreeKeysetCursor>> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| DbError::InvalidCursor)?;
+    let cursor: PhaseThreeKeysetCursor =
+        serde_json::from_slice(&bytes).map_err(|_| DbError::InvalidCursor)?;
+    if cursor.sort_value.trim().is_empty() || cursor.id.trim().is_empty() {
+        return Err(DbError::InvalidCursor);
+    }
+    Ok(Some(cursor))
+}
+
+fn encode_phase_three_cursor(sort_value: String, id: String) -> Result<String> {
+    let bytes = serde_json::to_vec(&PhaseThreeKeysetCursor { sort_value, id })
+        .map_err(|_| DbError::InvalidCursor)?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn phase_three_page_from_items<T>(
+    mut items: Vec<T>,
+    page: &PageRequest,
+    sort_value: impl Fn(&T) -> String,
+    id: impl Fn(&T) -> String,
+) -> Result<Page<T>> {
+    let page_limit = limit(page) as usize;
+    let has_next = items.len() > page_limit;
+    if has_next {
+        items.truncate(page_limit);
+    }
+    let next_cursor = if has_next {
+        items
+            .last()
+            .map(|last| encode_phase_three_cursor(sort_value(last), id(last)))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(Page {
+        items,
+        next_cursor,
+        total_count: None,
+    })
 }
 
 fn order_clause(page: &PageRequest) -> &'static str {
@@ -222,6 +283,38 @@ fn parse_enum<T: FromStr<Err = String>>(value: String) -> Result<T> {
 
 fn check_error(error: sqlx::Error) -> DbError {
     if let sqlx::Error::Database(database_error) = &error {
+        match database_error.message() {
+            "FORGE_COORDINATION_REVIEW_SOURCE_STALE"
+            | "FORGE_COORDINATION_REVIEW_DECISION_STALE"
+            | "FORGE_COORDINATION_SOURCE_STALE"
+            | "FORGE_COORDINATION_VALIDATION_SOURCE_STALE"
+            | "FORGE_COORDINATION_VALIDATION_DECISION_STALE"
+            | "FORGE_COORDINATION_DECISION_STALE"
+            | "FORGE_COORDINATION_HUMAN_DECISION_STALE"
+            | "FORGE_COORDINATION_EXTERNAL_FEEDBACK_STALE"
+            | "FORGE_PR_ACTION_STALE" => {
+                return DbError::VersionConflict;
+            }
+            "FORGE_PR_ACTION_NOT_AUTHORIZED" => return DbError::PrActionNotAuthorized,
+            "FORGE_PR_REWORK_NOT_AUTHORIZED" => return DbError::PrReworkNotAuthorized,
+            "FORGE_VALIDATION_CHECK_STALE_PIN" => return DbError::ValidationCheckStalePin,
+            "FORGE_VALIDATION_CHECK_NOT_AUTHORIZED" => {
+                return DbError::ValidationCheckNotAuthorized
+            }
+            "FORGE_VALIDATION_WORKSPACE_LEASED" => return DbError::ValidationWorkspaceLeased,
+            "FORGE_PROJECT_PLAN_BATCH_INACTIVE" => return DbError::ProjectPlanBatchInactive,
+            _ => {}
+        }
+        let message = database_error.message();
+        if message.starts_with("PR provider credential must be")
+            || message.starts_with("invalid PR feedback policy")
+            || message.starts_with("SCM credentials cannot back")
+            || message.starts_with("SCM credential handle identity")
+            || message.starts_with("external feedback requires")
+            || message.starts_with("external feedback disposition")
+        {
+            return DbError::Check(message.to_owned());
+        }
         if database_error
             .message()
             .to_ascii_lowercase()
@@ -259,10 +352,28 @@ pub(super) fn work_unit_execution_admission_error(error: &sqlx::Error) -> Option
         "FORGE_WU_ADMISSION_WORKSPACE_UNAVAILABLE" => Some(DbError::WorkUnitWorkspaceUnavailable),
         "FORGE_WU_ADMISSION_ALREADY_RUNNING" => Some(DbError::WorkUnitExecutionAlreadyRunning),
         "FORGE_WU_ADMISSION_DEPENDENCY_UNSATISFIED" => Some(DbError::DependencyGate),
+        "FORGE_WU_ADMISSION_PROJECT_DEPENDENCY_UNSATISFIED" => {
+            Some(DbError::ProjectDependencyUnsatisfied)
+        }
+        "FORGE_WU_ADMISSION_PROJECT_BATCH_INACTIVE" | "FORGE_PROJECT_PLAN_BATCH_INACTIVE" => {
+            Some(DbError::ProjectPlanBatchInactive)
+        }
+        "FORGE_PROJECT_PLAN_APPLY_INCOMPLETE" => Some(DbError::ProjectPlanApplyIncomplete),
         "FORGE_WU_ADMISSION_VERSION_CONFLICT" => Some(DbError::VersionConflict),
         "FORGE_WU_ADMISSION_INVALID" => Some(DbError::Check(
             "WorkUnit Execution admission has invalid required fields".to_owned(),
         )),
+        _ => None,
+    }
+}
+
+pub(super) fn project_plan_batch_write_error(error: &sqlx::Error) -> Option<DbError> {
+    let sqlx::Error::Database(database_error) = error else {
+        return None;
+    };
+    match database_error.message() {
+        "FORGE_PROJECT_PLAN_BATCH_INACTIVE" => Some(DbError::ProjectPlanBatchInactive),
+        "FORGE_PROJECT_PLAN_APPLY_INCOMPLETE" => Some(DbError::ProjectPlanApplyIncomplete),
         _ => None,
     }
 }
@@ -297,6 +408,16 @@ fn map_repo(row: SqliteRow) -> Result<Repo> {
     })
 }
 
+/// Reads an optional text column added by V173. File-backed historical
+/// migration fixtures map these rows before V173 exists; absence is `None`.
+pub(crate) fn try_get_v173_text(row: &SqliteRow, column: &str) -> Result<Option<String>> {
+    match row.try_get::<Option<String>, _>(column) {
+        Ok(value) => Ok(value),
+        Err(sqlx::Error::ColumnNotFound(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn map_pr_provider_config(row: SqliteRow) -> Result<PrProviderConfig> {
     Ok(PrProviderConfig {
         id: row.try_get("id")?,
@@ -305,6 +426,10 @@ fn map_pr_provider_config(row: SqliteRow) -> Result<PrProviderConfig> {
         base_url: row.try_get("base_url")?,
         polling_interval_seconds: row.try_get("polling_interval_seconds")?,
         token_secret_ref: row.try_get("token_secret_ref")?,
+        credential_handle_id: try_get_v173_text(&row, "credential_handle_id")?,
+        credential_owner_user_id: try_get_v173_text(&row, "credential_owner_user_id")?,
+        feedback_policy_json: try_get_v173_text(&row, "feedback_policy_json")?
+            .unwrap_or_else(|| crate::DEFAULT_PR_FEEDBACK_POLICY_JSON.to_owned()),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

@@ -1,9 +1,6 @@
 # Review and validation
 
-> Diseño objetivo aprobado, todavía pendiente de implementación:
-> [modelo operativo de tareas y UX](task-operating-model.md). Define la
-> separación Copilot/Orquestador, preparación desde objetivo y rutas de calidad.
-> El resto de este documento describe el contrato actual salvo indicación expresa.
+This page describes the current separation between formal review, deterministic validation, and Gate evaluation. The [task operating model](task-operating-model.md) and [delivery fluency](delivery-fluency.md) pages summarize how these records fit into Task delivery.
 
 
 Validation and review are separate kinds of work and separate sources of
@@ -39,6 +36,54 @@ An Actor may perform validation-related cognitive work through ordinary
 WorkUnit work: for example, reproducing a failure, investigating its cause, or
 interpreting scanner output. That is distinct from the deterministic
 ValidationRun and may itself produce an Artifact or Evidence.
+
+### Catalog checks
+
+A Project owner or admin may publish versioned **catalog checks**
+(`validation_check_definition`): a slug `check_key`, a bounded shell command,
+a timeout up to one hour and the `captured_default` environment policy. A
+definition is immutable; publishing again creates the next version, retires the
+previous active one and changes the `definition_digest`. Agents and the
+coordinator never write the catalog.
+
+A Task can use a catalog check only when its coordination envelope (schema
+version 2) pins the exact `check_key` and `definition_digest` with a trigger:
+`on_request` (the coordinator may ask for it) or `after_integration` (Forge runs
+it after a successful WorkUnit integration). A later version never changes what
+an existing pin authorizes: the pin turns stale (`validation.check_stale_pin`)
+and must be re-authorized. A check without a pin is rejected with
+`validation.check_not_authorized`.
+
+Requests are durable `validation_check_request` rows consumed by the
+`ValidationCheckRunner` inside the Forge process, not in a coordinator turn or
+an Agent daemon. The runner resolves the exact subject (an accepted WorkUnit
+result or the Task integration Workspace), defers while a worker lease is
+active, takes the Workspace execution lock, and runs the pinned command through
+the same core as legacy checks. The resulting `ValidationRun` records
+`run_origin`, `catalog_check_id`, `definition_digest` and the request, with
+identity `catalog:{check_key}@{definition_digest[0..16]}`. If the Workspace
+changes after the request was queued, the request fails with
+`validation.subject_changed` instead of validating a different subject. A
+restart recovers requests left `running`.
+
+A coordinator may request only a check key and definition digest pinned by the current Task authorization; it cannot supply a command, path, or timeout. Failed, error, or stale runs, and regression or inconclusive baseline comparisons, can create a source-bound validation_findings request. The coordinator can request a correction, recheck the same pinned subject, or raise a Human decision. These paths use the same durable budget and replay rules as other coordination requests. Structured Human decisions bind the exact source and evidence, require the expected version to answer, and resume only the matching authorized request.
+
+With `baseline=true` the runner also runs the same command in a runner-owned,
+disposable, detached git worktree at the exact base commit (no Workspace row,
+removed afterwards) and stores an immutable `validation_comparison`. Rust, not
+the model, classifies it: `regression`, `pre_existing_failure`, `fixed`,
+`both_pass` or `inconclusive`. A `pre_existing_failure` does not satisfy a PASS
+requirement.
+
+Gate policy schema version 2 adds `required_checks`
+(`{check_key, definition_digest, required_outcome: passed}`) for
+merge-readiness Gates. Each is resolved by the exact merge candidate (the
+integration Workspace commit and snapshot) and the pinned catalog identity, never
+by "latest"; no matching run is missing evidence and more than one matching run
+is an ambiguity. A `pre_existing_failure` is dispensed only by an exact approved
+Decision whose `policy_ref` is `validation_waiver:{check_key}@{digest[0..16]}`.
+Version 1 policies are unchanged and cannot carry `required_checks`; an unknown
+schema fails closed.
 
 Passing validation does not imply review passed. Validation may run without a
 review and review may be required even when no validation command exists.
@@ -113,8 +158,9 @@ the line's previous approval while preserving every historical revision.
 
 The previous implementation and review units are not reopened or rewritten.
 A later review sees the correction result, not the earlier version. An
-independent reviewer cannot be an Actor that contributed to the reviewed
-result, even if it uses another Role or model label. Exhaustion, missing
+independent Human reviewer cannot have contributed to the reviewed result. An
+Agent may reuse the same saved profile with a fresh Task/role-isolated native
+session; contributor session history and forks cannot cross into review. Exhaustion, missing
 assignment, unresolved disagreement, or expanded scope produces an explicit
 human decision instead of an automatic approval. Rework receipts do not release
 blocks owned by unrelated causes. Historical reviewer and implementer
@@ -124,4 +170,9 @@ Quality requests are durable routing records, not ReviewReports. A
 `delivery_correction` request names an exact ReviewReport source and the
 responsible implementation route; it does not fabricate a reviewer verdict or
 a ValidationRun. Review independence remains enforced by the existing review
-line and the plan-level reviewer-Actor check.
+line, Human contributor checks, and Agent role-session isolation.
+
+
+## Related delivery concepts
+
+See the [coordinator orchestration contract](orchestration.md), [Gate policy](gates.md), and [PR feedback loop](pr-feedback-loop.md).

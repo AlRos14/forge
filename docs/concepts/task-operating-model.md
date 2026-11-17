@@ -9,6 +9,12 @@ Baseline de análisis: `fd599647`. El contrato de runtime actual sigue en
 [Architecture](../architecture.md). La transición se detalla en el
 [plan de implementación](../plans/task-coordination-and-guided-experience.md).
 
+> Estado 0.9.0 (2026-11-17): el carril de verificación del coordinador, las
+> decisiones humanas, el ciclo de feedback de PR y los carriles de fluidez
+> (fallback entre Agents, micro-fix acotado y replan del coordinador) están
+> implementados. Ver [Entrega orquestada](delivery-fluency.md) y
+> [Ciclo de feedback de PR](pr-feedback-loop.md).
+
 ## Objetivo
 
 El usuario expresa un resultado, sus restricciones y el grado de autonomía que
@@ -203,3 +209,21 @@ Preservar usuarios, roles, IDs, tareas y evidencia existentes mediante migracion
 aditivas. No activar automatización retroactivamente. Los modos avanzados y los
 flujos manuales existentes siguen funcionando; cambios públicos deliberados se
 documentan en CHANGELOG. No renombrar Forge ni reintroducir Execution purpose.
+
+## Recommended automatic delivery
+
+Project Workers exposes a recommended workflow with an explicit primary Agent
+coordinator, correction destination and reviewer. Saving configures the existing
+role capabilities and automatic rework routes. New Tasks copy the coordinator as a
+preference, with manual coordination and no provider authority until Start. Start
+authorizes preparation/execution and requests the first coordinator plan in one
+action; the plan still passes deterministic allocation and authority checks.
+Editing a Project template does not rewrite existing Tasks.
+
+New Task defaults allow 32 coordinator turns (preparation and automatic wakes), 64
+quality requests, 16 correction/reassessment rounds, 16 requests per route, and
+16 planned WorkUnits (configurable up to 64). Existing Task budgets are preserved.
+Owners/admins can adjust limits from the Task panel or authorize eight extra
+rounds. Versioned, idempotent updates retain counters and receipts; only
+budget-exhausted work is requeued. Permission, scope, cycle, revocation and Gate
+restrictions remain in force. Extending a limit is never a merge authorization.

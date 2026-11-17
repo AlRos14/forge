@@ -277,6 +277,19 @@ impl From<DbError> for McpToolError {
             DbError::IdempotencyConflict => {
                 Self::new(-32009, "idempotency key conflicts with another request")
             }
+            DbError::ProjectDependencyUnsatisfied => {
+                Self::new(-32009, "project prerequisite is not satisfied")
+                    .with_data(json!({"code":"project_dependency_unsatisfied"}))
+            }
+            DbError::ProjectPlanBatchInactive => {
+                Self::new(-32009, "Project plan batch is not active")
+                    .with_data(json!({"code":"project_plan_batch_inactive"}))
+            }
+            DbError::ProjectPlanApplyIncomplete => Self::new(
+                -32009,
+                "Project plan apply is incomplete; retry the same request",
+            )
+            .with_data(json!({"code":"project_plan_apply_incomplete"})),
             DbError::InvalidTransition => Self::new(-32010, "invalid transition"),
             DbError::InvalidSoftDelete => Self::new(-32010, "invalid soft delete"),
             DbError::AgentAtCapacity => Self::new(-32029, "agent at capacity"),
@@ -288,5 +301,20 @@ impl From<DbError> for McpToolError {
                 "details": error.to_string()
             })),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_plan_apply_incomplete_is_a_retryable_conflict() {
+        let error = McpToolError::from(DbError::ProjectPlanApplyIncomplete);
+        assert_eq!(error.code, -32009);
+        assert_eq!(
+            error.data.expect("typed error code")["code"],
+            "project_plan_apply_incomplete"
+        );
     }
 }

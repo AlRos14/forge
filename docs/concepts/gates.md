@@ -36,6 +36,8 @@ WorkUnit requirements pin the exact WorkUnit version, dependency state,
 Execution result, and, when required, exact WorkUnitIntegration. WorkUnit
 completion is not integration.
 
+Gate policy schema version 2 may include required_checks. Each entry pins an exact check_key and definition_digest with required_outcome=passed. Evaluation resolves the run against the exact candidate Workspace, commit, and snapshot. Missing, stale, failed, ambiguous, or differently pinned runs do not satisfy the requirement; Gate never substitutes a latest run. Schema version 1 keeps its existing behavior and does not accept required_checks.
+
 ## Review policy
 
 The bounded reviewer policy supports one acceptable reviewer, all required
@@ -69,6 +71,10 @@ not perform review, validation, orchestration, or merge work. A current
 unsatisfied GateEvaluation or verified exact retry receipt can direct a
 merge-ready Task back to `active`; an Actor or legacy status transition cannot
 clear merge readiness.
+
+ReviewReport currentness checks the completed producer Execution and its frozen
+`formal_review` capability. The TaskRole's name does not grant or invalidate
+formal review authority.
 
 For merge readiness, ReviewReport and ValidationRun subjects must agree on
 Workspace, commit, and snapshot. WorkUnit-backed merges require an exact

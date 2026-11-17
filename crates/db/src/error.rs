@@ -13,6 +13,9 @@ pub enum DbError {
     #[error("repository has associated tasks")]
     RepoInUse,
 
+    #[error("Project already has a primary repository")]
+    ProjectAlreadyHasPrimaryRepo,
+
     #[error("Project has immutable Releases")]
     ProjectHasReleases,
 
@@ -88,11 +91,41 @@ pub enum DbError {
     #[error("WorkUnit already has a Running Execution")]
     WorkUnitExecutionAlreadyRunning,
 
+    #[error("the validation check pin is stale, retired, or not part of the Task scope")]
+    ValidationCheckStalePin,
+
+    #[error("the validation check is not authorized by the current coordination envelope")]
+    ValidationCheckNotAuthorized,
+
+    #[error("the validation workspace has an active worker WorkspaceLease")]
+    ValidationWorkspaceLeased,
+
+    #[error("the PR external action is not authorized by the frozen admission policy or exact current inputs")]
+    PrActionNotAuthorized,
+
+    #[error("the PR rework supersession is not authorized by the exact triaged request, open admission, and Merging lifecycle")]
+    PrReworkNotAuthorized,
+
+    #[error("the Task already used its coordinator replan limit")]
+    CoordinatorReplanLimitReached,
+
+    #[error("Coordinator turn budget exhausted; a Human may authorize extra rounds")]
+    CoordinationTurnBudgetExhausted,
+
     #[error("Task quality-request budget is exhausted")]
     QualityRequestBudgetExhausted,
 
     #[error("dependency gate")]
     DependencyGate,
+
+    #[error("a Project Task dependency is not accepted and integrated")]
+    ProjectDependencyUnsatisfied,
+
+    #[error("the Project plan batch is paused, revoked, stale, or no longer authorized")]
+    ProjectPlanBatchInactive,
+
+    #[error("the Project plan proposal import is incomplete")]
+    ProjectPlanApplyIncomplete,
 
     #[error("cycle detected")]
     CycleDetected,

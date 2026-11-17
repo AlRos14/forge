@@ -2,6 +2,11 @@ name: Build local Linux bundle
 
 on:
   workflow_dispatch:
+    inputs:
+      run_checks:
+        description: Run focused Rust and web checks on GitHub
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -21,11 +26,25 @@ jobs:
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Build web
         working-directory: web
         run: |
           pnpm install --frozen-lockfile
           pnpm build
+      - name: Check web
+        if: inputs.run_checks
+        working-directory: web
+        run: |
+          pnpm lint
+          pnpm test
+      - name: Browser smoke
+        if: inputs.run_checks
+        working-directory: web
+        run: |
+          pnpm exec playwright install --with-deps chromium
+          pnpm run e2e
       - name: Build binaries
         env:
           FORGE_SKIP_WEB_BUILD: '1'
@@ -45,3 +64,157 @@ jobs:
             forge-linux-x86_64.tar.gz
             forge-linux-x86_64.tar.gz.sha256
           retention-days: 7
+
+  rust-checks:
+    if: inputs.run_checks
+    runs-on: ubuntu-latest
+    env:
+      FORGE_SKIP_WEB_BUILD: '1'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo fmt --all -- --check
+      - id: rust_clippy
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          cargo clippy --locked -p services -p db -p cli-adapters -p api -p api-types -p mcp-server -p executors --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/forge-ci-clippy.log"
+      - name: Upload Clippy diagnostic log
+        if: ${{ failure() && !cancelled() && steps.rust_clippy.outcome == 'failure' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: forge-ci-clippy
+          path: ${{ runner.temp }}/forge-ci-clippy.log
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api-types --lib
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p forge-client --lib daemon_runtime
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p cli-adapters --lib
+      - id: rust_runtime
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          cargo test --locked -p services --lib orchestrator_runtime -- --nocapture 2>&1 | tee "$RUNNER_TEMP/forge-ci-runtime.log"
+      - name: Upload orchestrator runtime diagnostic log
+        if: ${{ failure() && !cancelled() && steps.rust_runtime.outcome == 'failure' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: forge-ci-runtime
+          path: ${{ runner.temp }}/forge-ci-runtime.log
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib task_coordination
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib task_quality
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib coordination_auto_completion
+      - id: rust_task_coordination
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          cargo test --locked -p services --test task_coordination 2>&1 | tee "$RUNNER_TEMP/forge-ci-task-coordination.log"
+      - name: Upload task coordination diagnostic log
+        if: ${{ failure() && !cancelled() && steps.rust_task_coordination.outcome == 'failure' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: forge-ci-task-coordination
+          path: ${{ runner.temp }}/forge-ci-task-coordination.log
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p db --lib pr6_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p db --lib v17
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p db --lib v180_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib fallback_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib micro_fix_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib coordinator_replan_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib validation_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib gate_required_checks_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib coordinator_outputs_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib human_decision
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib pr_github_client_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib pr_feedback_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib scm_credential_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib pr_lifecycle_spike_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib pr_rework_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib pr_external_action_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib pr_rework_watcher_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib rt_validation_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib rt_human_decision_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib rt_external_feedback_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked --no-fail-fast -p db --test pr2_execution_session --test pr5_workunit --test task_coordination_schema --test review_findings_migration --test file_backed_migration --test task_delete_integrity
+      - id: rust_project_plan
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          cargo test --locked -p services --lib project_plan 2>&1 | tee "$RUNNER_TEMP/forge-ci-project-plan.log"
+      - name: Upload project plan diagnostic log
+        if: ${{ failure() && !cancelled() && steps.rust_project_plan.outcome == 'failure' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: forge-ci-project-plan
+          path: ${{ runner.temp }}/forge-ci-project-plan.log
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib project_wide_plain_text_instruction_needs_no_dag_format_or_parser
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --lib project_plan_apply_incomplete_has_a_typed_conflict_code
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib project_plan
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib mcp_project_copilot_lists_only_delegated_management_tools
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib mcp_validation_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib mcp_human_decision_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib mcp_pr_feedback_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib mcp_phase_three_receipt_tools_are_read_only_and_task_scoped
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test coordinator_verification
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test coordinator_verification_pr_loop
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test coordinator_phase3
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test repos_endpoints
+      - id: rust_api_project_plan
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          cargo test --locked -p api --test project_plan --test copilot_mcp_authority 2>&1 | tee "$RUNNER_TEMP/forge-ci-api-project-plan.log"
+      - name: Upload API project plan diagnostic log
+        if: ${{ failure() && !cancelled() && steps.rust_api_project_plan.outcome == 'failure' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: forge-ci-api-project-plan
+          path: ${{ runner.temp }}/forge-ci-api-project-plan.log
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test e2e
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test pr12_public_surface
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked --no-fail-fast -p api --test task_rework --test task_autonomy --test task_dispatch --test work_unit_reviews --test work_unit_artifact_package --test happy_path --test autonomous_delivery_fluency

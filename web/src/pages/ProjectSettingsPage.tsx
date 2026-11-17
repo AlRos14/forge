@@ -32,9 +32,13 @@ import { HooksTab } from '@/components/settings/HooksTab'
 import { MembersTab } from '@/components/settings/MembersTab'
 import { RepoDialog } from '@/components/settings/RepoDialog'
 import { ReposTab } from '@/components/settings/ReposTab'
+import { ValidationChecksTab } from '@/components/settings/ValidationChecksTab'
 import { ProjectWorkersTab } from '@/components/settings/ProjectWorkersTab'
 import { SettingsSection } from '@/components/settings/SettingsSection'
-import { settingsErrorMessage } from '@/components/settings/project-settings-utils'
+import {
+  repoPrProviderConfigFromForm,
+  settingsErrorMessage,
+} from '@/components/settings/project-settings-utils'
 import { emptyRepoForm, type RepoFormState } from '@/components/settings/RepoForm'
 import { Button } from '@/components/ui/button'
 import { CopyReferenceButton } from '@/components/ui/copy-reference-button'
@@ -50,12 +54,14 @@ import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
 import { useAuthStore } from '@/stores/auth'
+import type { CreateRepoRequest } from '@/types/generated'
 
 export type ProjectSettingsTab =
   | 'general'
   | 'repos'
   | 'members'
   | 'workers'
+  | 'validation'
   | 'mcp'
   | 'hooks'
   | 'danger'
@@ -70,6 +76,7 @@ const SETTINGS_TABS: Array<{
   { id: 'repos', label: 'Repos', icon: GitBranch },
   { id: 'members', label: 'Members', icon: Users },
   { id: 'workers', label: 'Team & workflow', icon: Users },
+  { id: 'validation', label: 'Validation checks', icon: Lightning },
   { id: 'mcp', label: 'MCP', icon: Plugs },
   { id: 'hooks', label: 'Hooks', icon: Lightning },
   { id: 'danger', label: 'Danger zone', icon: WarningOctagon, danger: true },
@@ -253,6 +260,8 @@ export function ProjectSettingsPage({
 
           {initialTab === 'workers' && <ProjectWorkersTab projectId={projectId} />}
 
+          {initialTab === 'validation' && <ValidationChecksTab projectId={projectId} />}
+
           {initialTab === 'mcp' && <ProjectMcpTab projectId={projectId} />}
 
           {initialTab === 'hooks' && (
@@ -343,7 +352,7 @@ function ProjectMcpTab({ projectId }: { projectId: string }) {
     setRepoDialogOpen(true)
   }
 
-  const submitRepo = (nextForm = repoForm) => {
+  const submitRepo = async (nextForm = repoForm) => {
     const localPath = nextForm.local_path.trim()
     const remoteUrlInput = nextForm.remote_url.trim()
     if (nextForm.source_mode === 'local' && !localPath) {
@@ -356,24 +365,32 @@ function ProjectMcpTab({ projectId }: { projectId: string }) {
     }
     const remoteUrl =
       nextForm.source_mode === 'local' ? remoteUrlInput || localPath : remoteUrlInput
-    createRepo.mutate(
-      {
-        remote_url: remoteUrl,
-        name: nextForm.name.trim() || null,
-        local_path: nextForm.source_mode === 'local' ? localPath : null,
-        default_branch: nextForm.default_branch.trim() || 'main',
-        work_mode: nextForm.work_mode,
-        pr_provider: nextForm.work_mode === 'pull_request' ? nextForm.pr_provider : null,
-        pr_provider_config: null,
-      },
-      {
-        onError: (error) => toast.error(settingsErrorMessage(error, 'Repository creation failed')),
-        onSuccess: () => {
-          setRepoDialogOpen(false)
-          setRepoForm(emptyRepoForm)
-        },
-      },
-    )
+    const pollingIntervalInput = nextForm.pr_polling_interval_seconds.trim()
+    const pollingInterval = Number(pollingIntervalInput)
+    if (
+      nextForm.work_mode === 'pull_request' &&
+      (!pollingIntervalInput || !Number.isInteger(pollingInterval) || pollingInterval < 1)
+    ) {
+      toast.error('Polling interval must be 1 or greater')
+      return
+    }
+    const body: CreateRepoRequest = {
+      remote_url: remoteUrl,
+      name: nextForm.name.trim() || null,
+      local_path: nextForm.source_mode === 'local' ? localPath : null,
+      default_branch: nextForm.default_branch.trim() || 'main',
+      work_mode: nextForm.work_mode,
+      pr_provider: nextForm.work_mode === 'pull_request' ? nextForm.pr_provider : null,
+      pr_provider_config: repoPrProviderConfigFromForm(nextForm),
+    }
+    try {
+      await createRepo.mutateAsync(body)
+      setRepoDialogOpen(false)
+      setRepoForm(emptyRepoForm)
+      toast.success('Repository saved')
+    } catch (error) {
+      toast.error(settingsErrorMessage(error, 'Repository creation failed'))
+    }
   }
 
   const isLoading = projectQuery.isLoading || reposQuery.isLoading

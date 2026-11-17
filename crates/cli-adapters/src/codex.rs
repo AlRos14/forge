@@ -90,6 +90,16 @@ impl CodexAdapter {
             config.resume_thread_in_place = None;
             config.resume_fallback_prompt = None;
         }
+        if ctx
+            .task_role_capabilities
+            .contains(&executors::TaskRoleCapability::FormalReview)
+        {
+            config.sandbox = Some("read-only".to_owned());
+            config.ask_for_approval = Some("never".to_owned());
+            config.permission_policy = Some(executors::PermissionPolicy::Plan);
+            config.command_overrides.base_command_override = None;
+            config.command_overrides.additional_params = None;
+        }
         config
     }
 
@@ -1057,6 +1067,20 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn formal_review_overrides_unsafe_profile_permissions() {
+        let mut context = crate::test_execution_context(
+            executors::HarnessInvocation::Start,
+            serde_json::json!({"sandbox":"danger-full-access","ask_for_approval":"on-request","base_command_override":"unsafe","additional_params":["--yolo"]}),
+        );
+        context.task_role_capabilities = vec![executors::TaskRoleCapability::FormalReview];
+        let config = CodexAdapter::resolve_config(&context);
+        assert_eq!(config.sandbox.as_deref(), Some("read-only"));
+        assert_eq!(config.ask_for_approval.as_deref(), Some("never"));
+        assert!(config.command_overrides.base_command_override.is_none());
+        assert!(config.command_overrides.additional_params.is_none());
+    }
+
+    #[test]
     fn generic_resume_uses_exact_thread_and_start_clears_stale_thread_fields() {
         let stale = serde_json::json!({
             "resume_thread_id":"old-thread",
@@ -1307,6 +1331,7 @@ mod tests {
             role: "reviewer".to_owned(),
             task_role_capabilities: vec![],
             has_repository_workspace: false,
+            review_read_paths: Vec::new(),
             worktree_path: "/tmp/forge-codex-worktree".to_owned(),
             description: "Review the changes".to_owned(),
             agent_config: json!({}),
@@ -1351,6 +1376,7 @@ mod tests {
             role: "interactive".to_owned(),
             task_role_capabilities: vec![],
             has_repository_workspace: false,
+            review_read_paths: Vec::new(),
             worktree_path: "/tmp/forge-codex-worktree".to_owned(),
             description: "Continue the conversation".to_owned(),
             agent_config: json!({}),
@@ -1405,6 +1431,7 @@ mod tests {
             role: "interactive".to_owned(),
             task_role_capabilities: vec![],
             has_repository_workspace: false,
+            review_read_paths: Vec::new(),
             worktree_path: "/tmp/forge-codex-worktree".to_owned(),
             description: "Continue the conversation".to_owned(),
             agent_config: json!({}),
@@ -1478,6 +1505,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
                 has_repository_workspace: false,
+                review_read_paths: Vec::new(),
                 worktree_path: dir.path().display().to_string(),
                 description: "Do the task".to_owned(),
                 agent_config: json!({
@@ -1538,6 +1566,7 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
                 has_repository_workspace: false,
+                review_read_paths: Vec::new(),
                 worktree_path: dir.path().display().to_string(),
                 description: "Plan the task".to_owned(),
                 agent_config: json!({

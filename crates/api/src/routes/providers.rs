@@ -5,10 +5,11 @@
 use std::collections::HashMap;
 
 use api_types::{
-    AgentProviderCapabilitiesResponse, CliRuntimeEntryResponse, CreateProviderEntryRequest,
-    DetectedCli, DisconnectCredentialResponse, ProviderEntriesResponse, ProviderEntryAgentRef,
-    ProviderEntryResponse, ProviderEntryTestResponse, ProviderRevocationStatus,
-    ProviderUsageResponse, ProviderUsageWindow, RenameProviderEntryRequest,
+    AgentProviderCapabilitiesResponse, CliRuntimeEntryResponse, ConnectScmCredentialRequest,
+    CreateProviderEntryRequest, DetectedCli, DisconnectCredentialResponse, ProviderEntriesResponse,
+    ProviderEntryAgentRef, ProviderEntryResponse, ProviderEntryTestResponse,
+    ProviderRevocationStatus, ProviderUsageResponse, ProviderUsageWindow,
+    RenameProviderEntryRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -21,8 +22,10 @@ use db::{
 use serde::Deserialize;
 use serde_json::Value;
 use services::credential_service::{
-    ConnectApiKeyCredential, CredentialError, CredentialRevocationOutcome, Secret,
+    is_scm_handle, ConnectApiKeyCredential, ConnectScmCredential, CredentialError,
+    CredentialRevocationOutcome, Secret,
 };
+use services::ServiceError;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -35,6 +38,11 @@ pub struct ProviderEntryVersionQuery {
     version: i64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ProviderListQuery {
+    purpose: Option<String>,
+}
+
 pub async fn provider_catalog(
     State(state): State<AppState>,
     _user: AuthenticatedUser,
@@ -45,8 +53,29 @@ pub async fn provider_catalog(
 pub async fn list_providers(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    Query(query): Query<ProviderListQuery>,
 ) -> ApiResult<Json<ProviderEntriesResponse>> {
-    let handles = CredentialHandleRepo::list_credential_handles(&*state.db, &user.user_id).await?;
+    let scm_only = match query.purpose.as_deref() {
+        None => false,
+        Some("scm") => true,
+        Some(_) => {
+            return Err(ApiError::bad_request_with_code(
+                "credential.purpose_invalid",
+                "purpose must be scm when supplied",
+            ));
+        }
+    };
+    let handles = CredentialHandleRepo::list_credential_handles(&*state.db, &user.user_id)
+        .await?
+        .into_iter()
+        .filter(|handle| {
+            let metadata =
+                serde_json::from_str::<Value>(&handle.metadata_json).unwrap_or(Value::Null);
+            let scm = is_scm_handle(handle)
+                && metadata.get("purpose").and_then(Value::as_str) == Some("scm");
+            scm == scm_only
+        })
+        .collect::<Vec<_>>();
     let usage = CredentialHandleRepo::list_credential_usage(&*state.db, &user.user_id).await?;
     let mut usage_by_credential: HashMap<String, Vec<CredentialUsage>> = HashMap::new();
     for row in usage {
@@ -62,7 +91,11 @@ pub async fn list_providers(
             entry_response(handle, usage)
         })
         .collect();
-    let cli_runtimes = cli_runtime_entries(&state, &user.user_id).await?;
+    let cli_runtimes = if scm_only {
+        Vec::new()
+    } else {
+        cli_runtime_entries(&state, &user.user_id).await?
+    };
     Ok(Json(ProviderEntriesResponse {
         items,
         cli_runtimes,
@@ -72,19 +105,41 @@ pub async fn list_providers(
 pub async fn create_provider_entry(
     State(state): State<AppState>,
     user: AuthenticatedUser,
-    Json(request): Json<CreateProviderEntryRequest>,
+    Json(body): Json<Value>,
 ) -> ApiResult<Json<ProviderEntryResponse>> {
-    let provider = provider_name(request.provider);
-    let handle = state
-        .credential_service
-        .connect_api_key_credential(ConnectApiKeyCredential {
-            owner_user_id: user.user_id,
-            provider: provider.to_owned(),
-            label: request.label,
-            credential: Secret::new(request.credential),
-            base_url: request.base_url,
-        })
-        .await?;
+    let github = body.get("provider").and_then(Value::as_str) == Some("github");
+    let handle = if github {
+        let request =
+            serde_json::from_value::<ConnectScmCredentialRequest>(body).map_err(|error| {
+                ApiError::bad_request(format!("invalid SCM credential request: {error}"))
+            })?;
+        state
+            .credential_service
+            .connect_scm_credential(ConnectScmCredential {
+                owner_user_id: user.user_id,
+                provider: "github".to_owned(),
+                label: request.label,
+                credential: Secret::new(request.credential),
+            })
+            .await
+            .map_err(map_scm_credential_error)?
+    } else {
+        let request =
+            serde_json::from_value::<CreateProviderEntryRequest>(body).map_err(|error| {
+                ApiError::bad_request(format!("invalid provider entry request: {error}"))
+            })?;
+        let provider = provider_name(request.provider);
+        state
+            .credential_service
+            .connect_api_key_credential(ConnectApiKeyCredential {
+                owner_user_id: user.user_id,
+                provider: provider.to_owned(),
+                label: request.label,
+                credential: Secret::new(request.credential),
+                base_url: request.base_url,
+            })
+            .await?
+    };
     Ok(Json(entry_response(handle, Vec::new())))
 }
 
@@ -253,6 +308,15 @@ fn provider_name(provider: api_types::AgentProviderId) -> &'static str {
         api_types::AgentProviderId::Gemini => "gemini",
         api_types::AgentProviderId::OpenRouter => "openrouter",
         api_types::AgentProviderId::OpenAiCompatible => "openai_compatible",
+    }
+}
+
+fn map_scm_credential_error(error: ServiceError) -> ApiError {
+    match error {
+        ServiceError::InvalidOperation { message } => {
+            ApiError::bad_request_with_code("credential.invalid", message)
+        }
+        other => other.into(),
     }
 }
 

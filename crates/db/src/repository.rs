@@ -129,6 +129,26 @@ pub trait TaskCoordinationRepo: Send + Sync {
         input: AuthorizeTaskCoordinationInput,
         expected_task_version: i64,
     ) -> Result<TaskCoordinationWrite>;
+    async fn authorize_project_plan_batch_task_coordination(
+        &self,
+        input: AuthorizeTaskCoordinationInput,
+        expected_task_version: i64,
+        binding: ProjectPlanBatchAuthorizationBinding,
+    ) -> Result<TaskCoordinationWrite>;
+    async fn has_project_plan_batch_coordination_authorization(
+        &self,
+        batch_id: &str,
+        task_id: &str,
+        authorization_version: i64,
+        expected_batch_version: i64,
+        expected_graph_version: i64,
+    ) -> Result<bool>;
+    /// Returns whether the Task's current coordination version still has a
+    /// durable Project batch authorization origin, regardless of batch state.
+    async fn has_current_project_plan_batch_coordination_authorization(
+        &self,
+        task_id: &str,
+    ) -> Result<bool>;
     async fn revoke_task_coordination(
         &self,
         input: RevokeTaskCoordinationInput,
@@ -140,6 +160,21 @@ pub trait TaskCoordinationRepo: Send + Sync {
         &self,
         input: CreateTaskCoordinationRequestInput,
     ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)>;
+    async fn create_project_plan_batch_coordination_request(
+        &self,
+        input: CreateTaskCoordinationRequestInput,
+        binding: ProjectPlanBatchRequestBinding,
+    ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)>;
+    /// RT phase 2: create an `external_feedback` request (optionally Project
+    /// batch-bound with the `ExternalFeedbackTriage` origin, which alone may
+    /// target a `merging` Task) with its exact <= 20 item set in the same
+    /// transaction as the budget charge and the request event.
+    async fn create_external_feedback_coordination_request(
+        &self,
+        input: CreateTaskCoordinationRequestInput,
+        binding: Option<ProjectPlanBatchRequestBinding>,
+        entries: Vec<ExternalFeedbackSetEntry>,
+    ) -> Result<(TaskCoordinationRequest, Option<DomainEvent>)>;
     async fn get_task_coordination_request(
         &self,
         id: &str,
@@ -149,6 +184,13 @@ pub trait TaskCoordinationRepo: Send + Sync {
         task_id: &str,
         idempotency_key: &str,
     ) -> Result<Option<TaskCoordinationRequest>>;
+    async fn is_project_plan_batch_coordination_request(&self, request_id: &str) -> Result<bool>;
+    /// Returns None for a manual request, otherwise running, paused, or
+    /// inactive after revalidating the durable batch/request/authorization link.
+    async fn project_plan_batch_coordination_request_state(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<String>>;
     async fn link_task_coordination_request_wake(
         &self,
         request_id: &str,
@@ -417,6 +459,13 @@ pub trait OrchestratorWakeRepo: Send + Sync {
     /// Insert one obligation for the exact source event, TaskRole, and Actor.
     /// A uniqueness hit is an idempotent replay and returns `false`.
     async fn admit_orchestrator_wake(&self, input: CreateOrchestratorWake) -> Result<bool>;
+    /// Insert an autonomy-limit wake only while its exact coordination
+    /// authorization remains current and is not owned by a Project batch.
+    async fn admit_task_autonomy_orchestrator_wake(
+        &self,
+        input: CreateOrchestratorWake,
+        expected_authorization_version: i64,
+    ) -> Result<bool>;
     async fn claim_orchestrator_wake(
         &self,
         input: ClaimOrchestratorWake,
@@ -1081,6 +1130,7 @@ pub enum ProviderStartClaim {
     AuthorityLost,
     TaskCancelled,
     TaskPaused,
+    ProjectPlanBatchPaused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1630,6 +1680,14 @@ pub trait ProjectHookRunRepo: Send + Sync {
 #[async_trait]
 pub trait RepoRepo: Send + Sync {
     async fn create(&self, input: CreateRepo) -> Result<Repo>;
+    /// Create the Project's primary Repo and its optional PR provider config
+    /// atomically. A concurrent primary Repo creation returns
+    /// `DbError::ProjectAlreadyHasPrimaryRepo` without leaving partial rows.
+    async fn create_primary_with_pr_provider_config(
+        &self,
+        input: CreateRepo,
+        provider_config: Option<CreatePrProviderConfig>,
+    ) -> Result<Repo>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Repo>>;
     async fn list_by_project(&self, project_id: &str, page: PageRequest) -> Result<Page<Repo>>;
     async fn update(&self, input: UpdateRepo) -> Result<Repo>;
@@ -1641,6 +1699,26 @@ pub trait PrProviderConfigRepo: Send + Sync {
     async fn create(&self, input: CreatePrProviderConfig) -> Result<PrProviderConfig>;
     async fn get_by_repo_id(&self, repo_id: &str) -> Result<Option<PrProviderConfig>>;
     async fn update(&self, input: UpdatePrProviderConfig) -> Result<PrProviderConfig>;
+    /// Set (`Some`) or clear (`None`) the GitHub credential reference (V173).
+    /// The handle must be a configured `provider = 'github'` handle owned by
+    /// `owner_user_id`; otherwise the guard rejects the write
+    /// (`DbError::Check`/database error). Advances `updated_at` (the config
+    /// revision), so previously issued admissions keep their frozen copy.
+    async fn set_credential(
+        &self,
+        id: &str,
+        credential: Option<PrProviderCredentialRef>,
+        updated_at: &str,
+    ) -> Result<PrProviderConfig>;
+    /// Replace the feedback policy JSON (schema_version 1, validated by a
+    /// trigger). Advances `updated_at`; never alters issued admissions.
+    async fn set_feedback_policy(
+        &self,
+        id: &str,
+        expected_updated_at: Option<&str>,
+        policy_json: &str,
+        updated_at: &str,
+    ) -> Result<PrProviderConfig>;
     async fn delete(&self, id: &str) -> Result<()>;
 }
 
@@ -1823,6 +1901,8 @@ pub struct CreatePrProviderConfig {
     pub base_url: Option<String>,
     pub polling_interval_seconds: i64,
     pub token_secret_ref: Option<String>,
+    pub credential_handle_id: Option<String>,
+    pub credential_owner_user_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2729,4 +2809,488 @@ pub trait SystemSettingRepo: Send + Sync {
     async fn set_setting(&self, key: &str, value: &str, updated_at: &str) -> Result<()>;
     async fn list_settings(&self) -> Result<Vec<(String, String)>>;
     async fn delete_setting(&self, key: &str) -> Result<()>;
+}
+
+/// Versioned validation check catalog (V171). Rows are immutable except
+/// `active -> retired`; a new version is a new row.
+#[async_trait]
+pub trait ValidationCatalogRepo: Send + Sync {
+    /// Assign the next exact version, compute `definition_digest`
+    /// (`validation_check_definition_digest`), retire the previous active
+    /// version and insert the new one in one `BEGIN IMMEDIATE` transaction.
+    async fn publish_validation_check_definition(
+        &self,
+        input: PublishValidationCheckDefinition,
+    ) -> Result<ValidationCheckDefinition>;
+    /// `expected_state` must be `Active`; a definition that is no longer active
+    /// returns `DbError::VersionConflict`.
+    async fn retire_validation_check_definition(
+        &self,
+        id: &str,
+        expected_state: ValidationCheckState,
+        retired_at: &str,
+    ) -> Result<ValidationCheckDefinition>;
+    async fn get_validation_check_definition(
+        &self,
+        id: &str,
+    ) -> Result<Option<ValidationCheckDefinition>>;
+    async fn get_active_validation_check_definition(
+        &self,
+        project_id: &str,
+        repo_id: Option<&str>,
+        check_key: &str,
+    ) -> Result<Option<ValidationCheckDefinition>>;
+    async fn list_validation_check_definitions(
+        &self,
+        project_id: &str,
+        repo_id: Option<&str>,
+        state: Option<ValidationCheckState>,
+        page: &PageRequest,
+    ) -> Result<Page<ValidationCheckDefinition>>;
+}
+
+/// Queued/claimed/terminal check requests (V171). Transitions are guarded by
+/// `expected_version` and return `DbError::VersionConflict` on a stale write.
+#[async_trait]
+pub trait ValidationCheckRequestRepo: Send + Sync {
+    /// Insert queued, or return the identical existing row for the same
+    /// `idempotency_key` (`created == false`, no second event). A key bound to a
+    /// different exact subject is `DbError::IdempotencyConflict`.
+    async fn create_validation_check_request(
+        &self,
+        input: CreateValidationCheckRequest,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<ValidationCheckRequestWrite>;
+    async fn transition_validation_check_request(
+        &self,
+        input: TransitionValidationCheckRequest,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<ValidationCheckRequestWrite>;
+    async fn get_validation_check_request(
+        &self,
+        id: &str,
+    ) -> Result<Option<ValidationCheckRequest>>;
+    async fn get_validation_check_request_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<ValidationCheckRequest>>;
+    async fn list_validation_check_requests_by_task(
+        &self,
+        task_id: &str,
+        state: Option<ValidationCheckRequestState>,
+        page: &PageRequest,
+    ) -> Result<Page<ValidationCheckRequest>>;
+    /// Oldest first; used by the runner to claim (`queued`) or recover (`running`).
+    async fn list_validation_check_requests_by_state(
+        &self,
+        state: ValidationCheckRequestState,
+        limit: i64,
+    ) -> Result<Vec<ValidationCheckRequest>>;
+}
+
+#[async_trait]
+pub trait ValidationComparisonRepo: Send + Sync {
+    /// Immutable evidence; one per request. The repository derives
+    /// `classification` and `same_output_digest`. An identical replay returns
+    /// the stored row with `created == false`.
+    async fn create_validation_comparison(
+        &self,
+        input: CreateValidationComparison,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<ValidationComparisonWrite>;
+    async fn get_validation_comparison(&self, id: &str) -> Result<Option<ValidationComparison>>;
+    async fn get_validation_comparison_by_request(
+        &self,
+        check_request_id: &str,
+    ) -> Result<Option<ValidationComparison>>;
+    async fn list_validation_comparisons_by_task(
+        &self,
+        task_id: &str,
+        page: &PageRequest,
+    ) -> Result<Page<ValidationComparison>>;
+}
+
+/// Immutable coordinator decisions over a `validation_findings` request (V172).
+#[async_trait]
+pub trait TaskValidationTriageRepo: Send + Sync {
+    /// Idempotent per `request_id`: an identical `decision_digest` returns the
+    /// stored row, a different one is `DbError::IdempotencyConflict`.
+    async fn insert_task_validation_triage(
+        &self,
+        input: TaskValidationTriage,
+    ) -> Result<TaskValidationTriage>;
+    async fn get_task_validation_triage_by_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<TaskValidationTriage>>;
+    async fn get_task_validation_triage_for_run(
+        &self,
+        validation_run_id: &str,
+        authorization_version: i64,
+    ) -> Result<Option<TaskValidationTriage>>;
+    async fn list_task_validation_triage_by_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<TaskValidationTriage>>;
+}
+
+/// Coordinator replans with the hard limit of
+/// `MAX_COORDINATOR_REPLANS_PER_TASK` per Task (V172).
+#[async_trait]
+pub trait TaskCoordinatorReplanRepo: Send + Sync {
+    /// Assign `ordinal = max + 1` under `BEGIN IMMEDIATE`; beyond the limit
+    /// returns `DbError::CoordinatorReplanLimitReached`.
+    async fn create_coordinator_replan(
+        &self,
+        input: CreateCoordinatorReplan,
+    ) -> Result<TaskCoordinatorReplan>;
+    async fn transition_coordinator_replan(
+        &self,
+        input: TransitionCoordinatorReplan,
+    ) -> Result<TaskCoordinatorReplan>;
+    async fn get_coordinator_replan(&self, id: &str) -> Result<Option<TaskCoordinatorReplan>>;
+    async fn list_coordinator_replans_by_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<TaskCoordinatorReplan>>;
+    async fn list_coordinator_replans_by_task_page(
+        &self,
+        task_id: &str,
+        page: &PageRequest,
+    ) -> Result<Page<TaskCoordinatorReplan>>;
+}
+
+/// Durable evidence for a cross-Agent fallback on one exact WorkUnit attempt.
+#[async_trait]
+pub trait WorkUnitFallbackReceiptRepo: Send + Sync {
+    /// Atomically reallocates the exact open WorkUnit revision, appends its
+    /// allocation event, and creates the immutable fallback receipt.
+    async fn allocate_work_unit_with_fallback_receipt(
+        &self,
+        allocation: AllocateWorkUnit,
+        allocation_event: CreateDomainEvent,
+        receipt: CreateWorkUnitFallbackReceipt,
+    ) -> Result<(WorkUnitFallbackReceipt, DomainEvent)>;
+    async fn create_work_unit_fallback_receipt(
+        &self,
+        input: CreateWorkUnitFallbackReceipt,
+    ) -> Result<WorkUnitFallbackReceipt>;
+    async fn get_work_unit_fallback_receipt_by_origin_execution(
+        &self,
+        origin_execution_id: &str,
+    ) -> Result<Option<WorkUnitFallbackReceipt>>;
+    async fn list_work_unit_fallback_receipts_by_work_unit(
+        &self,
+        work_unit_id: &str,
+    ) -> Result<Vec<WorkUnitFallbackReceipt>>;
+    async fn list_work_unit_fallback_receipts_by_task_page(
+        &self,
+        task_id: &str,
+        page: &PageRequest,
+    ) -> Result<Page<WorkUnitFallbackReceipt>>;
+}
+
+/// Append-only micro-fix identity plus a single pending-to-terminal bounds update.
+#[async_trait]
+pub trait MicroFixReceiptRepo: Send + Sync {
+    /// Assigns the next per-Task ordinal under `BEGIN IMMEDIATE` and enforces
+    /// the hard product limit of `MAX_MICRO_FIX_PER_TASK`.
+    async fn create_micro_fix_receipt(
+        &self,
+        input: CreateMicroFixReceipt,
+    ) -> Result<MicroFixReceipt>;
+    /// Advances `bounds_outcome` exactly once from `pending` to either terminal
+    /// bounds result. A stale or repeated advance returns `DbError::VersionConflict`.
+    async fn advance_micro_fix_receipt_bounds(
+        &self,
+        input: AdvanceMicroFixReceiptBounds,
+    ) -> Result<MicroFixReceipt>;
+    async fn get_micro_fix_receipt(&self, id: &str) -> Result<Option<MicroFixReceipt>>;
+    async fn list_micro_fix_receipts_by_task(&self, task_id: &str) -> Result<Vec<MicroFixReceipt>>;
+    async fn list_micro_fix_receipts_by_task_page(
+        &self,
+        task_id: &str,
+        page: &PageRequest,
+    ) -> Result<Page<MicroFixReceipt>>;
+}
+
+/// Structured human decision requests (V174).
+#[async_trait]
+pub trait HumanDecisionRepo: Send + Sync {
+    /// Insert open, or return the identical existing row for the same exact
+    /// `(source_kind, source_id, authorization_version)` (`created == false`).
+    /// A different question/options/binding for that source is
+    /// `DbError::IdempotencyConflict`.
+    async fn create_human_decision_request(
+        &self,
+        input: CreateHumanDecisionRequest,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<HumanDecisionWrite>;
+    /// `open -> answered`; stale version or a non-open request is
+    /// `DbError::VersionConflict`.
+    async fn answer_human_decision(
+        &self,
+        input: AnswerHumanDecision,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<HumanDecisionWrite>;
+    /// `open -> superseded|cancelled`.
+    async fn close_human_decision(
+        &self,
+        id: &str,
+        expected_version: i64,
+        to_state: HumanDecisionState,
+        updated_at: &str,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<HumanDecisionWrite>;
+    /// Record the exact `human_decision_resume` request once, on an answered row.
+    async fn bind_human_decision_resume_request(
+        &self,
+        id: &str,
+        expected_version: i64,
+        resume_request_id: &str,
+        updated_at: &str,
+    ) -> Result<HumanDecisionRequest>;
+    async fn get_human_decision_request(&self, id: &str) -> Result<Option<HumanDecisionRequest>>;
+    async fn get_human_decision_request_by_source(
+        &self,
+        source_kind: HumanDecisionSourceKind,
+        source_id: &str,
+        authorization_version: Option<i64>,
+    ) -> Result<Option<HumanDecisionRequest>>;
+    async fn list_human_decision_requests_by_task(
+        &self,
+        task_id: &str,
+        state: Option<HumanDecisionState>,
+        page: &PageRequest,
+    ) -> Result<Page<HumanDecisionRequest>>;
+}
+
+/// Immutable external PR feedback ledger, request sets and triage (V173).
+#[async_trait]
+pub trait ExternalFeedbackRepo: Send + Sync {
+    /// Insert each item atomically; the `(admission, provider_item_id,
+    /// body_digest)` identity makes replays no-ops (`created == false`, existing
+    /// row returned). The admission must be the Task's `open` admission whose
+    /// frozen policy has `ingest = true`; otherwise the whole batch is rejected.
+    async fn ingest_external_feedback(
+        &self,
+        items: Vec<CreateExternalFeedbackItem>,
+    ) -> Result<Vec<(ExternalFeedbackItem, bool)>>;
+    async fn get_external_feedback_item(&self, id: &str) -> Result<Option<ExternalFeedbackItem>>;
+    async fn list_external_feedback_items(
+        &self,
+        admission_id: &str,
+        trust_class: Option<ExternalFeedbackTrustClass>,
+        head_state: Option<ExternalFeedbackHeadState>,
+        page: &PageRequest,
+    ) -> Result<Page<ExternalFeedbackItem>>;
+    /// Trusted, current-head items of the admission that no request set has
+    /// consumed yet, oldest first (the next triage candidates).
+    async fn list_unconsumed_trusted_feedback(
+        &self,
+        admission_id: &str,
+        limit: i64,
+    ) -> Result<Vec<ExternalFeedbackItem>>;
+    /// One-way `current -> stale_head` for items whose commented commit differs
+    /// from `current_head_sha`. Returns the number of rows marked.
+    async fn mark_external_feedback_stale_head(
+        &self,
+        admission_id: &str,
+        current_head_sha: &str,
+    ) -> Result<u64>;
+    /// Add the exact (<= 20) set to a `requested` `external_feedback` request.
+    /// Idempotent for identical entries; positions follow the given order. Use
+    /// the `_in_tx` form to commit with the request creation.
+    async fn add_external_feedback_set_items(
+        &self,
+        request_id: &str,
+        task_id: &str,
+        entries: &[ExternalFeedbackSetEntry],
+    ) -> Result<()>;
+    async fn add_external_feedback_set_items_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        request_id: &str,
+        task_id: &str,
+        entries: &[ExternalFeedbackSetEntry],
+    ) -> Result<()>;
+    /// The request's set, in position order.
+    async fn list_external_feedback_set(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ExternalFeedbackItem>>;
+    /// Insert once per `(request, item)`; an identical replay returns the
+    /// existing row, a different decision is `DbError::IdempotencyConflict`.
+    /// Rejects stale authorization/execution/digest (`DbError::VersionConflict`).
+    async fn record_external_feedback_triage(
+        &self,
+        input: CreateExternalFeedbackTriage,
+    ) -> Result<ExternalFeedbackTriage>;
+    async fn record_external_feedback_triage_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: CreateExternalFeedbackTriage,
+    ) -> Result<ExternalFeedbackTriage>;
+    async fn list_external_feedback_triage(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ExternalFeedbackTriage>>;
+    /// Latest decision recorded for the item (any request), if any.
+    async fn latest_external_feedback_triage_for_item(
+        &self,
+        feedback_item_id: &str,
+    ) -> Result<Option<ExternalFeedbackTriage>>;
+    /// Record the real per-item disposition (V175) next to the V173 triage
+    /// row `input.triage_id` (write both in ONE transaction; the legacy mapping
+    /// is derived from the disposition). Idempotent per `(request, item)`: an
+    /// identical replay returns the existing row, a different one is
+    /// `DbError::IdempotencyConflict`.
+    async fn record_external_feedback_disposition(
+        &self,
+        input: CreateExternalFeedbackDisposition,
+    ) -> Result<ExternalFeedbackDispositionRecord>;
+    async fn record_external_feedback_disposition_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: CreateExternalFeedbackDisposition,
+    ) -> Result<ExternalFeedbackDispositionRecord>;
+    /// The request's dispositions, in item-set order.
+    async fn list_external_feedback_dispositions(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ExternalFeedbackDispositionRecord>>;
+    /// Set-once link to the `human_decision_request` of a `propose_task` or
+    /// `human` item. A different earlier link is `DbError::IdempotencyConflict`.
+    async fn bind_external_feedback_disposition_decision(
+        &self,
+        disposition_id: &str,
+        human_decision_id: &str,
+    ) -> Result<ExternalFeedbackDispositionRecord>;
+    /// Set-once link to the follow-up Task of an approved `propose_task`.
+    async fn bind_external_feedback_disposition_followup(
+        &self,
+        disposition_id: &str,
+        followup_task_id: &str,
+    ) -> Result<ExternalFeedbackDispositionRecord>;
+}
+
+/// Non-destructive pause of an open remote PR admission for same-PR rework
+/// (V175, D3'). These are the only paths that write `pr_rework_supersession`
+/// and the admission pause marker.
+#[async_trait]
+pub trait PrReworkRepo: Send + Sync {
+    /// ONE caller-owned transaction (use `begin_with("BEGIN IMMEDIATE")`):
+    /// verifies the triaged `external_feedback` request (>= 1 `extend_task`),
+    /// the Task's `Merging` lifecycle and its `running` + `remote_waiting`
+    /// TaskMerge with an `open` admission, appends `pr.admission_superseded`,
+    /// inserts the receipt, marks the admission, abandons the TaskMerge and
+    /// moves the Task `Merging -> Blocked` (`pr_feedback_rework`). The PR is
+    /// not touched. Idempotent per TaskMerge (an existing receipt for the same
+    /// request is returned with `created == false`). Rejects with
+    /// `DbError::PrReworkNotAuthorized` / `DbError::VersionConflict`.
+    async fn supersede_admission_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: SupersedeAdmission,
+    ) -> Result<SupersedeAdmissionWrite>;
+    async fn create_supersession(
+        &self,
+        input: SupersedeAdmission,
+    ) -> Result<SupersedeAdmissionWrite>;
+    async fn get_supersession(&self, id: &str) -> Result<Option<PrReworkSupersession>>;
+    async fn get_supersession_by_task_merge(
+        &self,
+        task_merge_operation_id: &str,
+    ) -> Result<Option<PrReworkSupersession>>;
+    /// The Task's single `open` supersession, if any.
+    async fn get_open_supersession_by_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<PrReworkSupersession>>;
+    /// The Task's most recent supersession in any state.
+    async fn get_latest_supersession_by_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<PrReworkSupersession>>;
+    async fn list_supersessions_by_task(
+        &self,
+        task_id: &str,
+        page: &PageRequest,
+    ) -> Result<Page<PrReworkSupersession>>;
+    /// Supersessions in `state` (recovery / watcher sweeps), oldest first.
+    async fn list_supersessions_in_state(
+        &self,
+        state: PrReworkState,
+        limit: i64,
+    ) -> Result<Vec<PrReworkSupersession>>;
+    /// Version-guarded `open -> readmitted|remote_merged|remote_closed|abandoned`
+    /// and `remote_merged -> abandoned`; all other edges are rejected by
+    /// trigger. Idempotent when the receipt already is in `to_state` with the
+    /// same links.
+    async fn transition_supersession(
+        &self,
+        input: TransitionPrReworkSupersession,
+    ) -> Result<PrReworkSupersession>;
+    async fn transition_supersession_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: TransitionPrReworkSupersession,
+    ) -> Result<PrReworkSupersession>;
+}
+
+/// `push_update` / `post_comment` actions against the admitted remote PR (V173).
+/// All transitions are version-guarded and enforced by triggers; a stale
+/// version, a non-open admission, an exclusion by a running integration
+/// operation or a policy mismatch is rejected atomically.
+#[async_trait]
+pub trait PrExternalActionRepo: Send + Sync {
+    /// Idempotent by `idempotency_key`: an identical existing action returns
+    /// `created == false`; a different one is `DbError::IdempotencyConflict`.
+    /// Only the Task's `open` admission with a frozen policy can host actions;
+    /// `automatic` requires the frozen policy to say `automatic` for the kind.
+    async fn create_pr_external_action(
+        &self,
+        input: CreatePrExternalAction,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<PrExternalActionWrite>;
+    /// Attach the collaborative Proposal (`target_kind = 'pr_external_action'`,
+    /// `target_id = action.id`) once, while `proposed`.
+    async fn attach_pr_external_action_proposal(
+        &self,
+        id: &str,
+        expected_version: i64,
+        proposal_id: &str,
+        updated_at: &str,
+    ) -> Result<PrExternalAction>;
+    /// Move along the allowed graph:
+    /// proposed -> approved|rejected|abandoned; approved -> running|abandoned;
+    /// running -> succeeded|failed|outcome_unknown|reconciliation_required;
+    /// outcome_unknown -> succeeded|failed|reconciliation_required;
+    /// reconciliation_required -> succeeded|failed|abandoned. Terminal states
+    /// (succeeded, failed, rejected, abandoned) set `finished_at` and are final.
+    /// `running` re-checks the open admission, exclusion and exact Gate inputs.
+    async fn transition_pr_external_action(
+        &self,
+        input: TransitionPrExternalAction,
+        event: Option<CreateDomainEvent>,
+    ) -> Result<PrExternalActionWrite>;
+    async fn get_pr_external_action(&self, id: &str) -> Result<Option<PrExternalAction>>;
+    async fn get_pr_external_action_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<PrExternalAction>>;
+    /// The Task's single open action, if any.
+    async fn get_open_pr_external_action(&self, task_id: &str) -> Result<Option<PrExternalAction>>;
+    async fn list_pr_external_actions_by_task(
+        &self,
+        task_id: &str,
+        state: Option<PrExternalActionState>,
+        page: &PageRequest,
+    ) -> Result<Page<PrExternalAction>>;
+    /// Actions in any of `states` (recovery sweep), oldest first.
+    async fn list_pr_external_actions_in_states(
+        &self,
+        states: &[PrExternalActionState],
+        limit: i64,
+    ) -> Result<Vec<PrExternalAction>>;
 }

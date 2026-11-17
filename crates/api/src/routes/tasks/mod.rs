@@ -1,8 +1,8 @@
 use api_types::{
     AddDependencyRequest, AddRoleMembershipRequest, CreateTaskRequest, CreateTaskRoleRequest,
-    DiffEnvelope, ReorderSubtasksRequest, RoleMembershipResponse, TaskDependency, TaskResponse,
-    TaskRoleResponse, TasksResponse, UpdateRoleMembershipRequest, UpdateTaskRequest,
-    UpdateTaskRoleRequest, WorkspaceResponse,
+    DiffEnvelope, RemoveDependencyRequest, ReorderSubtasksRequest, RoleMembershipResponse,
+    TaskDependency, TaskResponse, TaskRoleResponse, TasksResponse, UpdateRoleMembershipRequest,
+    UpdateTaskRequest, UpdateTaskRoleRequest, WorkspaceResponse,
 };
 use axum::{
     extract::{Path, Query, State},

@@ -1201,13 +1201,19 @@ fn optional_overrides_field(
 pub(super) async fn forge_add_task_dependency(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let params: AddTaskDependencyParams = parse_params(params)?;
-    TaskDependencyRepo::add_dependency(
-        &*state.db,
+    services::project_plan::ProjectPlanService::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+    )
+    .add_dependency_versioned(
         &params.task_id,
         &params.depends_on_id,
-        &now_rfc3339(),
+        authenticated_user(context)?,
+        params.expected_graph_version,
+        &params.idempotency_key,
     )
     .await?;
     Ok(json!({ "task_id": params.task_id, "depends_on_id": params.depends_on_id }))
@@ -1216,10 +1222,21 @@ pub(super) async fn forge_add_task_dependency(
 pub(super) async fn forge_remove_task_dependency(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let params: RemoveTaskDependencyParams = parse_params(params)?;
-    TaskDependencyRepo::remove_dependency(&*state.db, &params.task_id, &params.depends_on_id)
-        .await?;
+    services::project_plan::ProjectPlanService::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+    )
+    .remove_dependency_versioned(
+        &params.task_id,
+        &params.depends_on_id,
+        authenticated_user(context)?,
+        params.expected_graph_version,
+        &params.idempotency_key,
+    )
+    .await?;
     Ok(json!({ "task_id": params.task_id, "depends_on_id": params.depends_on_id }))
 }
 
@@ -1888,6 +1905,7 @@ async fn coordination_overview_value(
         "max_quality_requests": overview.coordination.max_quality_requests,
         "can_authorize": overview.can_authorize,
         "can_request": overview.can_request,
+        "project_plan_batch_scope": overview.project_plan_batch_scope,
         "blockers": overview.blockers.into_iter().map(|blocker| json!({
             "code": blocker.code,
             "message": blocker.message,

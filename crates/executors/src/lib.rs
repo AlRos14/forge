@@ -48,6 +48,8 @@ pub struct ExecutionContext {
     /// Whether this exact Execution has a repository Workspace. CLI adapters
     /// must not run Git operations for isolated non-repository contexts.
     pub has_repository_workspace: bool,
+    /// Exact result Workspace roots authorized by Forge for read-only review.
+    pub review_read_paths: Vec<String>,
     pub worktree_path: String,
     pub description: String,
     pub agent_config: serde_json::Value,

@@ -2,11 +2,16 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 /// The sole management tool set shared by MCP dispatch and native harness
-/// configuration. Task-bound runs omit Project-wide Task listing.
+/// configuration. Task-bound runs omit Project-wide Task listing and plan tools.
 pub const PROJECT_COPILOT_MCP_TOOLS: &[&str] = &[
     "forge_get_project",
     "forge_list_tasks",
     "forge_get_task",
+    "forge_get_project_plan",
+    "forge_propose_project_plan",
+    "forge_apply_project_plan",
+    "forge_list_project_repo_tree",
+    "forge_read_project_repo_file",
     "forge_list_task_roles",
     "forge_list_task_artifacts",
     "forge_list_executions",

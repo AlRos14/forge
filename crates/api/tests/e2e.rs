@@ -179,12 +179,13 @@ async fn add_dependency_succeeds() {
     let app = test_app().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let (task_id, depends_on_id) = create_task_pair(&app, &project_id).await;
+    let graph_version = project_graph_version(&app, &project_id).await;
 
     let response = raw_json_request(
         &app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/dependencies"),
-        json!({ "depends_on_id": depends_on_id }),
+        json!({ "depends_on_id": depends_on_id, "expected_graph_version": graph_version, "idempotency_key": "add-dependency" }),
     )
     .await;
 
@@ -196,12 +197,13 @@ async fn add_dependency_cycle_returns_unprocessable_entity() {
     let app = test_app().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let (task_id, depends_on_id) = create_task_pair(&app, &project_id).await;
+    let graph_version = project_graph_version(&app, &project_id).await;
 
     let response = raw_json_request(
         &app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/dependencies"),
-        json!({ "depends_on_id": depends_on_id }),
+        json!({ "depends_on_id": depends_on_id, "expected_graph_version": graph_version, "idempotency_key": "add-dependency" }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
@@ -210,7 +212,7 @@ async fn add_dependency_cycle_returns_unprocessable_entity() {
         &app,
         Method::POST,
         &format!("/api/v1/tasks/{depends_on_id}/dependencies"),
-        json!({ "depends_on_id": task_id }),
+        json!({ "depends_on_id": task_id, "expected_graph_version": graph_version + 1, "idempotency_key": "add-cycle" }),
     )
     .await;
     assert_eq!(cycle_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -221,20 +223,22 @@ async fn remove_dependency_succeeds() {
     let app = test_app().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let (task_id, depends_on_id) = create_task_pair(&app, &project_id).await;
+    let graph_version = project_graph_version(&app, &project_id).await;
 
     let response = raw_json_request(
         &app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/dependencies"),
-        json!({ "depends_on_id": depends_on_id }),
+        json!({ "depends_on_id": depends_on_id, "expected_graph_version": graph_version, "idempotency_key": "add-dependency" }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = raw_empty_request(
+    let response = raw_json_request(
         &app,
         Method::DELETE,
         &format!("/api/v1/tasks/{task_id}/dependencies/{depends_on_id}"),
+        json!({ "expected_graph_version": graph_version + 1, "idempotency_key": "remove-dependency" }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -305,12 +309,13 @@ async fn list_dependencies_returns_task_dependencies() {
     let app = test_app().await;
     let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let (task_id, depends_on_id) = create_task_pair(&app, &project_id).await;
+    let graph_version = project_graph_version(&app, &project_id).await;
 
     let response = raw_json_request(
         &app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/dependencies"),
-        json!({ "depends_on_id": depends_on_id }),
+        json!({ "depends_on_id": depends_on_id, "expected_graph_version": graph_version, "idempotency_key": "add-dependency" }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
@@ -744,6 +749,17 @@ async fn create_task_pair(app: &Router, project_id: &str) -> (String, String) {
     )
     .await;
     (first.id, second.id)
+}
+
+async fn project_graph_version(app: &Router, project_id: &str) -> i64 {
+    let graph: Value = empty_request(
+        app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/plan"),
+        StatusCode::OK,
+    )
+    .await;
+    graph["version"].as_i64().expect("Project graph version")
 }
 
 async fn create_and_allocate_work_unit(

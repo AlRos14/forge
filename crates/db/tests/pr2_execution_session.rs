@@ -2003,3 +2003,85 @@ async fn historical_session_migration_groups_only_coherent_identity() {
     assert_eq!(actor_issue_count, 2);
     let _ = fs::remove_dir_all(migration_dir);
 }
+
+#[tokio::test]
+async fn same_agent_profile_requires_fresh_sessions_across_roles_and_forks() {
+    let db = database().await;
+    let agent = "role-isolation-agent";
+    let profile = seed_agent(&db, agent, "codex").await;
+    let task = seed_task(&db, "role-isolation").await;
+    let implementation = ExecutionRepo::create(
+        &db,
+        execution_input(
+            "role-implementation",
+            &task,
+            agent,
+            &profile,
+            "codex",
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    ExecutionRepo::record_harness_session_result(
+        &db,
+        &implementation.id,
+        "native-implementation",
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    let mut review = execution_input(
+        "role-review",
+        &task,
+        agent,
+        &profile,
+        "codex",
+        None,
+        None,
+        None,
+    );
+    review.role = "independent-review".to_owned();
+    let independent = ExecutionRepo::create(&db, review.clone())
+        .await
+        .expect("same profile is eligible with a fresh role session");
+    assert_ne!(
+        implementation.harness_session_id,
+        independent.harness_session_id
+    );
+    review.id = "role-review-reuse".into();
+    review.harness_session_id = implementation.harness_session_id.clone();
+    assert!(
+        ExecutionRepo::create(&db, review.clone()).await.is_err(),
+        "implementation session cannot be reused by review"
+    );
+    let now = now_rfc3339();
+    let fork = HarnessSessionRepo::create(
+        &db,
+        CreateHarnessSession {
+            id: "review-fork".into(),
+            agent_id: agent.into(),
+            harness_kind: "codex".into(),
+            external_session_id: None,
+            profile_id: Some(profile),
+            profile_snapshot_json: "{}".into(),
+            capabilities_snapshot_json: "{}".into(),
+            workspace_id: None,
+            status: HarnessSessionStatus::Pending,
+            predecessor_session_id: implementation.harness_session_id,
+            created_at: now.clone(),
+            updated_at: now,
+            last_activity_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    review.id = "role-review-fork".into();
+    review.harness_session_id = Some(fork.id);
+    assert!(
+        ExecutionRepo::create(&db, review).await.is_err(),
+        "forking implementation history does not create an independent review context"
+    );
+}

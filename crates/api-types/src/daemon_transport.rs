@@ -117,6 +117,9 @@ pub struct ExecutionStartParams {
     pub role: String,
     #[serde(default)]
     pub task_role_capabilities: Vec<crate::TaskRoleCapability>,
+    /// Read-only result roots derived from the exact persisted review subject.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_read_paths: Vec<String>,
     pub workspace_path: String,
     pub executor_type: String,
     #[ts(type = "unknown")]
@@ -366,6 +369,7 @@ mod tests {
             execution_id: "execution-1".to_owned(),
             role: "coder".to_owned(),
             task_role_capabilities: vec![],
+            review_read_paths: Vec::new(),
             workspace_path: "/tmp/worktree".to_owned(),
             executor_type: "codex".to_owned(),
             executor_config: serde_json::json!({"model":"test"}),
@@ -476,6 +480,7 @@ mod tests {
             execution_id: "execution-1".to_owned(),
             role: "worker".to_owned(),
             task_role_capabilities: vec![],
+            review_read_paths: Vec::new(),
             workspace_path: "/work".to_owned(),
             executor_type: "codex".to_owned(),
             executor_config: serde_json::json!({"executor_type":"codex","config":{}}),

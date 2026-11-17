@@ -263,13 +263,26 @@ impl From<ServiceError> for ApiError {
             ),
             ServiceError::Conflict(message) => Self::conflict_with_code("conflict", message),
             ServiceError::Coordination { code, message } => {
-                let status = if code.ends_with("not_authorized") {
+                let status = if code.ends_with("not_authorized")
+                    || code == "validation.catalog_forbidden"
+                    || code == "human_decision.authority_required"
+                    || code == "pr_feedback.policy_forbidden"
+                {
                     StatusCode::FORBIDDEN
                 } else if code.ends_with("host_unavailable") {
                     StatusCode::SERVICE_UNAVAILABLE
                 } else if code.ends_with("invalid_plan")
                     || code.ends_with("unsupported_plan_item")
                     || code.ends_with("human_turn_unsupported")
+                    || matches!(
+                        code,
+                        "validation.check_unknown"
+                            | "validation.subject_not_resolvable"
+                            | "human_decision.invalid_options"
+                            | "human_decision.evidence_invalid"
+                            | "pr_feedback.extend_out_of_scope"
+                            | "pr_feedback.plan_without_extend"
+                    )
                 {
                     StatusCode::UNPROCESSABLE_ENTITY
                 } else if code.ends_with("budget_exhausted") {
@@ -277,7 +290,12 @@ impl From<ServiceError> for ApiError {
                 } else {
                     StatusCode::CONFLICT
                 };
-                Self { status, code, message, details: None }
+                Self {
+                    status,
+                    code,
+                    message,
+                    details: None,
+                }
             }
             ServiceError::DaemonUnavailable { daemon_id } => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
@@ -480,6 +498,10 @@ impl From<DbError> for ApiError {
                 message: "repository cannot be deleted while Tasks reference it".to_owned(),
                 details: None,
             },
+            DbError::ProjectAlreadyHasPrimaryRepo => Self::conflict_with_code(
+                "project_already_has_primary_repo",
+                "Project already has a primary repository",
+            ),
             DbError::ProjectHasReleases => Self {
                 status: StatusCode::CONFLICT,
                 code: "project_has_releases",
@@ -509,6 +531,18 @@ impl From<DbError> for ApiError {
             DbError::ProjectCopilotRunAuthority => Self::forbidden_with_code(
                 "copilot_authority_lost",
                 "The Project Copilot delegation is no longer valid",
+            ),
+            DbError::ProjectDependencyUnsatisfied => Self::conflict_with_code(
+                "project_dependency_unsatisfied",
+                "A prerequisite Task has not reached accepted, integrated completion",
+            ),
+            DbError::ProjectPlanBatchInactive => Self::conflict_with_code(
+                "project_plan_batch_inactive",
+                "The Project plan batch is not active",
+            ),
+            DbError::ProjectPlanApplyIncomplete => Self::conflict_with_code(
+                "project_plan_apply_incomplete",
+                "Project plan apply is incomplete; retry the same request with its idempotency key",
             ),
             DbError::VersionConflict => Self {
                 status: StatusCode::CONFLICT,
@@ -546,6 +580,10 @@ impl From<DbError> for ApiError {
                 message: "invalid status transition".to_owned(),
                 details: None,
             },
+            DbError::CoordinationTurnBudgetExhausted => Self::conflict_with_code(
+                "coordination.budget_exhausted",
+                "Coordinator turn budget exhausted; a Human may authorize extra rounds",
+            ),
             DbError::AgentAtCapacity => Self {
                 status: StatusCode::CONFLICT,
                 code: "agent_at_capacity",
@@ -598,6 +636,14 @@ impl From<DbError> for ApiError {
                 message: "invalid pagination cursor".to_owned(),
                 details: None,
             },
+            DbError::PrActionNotAuthorized => Self::forbidden_with_code(
+                "pr_action.not_authorized",
+                "the exact PR admission, frozen policy or Decision does not authorize this action",
+            ),
+            DbError::PrReworkNotAuthorized => Self::forbidden_with_code(
+                "pr_rework.not_authorized",
+                "the exact feedback request and PR admission do not authorize this rework",
+            ),
             DbError::Check(message) => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "check_constraint",
@@ -647,6 +693,13 @@ mod tests {
     use services::ServiceError;
 
     #[test]
+    fn project_plan_apply_incomplete_has_a_typed_conflict_code() {
+        let error = ApiError::from(DbError::ProjectPlanApplyIncomplete);
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "project_plan_apply_incomplete");
+    }
+
+    #[test]
     fn work_unit_admission_failures_keep_stable_api_codes() {
         let cases = [
             (
@@ -689,6 +742,25 @@ mod tests {
         let dependency = ApiError::from(ServiceError::from(DbError::DependencyGate));
         assert_eq!(dependency.status, StatusCode::CONFLICT);
         assert_eq!(dependency.code, "dependency_gate");
+
+        for (db_error, code) in [
+            (
+                DbError::ProjectDependencyUnsatisfied,
+                "project_dependency_unsatisfied",
+            ),
+            (
+                DbError::ProjectPlanBatchInactive,
+                "project_plan_batch_inactive",
+            ),
+            (
+                DbError::ProjectPlanApplyIncomplete,
+                "project_plan_apply_incomplete",
+            ),
+        ] {
+            let error = ApiError::from(db_error);
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert_eq!(error.code, code);
+        }
 
         let uncertain = ApiError::from(ServiceError::ExecutionStartUncertain {
             execution_id: "execution-1".to_owned(),

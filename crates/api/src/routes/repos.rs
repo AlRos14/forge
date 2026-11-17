@@ -7,10 +7,12 @@ use axum::{
     Json,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, CreatePrProviderConfig, CreateRepo, PrProviderConfigRepo,
-    ProjectRepo, Repo, RepoRepo, SqliteDb, UpdatePrProviderConfig, UpdateProject, UpdateRepo,
-    WorkMode,
+    new_uuid_v4, now_rfc3339, CreatePrProviderConfig, CreateRepo, CredentialHandleRepo, DbError,
+    PrProviderConfigRepo, ProjectRepo, Repo, RepoRepo, SqliteDb, UpdatePrProviderConfig,
+    UpdateRepo, WorkMode,
 };
+use serde_json::Value;
+use services::{pr_provider_settings::PrProviderSettingsService, ServiceError};
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -23,8 +25,11 @@ pub async fn create_repo(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     user: AuthenticatedUser,
-    Json(request): Json<CreateRepoRequest>,
+    Json(body): Json<Value>,
 ) -> ApiResult<Json<RepoResponse>> {
+    reject_retired_pr_token_fields(&body)?;
+    let request = serde_json::from_value::<CreateRepoRequest>(body)
+        .map_err(|error| ApiError::bad_request(format!("invalid repo request: {error}")))?;
     crate::routes::projects::require_project_admin(&state, &project_id, &user.user_id).await?;
     if request.pr_provider.is_none() && request.pr_provider_config.is_some() {
         return Err(ApiError::bad_request_with_code(
@@ -55,11 +60,57 @@ pub async fn create_repo(
     let name = request
         .name
         .unwrap_or_else(|| repo_name_from_remote_url(&request.remote_url));
+    let credential = if let Some(credential_id) = request
+        .pr_provider_config
+        .as_ref()
+        .and_then(|config| config.credential_id.as_deref())
+    {
+        if request.pr_provider.as_deref() != Some("github") {
+            return Err(ApiError::bad_request_with_code(
+                "repo.pr_provider_credential_invalid",
+                "SCM credential references require pr_provider=github",
+            ));
+        }
+        let credential = state
+            .credential_service
+            .require_owned_entry(&user.user_id, credential_id)
+            .await
+            .map_err(map_repo_credential_error)?;
+        if credential.provider != "github" || credential.credential_method != "api_key" {
+            return Err(ApiError::bad_request_with_code(
+                "repo.pr_provider_credential_invalid",
+                "credential_id must reference a configured GitHub SCM API key owned by the caller",
+            ));
+        }
+        Some(credential)
+    } else {
+        None
+    };
     let now = now_rfc3339();
-    let repo = RepoRepo::create(
+    let repo_id = new_uuid_v4();
+    let provider_config = request.pr_provider.as_ref().map(|provider| {
+        let config = request.pr_provider_config.as_ref();
+        CreatePrProviderConfig {
+            id: new_uuid_v4(),
+            repo_id: repo_id.clone(),
+            provider_type: provider.clone(),
+            base_url: config.and_then(|config| config.base_url.clone()),
+            polling_interval_seconds: config
+                .and_then(|config| config.polling_interval_seconds)
+                .unwrap_or(300),
+            token_secret_ref: None,
+            credential_handle_id: credential.as_ref().map(|handle| handle.id.clone()),
+            credential_owner_user_id: credential
+                .as_ref()
+                .map(|handle| handle.owner_user_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        }
+    });
+    let repo = RepoRepo::create_primary_with_pr_provider_config(
         &*state.db,
         CreateRepo {
-            id: new_uuid_v4(),
+            id: repo_id,
             project_id: project_id.clone(),
             name,
             local_path,
@@ -72,40 +123,16 @@ pub async fn create_repo(
             created_at: now.clone(),
             updated_at: now,
         },
+        provider_config,
     )
-    .await?;
-    if let Some(pr_provider) = &request.pr_provider {
-        let pr_config = request.pr_provider_config.as_ref();
-        let now = now_rfc3339();
-        PrProviderConfigRepo::create(
-            &*state.db,
-            CreatePrProviderConfig {
-                id: new_uuid_v4(),
-                repo_id: repo.id.clone(),
-                provider_type: pr_provider.clone(),
-                base_url: pr_config.and_then(|c| c.base_url.clone()),
-                polling_interval_seconds: pr_config
-                    .and_then(|c| c.polling_interval_seconds)
-                    .unwrap_or(300),
-                token_secret_ref: pr_config.and_then(|c| c.token.clone()),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await?;
-    }
-    ProjectRepo::update(
-        &*state.db,
-        UpdateProject {
-            id: project_id,
-            name: None,
-            settings: None,
-            primary_repo_id: Some(Some(repo.id.clone())),
-            paused_at: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await?;
+    .await
+    .map_err(|error| match error {
+        DbError::ProjectAlreadyHasPrimaryRepo => ApiError::conflict_with_code(
+            "project_already_has_primary_repo",
+            format!("project {project_id} already has a primary repo"),
+        ),
+        other => other.into(),
+    })?;
     Ok(Json(repo_with_provider(&state.db, repo).await?))
 }
 
@@ -142,8 +169,11 @@ pub async fn update_repo(
     State(state): State<AppState>,
     Path(id): Path<String>,
     user: AuthenticatedUser,
-    Json(request): Json<UpdateRepoRequest>,
+    Json(body): Json<Value>,
 ) -> ApiResult<Json<RepoResponse>> {
+    reject_retired_pr_token_fields(&body)?;
+    let request = serde_json::from_value::<UpdateRepoRequest>(body)
+        .map_err(|error| ApiError::bad_request(format!("invalid repo request: {error}")))?;
     let db = &*state.db;
     require_repo_admin(&state, &id, &user).await?;
     let UpdateRepoRequest {
@@ -165,6 +195,64 @@ pub async fn update_repo(
             "pr_provider must not be empty",
         ));
     }
+    let sets_credential = pr_provider_config
+        .as_ref()
+        .and_then(Option::as_ref)
+        .and_then(|config| config.credential_id.as_ref())
+        .is_some_and(Option::is_some);
+    if sets_credential {
+        let effective_provider = match pr_provider.as_ref() {
+            Some(provider) => provider.as_deref().map(str::to_owned),
+            None => PrProviderConfigRepo::get_by_repo_id(db, &id)
+                .await?
+                .map(|config| config.provider_type),
+        };
+        if effective_provider.as_deref() != Some("github") {
+            return Err(ApiError::bad_request_with_code(
+                "repo.pr_provider_credential_invalid",
+                "SCM credential references require pr_provider=github",
+            ));
+        }
+    }
+    if let Some(credential_id) = pr_provider_config
+        .as_ref()
+        .and_then(Option::as_ref)
+        .and_then(|config| config.credential_id.as_ref())
+        .and_then(Option::as_deref)
+    {
+        let credential = state
+            .credential_service
+            .require_owned_entry(&user.user_id, credential_id)
+            .await
+            .map_err(map_repo_credential_error)?;
+        if credential.provider != "github" || credential.credential_method != "api_key" {
+            return Err(ApiError::bad_request_with_code(
+                "repo.pr_provider_credential_invalid",
+                "credential_id must reference a configured GitHub SCM API key owned by the caller",
+            ));
+        }
+    }
+    if pr_provider
+        .as_ref()
+        .and_then(Option::as_ref)
+        .is_some_and(|provider| provider.as_str() != "github")
+    {
+        let clears_credential = pr_provider_config
+            .as_ref()
+            .and_then(Option::as_ref)
+            .and_then(|config| config.credential_id.as_ref())
+            .is_some_and(Option::is_none);
+        if !clears_credential
+            && PrProviderConfigRepo::get_by_repo_id(db, &id)
+                .await?
+                .is_some_and(|config| config.credential_handle_id.is_some())
+        {
+            return Err(ApiError::bad_request_with_code(
+                "repo.pr_provider_credential_invalid",
+                "clear the GitHub SCM credential before changing to a different PR provider",
+            ));
+        }
+    }
     let local_path = normalize_update_local_path(local_path)?;
     let repo = RepoRepo::update(
         db,
@@ -179,17 +267,33 @@ pub async fn update_repo(
         },
     )
     .await?;
-    update_pr_provider_config(db, &repo.id, pr_provider, pr_provider_config).await?;
+    update_pr_provider_config(
+        &state,
+        &repo.id,
+        &user.user_id,
+        pr_provider,
+        pr_provider_config,
+    )
+    .await?;
     Ok(Json(repo_with_provider(db, repo).await?))
 }
 
 async fn repo_with_provider(db: &SqliteDb, repo: Repo) -> ApiResult<RepoResponse> {
     let mut response = repo_response(repo);
     if let Some(config) = PrProviderConfigRepo::get_by_repo_id(db, &response.id).await? {
+        let credential_label = if let Some(credential_id) = config.credential_handle_id.as_deref() {
+            CredentialHandleRepo::get_credential_handle(db, credential_id)
+                .await?
+                .map(|credential| credential.label)
+        } else {
+            None
+        };
         response.pr_provider = Some(config.provider_type.clone());
         response.pr_provider_status = Some(api_types::PrProviderStatus {
             provider_type: config.provider_type,
-            has_token: config.token_secret_ref.is_some(),
+            has_credential: config.credential_handle_id.is_some(),
+            credential_handle_id: config.credential_handle_id,
+            credential_label,
             polling_interval_seconds: config.polling_interval_seconds,
         });
     }
@@ -197,11 +301,13 @@ async fn repo_with_provider(db: &SqliteDb, repo: Repo) -> ApiResult<RepoResponse
 }
 
 async fn update_pr_provider_config(
-    db: &SqliteDb,
+    state: &AppState,
     repo_id: &str,
+    actor_user_id: &str,
     provider: Option<Option<String>>,
     config: Option<Option<api_types::UpdatePrProviderConfigRequest>>,
 ) -> ApiResult<()> {
+    let db = &*state.db;
     let existing = PrProviderConfigRepo::get_by_repo_id(db, repo_id).await?;
     if provider.as_ref().is_some_and(Option::is_none) {
         if config.as_ref().is_some_and(Option::is_some) {
@@ -234,6 +340,22 @@ async fn update_pr_provider_config(
     if provider_type.is_none() && config.is_none() {
         return Ok(());
     }
+    let credential_id = config
+        .as_ref()
+        .and_then(|config| config.credential_id.clone());
+    let effective_provider_type = provider_type.as_deref().or_else(|| {
+        existing
+            .as_ref()
+            .map(|config| config.provider_type.as_str())
+    });
+    if credential_id.as_ref().is_some_and(Option::is_some)
+        && effective_provider_type != Some("github")
+    {
+        return Err(ApiError::bad_request_with_code(
+            "repo.pr_provider_credential_invalid",
+            "SCM credential references require pr_provider=github",
+        ));
+    }
 
     if let Some(existing) = existing {
         PrProviderConfigRepo::update(
@@ -245,7 +367,7 @@ async fn update_pr_provider_config(
                 polling_interval_seconds: config
                     .as_ref()
                     .and_then(|config| config.polling_interval_seconds),
-                token_secret_ref: config.as_ref().and_then(|config| config.token.clone()),
+                token_secret_ref: None,
                 updated_at: now_rfc3339(),
             },
         )
@@ -270,16 +392,63 @@ async fn update_pr_provider_config(
                     .as_ref()
                     .and_then(|config| config.polling_interval_seconds)
                     .unwrap_or(300),
-                token_secret_ref: config
-                    .as_ref()
-                    .and_then(|config| config.token.clone().flatten()),
+                token_secret_ref: None,
+                credential_handle_id: None,
+                credential_owner_user_id: None,
                 created_at: now_rfc3339(),
                 updated_at: now_rfc3339(),
             },
         )
         .await?;
     }
+    if let Some(credential_id) = credential_id {
+        PrProviderSettingsService::new(
+            std::sync::Arc::clone(&state.db),
+            std::sync::Arc::clone(&state.credential_service),
+        )
+        .set_credential(actor_user_id, repo_id, credential_id.as_deref())
+        .await
+        .map_err(map_repo_credential_error)?;
+    }
     Ok(())
+}
+
+fn reject_retired_pr_token_fields(body: &Value) -> ApiResult<()> {
+    fn contains_retired_field(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                object.contains_key("token")
+                    || object.contains_key("token_secret_ref")
+                    || object.values().any(contains_retired_field)
+            }
+            Value::Array(values) => values.iter().any(contains_retired_field),
+            _ => false,
+        }
+    }
+
+    if contains_retired_field(body) {
+        return Err(ApiError::bad_request_with_code(
+            "repo.pr_provider_token_retired",
+            "PR provider tokens must be connected through POST /providers and referenced by credential_id",
+        ));
+    }
+    Ok(())
+}
+
+fn map_repo_credential_error(error: ServiceError) -> ApiError {
+    match error {
+        ServiceError::AuthorizationDenied { message } => {
+            ApiError::forbidden_with_code("repo.pr_provider_forbidden", message)
+        }
+        ServiceError::InvalidOperation { message } => {
+            ApiError::bad_request_with_code("repo.pr_provider_credential_invalid", message)
+        }
+        ServiceError::Db(db::DbError::VersionConflict) => ApiError::conflict_with_code(
+            "repo.pr_provider_version_conflict",
+            "PR provider configuration changed before the credential update committed",
+        ),
+        other => other.into(),
+    }
 }
 
 pub async fn delete_repo(

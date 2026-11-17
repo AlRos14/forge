@@ -1,14 +1,267 @@
 # Changelog
 
-This changelog preserves the source repository's recorded history. The
-`Unreleased` section describes changes in `AlRos14/forge`; historical entries
+This changelog preserves the source repository's recorded history. The 0.9.0
+section describes the current source state of AlRos14/forge; historical entries
 do not assert that this fork published matching artifacts. The workspace source
-version is `0.8.0`. This repository had no published GitHub Releases at the
-PR14 audit on 2026-10-16.
+version is 0.9.0. This repository has no verified published GitHub release as
+of 2026-11-17.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-17
+
+Version 0.9.0 turns Forge into an orchestrated autonomous delivery platform:
+coordinator verification runs deterministic validation and Gates can require
+exact checks; Humans handle explicit decisions; GitHub SCM credentials support
+a PR feedback and rework loop with policy-gated external PR actions; and
+preauthorized cross-Agent fallback, bounded micro-fixes, and coordinator
+replanning extend delivery while keeping merge a Human decision.
+
+### Added
+
+- Add a coordinator verification lane with immutable Project validation-check
+  definitions, exact check pins in coordination envelopes, deterministic runs,
+  optional baseline comparisons, and after-integration checks. Gate policy
+  schema 2 can require a passing run for an exact check key and definition
+  digest.
+- Add structured Human decision requests bound to exact source evidence and
+  coordination requests. Answers are versioned, attributed to the Human, and
+  resume only the matching authorized work.
+- Add GitHub SCM credential handles, repository PR feedback policies, external
+  feedback ingestion and triage, same-PR rework, follow-up Task proposals, and
+  durable external PR action proposals. Feedback, rework, and action receipts
+  are visible through Task-scoped REST, MCP reads, SSE projections, and the
+  web interface.
+- Add coordination envelope v2 preauthorizations for up to three fallback
+  Agents per TaskRole, bounded micro-fixes and their formal reviewer, and
+  coordinator replanning. V180 adds immutable fallback and micro-fix receipts;
+  replan records use the existing V172 ledger.
+- Add optional Project work-packet plans, typed source-bound proposals, and
+  explicit owner/admin batch authorization. Applying a plan does not authorize
+  worker dispatch; batch grants remain scoped to their exact batch.
+- Add Task coordination modes, a read-only coordinator plan turn, exact-digest
+  Human approval, and atomic idempotent materialization of assigned WorkUnits,
+  dependencies, review subjects, and Artifact inputs. Existing Tasks remain in
+  manual mode unless a Human authorizes coordination.
+- Add durable Task quality requests for corrections, specialists, plan
+  revisions, and Human decisions, with exact source links, bounded budgets,
+  replay-safe consumers, and one intervention circuit for Human operations and
+  live Project Copilot runs.
+- Add Project Copilot as a separate Project-scoped assistant with durable
+  conversation and management runs, a run-scoped MCP delegation, and bounded
+  reads from exact Project repository commits. It creates no placeholder Task
+  or worker authority.
+- Add Project role defaults for new Tasks and subtasks. Existing Task teams
+  remain independent when Project defaults change.
+- Extend Task coordination and quality routing with durable typed requests,
+  exact review and validation findings, bounded rework, Human intervention,
+  and replay-safe preparation and dispatch.
+
+### Changed
+
+- Keep review judgment, deterministic ValidationRuns, Gate evaluations,
+  integration, merge, and TaskLifecycle as separate durable facts. Required
+  validation checks resolve against exact subjects and digests; no latest run
+  is substituted.
+- Treat provider feedback as untrusted input. Only items admitted by the
+  repository policy reach coordinator triage; SSE projections omit feedback
+  bodies and credential material.
+- Apply cross-Agent fallback only after an eligible route is exhausted and
+  retry timing is outside the authorized wait bound. Fallback keeps the exact
+  WorkUnit scope and goes through ordinary admission and Provider Start checks.
+- Measure micro-fix diffs against the reviewed result. A correction outside
+  its declared paths or configured bounds returns to ordinary review and
+  triage; every micro-fix requires a fresh formal review and Gate.
+- Classify coordinator replans in Rust against the authorized objective, team,
+  WorkUnits, budgets, repository/path scope, and envelope. Scope or authority
+  changes wait for the exact Human decision before materialization.
+- Keep Project and Task views tied to durable receipts for validation, Human
+  decisions, PR feedback and rework, fallback, micro-fixes, and replans.
+- Remove upstream-era research reports, retired feature specs and the upstream
+  npm bootstrapper (`npx-cli`) with its CI/release jobs; they remain in Git
+  history.
+- Keep TaskLifecycle as the sole aggregate Task progress authority. Dispatch
+  intent, WorkUnit and Execution state, formal review, validation, Gate
+  evaluation, integration, PR actions, and merge remain separate facts.
+- Admit Agents only through the exact WorkUnit assignment, TaskRole capability,
+  current membership, WorkspaceLease, and Provider Start checks. An uncertain
+  provider start is not retried automatically.
+- Use the canonical Project owner and its exact owner membership for Project
+  administration. Owner changes and membership updates are revalidated in the
+  same write transaction.
+
 ### Breaking
+
+- Rust callers constructing CoordinationEnvelope with exhaustive struct
+  literals must initialize the phase-3 fields micro_fix, micro_fix_reviewer,
+  fallback_agents, and allow_coordinator_replan.
+- PR feedback policy GET and PUT now return {policy, updated_at}; updates may
+  carry expected_updated_at for an atomic stale-write check. PR action
+  approve/reject requests carry expected_version. Repository PR configuration
+  references an owned SCM handle with credential_id; PrProviderStatus uses
+  has_credential and may expose the handle ID and label, never the secret.
+- Connect GitHub SCM credentials through POST /providers and reference the
+  owned handle from repository configuration. The retired token and
+  token_secret_ref PR configuration fields are rejected with
+  repo.pr_provider_token_retired.
+- Task coordination request responses include kind and exact nullable source
+  identifiers and digest. Clients must handle triaged as a terminal coordinator
+  decision state, not a review pass or Task acceptance. Review triage is
+  accepted only by its exact review_findings request.
+- Direct Task dependency mutations require expected_graph_version and
+  idempotency_key; DELETE requests also carry those fields in a JSON body.
+  Project-batch coordination grants remain bound to their exact batch and
+  return project_plan_batch_inactive through generic standalone request routes.
+- Task launch uses durable dispatch intent and explicitly prepared WorkUnits.
+  POST /tasks/{id}/executions is retired; use POST
+  /tasks/{id}/dispatch/launch. Execution purpose is no longer part of active
+  REST, MCP, CLI, event, or persistence contracts; historical values remain
+  migration evidence.
+- TaskRole names alone no longer grant formal review, orchestration, or rework
+  authority. Clients must use the versioned capability configuration and
+  exact admission snapshot. Agent review requires isolated Task/role
+  HarnessSessions; Human contributors cannot self-review.
+- Task progress uses TaskLifecycle instead of `task.status`; Task Agent starts
+  use explicit WorkUnits and durable dispatch intent. `POST /tasks/{id}/executions`
+  is retired, and Execution purpose is no longer an active public or persistence
+  contract.
+- Reusable JWT, PAT, OAuth, and daemon credentials cannot be sent in query
+  parameters. REST, MCP, and daemon clients use `Authorization: Bearer`; browser
+  EventSource clients request a short-lived, single-use ticket.
+- Direct Task dependency changes require `expected_graph_version` and
+  `idempotency_key`. Batch-bound coordination grants retain their exact batch
+  origin and cannot be reused through the standalone Task coordination routes.
+
+### Security
+
+- Encrypt GitHub SCM credentials in CredentialService and require both current
+  Project administration and credential ownership when attaching a handle to a
+  repository. Preserve the resolved JWT secret with the database; the
+  credential-encryption key is derived from that secret.
+- Require reusable JWT, PAT, OAuth, and daemon credentials in Authorization:
+  Bearer headers. Browser SSE uses a 30-second single-use ticket; reusable
+  credentials in query parameters are rejected.
+- Resolve current durable user authority for authenticated tokens. Token
+  claims do not preserve stale administrator authority after account changes.
+- Keep PR external actions Human-approved by default. Automatic push or summary
+  actions require an explicit owner/admin repository policy; Forge has no merge
+  action, and merge remains Human-controlled.
+- Keep external PR text, credentials, prompts, paths, and raw context out of
+  public SSE payloads. Project Copilot and coordination turns receive only
+  their scoped tools and evidence.
+- Revalidate current user, Project membership, canonical owner, credential
+  ownership, Agent ownership, and daemon authority at each protected operation;
+  visibility alone does not grant write or execution permission.
+- Run the server container as unprivileged UID/GID 10001 and bind the published
+  host port to loopback by default. Root-owned data migration requires an
+  explicit one-time operator action.
+
+### Detailed entries
+
+The complete entries recorded under Unreleased before the 0.9.0 cut are kept
+verbatim below.
+
+#### Added
+
+- Coordination envelope v2 accepts bounded micro-fix, reviewer, fallback-Agent,
+  and coordinator-replan preauthorizations. V180 adds immutable fallback and
+  micro-fix receipts, including the one-step bounds outcome transition. The
+  dispatcher now applies cross-Agent fallback only after an exhausted route
+  when `retry_at` is absent or exceeds its envelope wait bound, recording an
+  immutable receipt and a public `task.work_unit_fallback` event. Micro-fix
+  corrections now record diff bounds and require a formal review with a fresh
+  Gate. The coordinator can propose a bounded replan; Rust classifies scope and
+  authority changes, requiring an exact Human decision before materialization.
+
+- Phase-3 receipts are available through paginated Task-visible REST and
+  read-only MCP reads. Task details show fallback substitutions and cost
+  classes, micro-fix bounds outcomes, and replan classifications/facts with
+  Human decision links. The coordination view displays the preauthorized
+  fallback chain and micro-fix reviewer cost classes; allowlisted SSE listeners
+  refresh the receipt panels.
+
+- Project repository settings can connect and select GitHub SCM credentials and
+  edit per-repository PR feedback policy. Task details show paginated PR
+  feedback, same-PR rework status, and proposed provider actions for owner/admin
+  decisions. Forge never offers a merge action.
+
+#### Breaking
+
+- Rust callers constructing `services::task_coordination::CoordinationEnvelope`
+  with exhaustive struct literals must initialize the phase-3 fields
+  `micro_fix`, `micro_fix_reviewer`, `fallback_agents`, and
+  `allow_coordinator_replan`.
+
+- PR feedback policy GET and PUT now return `{policy, updated_at}` instead of a
+  bare policy. Clients should send the returned `updated_at` as
+  `expected_updated_at`; the service compares it atomically and returns the
+  existing typed conflict when stale. Approve/reject actions carry
+  `expected_version` through the service to the compare-and-set write.
+  `PrProviderStatus` adds the referenced `credential_handle_id` and display
+  label, never the secret. Repo creation can include
+  `pr_provider_config.credential_id`, stored with the Repo and provider config
+  in the same transaction.
+
+- PR provider credentials now use the SCM credential flow: connect GitHub with
+  `POST /providers`, then reference the owned handle with
+  `pr_provider_config.credential_id`. `PrProviderStatus.has_token` is replaced
+  by `has_credential`. Sending `token` or `token_secret_ref` in repository PR
+  configuration returns `400 repo.pr_provider_token_retired`; remove those
+  fields from clients before updating a repository.
+
+- Task coordination request responses now expose `kind` (`work_unit_plan` or
+  `review_findings`) and exact nullable ReviewReport source identifiers/digest.
+  Clients must handle the new terminal `triaged` request state; it records a
+  coordinator decision, not a passing review or Task acceptance. Review triage
+  output is accepted only by an exact `review_findings` request; generic
+  Orchestrator action responses no longer accept a `review_findings` array.
+
+- Direct Task dependency mutations now use the versioned Project DAG service.
+  `POST /tasks/{id}/dependencies` and the Project DAG MCP add/remove tools require
+  `expected_graph_version` and `idempotency_key`; `DELETE` also requires a JSON
+  body with those fields. Update clients before using the new contract.
+
+- TaskCoordination versions minted by a Project batch require their exact batch
+  origin. `POST /tasks/{id}/coordination/requests` returns
+  `409 project_plan_batch_inactive` for those versions, including after batch
+  revocation or completion. The generic `POST /tasks/{id}/coordination/authorize`
+  also returns `409 project_plan_batch_inactive` while the batch is running or
+  paused. Explicitly revoke the Task authorization or revoke/complete the batch
+  before creating a fresh Human TaskCoordination authorization; the old batch
+  grant becomes stale and the standalone grant does not revive it.
+
+- Human Replan continuations from a Project batch now bind the explicitly
+  supplied plan Artifact to the active authorization and batch. Materialized
+  plans require their exact Task/request/digest/authorization receipt; several
+  plans may remain approved in one authorization, and authority is not selected
+  by latest timestamp. Batch authorization refreshes only the untouched manual
+  default TaskCoordination using the exact coordinator and current team
+  generation; customized Human configuration stays strict.
+
+- Review independence for Agents now requires isolated Task/role HarnessSessions
+  rather than different saved Agent identities. Reusing or forking a contributor
+  session across roles is rejected. Human contributors still cannot self-review.
+- The recommended Project workflow configures automatic correction routes and an
+  explicit primary coordinator. New Tasks copy that preference; Start explicitly
+  authorizes preparation and execution. Existing Tasks and saved Project teams are
+  preserved until edited. New authorizations mediate review findings through the
+  coordinator, who can request correction, independent reassessment, or Human help;
+  the coordinator cannot change a review verdict or bypass a Gate.
+- New Task autonomy defaults are 32 coordinator turns, 64 quality requests,
+  16 correction/reassessment rounds, 16 requests per quality route, and 16 planned
+  WorkUnits. Owners/admins can change limits or grant extra rounds without
+  resetting consumption. Historical Task limits remain unchanged (V162–V166).
+- Daemon `execution.start` carries optional `review_read_paths`, derived only
+  from the exact persisted result/workspace. OpenCode external reads are limited
+  to those roots; the daemon rechecks its registered filesystem root. Missing
+  paths grant no external access. Update the daemon alongside the server.
+- OpenCode reasoning effort uses the installed CLI's `provider/model#variant`
+  syntax and automatic permission mode uses `--auto`. Formal Agent review is
+  read-only with Codex, Claude Code and OpenCode; Claude coordination uses a native tool
+  allowlist. Ordinary WorkUnit assistant output is captured as a Summary Artifact
+  and exact pinned delivery evidence is passed to downstream work. Shell launches
+  validate the same exact inputs while preserving literal command instructions;
+  cognitive handoff prose is never appended to executable Shell commands.
 
 - TaskRole names no longer define formal review, orchestration, or rework
   authority. Use typed `configuration` with the capability catalog and exact
@@ -47,7 +300,44 @@ PR14 audit on 2026-10-16.
   generic Task/WorkUnit prompt. An open WorkUnit with a completed result is
   `awaiting_acceptance` and receives no automatic retry.
 
-### Added
+#### Added
+
+- Phase 1 of coordinator verification (API lane): validation catalog REST
+  (`GET|POST /projects/{id}/validation-checks`, `POST /validation-checks/{id}/retire`),
+  read-only `GET /tasks/{id}/validation-check-requests` and
+  `/validation-comparisons`, human decisions (`GET /tasks/{id}/human-decisions[/{decision_id}]`,
+  `POST .../answer` with `expected_version`), Gate policy schema 2 with
+  `required_checks`, four read-only MCP tools, and public SSE events
+  `task.validation_check_requested|completed`, `task.validation_comparison_recorded`,
+  `task.human_decision_requested|answered|closed`. `ValidationRunResponse` and
+  coordination request responses gain additive fields. Contract:
+  `docs/plans/coordinator-verification-and-pr-loop.md`.
+- Phase 2 of coordinator verification (API lane): GitHub SCM credential
+  connection and repository credential references; PR feedback policy,
+  task-wide feedback/rework/action reads, human approval/rejection routes,
+  three read-only MCP listing tools, and public PR feedback/rework/action SSE
+  projections. API coverage and focused workflow steps are added; local Cargo
+  and web checks were not run under the phase's validation rule. Contract:
+  `docs/plans/coordinator-verification-and-pr-loop.md`.
+- Add an optional Project DAG for work packets, typed proposals with source
+  provenance, explicit owner/admin batch authorization, deterministic dependency
+  admission, and bounded Project Copilot tools for free-form interpretation and
+  commit-pinned repository text. Applying a proposal creates or maps Tasks but
+  does not authorize their dispatch. `project.plan_changed` SSE notifications
+  expose only the Project ID and trigger an authorized graph refresh. Partial
+  Task imports remain blocked with `plan:apply_incomplete`; retries retain the
+  proposal's original graph version and idempotency key, and stale proposals
+  require refresh and review. Task coordination grants minted for a batch stay
+  scoped to it; the generic Task turn route returns
+  `409 project_plan_batch_inactive` for those grants, including after batch
+  revocation or completion. A fresh explicit Task coordination authorization
+  restores the standalone request path. The coordination overview exposes the
+  exact batch scope and suppresses generic `can_request` for batch-bound grants.
+  Increasing `max_turns` does not mint a generic turn or change authorization
+  version: the scheduler retries only the exact budget-exhausted Task in a
+  running batch after revalidating its grant, team, budget, and prerequisites.
+  The Task detail quick action adds eight coordinator turns only; quality and
+  rework limits remain separate and individually editable.
 
 - Add the Task coordination model: versioned Task authorization (`manual`,
   `proposal`, `prepare_and_execute`), a read-only Agent coordination turn over
@@ -144,7 +434,7 @@ PR14 audit on 2026-10-16.
   version checks. Issue integration's explicit `default_implementer` joins the
   copied `implementer` role when present instead of creating a duplicate.
 
-### Security
+#### Security
 
 - Redact credential-like query parameters from MCP configuration responses, reject foreign-origin and tokenized installed URLs as unusable, reject symlinked configuration files, require Project admin for Project MCP config reads/writes, and require a server administrator for `user`/`local` MCP config scopes.
 - Reject reusable JWT, PAT, OAuth, and daemon credentials in `?token=` on REST, MCP, and daemon WebSocket routes. Bearer Authorization is the only reusable credential transport. The browser SSE endpoint now requires a 30-second, single-use ticket from `POST /api/v1/events/ticket`; terminal WebSocket attach tokens remain short-lived and single-use.
@@ -158,7 +448,7 @@ PR14 audit on 2026-10-16.
 - Require authenticated account ownership for daemon registration and Agent routing. `global` daemon visibility no longer grants cross-account execution; ownerless historical daemons remain preserved and ineligible for ordinary accounts. The embedded host shell is restricted to an administrator's Agent and, when the daemon has a verified owner, to that same administrator account. This intentionally breaks implicit multi-account daemon sharing.
 - Require an automatic Orchestrator Agent and its Task Project to share the same owner account. `global` Agent visibility continues to support discovery and TaskRole membership without granting use of another account's Agent daemon; the check runs at Execution admission and again in the transactional Provider Start claim. Cross-account Agent execution grants are not implemented.
 
-### Documentation
+#### Documentation
 
 - Removed the retired Main Agent, Project Agent, and Project OS skills from active
   Codex discovery. Their history remains in Git.
@@ -179,7 +469,15 @@ PR14 audit on 2026-10-16.
   builds remain the supported installation path until this fork publishes a
   verified release. No product rename was selected or applied.
 
-### Fixed
+#### Fixed
+
+- Formal review Executions (`formal_review` capability) may bind to the Task
+  integration workspace to review the exact integrated result before merge;
+  other Executions remain barred from it on WorkUnit Tasks (V170).
+
+- Merge-readiness currentness checks use the exact producer Execution's frozen
+  `formal_review` capability for ReviewReports from custom TaskRoles, matching
+  Gate evaluation and formal review admission.
 
 - Backported the upstream SQLx SQLite dependency-range fix to 0.8.6 and updated
   the bundled SQLite binding to `libsqlite3-sys 0.39.1`, resolving
@@ -289,7 +587,7 @@ PR14 audit on 2026-10-16.
   Start outcome, so the provider request is not treated as a definitive
   rejection or replayed.
 
-### Breaking
+#### Breaking
 
 - REST, MCP, daemon command WebSocket, and SSE clients can no longer authenticate with `?token=`. Use `Authorization: Bearer`; EventSource clients must request `POST /api/v1/events/ticket`. `forge-ctl mcp install` writes a Bearer header instead of a tokenized URL, and legacy tokenized MCP configurations must be reinstalled. Project/local installs now require an environment reference; `--token` is accepted only for `user` scope, and existing project/local configs with literal tokens must be reinstalled. JWT payloads no longer carry `is_admin`; authorization reads the current user row.
 - `/api/v1/config/mcp` with `scope=project` now requires a non-empty `project_id`. The previous cwd fallback is removed; callers must name the Project explicitly.
@@ -554,7 +852,7 @@ PR14 audit on 2026-10-16.
   no way to change their model at all from `/agents`; only the removed
   launch-dialog checkbox could touch it).
 
-### Fixed
+#### Fixed
 
 - A successful repository Execution whose Harness omits `after_sha` now records
   the exact clean Workspace HEAD. If the Workspace remains dirty, Forge marks
@@ -602,7 +900,7 @@ PR14 audit on 2026-10-16.
   clearing such metadata no longer publishes `task.unblocked` while the
   lifecycle remains blocked.
 
-### Added
+#### Added
 
 - Plan PR4 adds generic, Task-scoped Artifact, Message, Handoff, Proposal, and
   multi-decider Decision records, with additive V090 persistence, atomic durable
@@ -644,7 +942,7 @@ PR14 audit on 2026-10-16.
   agent's identity, scope, and boundaries, includes the bounded portfolio
   projection, and is recorded in the turn's context manifest.
 
-### Changed
+#### Changed
 
 - Cursor's periodic `/usage` poll no longer runs inside an active Execution.
   Its PTY child can leave the wrapper's process group, so Forge cannot prove
@@ -682,7 +980,7 @@ PR14 audit on 2026-10-16.
   projections remain operational signals on execution surfaces and workflow
   gates, not a second plan authority in the overview.
 
-### Fixed
+#### Fixed
 
 - Large Cursor control prompts no longer pass through OS process arguments or
   the tracked worktree. Small prompts retain direct transport; large prompts

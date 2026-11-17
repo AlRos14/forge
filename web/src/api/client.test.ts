@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { apiFetch } from './client'
+import { addDependency, apiFetch, removeDependency } from './client'
 
 describe('apiFetch', () => {
   afterEach(() => {
@@ -62,5 +62,31 @@ describe('apiFetch', () => {
     )
 
     await expect(apiFetch<{ ok: boolean }>('/status')).resolves.toEqual({ ok: true })
+  })
+
+  it('fences Task dependency writes with the current Project graph version and replay key', async () => {
+    const fetchMock = vi.spyOn(window, 'fetch').mockResolvedValue(
+      new Response(null, { status: 204, statusText: 'No Content' }),
+    )
+
+    await addDependency('task id', 'prerequisite id', 4, 'add-key')
+    await removeDependency('task id', 'prerequisite id', 5, 'remove-key')
+
+    const addCall = fetchMock.mock.calls[0]
+    expect(String(addCall?.[0])).toContain('/tasks/task%20id/dependencies')
+    expect(JSON.parse((addCall?.[1] as RequestInit).body as string)).toEqual({
+      depends_on_id: 'prerequisite id',
+      expected_graph_version: 4,
+      idempotency_key: 'add-key',
+    })
+    const removeCall = fetchMock.mock.calls[1]
+    expect((removeCall?.[1] as RequestInit).method).toBe('DELETE')
+    expect(String(removeCall?.[0])).toContain(
+      '/tasks/task%20id/dependencies/prerequisite%20id',
+    )
+    expect(JSON.parse((removeCall?.[1] as RequestInit).body as string)).toEqual({
+      expected_graph_version: 5,
+      idempotency_key: 'remove-key',
+    })
   })
 })

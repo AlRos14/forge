@@ -455,6 +455,15 @@ async fn task_and_execution_routes_enforce_project_visibility() {
     .await
     .expect("create execution fixture");
 
+    let graph: api_types::ProjectPlanGraphResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}/plan", project_a.id),
+        &token_a,
+        StatusCode::OK,
+    )
+    .await;
+
     for (method, path, body) in [
         (Method::GET, format!("/api/v1/tasks/{}", task_a.id), None),
         (
@@ -476,7 +485,11 @@ async fn task_and_execution_routes_enforce_project_visibility() {
         (
             Method::POST,
             format!("/api/v1/tasks/{}/dependencies", task_a.id),
-            Some(json!({"depends_on_id": task_b.id})),
+            Some(json!({
+                "depends_on_id": task_b.id,
+                "expected_graph_version": graph.version,
+                "idempotency_key": "denied-task-dependency"
+            })),
         ),
         (
             Method::GET,
@@ -818,6 +831,15 @@ async fn repository_provider_settings_are_readable_and_patchable_without_secret_
         StatusCode::OK,
     )
     .await;
+    let scm_credential = common::create_provider_entry(
+        &harness.app,
+        &token,
+        "github",
+        "provider test credential",
+        "test-secret",
+        "",
+    )
+    .await;
     let created: RepoResponse = common::json_request_with_bearer(
         &harness.app,
         Method::POST,
@@ -827,7 +849,7 @@ async fn repository_provider_settings_are_readable_and_patchable_without_secret_
             "remote_url": "https://example.com/acme/provider.git",
             "work_mode": "pull_request",
             "pr_provider": "github",
-            "pr_provider_config": {"polling_interval_seconds": 300, "token": "test-secret"}
+            "pr_provider_config": {"polling_interval_seconds": 300}
         }),
         StatusCode::OK,
     )
@@ -837,10 +859,44 @@ async fn repository_provider_settings_are_readable_and_patchable_without_secret_
         .pr_provider_status
         .as_ref()
         .expect("provider status");
-    assert!(status.has_token);
+    assert!(!status.has_credential);
     assert_eq!(status.polling_interval_seconds, 300);
-    assert!(!serde_json::to_string(&created)
+    let updated: RepoResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/repos/{}", created.id),
+        &token,
+        json!({
+            "pr_provider_config": {"credential_id": scm_credential.id.clone()}
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        updated
+            .pr_provider_status
+            .as_ref()
+            .expect("provider status")
+            .has_credential
+    );
+    assert!(!serde_json::to_string(&updated)
         .expect("RepoResponse serializes")
+        .contains("test-secret"));
+
+    let scm_entries: api_types::ProviderEntriesResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        "/api/v1/providers?purpose=scm",
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(scm_entries
+        .items
+        .iter()
+        .any(|entry| entry.id == scm_credential.id));
+    assert!(!serde_json::to_string(&scm_entries)
+        .expect("SCM provider response serializes")
         .contains("test-secret"));
 
     let updated: RepoResponse = common::json_request_with_bearer(
@@ -859,8 +915,8 @@ async fn repository_provider_settings_are_readable_and_patchable_without_secret_
     assert_eq!(updated.pr_provider.as_deref(), Some("github"));
     let status = updated.pr_provider_status.expect("updated provider status");
     assert!(
-        status.has_token,
-        "omitting token preserves the saved credential"
+        status.has_credential,
+        "omitting credential_id preserves the saved credential"
     );
     assert_eq!(status.polling_interval_seconds, 90);
 

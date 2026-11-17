@@ -92,9 +92,23 @@ pub struct TaskDependency {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
 pub struct AddDependencyRequest {
     pub depends_on_id: String,
+    #[ts(type = "number")]
+    pub expected_graph_version: i64,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct RemoveDependencyRequest {
+    #[ts(type = "number")]
+    pub expected_graph_version: i64,
+    pub idempotency_key: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
@@ -239,7 +253,7 @@ pub struct PrProviderConfigRequest {
     #[ts(optional = nullable)]
     pub polling_interval_seconds: Option<i64>,
     #[ts(optional = nullable)]
-    pub token: Option<String>,
+    pub credential_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -255,7 +269,7 @@ pub struct UpdatePrProviderConfigRequest {
     #[serde(default, deserialize_with = "deserialize_optional_update_field")]
     #[ts(type = "string | null")]
     #[ts(optional)]
-    pub token: Option<Option<String>>,
+    pub credential_id: Option<Option<String>>,
 }
 
 #[cfg(test)]

@@ -307,12 +307,16 @@ pub(crate) struct SubTaskInput {
 pub(crate) struct AddTaskDependencyParams {
     pub(crate) task_id: String,
     pub(crate) depends_on_id: String,
+    pub(crate) expected_graph_version: i64,
+    pub(crate) idempotency_key: String,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RemoveTaskDependencyParams {
     pub(crate) task_id: String,
     pub(crate) depends_on_id: String,
+    pub(crate) expected_graph_version: i64,
+    pub(crate) idempotency_key: String,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

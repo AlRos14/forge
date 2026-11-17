@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { Link } from '@tanstack/react-router'
 import { toast } from 'sonner'
+import { useAuthStore } from '@/stores/auth'
 import {
   useAgentAvailability,
   useAuthorizeTaskCoordination,
@@ -10,6 +11,8 @@ import {
   useTaskCoordinationPlanQuery,
   useTaskCoordinationQuery,
   useTaskCoordinationRequestQuery,
+  useTaskReworkAutomationQuery,
+  useTaskWorkUnitsQuery,
 } from '@/api/hooks'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -40,14 +43,26 @@ import type {
   TaskCoordinationPlanDecision,
 } from '@/types/generated'
 import {
+  canEditTaskCoordinationAuthorization,
   coordinationRoleLabel,
   deriveCoordinationNextAction,
   dispatchStateLabel,
+  isProjectBatchScopedCoordination,
   isTurnBudgetExhausted,
   readableCoordinationCode,
 } from './task-coordination-status'
+import {
+  deriveReviewFindingsProjection,
+  isReviewFindingsRequest,
+} from './task-review-triage'
 import { TaskInterventionsPanel } from './task-interventions-panel'
+import { TaskAutonomyLimitsPanel } from './task-autonomy-limits'
 import { TaskQualityRequestsPanel } from './task-quality-requests-panel'
+import { TaskHumanDecisionsPanel } from './task-human-decisions-panel'
+import { TaskPrActionsPanel } from './task-pr-actions-panel'
+import { TaskPrFeedbackPanel } from './task-pr-feedback-panel'
+import { TaskCoordinationProfileGrants } from './task-coordination-profile-grants'
+import { TaskValidationPanel } from './task-validation-panel'
 
 type CoordinatorChoice = {
   role: TaskCoordinationOverviewResponse['team'][number]
@@ -78,6 +93,7 @@ const modeOptions: Array<{
 const requestStateLabels: Record<TaskCoordinationRequestResponse['state'], string> = {
   requested: 'Request recorded',
   running: 'Preparing a plan',
+  triaged: 'Findings triaged',
   plan_ready: 'Plan is ready',
   awaiting_approval: 'Waiting for approval',
   materialized: 'Work items materialized',
@@ -128,7 +144,7 @@ function getCoordinatorChoices(
       if (
         member.status !== 'active' ||
         member.actor_ref.kind !== 'agent' ||
-        member.harness?.toLowerCase() !== 'codex'
+        !['codex', 'claude_code'].includes(member.harness?.toLowerCase() ?? '')
       ) {
         return []
       }
@@ -158,17 +174,36 @@ export function TaskCoordinationPanel({
   daemons: DaemonResponse[]
   onOpenAdvancedWork: () => void
 }) {
+  const user = useAuthStore((state) => state.user)
+  const canManageLimits = members.some(
+    (member) => member.user_id === user?.id && ['owner', 'admin'].includes(member.role),
+  )
   const query = useTaskCoordinationQuery(task.id)
   const overview = query.data
+  const latestRequestIsReviewFindings = isReviewFindingsRequest(overview?.latest_request)
   const planQuery = useTaskCoordinationPlanQuery(
     task.id,
     overview?.latest_plan?.artifact_id ?? null,
   )
   const overviewPlan = overview?.latest_plan ?? null
   const plan = planQuery.data ?? overviewPlan
-  const requestId = plan?.request_id ?? overview?.latest_request?.id ?? null
+  const requestId = latestRequestIsReviewFindings
+    ? (overview?.latest_request?.id ?? null)
+    : (plan?.request_id ?? overview?.latest_request?.id ?? null)
   const requestQuery = useTaskCoordinationRequestQuery(task.id, requestId)
   const request = requestQuery.data ?? overview?.latest_request ?? null
+  const workUnitsQuery = useTaskWorkUnitsQuery(task.id)
+  const reworkAutomationQuery = useTaskReworkAutomationQuery(task.id)
+  const automationIntentsState = reworkAutomationQuery.isError
+    ? 'error'
+    : reworkAutomationQuery.data === undefined
+      ? 'loading'
+      : 'loaded'
+  const workUnitsState = workUnitsQuery.isError
+    ? 'error'
+    : workUnitsQuery.data === undefined
+      ? 'loading'
+      : 'loaded'
   const authorize = useAuthorizeTaskCoordination()
   const requestTurn = useRequestTaskCoordinationTurn()
   const createIntervention = useCreateTaskIntervention()
@@ -180,7 +215,7 @@ export function TaskCoordinationPanel({
   const currentCoordinatorValue = overview?.coordinator
     ? `${overview.coordinator.task_role_id}:${overview.coordinator.actor_ref.kind}:${overview.coordinator.actor_ref.id}`
     : ''
-  const [mode, setMode] = useState<Exclude<TaskCoordinationMode, 'manual'>>('proposal')
+  const [mode, setMode] = useState<Exclude<TaskCoordinationMode, 'manual'>>('prepare_and_execute')
   const [coordinatorKey, setCoordinatorKey] = useState('')
   const [objective, setObjective] = useState(task.title)
   const [constraints, setConstraints] = useState('')
@@ -226,7 +261,9 @@ export function TaskCoordinationPanel({
       ? displayedCoordinatorAgent.actor_ref.id
       : null
   const coordinatorAvailability = useAgentAvailability(coordinatorAgentId)
-  const supportedCoordinator = displayedCoordinatorAgent?.harness?.toLowerCase() === 'codex'
+  const supportedCoordinator = ['codex', 'claude_code'].includes(
+    displayedCoordinatorAgent?.harness?.toLowerCase() ?? '',
+  )
   const coordinatorAvailable = Boolean(
     supportedCoordinator && coordinatorAvailability.data?.available,
   )
@@ -234,10 +271,49 @@ export function TaskCoordinationPanel({
     overview && overview.mode !== 'manual' && !overview.revoked_at,
   )
   const turnBudgetExhausted = overview ? isTurnBudgetExhausted(overview) : false
+  const batchScopedCoordination = overview ? isProjectBatchScopedCoordination(overview) : false
+  const canEditCoordinationAuthorization = overview
+    ? canEditTaskCoordinationAuthorization(overview)
+    : false
+  const batchOwnsActiveAuthorization = Boolean(
+    overview?.project_plan_batch_scope &&
+    ['running', 'paused'].includes(overview.project_plan_batch_scope.batch_state),
+  )
   const coordinatorRole = overview?.team.find(
     (role) => role.id === overview.coordinator?.task_role_id,
   )
-  const baseNextAction = overview ? deriveCoordinationNextAction(overview, request, plan) : null
+  const derivedNextAction = overview
+    ? deriveCoordinationNextAction(overview, request, plan, {
+        automationIntents: reworkAutomationQuery.data?.items ?? [],
+        automationIntentsState,
+        workUnits: workUnitsQuery.data ?? [],
+        workUnitsState,
+      })
+    : null
+  const reviewFindingsProjection = overview
+    ? deriveReviewFindingsProjection({
+        overview,
+        request,
+        automationIntents: reworkAutomationQuery.data?.items ?? [],
+        automationIntentsState,
+        workUnits: workUnitsQuery.data ?? [],
+        workUnitsState,
+      })
+    : null
+  const baseNextAction =
+    overview?.mode === 'manual' &&
+    canEditCoordinationAuthorization &&
+    !batchScopedCoordination &&
+    selectedCoordinator
+      ? {
+          kind: 'request' as const,
+          tone: 'action' as const,
+          owner: 'You',
+          summary: 'Ready to start with the selected coordinator.',
+          detail:
+            'Start authorizes the selected mode for this Task. The coordinator prepares the WorkUnits and the team can proceed within the saved boundaries.',
+        }
+      : derivedNextAction
   const nextAction = baseNextAction
     ? baseNextAction.kind === 'request' && coordinatorAvailability.isLoading
       ? {
@@ -278,7 +354,7 @@ export function TaskCoordinationPanel({
     : null
 
   async function authorizeCoordination() {
-    if (!overview || !overview.can_authorize || !selectedCoordinator) return
+    if (!overview || !canEditCoordinationAuthorization || !selectedCoordinator) return
     setActionError(null)
     try {
       await authorize.mutateAsync({
@@ -301,17 +377,43 @@ export function TaskCoordinationPanel({
     }
   }
 
-  async function requestPlan(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    if (!overview?.can_request || turnBudgetExhausted || !coordinatorAvailable || !objective.trim())
+  async function requestPlan(event?: FormEvent<HTMLFormElement>) {
+    event?.preventDefault()
+    if (
+      !overview ||
+      batchScopedCoordination ||
+      (!overview.can_request && !overview.can_authorize) ||
+      turnBudgetExhausted ||
+      !coordinatorAvailable ||
+      !selectedCoordinator ||
+      !objective.trim()
+    )
       return
     setActionError(null)
     try {
+      const authorization =
+        !plannedModeIsAuthorized ||
+        overview.blockers.some((blocker) => blocker.code === 'coordination.authorization_stale') ||
+        overview.mode !== mode ||
+        selectedCoordinator.value !== currentCoordinatorValue
+          ? await authorize.mutateAsync({
+              taskId: task.id,
+              body: {
+                expected_task_version: overview.task_version,
+                expected_coordination_version: overview.authorization_version,
+                mode,
+                coordinator_task_role_id: selectedCoordinator.role.id,
+                coordinator_actor: selectedCoordinator.member.actor_ref,
+                envelope: null,
+                idempotency_key: newIdempotencyKey(),
+              },
+            })
+          : overview
       const response = await requestTurn.mutateAsync({
         taskId: task.id,
         body: {
-          expected_task_version: overview.task_version,
-          expected_coordination_version: overview.authorization_version,
+          expected_task_version: authorization.task_version,
+          expected_coordination_version: authorization.authorization_version,
           objective: objective.trim(),
           constraints: constraints.trim() || null,
           acceptance_criteria: acceptanceCriteria
@@ -547,6 +649,19 @@ export function TaskCoordinationPanel({
             <p className="mt-1 break-words text-sm font-semibold">{nextAction.summary}</p>
             <p className="mt-1 break-words text-sm opacity-90">{nextAction.detail}</p>
             <div className="mt-3 flex flex-wrap gap-2">
+              {nextAction.kind === 'request' && coordinatorAvailable && !batchScopedCoordination ? (
+                <Button
+                  size="sm"
+                  disabled={authorize.isPending || requestTurn.isPending || !objective.trim()}
+                  onClick={() => void requestPlan()}
+                >
+                  {authorize.isPending || requestTurn.isPending
+                    ? 'Starting coordinator…'
+                    : mode === 'proposal'
+                      ? 'Prepare proposal'
+                      : 'Start task'}
+                </Button>
+              ) : null}
               {nextAction.kind === 'resume' ? (
                 <Button
                   size="sm"
@@ -562,6 +677,20 @@ export function TaskCoordinationPanel({
               nextAction.kind === 'authorize' ? (
                 <Button size="sm" variant="outline" onClick={onOpenAdvancedWork}>
                   Open Advanced work
+                </Button>
+              ) : null}
+              {latestRequestIsReviewFindings &&
+              (reworkAutomationQuery.isError || workUnitsQuery.isError) ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={reworkAutomationQuery.isFetching || workUnitsQuery.isFetching}
+                  onClick={() => {
+                    if (reworkAutomationQuery.isError) void reworkAutomationQuery.refetch()
+                    if (workUnitsQuery.isError) void workUnitsQuery.refetch()
+                  }}
+                >
+                  Retry continuation evidence
                 </Button>
               ) : null}
             </div>
@@ -605,6 +734,12 @@ export function TaskCoordinationPanel({
           </div>
         </div>
       ) : null}
+
+      <TaskCoordinationProfileGrants
+        envelope={overview.envelope}
+        team={overview.team}
+        agents={agents}
+      />
 
       {overview.blockers.length ? (
         <div
@@ -697,7 +832,28 @@ export function TaskCoordinationPanel({
         </p>
       ) : null}
 
-      {overview.can_authorize ? (
+      {batchOwnsActiveAuthorization ? (
+        <div
+          role="status"
+          className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border-subtle bg-muted/20 p-3"
+        >
+          <p className="min-w-0 text-sm text-muted-foreground">
+            The Project batch owns this Task coordination authorization while it is running or
+            paused. To switch to standalone coordination, explicitly revoke this Task authorization
+            or revoke/complete the batch, then authorize again here. The old batch grant becomes
+            stale and admits no more work.
+          </p>
+          <Link
+            to="/projects/$projectId/plan"
+            params={{ projectId: task.project_id }}
+            className="inline-flex h-8 items-center justify-center rounded-md px-[9px] text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Open Project plan
+          </Link>
+        </div>
+      ) : null}
+
+      {canEditCoordinationAuthorization ? (
         <div className="space-y-4 rounded-md border p-3">
           <div>
             <h3 className="font-medium">
@@ -760,9 +916,9 @@ export function TaskCoordinationPanel({
                 No eligible coordinator is available in this Task team.
               </p>
               <p className="mt-1 text-sm text-muted-foreground">
-                The current automatic turn requires an active Codex CLI Agent in a Task role with
-                orchestration capability. You can change this Task&apos;s roles in Advanced work, or
-                reuse a Project team template so new Tasks start with eligible members.
+                Automatic coordination requires an active Codex or Claude Code Agent in a Task role
+                with orchestration capability. You can change this Task&apos;s roles in Advanced
+                work, or reuse a Project team template so new Tasks start with eligible members.
               </p>
               <div className="mt-3 flex flex-wrap gap-2">
                 <Button size="sm" variant="outline" onClick={onOpenAdvancedWork}>
@@ -826,6 +982,7 @@ export function TaskCoordinationPanel({
             size="sm"
             onClick={() => void authorizeCoordination()}
             disabled={!selectedCoordinator || authorize.isPending}
+            className={overview.mode === 'manual' ? 'hidden' : undefined}
           >
             {authorize.isPending ? 'Saving authorization…' : 'Save authorization'}
           </Button>
@@ -839,9 +996,17 @@ export function TaskCoordinationPanel({
         >
           <p className="font-medium">Preparation-turn limit reached</p>
           <p className="mt-1">
-            Forge recorded {overview.turn_count} of {overview.max_turns} preparation turns. No
-            further automatic turn will be admitted. Existing plans and WorkUnits are preserved;
-            continue through Advanced work or ask a Project owner to decide a new Task budget.
+            {batchScopedCoordination &&
+            overview.project_plan_batch_scope?.blocker ===
+              'coordination:coordination.budget_exhausted' ? (
+              nextAction?.detail
+            ) : (
+              <>
+                Forge recorded {overview.turn_count} of {overview.max_turns} preparation turns. No
+                further automatic turn will be admitted. Existing plans and WorkUnits are preserved;
+                continue through Advanced work or ask a Project owner to decide a new Task budget.
+              </>
+            )}
           </p>
           <Button size="sm" variant="outline" className="mt-3" onClick={onOpenAdvancedWork}>
             Continue with Advanced work
@@ -849,19 +1014,21 @@ export function TaskCoordinationPanel({
         </div>
       ) : null}
 
-      {plannedModeIsAuthorized &&
-      overview.can_request &&
+      {(overview.can_request || (overview.can_authorize && selectedCoordinator)) &&
+      !batchScopedCoordination &&
       !turnBudgetExhausted &&
       coordinatorAvailable ? (
         <form
+          id="coordination-start-form"
           onSubmit={(event) => void requestPlan(event)}
           className="space-y-4 rounded-md border p-3"
         >
           <div>
-            <h3 className="font-medium">Prepare from the Task objective</h3>
+            <h3 className="font-medium">Start from the Task objective</h3>
             <p className="mt-1 text-sm text-muted-foreground">
-              The request uses the saved authorization and current Task team. It does not require
-              manual WorkUnit setup.
+              Starting authorizes this coordinator and the selected mode for this Task. The
+              coordinator creates the work breakdown and assigns the team; WorkUnits are prepared
+              automatically within these boundaries.
             </p>
           </div>
           <div className="space-y-2">
@@ -903,18 +1070,23 @@ export function TaskCoordinationPanel({
               onChange={(event) => setContext(event.target.value)}
             />
           </div>
-          <Button size="sm" type="submit" disabled={!objective.trim() || requestTurn.isPending}>
-            {requestTurn.isPending
-              ? 'Recording request…'
-              : modeOptions.find((option) => option.value === overview.mode)?.value === 'proposal'
+          <Button
+            size="sm"
+            type="submit"
+            disabled={!objective.trim() || requestTurn.isPending || authorize.isPending}
+          >
+            {requestTurn.isPending || authorize.isPending
+              ? 'Starting coordinator…'
+              : mode === 'proposal'
                 ? 'Prepare proposal'
-                : 'Prepare and execute'}
+                : 'Start task'}
           </Button>
         </form>
       ) : null}
 
       {plannedModeIsAuthorized &&
       overview.can_request &&
+      !batchScopedCoordination &&
       !turnBudgetExhausted &&
       !coordinatorAvailable ? (
         <div
@@ -963,8 +1135,13 @@ export function TaskCoordinationPanel({
         >
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h3 id="coordination-request-title" className="font-medium">
-              Latest preparation request
+              {reviewFindingsProjection
+                ? 'Latest review-findings request'
+                : 'Latest preparation request'}
             </h3>
+            <Badge variant="outline">
+              {reviewFindingsProjection ? 'Review findings' : 'WorkUnit plan'}
+            </Badge>
             <Badge
               variant={
                 request.state === 'failed' || request.state === 'uncertain'
@@ -972,16 +1149,77 @@ export function TaskCoordinationPanel({
                   : 'outline'
               }
             >
-              {requestStateLabels[request.state]}
+              {reviewFindingsProjection?.stateLabel ?? requestStateLabels[request.state]}
             </Badge>
           </div>
-          <p className="mt-2 break-words text-sm">{request.brief.objective}</p>
-          {request.brief.constraints ? (
+          {reviewFindingsProjection ? (
+            <div className="mt-2 space-y-2 rounded-md border bg-background/60 p-3 text-sm">
+              <p className="font-medium">
+                Request kind · Review findings · {reviewFindingsProjection.stateLabel}
+              </p>
+              <div className="space-y-1 break-all text-xs text-muted-foreground">
+                <p>
+                  {reviewFindingsProjection.reportId
+                    ? 'Exact ReviewReport source is attached.'
+                    : 'Exact ReviewReport source is unavailable.'}
+                </p>
+                <p>
+                  {reviewFindingsProjection.producerExecutionId
+                    ? 'Reviewer producer Execution source is attached.'
+                    : 'Reviewer producer Execution source is unavailable.'}
+                </p>
+                {request.execution_id ? <p>Coordinator disposition is recorded.</p> : null}
+              </div>
+              {reviewFindingsProjection.triage ? (
+                <p className="text-xs text-muted-foreground">
+                  The coordinator recorded a disposition for this exact report. This does not
+                  approve the ReviewReport, satisfy a Gate, or set TaskLifecycle to done.
+                </p>
+              ) : null}
+              {reviewFindingsProjection.blockers.length ? (
+                <ul className="list-disc space-y-1 pl-5 text-xs text-amber-800 dark:text-amber-200">
+                  {reviewFindingsProjection.blockers.map((blocker) => (
+                    <li key={blocker}>{blocker}</li>
+                  ))}
+                </ul>
+              ) : null}
+              <details className="text-xs text-muted-foreground">
+                <summary className="w-fit cursor-pointer">Full immutable source references</summary>
+                <div className="mt-2 space-y-1 break-all">
+                  <p>Request ID: {request.id}</p>
+                  <p>ReviewReport: {reviewFindingsProjection.reportId ?? 'unavailable'}</p>
+                  <p>Report digest: {reviewFindingsProjection.reportDigest ?? 'unavailable'}</p>
+                  <p>
+                    Reviewer producer Execution:{' '}
+                    {reviewFindingsProjection.producerExecutionId ?? 'unavailable'}
+                  </p>
+                  {request.execution_id ? <p>Coordinator Execution: {request.execution_id}</p> : null}
+                  <div className="flex flex-wrap gap-2">
+                    {reviewFindingsProjection.reportId ? (
+                      <CopyReferenceButton
+                        value={reviewFindingsProjection.reportId}
+                        label="ReviewReport ID"
+                      />
+                    ) : null}
+                    {reviewFindingsProjection.reportDigest ? (
+                      <CopyReferenceButton
+                        value={reviewFindingsProjection.reportDigest}
+                        label="ReviewReport digest"
+                      />
+                    ) : null}
+                  </div>
+                </div>
+              </details>
+            </div>
+          ) : (
+            <p className="mt-2 break-words text-sm">{request.brief.objective}</p>
+          )}
+          {!reviewFindingsProjection && request.brief.constraints ? (
             <p className="mt-1 whitespace-pre-wrap break-words text-sm text-muted-foreground">
               Constraints: {request.brief.constraints}
             </p>
           ) : null}
-          {request.brief.acceptance_criteria.length ? (
+          {!reviewFindingsProjection && request.brief.acceptance_criteria.length ? (
             <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
               {request.brief.acceptance_criteria.map((criterion, index) => (
                 <li key={`${index}:${criterion}`} className="break-words">
@@ -1325,6 +1563,47 @@ export function TaskCoordinationPanel({
         </article>
       ) : null}
 
+      {overview.review_triage?.length ? (
+        <section className="space-y-3 rounded-lg border p-4">
+          <div>
+            <h3 className="font-medium">Coordinator review triage history</h3>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Each disposition is bound to one ReviewReport. Triage does not change its verdict,
+              satisfy a Gate, or complete the Task.
+            </p>
+          </div>
+          {overview.review_triage.map((triage) => (
+            <article
+              key={triage.review_report_artifact_id}
+              className="rounded-md border p-3 text-sm"
+            >
+              <p className="font-medium">
+                {triage.disposition === 'correct'
+                  ? 'Findings confirmed for correction'
+                  : triage.disposition === 'recheck'
+                    ? 'Fresh review WorkUnit recorded'
+                    : 'Human decision requested'}
+              </p>
+              <p className="mt-2 whitespace-pre-wrap">{triage.rationale}</p>
+              <p className="mt-2 whitespace-pre-wrap text-muted-foreground">
+                {triage.instructions}
+              </p>
+              <details className="mt-2 text-xs text-muted-foreground">
+                <summary className="cursor-pointer">Exact report and decision provenance</summary>
+                <p className="mt-1 break-all">Report: {triage.review_report_artifact_id}</p>
+                <p className="break-all">Coordinator Execution: {triage.execution_id}</p>
+                {triage.review_work_unit_id ? (
+                  <p className="break-all">New review WorkUnit: {triage.review_work_unit_id}</p>
+                ) : null}
+              </details>
+            </article>
+          ))}
+        </section>
+      ) : null}
+      <TaskHumanDecisionsPanel task={task} members={members} />
+      <TaskValidationPanel task={task} />
+      <TaskPrFeedbackPanel task={task} />
+      <TaskPrActionsPanel task={task} members={members} />
       <TaskQualityRequestsPanel
         task={task}
         coordination={overview}
@@ -1333,6 +1612,7 @@ export function TaskCoordinationPanel({
         daemons={daemons}
       />
       <TaskInterventionsPanel task={task} coordination={overview} />
+      <TaskAutonomyLimitsPanel taskId={task.id} canManage={canManageLimits} />
 
       <Dialog open={revokeOpen} onOpenChange={setRevokeOpen}>
         <DialogContent>

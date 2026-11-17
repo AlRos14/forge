@@ -1,5 +1,7 @@
 mod descriptors;
 mod handlers;
+mod project_plan;
+mod verification;
 
 use serde_json::Value;
 
@@ -20,9 +22,24 @@ pub(crate) async fn dispatch_tool(
     match name {
         "forge_create_task" => handlers::forge_create_task(state, arguments).await,
         "forge_create_sub_tasks" => handlers::forge_create_sub_tasks(state, arguments).await,
-        "forge_add_task_dependency" => handlers::forge_add_task_dependency(state, arguments).await,
+        "forge_add_task_dependency" => {
+            handlers::forge_add_task_dependency(state, arguments, context).await
+        }
         "forge_remove_task_dependency" => {
-            handlers::forge_remove_task_dependency(state, arguments).await
+            handlers::forge_remove_task_dependency(state, arguments, context).await
+        }
+        "forge_get_project_plan" => project_plan::get_project_plan(state, arguments, context).await,
+        "forge_propose_project_plan" => {
+            project_plan::propose_project_plan(state, arguments, context).await
+        }
+        "forge_apply_project_plan" => {
+            project_plan::apply_project_plan(state, arguments, context).await
+        }
+        "forge_list_project_repo_tree" => {
+            project_plan::list_project_repo_tree(state, arguments, context).await
+        }
+        "forge_read_project_repo_file" => {
+            project_plan::read_project_repo_file(state, arguments, context).await
         }
         "forge_list_task_dependencies" => {
             handlers::forge_list_task_dependencies(state, arguments).await
@@ -158,6 +175,36 @@ pub(crate) async fn dispatch_tool(
         "forge_list_task_handoffs" => handlers::forge_list_task_handoffs(state, arguments).await,
         "forge_list_task_proposals" => handlers::forge_list_task_proposals(state, arguments).await,
         "forge_list_task_decisions" => handlers::forge_list_task_decisions(state, arguments).await,
+        "forge_list_validation_checks" => {
+            verification::forge_list_validation_checks(state, arguments, context).await
+        }
+        "forge_list_task_validation_check_requests" => {
+            verification::forge_list_task_validation_check_requests(state, arguments).await
+        }
+        "forge_list_task_validation_comparisons" => {
+            verification::forge_list_task_validation_comparisons(state, arguments).await
+        }
+        "forge_list_task_human_decisions" => {
+            verification::forge_list_task_human_decisions(state, arguments).await
+        }
+        "forge_list_task_fallback_receipts" => {
+            verification::forge_list_task_fallback_receipts(state, arguments).await
+        }
+        "forge_list_task_micro_fixes" => {
+            verification::forge_list_task_micro_fixes(state, arguments).await
+        }
+        "forge_list_task_coordinator_replans" => {
+            verification::forge_list_task_coordinator_replans(state, arguments).await
+        }
+        "forge_list_task_pr_feedback" => {
+            verification::forge_list_task_pr_feedback(state, arguments).await
+        }
+        "forge_list_task_pr_actions" => {
+            verification::forge_list_task_pr_actions(state, arguments).await
+        }
+        "forge_list_task_pr_rework" => {
+            verification::forge_list_task_pr_rework(state, arguments).await
+        }
         _ => Err(McpToolError::new(-32601, "method not found")),
     }
 }

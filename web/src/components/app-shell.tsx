@@ -14,6 +14,7 @@ import {
   List,
   Robot,
   Kanban,
+  GitBranch,
   Gear,
   Key,
   Sliders,
@@ -70,13 +71,22 @@ const ProjectCopilotDock = lazy(() =>
 
 type NavItem = {
   to: string
-  key: 'board' | 'tasks' | 'agentSettings' | 'daemons' | 'operations' | 'settings' | 'forgeSettings'
+  key:
+    | 'board'
+    | 'plan'
+    | 'tasks'
+    | 'agentSettings'
+    | 'daemons'
+    | 'operations'
+    | 'settings'
+    | 'forgeSettings'
   icon: ComponentType<{ size?: string | number; weight?: IconWeight }>
   section: 'main' | 'project' | 'global'
 }
 
 const navItems: NavItem[] = [
   { to: '/projects/$projectId/board', key: 'board', icon: Kanban, section: 'project' },
+  { to: '/projects/$projectId/plan', key: 'plan', icon: GitBranch, section: 'project' },
   { to: '/projects/$projectId/tasks', key: 'tasks', icon: List, section: 'project' },
   { to: '/projects/$projectId/settings', key: 'settings', icon: Gear, section: 'project' },
   { to: '/agents', key: 'agentSettings', icon: Robot, section: 'global' },

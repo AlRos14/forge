@@ -799,6 +799,11 @@ fn tools_list_returns_descriptors() {
             "forge_get_gate",
             "forge_get_gate_evaluation",
             "forge_get_project",
+            "forge_get_project_plan",
+            "forge_propose_project_plan",
+            "forge_apply_project_plan",
+            "forge_list_project_repo_tree",
+            "forge_read_project_repo_file",
             "forge_get_review_execution",
             "forge_get_task",
             "forge_get_task_diff",
@@ -855,6 +860,16 @@ fn tools_list_returns_descriptors() {
             "forge_update_task",
             "forge_update_task_role",
             "forge_update_work_unit",
+            "forge_list_validation_checks",
+            "forge_list_task_validation_check_requests",
+            "forge_list_task_validation_comparisons",
+            "forge_list_task_human_decisions",
+            "forge_list_task_pr_feedback",
+            "forge_list_task_pr_actions",
+            "forge_list_task_pr_rework",
+            "forge_list_task_fallback_receipts",
+            "forge_list_task_micro_fixes",
+            "forge_list_task_coordinator_replans",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -872,6 +887,29 @@ fn tools_list_returns_descriptors() {
             .expect("follow-up required params are an array")
             .iter()
             .any(|required| required == "idempotency_key"));
+    });
+}
+
+#[test]
+fn mcp_pr_feedback_tools_return_empty_task_scoped_pages() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+
+        for tool in [
+            "forge_list_task_pr_feedback",
+            "forge_list_task_pr_actions",
+            "forge_list_task_pr_rework",
+        ] {
+            let result = call_tool(
+                &state,
+                tool,
+                json!({"task_id": task.id.clone(), "limit": 1}),
+            )
+            .await;
+            assert_eq!(result["items"].as_array().map(Vec::len), Some(0));
+            assert!(result["next_cursor"].is_null());
+        }
     });
 }
 
@@ -1421,6 +1459,91 @@ fn forge_create_sub_tasks_rejects_malformed_subtasks() {
             .as_str()
             .expect("details string")
             .contains("title"));
+    });
+}
+
+#[test]
+fn direct_task_dependency_mcp_uses_project_graph_version_and_idempotency() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        let successor = seed_task_in_project(&state, project_id.clone()).await;
+        let prerequisite = seed_task_in_project(&state, project_id.clone()).await;
+        let context = user_mcp_context("test-user");
+        let initial = services::project_plan::ProjectPlanService::new(
+            Arc::clone(&state.db),
+            Arc::clone(&state.event_bus),
+        )
+        .graph(&project_id)
+        .await
+        .expect("initial graph loads");
+
+        let add_arguments = json!({
+            "task_id":successor.id,
+            "depends_on_id":prerequisite.id,
+            "expected_graph_version":initial.version,
+            "idempotency_key":"mcp-task-dependency-add"
+        });
+        let added = call_tool_as(
+            &state,
+            &context,
+            "forge_add_task_dependency",
+            add_arguments.clone(),
+        )
+        .await;
+        assert_eq!(added["task_id"], successor.id);
+        let replay =
+            call_tool_as(&state, &context, "forge_add_task_dependency", add_arguments).await;
+        assert_eq!(replay, added);
+
+        let changed = services::project_plan::ProjectPlanService::new(
+            Arc::clone(&state.db),
+            Arc::clone(&state.event_bus),
+        )
+        .graph(&project_id)
+        .await
+        .expect("graph after dependency mutation loads");
+        assert!(changed.version > initial.version);
+        assert_eq!(changed.edges.len(), 1);
+
+        let stale = call_tool_error_as(
+            &state,
+            &context,
+            "forge_remove_task_dependency",
+            json!({
+                "task_id":successor.id,
+                "depends_on_id":prerequisite.id,
+                "expected_graph_version":initial.version,
+                "idempotency_key":"mcp-stale-dependency-remove"
+            }),
+        )
+        .await;
+        assert_eq!(
+            stale.code, -32009,
+            "stale graph version is a typed conflict"
+        );
+
+        let removed = call_tool_as(
+            &state,
+            &context,
+            "forge_remove_task_dependency",
+            json!({
+                "task_id":successor.id,
+                "depends_on_id":prerequisite.id,
+                "expected_graph_version":changed.version,
+                "idempotency_key":"mcp-task-dependency-remove"
+            }),
+        )
+        .await;
+        assert_eq!(removed["task_id"], successor.id);
+        let final_graph = services::project_plan::ProjectPlanService::new(
+            Arc::clone(&state.db),
+            Arc::clone(&state.event_bus),
+        )
+        .graph(&project_id)
+        .await
+        .expect("graph after dependency removal loads");
+        assert!(final_graph.edges.is_empty());
     });
 }
 
@@ -2773,6 +2896,11 @@ fn mcp_project_copilot_lists_only_delegated_management_tools() {
         assert!(names.contains(&"forge_list_tasks"));
         for name in [
             "forge_get_task",
+            "forge_get_project_plan",
+            "forge_propose_project_plan",
+            "forge_apply_project_plan",
+            "forge_list_project_repo_tree",
+            "forge_read_project_repo_file",
             "forge_list_task_roles",
             "forge_list_work_units",
             "forge_get_work_unit",
@@ -2787,6 +2915,8 @@ fn mcp_project_copilot_lists_only_delegated_management_tools() {
         }
         for name in [
             "forge_get_task_dispatch",
+            "forge_authorize_project_plan_batch",
+            "forge_create_task",
             "forge_launch_task",
             "forge_pause_task",
             "forge_resume_task",
@@ -2819,6 +2949,11 @@ fn mcp_project_copilot_lists_only_delegated_management_tools() {
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
         assert!(!names.contains(&"forge_list_tasks"));
+        assert!(!names.contains(&"forge_get_project_plan"));
+        assert!(!names.contains(&"forge_propose_project_plan"));
+        assert!(!names.contains(&"forge_apply_project_plan"));
+        assert!(!names.contains(&"forge_list_project_repo_tree"));
+        assert!(!names.contains(&"forge_read_project_repo_file"));
 
         let error = dispatch_with_context(
             &state,
@@ -2858,6 +2993,15 @@ fn mcp_project_copilot_lists_only_delegated_management_tools() {
 
         for (name, arguments) in [
             ("forge_launch_task", json!({"task_id":"task-1"})),
+            ("forge_get_project_plan", json!({"project_id":"project-1"})),
+            (
+                "forge_propose_project_plan",
+                json!({"project_id":"project-1"}),
+            ),
+            (
+                "forge_apply_project_plan",
+                json!({"project_id":"project-1"}),
+            ),
             ("forge_list_agents", json!({"limit":10})),
             (
                 "forge_list_agent_profiles",
@@ -3206,5 +3350,196 @@ fn viewer_can_read_a_task_but_cannot_mutate_its_work_units() {
         )
         .await;
         assert_eq!(error.code, -32003, "viewer WorkUnit mutation is denied");
+    });
+}
+
+#[test]
+fn mcp_validation_tools_are_read_only_and_not_copilot_tools() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let result = dispatch(&state, "tools/list", json!({}))
+            .await
+            .expect("tools/list succeeds");
+        let names = result["tools"]
+            .as_array()
+            .expect("tools list")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        for name in [
+            "forge_list_validation_checks",
+            "forge_list_task_validation_check_requests",
+            "forge_list_task_validation_comparisons",
+            "forge_list_task_human_decisions",
+            "forge_list_task_fallback_receipts",
+            "forge_list_task_micro_fixes",
+            "forge_list_task_coordinator_replans",
+        ] {
+            assert!(names.contains(&name), "{name}");
+            assert!(
+                !api_types::PROJECT_COPILOT_MCP_TOOLS.contains(&name),
+                "{name}"
+            );
+        }
+        assert!(names.iter().all(|name| !name.contains("answer")));
+    });
+}
+
+#[test]
+fn mcp_validation_catalog_lists_versions_for_members_only() {
+    run_async(async {
+        let state = sqlite_state().await;
+        add_user(&state, "catalog-outsider").await;
+        let now = now_rfc3339();
+        let project_id = new_uuid_v4();
+        ProjectRepo::create_with_owner_membership(
+            &*state.db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "catalog".to_owned(),
+                settings: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: Some("test-user".to_owned()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            &new_uuid_v4(),
+        )
+        .await
+        .expect("project creates");
+        services::ValidationCatalogService::new(state.db.clone())
+            .create_version(
+                &project_id,
+                "test-user",
+                services::PublishCheckInput {
+                    repo_id: None,
+                    check_key: "unit".to_owned(),
+                    command: "true".to_owned(),
+                    timeout_seconds: 30,
+                    env_policy: None,
+                },
+            )
+            .await
+            .expect("owner publishes");
+        let listed = call_tool_as(
+            &state,
+            &user_mcp_context("test-user"),
+            "forge_list_validation_checks",
+            json!({ "project_id": project_id }),
+        )
+        .await;
+        assert_eq!(listed["items"][0]["check_key"], "unit");
+        assert_eq!(listed["items"][0]["state"], "active");
+        let error = call_tool_error_as(
+            &state,
+            &user_mcp_context("catalog-outsider"),
+            "forge_list_validation_checks",
+            json!({ "project_id": project_id }),
+        )
+        .await;
+        assert_eq!(error.code, -32001);
+    });
+}
+
+#[test]
+fn mcp_validation_task_lists_are_empty_and_access_checked() {
+    run_async(async {
+        let state = sqlite_state().await;
+        add_user(&state, "task-outsider").await;
+        let (project_id, _) = seed_private_project_repo(&state, "test-user", "private").await;
+        let task = seed_task_in_project(&state, project_id).await;
+        for name in [
+            "forge_list_task_validation_check_requests",
+            "forge_list_task_validation_comparisons",
+            "forge_list_task_human_decisions",
+        ] {
+            let listed = call_tool_as(
+                &state,
+                &user_mcp_context("test-user"),
+                name,
+                json!({ "task_id": task.id }),
+            )
+            .await;
+            assert_eq!(listed["items"], json!([]), "{name}");
+            let error = call_tool_error_as(
+                &state,
+                &user_mcp_context("task-outsider"),
+                name,
+                json!({ "task_id": task.id }),
+            )
+            .await;
+            assert_eq!(error.code, -32001, "{name}");
+        }
+    });
+}
+
+#[test]
+fn mcp_phase_three_receipt_tools_are_read_only_and_task_scoped() {
+    run_async(async {
+        let state = sqlite_state().await;
+        add_user(&state, "phase3-outsider").await;
+        let task = seed_task(&state).await;
+        let tools = dispatch(&state, "tools/list", json!({}))
+            .await
+            .expect("tools/list succeeds");
+        let names = tools["tools"]
+            .as_array()
+            .expect("tool list")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+
+        for name in [
+            "forge_list_task_fallback_receipts",
+            "forge_list_task_micro_fixes",
+            "forge_list_task_coordinator_replans",
+        ] {
+            assert!(names.contains(&name), "{name}");
+            assert!(
+                !api_types::PROJECT_COPILOT_MCP_TOOLS.contains(&name),
+                "{name}"
+            );
+            let listed = call_tool_as(
+                &state,
+                &user_mcp_context("test-user"),
+                name,
+                json!({ "task_id": task.id, "limit": 1 }),
+            )
+            .await;
+            assert_eq!(listed["items"], json!([]), "{name}");
+            assert!(listed["next_cursor"].is_null(), "{name}");
+            let error = call_tool_error_as(
+                &state,
+                &user_mcp_context("phase3-outsider"),
+                name,
+                json!({ "task_id": task.id }),
+            )
+            .await;
+            assert_eq!(error.code, -32001, "{name}");
+        }
+    });
+}
+
+#[test]
+fn mcp_human_decision_list_rejects_unknown_state_and_has_no_answer_tool() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+        let error = call_tool_error_as(
+            &state,
+            &user_mcp_context("test-user"),
+            "forge_list_task_human_decisions",
+            json!({ "task_id": task.id, "state": "bogus" }),
+        )
+        .await;
+        assert_eq!(error.code, -32602);
+        let error = call_tool_error_as(
+            &state,
+            &user_mcp_context("test-user"),
+            "forge_answer_human_decision",
+            json!({ "task_id": task.id }),
+        )
+        .await;
+        assert!(error.code == -32601 || error.code == -32602);
     });
 }

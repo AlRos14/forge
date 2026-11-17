@@ -376,6 +376,28 @@ impl DaemonRuntime {
         )?;
         let logs_path = local_execution_log_path(&self.workspace_root, &params.execution_id);
         let description = prompt_description(&params.prompt);
+        if !params.review_read_paths.is_empty()
+            && !params
+                .task_role_capabilities
+                .contains(&api_types::TaskRoleCapability::FormalReview)
+        {
+            return Err(execution_error(
+                "Read-only review roots require a formal_review invocation".to_owned(),
+            ));
+        }
+        let review_read_paths = params
+            .review_read_paths
+            .iter()
+            .map(|path| {
+                if !Path::new(path).is_absolute() {
+                    return Err(execution_error(
+                        "Exact review read roots must be absolute".to_owned(),
+                    ));
+                }
+                daemon_fs::validate_within_root(Path::new(path), &self.workspace_root)
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .collect::<CommandResult<Vec<_>>>()?;
         let ctx = ExecutionContext {
             invocation: params.invocation.clone(),
             task_id: params.task_id.clone(),
@@ -385,6 +407,7 @@ impl DaemonRuntime {
             // The daemon ExecutionStart contract supplies an exact workspace
             // path; non-repository WorkUnits are admitted only on the local host.
             has_repository_workspace: true,
+            review_read_paths,
             worktree_path: worktree_path.to_string_lossy().into_owned(),
             description,
             agent_config: params.executor_config,
@@ -1237,6 +1260,7 @@ mod tests {
             execution_id: execution_id.to_owned(),
             role: "coder".to_owned(),
             task_role_capabilities: vec![],
+            review_read_paths: Vec::new(),
             workspace_path: workspace_root.to_string_lossy().into_owned(),
             executor_type: "codex".to_owned(),
             executor_config: serde_json::json!({
@@ -1276,6 +1300,25 @@ mod tests {
             Some("# Full plan\nDetailed steps\n")
         );
         assert_eq!(notification.summary.as_deref(), Some("short summary"));
+    }
+
+    #[tokio::test]
+    async fn review_roots_cannot_escape_daemon_workspace_or_be_used_by_workers() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let runtime = DaemonRuntime::new(tx, root.path().to_path_buf());
+        let mut params = controlled_start_params(root.path(), "review-path-boundary");
+        params.review_read_paths = vec![outside.path().to_string_lossy().into_owned()];
+        assert!(
+            runtime.start(params.clone()).await.is_err(),
+            "ordinary workers cannot add review read grants"
+        );
+        params.task_role_capabilities = vec![api_types::TaskRoleCapability::FormalReview];
+        assert!(
+            runtime.start(params).await.is_err(),
+            "formal review cannot escape the daemon's registered root"
+        );
     }
 
     #[tokio::test]
@@ -1379,6 +1422,7 @@ mod tests {
                 execution_id: execution_id.clone(),
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
+                review_read_paths: Vec::new(),
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "shell".to_owned(),
                 executor_config: serde_json::json!({
@@ -1426,6 +1470,7 @@ mod tests {
                 execution_id: "exec-remote-resume".to_owned(),
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
+                review_read_paths: Vec::new(),
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "codex".to_owned(),
                 executor_config: serde_json::json!({
@@ -1482,6 +1527,7 @@ mod tests {
                 execution_id: "exec-cursor-usage".to_owned(),
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
+                review_read_paths: Vec::new(),
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "cursor".to_owned(),
                 executor_config: serde_json::json!({
@@ -1524,6 +1570,7 @@ mod tests {
                 execution_id: execution_id.clone(),
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
+                review_read_paths: Vec::new(),
                 workspace_path: dir.path().to_string_lossy().into_owned(),
                 executor_type: "shell".to_owned(),
                 executor_config: serde_json::json!({

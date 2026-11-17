@@ -182,6 +182,7 @@ pub enum ProposalTargetKind {
     Execution,
     Workspace,
     WorkUnit,
+    PrExternalAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

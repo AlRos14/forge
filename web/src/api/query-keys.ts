@@ -24,6 +24,19 @@ export const qk = {
   reviewExecutions: (taskId: string) => ['tasks', taskId, 'review-executions'] as const,
   taskReworkAutomation: (taskId: string) => ['tasks', taskId, 'rework-automation'] as const,
   validationRuns: (taskId: string) => ['tasks', taskId, 'validation-runs'] as const,
+  taskValidationCheckRequests: (taskId: string) =>
+    ['tasks', taskId, 'validation-check-requests'] as const,
+  taskValidationComparisons: (taskId: string) =>
+    ['tasks', taskId, 'validation-comparisons'] as const,
+  taskHumanDecisions: (taskId: string) => ['tasks', taskId, 'human-decisions'] as const,
+  taskFallbackReceipts: (taskId: string) => ['tasks', taskId, 'fallback-receipts'] as const,
+  taskMicroFixes: (taskId: string) => ['tasks', taskId, 'micro-fixes'] as const,
+  taskCoordinatorReplans: (taskId: string) => ['tasks', taskId, 'coordinator-replans'] as const,
+  taskPrFeedback: (taskId: string) => ['tasks', taskId, 'pr-feedback'] as const,
+  taskPrRework: (taskId: string) => ['tasks', taskId, 'pr-rework'] as const,
+  taskPrActions: (taskId: string) => ['tasks', taskId, 'pr-actions'] as const,
+  projectValidationChecks: (projectId: string) =>
+    ['projects', projectId, 'validation-checks'] as const,
   agents: ['agents'] as const,
   agentPages: (limit: number) => ['agents', 'pages', limit] as const,
   agent: (id: string) => ['agents', id] as const,
@@ -37,6 +50,8 @@ export const qk = {
   projectHookRunPages: (projectId: string, limit: number) =>
     ['projects', projectId, 'project-hook-runs', limit] as const,
   repos: (projectId: string) => ['projects', projectId, 'repos'] as const,
+  repoPrFeedbackPolicy: (repoId: string) => ['repos', repoId, 'pr-feedback-policy'] as const,
+  scmCredentials: ['providers', 'scm'] as const,
   mcpConfig: (agent: string, scope: string, projectId?: string) =>
     ['config', 'mcp', agent, scope, projectId ?? 'global'] as const,
   fsEntries: (path: string, daemonId: string) => ['fs', 'entries', daemonId, path] as const,

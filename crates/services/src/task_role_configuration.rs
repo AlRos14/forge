@@ -133,6 +133,19 @@ pub fn validate_task_role_configuration(configuration: &TaskRoleConfiguration) -
 pub fn validate_project_task_role_configuration(
     configuration: &ProjectTaskRoleConfiguration,
 ) -> Result<()> {
+    if configuration.coordinator_actor.is_some()
+        && (!configuration
+            .capabilities
+            .contains(&TaskRoleCapability::Orchestration)
+            || !matches!(
+                configuration.coordinator_actor,
+                Some(api_types::ActorRef::Agent(_))
+            ))
+    {
+        return Err(ServiceError::invalid_operation(
+            "A default coordinator must be an Agent in an orchestration-capable role",
+        ));
+    }
     if configuration.schema_version != 1 {
         return Err(ServiceError::invalid_operation(format!(
             "unsupported Project TaskRole configuration schema version {}",
@@ -248,7 +261,7 @@ fn validate_rework_configuration(configuration: &TaskRoleReworkConfiguration) ->
     if configuration.review_actor.is_some()
         && matches!(
             configuration.correction_actor,
-            Some(ReworkActorSelection::Explicit { ref actor_ref }) if configuration.review_actor.as_ref() == Some(actor_ref)
+            Some(ReworkActorSelection::Explicit { ref actor_ref }) if matches!(actor_ref, api_types::ActorRef::Human(_)) && configuration.review_actor.as_ref() == Some(actor_ref)
         )
     {
         return Err(ServiceError::invalid_operation(

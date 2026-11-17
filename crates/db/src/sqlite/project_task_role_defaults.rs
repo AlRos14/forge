@@ -131,6 +131,7 @@ impl ProjectTaskRoleDefaultsRepo for SqliteDb {
         }
         let available_roles = seen_roles.clone();
         seen_roles.clear();
+        let mut coordinator_count = 0;
         for role in &roles {
             let canonical = crate::canonical_task_role_name(&role.role)
                 .ok_or_else(|| DbError::Check("role is not a TaskRole".to_owned()))?;
@@ -146,6 +147,28 @@ impl ProjectTaskRoleDefaultsRepo for SqliteDb {
                 )));
             }
             validate_project_role_configuration(&role.configuration_json, &available_roles)?;
+            let configuration: serde_json::Value =
+                serde_json::from_str(&role.configuration_json)
+                    .map_err(|error| DbError::Check(error.to_string()))?;
+            if let Some(value) = configuration
+                .get("coordinator_actor")
+                .filter(|value| !value.is_null())
+            {
+                coordinator_count += 1;
+                let actor: ActorRef = serde_json::from_value(value.clone())
+                    .map_err(|error| DbError::Check(error.to_string()))?;
+                let orchestration = configuration
+                    .get("capabilities")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|items| items.iter().any(|item| item == "orchestration"));
+                if coordinator_count > 1
+                    || !orchestration
+                    || actor.kind() != crate::ActorKind::Agent
+                    || !role.members.contains(&actor)
+                {
+                    return Err(DbError::Check("Choose exactly one eligible Agent as the Project's default Task coordinator".to_owned()));
+                }
+            }
             let mut seen_members = HashSet::new();
             for actor in &role.members {
                 let (kind, actor_id) = match actor {

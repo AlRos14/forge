@@ -3,8 +3,9 @@ use std::sync::Arc;
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ActorKind, AgentRepo,
     AgentStatus, CoordinationMode, CreateAgentIdentity, CreateAgentProfile, CreateDomainEvent,
-    CreateOrchestratorWake, CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkUnit,
-    DomainEventRepo, OrchestratorWakeRepo, ProjectRepo, RoleMembershipRepo, SqliteDb,
+    CreateOrchestratorWake, CreateProjectMember, CreateRoleMembership, CreateTask, CreateTaskRole,
+    CreateWorkUnit, DomainEventRepo, OrchestratorWakeRepo, ProjectMemberRepo, ProjectRepo,
+    ProjectTaskRoleDefault, ProjectTaskRoleDefaultsRepo, RoleMembershipRepo, SqliteDb,
     TaskCoordinationMode, TaskRepo, TaskRoleRepo, UserRepo, WorkUnitProvenance, WorkUnitRepo,
     WorkUnitStatus,
 };
@@ -151,11 +152,31 @@ async fn fixture(suffix: &str) -> Fixture {
     )
     .await
     .expect("membership");
+    let event_bus = Arc::new(EventBus::new(32));
+    let task_service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    task_service
+        .create_task_role_with_configuration(
+            &task_id,
+            "reviewer",
+            CoordinationMode::Independent,
+            "{}".to_owned(),
+            r#"{"schema_version":1,"display_label":"Reviewer","capabilities":["formal_review"],"rework":null}"#.to_owned(),
+        )
+        .await
+        .expect("reviewer TaskRole with formal_review capability creates through TaskService");
+    task_service
+        .add_task_role_member(
+            &task_id,
+            "reviewer",
+            api_types::ActorRef::Agent(agent_id.clone()),
+        )
+        .await
+        .expect("Agent becomes an active member of the formal reviewer role");
     let task = TaskRepo::get_by_id(&*db, &task_id, false)
         .await
         .expect("task")
         .expect("task row");
-    let service = TaskCoordinationService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    let service = TaskCoordinationService::new(Arc::clone(&db), event_bus);
     let overview = service
         .authorize(
             &task_id,
@@ -982,35 +1003,32 @@ async fn rework_correction_completion_freezes_result_for_its_review() {
     )
     .await
     .expect("specialist membership");
-    TaskRoleRepo::create_with_configuration(
+    let task_project_id: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id=?")
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("task project ID");
+    ProjectMemberRepo::add_member(
         &*fixture.db,
-        CreateTaskRole {
-            id: "rework-reviewer-role".to_owned(),
-            task_id: fixture.task_id.clone(),
-            role: "reviewer".to_owned(),
-            coordination_mode: Some(CoordinationMode::Independent),
-            policy_json: "{}".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-        r#"{"schema_version":1,"display_label":"Reviewer","capabilities":["formal_review"],"rework":null}"#,
-    )
-    .await
-    .expect("reviewer role");
-    RoleMembershipRepo::add(
-        &*fixture.db,
-        CreateRoleMembership {
+        CreateProjectMember {
             id: new_uuid_v4(),
-            task_role_id: "rework-reviewer-role".to_owned(),
-            actor_kind: ActorKind::Human,
-            actor_id: reviewer_user_id.clone(),
-            status: db::RoleMembershipStatus::Active,
+            project_id: task_project_id,
+            user_id: reviewer_user_id.clone(),
+            role: "member".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
     )
     .await
-    .expect("reviewer membership");
+    .expect("human reviewer becomes a current Project member");
+    TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)))
+        .add_task_role_member(
+            &fixture.task_id,
+            "reviewer",
+            api_types::ActorRef::Human(reviewer_user_id.clone()),
+        )
+        .await
+        .expect("human reviewer joins the existing formal_review TaskRole");
     sqlx::query("UPDATE task_coordination SET team_stale = 0 WHERE task_id = ?")
         .bind(&fixture.task_id)
         .execute(fixture.db.pool())
@@ -1254,6 +1272,12 @@ async fn rework_correction_completion_freezes_result_for_its_review() {
 #[tokio::test]
 async fn quality_route_budget_is_atomic_and_does_not_reset_with_category_or_role() {
     let fixture = fixture("quality-route-budget").await;
+    sqlx::query("UPDATE task_autonomy_limits SET max_route_requests=4 WHERE task_id=?")
+        .bind(&fixture.task_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+
     let role_a = "quality-route-role-a";
     add_quality_role(&fixture, role_a, "specialist-alpha").await;
     let quality = TaskQualityService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)));
@@ -1355,11 +1379,54 @@ async fn quality_route_budget_is_atomic_and_does_not_reset_with_category_or_role
     .expect("route counters");
     assert_eq!(counts, (5, 4));
     assert_eq!(quality.process_pending(10).await.expect("recovery scan"), 4);
+    let autonomy = services::task_autonomy::TaskAutonomyService::new(
+        fixture.db.clone(),
+        Arc::new(EventBus::new(32)),
+    );
+    let mut limits = autonomy
+        .get(&fixture.task_id, &fixture.user_id)
+        .await
+        .unwrap();
+    let version = limits.version;
+    limits.max_route_requests = 12;
+    let grant = api_types::UpdateTaskAutonomyLimitsRequest {
+        expected_version: version,
+        limits,
+        reason: "Human authorized more quality rounds".into(),
+        idempotency_key: "extend-route".into(),
+    };
+    autonomy
+        .update(&fixture.task_id, &fixture.user_id, grant.clone())
+        .await
+        .unwrap();
+    autonomy
+        .update(&fixture.task_id, &fixture.user_id, grant)
+        .await
+        .unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM task_quality_request WHERE id=?")
+        .bind(&exhausted.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "requested");
+    let counts:(i64,i64,i64)=sqlx::query_as("SELECT request_count,budget_used,max_requests FROM task_quality_route WHERE task_id=? AND route_id=?")
+        .bind(&fixture.task_id).bind(&exhausted.route_id).fetch_one(fixture.db.pool()).await.unwrap();
+    assert_eq!(
+        counts,
+        (5, 5, 12),
+        "extension and exact replay preserve consumed rounds and request identity"
+    );
 }
 
 #[tokio::test]
 async fn concurrent_quality_route_requests_consume_one_round_each_and_replay_once() {
     let fixture = fixture("quality-route-concurrency").await;
+    sqlx::query("UPDATE task_autonomy_limits SET max_route_requests=4 WHERE task_id=?")
+        .bind(&fixture.task_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+
     let role_id = "quality-route-concurrent-role";
     add_quality_role(&fixture, role_id, "custom-specialist").await;
     for round in 1..=3 {
@@ -1629,4 +1696,272 @@ async fn specialist_quality_request_is_materialized_and_resolved() {
         .expect("unit")
         .expect("unit row");
     assert_eq!(unit.status, db::WorkUnitStatus::Completed);
+}
+
+#[tokio::test]
+async fn plan_revision_without_a_project_batch_keeps_the_standalone_turn_path() {
+    let fixture = fixture("quality-plan-revision-standalone").await;
+    let quality = TaskQualityService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)));
+    let request = fixture
+        .service
+        .create_quality_request(
+            &fixture.task_id,
+            &fixture.user_id,
+            services::QualityRequestInput {
+                source_artifact_id: None,
+                category: db::TaskQualityCategory::PlanRevision,
+                target_kind: db::TaskQualityTargetKind::Orchestrator,
+                target_task_role_id: Some(fixture.role_id.clone()),
+                target_actor: None,
+                summary: "Revise the Task plan".to_owned(),
+                findings: vec!["The plan needs a clearer acceptance condition".to_owned()],
+                resolution_condition: "The revised plan states its acceptance condition".to_owned(),
+                idempotency_key: "quality-plan-revision-standalone".to_owned(),
+            },
+        )
+        .await
+        .expect("quality request");
+
+    assert_eq!(
+        quality.process_pending(10).await.expect("quality consumer"),
+        1
+    );
+    let persisted = db::TaskCoordinationRepo::get_task_quality_request(&*fixture.db, &request.id)
+        .await
+        .expect("quality request read")
+        .expect("quality request row");
+    assert_eq!(persisted.state, db::TaskQualityState::WorkCreated);
+    assert!(persisted.coordination_request_id.is_some());
+    let turn_count: i64 =
+        sqlx::query_scalar("SELECT turn_count FROM task_coordination WHERE task_id=?")
+            .bind(&fixture.task_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("standalone turn budget");
+    assert_eq!(turn_count, 1);
+}
+
+#[tokio::test]
+async fn batch_scoped_plan_revision_without_exact_batch_origin_requires_human() {
+    let fixture = fixture("quality-plan-revision-batch-scope").await;
+    let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task_id, false)
+        .await
+        .expect("Task read")
+        .expect("Task row");
+    let graph_version: i64 =
+        sqlx::query_scalar("SELECT version FROM project_plan WHERE project_id=?")
+            .bind(&task.project_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("Project graph version");
+    let project_plan = services::project_plan::ProjectPlanService::new(
+        Arc::clone(&fixture.db),
+        Arc::new(EventBus::new(32)),
+    );
+    let batch = project_plan
+        .authorize_batch(
+            &task.project_id,
+            &fixture.user_id,
+            graph_version,
+            vec![fixture.task_id.clone()],
+            1,
+            "quality-plan-revision-batch",
+        )
+        .await
+        .expect("owner authorizes the exact Task phase");
+    assert_eq!(batch.state, "running");
+    let preparation_complete: i64 =
+        sqlx::query_scalar("SELECT preparation_complete FROM project_plan_batch WHERE id=?")
+            .bind(&batch.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("batch preparation status persists");
+    assert_eq!(preparation_complete, 1);
+
+    let quality = TaskQualityService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)));
+    let request = fixture
+        .service
+        .create_quality_request(
+            &fixture.task_id,
+            &fixture.user_id,
+            services::QualityRequestInput {
+                source_artifact_id: None,
+                category: db::TaskQualityCategory::PlanRevision,
+                target_kind: db::TaskQualityTargetKind::Orchestrator,
+                target_task_role_id: Some(fixture.role_id.clone()),
+                target_actor: None,
+                summary: "Revise the Task plan".to_owned(),
+                findings: vec!["No source from this authorized batch is attached".to_owned()],
+                resolution_condition: "An owner reviews the missing source lineage".to_owned(),
+                idempotency_key: "quality-plan-revision-batch-source-missing".to_owned(),
+            },
+        )
+        .await
+        .expect("quality request");
+
+    assert_eq!(
+        quality.process_pending(10).await.expect("quality consumer"),
+        1
+    );
+    let persisted = db::TaskCoordinationRepo::get_task_quality_request(&*fixture.db, &request.id)
+        .await
+        .expect("quality request read")
+        .expect("quality request row");
+    assert_eq!(persisted.state, db::TaskQualityState::RequiresHuman);
+    assert_eq!(
+        persisted.requires_human_reason_code.as_deref(),
+        Some("project_plan_batch_inactive")
+    );
+    assert!(persisted
+        .requires_human_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("exact quality source")));
+
+    let turn_count: i64 =
+        sqlx::query_scalar("SELECT turn_count FROM task_coordination WHERE task_id=?")
+            .bind(&fixture.task_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("batch turn budget");
+    let request_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_coordination_request WHERE task_id=?")
+            .bind(&fixture.task_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("batch coordination requests");
+    let execution_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id=?")
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("batch executions");
+    assert_eq!(turn_count, 0);
+    assert_eq!(request_count, 0);
+    assert_eq!(execution_count, 0);
+}
+
+#[tokio::test]
+async fn new_project_template_task_derives_custom_review_roles_for_batch_authorization() {
+    let fixture = fixture("quality-template-envelope").await;
+    let existing_task = TaskRepo::get_by_id(&*fixture.db, &fixture.task_id, false)
+        .await
+        .expect("existing Task read")
+        .expect("existing Task row");
+    let coordination =
+        db::TaskCoordinationRepo::get_task_coordination(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("existing Task coordination read")
+            .expect("existing Task coordination row");
+    let agent_id = match coordination.coordinator_actor {
+        Some(db::ActorRef::Agent(id)) => id,
+        other => panic!("fixture has no Agent coordinator hint: {other:?}"),
+    };
+    let defaults = ProjectTaskRoleDefaultsRepo::get_task_role_defaults(
+        &*fixture.db,
+        &existing_task.project_id,
+    )
+    .await
+    .expect("Project role defaults read");
+    let now = now_rfc3339();
+    ProjectTaskRoleDefaultsRepo::replace_task_role_defaults(
+        &*fixture.db,
+        &existing_task.project_id,
+        &fixture.user_id,
+        defaults.version,
+        vec![
+            ProjectTaskRoleDefault {
+                role: "planner".to_owned(),
+                coordination_mode: CoordinationMode::Collaborative,
+                configuration_json: serde_json::json!({
+                    "schema_version": 1,
+                    "display_label": "Planner",
+                    "capabilities": ["orchestration"],
+                    "rework": null,
+                    "coordinator_actor": {"kind": "agent", "id": agent_id.clone()}
+                })
+                .to_string(),
+                members: vec![db::ActorRef::Agent(agent_id.clone())],
+            },
+            ProjectTaskRoleDefault {
+                role: "quality_reviewer".to_owned(),
+                coordination_mode: CoordinationMode::Independent,
+                configuration_json: serde_json::json!({
+                    "schema_version": 1,
+                    "display_label": "Quality reviewer",
+                    "capabilities": ["formal_review"],
+                    "rework": null,
+                    "coordinator_actor": null
+                })
+                .to_string(),
+                members: vec![db::ActorRef::Human(fixture.user_id.clone())],
+            },
+        ],
+        &now,
+    )
+    .await
+    .expect("Project template updates to the custom reviewer role");
+
+    let task_service = TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)));
+    let task = task_service
+        .create_task(
+            &existing_task.project_id,
+            "Task with custom reviewer template",
+            Some("Use the Project's copied coordinator and reviewer roles".to_owned()),
+            None,
+            None,
+            Some(db::TaskLifecycleState::Ready),
+            None,
+        )
+        .await
+        .expect("Task copies current Project defaults");
+    let initial_coordination =
+        db::TaskCoordinationRepo::get_task_coordination(&*fixture.db, &task.id)
+            .await
+            .expect("new Task coordination read")
+            .expect("new Task coordination row");
+    assert_eq!(initial_coordination.mode, TaskCoordinationMode::Manual);
+    assert!(initial_coordination.requested_by.is_none());
+    assert!(initial_coordination.team_stale);
+    assert_eq!(
+        initial_coordination.coordinator_actor,
+        Some(db::ActorRef::Agent(agent_id.clone()))
+    );
+
+    let graph_version: i64 =
+        sqlx::query_scalar("SELECT version FROM project_plan WHERE project_id=?")
+            .bind(&existing_task.project_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("current Project graph version");
+    let project_plan = services::project_plan::ProjectPlanService::new(
+        Arc::clone(&fixture.db),
+        Arc::new(EventBus::new(32)),
+    );
+    project_plan
+        .authorize_batch(
+            &existing_task.project_id,
+            &fixture.user_id,
+            graph_version,
+            vec![task.id.clone()],
+            1,
+            "template-custom-reviewer-batch",
+        )
+        .await
+        .expect("batch prepares the Task from the exact Project template");
+
+    let configured: String =
+        sqlx::query_scalar("SELECT envelope_json FROM task_coordination WHERE task_id=?")
+            .bind(&task.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("batch authorization envelope");
+    let configured: serde_json::Value =
+        serde_json::from_str(&configured).expect("stored envelope is valid");
+    assert_eq!(
+        configured["allowed_review_roles"],
+        serde_json::json!(["quality_reviewer"])
+    );
+    assert_eq!(configured["max_work_units"], 16);
+    assert!(configured["require_independent_review"]
+        .as_bool()
+        .unwrap_or(false));
 }

@@ -325,22 +325,39 @@ fn cleanup_stale_control_dirs_at(parent: &Path, now: SystemTime) -> std::io::Res
         Err(error) => return Err(error),
     };
     for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with(CONTROL_DIR_PREFIX) || !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let modified = entry.metadata()?.modified().unwrap_or(now);
-        let stale = now
-            .duration_since(modified)
-            .unwrap_or_default()
-            .gt(&STALE_CONTROL_DIR_TTL);
-        if stale {
-            fs::remove_dir_all(entry.path())?;
-        }
+        // Concurrent Executions own and remove their control directories, so
+        // an entry may vanish between listing and inspection or removal.
+        ignore_not_found(cleanup_stale_control_dir(entry, now))?;
     }
     Ok(())
+}
+
+fn cleanup_stale_control_dir(
+    entry: std::io::Result<fs::DirEntry>,
+    now: SystemTime,
+) -> std::io::Result<()> {
+    let entry = entry?;
+    let name = entry.file_name();
+    let name = name.to_string_lossy();
+    if !name.starts_with(CONTROL_DIR_PREFIX) || !entry.file_type()?.is_dir() {
+        return Ok(());
+    }
+    let modified = entry.metadata()?.modified().unwrap_or(now);
+    let stale = now
+        .duration_since(modified)
+        .unwrap_or_default()
+        .gt(&STALE_CONTROL_DIR_TTL);
+    if stale {
+        fs::remove_dir_all(entry.path())?;
+    }
+    Ok(())
+}
+
+fn ignore_not_found(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 fn set_private_runtime_permissions(
@@ -2033,6 +2050,7 @@ mod tests {
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
                 has_repository_workspace: false,
+                review_read_paths: Vec::new(),
                 worktree_path: worktree.path().display().to_string(),
                 description: "x".repeat(MAX_DIRECT_PROMPT_BYTES + 1),
                 agent_config: serde_json::json!({
@@ -2095,6 +2113,7 @@ mod tests {
                 role: "coder".to_owned(),
                 task_role_capabilities: vec![],
                 has_repository_workspace: false,
+                review_read_paths: Vec::new(),
                 worktree_path: worktree.path().display().to_string(),
                 description: prompt.clone(),
                 agent_config: serde_json::json!({

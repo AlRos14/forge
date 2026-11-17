@@ -163,6 +163,10 @@ async fn validation_run_response(
         logs_ref: run.logs_ref,
         evidence_ids: evidence.into_iter().map(|item| item.id).collect(),
         validation_report_artifact_id: artifact.map(|artifact| artifact.id),
+        run_origin: crate::routes::validation_checks::api_run_origin(run.run_origin),
+        definition_digest: run.definition_digest,
+        catalog_check_id: run.catalog_check_id,
+        check_request_id: run.check_request_id,
         created_at: run.created_at,
         updated_at: run.updated_at,
     })

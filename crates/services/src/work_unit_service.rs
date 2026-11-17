@@ -494,7 +494,7 @@ impl WorkUnitService {
                         "SELECT p.artifact_id FROM artifact_execution_producer p
                          JOIN artifact a ON a.id = p.artifact_id AND a.task_id = p.task_id
                          WHERE p.execution_id = ? AND p.task_id = ?
-                         ORDER BY CASE WHEN a.kind = 'review_report' THEN 0 ELSE 1 END,
+                         ORDER BY CASE WHEN a.kind = 'review_report' THEN 0 WHEN a.kind = 'summary' THEN 1 ELSE 2 END,
                                   p.artifact_id LIMIT 1",
                     )
                     .bind(&execution.id)
@@ -875,7 +875,7 @@ impl WorkUnitService {
             .bind(assigned_actor.id())
             .fetch_one(self.db.pool())
             .await?;
-            if dependent_reviewer != 0 {
+            if dependent_reviewer != 0 && assigned_actor.kind() == db::ActorKind::Human {
                 return Err(invalid(
                     "correction Actor cannot also be assigned as the dependent independent reviewer",
                 ));
@@ -1034,7 +1034,7 @@ impl WorkUnitService {
                 "SELECT p.artifact_id, a.digest FROM artifact_execution_producer p
                  JOIN artifact a ON a.id = p.artifact_id AND a.task_id = p.task_id
                  WHERE p.execution_id = ? AND p.task_id = ?
-                 ORDER BY CASE WHEN a.kind = 'review_report' THEN 0 ELSE 1 END,
+                 ORDER BY CASE WHEN a.kind = 'review_report' THEN 0 WHEN a.kind = 'summary' THEN 1 ELSE 2 END,
                           p.artifact_id LIMIT 1",
             )
             .bind(&execution.id)
@@ -2107,7 +2107,24 @@ impl WorkUnitService {
         };
         let finish_result = operation.finish(operation_status).await;
         match (result, finish_result) {
-            (Ok(record), Ok(_)) => Ok(record),
+            (Ok(record), Ok(_)) => {
+                // C3 hook: queue the Task's pinned `after_integration` catalog
+                // checks against the exact integration Workspace. Best effort and
+                // idempotent; the durable request, not this call, is authoritative.
+                if record.outcome == WorkUnitIntegrationOutcome::Success {
+                    if let Err(error) =
+                        crate::validation_post_integration::enqueue_after_integration(
+                            &self.db,
+                            &self.event_bus,
+                            &record.task_id,
+                        )
+                        .await
+                    {
+                        tracing::warn!(task_id = %record.task_id, %error, "after-integration validation enqueue failed");
+                    }
+                }
+                Ok(record)
+            }
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }

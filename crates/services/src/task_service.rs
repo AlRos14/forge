@@ -133,46 +133,25 @@ impl TaskService {
         let Some(expected_authorization_version) = coordination_authorization_version else {
             return Ok(None);
         };
-        let provenance_eligible = match unit.provenance.as_ref() {
-            Some(WorkUnitProvenance::Artifact(artifact_id)) => {
-                let is_plan: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM artifact
-                        WHERE id = ? AND task_id = ? AND kind = 'work_unit_plan'
-                    )",
-                )
-                .bind(artifact_id)
-                .bind(&unit.task_id)
-                .fetch_one(self.db.pool())
-                .await?;
-                if is_plan {
-                    true
-                } else {
-                    // A reviewed delivery or rework correction completes only
-                    // when a durable, opt-in circuit owns this advance: an
-                    // exact quality request linked to the WorkUnit, or a
-                    // completed automatic-rework intent. Historical/manual
-                    // Tasks and arbitrary Artifact provenance stay untouched.
-                    sqlx::query_scalar(
-                        "SELECT EXISTS(
-                            SELECT 1 FROM task_quality_request
-                            WHERE task_id = ? AND work_unit_id = ?
-                            UNION ALL
-                            SELECT 1 FROM task_rework_automation_intent
-                            WHERE task_id = ? AND correction_work_unit_id = ?
-                              AND state = 'completed'
-                        )",
-                    )
-                    .bind(&unit.task_id)
-                    .bind(&unit.id)
-                    .bind(&unit.task_id)
-                    .bind(&unit.id)
-                    .fetch_one(self.db.pool())
-                    .await?
-                }
-            }
-            _ => false,
+        let is_plan = if let Some(WorkUnitProvenance::Artifact(artifact_id)) =
+            unit.provenance.as_ref()
+        {
+            sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM artifact WHERE id=? AND task_id=? AND kind='work_unit_plan')")
+                .bind(artifact_id).bind(&unit.task_id).fetch_one(self.db.pool()).await?
+        } else {
+            false
         };
+        let provenance_eligible = is_plan || sqlx::query_scalar::<_,bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_quality_request WHERE task_id=? AND work_unit_id=?
+                UNION ALL SELECT 1 FROM task_rework_automation_intent
+                    WHERE task_id=? AND (correction_work_unit_id=? OR review_work_unit_id=?) AND state='completed'
+                UNION ALL SELECT 1 FROM task_review_triage
+                    WHERE task_id=? AND review_work_unit_id=? AND disposition='recheck'
+            )")
+            .bind(&unit.task_id).bind(&unit.id)
+            .bind(&unit.task_id).bind(&unit.id).bind(&unit.id)
+            .bind(&unit.task_id).bind(&unit.id).fetch_one(self.db.pool()).await?;
         if !provenance_eligible {
             return Ok(None);
         }
@@ -1535,6 +1514,38 @@ impl TaskService {
             .unwrap_or(if succeeded { "completed" } else { "failed" })
             .to_owned();
         let mut review_result_error = None;
+        if current_execution.work_unit_id.is_some()
+            && current_execution.role != "planner"
+            && !is_formal_review
+            && outcome == "completed"
+        {
+            if let Some(output) = notification
+                .assistant_output
+                .as_deref()
+                .filter(|output| !output.trim().is_empty())
+            {
+                crate::CollaborationService::new(self.db.clone(), self.event_bus.clone())
+                    .create_delivery_artifact_from_execution(&current_execution.id, output)
+                    .await?;
+            }
+        }
+        if is_formal_review && outcome == "completed" {
+            if let Some(session_id) = notification.agent_session_id.as_deref() {
+                if let Err(error) = ExecutionRepo::record_harness_session_result(
+                    &*self.db,
+                    &current_execution.id,
+                    session_id,
+                    &now_rfc3339(),
+                )
+                .await
+                {
+                    outcome = "failed".to_owned();
+                    review_result_error = Some(format!(
+                        "Review native session isolation could not be established: {error}"
+                    ));
+                }
+            }
+        }
         if current_execution.role == "planner" && outcome == "completed" {
             let assistant_output = notification
                 .assistant_output

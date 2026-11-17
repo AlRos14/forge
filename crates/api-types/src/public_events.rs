@@ -90,6 +90,12 @@ pub enum PublicEventType {
     #[serde(rename = "task.coordination_plan_materialized")]
     #[ts(rename = "task.coordination_plan_materialized")]
     TaskCoordinationPlanMaterialized,
+    #[serde(rename = "task.review_triaged")]
+    #[ts(rename = "task.review_triaged")]
+    TaskReviewTriaged,
+    #[serde(rename = "task.autonomy_limits_changed")]
+    #[ts(rename = "task.autonomy_limits_changed")]
+    TaskAutonomyLimitsChanged,
     #[serde(rename = "task.quality_requested")]
     #[ts(rename = "task.quality_requested")]
     TaskQualityRequested,
@@ -102,6 +108,57 @@ pub enum PublicEventType {
     #[serde(rename = "task.intervention_state_changed")]
     #[ts(rename = "task.intervention_state_changed")]
     TaskInterventionStateChanged,
+    #[serde(rename = "task.validation_check_requested")]
+    #[ts(rename = "task.validation_check_requested")]
+    TaskValidationCheckRequested,
+    #[serde(rename = "task.validation_check_completed")]
+    #[ts(rename = "task.validation_check_completed")]
+    TaskValidationCheckCompleted,
+    #[serde(rename = "task.validation_comparison_recorded")]
+    #[ts(rename = "task.validation_comparison_recorded")]
+    TaskValidationComparisonRecorded,
+    #[serde(rename = "task.human_decision_requested")]
+    #[ts(rename = "task.human_decision_requested")]
+    TaskHumanDecisionRequested,
+    #[serde(rename = "task.human_decision_answered")]
+    #[ts(rename = "task.human_decision_answered")]
+    TaskHumanDecisionAnswered,
+    #[serde(rename = "task.human_decision_closed")]
+    #[ts(rename = "task.human_decision_closed")]
+    TaskHumanDecisionClosed,
+    #[serde(rename = "task.pr_feedback_ingested")]
+    #[ts(rename = "task.pr_feedback_ingested")]
+    TaskPrFeedbackIngested,
+    #[serde(rename = "task.pr_feedback_triaged")]
+    #[ts(rename = "task.pr_feedback_triaged")]
+    TaskPrFeedbackTriaged,
+    #[serde(rename = "task.pr_rework_superseded")]
+    #[ts(rename = "task.pr_rework_superseded")]
+    TaskPrReworkSuperseded,
+    #[serde(rename = "task.pr_rework_resumed")]
+    #[ts(rename = "task.pr_rework_resumed")]
+    TaskPrReworkResumed,
+    #[serde(rename = "task.pr_rework_converged")]
+    #[ts(rename = "task.pr_rework_converged")]
+    TaskPrReworkConverged,
+    #[serde(rename = "task.pr_followup_proposed")]
+    #[ts(rename = "task.pr_followup_proposed")]
+    TaskPrFollowupProposed,
+    #[serde(rename = "task.pr_action_requested")]
+    #[ts(rename = "task.pr_action_requested")]
+    TaskPrActionRequested,
+    #[serde(rename = "task.pr_action_completed")]
+    #[ts(rename = "task.pr_action_completed")]
+    TaskPrActionCompleted,
+    #[serde(rename = "task.work_unit_fallback")]
+    #[ts(rename = "task.work_unit_fallback")]
+    TaskWorkUnitFallback,
+    #[serde(rename = "task.micro_fix_bounds_exceeded")]
+    #[ts(rename = "task.micro_fix_bounds_exceeded")]
+    TaskMicroFixBoundsExceeded,
+    #[serde(rename = "task.coordinator_replan_proposed")]
+    #[ts(rename = "task.coordinator_replan_proposed")]
+    TaskCoordinatorReplanProposed,
     #[serde(rename = "project.created")]
     #[ts(rename = "project.created")]
     ProjectCreated,
@@ -117,6 +174,9 @@ pub enum PublicEventType {
     #[serde(rename = "project.resumed")]
     #[ts(rename = "project.resumed")]
     ProjectResumed,
+    #[serde(rename = "project.plan_changed")]
+    #[ts(rename = "project.plan_changed")]
+    ProjectPlanChanged,
     #[serde(rename = "project_hook.run_changed")]
     #[ts(rename = "project_hook.run_changed")]
     ProjectHookRunChanged,
@@ -162,15 +222,35 @@ impl PublicEventType {
             Self::TaskCoordinationPlanApproved => "task.coordination_plan_approved",
             Self::TaskCoordinationPlanRejected => "task.coordination_plan_rejected",
             Self::TaskCoordinationPlanMaterialized => "task.coordination_plan_materialized",
+            Self::TaskReviewTriaged => "task.review_triaged",
+            Self::TaskAutonomyLimitsChanged => "task.autonomy_limits_changed",
             Self::TaskQualityRequested => "task.quality_requested",
             Self::TaskQualityRequestResolved => "task.quality_request_resolved",
             Self::TaskInterventionRecorded => "task.intervention_recorded",
             Self::TaskInterventionStateChanged => "task.intervention_state_changed",
+            Self::TaskValidationCheckRequested => "task.validation_check_requested",
+            Self::TaskValidationCheckCompleted => "task.validation_check_completed",
+            Self::TaskValidationComparisonRecorded => "task.validation_comparison_recorded",
+            Self::TaskHumanDecisionRequested => "task.human_decision_requested",
+            Self::TaskHumanDecisionAnswered => "task.human_decision_answered",
+            Self::TaskHumanDecisionClosed => "task.human_decision_closed",
+            Self::TaskPrFeedbackIngested => "task.pr_feedback_ingested",
+            Self::TaskPrFeedbackTriaged => "task.pr_feedback_triaged",
+            Self::TaskPrReworkSuperseded => "task.pr_rework_superseded",
+            Self::TaskPrReworkResumed => "task.pr_rework_resumed",
+            Self::TaskPrReworkConverged => "task.pr_rework_converged",
+            Self::TaskPrFollowupProposed => "task.pr_followup_proposed",
+            Self::TaskPrActionRequested => "task.pr_action_requested",
+            Self::TaskPrActionCompleted => "task.pr_action_completed",
+            Self::TaskWorkUnitFallback => "task.work_unit_fallback",
+            Self::TaskMicroFixBoundsExceeded => "task.micro_fix_bounds_exceeded",
+            Self::TaskCoordinatorReplanProposed => "task.coordinator_replan_proposed",
             Self::ProjectCreated => "project.created",
             Self::ProjectUpdated => "project.updated",
             Self::ProjectDeleted => "project.deleted",
             Self::ProjectPaused => "project.paused",
             Self::ProjectResumed => "project.resumed",
+            Self::ProjectPlanChanged => "project.plan_changed",
             Self::ProjectHookRunChanged => "project_hook.run_changed",
             Self::NotificationCreated => "notification.created",
             Self::OperationsStatusChanged => "operations.status_changed",

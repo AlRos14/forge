@@ -11,6 +11,14 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
+mod external_feedback_triage;
+mod micro_fix;
+mod triage;
+mod validation_triage;
+pub(crate) use micro_fix::MicroFixSourceReceiptInput;
+pub(crate) use triage::ReviewFindingsDecision;
+pub(crate) use validation_triage::ValidationFindingsDecision;
+
 use crate::{
     collaboration_service::{CollaborationActorSource, CollaborationService},
     Result, ServiceError,
@@ -25,10 +33,6 @@ const PENDING_AUTOMATIC_REWORK_SQL: &str = "SELECT intent.*, dispatch.state AS d
                AND (dispatch.state != 'paused' OR lifecycle.state = 'cancelled')
              ORDER BY intent.created_at, intent.id
              LIMIT ?";
-
-/// Bounded correction rounds per Task. The budget is consumed atomically by
-/// the rework receipt; replaying the same idempotency key consumes nothing.
-pub const MAX_REWORK_ROUNDS: i64 = 8;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestReworkInput {
@@ -90,6 +94,14 @@ impl TaskReworkService {
     /// ReviewReport. The event itself is only a hint; all authority and
     /// subject fields are loaded again from SQLite.
     pub async fn process_domain_event(&self, event: &DomainEvent) -> Result<bool> {
+        if event.event_type == "execution.completed" && event.entity_type == "execution" {
+            return self.process_micro_fix_result(&event.entity_id).await;
+        }
+        if event.event_type == "work_unit.completed" && event.entity_type == "work_unit" {
+            return self
+                .process_micro_fix_work_unit_result(&event.entity_id)
+                .await;
+        }
         if event.event_type != "artifact.created" || event.entity_type != "artifact" {
             return Ok(false);
         }
@@ -147,6 +159,46 @@ impl TaskReworkService {
             if dispatch_state == "paused" {
                 continue;
             }
+            let triage_required: bool = sqlx::query_scalar("SELECT mode != 'manual' AND COALESCE(json_extract(envelope_json,'$.orchestrator_reviews_findings'),0)=1 FROM task_coordination WHERE task_id=?")
+                .bind(&task_id).fetch_optional(self.db.pool()).await?.unwrap_or(false);
+            let triage: Option<(String,String)> = sqlx::query_as("SELECT disposition,instructions FROM task_review_triage WHERE review_report_artifact_id=?")
+                .bind(&report_id).fetch_optional(self.db.pool()).await?;
+            if triage_required {
+                match triage.as_ref().map(|value| value.0.as_str()) {
+                    None => continue,
+                    Some("recheck") => {
+                        self.finish_automation_intent(
+                            &intent_id,
+                            "cancelled",
+                            Some("Coordinator requested a new independent review"),
+                            None,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Some("human") => {
+                        self.finish_automation_intent(
+                            &intent_id,
+                            "blocked",
+                            Some("Coordinator requires a Human decision on the review findings"),
+                            None,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Some("correct") => {}
+                    _ => {
+                        return Err(ServiceError::invalid_operation(
+                            "Unknown review triage disposition",
+                        ))
+                    }
+                }
+            }
+            let micro_fix_request = if triage.as_ref().is_some_and(|value| value.0 == "correct") {
+                self.micro_fix_request(&task_id, &report_id).await?
+            } else {
+                None
+            };
 
             let source = sqlx::query(
                 "SELECT role.version AS role_version, configuration.configuration_json,
@@ -280,7 +332,34 @@ impl TaskReworkService {
                 processed += 1;
                 continue;
             }
-            let Some(review_actor) = policy.review_actor.clone() else {
+            let review_actor = if let Some(micro_fix) = micro_fix_request.as_ref() {
+                match self
+                    .micro_fix_review_actor(
+                        &task_id,
+                        micro_fix.authorization_version,
+                        policy.next_review_role_id.as_deref(),
+                        policy.review_actor.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(Some(actor)) => Some(actor),
+                    Ok(None) => policy.review_actor.clone(),
+                    Err(error) => {
+                        self.finish_automation_intent(
+                            &intent_id,
+                            "blocked",
+                            Some(&error.to_string()),
+                            None,
+                        )
+                        .await?;
+                        processed += 1;
+                        continue;
+                    }
+                }
+            } else {
+                policy.review_actor.clone()
+            };
+            let Some(review_actor) = review_actor else {
                 self.finish_automation_intent(
                     &intent_id,
                     "blocked",
@@ -358,8 +437,9 @@ impl TaskReworkService {
                 reviewed_work_unit_version,
                 correction_title: format!("Address review findings: {}", reviewed.title),
                 correction_scope: format!(
-                    "Original scope:\n{}\n\nExact findings from ReviewReport {}:\n{}",
-                    reviewed.scope, report_id, findings
+                    "Original scope:\n{}\n\nExact findings from ReviewReport {}:\n{}\n\nCoordinator's confirmed correction scope:\n{}",
+                    reviewed.scope, report_id, findings,
+                    triage.as_ref().map(|value|value.1.as_str()).unwrap_or("Address the exact report within the authorized original scope.")
                 ),
                 correction_role_id,
                 correction_actor,
@@ -380,7 +460,18 @@ impl TaskReworkService {
                 .await
             {
                 Ok(result) => {
-                    let round = MAX_REWORK_ROUNDS - result.rounds_remaining;
+                    self.ensure_micro_fix_receipt(
+                        &task_id,
+                        &report_id,
+                        &result.correction_work_unit.id,
+                    )
+                    .await?;
+                    let round: i64 = sqlx::query_scalar(
+                        "SELECT round FROM task_rework_receipt WHERE correction_work_unit_id=?",
+                    )
+                    .bind(&result.correction_work_unit.id)
+                    .fetch_one(self.db.pool())
+                    .await?;
                     self.finish_automation_intent(
                         &intent_id,
                         "completed",
@@ -752,6 +843,8 @@ impl TaskReworkService {
         let correction_id: String = receipt.try_get("correction_work_unit_id")?;
         let review_id: String = receipt.try_get("review_work_unit_id")?;
         let round: i64 = receipt.try_get("round")?;
+        self.ensure_micro_fix_receipt(task_id, report_id, &correction_id)
+            .await?;
         if receipt_idempotency_key == automatic_idempotency_key {
             self.finish_automation_intent(
                 intent_id,
@@ -1062,7 +1155,7 @@ impl TaskReworkService {
                 "rework requires an explicit next review Actor; no correction pair was created",
             )
         })?;
-        if correction_actor == review_actor
+        if (correction_actor == review_actor && matches!(review_actor, ActorRef::Human(_)))
             || actor_contributed_to_work_unit(&self.db, &task.id, &reviewed.id, &review_actor)
                 .await?
         {
@@ -1126,6 +1219,22 @@ impl TaskReworkService {
                         "rework receipt could not be resolved after concurrent commit",
                     )
                 });
+        }
+        if input.expected_source_configuration_json.is_some() {
+            let current_triage_authority: bool = sqlx::query_scalar(
+                "SELECT NOT EXISTS(SELECT 1 FROM task_coordination c WHERE c.task_id=? AND c.mode!='manual'
+                    AND COALESCE(json_extract(c.envelope_json,'$.orchestrator_reviews_findings'),0)=1
+                    AND (c.revoked_at IS NOT NULL OR c.team_stale=1 OR NOT EXISTS(
+                        SELECT 1 FROM task_review_triage triage JOIN execution coordinator ON coordinator.id=triage.execution_id
+                        JOIN execution_task_role_authority authority ON authority.execution_id=coordinator.id
+                        WHERE triage.task_id=c.task_id AND triage.review_report_artifact_id=? AND triage.disposition='correct'
+                          AND triage.authorization_version=c.authorization_version
+                          AND authority.task_role_id=c.coordinator_task_role_id
+                          AND coordinator.actor_kind=c.coordinator_actor_kind AND coordinator.actor_id=c.coordinator_actor_id)))"
+            ).bind(&task.id).bind(&input.review_report_artifact_id).fetch_one(&mut *tx).await?;
+            if !current_triage_authority {
+                return Err(ServiceError::invalid_operation("Current guided authorization and an exact confirmed coordinator triage are required for automatic correction"));
+            }
         }
         let current_task_version: i64 =
             sqlx::query_scalar("SELECT version FROM task WHERE id = ? AND deleted_at IS NULL")
@@ -1268,7 +1377,8 @@ impl TaskReworkService {
             ));
         }
         let round: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) + 1 FROM task_rework_receipt WHERE task_id = ?")
+            sqlx::query_scalar("SELECT COUNT(*) + 1 + (SELECT COUNT(*) FROM task_review_triage WHERE task_id=? AND disposition='recheck') FROM task_rework_receipt WHERE task_id = ?")
+                .bind(&task.id)
                 .bind(&task.id)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -1285,9 +1395,15 @@ impl TaskReworkService {
                 "this exact ReviewReport already created a correction and review round",
             ));
         }
-        if round > MAX_REWORK_ROUNDS {
+        let max_rounds: i64 = sqlx::query_scalar(
+            "SELECT max_rework_rounds FROM task_autonomy_limits WHERE task_id=?",
+        )
+        .bind(&task.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if round > max_rounds {
             return Err(ServiceError::conflict(format!(
-                "rework budget exhausted after {MAX_REWORK_ROUNDS} rounds"
+                "rework budget exhausted after {max_rounds} rounds"
             )));
         }
 
@@ -1461,7 +1577,7 @@ impl TaskReworkService {
             correction_work_unit,
             review_work_unit,
             review_subject,
-            rounds_remaining: MAX_REWORK_ROUNDS - round,
+            rounds_remaining: (max_rounds - round).max(0),
             replayed: false,
         })
     }
@@ -1488,6 +1604,12 @@ impl TaskReworkService {
         let correction_id: String = row.try_get("correction_work_unit_id")?;
         let review_id: String = row.try_get("review_work_unit_id")?;
         let round: i64 = row.try_get("round")?;
+        let max_rounds: i64 = sqlx::query_scalar(
+            "SELECT max_rework_rounds FROM task_autonomy_limits WHERE task_id=?",
+        )
+        .bind(&input.task_id)
+        .fetch_one(self.db.pool())
+        .await?;
         let correction_work_unit = WorkUnitRepo::get_by_id(&*self.db, &correction_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("work_unit", correction_id.clone()))?;
@@ -1498,7 +1620,7 @@ impl TaskReworkService {
             correction_work_unit,
             review_work_unit,
             review_subject: get_review_subject(&self.db, &review_id).await?,
-            rounds_remaining: MAX_REWORK_ROUNDS - round,
+            rounds_remaining: (max_rounds - round).max(0),
             replayed: true,
         }))
     }
@@ -1816,6 +1938,12 @@ async fn actor_contributed_to_work_unit(
     work_unit_id: &str,
     actor: &ActorRef,
 ) -> Result<bool> {
+    // Agent profiles are reusable across responsibilities. Their native session
+    // and context ancestry are isolated by execution_role_session_isolation_*.
+    // Humans cannot obtain independence by changing a role label.
+    if matches!(actor, ActorRef::Agent(_)) {
+        return Ok(false);
+    }
     let exists: i64 = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM execution

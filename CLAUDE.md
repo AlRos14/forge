@@ -17,9 +17,11 @@ When behavior or a public contract changes, update the affected documentation in
 
 ## Product state
 
-The workspace source version is 0.8.0. This repository has no verified published GitHub release as of the PR14 documentation audit. Build from this repository to use the current implementation; do not present ForgeAILab npm, Homebrew, installer, or release artifacts as this fork's distribution.
+The workspace source version is 0.9.0. This repository has no verified published GitHub release as of 2026-11-17. Build from this repository to use the current implementation; do not present ForgeAILab npm, Homebrew, installer, or release artifacts as this fork's distribution.
 
 PR0–PR15 are merged. The current implementation uses the Actor and harness orchestration model, TaskLifecycle, TaskRole/RoleMembership, WorkUnits, explicit Executions and HarnessSessions, deterministic Gates, and generic collaboration. Task launch is a durable dispatch intent: prepared Agent WorkUnits are admitted by the dispatcher, Human-assigned WorkUnits remain pending human work, and manual Execution creation is retired. Execution purpose is retired from public and active persistence; historical values remain migration evidence. Main Agent, Project Agent, Agent Chat, Product Genesis, Project OS operations, legacy Attention, and the old WorkflowEngine are retired from current runtime/public authority. Their migration provenance and historical snapshots remain historical evidence.
+
+Current delivery capabilities include a coordinator verification lane with deterministic validation and Gate required checks, plus structured Human decision requests. The PR feedback and rework loop uses GitHub SCM credentials encrypted by CredentialService. PR external actions require Human approval by default; automatic push or summary actions require an owner/admin repository policy, and merge always remains a Human decision. Coordination envelope v2 supports preauthorized fallback Agents, bounded micro-fixes, and coordinator replans; Rust classifies scope and authority changes, and a change requires the exact Human decision before materialization.
 
 Project Copilot is a separate, explicit Project-to-Agent assignment with durable
 Project management runs and conversation. It uses the selected installed

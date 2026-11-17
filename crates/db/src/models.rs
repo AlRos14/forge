@@ -348,7 +348,15 @@ pub struct PrProviderConfig {
     pub provider_type: String,
     pub base_url: Option<String>,
     pub polling_interval_seconds: i64,
+    /// Retired for PR use (historical data); the PR credential is
+    /// `credential_handle_id` (V173, D4).
     pub token_secret_ref: Option<String>,
+    /// `credential_handle` (`provider = 'github'`) whose secret authenticates
+    /// PR provider calls; always set together with `credential_owner_user_id`.
+    pub credential_handle_id: Option<String>,
+    pub credential_owner_user_id: Option<String>,
+    /// Versioned feedback policy JSON (schema_version 1); see `PrFeedbackPolicy`.
+    pub feedback_policy_json: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -391,6 +399,21 @@ pub struct RemotePrAdmission {
     pub source_branch: String,
     pub target_branch: String,
     pub admitted_source_sha: String,
+    /// `Some("superseded_for_rework")` once the admission was paused for
+    /// same-PR rework (V175); `state` then stays at the last provider-observed
+    /// value and the admission is excluded from every "open admission" query.
+    pub rework_outcome: Option<String>,
+    pub supersession_id: Option<String>,
+    /// The paused `pr_rework_supersession` this admission re-admits (V175).
+    pub readmits_supersession_id: Option<String>,
+    /// Credential reference frozen at admission (V173). `None` on historical
+    /// admissions and when the repo had no credential configured.
+    pub credential_handle_id: Option<String>,
+    pub credential_owner_user_id: Option<String>,
+    /// Feedback policy frozen at admission (V173); `None` on historical
+    /// admissions (no ingestion, no external action is authorized for them).
+    pub feedback_policy_json: Option<String>,
+    pub feedback_policy_digest: Option<String>,
     pub state: String,
     /// The outcome the provider reported, independent from Forge's integrity
     /// classification of whether it affected the admitted subject.
@@ -1224,6 +1247,11 @@ pub struct ValidationRun {
     pub started_at: String,
     pub finished_at: Option<String>,
     pub logs_ref: Option<String>,
+    /// Catalog provenance (V171). `LegacyCommand` rows carry no catalog identity.
+    pub catalog_check_id: Option<String>,
+    pub definition_digest: Option<String>,
+    pub run_origin: ValidationRunOrigin,
+    pub check_request_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1242,6 +1270,12 @@ pub struct CreateValidationRun {
     pub commit_sha: String,
     pub workspace_snapshot_digest: String,
     pub idempotency_key: String,
+    /// All-or-nothing with `check_request_id`/`definition_digest`; use
+    /// `ValidationRunOrigin::LegacyCommand` with `None` for the historical path.
+    pub catalog_check_id: Option<String>,
+    pub definition_digest: Option<String>,
+    pub run_origin: ValidationRunOrigin,
+    pub check_request_id: Option<String>,
     pub started_at: String,
     pub created_at: String,
     pub updated_at: String,
@@ -2282,6 +2316,8 @@ pub enum ProposalTargetKind {
     Execution,
     Workspace,
     WorkUnit,
+    /// A `human_approval` PR external action (V177; plan node P3).
+    PrExternalAction,
 }
 
 enum_strings!(ProposalTargetKind {
@@ -2289,6 +2325,7 @@ enum_strings!(ProposalTargetKind {
     Execution => "execution",
     Workspace => "workspace",
     WorkUnit => "work_unit",
+    PrExternalAction => "pr_external_action",
 });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2730,6 +2767,7 @@ pub struct AuthorizeTaskCoordinationInput {
     pub team_digest: String,
     pub envelope_json: String,
     pub envelope_digest: String,
+    pub unconfigured_default_refresh: bool,
     pub requested_by: String,
     pub idempotency_key: String,
     pub request_digest: String,
@@ -2753,12 +2791,31 @@ pub struct RevokeTaskCoordinationInput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TaskCoordinationRequestKind {
+    WorkUnitPlan,
+    ReviewFindings,
+    ValidationFindings,
+    ExternalFeedback,
+    HumanDecisionResume,
+}
+
+enum_strings!(TaskCoordinationRequestKind {
+    WorkUnitPlan => "work_unit_plan",
+    ReviewFindings => "review_findings",
+    ValidationFindings => "validation_findings",
+    ExternalFeedback => "external_feedback",
+    HumanDecisionResume => "human_decision_resume",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskCoordinationRequestState {
     Requested,
     Running,
     PlanReady,
     AwaitingApproval,
     Materialized,
+    Triaged,
     Failed,
     Cancelled,
     Uncertain,
@@ -2770,6 +2827,7 @@ enum_strings!(TaskCoordinationRequestState {
     PlanReady => "plan_ready",
     AwaitingApproval => "awaiting_approval",
     Materialized => "materialized",
+    Triaged => "triaged",
     Failed => "failed",
     Cancelled => "cancelled",
     Uncertain => "uncertain",
@@ -2777,7 +2835,10 @@ enum_strings!(TaskCoordinationRequestState {
 
 impl TaskCoordinationRequestState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Materialized | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Materialized | Self::Triaged | Self::Failed | Self::Cancelled
+        )
     }
 }
 
@@ -2785,6 +2846,17 @@ impl TaskCoordinationRequestState {
 pub struct TaskCoordinationRequest {
     pub id: String,
     pub task_id: String,
+    pub kind: TaskCoordinationRequestKind,
+    pub review_report_artifact_id: Option<String>,
+    pub review_report_digest: Option<String>,
+    pub review_producer_execution_id: Option<String>,
+    /// Exact non-review source of validation_findings / external_feedback /
+    /// human_decision_resume requests (V172). `None` for historical kinds.
+    pub source_subject_kind: Option<String>,
+    pub source_subject_id: Option<String>,
+    pub source_subject_digest: Option<String>,
+    /// The request a human_decision_resume request continues (V172).
+    pub resumes_request_id: Option<String>,
     pub authorization_version: i64,
     pub mode: TaskCoordinationMode,
     pub brief_json: String,
@@ -2807,6 +2879,16 @@ pub struct TaskCoordinationRequest {
 pub struct CreateTaskCoordinationRequestInput {
     pub id: String,
     pub task_id: String,
+    pub kind: TaskCoordinationRequestKind,
+    pub review_report_artifact_id: Option<String>,
+    pub review_report_digest: Option<String>,
+    pub review_producer_execution_id: Option<String>,
+    pub source_subject_kind: Option<String>,
+    pub source_subject_id: Option<String>,
+    pub source_subject_digest: Option<String>,
+    pub resumes_request_id: Option<String>,
+    pub requested_by: String,
+    pub expected_task_version: i64,
     pub authorization_version: i64,
     pub mode: TaskCoordinationMode,
     pub brief_json: String,
@@ -2815,6 +2897,62 @@ pub struct CreateTaskCoordinationRequestInput {
     pub idempotency_key: String,
     pub created_at: String,
     pub event: CreateDomainEvent,
+}
+
+/// Exact Project batch claim that is allowed to create and attach one
+/// coordinator request. The repository consumes the coordination turn budget,
+/// links the request to the batch Task row, and appends the request event in
+/// the same serialized transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectPlanBatchRequestBinding {
+    pub project_id: String,
+    pub batch_id: String,
+    pub authorized_by: String,
+    pub expected_batch_version: i64,
+    pub expected_graph_version: i64,
+    pub expected_task_version: i64,
+    pub expected_coordination_version: i64,
+    pub coordination_snapshot_digest: String,
+    pub origin: ProjectPlanBatchRequestOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectPlanBatchRequestOrigin {
+    Scheduler {
+        claim_token: String,
+    },
+    QualityReplan {
+        source_artifact_id: String,
+        producer_execution_id: String,
+    },
+    HumanReplan {
+        approved_plan_artifact_id: String,
+    },
+    ReviewTriage {
+        source_artifact_id: String,
+        producer_execution_id: String,
+    },
+    /// The exact source lives in `task_coordination_request.source_subject_*`.
+    ValidationTriage,
+    ExternalFeedbackTriage,
+    HumanDecisionResume,
+    CoordinatorReplan {
+        producer_execution_id: String,
+    },
+}
+
+/// Typed binding used while minting TaskCoordination authority from a
+/// Project batch. It is persisted in the same transaction as the new
+/// authorization version, so a later pin failure or batch revocation cannot
+/// turn that grant into a generic Task authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectPlanBatchAuthorizationBinding {
+    pub project_id: String,
+    pub batch_id: String,
+    pub authorized_by: String,
+    pub expected_batch_version: i64,
+    pub expected_graph_version: i64,
+    pub expected_team_generation: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3363,4 +3501,1258 @@ pub struct TaskLifecycleTransitionWrite {
     pub gate_evaluation_id: Option<String>,
     pub replayed: bool,
     pub event: Option<DomainEvent>,
+}
+
+// ---------------------------------------------------------------------------
+// V171 validation check catalog, requests and comparison; V172 triage/replan;
+// V174 human decisions (coordinator-verification-and-pr-loop, Phase 1).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationRunOrigin {
+    LegacyCommand,
+    CoordinatorRequest,
+    AfterIntegration,
+    /// Reserved by the frozen enum; never inserted (baseline results live in
+    /// `validation_comparison`, decision C2).
+    Baseline,
+}
+
+enum_strings!(ValidationRunOrigin {
+    LegacyCommand => "legacy_command",
+    CoordinatorRequest => "coordinator_request",
+    AfterIntegration => "after_integration",
+    Baseline => "baseline",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationCheckState {
+    Active,
+    Retired,
+}
+
+enum_strings!(ValidationCheckState {
+    Active => "active",
+    Retired => "retired",
+});
+
+/// Trigger pinned in the coordination envelope (`validation_checks[].trigger`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvelopeCheckTrigger {
+    OnRequest,
+    AfterIntegration,
+}
+
+enum_strings!(EnvelopeCheckTrigger {
+    OnRequest => "on_request",
+    AfterIntegration => "after_integration",
+});
+
+/// Trigger stored on a `validation_check_request` row. `CoordinatorRequest`
+/// requires an `on_request` pin; `AfterIntegration` an `after_integration` pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationCheckRequestTrigger {
+    CoordinatorRequest,
+    AfterIntegration,
+}
+
+enum_strings!(ValidationCheckRequestTrigger {
+    CoordinatorRequest => "coordinator_request",
+    AfterIntegration => "after_integration",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationCheckSubjectKind {
+    WorkUnitResult,
+    TaskIntegration,
+}
+
+enum_strings!(ValidationCheckSubjectKind {
+    WorkUnitResult => "work_unit_result",
+    TaskIntegration => "task_integration",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationCheckRequestState {
+    Queued,
+    Running,
+    Completed,
+    Cancelled,
+    FailedToStart,
+}
+
+enum_strings!(ValidationCheckRequestState {
+    Queued => "queued",
+    Running => "running",
+    Completed => "completed",
+    Cancelled => "cancelled",
+    FailedToStart => "failed_to_start",
+});
+
+impl ValidationCheckRequestState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Cancelled | Self::FailedToStart
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationComparisonClass {
+    Regression,
+    PreExistingFailure,
+    Fixed,
+    BothPass,
+    Inconclusive,
+}
+
+enum_strings!(ValidationComparisonClass {
+    Regression => "regression",
+    PreExistingFailure => "pre_existing_failure",
+    Fixed => "fixed",
+    BothPass => "both_pass",
+    Inconclusive => "inconclusive",
+});
+
+impl ValidationComparisonClass {
+    /// Deterministic classification enforced by the V171 CHECK constraint.
+    pub fn classify(candidate: ValidationRunStatus, baseline: ValidationRunStatus) -> Self {
+        match (candidate, baseline) {
+            (ValidationRunStatus::Passed, ValidationRunStatus::Passed) => Self::BothPass,
+            (ValidationRunStatus::Failed, ValidationRunStatus::Passed) => Self::Regression,
+            (ValidationRunStatus::Failed, ValidationRunStatus::Failed) => Self::PreExistingFailure,
+            (ValidationRunStatus::Passed, ValidationRunStatus::Failed) => Self::Fixed,
+            _ => Self::Inconclusive,
+        }
+    }
+}
+
+/// Input of the frozen `definition_digest`:
+/// `sha256(serde_json::to_string(&ValidationCheckDigestInput))` with this exact
+/// field order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationCheckDigestInput {
+    pub check_key: String,
+    pub version: i64,
+    pub command: String,
+    pub timeout_seconds: i64,
+    pub env_policy: String,
+}
+
+/// Frozen digest of a catalog definition version (sha256, lowercase hex).
+pub fn validation_check_definition_digest(input: &ValidationCheckDigestInput) -> String {
+    use sha2::{Digest, Sha256};
+    // Serializing plain strings and integers cannot fail.
+    let json = serde_json::to_string(input).unwrap_or_default();
+    hex::encode(Sha256::digest(json.as_bytes()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationCheckDefinition {
+    pub id: String,
+    pub project_id: String,
+    pub repo_id: Option<String>,
+    pub check_key: String,
+    pub version: i64,
+    pub command: String,
+    pub timeout_seconds: i64,
+    pub env_policy: String,
+    pub definition_digest: String,
+    pub state: ValidationCheckState,
+    pub created_by: String,
+    pub created_at: String,
+    pub retired_at: Option<String>,
+}
+
+/// Publishes the next exact version of `(project_id, repo_id, check_key)`. The
+/// repository assigns `version`, computes `definition_digest`, and retires the
+/// previous active version in the same `BEGIN IMMEDIATE` transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishValidationCheckDefinition {
+    pub id: String,
+    pub project_id: String,
+    pub repo_id: Option<String>,
+    pub check_key: String,
+    pub command: String,
+    pub timeout_seconds: i64,
+    pub env_policy: String,
+    pub created_by: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationCheckRequest {
+    pub id: String,
+    pub task_id: String,
+    pub authorization_version: i64,
+    pub check_definition_id: String,
+    pub definition_digest: String,
+    pub trigger_kind: ValidationCheckRequestTrigger,
+    pub subject_kind: ValidationCheckSubjectKind,
+    pub subject_id: String,
+    pub subject_version: i64,
+    pub workspace_id: String,
+    pub commit_sha: String,
+    pub workspace_snapshot_digest: String,
+    pub baseline: bool,
+    pub baseline_commit_sha: Option<String>,
+    pub requested_by_request_id: Option<String>,
+    pub requested_by_execution_id: Option<String>,
+    pub reason: Option<String>,
+    pub idempotency_key: String,
+    pub state: ValidationCheckRequestState,
+    pub candidate_run_id: Option<String>,
+    pub failure_code: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateValidationCheckRequest {
+    pub id: String,
+    pub task_id: String,
+    pub authorization_version: i64,
+    pub check_definition_id: String,
+    pub definition_digest: String,
+    pub trigger_kind: ValidationCheckRequestTrigger,
+    pub subject_kind: ValidationCheckSubjectKind,
+    pub subject_id: String,
+    pub subject_version: i64,
+    pub workspace_id: String,
+    pub commit_sha: String,
+    pub workspace_snapshot_digest: String,
+    pub baseline: bool,
+    pub requested_by_request_id: Option<String>,
+    pub requested_by_execution_id: Option<String>,
+    pub reason: Option<String>,
+    pub idempotency_key: String,
+    pub created_at: String,
+}
+
+/// Forward-only transition guarded by `expected_version` (typed conflict).
+/// `candidate_run_id`/`baseline_commit_sha` may be set once while open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionValidationCheckRequest {
+    pub id: String,
+    pub expected_version: i64,
+    pub to_state: ValidationCheckRequestState,
+    pub candidate_run_id: Option<String>,
+    pub baseline_commit_sha: Option<String>,
+    pub failure_code: Option<String>,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationCheckRequestWrite {
+    pub request: ValidationCheckRequest,
+    /// `false` means an identical idempotent replay returned the existing row.
+    pub created: bool,
+    pub event: Option<DomainEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationComparison {
+    pub id: String,
+    pub task_id: String,
+    pub check_request_id: String,
+    pub candidate_run_id: String,
+    pub candidate_status: ValidationRunStatus,
+    pub candidate_output_digest: Option<String>,
+    pub baseline_commit_sha: String,
+    pub baseline_snapshot_digest: String,
+    pub baseline_provenance_json: String,
+    pub baseline_status: ValidationRunStatus,
+    pub baseline_exit_code: Option<i64>,
+    pub baseline_output_digest: Option<String>,
+    pub classification: ValidationComparisonClass,
+    pub same_output_digest: bool,
+    pub created_at: String,
+}
+
+/// `classification` and `same_output_digest` are derived by the repository from
+/// the statuses and digests (never trusted from the caller).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateValidationComparison {
+    pub id: String,
+    pub task_id: String,
+    pub check_request_id: String,
+    pub candidate_run_id: String,
+    pub candidate_output_digest: Option<String>,
+    pub baseline_commit_sha: String,
+    pub baseline_snapshot_digest: String,
+    pub baseline_provenance_json: String,
+    pub baseline_status: ValidationRunStatus,
+    pub baseline_exit_code: Option<i64>,
+    pub baseline_output_digest: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationComparisonWrite {
+    pub comparison: ValidationComparison,
+    pub created: bool,
+    pub event: Option<DomainEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationTriageDisposition {
+    Correct,
+    Recheck,
+    Human,
+}
+
+enum_strings!(ValidationTriageDisposition {
+    Correct => "correct",
+    Recheck => "recheck",
+    Human => "human",
+});
+
+/// Immutable decision of a `validation_findings` coordination request (V172).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskValidationTriage {
+    pub request_id: String,
+    pub task_id: String,
+    pub validation_run_id: String,
+    pub comparison_id: Option<String>,
+    pub run_digest: String,
+    pub execution_id: String,
+    pub authorization_version: i64,
+    pub disposition: ValidationTriageDisposition,
+    pub rationale: String,
+    pub instructions: String,
+    pub decision_digest: String,
+    pub review_work_unit_id: Option<String>,
+    pub rework_ref: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinatorReplanState {
+    Proposed,
+    Planning,
+    AwaitingHuman,
+    Approved,
+    Rejected,
+    Materialized,
+    Failed,
+}
+
+enum_strings!(CoordinatorReplanState {
+    Proposed => "proposed",
+    Planning => "planning",
+    AwaitingHuman => "awaiting_human",
+    Approved => "approved",
+    Rejected => "rejected",
+    Materialized => "materialized",
+    Failed => "failed",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinatorReplanClassification {
+    WithinEnvelope,
+    ScopeOrAuthorityChange,
+}
+
+enum_strings!(CoordinatorReplanClassification {
+    WithinEnvelope => "within_envelope",
+    ScopeOrAuthorityChange => "scope_or_authority_change",
+});
+
+/// Hard D6 limit: at most `MAX_COORDINATOR_REPLANS_PER_TASK` rows per Task.
+pub const MAX_COORDINATOR_REPLANS_PER_TASK: i64 = 2;
+
+/// Product bounds shared by envelope validation and micro-fix persistence.
+pub const MAX_MICRO_FIX_FILES: u32 = 3;
+pub const MAX_MICRO_FIX_CHANGED_LINES: u32 = 60;
+pub const MAX_MICRO_FIX_PER_TASK: i64 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostClass {
+    Economy,
+    Standard,
+    Premium,
+}
+
+enum_strings!(CostClass {
+    Economy => "economy",
+    Standard => "standard",
+    Premium => "premium",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicroFixSourceKind {
+    ReviewFindings,
+    ValidationFindings,
+    ExternalFeedback,
+}
+
+enum_strings!(MicroFixSourceKind {
+    ReviewFindings => "review_findings",
+    ValidationFindings => "validation_findings",
+    ExternalFeedback => "external_feedback",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicroFixBoundsOutcome {
+    Pending,
+    WithinBounds,
+    BoundsExceeded,
+}
+
+enum_strings!(MicroFixBoundsOutcome {
+    Pending => "pending",
+    WithinBounds => "within_bounds",
+    BoundsExceeded => "bounds_exceeded",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicroFixBoundsViolation {
+    PathsOutsideDeclared,
+    ForbiddenGlob,
+    TooManyFiles,
+    TooManyLines,
+    NewDependency,
+}
+
+enum_strings!(MicroFixBoundsViolation {
+    PathsOutsideDeclared => "paths_outside_declared",
+    ForbiddenGlob => "forbidden_glob",
+    TooManyFiles => "too_many_files",
+    TooManyLines => "too_many_lines",
+    NewDependency => "new_dependency",
+});
+
+/// Immutable record of one preauthorized cross-Agent WorkUnit allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkUnitFallbackReceipt {
+    pub id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub work_unit_version_before: i64,
+    pub work_unit_version_after: i64,
+    pub origin_execution_id: String,
+    pub failure_class: String,
+    pub route_attempts_digest: String,
+    pub task_role_id: String,
+    pub from_actor_kind: ActorKind,
+    pub from_actor_id: String,
+    pub to_actor_kind: ActorKind,
+    pub to_actor_id: String,
+    pub chain_index: i64,
+    pub cost_class: CostClass,
+    pub authorization_version: i64,
+    pub envelope_digest: String,
+    pub new_execution_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkUnitFallbackReceipt {
+    pub id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub work_unit_version_before: i64,
+    pub work_unit_version_after: i64,
+    pub origin_execution_id: String,
+    pub failure_class: String,
+    pub route_attempts_digest: String,
+    pub task_role_id: String,
+    pub from_actor_kind: ActorKind,
+    pub from_actor_id: String,
+    pub to_actor_kind: ActorKind,
+    pub to_actor_id: String,
+    pub chain_index: i64,
+    pub cost_class: CostClass,
+    pub authorization_version: i64,
+    pub envelope_digest: String,
+    pub new_execution_id: Option<String>,
+    pub created_at: String,
+}
+
+/// Micro-fix bounds evidence starts pending and receives one result advance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicroFixReceipt {
+    pub id: String,
+    pub task_id: String,
+    pub request_id: String,
+    pub source_kind: MicroFixSourceKind,
+    pub finding_refs_json: String,
+    pub declared_paths_json: String,
+    pub fix_work_unit_id: String,
+    pub reviewed_commit_sha: String,
+    pub result_commit_sha: Option<String>,
+    pub changed_files: Option<i64>,
+    pub changed_lines: Option<i64>,
+    pub bounds_outcome: MicroFixBoundsOutcome,
+    pub bounds_violation: Option<MicroFixBoundsViolation>,
+    pub reviewer_cost_class: Option<CostClass>,
+    pub reviewer_actor_kind: Option<ActorKind>,
+    pub reviewer_actor_id: Option<String>,
+    pub envelope_digest: String,
+    pub ordinal: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateMicroFixReceipt {
+    pub id: String,
+    pub task_id: String,
+    pub request_id: String,
+    pub source_kind: MicroFixSourceKind,
+    pub finding_refs_json: String,
+    pub declared_paths_json: String,
+    pub fix_work_unit_id: String,
+    pub reviewed_commit_sha: String,
+    pub reviewer_cost_class: Option<CostClass>,
+    pub reviewer_actor_kind: Option<ActorKind>,
+    pub reviewer_actor_id: Option<String>,
+    pub envelope_digest: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvanceMicroFixReceiptBounds {
+    pub id: String,
+    pub result_commit_sha: String,
+    pub changed_files: i64,
+    pub changed_lines: i64,
+    pub bounds_outcome: MicroFixBoundsOutcome,
+    pub bounds_violation: Option<MicroFixBoundsViolation>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCoordinatorReplan {
+    pub id: String,
+    pub task_id: String,
+    pub ordinal: i64,
+    pub authorization_version: i64,
+    pub source_request_id: String,
+    pub producer_execution_id: String,
+    pub plan_request_id: Option<String>,
+    pub reason: String,
+    pub evidence_links_json: String,
+    pub classification: Option<CoordinatorReplanClassification>,
+    pub classification_facts_json: Option<String>,
+    pub human_decision_id: Option<String>,
+    pub state: CoordinatorReplanState,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The repository assigns `ordinal = max + 1` inside `BEGIN IMMEDIATE`; a third
+/// proposal fails with `DbError::CoordinatorReplanLimitReached`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateCoordinatorReplan {
+    pub id: String,
+    pub task_id: String,
+    pub authorization_version: i64,
+    pub source_request_id: String,
+    pub producer_execution_id: String,
+    pub reason: String,
+    pub evidence_links_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionCoordinatorReplan {
+    pub id: String,
+    pub expected_version: i64,
+    pub to_state: CoordinatorReplanState,
+    /// Each optional field may be set once (`None` keeps the stored value).
+    pub plan_request_id: Option<String>,
+    pub classification: Option<CoordinatorReplanClassification>,
+    pub classification_facts_json: Option<String>,
+    pub human_decision_id: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanDecisionState {
+    Open,
+    Answered,
+    Superseded,
+    Cancelled,
+}
+
+enum_strings!(HumanDecisionState {
+    Open => "open",
+    Answered => "answered",
+    Superseded => "superseded",
+    Cancelled => "cancelled",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanDecisionSourceKind {
+    CoordinationRequest,
+    QualityRequest,
+    GateEvaluation,
+    ValidationRun,
+    ExternalFeedback,
+    CoordinatorReplan,
+}
+
+enum_strings!(HumanDecisionSourceKind {
+    CoordinationRequest => "coordination_request",
+    QualityRequest => "quality_request",
+    GateEvaluation => "gate_evaluation",
+    ValidationRun => "validation_run",
+    ExternalFeedback => "external_feedback",
+    CoordinatorReplan => "coordinator_replan",
+});
+
+/// Ordered: `None < Scope < Authority`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityEffect {
+    None,
+    Scope,
+    Authority,
+}
+
+enum_strings!(AuthorityEffect {
+    None => "none",
+    Scope => "scope",
+    Authority => "authority",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HumanDecisionRequest {
+    pub id: String,
+    pub task_id: String,
+    pub source_kind: HumanDecisionSourceKind,
+    pub source_id: String,
+    pub raised_by_execution_id: Option<String>,
+    pub authorization_version: Option<i64>,
+    pub question: String,
+    pub options_json: String,
+    pub recommended_option_id: Option<String>,
+    pub recommendation_rationale: Option<String>,
+    pub evidence_links_json: String,
+    pub max_authority_effect: AuthorityEffect,
+    pub state: HumanDecisionState,
+    pub answered_by_user_id: Option<String>,
+    pub answered_option_id: Option<String>,
+    pub answer_note: Option<String>,
+    pub answered_at: Option<String>,
+    pub resume_request_id: Option<String>,
+    pub resume_binding_json: String,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateHumanDecisionRequest {
+    pub id: String,
+    pub task_id: String,
+    pub source_kind: HumanDecisionSourceKind,
+    pub source_id: String,
+    pub raised_by_execution_id: Option<String>,
+    pub authorization_version: Option<i64>,
+    pub question: String,
+    pub options_json: String,
+    pub recommended_option_id: Option<String>,
+    pub recommendation_rationale: Option<String>,
+    pub evidence_links_json: String,
+    pub max_authority_effect: AuthorityEffect,
+    pub resume_binding_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnswerHumanDecision {
+    pub id: String,
+    pub expected_version: i64,
+    pub option_id: String,
+    pub answered_by_user_id: String,
+    pub note: Option<String>,
+    pub answered_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HumanDecisionWrite {
+    pub decision: HumanDecisionRequest,
+    /// `false` means an identical idempotent replay returned the existing row.
+    pub created: bool,
+    pub event: Option<DomainEvent>,
+}
+
+// ---------------------------------------------------------------------------
+// V173 (coordinator-verification-and-pr-loop, Phase 2): PR feedback policy,
+// external feedback ledger and triage, PR external actions.
+// ---------------------------------------------------------------------------
+
+/// Default feedback policy JSON stored on every `pr_provider_config` row.
+pub const DEFAULT_PR_FEEDBACK_POLICY_JSON: &str = r#"{"schema_version":1,"ingest":false,"trusted_author_associations":["OWNER","MEMBER","COLLABORATOR"],"trusted_logins":[],"max_items_per_poll":50,"push_corrections":"human_approval","post_summary":"off"}"#;
+
+/// Maximum number of items one `external_feedback` coordination request triages.
+pub const MAX_EXTERNAL_FEEDBACK_SET_ITEMS: usize = 20;
+
+/// Lower-case SHA-256 hex of the exact stored policy JSON (what is frozen in
+/// `remote_pr_admission.feedback_policy_digest`).
+pub fn pr_feedback_policy_digest(policy_json: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(policy_json.as_bytes()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrFeedbackAuthorization {
+    HumanApproval,
+    Automatic,
+}
+
+enum_strings!(PrFeedbackAuthorization {
+    HumanApproval => "human_approval",
+    Automatic => "automatic",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrFeedbackSummaryMode {
+    HumanApproval,
+    Automatic,
+    Off,
+}
+
+enum_strings!(PrFeedbackSummaryMode {
+    HumanApproval => "human_approval",
+    Automatic => "automatic",
+    Off => "off",
+});
+
+/// Typed view of `feedback_policy_json` (schema_version 1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrFeedbackPolicy {
+    pub schema_version: i64,
+    pub ingest: bool,
+    pub trusted_author_associations: Vec<String>,
+    pub trusted_logins: Vec<String>,
+    pub max_items_per_poll: i64,
+    pub push_corrections: PrFeedbackAuthorization,
+    pub post_summary: PrFeedbackSummaryMode,
+}
+
+impl Default for PrFeedbackPolicy {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            ingest: false,
+            trusted_author_associations: vec![
+                "OWNER".to_owned(),
+                "MEMBER".to_owned(),
+                "COLLABORATOR".to_owned(),
+            ],
+            trusted_logins: Vec::new(),
+            max_items_per_poll: 50,
+            push_corrections: PrFeedbackAuthorization::HumanApproval,
+            post_summary: PrFeedbackSummaryMode::Off,
+        }
+    }
+}
+
+impl PrFeedbackPolicy {
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        serde_json::from_str(json).map_err(|error| format!("invalid feedback policy: {error}"))
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("feedback policy serializes")
+    }
+}
+
+/// Reference to a `credential_handle` (`provider = 'github'`) and its owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrProviderCredentialRef {
+    pub handle_id: String,
+    pub owner_user_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalFeedbackKind {
+    Review,
+    ReviewComment,
+    IssueComment,
+}
+
+enum_strings!(ExternalFeedbackKind {
+    Review => "review",
+    ReviewComment => "review_comment",
+    IssueComment => "issue_comment",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalFeedbackReviewState {
+    #[serde(rename = "CHANGES_REQUESTED")]
+    ChangesRequested,
+    #[serde(rename = "COMMENTED")]
+    Commented,
+    #[serde(rename = "APPROVED")]
+    Approved,
+    #[serde(rename = "DISMISSED")]
+    Dismissed,
+}
+
+enum_strings!(ExternalFeedbackReviewState {
+    ChangesRequested => "CHANGES_REQUESTED",
+    Commented => "COMMENTED",
+    Approved => "APPROVED",
+    Dismissed => "DISMISSED",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalFeedbackTrustClass {
+    Trusted,
+    Untrusted,
+    ForgeAuthored,
+}
+
+enum_strings!(ExternalFeedbackTrustClass {
+    Trusted => "trusted",
+    Untrusted => "untrusted",
+    ForgeAuthored => "forge_authored",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalFeedbackHeadState {
+    Current,
+    StaleHead,
+}
+
+enum_strings!(ExternalFeedbackHeadState {
+    Current => "current",
+    StaleHead => "stale_head",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalFeedbackDisposition {
+    Correct,
+    Recheck,
+    Human,
+    Dismiss,
+}
+
+enum_strings!(ExternalFeedbackDisposition {
+    Correct => "correct",
+    Recheck => "recheck",
+    Human => "human",
+    Dismiss => "dismiss",
+});
+
+/// Immutable provider-authored item ingested for an open remote PR admission.
+/// `body` is untrusted data; never treat it as an instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFeedbackItem {
+    pub id: String,
+    pub task_id: String,
+    pub admission_id: String,
+    pub provider_item_id: String,
+    pub kind: ExternalFeedbackKind,
+    pub author_login: String,
+    pub author_association: String,
+    pub review_state: Option<ExternalFeedbackReviewState>,
+    pub path: Option<String>,
+    pub line: Option<i64>,
+    pub commit_sha: Option<String>,
+    pub body: String,
+    pub body_truncated: bool,
+    pub body_digest: String,
+    pub provider_url: Option<String>,
+    pub trust_class: ExternalFeedbackTrustClass,
+    pub head_state: ExternalFeedbackHeadState,
+    pub ingested_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateExternalFeedbackItem {
+    pub id: String,
+    pub task_id: String,
+    pub admission_id: String,
+    pub provider_item_id: String,
+    pub kind: ExternalFeedbackKind,
+    pub author_login: String,
+    pub author_association: String,
+    pub review_state: Option<ExternalFeedbackReviewState>,
+    pub path: Option<String>,
+    pub line: Option<i64>,
+    pub commit_sha: Option<String>,
+    /// At most 16 KiB; truncate and set `body_truncated` before calling.
+    pub body: String,
+    pub body_truncated: bool,
+    pub body_digest: String,
+    pub provider_url: Option<String>,
+    pub trust_class: ExternalFeedbackTrustClass,
+    pub head_state: ExternalFeedbackHeadState,
+    pub ingested_at: String,
+}
+
+/// One entry of the exact set an `external_feedback` request triages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFeedbackSetEntry {
+    pub feedback_item_id: String,
+    pub body_digest: String,
+}
+
+/// Immutable coordinator decision about one feedback item of one request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFeedbackTriage {
+    pub id: String,
+    pub task_id: String,
+    pub request_id: String,
+    pub feedback_item_id: String,
+    pub body_digest: String,
+    pub disposition: ExternalFeedbackDisposition,
+    pub rationale: String,
+    pub instructions: String,
+    pub decision_digest: String,
+    pub execution_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateExternalFeedbackTriage {
+    pub id: String,
+    pub task_id: String,
+    pub request_id: String,
+    pub feedback_item_id: String,
+    pub body_digest: String,
+    pub disposition: ExternalFeedbackDisposition,
+    pub rationale: String,
+    pub instructions: String,
+    pub decision_digest: String,
+    pub execution_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrExternalActionKind {
+    PushUpdate,
+    PostComment,
+}
+
+enum_strings!(PrExternalActionKind {
+    PushUpdate => "push_update",
+    PostComment => "post_comment",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrExternalActionState {
+    Proposed,
+    Approved,
+    Running,
+    Succeeded,
+    Failed,
+    OutcomeUnknown,
+    ReconciliationRequired,
+    Rejected,
+    Abandoned,
+}
+
+enum_strings!(PrExternalActionState {
+    Proposed => "proposed",
+    Approved => "approved",
+    Running => "running",
+    Succeeded => "succeeded",
+    Failed => "failed",
+    OutcomeUnknown => "outcome_unknown",
+    ReconciliationRequired => "reconciliation_required",
+    Rejected => "rejected",
+    Abandoned => "abandoned",
+});
+
+impl PrExternalActionState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Rejected | Self::Abandoned
+        )
+    }
+
+    /// States counted by the one-open-action-per-Task unique index.
+    pub fn is_open(self) -> bool {
+        matches!(
+            self,
+            Self::Proposed
+                | Self::Approved
+                | Self::Running
+                | Self::OutcomeUnknown
+                | Self::ReconciliationRequired
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrExternalAction {
+    pub id: String,
+    pub task_id: String,
+    pub admission_id: String,
+    pub kind: PrExternalActionKind,
+    pub state: PrExternalActionState,
+    pub authorization_mode: PrFeedbackAuthorization,
+    pub gate_evaluation_id: Option<String>,
+    pub subject_commit_sha: Option<String>,
+    pub expected_remote_head_sha: Option<String>,
+    pub summary_artifact_id: Option<String>,
+    pub body_digest: Option<String>,
+    pub proposal_id: Option<String>,
+    pub decision_id: Option<String>,
+    pub idempotency_key: String,
+    pub provider_event_id: Option<String>,
+    pub provider_result_json: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
+}
+
+/// Birth of an action: always `proposed`, or `approved` for an `automatic`
+/// action whose frozen admission policy says so. `push_update` requires the
+/// Gate evaluation and both SHAs; `post_comment` the summary Artifact and
+/// body digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePrExternalAction {
+    pub id: String,
+    pub task_id: String,
+    pub admission_id: String,
+    pub kind: PrExternalActionKind,
+    pub authorization_mode: PrFeedbackAuthorization,
+    pub gate_evaluation_id: Option<String>,
+    pub subject_commit_sha: Option<String>,
+    pub expected_remote_head_sha: Option<String>,
+    pub summary_artifact_id: Option<String>,
+    pub body_digest: Option<String>,
+    pub idempotency_key: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionPrExternalAction {
+    pub id: String,
+    pub expected_version: i64,
+    pub to_state: PrExternalActionState,
+    /// Required for `proposed -> approved|rejected` under `human_approval`.
+    pub decision_id: Option<String>,
+    pub provider_event_id: Option<String>,
+    pub provider_result_json: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrExternalActionWrite {
+    pub action: PrExternalAction,
+    /// `false` means an identical idempotent replay returned the existing row.
+    pub created: bool,
+    pub event: Option<DomainEvent>,
+}
+
+// ---------------------------------------------------------------------------
+// V175 (coordinator-verification-and-pr-loop, Phase 2, node PX, D3'):
+// non-destructive PR pause for same-PR rework and per-item feedback
+// dispositions.
+// ---------------------------------------------------------------------------
+
+/// `remote_pr_admission.rework_outcome` marker of a paused admission.
+pub const REWORK_OUTCOME_SUPERSEDED: &str = "superseded_for_rework";
+/// `reason_kind` of the `Merging -> Blocked` and `Blocked -> Active` receipts.
+pub const PR_FEEDBACK_REWORK_REASON_KIND: &str = "pr_feedback_rework";
+/// Domain event recorded when an open admission is paused for rework.
+pub const PR_ADMISSION_SUPERSEDED_EVENT: &str = "pr.admission_superseded";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrReworkState {
+    Open,
+    Readmitted,
+    RemoteMerged,
+    RemoteClosed,
+    Abandoned,
+}
+
+enum_strings!(PrReworkState {
+    Open => "open",
+    Readmitted => "readmitted",
+    RemoteMerged => "remote_merged",
+    RemoteClosed => "remote_closed",
+    Abandoned => "abandoned",
+});
+
+/// Immutable receipt of one paused admission (also the lifecycle receipt
+/// `reason_ref` of the `pr_feedback_rework` edges). Only `state`,
+/// `readmission_merge_operation_id`, `convergence_decision_id`, `version` and
+/// `updated_at` ever change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrReworkSupersession {
+    pub id: String,
+    pub task_id: String,
+    pub task_merge_operation_id: String,
+    pub publish_operation_id: String,
+    pub metadata_id: String,
+    pub request_id: String,
+    pub triage_set_digest: String,
+    pub provider_pr_id: String,
+    pub superseded_head_sha: String,
+    pub result_event_id: String,
+    pub state: PrReworkState,
+    pub readmission_merge_operation_id: Option<String>,
+    pub convergence_decision_id: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Input of [`PrReworkRepo::supersede_admission_in_tx`]. Everything else
+/// (admission, metadata, request digest, provider PR id, head SHA, event) is
+/// read and verified inside the transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersedeAdmission {
+    pub id: String,
+    pub task_merge_operation_id: String,
+    pub request_id: String,
+    pub now: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersedeAdmissionWrite {
+    pub supersession: PrReworkSupersession,
+    /// `false`: an identical earlier supersession was returned (replay).
+    pub created: bool,
+    /// Domain events committed by this call (`pr.admission_superseded`, the
+    /// `task.lifecycle_changed` of `Merging -> Blocked`); empty on replay.
+    pub events: Vec<DomainEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionPrReworkSupersession {
+    pub id: String,
+    pub expected_version: i64,
+    pub to_state: PrReworkState,
+    /// Required (and only allowed) for `readmitted`.
+    pub readmission_merge_operation_id: Option<String>,
+    /// Only allowed for `remote_merged` / `abandoned`; set once.
+    pub convergence_decision_id: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackItemDisposition {
+    ExtendTask,
+    ProposeTask,
+    Human,
+    Dismiss,
+}
+
+enum_strings!(FeedbackItemDisposition {
+    ExtendTask => "extend_task",
+    ProposeTask => "propose_task",
+    Human => "human",
+    Dismiss => "dismiss",
+});
+
+impl FeedbackItemDisposition {
+    /// Mandatory mapping onto the V173 triage row.
+    pub fn legacy(self) -> ExternalFeedbackDisposition {
+        match self {
+            Self::ExtendTask => ExternalFeedbackDisposition::Correct,
+            Self::ProposeTask | Self::Human => ExternalFeedbackDisposition::Human,
+            Self::Dismiss => ExternalFeedbackDisposition::Dismiss,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackScopeClassification {
+    WithinTaskScope,
+    ScopeChange,
+}
+
+enum_strings!(FeedbackScopeClassification {
+    WithinTaskScope => "within_task_scope",
+    ScopeChange => "scope_change",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackDismissReason {
+    NotActionable,
+    Disagree,
+    Duplicate,
+    AlreadyAddressed,
+    OutOfDate,
+}
+
+enum_strings!(FeedbackDismissReason {
+    NotActionable => "not_actionable",
+    Disagree => "disagree",
+    Duplicate => "duplicate",
+    AlreadyAddressed => "already_addressed",
+    OutOfDate => "out_of_date",
+});
+
+/// Real per-item disposition recorded next to the V173 triage row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFeedbackDispositionRecord {
+    pub id: String,
+    pub task_id: String,
+    pub triage_id: String,
+    pub request_id: String,
+    pub feedback_item_id: String,
+    pub body_digest: String,
+    pub disposition: FeedbackItemDisposition,
+    pub legacy_disposition: ExternalFeedbackDisposition,
+    pub scope_classification: Option<FeedbackScopeClassification>,
+    pub classification_facts_json: Option<String>,
+    pub dismiss_reason: Option<FeedbackDismissReason>,
+    pub proposal_json: Option<String>,
+    pub human_decision_id: Option<String>,
+    pub followup_task_id: Option<String>,
+    pub created_at: String,
+}
+
+/// `legacy_disposition` is derived from `disposition` and written to the
+/// matching V173 triage row (`triage_id`) by the caller in the same transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateExternalFeedbackDisposition {
+    pub id: String,
+    pub task_id: String,
+    pub triage_id: String,
+    pub request_id: String,
+    pub feedback_item_id: String,
+    pub body_digest: String,
+    pub disposition: FeedbackItemDisposition,
+    pub scope_classification: Option<FeedbackScopeClassification>,
+    pub classification_facts_json: Option<String>,
+    pub dismiss_reason: Option<FeedbackDismissReason>,
+    pub proposal_json: Option<String>,
+    pub created_at: String,
 }

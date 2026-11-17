@@ -117,6 +117,11 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "reason_ref",
             ],
         ),
+        "project.plan_proposed"
+        | "project.plan_applied"
+        | "project.plan_dependencies_changed"
+        | "project.plan_batch_authorized"
+        | "project.plan_batch_updated" => json!({ "project_id": event.scope_id.as_str() }),
         "gate.created" => {
             project_fields(&source, &["gate_id", "gate_kind", "scope_kind", "scope_id"])
         }
@@ -209,6 +214,16 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "work_unit_ids",
             ],
         ),
+        "task.review_triaged" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "review_report_artifact_id",
+                "disposition",
+                "review_work_unit_id",
+            ],
+        ),
+        "task.autonomy_limits_changed" => project_fields(&source, &["task_id", "limits"]),
         "task.quality_requested" => project_fields(
             &source,
             &[
@@ -236,6 +251,150 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
             &source,
             &["task_id", "intervention_id", "state", "failure_code"],
         ),
+        "validation_check_request.queued"
+        | "validation_check_request.completed"
+        | "validation_check_request.cancelled"
+        | "validation_check_request.failed_to_start"
+        | "task.validation_check_requested"
+        | "task.validation_check_completed" => project_validation_check(&source, &event.event_type),
+        "validation_comparison.recorded" | "task.validation_comparison_recorded" => project_fields(
+            event_details(&source),
+            &["task_id", "check_request_id", "candidate_run_id"],
+        ),
+        "task.human_decision_requested" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "decision_id",
+                "source_kind",
+                "source_id",
+                "authorization_version",
+                "max_authority_effect",
+                "resumes_request_id",
+                "state",
+            ],
+        ),
+        "task.human_decision_answered" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "decision_id",
+                "answered_option_id",
+                "authority_effect",
+                "state",
+                "resumes_request_id",
+            ],
+        ),
+        "task.human_decision_closed" => {
+            project_fields(&source, &["task_id", "decision_id", "state"])
+        }
+        "task.pr_feedback_ingested" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "feedback_item_id",
+                "admission_id",
+                "body_digest",
+                "trust_class",
+                "head_state",
+            ],
+        ),
+        "task.pr_feedback_triaged" => project_fields(
+            &source,
+            &["task_id", "request_id", "admission_id", "set_digest"],
+        ),
+        "task.work_unit_fallback" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "work_unit_id",
+                "origin_execution_id",
+                "receipt_id",
+                "task_role_id",
+                "from_actor_id",
+                "to_actor_id",
+                "candidate_agent_id",
+                "chain_index",
+                "cost_class",
+                "work_unit_version",
+                "authorization_version",
+                "envelope_digest",
+                "route_attempts_digest",
+                "outcome",
+                "reason",
+                "chain_length",
+            ],
+        ),
+        "micro_fix.bounds_exceeded" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "micro_fix_receipt_id",
+                "work_unit_id",
+                "result_commit_sha",
+                "bounds_violation",
+            ],
+        ),
+        "task.coordinator_replan_proposed" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "coordinator_replan_id",
+                "ordinal",
+                "plan_request_id",
+                "authorization_version",
+                "envelope_digest",
+            ],
+        ),
+        "task.pr_rework_superseded" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "supersession_id",
+                "request_id",
+                "task_merge_operation_id",
+                "provider_pr_id",
+                "superseded_head_sha",
+                "triage_set_digest",
+            ],
+        ),
+        "task.pr_rework_resumed" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "supersession_id",
+                "request_id",
+                "state",
+                "readmission_merge_operation_id",
+            ],
+        ),
+        "task.pr_rework_converged" => project_fields(
+            &source,
+            &["task_id", "supersession_id", "outcome", "decision_id"],
+        ),
+        "task.pr_followup_proposed" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "disposition_id",
+                "human_decision_id",
+                "followup_task_id",
+                "state",
+            ],
+        ),
+        "pr.external_action_created"
+        | "pr.external_action_approved"
+        | "pr.external_action_running"
+        | "pr.external_action_outcome_unknown" => {
+            project_fields(&source, &["task_id", "action_id", "admission_id", "state"])
+        }
+        "pr.external_action_rejected"
+        | "pr.external_action_succeeded"
+        | "pr.external_action_failed"
+        | "pr.external_action_reconciliation_required"
+        | "pr.external_action_abandoned" => {
+            project_fields(&source, &["task_id", "action_id", "admission_id", "state"])
+        }
         // In particular, legacy Review-row events are not current Review
         // authority and never enter the public stream.
         _ => return None,
@@ -313,6 +472,11 @@ fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
         "proposal.created" => PublicEventType::ProposalCreated,
         "proposal.withdrawn" => PublicEventType::ProposalWithdrawn,
         "decision.recorded" => PublicEventType::DecisionRecorded,
+        "project.plan_proposed"
+        | "project.plan_applied"
+        | "project.plan_dependencies_changed"
+        | "project.plan_batch_authorized"
+        | "project.plan_batch_updated" => PublicEventType::ProjectPlanChanged,
         "task.coordination_authorized" => PublicEventType::TaskCoordinationAuthorized,
         "task.coordination_revoked" => PublicEventType::TaskCoordinationRevoked,
         "task.coordination_requested" => PublicEventType::TaskCoordinationRequested,
@@ -324,12 +488,84 @@ fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
         "task.coordination_plan_approved" => PublicEventType::TaskCoordinationPlanApproved,
         "task.coordination_plan_rejected" => PublicEventType::TaskCoordinationPlanRejected,
         "task.coordination_plan_materialized" => PublicEventType::TaskCoordinationPlanMaterialized,
+        "task.review_triaged" => PublicEventType::TaskReviewTriaged,
+        "task.autonomy_limits_changed" => PublicEventType::TaskAutonomyLimitsChanged,
         "task.quality_requested" => PublicEventType::TaskQualityRequested,
         "task.quality_request_resolved" => PublicEventType::TaskQualityRequestResolved,
         "task.intervention_recorded" => PublicEventType::TaskInterventionRecorded,
         "task.intervention_state_changed" => PublicEventType::TaskInterventionStateChanged,
+        "validation_check_request.queued" | "task.validation_check_requested" => {
+            PublicEventType::TaskValidationCheckRequested
+        }
+        "validation_check_request.completed"
+        | "validation_check_request.cancelled"
+        | "validation_check_request.failed_to_start"
+        | "task.validation_check_completed" => PublicEventType::TaskValidationCheckCompleted,
+        "validation_comparison.recorded" | "task.validation_comparison_recorded" => {
+            PublicEventType::TaskValidationComparisonRecorded
+        }
+        "task.human_decision_requested" => PublicEventType::TaskHumanDecisionRequested,
+        "task.human_decision_answered" => PublicEventType::TaskHumanDecisionAnswered,
+        "task.human_decision_closed" => PublicEventType::TaskHumanDecisionClosed,
+        "task.pr_feedback_ingested" => PublicEventType::TaskPrFeedbackIngested,
+        "task.pr_feedback_triaged" => PublicEventType::TaskPrFeedbackTriaged,
+        "task.work_unit_fallback" => PublicEventType::TaskWorkUnitFallback,
+        "micro_fix.bounds_exceeded" => PublicEventType::TaskMicroFixBoundsExceeded,
+        "task.coordinator_replan_proposed" => PublicEventType::TaskCoordinatorReplanProposed,
+        "task.pr_rework_superseded" => PublicEventType::TaskPrReworkSuperseded,
+        "task.pr_rework_resumed" => PublicEventType::TaskPrReworkResumed,
+        "task.pr_rework_converged" => PublicEventType::TaskPrReworkConverged,
+        "task.pr_followup_proposed" => PublicEventType::TaskPrFollowupProposed,
+        "pr.external_action_created"
+        | "pr.external_action_approved"
+        | "pr.external_action_running"
+        | "pr.external_action_outcome_unknown" => PublicEventType::TaskPrActionRequested,
+        "pr.external_action_rejected"
+        | "pr.external_action_succeeded"
+        | "pr.external_action_failed"
+        | "pr.external_action_reconciliation_required"
+        | "pr.external_action_abandoned" => PublicEventType::TaskPrActionCompleted,
         _ => return None,
     })
+}
+
+/// Validation events wrap their facts in `details`; direct payloads are
+/// accepted as-is.
+fn event_details(source: &Value) -> &Value {
+    source
+        .get("details")
+        .filter(|value| value.is_object())
+        .unwrap_or(source)
+}
+
+/// Ids, digests and states only: never commands, output tails or commit
+/// bodies. The queued event carries no `state`, so it is derived from the
+/// durable event name.
+fn project_validation_check(source: &Value, event_type: &str) -> Value {
+    let mut projected = project_fields(
+        event_details(source),
+        &[
+            "check_request_id",
+            "task_id",
+            "check_key",
+            "definition_digest",
+            "trigger",
+            "subject_kind",
+            "subject_id",
+            "subject_version",
+            "workspace_id",
+            "baseline",
+            "state",
+            "candidate_run_id",
+            "failure_code",
+        ],
+    );
+    if let Some(object) = projected.as_object_mut() {
+        if !object.contains_key("state") && event_type == "validation_check_request.queued" {
+            object.insert("state".to_owned(), json!("queued"));
+        }
+    }
+    projected
 }
 
 fn project_fields(source: &Value, fields: &[&str]) -> Value {
@@ -490,6 +726,95 @@ mod tests {
     }
 
     #[test]
+    fn pr_feedback_and_action_events_project_only_safe_facts() {
+        let action = domain_event(
+            "pr.external_action_created",
+            r#"{"task_id":"task-1","action_id":"action-1","admission_id":"admission-1","state":"proposed","body":"provider text","token":"secret"}"#,
+        );
+        let projected = project_domain_event(&action).expect("PR action event is public");
+        assert_eq!(projected.event_type, PublicEventType::TaskPrActionRequested);
+        let payload = projected.payload.expect("action payload");
+        assert_eq!(payload["action_id"], "action-1");
+        assert_eq!(payload["state"], "proposed");
+        assert!(payload.get("body").is_none());
+        assert!(payload.get("token").is_none());
+
+        let triage = domain_event(
+            "task.pr_feedback_triaged",
+            r#"{"task_id":"task-1","request_id":"request-1","admission_id":"admission-1","set_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","rationale":"private rationale","body":"provider text"}"#,
+        );
+        let projected = project_domain_event(&triage).expect("PR triage event is public");
+        assert_eq!(projected.event_type, PublicEventType::TaskPrFeedbackTriaged);
+        let payload = projected.payload.expect("triage payload");
+        assert_eq!(payload["set_digest"], json!("a".repeat(64)));
+        assert!(payload.get("rationale").is_none());
+        assert!(payload.get("body").is_none());
+    }
+
+    #[test]
+    fn phase_three_events_use_public_names_and_project_only_allowlisted_fields() {
+        let fallback = domain_event(
+            "task.work_unit_fallback",
+            r#"{"task_id":"task-1","work_unit_id":"work-unit-1","origin_execution_id":"execution-1","receipt_id":"receipt-1","task_role_id":"role-1","from_actor_id":"agent-old","to_actor_id":"agent-new","candidate_agent_id":"agent-new","chain_index":0,"cost_class":"economy","work_unit_version":3,"authorization_version":4,"envelope_digest":"digest-envelope","route_attempts_digest":"digest-route","outcome":"reassigned","reason":"executor_unavailable","chain_length":2,"path":"private/path","prompt":"private prompt","token":"secret"}"#,
+        );
+        let projected = project_domain_event(&fallback).expect("fallback event is public");
+        assert_eq!(projected.event_type, PublicEventType::TaskWorkUnitFallback);
+        let payload = projected.payload.expect("fallback payload");
+        assert_eq!(payload["receipt_id"], "receipt-1");
+        assert_eq!(payload["cost_class"], "economy");
+        assert!(payload.get("path").is_none());
+        assert!(payload.get("prompt").is_none());
+        assert!(payload.get("token").is_none());
+
+        let micro_fix = domain_event(
+            "micro_fix.bounds_exceeded",
+            r#"{"task_id":"task-1","micro_fix_receipt_id":"micro-fix-1","work_unit_id":"work-unit-2","result_commit_sha":"commit-1","bounds_violation":"too_many_lines","declared_paths":["private/path"],"body":"private"}"#,
+        );
+        let projected = project_domain_event(&micro_fix).expect("micro-fix event is public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::TaskMicroFixBoundsExceeded
+        );
+        let payload = projected.payload.expect("micro-fix payload");
+        assert_eq!(payload["micro_fix_receipt_id"], "micro-fix-1");
+        assert!(payload.get("declared_paths").is_none());
+        assert!(payload.get("body").is_none());
+
+        let replan = domain_event(
+            "task.coordinator_replan_proposed",
+            r#"{"task_id":"task-1","coordinator_replan_id":"replan-1","ordinal":1,"plan_request_id":"plan-request-1","authorization_version":4,"envelope_digest":"digest-envelope","reason":"private plan rationale"}"#,
+        );
+        let projected = project_domain_event(&replan).expect("replan event is public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::TaskCoordinatorReplanProposed
+        );
+        let payload = projected.payload.expect("replan payload");
+        assert_eq!(payload["coordinator_replan_id"], "replan-1");
+        assert!(payload.get("reason").is_none());
+    }
+
+    #[test]
+    fn project_plan_event_projection_exposes_only_project_id() {
+        let mut event = domain_event(
+            "project.plan_proposed",
+            r#"{"project_id":"project-1","excerpt":"private source","instructions":"private instructions"}"#,
+        );
+        event.entity_type = "project_plan".to_owned();
+        event.entity_id = "proposal-1".to_owned();
+        event.scope_type = "project".to_owned();
+        event.scope_id = "project-1".to_owned();
+
+        let projected = project_domain_event(&event).expect("Project plan event is public");
+        assert_eq!(projected.event_type, PublicEventType::ProjectPlanChanged);
+        assert_eq!(projected.entity_id, "proposal-1");
+        assert_eq!(projected.payload, Some(json!({"project_id":"project-1"})));
+        let encoded = serde_json::to_string(&projected).expect("event serializes");
+        assert!(!encoded.contains("private source"));
+        assert!(!encoded.contains("private instructions"));
+    }
+
+    #[test]
     fn quality_route_event_exposes_safe_cycle_evidence_without_reason_text() {
         let event = domain_event(
             "task.quality_requested",
@@ -508,6 +833,21 @@ mod tests {
         assert_eq!(payload["cycle_task_role_ids"][1], "role-b");
         assert!(payload.get("requires_human_reason").is_none());
         assert!(payload.get("summary").is_none());
+    }
+
+    #[test]
+    fn review_triage_event_omits_private_coordinator_brief() {
+        let event = domain_event(
+            "task.review_triaged",
+            r#"{"task_id":"task-1","review_report_artifact_id":"report-1","disposition":"recheck","review_work_unit_id":"review-2","rationale":"private evaluation","instructions":"private brief"}"#,
+        );
+        let projected = project_domain_event(&event).expect("triage event is public");
+        assert_eq!(projected.event_type, PublicEventType::TaskReviewTriaged);
+        let payload = projected.payload.unwrap();
+        assert_eq!(payload["disposition"], "recheck");
+        assert_eq!(payload["review_work_unit_id"], "review-2");
+        assert!(payload.get("rationale").is_none());
+        assert!(payload.get("instructions").is_none());
     }
 
     #[test]

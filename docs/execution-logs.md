@@ -23,9 +23,9 @@ then maps `kind` and adapter-specific `payload` shapes into chat entries.
 
 The prompt sent to the executor is stored separately on `execution.prompt`.
 The chat UI renders that prompt as the first user message and deduplicates any
-matching user-message event that also appears in the agent stream. This mirrors
-Vibe Kanban's approach: product-level execution metadata is the stable source for
-turn prompts, while logs remain the source for agent output and tool activity.
+matching user-message event that also appears in the agent stream. Execution
+metadata is the stable source for the initial prompt; logs remain the source
+for agent output and tool activity.
 
 ## Logical storage and recovery
 
@@ -52,22 +52,25 @@ than starting a second sequence.
 
 Usage observations follow the execution and daemon event paths with account
 context and host provenance. Codex `account/rateLimits/updated` events are
-native `provider_event` observations. The current local Cursor Execution path
-does not launch a `/usage` polling helper or persist a `cursor_poll` snapshot.
-An authenticated daemon may report a usage observation; the server ties any
-persisted observation to its exact Execution, account context, source, and
-host/daemon provenance.
+native `provider_event` observations. Cursor supports an explicit account-usage
+observation that runs its `/usage` probe and records source `cursor_poll`; Forge
+does not schedule that probe from an active Execution. An authenticated daemon
+may report a usage observation; the server ties any persisted observation to
+its exact Execution, account context, source, and host/daemon provenance.
 
 ## Adapter Sources
 
 Adapters differ in where user-visible chat messages come from.
 
-| Adapter     | Log source                                                    | User prompt handling                                                                                                                                                                             |
-| ----------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Codex       | Codex app-server protocol events normalized into Forge JSONL. | The UI renders `execution.prompt` first. Native Codex `userMessage` events are still parsed for later user turns, but a native event matching `execution.prompt` is skipped to avoid duplicates. |
-| Claude Code | Claude Code stream JSON normalized into Forge JSONL.          | The UI renders `execution.prompt` first. Forge may also preserve a `kind: "user"` prompt log for compatibility, but the matching log is skipped in chat to avoid duplicates.                     |
-| Cursor      | Cursor Agent stream JSON normalized into Forge JSONL.         | Cursor emits a native `user` event in print mode; the UI renders `execution.prompt` first and skips matching native prompt events to avoid duplicates.                                           |
-| Shell       | Process stdout/stderr written into Forge JSONL.               | Shell has no structured agent conversation; stdout/stderr render as shell output.                                                                                                                |
+| Adapter     | Log source and chat handling |
+| ----------- | ---------------------------- |
+| Codex       | App-server protocol events are normalized into Forge JSONL. The UI renders `execution.prompt` first, preserves later Codex `userMessage` events, and skips a matching prompt echo. |
+| Claude Code | Stream JSON is normalized into Forge JSONL. The UI renders `execution.prompt` first; a matching `kind: "user"` log is deduplicated. |
+| Cursor      | Cursor Agent stream JSON is normalized into Forge JSONL. The UI renders `execution.prompt` first and skips a matching native `user` event. |
+| OpenCode    | CLI JSON run events are preserved and normalized into Forge JSONL, including session and assistant records; the UI renders the prompt from `execution.prompt`. |
+| Gemini CLI  | Parsed JSON output is classified as assistant, tool-call, or tool-result activity; unrecognized output remains stdout. The Forge prompt is stored in the log and rendered from `execution.prompt`. |
+| Smith       | Runtime `stream-json` events are normalized into Forge JSONL with session and assistant records; the UI renders the prompt from `execution.prompt`. |
+| Shell       | Process stdout/stderr are written into Forge JSONL. Shell has no structured agent conversation; output renders as shell activity. |
 
 Codex may emit events for root and child-agent threads over the same app-server
 connection. Forge preserves all of those events in JSONL, but only the exact
@@ -97,11 +100,14 @@ never authorize Resume.
 | Codex       | `resume_thread_id`  | Existing Codex thread id. Follow-ups fork the thread and start a new turn. |
 | Claude Code | `resume_session_id` | Existing Claude session id passed to Claude Code resume mode.              |
 | Cursor      | `resume_session_id` | Existing Cursor Agent session id passed to `cursor-agent --resume`.        |
+| OpenCode    | `resume_session_id` | Existing OpenCode session id passed to `opencode run --session`.           |
+| Smith       | `resume_session_id` | Existing Smith session id passed to `smith --resume`.                      |
 
 ## Follow-Up Turns
 
 Follow-ups are modeled as new executions, not as mutations of the previous
-execution's chat history. This matches the Vibe Kanban model:
+execution's chat history. Each follow-up has its own durable Execution and log
+stream:
 
 1. The user submits a follow-up message.
 2. Forge creates a new execution with:
@@ -124,6 +130,8 @@ Adapter behavior:
 | Codex       | Uses `resume_thread_id`, forks the existing thread, then starts a new turn with the follow-up prompt.        |
 | Claude Code | Uses `resume_session_id`, starts Claude Code in resume mode, then sends the follow-up prompt over stdin JSON. |
 | Cursor      | Uses `resume_session_id`, starts `cursor-agent --resume`, then sends the follow-up prompt in print mode.     |
+| OpenCode    | Uses `resume_session_id` as `opencode run --session` and sends the follow-up prompt to the resumed session. |
+| Smith       | Uses `resume_session_id` as `smith --resume` and sends the follow-up prompt in stream-json mode.             |
 
 The important distinction is that native agent history is used for agent
 context, while Forge execution metadata is used for stable product chat display.
@@ -142,6 +150,9 @@ Use this checklist when revisiting prompt/resume behavior:
   Claude stream to echo the prompt.
 - Cursor follow-up resumes from the parent session and deduplicates the native
   Cursor `user` event when it matches `execution.prompt`.
+- OpenCode and Smith follow-ups use the explicitly linked HarnessSession and
+  require the adapter to confirm the requested external session.
+- Gemini does not currently support native session resume.
 - Raw logs remain unchanged; prompt synthesis affects only chat rendering.
 
 ## Important Invariants

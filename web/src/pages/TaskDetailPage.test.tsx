@@ -14,6 +14,13 @@ const pageMocks = vi.hoisted(() => ({
 }))
 
 vi.mock('@/api/hooks', async () => {
+  const emptyInfiniteQuery = () => ({
+    data: { pages: [] },
+    isLoading: false,
+    isError: false,
+    hasNextPage: false,
+    fetchNextPage: vi.fn(),
+  })
   const React = await import('react')
   const task = {
     id: 'task-1',
@@ -52,6 +59,9 @@ vi.mock('@/api/hooks', async () => {
     useAgentsInfiniteQuery: () => ({ data: { pages: [] }, isLoading: false, isError: false }),
     useDaemonsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false }),
     useTaskCoordinationQuery: () => ({ data: undefined, isError: false }),
+    useTaskFallbackReceiptsQuery: emptyInfiniteQuery,
+    useTaskMicroFixesQuery: emptyInfiniteQuery,
+    useTaskCoordinatorReplansQuery: emptyInfiniteQuery,
     useTaskQuery: () => ({
       data: { ...task, lifecycle: { ...task.lifecycle, state: pageMocks.lifecycleState } },
       isLoading: false,

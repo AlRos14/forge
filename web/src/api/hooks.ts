@@ -112,6 +112,27 @@ import type {
   Workspace,
   WorkUnitResponse,
   WorkUnitArtifactPackageResponse,
+  AnswerHumanDecisionRequest,
+  AnswerHumanDecisionResponse,
+  CreateValidationCheckRequest,
+  HumanDecisionListResponse,
+  HumanDecisionResponse,
+  WorkUnitFallbackReceiptListResponse,
+  MicroFixReceiptListResponse,
+  CoordinatorReplanListResponse,
+  RetireValidationCheckRequest,
+  ValidationCheckDefinitionResponse,
+  ValidationCheckListResponse,
+  ValidationCheckRequestListResponse,
+  ValidationCheckState,
+  ValidationComparisonListResponse,
+  ExternalFeedbackItemListResponse,
+  PrReworkListResponse,
+  PrExternalActionListResponse,
+  PrExternalActionResponse,
+  DecidePrExternalActionRequest,
+  PrFeedbackPolicyResponse,
+  UpdatePrFeedbackPolicyRequest,
 } from '@/types/generated'
 import { recordUserInitiatedTransition } from '@/lib/notification-toast-suppression'
 
@@ -719,6 +740,242 @@ export function useValidationsQuery(taskId: string) {
     queryKey: qk.validationRuns(taskId),
     queryFn: () => apiFetch<ValidationRunResponse[]>(`/tasks/${taskId}/validation-runs`),
     enabled: Boolean(taskId),
+  })
+}
+
+// --- Validation checks, comparisons and human decisions ---
+
+export function useProjectValidationChecksQuery(projectId: string, state?: ValidationCheckState) {
+  return useQuery({
+    queryKey: [...qk.projectValidationChecks(projectId), state ?? 'all'] as const,
+    queryFn: () =>
+      apiFetch<ValidationCheckListResponse>(
+        `/projects/${projectId}/validation-checks${state ? `?state=${state}` : ''}`,
+      ),
+    enabled: Boolean(projectId),
+  })
+}
+
+export function useCreateValidationCheck(projectId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (body: CreateValidationCheckRequest) =>
+      apiFetch<ValidationCheckDefinitionResponse>(`/projects/${projectId}/validation-checks`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: () =>
+      void queryClient.invalidateQueries({ queryKey: qk.projectValidationChecks(projectId) }),
+  })
+}
+
+export function useRetireValidationCheck(projectId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ checkId, body }: { checkId: string; body: RetireValidationCheckRequest }) =>
+      apiFetch<ValidationCheckDefinitionResponse>(`/validation-checks/${checkId}/retire`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSettled: () =>
+      void queryClient.invalidateQueries({ queryKey: qk.projectValidationChecks(projectId) }),
+  })
+}
+
+export function useTaskValidationCheckRequestsQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskValidationCheckRequests(taskId),
+    queryFn: () =>
+      apiFetch<ValidationCheckRequestListResponse>(`/tasks/${taskId}/validation-check-requests`),
+    enabled: Boolean(taskId),
+    refetchInterval: 5_000,
+  })
+}
+
+export function useTaskValidationComparisonsQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskValidationComparisons(taskId),
+    queryFn: () =>
+      apiFetch<ValidationComparisonListResponse>(`/tasks/${taskId}/validation-comparisons`),
+    enabled: Boolean(taskId),
+    refetchInterval: 5_000,
+  })
+}
+
+export function useTaskHumanDecisionsQuery(taskId: string) {
+  return useQuery({
+    queryKey: qk.taskHumanDecisions(taskId),
+    queryFn: () => apiFetch<HumanDecisionListResponse>(`/tasks/${taskId}/human-decisions`),
+    enabled: Boolean(taskId),
+    refetchInterval: 5_000,
+  })
+}
+
+const TASK_PHASE_THREE_PAGE_SIZE = 50
+
+export function useTaskFallbackReceiptsQuery(taskId: string) {
+  return useInfiniteQuery({
+    queryKey: qk.taskFallbackReceipts(taskId),
+    queryFn: ({ pageParam }) =>
+      apiFetch<WorkUnitFallbackReceiptListResponse>(`/tasks/${taskId}/fallback-receipts`, {
+        search: { cursor: pageParam as string | undefined, limit: TASK_PHASE_THREE_PAGE_SIZE },
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useTaskMicroFixesQuery(taskId: string) {
+  return useInfiniteQuery({
+    queryKey: qk.taskMicroFixes(taskId),
+    queryFn: ({ pageParam }) =>
+      apiFetch<MicroFixReceiptListResponse>(`/tasks/${taskId}/micro-fixes`, {
+        search: { cursor: pageParam as string | undefined, limit: TASK_PHASE_THREE_PAGE_SIZE },
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useTaskCoordinatorReplansQuery(taskId: string) {
+  return useInfiniteQuery({
+    queryKey: qk.taskCoordinatorReplans(taskId),
+    queryFn: ({ pageParam }) =>
+      apiFetch<CoordinatorReplanListResponse>(`/tasks/${taskId}/coordinator-replans`, {
+        search: { cursor: pageParam as string | undefined, limit: TASK_PHASE_THREE_PAGE_SIZE },
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: Boolean(taskId),
+  })
+}
+
+const TASK_PR_PAGE_SIZE = 50
+
+export function useTaskPrFeedbackQuery(taskId: string) {
+  return useInfiniteQuery({
+    queryKey: qk.taskPrFeedback(taskId),
+    queryFn: ({ pageParam }) =>
+      apiFetch<ExternalFeedbackItemListResponse>(`/tasks/${taskId}/pr-feedback`, {
+        search: { cursor: pageParam as string | undefined, limit: TASK_PR_PAGE_SIZE },
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useTaskPrReworkQuery(taskId: string) {
+  return useInfiniteQuery({
+    queryKey: qk.taskPrRework(taskId),
+    queryFn: ({ pageParam }) =>
+      apiFetch<PrReworkListResponse>(`/tasks/${taskId}/pr-rework`, {
+        search: { cursor: pageParam as string | undefined, limit: TASK_PR_PAGE_SIZE },
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useTaskPrActionsQuery(taskId: string) {
+  return useInfiniteQuery({
+    queryKey: qk.taskPrActions(taskId),
+    queryFn: ({ pageParam }) =>
+      apiFetch<PrExternalActionListResponse>(`/tasks/${taskId}/pr-actions`, {
+        search: { cursor: pageParam as string | undefined, limit: TASK_PR_PAGE_SIZE },
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useDecidePrExternalAction() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      actionId,
+      decision,
+      body,
+    }: {
+      taskId: string
+      actionId: string
+      decision: 'approve' | 'reject'
+      body: DecidePrExternalActionRequest
+    }) =>
+      apiFetch<PrExternalActionResponse>(
+        `/tasks/${taskId}/pr-actions/${actionId}/${decision}`,
+        { method: 'POST', body: JSON.stringify(body) },
+      ),
+    onSettled: (_result, _error, variables) => {
+      void queryClient.invalidateQueries({ queryKey: qk.taskPrActions(variables.taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(variables.taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(variables.taskId) })
+    },
+  })
+}
+
+export function useRepoPrFeedbackPolicyQuery(repoId: string, enabled = true) {
+  return useQuery({
+    queryKey: qk.repoPrFeedbackPolicy(repoId),
+    queryFn: () => apiFetch<PrFeedbackPolicyResponse>(`/repos/${repoId}/pr-feedback-policy`),
+    enabled: Boolean(repoId) && enabled,
+  })
+}
+
+export function useUpdateRepoPrFeedbackPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      repoId,
+      body,
+    }: {
+      repoId: string
+      body: UpdatePrFeedbackPolicyRequest
+    }) =>
+      apiFetch<PrFeedbackPolicyResponse>(`/repos/${repoId}/pr-feedback-policy`, {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: (policy, variables) => {
+      queryClient.setQueryData(qk.repoPrFeedbackPolicy(variables.repoId), policy)
+    },
+  })
+}
+
+export function useTaskHumanDecisionQuery(taskId: string, decisionId: string | null) {
+  return useQuery({
+    queryKey: [...qk.taskHumanDecisions(taskId), decisionId ?? ''] as const,
+    queryFn: () =>
+      apiFetch<HumanDecisionResponse>(`/tasks/${taskId}/human-decisions/${decisionId}`),
+    enabled: Boolean(taskId) && Boolean(decisionId),
+  })
+}
+
+export function useAnswerHumanDecision() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      decisionId,
+      body,
+    }: {
+      taskId: string
+      decisionId: string
+      body: AnswerHumanDecisionRequest
+    }) =>
+      apiFetch<AnswerHumanDecisionResponse>(
+        `/tasks/${taskId}/human-decisions/${decisionId}/answer`,
+        { method: 'POST', body: JSON.stringify(body) },
+      ),
+    onSettled: (_result, _error, variables) => {
+      void queryClient.invalidateQueries({ queryKey: qk.taskHumanDecisions(variables.taskId) })
+      invalidateTaskCoordinationQueries(queryClient, variables.taskId)
+    },
   })
 }
 
@@ -1465,7 +1722,12 @@ export function useTaskDependentsQuery(taskId: string) {
 export function useAddDependency(taskId: string) {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (dependsOnId: string) => addDependency(taskId, dependsOnId),
+    mutationFn: (input: {
+      dependsOnId: string
+      expectedGraphVersion: number
+      idempotencyKey: string
+    }) =>
+      addDependency(taskId, input.dependsOnId, input.expectedGraphVersion, input.idempotencyKey),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.taskDependencies(taskId) })
     },
@@ -1475,7 +1737,12 @@ export function useAddDependency(taskId: string) {
 export function useRemoveDependency(taskId: string) {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (dependsOnId: string) => removeDependency(taskId, dependsOnId),
+    mutationFn: (input: {
+      dependsOnId: string
+      expectedGraphVersion: number
+      idempotencyKey: string
+    }) =>
+      removeDependency(taskId, input.dependsOnId, input.expectedGraphVersion, input.idempotencyKey),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.taskDependencies(taskId) })
     },

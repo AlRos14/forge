@@ -76,6 +76,7 @@ pub(crate) fn test_execution_context(
         role: "coder".to_owned(),
         task_role_capabilities: Vec::new(),
         has_repository_workspace: false,
+        review_read_paths: Vec::new(),
         worktree_path: "/tmp/forge-test-worktree".to_owned(),
         description: "test invocation".to_owned(),
         agent_config,

@@ -22,6 +22,7 @@ pub struct MergeService {
     workspace_root: PathBuf,
     workspace_exec_locks: Arc<crate::workspace_execution_lock::WorkspaceExecutionLockManager>,
     cleanup_scheduler: RwLock<Option<Arc<crate::WorkspaceCleanupScheduler>>>,
+    credentials: RwLock<Option<Arc<crate::CredentialService>>>,
     integration_operations: TaskIntegrationOperationManager,
 }
 
@@ -82,6 +83,7 @@ impl MergeService {
                 crate::workspace_execution_lock::WorkspaceExecutionLockManager::default(),
             ),
             cleanup_scheduler: RwLock::new(None),
+            credentials: RwLock::new(None),
             integration_operations,
         }
     }
@@ -90,6 +92,17 @@ impl MergeService {
         &self,
     ) -> Arc<crate::workspace_execution_lock::WorkspaceExecutionLockManager> {
         Arc::clone(&self.workspace_exec_locks)
+    }
+
+    /// Credential source used to open the frozen GitHub credential handle when
+    /// publishing a PR. Without it PR publication fails closed.
+    pub fn set_credential_service(&self, credentials: Arc<crate::CredentialService>) {
+        match self.credentials.write() {
+            Ok(mut configured) => *configured = Some(credentials),
+            Err(error) => {
+                tracing::warn!(%error, "merge credential service configuration lock poisoned")
+            }
+        }
     }
 
     pub fn set_cleanup_scheduler(&self, cleanup_scheduler: Arc<crate::WorkspaceCleanupScheduler>) {
@@ -395,7 +408,17 @@ impl MergeService {
         // Push the pinned source before persisting the PR admission. A crash
         // after admission therefore always leaves a provider-ready branch and
         // an atomic PublishPr plus metadata intent for startup recovery.
-        push_branch(worktree_path, &source_branch).await?;
+        //
+        // While a same-PR rework pause is open (plan 11.5) the update of the
+        // existing PR branch is the authorized `push_update` external action
+        // (frozen policy or Decision, expected remote head, no force), never
+        // this ambient push.
+        if db::PrReworkRepo::get_open_supersession_by_task(&*self.db, &task_id)
+            .await?
+            .is_none()
+        {
+            push_branch(worktree_path, &source_branch).await?;
+        }
         self.ensure_current_gate_evaluation(&task_id, &evaluation)
             .await?;
         let source_sha = self
@@ -428,10 +451,18 @@ impl MergeService {
         ))
         .await;
         let result = async {
-            let pr_service = crate::pr_service::PrService::new(
+            let mut pr_service = crate::pr_service::PrService::new(
                 Arc::clone(&self.db),
                 Arc::clone(&self.event_bus),
             );
+            if let Some(credentials) = self
+                .credentials
+                .read()
+                .ok()
+                .and_then(|configured| configured.clone())
+            {
+                pr_service = pr_service.with_credentials(credentials);
+            }
             let published = pr_service
                 .publish_pr(&task, &repo, &source_branch, &target_branch)
                 .await?;

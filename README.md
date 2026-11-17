@@ -1,80 +1,73 @@
-<div align="center">
+# Forge
 
-<img src="assets/forge-wordmark.png" alt="Forge" width="420">
+Forge 0.9.0 is an orchestrated autonomous delivery platform for Human and
+harness-bound Agent work. Humans set scope and make reserved decisions; Forge
+coordinates durable Tasks, assigned WorkUnits, deterministic validation, review,
+repository delivery, and recovery within that authority.
 
-**Coordinate programming work between people and agents with explicit authority and evidence.**
+## What Forge does
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+- Coordinates a bounded Task plan and dispatches only explicitly prepared and
+  assigned WorkUnits.
+- Runs deterministic validation pinned to exact inputs; Gates can require exact
+  check versions and passing outcomes.
+- Routes review and GitHub PR feedback through durable rework and Human decision
+  records.
+- Supports preauthorized Agent fallback, bounded micro-fixes, and coordinator
+  replanning with inspectable receipts.
+- Keeps merge as a Human decision. Repository PR actions require Human approval
+  by default; automatic actions need an explicit owner/admin repository policy.
 
-[Architecture](docs/architecture.md) · [Getting started](docs/getting-started.md) · [REST, MCP, and SSE](docs/api.md) · [CLI](docs/cli.md) · [Contributing](CONTRIBUTING.md)
-
-</div>
-
----
-
-Forge is a local platform for coordinating programming work with agents that keep their native harness. The harness owns its model loop, tools, and session behavior. Forge owns work records, authorization, collaboration, workspace isolation, integration, and lifecycle.
-
-## Work model
-
-| Record | Purpose |
-|---|---|
-| **Actor** | A human or a harness-bound Agent. |
-| **TaskRole / RoleMembership** | Defines a Task responsibility and the Actors eligible to participate. Membership does not allocate executable work. |
-| **WorkUnit** | Defines executable scope, Role, optional Actor assignment, and optional harness instructions. The guided Task flow can prepare WorkUnits from an objective; manual creation remains available as an advanced path. |
-| **Workspace** | Isolates a repository WorkUnit that requires integration. A non-repository WorkUnit can run without a Workspace or WorkspaceLease under the supported local-host constraints. |
-| **Execution / HarnessSession** | Records one Actor, Role, and WorkUnit attempt. Task launch and dispatch create attempts; users do not create them manually. Session continuity follows an explicit HarnessSession reference. |
-| **Artifact, Message, Handoff, Proposal, Decision** | Stores outputs and collaboration as separate durable records. A Proposal or Decision does not execute a protected action. |
-| **ReviewReport, ValidationRun, Gate** | Keeps reviewer judgment, deterministic validation evidence, and policy evaluation distinct. A Gate evaluates exact records; it does not run tests or a review. |
-
-WorkUnits can run concurrently when their dependencies, Actor capacity, and workspace authority allow it. Repository integration is an explicit serialized operation. The normal web journey starts with a Task objective, the saved Project team, and an explicit coordination mode. Proposal mode waits for review before WorkUnits are materialized; prepare-and-execute can materialize only within its saved limits. Dispatch intent, provider starts, review, and TaskLifecycle remain separate facts. Manual planning is still available under Advanced work.
+See [orchestrated delivery](docs/concepts/delivery-fluency.md),
+[coordinator verification](docs/concepts/review-and-validation.md), and the
+[PR feedback loop](docs/concepts/pr-feedback-loop.md) for the current product
+boundaries.
 
 ## Interfaces
 
-The local server provides REST, MCP, the `forge-ctl` client, and the web UI. It starts an embedded daemon by default and can also connect to compatible external daemon hosts. Daemon, provider, credential, and WorkUnit constraints apply to each execution path.
-
-The [Project Copilot](docs/concepts/project-copilot.md) stays available across
-Project and Task screens with a persistent conversation and attributable
-activity. In a Task, Copilot instructions enter the same durable intervention
-inbox as Human actions. Copilot cannot authorize coordination, approve a plan,
-pause or cancel a Task, revoke authorization, or request a replan.
+Use the REST API, registered MCP tools, forge-ctl, or the web UI. All surfaces
+use the same durable domain services and authorization. The [API reference](docs/api.md)
+lists exact REST routes, MCP tool names, and SSE event names.
 
 ## Build this repository
 
-At the PR14 documentation audit on 2026-10-16, this repository had no published GitHub release and no npm or Homebrew distribution of this fork was verified. Build from source to use this version. The build requires stable Rust, Git, Node.js 24, and pnpm 10; building the `forge` binary also builds the web UI.
+This fork has no verified published GitHub release as of 2026-11-17. Build from
+source to use the current implementation. The build requires stable Rust, Git,
+Node.js 24, and pnpm 10; building forge-cli also builds the web UI.
 
-```bash
-git clone https://github.com/AlRos14/forge.git
-cd forge
-corepack enable
-corepack prepare pnpm@10 --activate
-cargo run --locked -p forge-cli
-```
+    git clone https://github.com/AlRos14/forge.git
+    cd forge
+    corepack enable
+    corepack prepare pnpm@10 --activate
+    cargo run --locked -p forge-cli
 
-The server prints its local management URL and records its address in the data directory. Follow the [reproducible walkthrough](docs/getting-started.md) to configure a Project team, describe a Task, inspect its proposed work, and follow the durable dispatch and review facts. The walkthrough also documents the advanced manual WorkUnit path.
-
-The retained `npx-cli` wrapper downloads ForgeAILab release assets; it is upstream-owned and does not install this fork. The inherited release workflow restricts npm and Homebrew publication to `ForgeAILab/forge`. This repository's `install.sh` targets `AlRos14/forge`, but it cannot install until this repository publishes a release; use the source build above for now. See [the upstream and attribution note](docs/upstream.md).
-
-The container image runs the server as an unprivileged `forge` user. Docker Compose binds to `127.0.0.1` by default; exposing Forge beyond loopback requires an explicit setting and a reviewed TLS/proxy boundary. See [deployment](docs/deployment.md).
-
-Authentication uses current durable account authority. Reusable JWT/PAT/OAuth credentials are accepted in the `Authorization: Bearer` header, not in URLs. The browser SSE connection uses a short-lived, single-use ticket.
+Follow [Getting Started](docs/getting-started.md) to create a Project, connect
+an optional GitHub SCM credential, configure PR feedback policy, and run a Task.
+The container runs as an unprivileged forge user and Compose binds to loopback
+by default. See [deployment](docs/deployment.md) before changing network
+exposure.
 
 ## Documentation
 
-- [Architecture after PR13](docs/architecture.md)
-- [Approved task operating model — coordination, quality routing, delivery completion, and review gates implemented; PR6 acceptance pending](docs/concepts/task-operating-model.md)
+- [Architecture](docs/architecture.md)
+- [Task operating model](docs/concepts/task-operating-model.md)
+- [WorkUnits](docs/concepts/work-units.md)
+- [Review, validation, and Gates](docs/concepts/review-and-validation.md)
+- [PR feedback loop](docs/concepts/pr-feedback-loop.md)
+- [Optional Project plans](docs/concepts/project-plan.md)
+- [REST, MCP, and SSE](docs/api.md)
 - [Getting started](docs/getting-started.md)
-- [REST, MCP, and SSE reference](docs/api.md)
-- [`forge-ctl` reference](docs/cli.md)
-- [Execution logs and session identity](docs/execution-logs.md)
-- [Deployment and container permissions](docs/deployment.md)
-- [Post-V2 security audit notes](docs/security-audit.md)
-- [Documentation audit and legacy classification](docs/documentation-audit-2026-10-28.md)
+- [forge-ctl](docs/cli.md)
+- [Deployment](docs/deployment.md)
 - [Release checklist](docs/release_checklist.md)
-- [Upstream relationship and attribution](docs/upstream.md)
 - [Changelog](CHANGELOG.md)
 
 ## Project identity and history
 
-The workspace version is `0.8.0`; it does not identify a published release. The current schema contains migrations through V135. Migration records, historical specification packages, earlier design documents, and ProjectRelease snapshots remain historical evidence.
+The workspace source version is 0.9.0; it does not identify a published release.
+The current schema contains migrations through V180. Migration records,
+historical specifications, earlier design documents, and ProjectRelease
+snapshots remain historical evidence.
 
-The public product name remains **Forge** until the owner provides a replacement name. This repository preserves its MIT license and upstream attribution.
+The product name remains Forge until its owner provides a replacement name.
+This repository preserves its MIT license and upstream attribution.

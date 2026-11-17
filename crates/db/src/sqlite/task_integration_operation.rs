@@ -35,6 +35,19 @@ fn map_remote_pr_admission(row: SqliteRow) -> Result<RemotePrAdmission> {
         source_branch: row.try_get("source_branch")?,
         target_branch: row.try_get("target_branch")?,
         admitted_source_sha: row.try_get("admitted_source_sha")?,
+        rework_outcome: crate::sqlite::try_get_v173_text(&row, "rework_outcome")?,
+        supersession_id: crate::sqlite::try_get_v173_text(&row, "supersession_id")?,
+        readmits_supersession_id: crate::sqlite::try_get_v173_text(
+            &row,
+            "readmits_supersession_id",
+        )?,
+        credential_handle_id: crate::sqlite::try_get_v173_text(&row, "credential_handle_id")?,
+        credential_owner_user_id: crate::sqlite::try_get_v173_text(
+            &row,
+            "credential_owner_user_id",
+        )?,
+        feedback_policy_json: crate::sqlite::try_get_v173_text(&row, "feedback_policy_json")?,
+        feedback_policy_digest: crate::sqlite::try_get_v173_text(&row, "feedback_policy_digest")?,
         state: row.try_get("state")?,
         provider_status: row.try_get("provider_status")?,
         result_classification: row.try_get("result_classification")?,
@@ -46,6 +59,24 @@ fn map_remote_pr_admission(row: SqliteRow) -> Result<RemotePrAdmission> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+async fn table_has_column(
+    tx: &mut Transaction<'_, Sqlite>,
+    table: &str,
+    column: &str,
+) -> Result<bool> {
+    // Table names at call sites are static. This also lets migration-history
+    // fixtures use the current repository against their historical schema.
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(&mut **tx)
+        .await?;
+    for row in rows {
+        if row.try_get::<String, _>("name")? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn load_remote_pr_admission(
@@ -479,6 +510,32 @@ async fn finish_merge_lifecycle_in_tx(
     Ok(Some(transition_event))
 }
 
+async fn reset_pr_metadata_for_new_pr(
+    tx: &mut Transaction<'_, Sqlite>,
+    metadata: &CreatePrMetadata,
+    metadata_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE pr_metadata
+         SET provider_type = ?, provider_pr_id = NULL, pr_url = NULL,
+             source_branch = ?, target_branch = ?, pr_state = 'publishing',
+             merge_status = 'pending', task_merge_operation_id = ?,
+             publish_operation_id = ?, last_synced_at = NULL, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&metadata.provider_type)
+    .bind(&metadata.source_branch)
+    .bind(&metadata.target_branch)
+    .bind(&metadata.task_merge_operation_id)
+    .bind(&metadata.publish_operation_id)
+    .bind(&metadata.updated_at)
+    .bind(metadata_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(check_error)?;
+    Ok(())
+}
+
 async fn insert_operation(
     tx: &mut Transaction<'_, Sqlite>,
     input: &CreateTaskIntegrationOperation,
@@ -716,38 +773,65 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                 if previous_admission.task_id != metadata.task_id
                     || previous_admission.metadata_id != metadata_id
                     || previous_admission.publish_operation_id != previous_publish_id
-                    || !matches!(
-                        previous_admission.state.as_str(),
-                        "merged" | "closed" | "head_mismatch" | "publication_failed"
-                    )
                 {
                     return Err(DbError::InvalidTransition);
                 }
-                snapshot_terminal_remote_pr_in_tx(
-                    &mut tx,
-                    &metadata.task_id,
-                    &metadata_id,
-                    &metadata.updated_at,
-                )
-                .await?;
-                sqlx::query(
-                    "UPDATE pr_metadata
-                     SET provider_type = ?, provider_pr_id = NULL, pr_url = NULL,
-                         source_branch = ?, target_branch = ?, pr_state = 'publishing',
-                         merge_status = 'pending', task_merge_operation_id = ?,
-                         publish_operation_id = ?, last_synced_at = NULL, updated_at = ?
-                     WHERE id = ?",
-                )
-                .bind(&metadata.provider_type)
-                .bind(&metadata.source_branch)
-                .bind(&metadata.target_branch)
-                .bind(&metadata.task_merge_operation_id)
-                .bind(&metadata.publish_operation_id)
-                .bind(&metadata.updated_at)
-                .bind(&metadata_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(check_error)?;
+                // V175: an admission paused for rework has no remote result and
+                // no history. While the pause is open the SAME PR stays bound
+                // (provider PR id, URL and state are kept); after the PR was
+                // closed remotely the projection is reset for a new PR.
+                let pause_state: Option<String> = if previous_admission.rework_outcome.is_some() {
+                    match previous_admission.supersession_id.as_deref() {
+                        Some(supersession_id) => sqlx::query_scalar(
+                            "SELECT state FROM pr_rework_supersession WHERE id = ? AND task_id = ?",
+                        )
+                        .bind(supersession_id)
+                        .bind(&metadata.task_id)
+                        .fetch_optional(&mut *tx)
+                        .await?,
+                        None => return Err(DbError::InvalidTransition),
+                    }
+                } else {
+                    None
+                };
+                match pause_state.as_deref() {
+                    Some("open") => {
+                        sqlx::query(
+                            "UPDATE pr_metadata
+                             SET task_merge_operation_id = ?, publish_operation_id = ?,
+                                 updated_at = ?
+                             WHERE id = ?",
+                        )
+                        .bind(&metadata.task_merge_operation_id)
+                        .bind(&metadata.publish_operation_id)
+                        .bind(&metadata.updated_at)
+                        .bind(&metadata_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(check_error)?;
+                    }
+                    Some("remote_closed") => {
+                        reset_pr_metadata_for_new_pr(&mut tx, &metadata, &metadata_id).await?;
+                    }
+                    Some(_) => return Err(DbError::InvalidTransition),
+                    None => {
+                        if !matches!(
+                            previous_admission.state.as_str(),
+                            "merged" | "closed" | "head_mismatch" | "publication_failed"
+                        ) || previous_admission.rework_outcome.is_some()
+                        {
+                            return Err(DbError::InvalidTransition);
+                        }
+                        snapshot_terminal_remote_pr_in_tx(
+                            &mut tx,
+                            &metadata.task_id,
+                            &metadata_id,
+                            &metadata.updated_at,
+                        )
+                        .await?;
+                        reset_pr_metadata_for_new_pr(&mut tx, &metadata, &metadata_id).await?;
+                    }
+                }
                 metadata_id
             }
         } else {
@@ -755,36 +839,111 @@ impl TaskIntegrationOperationRepo for SqliteDb {
             metadata.id.clone()
         };
         remote_admission.metadata_id = metadata_id.clone();
-        sqlx::query(
-            "INSERT INTO remote_pr_admission (
-                task_merge_operation_id, publish_operation_id, metadata_id, task_id,
-                provider_config_id, provider_type, provider_config_revision,
-                provider_config_digest, provider_base_url, token_secret_ref,
-                remote_repo_identity, source_branch, target_branch, admitted_source_sha,
-                state, reconciliation_reason, provider_event_id, observed_head_sha,
-                merged_commit_sha, result_event_id, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', NULL,
-                       NULL, NULL, NULL, NULL, ?, ?)",
-        )
-        .bind(&remote_admission.task_merge_operation_id)
-        .bind(&remote_admission.publish_operation_id)
-        .bind(&remote_admission.metadata_id)
-        .bind(&remote_admission.task_id)
-        .bind(&remote_admission.provider_config_id)
-        .bind(&remote_admission.provider_type)
-        .bind(&remote_admission.provider_config_revision)
-        .bind(&remote_admission.provider_config_digest)
-        .bind(remote_admission.provider_base_url.as_deref())
-        .bind(remote_admission.token_secret_ref.as_deref())
-        .bind(&remote_admission.remote_repo_identity)
-        .bind(&remote_admission.source_branch)
-        .bind(&remote_admission.target_branch)
-        .bind(&remote_admission.admitted_source_sha)
-        .bind(&remote_admission.created_at)
-        .bind(&remote_admission.updated_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
+        // V173: freeze the credential reference and feedback policy that the
+        // repo config carries in this same transaction; the admission insert
+        // guard verifies the copy is exactly the current config.
+        let frozen = sqlx::query("SELECT * FROM pr_provider_config WHERE id = ?")
+            .bind(&remote_admission.provider_config_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DbError::InvalidTransition)?;
+        let frozen_credential_handle_id =
+            crate::sqlite::try_get_v173_text(&frozen, "credential_handle_id")?;
+        let frozen_credential_owner_user_id =
+            crate::sqlite::try_get_v173_text(&frozen, "credential_owner_user_id")?;
+        let frozen_policy_json = crate::sqlite::try_get_v173_text(&frozen, "feedback_policy_json")?
+            .unwrap_or_else(|| crate::DEFAULT_PR_FEEDBACK_POLICY_JSON.to_owned());
+        let frozen_policy_digest = crate::pr_feedback_policy_digest(&frozen_policy_json);
+        let has_v173_columns =
+            table_has_column(&mut tx, "remote_pr_admission", "credential_handle_id").await?;
+        let has_v175_column =
+            table_has_column(&mut tx, "remote_pr_admission", "readmits_supersession_id").await?;
+        // V175: while a pause is open the admission MUST re-admit it (the insert
+        // guard rejects any other admission); otherwise the column stays NULL.
+        let readmits_supersession_id: Option<String> = if has_v175_column {
+            sqlx::query_scalar(
+                "SELECT id FROM pr_rework_supersession WHERE task_id = ? AND state = 'open'",
+            )
+            .bind(&remote_admission.task_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            None
+        };
+        let mut columns = vec![
+            "task_merge_operation_id",
+            "publish_operation_id",
+            "metadata_id",
+            "task_id",
+            "provider_config_id",
+            "provider_type",
+            "provider_config_revision",
+            "provider_config_digest",
+            "provider_base_url",
+            "token_secret_ref",
+            "remote_repo_identity",
+            "source_branch",
+            "target_branch",
+            "admitted_source_sha",
+            "state",
+            "reconciliation_reason",
+            "provider_event_id",
+            "observed_head_sha",
+            "merged_commit_sha",
+            "result_event_id",
+            "created_at",
+            "updated_at",
+        ];
+        if has_v173_columns {
+            columns.extend([
+                "credential_handle_id",
+                "credential_owner_user_id",
+                "feedback_policy_json",
+                "feedback_policy_digest",
+            ]);
+        }
+        if has_v175_column {
+            columns.push("readmits_supersession_id");
+        }
+        let placeholders = vec!["?"; columns.len()].join(", ");
+        let insert_sql = format!(
+            "INSERT INTO remote_pr_admission ({}) VALUES ({placeholders})",
+            columns.join(", ")
+        );
+        let mut insert = sqlx::query(&insert_sql)
+            .bind(&remote_admission.task_merge_operation_id)
+            .bind(&remote_admission.publish_operation_id)
+            .bind(&remote_admission.metadata_id)
+            .bind(&remote_admission.task_id)
+            .bind(&remote_admission.provider_config_id)
+            .bind(&remote_admission.provider_type)
+            .bind(&remote_admission.provider_config_revision)
+            .bind(&remote_admission.provider_config_digest)
+            .bind(remote_admission.provider_base_url.as_deref())
+            .bind(remote_admission.token_secret_ref.as_deref())
+            .bind(&remote_admission.remote_repo_identity)
+            .bind(&remote_admission.source_branch)
+            .bind(&remote_admission.target_branch)
+            .bind(&remote_admission.admitted_source_sha)
+            .bind("admitted")
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .bind(&remote_admission.created_at)
+            .bind(&remote_admission.updated_at);
+        if has_v173_columns {
+            insert = insert
+                .bind(frozen_credential_handle_id.as_deref())
+                .bind(frozen_credential_owner_user_id.as_deref())
+                .bind(&frozen_policy_json)
+                .bind(&frozen_policy_digest);
+        }
+        if has_v175_column {
+            insert = insert.bind(readmits_supersession_id.as_deref());
+        }
+        insert.execute(&mut *tx).await.map_err(check_error)?;
         sqlx::query("UPDATE pr_metadata SET admission_status = 'admitted' WHERE id = ?")
             .bind(&metadata_id)
             .execute(&mut *tx)

@@ -6,17 +6,21 @@ use std::{
 use api_types::{ActorRef as ApiActorRef, TaskRoleCapability, TaskRoleConfiguration};
 use db::{
     new_uuid_v4, now_rfc3339, ActorRef, AgentRepo, ArtifactKind, CollaborationRepo,
-    CreateDomainEvent, RoleMembershipRepo, RoleMembershipStatus, SqliteDb, Task, TaskCoordination,
-    TaskCoordinationMaterialization, TaskCoordinationMode, TaskCoordinationPlan,
-    TaskCoordinationPlanState, TaskCoordinationRepo, TaskCoordinationRequest,
-    TaskCoordinationRequestState, TaskCoordinationWrite, TaskIntervention, TaskInterventionKind,
-    TaskInterventionState, TaskLifecycleRepo, TaskLifecycleState, TaskQualityCategory,
-    TaskQualityRequest, TaskQualityState, TaskQualityTargetKind, TaskRepo, TaskRoleRepo, UserRepo,
+    CoordinatorReplanState, CostClass, CreateDomainEvent, ProjectPlanBatchAuthorizationBinding,
+    ProjectPlanBatchRequestBinding, ProjectPlanBatchRequestOrigin, RoleMembershipRepo,
+    RoleMembershipStatus, SqliteDb, Task, TaskCoordination, TaskCoordinationMaterialization,
+    TaskCoordinationMode, TaskCoordinationPlan, TaskCoordinationPlanState, TaskCoordinationRepo,
+    TaskCoordinationRequest, TaskCoordinationRequestKind, TaskCoordinationRequestState,
+    TaskCoordinationWrite, TaskIntervention, TaskInterventionKind, TaskInterventionState,
+    TaskLifecycleRepo, TaskLifecycleState, TaskQualityCategory, TaskQualityRequest,
+    TaskQualityState, TaskQualityTargetKind, TaskRepo, TaskRoleRepo, UserRepo,
+    MAX_MICRO_FIX_CHANGED_LINES, MAX_MICRO_FIX_FILES, MAX_MICRO_FIX_PER_TASK,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 
 use crate::{
     collaboration_service::{
@@ -24,13 +28,22 @@ use crate::{
         CreateMessageInput, CreateProposalInput,
     },
     domain_event_service::DomainEventService,
+    replan_classifier::ReplanClassification,
     task_lifecycle::TaskLifecycleService,
     Result, ServiceError,
 };
 
+mod external_feedback;
+mod replan;
+mod turn_outputs;
+mod validation_findings;
+
+pub(crate) use turn_outputs::output_not_permitted;
+pub(crate) use validation_findings::related_validation_context;
+
 const MAX_PLAN_BYTES: usize = 256 * 1024;
 const MAX_BRIEF_BYTES: usize = 64 * 1024;
-const MAX_PLAN_WORK_UNITS: usize = 4;
+const MAX_PLAN_WORK_UNITS: usize = 64;
 const MAX_TITLE_BYTES: usize = 512;
 const MAX_SCOPE_BYTES: usize = 4096;
 const MAX_INSTRUCTIONS_BYTES: usize = 64 * 1024;
@@ -71,6 +84,10 @@ fn bounded(value: &str, max: usize) -> bool {
     !value.trim().is_empty() && value.len() <= max
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CoordinationEnvelope {
@@ -85,13 +102,91 @@ pub struct CoordinationEnvelope {
     pub allow_merge: bool,
     pub allowed_review_roles: Vec<String>,
     pub require_independent_review: bool,
+    /// Missing on historical envelopes means the previously authorized direct route.
+    #[serde(default)]
+    pub orchestrator_reviews_findings: bool,
+    /// Envelope v2 (`schema_version == 2`): exact catalog check pins the
+    /// coordinator may request (`on_request`) or Forge runs after integration
+    /// (`after_integration`). Omitted when empty so v1 JSON and digests are
+    /// byte-identical to the historical serialization.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_checks: Vec<EnvelopeValidationCheck>,
+    /// Envelope v2: explicitly enabled bounded correction routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub micro_fix: Option<EnvelopeMicroFix>,
+    /// Envelope v2: optional preauthorized formal reviewer profile grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub micro_fix_reviewer: Option<EnvelopeProfileGrant>,
+    /// Envelope v2: ordered, per-TaskRole fallback Agent candidates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_agents: Vec<EnvelopeFallbackAgent>,
+    /// Envelope v2: allow the coordinator to propose a bounded replan.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_coordinator_replan: bool,
+}
+
+/// One pinned catalog definition version authorized for a Task (envelope v2).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeValidationCheck {
+    pub check_key: String,
+    pub definition_digest: String,
+    pub trigger: db::EnvelopeCheckTrigger,
+}
+
+/// Bounded micro-fix limits authorized for one Task.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeMicroFix {
+    pub enabled: bool,
+    pub max_files: u32,
+    pub max_changed_lines: u32,
+    pub max_per_task: u32,
+    #[serde(default)]
+    pub extra_forbidden_globs: Vec<String>,
+}
+
+/// A TaskRole/Agent profile explicitly preauthorized for a formal review.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeProfileGrant {
+    pub task_role_id: String,
+    pub agent_id: String,
+    pub cost_class: CostClass,
+}
+
+/// One ordered fallback Agent candidate for a TaskRole.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeFallbackAgent {
+    pub task_role_id: String,
+    pub agent_id: String,
+    pub cost_class: CostClass,
+    pub max_wait_seconds: u32,
+}
+
+const MAX_ENVELOPE_VALIDATION_CHECKS: usize = 8;
+
+/// Scope against which envelope pins are resolved (`validate_pins`).
+pub struct EnvelopePinContext<'a> {
+    pub db: &'a SqliteDb,
+    pub project_id: &'a str,
+    pub repo_id: Option<&'a str>,
+}
+
+/// Exact Task and coordinator scope for phase-3 Agent grants in an envelope.
+pub struct EnvelopePhaseThreePinContext<'a> {
+    pub db: &'a SqliteDb,
+    pub project_id: &'a str,
+    pub task_id: Option<&'a str>,
+    pub coordinator_actor: Option<&'a ActorRef>,
 }
 
 impl Default for CoordinationEnvelope {
     fn default() -> Self {
         Self {
             schema_version: 1,
-            max_work_units: MAX_PLAN_WORK_UNITS,
+            max_work_units: 16,
             allow_new_task_roles: false,
             allow_membership_changes: false,
             allow_capability_changes: false,
@@ -101,17 +196,25 @@ impl Default for CoordinationEnvelope {
             allow_merge: false,
             allowed_review_roles: vec!["reviewer".to_owned()],
             require_independent_review: true,
+            orchestrator_reviews_findings: true,
+            validation_checks: Vec::new(),
+            micro_fix: None,
+            micro_fix_reviewer: None,
+            fallback_agents: Vec::new(),
+            allow_coordinator_replan: false,
         }
     }
 }
 
 impl CoordinationEnvelope {
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 1 {
+        if !matches!(self.schema_version, 1 | 2) {
             return Err(unsupported_item(
-                "only envelope schema version 1 is supported",
+                "only envelope schema versions 1 and 2 are supported",
             ));
         }
+        self.validate_validation_checks()?;
+        self.validate_phase_three_fields()?;
         if self.max_work_units == 0 || self.max_work_units > MAX_PLAN_WORK_UNITS {
             return Err(unsupported_item(format!(
                 "max_work_units must be between 1 and {MAX_PLAN_WORK_UNITS}"
@@ -148,6 +251,291 @@ impl CoordinationEnvelope {
         }
         Ok(())
     }
+
+    fn validate_phase_three_fields(&self) -> Result<()> {
+        if self.schema_version < 2
+            && (self.micro_fix.is_some()
+                || self.micro_fix_reviewer.is_some()
+                || !self.fallback_agents.is_empty()
+                || self.allow_coordinator_replan)
+        {
+            return Err(unsupported_item(
+                "phase-3 coordination fields require envelope schema_version 2",
+            ));
+        }
+
+        if let Some(micro_fix) = &self.micro_fix {
+            if micro_fix.max_files == 0 || micro_fix.max_files > MAX_MICRO_FIX_FILES {
+                return Err(unsupported_item(format!(
+                    "micro_fix.max_files must be between 1 and {MAX_MICRO_FIX_FILES}"
+                )));
+            }
+            if micro_fix.max_changed_lines == 0
+                || micro_fix.max_changed_lines > MAX_MICRO_FIX_CHANGED_LINES
+            {
+                return Err(unsupported_item(format!(
+                    "micro_fix.max_changed_lines must be between 1 and {MAX_MICRO_FIX_CHANGED_LINES}"
+                )));
+            }
+            if micro_fix.max_per_task == 0 || micro_fix.max_per_task as i64 > MAX_MICRO_FIX_PER_TASK
+            {
+                return Err(unsupported_item(format!(
+                    "micro_fix.max_per_task must be between 1 and {MAX_MICRO_FIX_PER_TASK}"
+                )));
+            }
+            if micro_fix.extra_forbidden_globs.len() > 16 {
+                return Err(unsupported_item(
+                    "micro_fix.extra_forbidden_globs accepts at most 16 patterns",
+                ));
+            }
+        }
+
+        if self.micro_fix_reviewer.is_some()
+            && !self.micro_fix.as_ref().is_some_and(|value| value.enabled)
+        {
+            return Err(unsupported_item(
+                "micro_fix_reviewer requires an enabled micro_fix grant",
+            ));
+        }
+
+        let mut fallback_counts = HashMap::<&str, usize>::new();
+        let mut fallback_actors = HashSet::new();
+        for candidate in &self.fallback_agents {
+            if !bounded(&candidate.task_role_id, 128) || !bounded(&candidate.agent_id, 128) {
+                return Err(unsupported_item(
+                    "fallback_agents requires non-empty TaskRole and Agent ids",
+                ));
+            }
+            if candidate.max_wait_seconds > 86_400 {
+                return Err(unsupported_item(
+                    "fallback_agents.max_wait_seconds must not exceed 86400",
+                ));
+            }
+            if !fallback_actors
+                .insert((candidate.task_role_id.as_str(), candidate.agent_id.as_str()))
+            {
+                return Err(unsupported_item(
+                    "fallback_agents cannot repeat an Agent within a TaskRole chain",
+                ));
+            }
+            let count = fallback_counts
+                .entry(candidate.task_role_id.as_str())
+                .or_default();
+            *count += 1;
+            if *count > 3 {
+                return Err(unsupported_item(
+                    "fallback_agents accepts at most 3 Agents per TaskRole",
+                ));
+            }
+        }
+
+        for grant in self.micro_fix_reviewer.iter() {
+            if !bounded(&grant.task_role_id, 128) || !bounded(&grant.agent_id, 128) {
+                return Err(unsupported_item(
+                    "micro_fix_reviewer requires non-empty TaskRole and Agent ids",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl CoordinationEnvelope {
+    fn validate_validation_checks(&self) -> Result<()> {
+        if self.validation_checks.is_empty() {
+            return Ok(());
+        }
+        if self.schema_version < 2 {
+            return Err(unsupported_item(
+                "validation_checks require envelope schema_version 2",
+            ));
+        }
+        if self.validation_checks.len() > MAX_ENVELOPE_VALIDATION_CHECKS {
+            return Err(unsupported_item(format!(
+                "validation_checks accepts at most {MAX_ENVELOPE_VALIDATION_CHECKS} pins"
+            )));
+        }
+        let mut seen = HashSet::new();
+        let mut digests: HashMap<&str, &str> = HashMap::new();
+        for pin in &self.validation_checks {
+            if !crate::validation_catalog::is_valid_check_key(&pin.check_key) {
+                return Err(unsupported_item(
+                    "validation_checks check_key must be a slug of 1 to 64 [a-z0-9_-] bytes",
+                ));
+            }
+            if pin.definition_digest.len() != 64
+                || !pin
+                    .definition_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(unsupported_item(
+                    "validation_checks definition_digest must be 64 lowercase hex characters",
+                ));
+            }
+            if !seen.insert((pin.check_key.as_str(), pin.trigger.to_string())) {
+                return Err(unsupported_item(
+                    "validation_checks contains a duplicate check_key and trigger",
+                ));
+            }
+            if let Some(previous) =
+                digests.insert(pin.check_key.as_str(), pin.definition_digest.as_str())
+            {
+                if previous != pin.definition_digest {
+                    return Err(unsupported_item(
+                        "validation_checks pins one exact definition digest per check_key",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Asynchronous pin validation (`authorize_inner`): every pinned check must
+    /// exist in the Task scope, be `active`, and match its exact digest.
+    /// Typed codes: `validation.check_unknown`, `validation.check_stale_pin`.
+    pub async fn validate_pins(&self, ctx: &EnvelopePinContext<'_>) -> Result<()> {
+        for pin in &self.validation_checks {
+            crate::validation_catalog::resolve_pin(
+                ctx.db,
+                ctx.project_id,
+                ctx.repo_id,
+                &pin.check_key,
+                &pin.definition_digest,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Validate phase-3 reviewer and fallback Agent grants against the exact
+    /// Task, Project owner, TaskRole memberships, and coordinator Actor.
+    pub async fn validate_phase_three_pins(
+        &self,
+        ctx: &EnvelopePhaseThreePinContext<'_>,
+    ) -> Result<()> {
+        if !self.fallback_agents.is_empty() || self.micro_fix_reviewer.is_some() {
+            let task_id = ctx.task_id.ok_or_else(|| {
+                unsupported_item("phase-3 Agent grants require an exact Task scope")
+            })?;
+            for candidate in &self.fallback_agents {
+                if ctx.coordinator_actor.is_some_and(|coordinator| {
+                    matches!(coordinator, ActorRef::Agent(id) if id == &candidate.agent_id)
+                }) {
+                    return Err(unsupported_item(
+                        "the coordinator Agent cannot appear in fallback_agents",
+                    ));
+                }
+                if !envelope_agent_is_active_task_role_member(
+                    ctx.db,
+                    task_id,
+                    ctx.project_id,
+                    &candidate.task_role_id,
+                    &candidate.agent_id,
+                    false,
+                )
+                .await?
+                {
+                    return Err(unsupported_item(format!(
+                        "fallback Agent {} must be an existing same-account active member of TaskRole {}",
+                        candidate.agent_id, candidate.task_role_id
+                    )));
+                }
+            }
+            if let Some(grant) = &self.micro_fix_reviewer {
+                let role_name: Option<String> =
+                    sqlx::query_scalar("SELECT role FROM task_role WHERE id = ? AND task_id = ?")
+                        .bind(&grant.task_role_id)
+                        .bind(task_id)
+                        .fetch_optional(ctx.db.pool())
+                        .await?;
+                if !role_name.as_deref().is_some_and(|role| {
+                    self.allowed_review_roles
+                        .iter()
+                        .any(|allowed| allowed == role)
+                }) || !envelope_agent_is_active_task_role_member(
+                    ctx.db,
+                    task_id,
+                    ctx.project_id,
+                    &grant.task_role_id,
+                    &grant.agent_id,
+                    true,
+                )
+                .await?
+                {
+                    return Err(unsupported_item(
+                        "micro_fix_reviewer must be an existing same-account active formal reviewer in an allowed review TaskRole",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn envelope_agent_is_active_task_role_member(
+    db: &SqliteDb,
+    task_id: &str,
+    project_id: &str,
+    task_role_id: &str,
+    agent_id: &str,
+    require_formal_review: bool,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM task_role role
+            JOIN task task_row ON task_row.id = role.task_id
+            JOIN project project_row ON project_row.id = task_row.project_id
+            JOIN role_membership membership ON membership.task_role_id = role.id
+            JOIN agent_identity agent ON agent.id = membership.actor_id
+            WHERE role.id = ? AND role.task_id = ? AND task_row.project_id = ?
+              AND membership.actor_kind = 'agent'
+              AND membership.actor_id = ? AND membership.status = 'active'
+              AND project_row.owner_id IS NOT NULL
+              AND agent.owner_id = project_row.owner_id
+              AND (
+                  ? = 0 OR EXISTS (
+                      SELECT 1
+                      FROM task_role_capability_configuration configuration,
+                           json_each(configuration.configuration_json, '$.capabilities') capability
+                      WHERE configuration.task_role_id = role.id
+                        AND capability.value = 'formal_review'
+                  )
+              )
+        )",
+    )
+    .bind(task_role_id)
+    .bind(task_id)
+    .bind(project_id)
+    .bind(agent_id)
+    .bind(if require_formal_review { 1_i64 } else { 0_i64 })
+    .fetch_one(db.pool())
+    .await?
+        != 0)
+}
+
+pub(crate) fn semantic_unconfigured_manual_default(
+    mode: Option<&str>,
+    requested_by: Option<&str>,
+    revoked_at: Option<&str>,
+    envelope_text: Option<&str>,
+) -> bool {
+    if mode != Some("manual") || requested_by.is_some() || revoked_at.is_some() {
+        return false;
+    }
+    let Some(envelope_text) = envelope_text else {
+        return false;
+    };
+    let Ok(envelope) = serde_json::from_str::<CoordinationEnvelope>(envelope_text) else {
+        return false;
+    };
+    let current_default = CoordinationEnvelope::default();
+    let mut legacy_default = current_default.clone();
+    legacy_default.max_work_units = 4;
+    legacy_default.orchestrator_reviews_findings = false;
+    envelope == current_default || envelope == legacy_default
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -293,6 +681,7 @@ pub struct Overview {
     pub blockers: Vec<CoordinationBlocker>,
     pub can_authorize: bool,
     pub can_request: bool,
+    pub project_plan_batch_scope: Option<api_types::TaskCoordinationProjectBatchScopeResponse>,
     pub latest_request: Option<(TaskCoordinationRequest, CoordinationBrief)>,
     pub latest_plan: Option<PlanView>,
 }
@@ -405,6 +794,38 @@ impl TaskCoordinationService {
             .authorize_source(task_id, &source)
             .await?;
         let coordination = self.require_coordination(&task.id).await?;
+        let batch_scope_rows = sqlx::query(
+            "SELECT b.id AS batch_id,b.state AS batch_state,bt.state AS task_state,bt.blocker
+             FROM project_plan_batch_coordination_authorization a
+             JOIN project_plan_batch b
+               ON b.id=a.batch_id AND b.project_id=a.project_id
+             JOIN project_plan_batch_task bt
+               ON bt.batch_id=a.batch_id AND bt.task_id=a.task_id
+             WHERE a.project_id=? AND a.task_id=? AND a.authorization_version=?
+             ORDER BY b.id",
+        )
+        .bind(&task.project_id)
+        .bind(&task.id)
+        .bind(coordination.authorization_version)
+        .fetch_all(self.db.pool())
+        .await?;
+        if batch_scope_rows.len() > 1 {
+            return Err(ServiceError::Conflict(
+                "Task coordination authorization has multiple Project batch origins".into(),
+            ));
+        }
+        let project_plan_batch_scope = batch_scope_rows
+            .into_iter()
+            .next()
+            .map(|row| -> std::result::Result<_, sqlx::Error> {
+                Ok(api_types::TaskCoordinationProjectBatchScopeResponse {
+                    batch_id: row.try_get("batch_id")?,
+                    batch_state: row.try_get("batch_state")?,
+                    task_state: row.try_get("task_state")?,
+                    blocker: row.try_get("blocker")?,
+                })
+            })
+            .transpose()?;
         let envelope = self.envelope(&coordination)?;
         let team = self.current_team(&task.id).await?;
         let team_digest = self.team_digest(&team)?;
@@ -476,6 +897,7 @@ impl TaskCoordinationService {
                 )
             })
             && coordination.turn_count < coordination.max_turns;
+        let can_request = can_request && project_plan_batch_scope.is_none();
         Ok(Overview {
             task,
             coordination,
@@ -485,6 +907,7 @@ impl TaskCoordinationService {
             blockers,
             can_authorize: mutable,
             can_request,
+            project_plan_batch_scope,
             latest_request,
             latest_plan,
         })
@@ -496,6 +919,61 @@ impl TaskCoordinationService {
         user_id: &str,
         input: AuthorizationInput,
     ) -> Result<Overview> {
+        self.authorize_inner(task_id, user_id, input, None, None)
+            .await
+    }
+
+    pub async fn authorize_with_expected_team_generation(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        input: AuthorizationInput,
+        expected_team_generation: i64,
+    ) -> Result<Overview> {
+        self.authorize_inner(
+            task_id,
+            user_id,
+            input,
+            Some(expected_team_generation),
+            None,
+        )
+        .await
+    }
+
+    /// Mints a TaskCoordination authorization that is durably scoped to one
+    /// current Project batch. The exact grant receipt is written in the same
+    /// database transaction as the authorization version change.
+    pub async fn authorize_for_project_plan_batch(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        input: AuthorizationInput,
+        binding: ProjectPlanBatchAuthorizationBinding,
+    ) -> Result<Overview> {
+        if binding.authorized_by != user_id {
+            return Err(ServiceError::AuthorizationDenied {
+                message: "Project batch authorization must be issued by its current human approver"
+                    .into(),
+            });
+        }
+        self.authorize_inner(
+            task_id,
+            user_id,
+            input,
+            Some(binding.expected_team_generation),
+            Some(binding),
+        )
+        .await
+    }
+
+    async fn authorize_inner(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        input: AuthorizationInput,
+        expected_team_generation: Option<i64>,
+        batch_binding: Option<ProjectPlanBatchAuthorizationBinding>,
+    ) -> Result<Overview> {
         let source = CollaborationActorSource::Human(user_id.to_owned());
         let (task, _) = self
             .collaboration
@@ -504,7 +982,7 @@ impl TaskCoordinationService {
         if input.idempotency_key.trim().is_empty() || input.idempotency_key.len() > 256 {
             return Err(invalid_plan("idempotency key must contain 1 to 256 bytes"));
         }
-        let envelope = match input.envelope.as_ref() {
+        let mut envelope = match input.envelope.as_ref() {
             Some(value) => {
                 serde_json::from_value::<CoordinationEnvelope>(value.clone()).map_err(|error| {
                     unsupported_item(format!("invalid coordination envelope: {error}"))
@@ -512,7 +990,24 @@ impl TaskCoordinationService {
             }
             None => CoordinationEnvelope::default(),
         };
-        envelope.validate()?;
+        if input.envelope.is_some() {
+            envelope.validate()?;
+            envelope
+                .validate_pins(&EnvelopePinContext {
+                    db: &self.db,
+                    project_id: &task.project_id,
+                    repo_id: task.repo_id.as_deref(),
+                })
+                .await?;
+            envelope
+                .validate_phase_three_pins(&EnvelopePhaseThreePinContext {
+                    db: &self.db,
+                    project_id: &task.project_id,
+                    task_id: Some(&task.id),
+                    coordinator_actor: input.coordinator_actor.as_ref(),
+                })
+                .await?;
+        }
         if input.mode != TaskCoordinationMode::Manual
             && (input.coordinator_task_role_id.is_none() || input.coordinator_actor.is_none())
         {
@@ -521,7 +1016,37 @@ impl TaskCoordinationService {
             ));
         }
         let coordination_before = self.require_coordination(&task.id).await?;
+        let current_mode = coordination_before.mode.to_string();
+        let unconfigured_default_refresh = batch_binding.is_some()
+            && input.envelope.is_none()
+            && semantic_unconfigured_manual_default(
+                Some(&current_mode),
+                coordination_before.requested_by.as_deref(),
+                coordination_before.revoked_at.as_deref(),
+                Some(&coordination_before.envelope_json),
+            );
+        if expected_team_generation
+            .is_some_and(|expected| coordination_before.team_generation != expected)
+        {
+            return Err(db::DbError::VersionConflict.into());
+        }
         let team = self.current_team(&task.id).await?;
+        if input.envelope.is_none() {
+            let team_review_roles: Vec<String> = team
+                .iter()
+                .filter(|role| {
+                    role.capabilities
+                        .contains(&TaskRoleCapability::FormalReview)
+                })
+                .map(|role| role.role.clone())
+                .collect();
+            // A team without a formal-review role keeps the default review
+            // role list instead of failing default authorization.
+            if !team_review_roles.is_empty() {
+                envelope.allowed_review_roles = team_review_roles;
+            }
+            envelope.validate()?;
+        }
         let team_snapshot_json = self.team_snapshot_json(&team)?;
         let team_digest = sha256_hex(team_snapshot_json.as_bytes());
         let coordinator = match (
@@ -566,7 +1091,15 @@ impl TaskCoordinationService {
                 "coordinator_actor": coordinator,
                 "team_digest": team_digest,
                 "envelope_digest": envelope_digest,
+                "unconfigured_default_refresh": unconfigured_default_refresh,
                 "requested_by": user_id,
+                "batch_scope": batch_binding.as_ref().map(|binding| (
+                    binding.project_id.as_str(),
+                    binding.batch_id.as_str(),
+                    binding.expected_batch_version,
+                    binding.expected_graph_version,
+                    binding.expected_team_generation,
+                )),
             }))?
             .as_bytes(),
         );
@@ -592,29 +1125,41 @@ impl TaskCoordinationService {
             task.id,
             input.expected_coordination_version + 1
         ));
-        let write = TaskCoordinationRepo::authorize_task_coordination(
-            &*self.db,
-            db::AuthorizeTaskCoordinationInput {
-                task_id: task.id.clone(),
-                expected_coordination_version: input.expected_coordination_version,
-                expected_team_generation: coordination_before.team_generation,
-                mode: input.mode,
-                coordinator_task_role_id: input.coordinator_task_role_id,
-                coordinator_actor: coordinator,
-                team_snapshot_json,
-                team_digest,
-                envelope_json,
-                envelope_digest,
-                requested_by: user_id.to_owned(),
-                idempotency_key: input.idempotency_key,
-                request_digest,
-                receipt_id: new_uuid_v4(),
-                created_at: now,
-                event,
-            },
-            input.expected_task_version,
-        )
-        .await?;
+        let write_input = db::AuthorizeTaskCoordinationInput {
+            task_id: task.id.clone(),
+            expected_coordination_version: input.expected_coordination_version,
+            expected_team_generation: coordination_before.team_generation,
+            mode: input.mode,
+            coordinator_task_role_id: input.coordinator_task_role_id,
+            coordinator_actor: coordinator,
+            team_snapshot_json,
+            team_digest,
+            envelope_json,
+            envelope_digest,
+            unconfigured_default_refresh,
+            requested_by: user_id.to_owned(),
+            idempotency_key: input.idempotency_key,
+            request_digest,
+            receipt_id: new_uuid_v4(),
+            created_at: now,
+            event,
+        };
+        let write = if let Some(binding) = batch_binding {
+            TaskCoordinationRepo::authorize_project_plan_batch_task_coordination(
+                &*self.db,
+                write_input,
+                input.expected_task_version,
+                binding,
+            )
+            .await?
+        } else {
+            TaskCoordinationRepo::authorize_task_coordination(
+                &*self.db,
+                write_input,
+                input.expected_task_version,
+            )
+            .await?
+        };
         if let Some(event) = write.event.as_ref() {
             self.domain_events.publish_committed(event);
         }
@@ -691,6 +1236,31 @@ impl TaskCoordinationService {
         user_id: &str,
         input: TurnRequestInput,
     ) -> Result<(TaskCoordinationRequest, bool)> {
+        self.request_turn_inner(task_id, user_id, input, None).await
+    }
+
+    /// Requests a continuation that is attached to one exact active Project
+    /// batch origin. The repository atomically validates the origin, charges
+    /// the turn budget, creates the request, links it to the batch Task, and
+    /// appends the event.
+    pub async fn request_project_batch_turn(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        input: TurnRequestInput,
+        binding: ProjectPlanBatchRequestBinding,
+    ) -> Result<(TaskCoordinationRequest, bool)> {
+        self.request_turn_inner(task_id, user_id, input, Some(binding))
+            .await
+    }
+
+    async fn request_turn_inner(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        input: TurnRequestInput,
+        batch_binding: Option<ProjectPlanBatchRequestBinding>,
+    ) -> Result<(TaskCoordinationRequest, bool)> {
         input.brief.validate()?;
         if input.idempotency_key.trim().is_empty() || input.idempotency_key.len() > 256 {
             return Err(invalid_plan("idempotency key must contain 1 to 256 bytes"));
@@ -740,7 +1310,18 @@ impl TaskCoordinationService {
                     "idempotency key already identifies a different coordination request",
                 ));
             }
-            return Ok((request, false));
+            if batch_binding.is_none()
+                && TaskCoordinationRepo::is_project_plan_batch_coordination_request(
+                    &*self.db,
+                    &request.id,
+                )
+                .await?
+            {
+                return Err(db::DbError::ProjectPlanBatchInactive.into());
+            }
+            if batch_binding.is_none() {
+                return Ok((request, false));
+            }
         }
         let team = self.current_team(&task.id).await?;
         if coordination.team_stale || self.team_digest(&team)? != coordination.team_digest {
@@ -785,11 +1366,13 @@ impl TaskCoordinationService {
                 "Task dispatch is cancelled",
             ));
         }
-        if !TaskCoordinationRepo::consume_coordination_turn_budget(&*self.db, &task.id).await? {
-            return Err(coordination_error(
-                "coordination.budget_exhausted",
-                "the Task coordination turn budget is exhausted",
-            ));
+        if let Some(binding) = batch_binding.as_ref() {
+            if binding.authorized_by != user_id
+                || binding.expected_task_version != input.expected_task_version
+                || binding.expected_coordination_version != input.expected_coordination_version
+            {
+                return Err(db::DbError::ProjectPlanBatchInactive.into());
+            }
         }
         let brief_json = canonical_json(&input.brief)?;
         let objective_digest = sha256_hex(brief_json.as_bytes());
@@ -812,28 +1395,613 @@ impl TaskCoordinationService {
             }),
             &now,
         );
-        let (request, committed) = TaskCoordinationRepo::create_task_coordination_request(
-            &*self.db,
-            db::CreateTaskCoordinationRequestInput {
-                id: request_id,
-                task_id: task.id.clone(),
-                authorization_version: coordination.authorization_version,
-                mode: coordination.mode,
-                brief_json,
-                objective_digest,
-                request_digest,
-                idempotency_key: input.idempotency_key,
-                created_at: now,
-                event,
-            },
-        )
-        .await?;
-        if committed.is_none() {
-            TaskCoordinationRepo::refund_coordination_turn_budget(&*self.db, &task.id).await?;
-        } else if let Some(event) = committed.as_ref() {
+        let create_input = db::CreateTaskCoordinationRequestInput {
+            id: request_id,
+            task_id: task.id.clone(),
+            kind: TaskCoordinationRequestKind::WorkUnitPlan,
+            review_report_artifact_id: None,
+            review_report_digest: None,
+            review_producer_execution_id: None,
+            source_subject_kind: None,
+            source_subject_id: None,
+            source_subject_digest: None,
+            resumes_request_id: None,
+            requested_by: user_id.to_owned(),
+            expected_task_version: input.expected_task_version,
+            authorization_version: coordination.authorization_version,
+            mode: coordination.mode,
+            brief_json,
+            objective_digest,
+            request_digest,
+            idempotency_key: input.idempotency_key,
+            created_at: now,
+            event,
+        };
+        let write = if let Some(binding) = batch_binding {
+            TaskCoordinationRepo::create_project_plan_batch_coordination_request(
+                &*self.db,
+                create_input,
+                binding,
+            )
+            .await
+        } else {
+            TaskCoordinationRepo::create_task_coordination_request(&*self.db, create_input).await
+        };
+        let (request, committed) = match write {
+            Ok(write) => write,
+            Err(db::DbError::CoordinationTurnBudgetExhausted) => {
+                return Err(coordination_error(
+                    "coordination.budget_exhausted",
+                    "the Task coordination turn budget is exhausted",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(event) = committed.as_ref() {
             self.domain_events.publish_committed(event);
         }
         Ok((request, committed.is_some()))
+    }
+
+    /// Create the exact coordinator turn that triages one current ReviewReport.
+    /// The database writer revalidates the report producer, pending rework
+    /// intent, review-line head, current coordination, and any batch origin.
+    pub async fn request_review_findings_for_report(
+        &self,
+        task_id: &str,
+        review_report_artifact_id: &str,
+    ) -> Result<Option<(TaskCoordinationRequest, bool)>> {
+        if task_id.trim().is_empty() || review_report_artifact_id.trim().is_empty() {
+            return Err(invalid_plan(
+                "review findings source identifiers must be nonempty",
+            ));
+        }
+        let source = sqlx::query(
+            "SELECT report.digest, producer.execution_id AS producer_execution_id
+             FROM artifact report
+             JOIN artifact_execution_producer producer
+               ON producer.artifact_id=report.id AND producer.task_id=report.task_id
+             WHERE report.id=? AND report.task_id=? AND report.kind='review_report'",
+        )
+        .bind(review_report_artifact_id)
+        .bind(task_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        let report_digest: String = source.try_get("digest")?;
+        let review_producer_execution_id: String = source.try_get("producer_execution_id")?;
+        let Some(coordination) =
+            TaskCoordinationRepo::get_task_coordination(&*self.db, task_id).await?
+        else {
+            return Ok(None);
+        };
+        let idempotency_key = format!(
+            "review-findings:{}:{review_report_artifact_id}",
+            coordination.authorization_version
+        );
+
+        // A request remains the receipt for this source after triage,
+        // revocation, or a later review-line revision. Replay it before
+        // requiring the source to remain pending so no second turn is charged.
+        if let Some(existing) = TaskCoordinationRepo::get_task_coordination_request_by_key(
+            &*self.db,
+            task_id,
+            &idempotency_key,
+        )
+        .await?
+        {
+            if existing.kind != TaskCoordinationRequestKind::ReviewFindings
+                || existing.review_report_artifact_id.as_deref() != Some(review_report_artifact_id)
+                || existing.review_report_digest.as_deref() != Some(report_digest.as_str())
+                || existing.review_producer_execution_id.as_deref()
+                    != Some(review_producer_execution_id.as_str())
+                || existing.authorization_version != coordination.authorization_version
+            {
+                return Err(db::DbError::IdempotencyConflict.into());
+            }
+            return Ok(Some((existing, false)));
+        }
+
+        let source_current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_review_coordination_source_current source
+                WHERE source.report_id=? AND source.task_id=?
+                  AND source.report_digest=?
+                  AND source.producer_execution_id=?
+                  AND source.authorization_version=?
+            )",
+        )
+        .bind(review_report_artifact_id)
+        .bind(task_id)
+        .bind(&report_digest)
+        .bind(&review_producer_execution_id)
+        .bind(coordination.authorization_version)
+        .fetch_one(self.db.pool())
+        .await?;
+        if !source_current {
+            return Ok(None);
+        }
+
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        if coordination.mode == TaskCoordinationMode::Manual
+            || coordination.revoked_at.is_some()
+            || coordination.team_stale
+        {
+            return Ok(None);
+        }
+        let Some(requested_by) = coordination.requested_by.as_deref() else {
+            return Ok(None);
+        };
+        let team = self.current_team(task_id).await?;
+        if self.team_digest(&team)? != coordination.team_digest {
+            return Ok(None);
+        }
+        let coordinator = self.resolve_coordinator(&coordination, &team).await?;
+        if coordinator
+            .as_ref()
+            .is_none_or(|value| value.actor_ref.kind() != db::ActorKind::Agent)
+        {
+            return Ok(None);
+        }
+        let envelope = self.envelope(&coordination)?;
+        if !envelope.orchestrator_reviews_findings {
+            return Ok(None);
+        }
+
+        let has_batch_authority =
+            TaskCoordinationRepo::has_current_project_plan_batch_coordination_authorization(
+                &*self.db, task_id,
+            )
+            .await?;
+        let batch_binding = if has_batch_authority {
+            self.project_batch_binding_for_review_triage(
+                task_id,
+                requested_by,
+                review_report_artifact_id,
+                task.version,
+                coordination.authorization_version,
+            )
+            .await?
+        } else {
+            None
+        };
+        if has_batch_authority && batch_binding.is_none() {
+            // Paused or stale batches retain the source. The durable scanner
+            // retries after a valid resume without creating a generic wake.
+            return Ok(None);
+        }
+
+        let brief = CoordinationBrief {
+            objective: format!(
+                "Triage ReviewReport {review_report_artifact_id} ({report_digest})"
+            ),
+            constraints: Some(
+                "Decide only correct, recheck, or human for this exact report. Do not rewrite its verdict, widen scope, or approve its Gate.".to_owned(),
+            ),
+            acceptance_criteria: vec![
+                "Use only the exact report and reviewed result supplied in the request context".to_owned(),
+                "A recheck is a fresh formal review of the same subject without changing implementation".to_owned(),
+            ],
+            context: Some(
+                json!({
+                    "task_version": task.version,
+                    "authorization_version": coordination.authorization_version,
+                    "coordinator_task_role_id": coordination.coordinator_task_role_id,
+                    "coordinator_actor": coordination.coordinator_actor,
+                    "team_generation": coordination.team_generation,
+                    "team_digest": coordination.team_digest,
+                    "envelope_digest": coordination.envelope_digest,
+                    "review_report_artifact_id": review_report_artifact_id,
+                    "review_report_digest": report_digest,
+                    "review_producer_execution_id": review_producer_execution_id,
+                })
+                .to_string(),
+            ),
+        };
+        brief.validate()?;
+        let brief_json = canonical_json(&brief)?;
+        let objective_digest = sha256_hex(brief_json.as_bytes());
+        let request_digest = sha256_hex(
+            canonical_json(&json!({
+                "kind": "review_findings",
+                "task_id": task.id,
+                "task_version": task.version,
+                "authorization_version": coordination.authorization_version,
+                "team_generation": coordination.team_generation,
+                "team_digest": coordination.team_digest,
+                "envelope_digest": coordination.envelope_digest,
+                "review_report_artifact_id": review_report_artifact_id,
+                "review_report_digest": report_digest,
+                "review_producer_execution_id": review_producer_execution_id,
+            }))?
+            .as_bytes(),
+        );
+        let request_id = new_uuid_v4();
+        let now = now_rfc3339();
+        let mut event = self.event(
+            "task.coordination_requested",
+            "task_coordination_request",
+            &request_id,
+            "system",
+            None,
+            &task.id,
+            json!({
+                "task_id": task.id,
+                "request_id": request_id,
+                "kind": TaskCoordinationRequestKind::ReviewFindings.to_string(),
+                "authorization_version": coordination.authorization_version,
+                "review_report_artifact_id": review_report_artifact_id,
+                "review_report_digest": report_digest,
+                "review_producer_execution_id": review_producer_execution_id,
+                "objective_digest": objective_digest,
+            }),
+            &now,
+        );
+        event.dedupe_key = Some(format!(
+            "review-findings-request:{}:{review_report_artifact_id}",
+            coordination.authorization_version
+        ));
+        let create_input = db::CreateTaskCoordinationRequestInput {
+            id: request_id,
+            task_id: task.id.clone(),
+            kind: TaskCoordinationRequestKind::ReviewFindings,
+            review_report_artifact_id: Some(review_report_artifact_id.to_owned()),
+            review_report_digest: Some(report_digest),
+            review_producer_execution_id: Some(review_producer_execution_id),
+            source_subject_kind: None,
+            source_subject_id: None,
+            source_subject_digest: None,
+            resumes_request_id: None,
+            requested_by: requested_by.to_owned(),
+            expected_task_version: task.version,
+            authorization_version: coordination.authorization_version,
+            mode: coordination.mode,
+            brief_json,
+            objective_digest,
+            request_digest,
+            idempotency_key,
+            created_at: now,
+            event,
+        };
+        let write = if let Some(binding) = batch_binding {
+            TaskCoordinationRepo::create_project_plan_batch_coordination_request(
+                &*self.db,
+                create_input,
+                binding,
+            )
+            .await?
+        } else {
+            TaskCoordinationRepo::create_task_coordination_request(&*self.db, create_input).await?
+        };
+        if let Some(event) = write.1.as_ref() {
+            self.domain_events.publish_committed(event);
+        }
+        Ok(Some((write.0, write.1.is_some())))
+    }
+
+    /// Reconcile current pending sources after startup/resume. Requests use
+    /// the exact report and authorization version as their idempotency key, so
+    /// retries do not charge another coordination turn and reauthorization can
+    /// admit a new request only while the report remains the current source.
+    pub async fn process_pending_review_findings_requests(&self, limit: i64) -> Result<usize> {
+        let rows = sqlx::query(
+            "SELECT source.report_id,source.task_id
+             FROM task_review_coordination_source_current source
+             JOIN task_coordination coordination
+               ON coordination.task_id=source.task_id
+              AND coordination.authorization_version=source.authorization_version
+             WHERE coordination.turn_count < coordination.max_turns
+               AND coordination.coordinator_task_role_id IS NOT NULL
+               AND coordination.coordinator_actor_kind='agent'
+               AND coordination.coordinator_actor_id IS NOT NULL
+               AND (
+                 NOT EXISTS(
+                   SELECT 1 FROM project_plan_batch_coordination_authorization grant_scope
+                   WHERE grant_scope.task_id=source.task_id
+                     AND grant_scope.authorization_version=source.authorization_version
+                 )
+                 OR EXISTS(
+                   SELECT 1
+                   FROM project_plan_batch_execution producer_link
+                   JOIN project_plan_batch batch ON batch.id=producer_link.batch_id
+                   JOIN project_plan plan ON plan.project_id=batch.project_id
+                   JOIN project_plan_batch_task batch_task
+                     ON batch_task.batch_id=batch.id AND batch_task.task_id=source.task_id
+                   JOIN project_plan_batch_coordination_authorization grant_scope
+                     ON grant_scope.batch_id=batch.id AND grant_scope.task_id=source.task_id
+                    AND grant_scope.authorization_version=source.authorization_version
+                   WHERE producer_link.execution_id=source.producer_execution_id
+                     AND producer_link.task_id=source.task_id
+                     AND producer_link.authorization_version=source.authorization_version
+                     AND batch.state='running' AND batch.preparation_complete=1
+                     AND batch.graph_version=plan.version
+                     AND batch_task.state='started'
+                     AND batch_task.coordination_snapshot_json IS NOT NULL
+                     AND batch_task.coordination_snapshot_digest IS NOT NULL
+                 )
+               )
+               AND NOT EXISTS(
+                 SELECT 1 FROM task_coordination_request request
+                 WHERE request.task_id=source.task_id
+                   AND request.authorization_version=source.authorization_version
+                   AND request.kind='review_findings'
+                   AND request.review_report_artifact_id=source.report_id
+               )
+             ORDER BY source.report_id LIMIT ?",
+        )
+        .bind(limit.clamp(1, 100))
+        .fetch_all(self.db.pool())
+        .await?;
+        let mut created = 0;
+        for row in rows {
+            let report_id: String = row.try_get("report_id")?;
+            let task_id: String = row.try_get("task_id")?;
+            match self
+                .request_review_findings_for_report(&task_id, &report_id)
+                .await
+            {
+                Ok(Some((_, true))) => created += 1,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        task_id,
+                        review_report_artifact_id = %report_id,
+                        %error,
+                        "review findings request remains pending after a source-local error"
+                    );
+                }
+            }
+        }
+        Ok(created)
+    }
+
+    /// Resolves the exact producer Execution for a quality source Artifact into
+    /// the still-active Project batch scope that admitted it. No latest
+    /// Execution or Task-only inference is used.
+    pub async fn project_batch_binding_for_quality_source(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        source_artifact_id: &str,
+        expected_task_version: i64,
+        expected_coordination_version: i64,
+    ) -> Result<Option<ProjectPlanBatchRequestBinding>> {
+        let rows: Vec<(String, String, String, i64, i64, String, String)> = sqlx::query_as(
+            "SELECT b.id,b.project_id,b.authorized_by,b.version,b.graph_version,
+                    bt.coordination_snapshot_digest,producer.execution_id
+             FROM artifact_execution_producer producer
+             JOIN project_plan_batch_execution exec_link
+               ON exec_link.execution_id=producer.execution_id
+              AND exec_link.task_id=producer.task_id
+              AND exec_link.authorization_version=?
+             JOIN project_plan_batch b ON b.id=exec_link.batch_id
+             JOIN project_plan p ON p.project_id=b.project_id
+             JOIN project_plan_batch_task bt
+               ON bt.batch_id=b.id AND bt.task_id=producer.task_id
+             JOIN task t ON t.id=producer.task_id AND t.project_id=b.project_id
+              AND t.version=? AND t.deleted_at IS NULL
+             JOIN task_coordination c ON c.task_id=t.id
+             JOIN project_plan_batch_coordination_authorization a
+               ON a.batch_id=b.id AND a.task_id=t.id
+              AND a.authorization_version=c.authorization_version
+             JOIN project_member m ON m.project_id=b.project_id
+              AND m.user_id=b.authorized_by AND m.role IN ('owner','admin')
+             JOIN project owner_project ON owner_project.id=b.project_id
+             JOIN project_member owner_membership ON owner_membership.project_id=b.project_id
+              AND owner_membership.user_id=owner_project.owner_id AND owner_membership.role='owner'
+             WHERE producer.artifact_id=? AND producer.task_id=?
+              AND b.state='running' AND b.preparation_complete=1
+              AND b.graph_version=p.version AND bt.state='started'
+              AND b.authorized_by=? AND c.requested_by=b.authorized_by
+              AND c.authorization_version=? AND c.mode='prepare_and_execute'
+              AND c.revoked_at IS NULL AND c.team_stale=0
+              AND bt.coordination_snapshot_json IS NOT NULL
+              AND bt.coordination_snapshot_digest IS NOT NULL
+              AND c.authorization_version=json_extract(bt.coordination_snapshot_json,'$.authorization_version')
+              AND c.team_generation=json_extract(bt.coordination_snapshot_json,'$.team_generation')
+              AND c.team_digest=json_extract(bt.coordination_snapshot_json,'$.team_digest')
+              AND c.envelope_digest=json_extract(bt.coordination_snapshot_json,'$.envelope_digest')
+              AND c.coordinator_task_role_id=json_extract(bt.coordination_snapshot_json,'$.role_id')
+              AND c.coordinator_actor_kind=json_extract(bt.coordination_snapshot_json,'$.actor_kind')
+              AND c.coordinator_actor_id=json_extract(bt.coordination_snapshot_json,'$.actor_id')
+              AND a.project_id=b.project_id AND a.authorized_by=b.authorized_by
+              AND a.expected_graph_version=b.graph_version
+              AND a.task_title=t.title AND a.task_description IS t.description
+              AND a.task_repo_id IS t.repo_id AND a.task_parent_task_id IS t.parent_task_id
+              AND EXISTS(SELECT 1 FROM project_plan_batch_coordination_request scope
+                         WHERE scope.batch_id=b.id AND scope.task_id=t.id
+                          AND scope.authorization_version=c.authorization_version)
+              AND EXISTS(SELECT 1 FROM task_lifecycle l WHERE l.task_id=t.id
+                         AND l.state NOT IN ('done','cancelled','merging'))
+              AND NOT EXISTS(SELECT 1 FROM task_dispatch d
+                             WHERE d.task_id=t.id AND d.state='cancelled')",
+        )
+        .bind(expected_coordination_version)
+        .bind(expected_task_version)
+        .bind(source_artifact_id)
+        .bind(task_id)
+        .bind(user_id)
+        .bind(expected_coordination_version)
+        .fetch_all(self.db.pool())
+        .await?;
+        if rows.len() > 1 {
+            return Err(db::DbError::ProjectPlanBatchInactive.into());
+        }
+        Ok(rows.into_iter().next().map(
+            |(
+                batch_id,
+                project_id,
+                authorized_by,
+                batch_version,
+                graph_version,
+                snapshot_digest,
+                producer_execution_id,
+            )| {
+                ProjectPlanBatchRequestBinding {
+                    project_id,
+                    batch_id,
+                    authorized_by,
+                    expected_batch_version: batch_version,
+                    expected_graph_version: graph_version,
+                    expected_task_version,
+                    expected_coordination_version,
+                    coordination_snapshot_digest: snapshot_digest,
+                    origin: ProjectPlanBatchRequestOrigin::QualityReplan {
+                        source_artifact_id: source_artifact_id.to_owned(),
+                        producer_execution_id,
+                    },
+                }
+            },
+        ))
+    }
+
+    /// Uses the exact ReviewReport producer already linked to the active batch,
+    /// while preserving the distinct typed `review_triage` origin at write.
+    pub async fn project_batch_binding_for_review_triage(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        review_report_artifact_id: &str,
+        expected_task_version: i64,
+        expected_coordination_version: i64,
+    ) -> Result<Option<ProjectPlanBatchRequestBinding>> {
+        let Some(mut binding) = self
+            .project_batch_binding_for_quality_source(
+                task_id,
+                user_id,
+                review_report_artifact_id,
+                expected_task_version,
+                expected_coordination_version,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let producer_execution_id = match binding.origin {
+            ProjectPlanBatchRequestOrigin::QualityReplan {
+                producer_execution_id,
+                ..
+            } => producer_execution_id,
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "Review triage source resolved to a non-quality batch origin",
+                ))
+            }
+        };
+        binding.origin = ProjectPlanBatchRequestOrigin::ReviewTriage {
+            source_artifact_id: review_report_artifact_id.to_owned(),
+            producer_execution_id,
+        };
+        Ok(Some(binding))
+    }
+
+    /// Resolves a Human-requested plan revision only from an exact approved
+    /// plan Artifact, pending materialization or materialized with its durable
+    /// receipt, whose originating request belongs to this running batch.
+    pub async fn project_batch_binding_for_approved_plan(
+        &self,
+        task_id: &str,
+        user_id: &str,
+        approved_plan_artifact_id: &str,
+        expected_task_version: i64,
+        expected_coordination_version: i64,
+    ) -> Result<Option<ProjectPlanBatchRequestBinding>> {
+        let rows: Vec<(String, String, String, i64, i64, String)> = sqlx::query_as(
+            "SELECT b.id,b.project_id,b.authorized_by,b.version,b.graph_version,
+                    bt.coordination_snapshot_digest
+             FROM task_coordination_plan plan
+             JOIN project_plan_batch_coordination_request origin
+               ON origin.request_id=plan.request_id AND origin.task_id=plan.task_id
+             JOIN artifact plan_artifact
+               ON plan_artifact.id=plan.artifact_id AND plan_artifact.task_id=plan.task_id
+                AND plan_artifact.digest=plan.plan_digest
+             JOIN project_plan_batch b ON b.id=origin.batch_id
+             JOIN project_plan p ON p.project_id=b.project_id
+             JOIN project_plan_batch_task bt ON bt.batch_id=b.id AND bt.task_id=plan.task_id
+             JOIN task t ON t.id=plan.task_id AND t.project_id=b.project_id
+              AND t.version=? AND t.deleted_at IS NULL
+             JOIN task_coordination c ON c.task_id=t.id
+             JOIN project_plan_batch_coordination_authorization a
+               ON a.batch_id=b.id AND a.task_id=t.id
+              AND a.authorization_version=c.authorization_version
+             JOIN project_member m ON m.project_id=b.project_id
+              AND m.user_id=b.authorized_by AND m.role IN ('owner','admin')
+             JOIN project owner_project ON owner_project.id=b.project_id
+             JOIN project_member owner_membership ON owner_membership.project_id=b.project_id
+              AND owner_membership.user_id=owner_project.owner_id AND owner_membership.role='owner'
+             WHERE plan.artifact_id=? AND plan.task_id=?
+              AND plan.authorization_version=c.authorization_version
+              AND ((plan.state='approved' AND NOT EXISTS(
+                    SELECT 1 FROM task_coordination_materialization receipt
+                    WHERE receipt.plan_artifact_id=plan.artifact_id))
+                OR (plan.state='materialized' AND EXISTS(
+                    SELECT 1 FROM task_coordination_materialization receipt
+                    WHERE receipt.plan_artifact_id=plan.artifact_id
+                      AND receipt.task_id=plan.task_id
+                      AND receipt.request_id=plan.request_id
+                      AND receipt.plan_digest=plan.plan_digest
+                      AND receipt.authorization_version=plan.authorization_version)))
+              AND b.authorized_by=? AND b.state='running' AND b.preparation_complete=1
+              AND b.graph_version=p.version AND bt.state='started'
+              AND origin.authorization_version=c.authorization_version
+              AND c.requested_by=b.authorized_by AND c.authorization_version=?
+              AND c.mode='prepare_and_execute' AND c.revoked_at IS NULL AND c.team_stale=0
+              AND bt.coordination_snapshot_json IS NOT NULL
+              AND bt.coordination_snapshot_digest IS NOT NULL
+              AND c.authorization_version=json_extract(bt.coordination_snapshot_json,'$.authorization_version')
+              AND c.team_generation=json_extract(bt.coordination_snapshot_json,'$.team_generation')
+              AND c.team_digest=json_extract(bt.coordination_snapshot_json,'$.team_digest')
+              AND c.envelope_digest=json_extract(bt.coordination_snapshot_json,'$.envelope_digest')
+              AND c.coordinator_task_role_id=json_extract(bt.coordination_snapshot_json,'$.role_id')
+              AND c.coordinator_actor_kind=json_extract(bt.coordination_snapshot_json,'$.actor_kind')
+              AND c.coordinator_actor_id=json_extract(bt.coordination_snapshot_json,'$.actor_id')
+              AND a.project_id=b.project_id AND a.authorized_by=b.authorized_by
+              AND a.expected_graph_version=b.graph_version
+              AND a.task_title=t.title AND a.task_description IS t.description
+              AND a.task_repo_id IS t.repo_id AND a.task_parent_task_id IS t.parent_task_id
+              AND EXISTS(SELECT 1 FROM task_lifecycle l WHERE l.task_id=t.id
+                         AND l.state NOT IN ('done','cancelled','merging'))
+              AND NOT EXISTS(SELECT 1 FROM task_dispatch d
+                             WHERE d.task_id=t.id AND d.state='cancelled')",
+        )
+        .bind(expected_task_version)
+        .bind(approved_plan_artifact_id)
+        .bind(task_id)
+        .bind(user_id)
+        .bind(expected_coordination_version)
+        .fetch_all(self.db.pool())
+        .await?;
+        if rows.len() > 1 {
+            return Err(db::DbError::ProjectPlanBatchInactive.into());
+        }
+        Ok(rows.into_iter().next().map(
+            |(
+                batch_id,
+                project_id,
+                authorized_by,
+                batch_version,
+                graph_version,
+                snapshot_digest,
+            )| {
+                ProjectPlanBatchRequestBinding {
+                    project_id,
+                    batch_id,
+                    authorized_by,
+                    expected_batch_version: batch_version,
+                    expected_graph_version: graph_version,
+                    expected_task_version,
+                    expected_coordination_version,
+                    coordination_snapshot_digest: snapshot_digest,
+                    origin: ProjectPlanBatchRequestOrigin::HumanReplan {
+                        approved_plan_artifact_id: approved_plan_artifact_id.to_owned(),
+                    },
+                }
+            },
+        ))
     }
 
     pub async fn get_request(
@@ -1018,6 +2186,34 @@ impl TaskCoordinationService {
             Some(event),
         )
         .await?;
+        if let Some(replan) =
+            db::TaskCoordinatorReplanRepo::list_coordinator_replans_by_task(&*self.db, &task.id)
+                .await?
+                .into_iter()
+                .find(|replan| replan.plan_request_id.as_deref() == Some(plan.request_id.as_str()))
+        {
+            let next = if input.approve {
+                CoordinatorReplanState::Approved
+            } else {
+                CoordinatorReplanState::Rejected
+            };
+            if replan.state != next {
+                db::TaskCoordinatorReplanRepo::transition_coordinator_replan(
+                    &*self.db,
+                    db::TransitionCoordinatorReplan {
+                        id: replan.id,
+                        expected_version: replan.version,
+                        to_state: next,
+                        plan_request_id: None,
+                        classification: None,
+                        classification_facts_json: None,
+                        human_decision_id: None,
+                        updated_at: now_rfc3339(),
+                    },
+                )
+                .await?;
+            }
+        }
         self.plan_view(plan).await
     }
 
@@ -1062,6 +2258,13 @@ impl TaskCoordinationService {
             let (launch_intent_accepted, launch_blockers) = self
                 .launch_materialized_work(&task.id, user_id, existing.authorization_version)
                 .await?;
+            if let Some((replan_id, _)) = self.replan_context_for_request(&request)? {
+                self.mark_coordinator_replan_state(
+                    &replan_id,
+                    CoordinatorReplanState::Materialized,
+                )
+                .await?;
+            }
             return Ok(MaterializeOutcome {
                 plan: self.plan_view(plan).await?,
                 request,
@@ -1318,6 +2521,10 @@ impl TaskCoordinationService {
         let (launch_intent_accepted, launch_blockers) = self
             .launch_materialized_work(&task.id, user_id, materialization.authorization_version)
             .await?;
+        if let Some((replan_id, _)) = self.replan_context_for_request(&request)? {
+            self.mark_coordinator_replan_state(&replan_id, CoordinatorReplanState::Materialized)
+                .await?;
+        }
         Ok(MaterializeOutcome {
             plan: self.plan_view(plan).await?,
             request,
@@ -1448,12 +2655,31 @@ impl TaskCoordinationService {
         request: &TaskCoordinationRequest,
         execution: &db::Execution,
     ) -> Result<()> {
+        if request.kind == TaskCoordinationRequestKind::ReviewFindings {
+            return self
+                .complete_review_findings_turn(request, execution, None)
+                .await;
+        }
+        if matches!(
+            request.kind,
+            TaskCoordinationRequestKind::ValidationFindings
+                | TaskCoordinationRequestKind::HumanDecisionResume
+                | TaskCoordinationRequestKind::ExternalFeedback
+        ) {
+            return self.complete_new_kind_turn(request, execution).await;
+        }
         if let Some(existing) =
             TaskCoordinationRepo::list_task_coordination_plans(&*self.db, &request.task_id, 100)
                 .await?
                 .into_iter()
                 .find(|plan| plan.request_id == request.id)
         {
+            if self
+                .reconcile_replan_plan_completion(request, execution, &existing)
+                .await?
+            {
+                return Ok(());
+            }
             if existing.state == TaskCoordinationPlanState::Approved {
                 let coordination = self.require_coordination(&request.task_id).await?;
                 let task_version = TaskRepo::get_by_id(&*self.db, &request.task_id, false)
@@ -1461,21 +2687,43 @@ impl TaskCoordinationService {
                     .map(|task| task.version)
                     .unwrap_or_default();
                 if let Some(authorizer) = coordination.requested_by.as_deref() {
-                    self.materialize(
-                        &request.task_id,
-                        &existing.artifact_id,
-                        authorizer,
-                        MaterializeInput {
-                            expected_task_version: task_version,
-                            expected_coordination_version: existing.authorization_version,
-                            expected_plan_digest: existing.plan_digest.clone(),
-                            expected_plan_version: existing.version,
-                            expected_request_version: request.version,
-                            idempotency_key: format!("coordination-auto:{}", existing.artifact_id),
-                        },
+                    if self
+                        .materialize(
+                            &request.task_id,
+                            &existing.artifact_id,
+                            authorizer,
+                            MaterializeInput {
+                                expected_task_version: task_version,
+                                expected_coordination_version: existing.authorization_version,
+                                expected_plan_digest: existing.plan_digest.clone(),
+                                expected_plan_version: existing.version,
+                                expected_request_version: request.version,
+                                idempotency_key: format!(
+                                    "coordination-auto:{}",
+                                    existing.artifact_id
+                                ),
+                            },
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        if let Some((replan_id, _)) = self.replan_context_for_request(request)? {
+                            self.mark_coordinator_replan_state(
+                                &replan_id,
+                                CoordinatorReplanState::Materialized,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+            if let Some((replan_id, _)) = self.replan_context_for_request(request)? {
+                if existing.state == TaskCoordinationPlanState::Materialized {
+                    self.mark_coordinator_replan_state(
+                        &replan_id,
+                        CoordinatorReplanState::Materialized,
                     )
-                    .await
-                    .ok();
+                    .await?;
                 }
             }
             return Ok(());
@@ -1506,15 +2754,20 @@ impl TaskCoordinationService {
             false,
         )
         .await?;
+        let replan_classification =
+            self.replan_classification(request, &parsed, &envelope, &task)?;
         let within_envelope = self.is_within_envelope(&envelope, &parsed);
         let plan_digest = sha256_hex(output.as_bytes());
         let artifact_id = new_uuid_v4();
-        let plan_state =
-            if request.mode == TaskCoordinationMode::PrepareAndExecute && within_envelope {
-                TaskCoordinationPlanState::Approved
-            } else {
-                TaskCoordinationPlanState::Proposed
-            };
+        let plan_state = if request.mode == TaskCoordinationMode::PrepareAndExecute
+            && within_envelope
+            && replan_classification.as_ref().is_none_or(|(_, result)| {
+                result.classification == ReplanClassification::WithinEnvelope
+            }) {
+            TaskCoordinationPlanState::Approved
+        } else {
+            TaskCoordinationPlanState::Proposed
+        };
         let now = now_rfc3339();
         let artifact_event = self.event(
             "artifact.created",
@@ -1585,6 +2838,23 @@ impl TaskCoordinationService {
         )
         .await?;
         if plan_state == TaskCoordinationPlanState::Proposed {
+            if let Some((replan_id, result)) =
+                replan_classification.as_ref().filter(|(_, result)| {
+                    result.classification == ReplanClassification::ScopeOrAuthorityChange
+                })
+            {
+                self.raise_replan_scope_decision(replan::RaiseReplanScopeDecisionInput {
+                    request,
+                    execution,
+                    artifact_id: &artifact_id,
+                    artifact_digest: &plan_digest,
+                    replan_id,
+                    classification: result.classification,
+                    facts_json: result.classification_facts_json(),
+                })
+                .await?;
+                return Ok(());
+            }
             let proposal = self
                 .collaboration
                 .create_proposal_with_id(
@@ -1657,7 +2927,25 @@ impl TaskCoordinationService {
             .await?;
             write.plan = plan;
             write.request = updated_request;
+            if let Some((replan_id, result)) = replan_classification.as_ref() {
+                self.record_replan_classification(
+                    replan_id,
+                    CoordinatorReplanState::AwaitingHuman,
+                    result.classification,
+                    result.classification_facts_json(),
+                )
+                .await?;
+            }
         } else {
+            if let Some((replan_id, result)) = replan_classification.as_ref() {
+                self.record_replan_classification(
+                    replan_id,
+                    CoordinatorReplanState::Approved,
+                    result.classification,
+                    result.classification_facts_json(),
+                )
+                .await?;
+            }
             let authorizer = coordination.requested_by.clone().ok_or_else(|| {
                 coordination_error(
                     "coordination.not_authorized",
@@ -1680,7 +2968,15 @@ impl TaskCoordinationService {
                 )
                 .await;
             match materialize {
-                Ok(_) => {}
+                Ok(_) => {
+                    if let Some((replan_id, _)) = replan_classification.as_ref() {
+                        self.mark_coordinator_replan_state(
+                            replan_id,
+                            CoordinatorReplanState::Materialized,
+                        )
+                        .await?;
+                    }
+                }
                 Err(ServiceError::Coordination {
                     code: "coordination.paused",
                     message,
@@ -1693,6 +2989,250 @@ impl TaskCoordinationService {
         Ok(())
     }
 
+    pub(super) async fn complete_review_findings_turn(
+        &self,
+        request: &TaskCoordinationRequest,
+        execution: &db::Execution,
+        allowed_outputs: Option<&[crate::coordinator_outputs::CoordinatorOutputKind]>,
+    ) -> Result<()> {
+        const MAX_REVIEW_FINDINGS_BYTES: usize = 64 * 1024;
+
+        let output = execution.summary.as_deref().ok_or_else(|| {
+            invalid_plan("the ReviewFindings coordination Execution has no triage output")
+        })?;
+        if output.len() > MAX_REVIEW_FINDINGS_BYTES {
+            return Err(invalid_plan(
+                "the ReviewFindings triage output exceeds 64 KiB",
+            ));
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ReviewFindingsTurn {
+            schema_version: u32,
+            request_id: String,
+            task_id: String,
+            authorization_version: i64,
+            review_findings: Vec<crate::task_rework::ReviewFindingsDecision>,
+            #[serde(default)]
+            outputs: Vec<Value>,
+        }
+        let response: ReviewFindingsTurn = serde_json::from_str(output).map_err(|_| {
+            invalid_plan("the ReviewFindings output is not its typed JSON envelope")
+        })?;
+        if !matches!(response.schema_version, 1 | 2)
+            || response.request_id != request.id
+            || response.task_id != request.task_id
+            || response.authorization_version != request.authorization_version
+            || response.review_findings.len() != 1
+        {
+            return Err(invalid_plan(
+                "ReviewFindings requires exactly one decision for its exact request and authorization",
+            ));
+        }
+        let mut decision = response
+            .review_findings
+            .into_iter()
+            .next()
+            .expect("one ReviewFindings decision was checked");
+        if response.schema_version == 1
+            && (!response.outputs.is_empty() || decision.micro_fix.is_some())
+        {
+            return Err(invalid_plan(
+                "ReviewFindings schema 1 is frozen; micro_fix and outputs require schema 2",
+            ));
+        }
+        if decision.authorization_version != request.authorization_version
+            || request.review_report_artifact_id.as_deref()
+                != Some(decision.review_report_artifact_id.as_str())
+            || request.review_report_digest.as_deref() != Some(decision.report_digest.as_str())
+        {
+            return Err(invalid_plan(
+                "ReviewFindings decision does not match its exact report and authorization",
+            ));
+        }
+        if let Some(micro_fix) = decision.micro_fix.as_ref() {
+            if response.schema_version != 2
+                || decision.disposition != api_types::TaskReviewDisposition::Correct
+            {
+                return Err(crate::task_coordination::output_not_permitted(
+                    "micro_fix requires ReviewFindings schema 2 with the correct disposition",
+                ));
+            }
+            let coordination = self.require_coordination(&request.task_id).await?;
+            let envelope = self.envelope(&coordination)?;
+            if !envelope
+                .micro_fix
+                .as_ref()
+                .is_some_and(|grant| grant.enabled)
+            {
+                return Err(crate::task_coordination::output_not_permitted(
+                    "micro_fix requires envelope.micro_fix.enabled",
+                ));
+            }
+            let exact_context = crate::task_rework::TaskReworkService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .exact_review_findings_context(request)
+            .await?;
+            if exact_context
+                .pointer("/reviewed_result/commit_sha")
+                .and_then(Value::as_str)
+                .is_none()
+                || exact_context
+                    .pointer("/reviewed_result/workspace_id")
+                    .and_then(Value::as_str)
+                    .is_none()
+            {
+                return Err(crate::task_coordination::output_not_permitted(
+                    "micro_fix requires the exact reviewed repository commit and Workspace",
+                ));
+            }
+            crate::coordinator_outputs::ensure_new_kind_permitted(
+                crate::coordinator_outputs::CoordinatorOutputKind::MicroFix,
+                allowed_outputs,
+            )
+            .map_err(ServiceError::from)?;
+            if let Some(reviewer) = envelope.micro_fix_reviewer.as_ref() {
+                let producer_id = request
+                    .review_producer_execution_id
+                    .as_deref()
+                    .ok_or_else(|| invalid_plan("ReviewFindings request has no report producer"))?;
+                let authority =
+                    db::ExecutionTaskRoleAuthorityRepo::get_by_execution_id(&*self.db, producer_id)
+                        .await?
+                        .ok_or_else(|| {
+                            invalid_plan("ReviewReport producer has no exact TaskRole authority")
+                        })?;
+                let configuration = crate::role_capabilities::current_task_role_configuration(
+                    &self.db,
+                    &authority.task_role_id,
+                )
+                .await?
+                .ok_or_else(|| invalid_plan("ReviewReport TaskRole configuration is missing"))?;
+                let route = configuration.rework.as_ref().ok_or_else(|| {
+                    invalid_plan("micro_fix requires the ReviewReport TaskRole rework route")
+                })?;
+                if route.next_review_role_id.as_deref() != Some(reviewer.task_role_id.as_str())
+                    || route.review_actor.as_ref().is_some_and(|actor| {
+                        actor != &ApiActorRef::Agent(reviewer.agent_id.clone())
+                    })
+                {
+                    return Err(crate::task_coordination::output_not_permitted(
+                        "micro_fix_reviewer must match the configured next formal review route",
+                    ));
+                }
+            }
+            let artifact =
+                CollaborationRepo::get_artifact(&*self.db, &decision.review_report_artifact_id)
+                    .await?
+                    .filter(|artifact| {
+                        artifact.task_id == request.task_id
+                            && artifact.digest.as_deref() == Some(decision.report_digest.as_str())
+                    })
+                    .ok_or_else(|| {
+                        ServiceError::not_found(
+                            "ReviewReport",
+                            decision.review_report_artifact_id.clone(),
+                        )
+                    })?;
+            let report: Value =
+                serde_json::from_str(artifact.content.as_deref().unwrap_or_default())
+                    .map_err(|_| invalid_plan("ReviewReport source is invalid JSON"))?;
+            let findings = report
+                .get("findings")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let exact_findings = findings
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            if micro_fix
+                .finding_refs
+                .iter()
+                .any(|reference| !exact_findings.contains(reference.as_str()))
+                || micro_fix.paths.iter().any(|path| {
+                    !micro_fix
+                        .finding_refs
+                        .iter()
+                        .any(|reference| reference.contains(path))
+                })
+            {
+                return Err(crate::task_coordination::output_not_permitted(
+                    "micro_fix findings and paths must be exact subsets of this ReviewReport",
+                ));
+            }
+            let used = db::MicroFixReceiptRepo::list_micro_fix_receipts_by_task(
+                &*self.db,
+                &request.task_id,
+            )
+            .await?
+            .len() as i64;
+            if used
+                >= envelope
+                    .micro_fix
+                    .as_ref()
+                    .map(|grant| grant.max_per_task as i64)
+                    .unwrap_or(0)
+            {
+                return Err(crate::task_coordination::output_not_permitted(
+                    "micro_fix.max_per_task is exhausted; route the finding through ordinary triage or a Human",
+                ));
+            }
+            let scoped_instructions = format!(
+                "{}\n{}\nDeclared micro-fix paths: {}",
+                decision.instructions,
+                micro_fix.instructions,
+                micro_fix.paths.join(", ")
+            );
+            if scoped_instructions.len() > 16 * 1024 {
+                return Err(crate::task_coordination::output_not_permitted(
+                    "micro_fix instructions exceed the durable correction instruction bound",
+                ));
+            }
+            decision.instructions = scoped_instructions;
+        }
+        let outputs = crate::coordinator_outputs::parse_outputs(
+            response.outputs,
+            &self.envelope(&self.require_coordination(&request.task_id).await?)?,
+            allowed_outputs,
+        )
+        .map_err(ServiceError::from)?;
+        let propose_replan = outputs.iter().find_map(|output| match output {
+            crate::coordinator_outputs::CoordinatorOutput::ProposeReplan(value) => {
+                Some(value.clone())
+            }
+            _ => None,
+        });
+        if outputs.iter().any(|output| {
+            !matches!(
+                output,
+                crate::coordinator_outputs::CoordinatorOutput::ProposeReplan(_)
+            )
+        }) {
+            return Err(crate::task_coordination::output_not_permitted(
+                "ReviewFindings supports propose_replan outputs in this phase",
+            ));
+        }
+        if decision.micro_fix.is_some() && propose_replan.is_some() {
+            return Err(invalid_plan(
+                "one ReviewFindings turn cannot combine micro_fix and propose_replan",
+            ));
+        }
+        crate::task_rework::TaskReworkService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .record_review_triage(&execution.id, &request.id, decision)
+        .await?;
+        if let Some(output) = propose_replan {
+            self.apply_propose_replan(request, execution, output)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn mark_turn_started(
         &self,
         request: &TaskCoordinationRequest,
@@ -1700,7 +3240,7 @@ impl TaskCoordinationService {
         execution_id: &str,
     ) -> Result<()> {
         let now = now_rfc3339();
-        let event = self.event(
+        let mut event = self.event(
             "task.coordination_turn_started",
             "task_coordination_request",
             &request.id,
@@ -1715,6 +3255,10 @@ impl TaskCoordinationService {
             }),
             &now,
         );
+        event.dedupe_key = Some(format!(
+            "task.coordination_turn_started:{}:{execution_id}",
+            request.id
+        ));
         TaskCoordinationRepo::update_task_coordination_request(
             &*self.db,
             db::UpdateTaskCoordinationRequestState {
@@ -1825,6 +3369,71 @@ impl TaskCoordinationService {
         request: &TaskCoordinationRequest,
         context: &Value,
     ) -> Result<String> {
+        match request.kind {
+            TaskCoordinationRequestKind::ValidationFindings => {
+                return self.render_validation_findings_prompt(request, context);
+            }
+            TaskCoordinationRequestKind::HumanDecisionResume => {
+                return self.render_human_decision_resume_prompt(request, context);
+            }
+            TaskCoordinationRequestKind::ExternalFeedback => {
+                return self.render_external_feedback_prompt(request, context);
+            }
+            _ => {}
+        }
+        if request.kind == TaskCoordinationRequestKind::ReviewFindings {
+            let report_id = request
+                .review_report_artifact_id
+                .as_deref()
+                .ok_or_else(|| invalid_plan("ReviewFindings request has no exact report ID"))?;
+            let report_digest = request
+                .review_report_digest
+                .as_deref()
+                .ok_or_else(|| invalid_plan("ReviewFindings request has no exact report digest"))?;
+            let coordination = self.require_coordination(&request.task_id).await?;
+            let envelope = self.envelope(&coordination)?;
+            let action_is_allowed = |action: &str| {
+                context
+                    .pointer("/task_role/pr6_policy/allowed_actions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|allowed| {
+                        allowed.iter().any(|value| value.as_str() == Some(action))
+                    })
+            };
+            let micro_fix_enabled = envelope
+                .micro_fix
+                .as_ref()
+                .is_some_and(|grant| grant.enabled)
+                && action_is_allowed("micro_fix");
+            let propose_replan_enabled =
+                envelope.allow_coordinator_replan && action_is_allowed("propose_replan");
+            let micro_fix_instruction = if micro_fix_enabled {
+                "Optional `micro_fix` is permitted only with `correct`; use exact report findings and up to 3 paths explicitly named in those findings. It requests a bounded correction and never supplies a patch."
+            } else {
+                "Set `micro_fix` to null because this TaskRole and envelope do not preauthorize a micro-fix."
+            };
+            let outputs_instruction = if propose_replan_enabled {
+                "The `outputs` array may contain up to 4 entries and may use `propose_replan` with `reason`, `evidence_links`, and `plan_request.instructions` (<= 4 KiB)."
+            } else {
+                "Keep `outputs` empty; `propose_replan` is not preauthorized by this TaskRole and envelope."
+            };
+            return Ok(format!(
+                r#"You are the selected Task coordinator reviewing one exact request-changes ReviewReport. This execution is read-only and cannot change the report, its verdict, the reviewed result, or a Gate.
+Return exactly one JSON object matching:
+{{"schema_version":2,"request_id":{request_id},"task_id":{task_id},"authorization_version":{authorization_version},"review_findings":[{{"authorization_version":{authorization_version},"review_report_artifact_id":{report_id},"report_digest":{report_digest},"disposition":"correct|recheck|human","rationale":"...","instructions":"...","micro_fix":null}}],"outputs":[]}}
+Return exactly one decision and no `actions` field. `correct` confirms a reproducible defect and gives a bounded correction; `recheck` asks for a fresh formal review of the same frozen subject; `human` identifies the concrete decision that needs a Human. {micro_fix_instruction} {outputs_instruction} Do not combine `micro_fix` with `propose_replan`. Never include commands, commits, workspace IDs, or arbitrary paths. Keep rationale under 8 KiB and decision instructions under 16 KiB.
+Exact report: {report_id} ({report_digest})
+Task context: {context}"#,
+                request_id = serde_json::to_string(&request.id).unwrap(),
+                task_id = serde_json::to_string(&request.task_id).unwrap(),
+                authorization_version = request.authorization_version,
+                report_id = serde_json::to_string(report_id).unwrap(),
+                report_digest = serde_json::to_string(report_digest).unwrap(),
+                micro_fix_instruction = micro_fix_instruction,
+                outputs_instruction = outputs_instruction,
+                context = serde_json::to_string(context).unwrap_or_else(|_| "{}".to_owned()),
+            ));
+        }
         let brief = self.parse_brief(request)?;
         let coordination = self.require_coordination(&request.task_id).await?;
         let envelope = self.envelope(&coordination)?;
@@ -1853,7 +3462,7 @@ impl TaskCoordinationService {
             "You are the selected Task coordinator for one bounded preparation turn. This execution is read-only and must not modify repository files, create WorkUnits, call provider APIs, or grant authority.\n\
 Return exactly one JSON object and no markdown fences. The object must match this schema:\n\
 {{\"schema_version\":1,\"request_id\":{request_id},\"task_id\":{task_id},\"task_version\":{task_version},\"authorization_version\":{authorization_version},\"team_digest\":{team_digest},\"envelope_digest\":{envelope_digest},\"objective_digest\":{objective_digest},\"work_units\":[{{\"key\":\"stable-key\",\"title\":\"...\",\"scope\":\"...\",\"role\":\"exact existing TaskRole role name\",\"assigned_actor\":{{\"kind\":\"agent|human\",\"id\":\"exact eligible member id\"}}|null,\"parent_key\":null,\"depends_on\":[],\"requires_integration\":false,\"execution_instructions\":null,\"review_subject_key\":null,\"acceptance\":[],\"artifact_inputs\":[]}}],\"delivery\":null,\"review\":null,\"limits\":null}}\n\
-Create at most {max_work_units} WorkUnits. Use only TaskRole names and active members listed in the team. A formal review WorkUnit must use a TaskRole with the `formal_review` capability, set review_subject_key to another planned key, and must be independent from that WorkUnit's assigned Actor. The review role must also appear in the envelope's allowed_review_roles by its exact role name. Do not create, rename, or grant TaskRoles, memberships, or capabilities. Do not request external actions or merge. A plan outside the envelope will wait for Human approval.\n\
+Create at most {max_work_units} WorkUnits. Use only TaskRole names and active members listed in the team. A formal review WorkUnit must use a TaskRole with the `formal_review` capability, set review_subject_key to another planned key, and must use a fresh role-isolated native session; the same Agent profile is allowed, but a Human contributor cannot review their own result. The review role must also appear in the envelope's allowed_review_roles by its exact role name. Do not create, rename, or grant TaskRoles, memberships, or capabilities. Do not request external actions or merge. A plan outside the envelope will wait for Human approval.\n\
 Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {acceptance}\nContext: {context}\nEnvelope: {envelope_json}\nTeam: {team}\nCurrent Task context: {task_context}",
             request_id = serde_json::to_string(&request.id).unwrap(),
             task_id = serde_json::to_string(&request.task_id).unwrap(),
@@ -2810,18 +4419,45 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                         "request_replan coordination version is inconsistent",
                     ));
                 }
-                if resuming
-                    && TaskCoordinationRepo::get_task_coordination_request_by_key(
-                        &*self.db,
-                        &task.id,
-                        &brief.idempotency_key,
-                    )
-                    .await?
-                    .is_some()
-                {
-                    return Ok(());
+                let batch_binding =
+                    if let Some(approved_plan_artifact_id) = input.plan_artifact_id.as_deref() {
+                        self.project_batch_binding_for_approved_plan(
+                            &task.id,
+                            user_id,
+                            approved_plan_artifact_id,
+                            brief.expected_task_version,
+                            brief.expected_coordination_version,
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
+                if resuming {
+                    if let Some(existing) =
+                        TaskCoordinationRepo::get_task_coordination_request_by_key(
+                            &*self.db,
+                            &task.id,
+                            &brief.idempotency_key,
+                        )
+                        .await?
+                    {
+                        let batch_bound =
+                            TaskCoordinationRepo::is_project_plan_batch_coordination_request(
+                                &*self.db,
+                                &existing.id,
+                            )
+                            .await?;
+                        if !batch_bound && batch_binding.is_none() {
+                            return Ok(());
+                        }
+                    }
                 }
-                self.request_turn(&task.id, user_id, brief).await?;
+                if let Some(binding) = batch_binding {
+                    self.request_project_batch_turn(&task.id, user_id, brief, binding)
+                        .await?;
+                } else {
+                    self.request_turn(&task.id, user_id, brief).await?;
+                }
                 Ok(())
             }
         }
@@ -2912,7 +4548,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         }
         if plan.work_units.is_empty() || plan.work_units.len() > MAX_PLAN_WORK_UNITS {
             return Err(invalid_plan(
-                "the plan must contain between 1 and 4 WorkUnits",
+                "the plan must contain between 1 and 64 WorkUnits",
             ));
         }
         Ok(plan)
@@ -3252,10 +4888,11 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                     .ok_or_else(|| invalid_plan("review subject key is missing"))?;
                 if unit.assigned_actor.is_some()
                     && unit.assigned_actor == reviewed.assigned_actor
+                    && matches!(unit.assigned_actor.as_ref(), Some(ApiActorRef::Human(_)))
                     && envelope.require_independent_review
                 {
                     return Err(invalid_plan(
-                        "review must be performed by an independent Actor",
+                        "a Human contributor cannot review their own result",
                     ));
                 }
                 if reviewed.review_subject_key.is_some() {
@@ -3663,10 +5300,172 @@ mod tests {
     use super::*;
 
     #[test]
+    fn historical_envelopes_keep_direct_routing_and_new_defaults_mediate_findings() {
+        let mut historical = serde_json::to_value(CoordinationEnvelope::default()).unwrap();
+        historical
+            .as_object_mut()
+            .unwrap()
+            .remove("orchestrator_reviews_findings");
+        let parsed: CoordinationEnvelope = serde_json::from_value(historical).unwrap();
+        assert!(!parsed.orchestrator_reviews_findings);
+        assert!(CoordinationEnvelope::default().orchestrator_reviews_findings);
+    }
+
+    #[test]
+    fn validation_catalog_envelope_v1_serialization_and_digest_are_unchanged() {
+        let envelope = CoordinationEnvelope::default();
+        let json = canonical_json(&envelope).expect("envelope serializes");
+        assert!(!json.contains("validation_checks"));
+        assert_eq!(
+            json,
+            "{\"schema_version\":1,\"max_work_units\":16,\"allow_new_task_roles\":false,\"allow_membership_changes\":false,\"allow_capability_changes\":false,\"allow_repository_write\":true,\"allow_external_actions\":false,\"allow_integration\":true,\"allow_merge\":false,\"allowed_review_roles\":[\"reviewer\"],\"require_independent_review\":true,\"orchestrator_reviews_findings\":true}"
+        );
+        assert_eq!(
+            sha256_hex(json.as_bytes()),
+            "1d51d9a985faa6240cc35108b94fadefd4882600fec0cec08abf7602ea5734a9"
+        );
+        let parsed: CoordinationEnvelope = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(parsed, envelope);
+    }
+
+    #[test]
+    fn v180_envelope_phase_three_fields_are_bounded_and_omitted_when_unset() {
+        let serialized = canonical_json(&CoordinationEnvelope::default()).expect("default JSON");
+        for field in [
+            "micro_fix",
+            "micro_fix_reviewer",
+            "fallback_agents",
+            "allow_coordinator_replan",
+        ] {
+            assert!(!serialized.contains(field), "unset {field} is omitted");
+        }
+
+        let micro_fix = EnvelopeMicroFix {
+            enabled: true,
+            max_files: MAX_MICRO_FIX_FILES,
+            max_changed_lines: MAX_MICRO_FIX_CHANGED_LINES,
+            max_per_task: MAX_MICRO_FIX_PER_TASK as u32,
+            extra_forbidden_globs: vec!["*.toml".to_owned()],
+        };
+        let fallback = EnvelopeFallbackAgent {
+            task_role_id: "role-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            cost_class: CostClass::Economy,
+            max_wait_seconds: 86_400,
+        };
+        let envelope = CoordinationEnvelope {
+            schema_version: 2,
+            micro_fix: Some(micro_fix.clone()),
+            fallback_agents: vec![
+                fallback.clone(),
+                EnvelopeFallbackAgent {
+                    agent_id: "agent-2".to_owned(),
+                    ..fallback.clone()
+                },
+                EnvelopeFallbackAgent {
+                    agent_id: "agent-3".to_owned(),
+                    ..fallback.clone()
+                },
+            ],
+            allow_coordinator_replan: true,
+            ..CoordinationEnvelope::default()
+        };
+        envelope.validate().expect("product maxima are accepted");
+        let json = canonical_json(&envelope).expect("v2 JSON");
+        assert!(json.contains("\"cost_class\":\"economy\""));
+        assert!(json.contains("\"allow_coordinator_replan\":true"));
+
+        let mut v1 = envelope.clone();
+        v1.schema_version = 1;
+        assert!(v1.validate().is_err(), "v1 rejects phase-3 grants");
+
+        let mut over_files = envelope.clone();
+        over_files.micro_fix.as_mut().unwrap().max_files += 1;
+        assert!(over_files.validate().is_err());
+        let mut over_lines = envelope.clone();
+        over_lines.micro_fix.as_mut().unwrap().max_changed_lines += 1;
+        assert!(over_lines.validate().is_err());
+        let mut over_budget = envelope.clone();
+        over_budget.micro_fix.as_mut().unwrap().max_per_task += 1;
+        assert!(over_budget.validate().is_err());
+        let mut over_fallbacks = envelope.clone();
+        over_fallbacks.fallback_agents.push(EnvelopeFallbackAgent {
+            agent_id: "agent-4".to_owned(),
+            ..fallback.clone()
+        });
+        assert!(over_fallbacks.validate().is_err());
+        let mut duplicate_fallback = envelope;
+        duplicate_fallback.fallback_agents[1].agent_id = "agent-1".to_owned();
+        assert!(duplicate_fallback.validate().is_err());
+    }
+
+    fn pin(
+        key: &str,
+        digest_char: char,
+        trigger: db::EnvelopeCheckTrigger,
+    ) -> EnvelopeValidationCheck {
+        EnvelopeValidationCheck {
+            check_key: key.to_owned(),
+            definition_digest: digest_char.to_string().repeat(64),
+            trigger,
+        }
+    }
+
+    #[test]
+    fn validation_catalog_envelope_pins_require_schema_v2_and_are_bounded() {
+        let mut envelope = CoordinationEnvelope {
+            validation_checks: vec![pin("tests", 'a', db::EnvelopeCheckTrigger::OnRequest)],
+            ..CoordinationEnvelope::default()
+        };
+        assert!(envelope.validate().is_err(), "v1 rejects pins");
+        envelope.schema_version = 2;
+        envelope.validate().expect("v2 accepts a pin");
+        assert!(canonical_json(&envelope)
+            .expect("json")
+            .contains("\"validation_checks\""));
+
+        envelope.validation_checks = (0..9)
+            .map(|index| {
+                pin(
+                    &format!("check-{index}"),
+                    'a',
+                    db::EnvelopeCheckTrigger::OnRequest,
+                )
+            })
+            .collect();
+        assert!(envelope.validate().is_err(), "more than 8 pins rejected");
+
+        envelope.validation_checks = vec![
+            pin("tests", 'a', db::EnvelopeCheckTrigger::OnRequest),
+            pin("tests", 'a', db::EnvelopeCheckTrigger::OnRequest),
+        ];
+        assert!(envelope.validate().is_err(), "duplicate pin rejected");
+
+        envelope.validation_checks = vec![
+            pin("tests", 'a', db::EnvelopeCheckTrigger::OnRequest),
+            pin("tests", 'b', db::EnvelopeCheckTrigger::AfterIntegration),
+        ];
+        assert!(envelope.validate().is_err(), "one digest per key");
+
+        envelope.validation_checks = vec![pin("Bad Key", 'a', db::EnvelopeCheckTrigger::OnRequest)];
+        assert!(envelope.validate().is_err(), "slug required");
+        envelope.validation_checks = vec![EnvelopeValidationCheck {
+            check_key: "tests".to_owned(),
+            definition_digest: "short".to_owned(),
+            trigger: db::EnvelopeCheckTrigger::OnRequest,
+        }];
+        assert!(envelope.validate().is_err(), "64 hex digest required");
+
+        envelope.validation_checks = vec![pin("tests", 'a', db::EnvelopeCheckTrigger::OnRequest)];
+        envelope.allow_merge = true;
+        assert!(envelope.validate().is_err(), "v2 still forbids merge");
+    }
+
+    #[test]
     fn default_envelope_is_structurally_safe() {
         let envelope = CoordinationEnvelope::default();
         envelope.validate().expect("default envelope");
-        assert_eq!(envelope.max_work_units, 4);
+        assert_eq!(envelope.max_work_units, 16);
         assert!(!envelope.allow_new_task_roles);
         assert!(!envelope.allow_merge);
     }

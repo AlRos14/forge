@@ -44,6 +44,39 @@ fn service(state: &AppState) -> TaskCoordinationService {
         .with_work_unit_service(Arc::clone(&state.work_unit_service))
 }
 
+pub async fn get_autonomy_limits(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    user: AuthenticatedUser,
+) -> ApiResult<Json<api_types::TaskAutonomyLimits>> {
+    tasks::require_task_visible(&state, &task_id, &user).await?;
+    Ok(Json(
+        services::task_autonomy::TaskAutonomyService::new(
+            state.db.clone(),
+            state.event_bus.clone(),
+        )
+        .get(&task_id, &user.user_id)
+        .await?,
+    ))
+}
+
+pub async fn update_autonomy_limits(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    user: AuthenticatedUser,
+    Json(request): Json<api_types::UpdateTaskAutonomyLimitsRequest>,
+) -> ApiResult<Json<api_types::TaskAutonomyLimits>> {
+    tasks::require_task_mutable(&state, &task_id, &user).await?;
+    Ok(Json(
+        services::task_autonomy::TaskAutonomyService::new(
+            state.db.clone(),
+            state.event_bus.clone(),
+        )
+        .update(&task_id, &user.user_id, request)
+        .await?,
+    ))
+}
+
 fn db_mode(mode: TaskCoordinationMode) -> db::TaskCoordinationMode {
     match mode {
         TaskCoordinationMode::Manual => db::TaskCoordinationMode::Manual,
@@ -67,6 +100,7 @@ fn api_request_state(state: DbRequestState) -> TaskCoordinationRequestState {
         DbRequestState::PlanReady => TaskCoordinationRequestState::PlanReady,
         DbRequestState::AwaitingApproval => TaskCoordinationRequestState::AwaitingApproval,
         DbRequestState::Materialized => TaskCoordinationRequestState::Materialized,
+        DbRequestState::Triaged => TaskCoordinationRequestState::Triaged,
         DbRequestState::Failed => TaskCoordinationRequestState::Failed,
         DbRequestState::Cancelled => TaskCoordinationRequestState::Cancelled,
         DbRequestState::Uncertain => TaskCoordinationRequestState::Uncertain,
@@ -214,6 +248,30 @@ fn request_response(
     TaskCoordinationRequestResponse {
         id: request.id,
         task_id: request.task_id,
+        kind: match request.kind {
+            db::TaskCoordinationRequestKind::WorkUnitPlan => {
+                api_types::TaskCoordinationRequestKind::WorkUnitPlan
+            }
+            db::TaskCoordinationRequestKind::ReviewFindings => {
+                api_types::TaskCoordinationRequestKind::ReviewFindings
+            }
+            db::TaskCoordinationRequestKind::ValidationFindings => {
+                api_types::TaskCoordinationRequestKind::ValidationFindings
+            }
+            db::TaskCoordinationRequestKind::ExternalFeedback => {
+                api_types::TaskCoordinationRequestKind::ExternalFeedback
+            }
+            db::TaskCoordinationRequestKind::HumanDecisionResume => {
+                api_types::TaskCoordinationRequestKind::HumanDecisionResume
+            }
+        },
+        review_report_artifact_id: request.review_report_artifact_id,
+        review_report_digest: request.review_report_digest,
+        review_producer_execution_id: request.review_producer_execution_id,
+        source_subject_kind: request.source_subject_kind,
+        source_subject_id: request.source_subject_id,
+        source_subject_digest: request.source_subject_digest,
+        resumes_request_id: request.resumes_request_id,
         mode: api_mode(request.mode),
         state: api_request_state(request.state),
         authorization_version: request.authorization_version,
@@ -310,6 +368,14 @@ async fn overview_response(
         None => None,
     };
     Ok(TaskCoordinationOverviewResponse {
+        review_triage: Some(
+            services::task_rework::TaskReworkService::new(
+                state.db.clone(),
+                state.event_bus.clone(),
+            )
+            .list_review_triage(&overview.task.id)
+            .await?,
+        ),
         task_id: overview.task.id,
         task_version: overview.task.version,
         lifecycle,
@@ -334,6 +400,7 @@ async fn overview_response(
         max_quality_requests: overview.coordination.max_quality_requests,
         can_authorize: overview.can_authorize,
         can_request: overview.can_request,
+        project_plan_batch_scope: overview.project_plan_batch_scope,
         blockers: overview
             .blockers
             .into_iter()

@@ -20,6 +20,29 @@ impl TaskService {
             priority,
             initial_lifecycle_state,
             merge_config,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn create_project_plan_task(
+        &self,
+        project_id: &str,
+        user_id: &str,
+        import_key: &str,
+        title: &str,
+        description: Option<String>,
+        grant: Option<&db::ProjectCopilotRunGrant>,
+    ) -> Result<Task> {
+        self.create_task_inner(
+            project_id,
+            title,
+            description,
+            None,
+            None,
+            Some(db::TaskLifecycleState::Backlog),
+            None,
+            Some((user_id, import_key, grant)),
         )
         .await
     }
@@ -34,6 +57,7 @@ impl TaskService {
         priority: Option<i64>,
         initial_lifecycle_state: Option<db::TaskLifecycleState>,
         merge_config: Option<Value>,
+        plan_import: Option<(&str, &str, Option<&db::ProjectCopilotRunGrant>)>,
     ) -> Result<Task> {
         let project_id = project_id.into();
         let title = title.into();
@@ -59,6 +83,29 @@ impl TaskService {
         let project = ProjectRepo::get_by_id_in_tx(&*self.db, &mut transaction, &project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
+        if let Some((user_id, import_key, grant)) = plan_import {
+            crate::project_plan::authorize_project_write_in_tx(
+                &self.db,
+                &mut transaction,
+                &project_id,
+                user_id,
+                grant,
+            )
+            .await?;
+            if let Some(task_id) = sqlx::query_scalar::<_, String>(
+                "SELECT task_id FROM project_plan_import_task WHERE project_id=? AND import_key=?",
+            )
+            .bind(&project_id)
+            .bind(import_key)
+            .fetch_optional(&mut *transaction)
+            .await?
+            {
+                let task =
+                    TaskRepo::get_by_id_in_tx(&*self.db, &mut transaction, &task_id, false).await?;
+                transaction.commit().await?;
+                return task.ok_or_else(|| ServiceError::not_found("task", task_id));
+            }
+        }
         let (repo_id, subtask_order) = if let Some(parent_id) = parent_task_id.as_deref() {
             let parent = super::subtask::validate_parent_placement_in_tx(
                 &self.db,
@@ -98,6 +145,16 @@ impl TaskService {
             created_at: now.clone(),
             updated_at: now.clone(),
         };
+        if let Some((_, import_key, _)) = plan_import {
+            sqlx::query(
+                "INSERT INTO project_plan_import_in_progress(project_id,task_id,import_key) VALUES(?,?,?)",
+            )
+            .bind(&create_task.project_id)
+            .bind(&create_task.id)
+            .bind(import_key)
+            .execute(&mut *transaction)
+            .await?;
+        }
         let mut task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
         self.apply_project_task_role_defaults_in_tx(
             &mut transaction,
@@ -123,6 +180,24 @@ impl TaskService {
                 &task.project_id,
                 1,
             )
+            .await?;
+        }
+        if let Some((_, import_key, _)) = plan_import {
+            sqlx::query(
+                "INSERT INTO project_plan_import_task(project_id,import_key,task_id) VALUES(?,?,?)",
+            )
+            .bind(&task.project_id)
+            .bind(import_key)
+            .bind(&task.id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "DELETE FROM project_plan_import_in_progress WHERE project_id=? AND task_id=? AND import_key=?",
+            )
+            .bind(&task.project_id)
+            .bind(&task.id)
+            .bind(import_key)
+            .execute(&mut *transaction)
             .await?;
         }
         transaction.commit().await?;

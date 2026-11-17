@@ -100,14 +100,40 @@ export function routeSsePayload(
   }
 
   if (eventType.startsWith('project.')) {
-    void queryClient.invalidateQueries({ queryKey: qk.project(payload.entity_id) })
+    const projectId =
+      eventType === 'project.plan_changed'
+        ? typeof facts.project_id === 'string'
+          ? facts.project_id
+          : payload.scope_type === 'project'
+            ? (payload.scope_id ?? undefined)
+            : undefined
+        : payload.entity_id
+    if (projectId) {
+      void queryClient.invalidateQueries({ queryKey: qk.project(projectId) })
+      if (eventType === 'project.plan_changed') {
+        void queryClient.invalidateQueries({ queryKey: ['projects', projectId, 'plan'] })
+        void queryClient.invalidateQueries({ queryKey: qk.projectTasks(projectId) })
+      }
+      void queryClient.invalidateQueries({
+        queryKey: qk.projectTaskRoleDefaults(projectId),
+      })
+    } else if (eventType === 'project.plan_changed') {
+      invalidateAllActiveQueries(queryClient)
+    }
     void queryClient.invalidateQueries({ queryKey: qk.projects })
-    void queryClient.invalidateQueries({
-      queryKey: qk.projectTaskRoleDefaults(payload.entity_id),
-    })
   }
 
-  if (['artifact.created', 'message.created', 'handoff.created', 'handoff.status_changed', 'proposal.created', 'proposal.withdrawn', 'decision.recorded'].includes(eventType)) {
+  if (
+    [
+      'artifact.created',
+      'message.created',
+      'handoff.created',
+      'handoff.status_changed',
+      'proposal.created',
+      'proposal.withdrawn',
+      'decision.recorded',
+    ].includes(eventType)
+  ) {
     const taskId = payload.scope_type === 'task' ? payload.scope_id : undefined
     if (taskId) void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
   }
@@ -119,21 +145,32 @@ export function routeSsePayload(
     browserEvents.dispatch('forge:notification-created', { ...payload, ...facts })
   }
 
-  if (eventType.startsWith('task.coordination_')) {
+  if (
+    eventType.startsWith('task.coordination_') ||
+    eventType === 'task.review_triaged' ||
+    eventType === 'task.autonomy_limits_changed'
+  ) {
     const taskId =
       typeof facts.task_id === 'string'
         ? facts.task_id
         : payload.scope_type === 'task'
-          ? payload.scope_id ?? undefined
+          ? (payload.scope_id ?? undefined)
           : undefined
     if (taskId) {
+      void queryClient.invalidateQueries({ queryKey: ['task-autonomy-limits', taskId] })
       void queryClient.invalidateQueries({ queryKey: qk.taskCoordination(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskQualityRequests(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.workUnits(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.lifecycleTransitions(taskId) })
       invalidateProjectTaskLists(queryClient)
+      if (eventType === 'task.autonomy_limits_changed') {
+        void queryClient.invalidateQueries({
+          predicate: (query) => query.queryKey[0] === 'projects' && query.queryKey[2] === 'plan',
+        })
+      }
     } else {
       invalidateAllActiveQueries(queryClient)
     }
@@ -144,7 +181,7 @@ export function routeSsePayload(
       typeof facts.task_id === 'string'
         ? facts.task_id
         : payload.scope_type === 'task'
-          ? payload.scope_id ?? undefined
+          ? (payload.scope_id ?? undefined)
           : undefined
     if (taskId) {
       void queryClient.invalidateQueries({ queryKey: qk.taskQualityRequests(taskId) })
@@ -159,12 +196,87 @@ export function routeSsePayload(
     }
   }
 
+  if (
+    eventType.startsWith('task.pr_feedback_') ||
+    eventType.startsWith('task.pr_rework_') ||
+    eventType.startsWith('task.pr_action_') ||
+    eventType === 'task.pr_followup_proposed'
+  ) {
+    const taskId =
+      typeof facts.task_id === 'string'
+        ? facts.task_id
+        : payload.scope_type === 'task'
+          ? (payload.scope_id ?? undefined)
+          : undefined
+    if (taskId) {
+      void queryClient.invalidateQueries({ queryKey: qk.taskPrFeedback(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskPrRework(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskPrActions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskHumanDecisions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
+      invalidateProjectTaskLists(queryClient)
+      void queryClient.invalidateQueries({
+        predicate: (query) => query.queryKey[0] === 'projects' && query.queryKey[2] === 'plan',
+      })
+    } else {
+      invalidateAllActiveQueries(queryClient)
+    }
+  }
+
+  if (eventType.startsWith('task.validation_') || eventType.startsWith('task.human_decision_')) {
+    const taskId =
+      typeof facts.task_id === 'string'
+        ? facts.task_id
+        : payload.scope_type === 'task'
+          ? (payload.scope_id ?? undefined)
+          : undefined
+    if (taskId) {
+      void queryClient.invalidateQueries({ queryKey: qk.taskValidationCheckRequests(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskValidationComparisons(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskHumanDecisions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.validationRuns(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.gates(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskCoordination(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+    } else {
+      invalidateAllActiveQueries(queryClient)
+    }
+  }
+
+  if (
+    eventType === 'task.work_unit_fallback' ||
+    eventType === 'task.micro_fix_bounds_exceeded' ||
+    eventType === 'task.coordinator_replan_proposed'
+  ) {
+    const taskId =
+      typeof facts.task_id === 'string'
+        ? facts.task_id
+        : payload.scope_type === 'task'
+          ? (payload.scope_id ?? undefined)
+          : undefined
+    if (taskId) {
+      void queryClient.invalidateQueries({ queryKey: qk.taskFallbackReceipts(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskMicroFixes(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskCoordinatorReplans(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskHumanDecisions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskCoordination(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.workUnits(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.reviewLines(taskId) })
+    } else {
+      invalidateAllActiveQueries(queryClient)
+    }
+  }
+
   if (eventType.startsWith('task.intervention_')) {
     const taskId =
       typeof facts.task_id === 'string'
         ? facts.task_id
         : payload.scope_type === 'task'
-          ? payload.scope_id ?? undefined
+          ? (payload.scope_id ?? undefined)
           : undefined
     if (taskId) {
       void queryClient.invalidateQueries({ queryKey: qk.taskInterventions(taskId) })
@@ -252,15 +364,35 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
             'task.coordination_plan_approved',
             'task.coordination_plan_rejected',
             'task.coordination_plan_materialized',
+            'task.review_triaged',
+            'task.autonomy_limits_changed',
             'task.quality_requested',
             'task.quality_request_resolved',
             'task.intervention_recorded',
             'task.intervention_state_changed',
+            'task.validation_check_requested',
+            'task.validation_check_completed',
+            'task.validation_comparison_recorded',
+            'task.human_decision_requested',
+            'task.human_decision_answered',
+            'task.human_decision_closed',
+            'task.pr_feedback_ingested',
+            'task.pr_feedback_triaged',
+            'task.pr_rework_superseded',
+            'task.pr_rework_resumed',
+            'task.pr_rework_converged',
+            'task.pr_followup_proposed',
+            'task.pr_action_requested',
+            'task.pr_action_completed',
+            'task.work_unit_fallback',
+            'task.micro_fix_bounds_exceeded',
+            'task.coordinator_replan_proposed',
             'project.created',
             'project.updated',
             'project.deleted',
             'project.paused',
             'project.resumed',
+            'project.plan_changed',
             'project_hook.run_changed',
             'notification.created',
             'events.resync_required',

@@ -126,8 +126,8 @@ async fn migration_backfills_manual_and_creates_new_task_rows() {
     assert_eq!(coordination.mode, TaskCoordinationMode::Manual);
     assert_eq!(coordination.authorization_version, 1);
     assert_eq!(coordination.turn_count, 0);
-    assert_eq!(coordination.max_turns, 8);
-    assert_eq!(coordination.max_quality_requests, 8);
+    assert_eq!(coordination.max_turns, 32);
+    assert_eq!(coordination.max_quality_requests, 64);
     assert!(coordination.coordinator_actor.is_none());
 }
 
@@ -152,6 +152,7 @@ async fn authorization_receipts_are_idempotent_and_fence_conflicts() {
         team_digest: team_digest.clone(),
         envelope_json: envelope_json.clone(),
         envelope_digest: envelope_digest.clone(),
+        unconfigured_default_refresh: false,
         requested_by: user_id.clone(),
         idempotency_key: "authorize-1".to_owned(),
         request_digest: digest,
@@ -206,7 +207,7 @@ async fn authorization_receipts_are_idempotent_and_fence_conflicts() {
 async fn turn_budget_is_global_and_does_not_reset() {
     let db = database().await;
     let (task_id, _) = seed_task(&db).await;
-    for _ in 0..8 {
+    for _ in 0..32 {
         assert!(
             TaskCoordinationRepo::consume_coordination_turn_budget(&db, &task_id)
                 .await
@@ -325,6 +326,7 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
             team_digest: team_digest.clone(),
             envelope_json,
             envelope_digest,
+            unconfigured_default_refresh: false,
             requested_by: owner_id.clone(),
             idempotency_key: "materialize-test-authorize".to_owned(),
             request_digest: hex::encode(sha2::Sha256::digest(b"authorize-materialize")),

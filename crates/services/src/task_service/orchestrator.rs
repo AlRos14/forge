@@ -161,12 +161,14 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", wake.actor_id.clone()))?;
         ensure_orchestrator_agent_project_authority(&self.db, &project, &agent).await?;
-        // The current safe automatic profile is a Codex CLI with an explicit
-        // read-only sandbox. Other adapters stay durable and fail closed until
-        // they expose an equally strong, verified sandbox capability.
-        if agent.backend_kind == "native" || agent.executor_type != "codex" {
+        // Automatic coordination requires an installed supported read-only
+        // harness policy: Codex native sandbox or Claude native tool allowlist.
+        // Unsupported adapters fail closed.
+        if agent.backend_kind == "native"
+            || !matches!(agent.executor_type.as_str(), "codex" | "claude_code")
+        {
             return Err(ServiceError::invalid_operation(
-                "PR6 automatic orchestration requires a Codex CLI Agent with read-only sandbox support",
+                "automatic orchestration requires Codex read-only sandbox or Claude isolated read-only tools",
             ));
         }
 
@@ -188,7 +190,7 @@ impl TaskService {
             .and_then(|value| value.get("capabilities"))
             .and_then(|value| value.get("sandbox_controls"))
             .and_then(Value::as_str);
-        if sandbox_support != Some("native") {
+        if agent.executor_type == "codex" && sandbox_support != Some("native") {
             return Err(ServiceError::invalid_operation(
                 "Codex read-only sandbox capability is unknown or unsupported",
             ));
@@ -204,7 +206,9 @@ impl TaskService {
         let config = snapshot_value
             .get_mut("config")
             .and_then(Value::as_object_mut)
-            .ok_or_else(|| ServiceError::invalid_operation("Codex config snapshot is invalid"))?;
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("Coordinator config snapshot is invalid")
+            })?;
         config.insert("sandbox".to_owned(), Value::String("read-only".to_owned()));
         config.insert(
             "ask_for_approval".to_owned(),
@@ -215,6 +219,16 @@ impl TaskService {
             Value::String("plan".to_owned()),
         );
         config.insert("auto_commit".to_owned(), Value::Bool(false));
+        if agent.executor_type == "claude_code" {
+            config.insert("forge_task_read_only".to_owned(), Value::Bool(true));
+            config.insert(
+                "dangerously_skip_permissions".to_owned(),
+                Value::Bool(false),
+            );
+            config.insert("claude_code_router".to_owned(), Value::Bool(false));
+            config.remove("base_command_override");
+            config.remove("additional_params");
+        }
         snapshot_value["permission_policy"] = Value::String("plan".to_owned());
         let started_event_id = new_uuid_v4();
         snapshot_value["pr6_orchestrator_wake"] = serde_json::json!({

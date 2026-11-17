@@ -76,3 +76,13 @@ Every Artifact and Evidence reference is authorized to its Project and Task
 before content, path, filename, checksum, or cursor data is disclosed.
 Deletion, redaction, and release retention are explicit policies. Generic
 Artifacts do not become a hidden memory or authority source.
+
+## Delivery context between roles
+
+Successful ordinary WorkUnit assistant output is saved as an immutable Summary
+Artifact bound to its producer Execution. Downstream review receives the exact
+result subject, original scope, source workspace path, Execution summary and
+pinned inline Artifact inputs. Context is bounded and rejects oversized or changed
+pins instead of silently truncating evidence. Private native conversations are not
+shared between roles. Formal review prompts include the versioned FORGE_RESULT
+contract; cognitive review remains separate from deterministic validation.

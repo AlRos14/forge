@@ -137,6 +137,26 @@ pub fn api_router(state: AppState) -> Router {
                 .put(routes::projects::update_task_role_defaults),
         )
         .route(
+            "/api/v1/projects/{id}/plan",
+            get(routes::project_plan::graph),
+        )
+        .route(
+            "/api/v1/projects/{id}/plan/proposals",
+            post(routes::project_plan::propose),
+        )
+        .route(
+            "/api/v1/projects/{id}/plan/proposals/{proposal_id}/apply",
+            post(routes::project_plan::apply),
+        )
+        .route(
+            "/api/v1/projects/{id}/plan/batches",
+            post(routes::project_plan::authorize_batch),
+        )
+        .route(
+            "/api/v1/projects/{id}/plan/batches/{batch_id}",
+            post(routes::project_plan::update_batch),
+        )
+        .route(
             "/api/v1/projects/{id}/copilot",
             get(routes::project_copilot::get).put(routes::project_copilot::update),
         )
@@ -455,6 +475,72 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/validation-runs/{id}",
             get(routes::reviews::get_validation_run),
         )
+        .route(
+            "/api/v1/projects/{id}/validation-checks",
+            get(routes::validation_checks::list_project_checks)
+                .post(routes::validation_checks::create_project_check),
+        )
+        .route(
+            "/api/v1/validation-checks/{id}/retire",
+            post(routes::validation_checks::retire_check),
+        )
+        .route(
+            "/api/v1/tasks/{id}/validation-check-requests",
+            get(routes::validation_checks::list_task_check_requests),
+        )
+        .route(
+            "/api/v1/tasks/{id}/validation-comparisons",
+            get(routes::validation_checks::list_task_comparisons),
+        )
+        .route(
+            "/api/v1/tasks/{id}/human-decisions",
+            get(routes::human_decisions::list_task_decisions),
+        )
+        .route(
+            "/api/v1/tasks/{id}/human-decisions/{decision_id}",
+            get(routes::human_decisions::get_task_decision),
+        )
+        .route(
+            "/api/v1/tasks/{id}/human-decisions/{decision_id}/answer",
+            post(routes::human_decisions::answer_task_decision),
+        )
+        .route(
+            "/api/v1/tasks/{id}/fallback-receipts",
+            get(routes::phase_three::list_task_fallback_receipts),
+        )
+        .route(
+            "/api/v1/tasks/{id}/micro-fixes",
+            get(routes::phase_three::list_task_micro_fixes),
+        )
+        .route(
+            "/api/v1/tasks/{id}/coordinator-replans",
+            get(routes::phase_three::list_task_coordinator_replans),
+        )
+        .route(
+            "/api/v1/tasks/{id}/pr-feedback",
+            get(routes::pr_feedback::list_task_feedback),
+        )
+        .route(
+            "/api/v1/tasks/{id}/pr-rework",
+            get(routes::pr_feedback::list_task_rework),
+        )
+        .route(
+            "/api/v1/tasks/{id}/pr-actions",
+            get(routes::pr_feedback::list_task_actions),
+        )
+        .route(
+            "/api/v1/tasks/{id}/pr-actions/{action_id}/approve",
+            post(routes::pr_feedback::approve_task_action),
+        )
+        .route(
+            "/api/v1/tasks/{id}/pr-actions/{action_id}/reject",
+            post(routes::pr_feedback::reject_task_action),
+        )
+        .route(
+            "/api/v1/repos/{id}/pr-feedback-policy",
+            get(routes::pr_feedback::get_repo_feedback_policy)
+                .put(routes::pr_feedback::set_repo_feedback_policy),
+        )
         .route("/api/v1/evidence/{id}", get(routes::reviews::get_evidence))
         .route(
             "/api/v1/notifications",
@@ -609,6 +695,11 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/tasks/{id}/coordination",
             get(routes::task_coordination::get_coordination),
+        )
+        .route(
+            "/api/v1/tasks/{id}/coordination/limits",
+            get(routes::task_coordination::get_autonomy_limits)
+                .put(routes::task_coordination::update_autonomy_limits),
         )
         .route(
             "/api/v1/tasks/{id}/coordination/authorize",

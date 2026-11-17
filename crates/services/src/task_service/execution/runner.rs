@@ -255,6 +255,12 @@ impl TaskService {
                     .await?;
             }
             let execution = self.freeze_review_subject_and_inputs(execution).await?;
+            crate::project_plan::ProjectPlanService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .verify_execution_handoff_workspace_base(&execution)
+            .await?;
             let provider = self.execution_provider_for_execution(&execution).await?;
             let params = self.execution_start_params(&execution).await?;
             if snapshot_credential_ref(&params.executor_config)?.is_some() {
@@ -298,7 +304,23 @@ impl TaskService {
             &execution.id,
             provider_start_receipt_event(&execution, "execution.provider_start_attempted"),
         )
-        .await?;
+        .await;
+        let claim = match claim {
+            Ok(claim) => claim,
+            Err(
+                error @ (db::DbError::ProjectPlanBatchInactive
+                | db::DbError::ProjectDependencyUnsatisfied
+                | db::DbError::ProjectPlanApplyIncomplete),
+            ) => {
+                self.fail_execution_before_dispatch(
+                    &execution.id,
+                    "Project plan batch authority or exact prerequisite evidence became invalid before provider Start".to_owned(),
+                )
+                .await?;
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         match claim {
             db::ProviderStartClaim::Accepted => {
                 return Ok(api_types::ExecutionStartResult {
@@ -345,6 +367,12 @@ impl TaskService {
                 });
             }
             db::ProviderStartClaim::TaskPaused => {
+                return Ok(api_types::ExecutionStartResult {
+                    execution_id: execution.id,
+                    accepted: false,
+                });
+            }
+            db::ProviderStartClaim::ProjectPlanBatchPaused => {
                 return Ok(api_types::ExecutionStartResult {
                     execution_id: execution.id,
                     accepted: false,
@@ -938,6 +966,7 @@ impl TaskService {
                     )
                     .await?,
                     has_repository_workspace: execution.workspace_id.is_some(),
+                    review_read_paths: self.review_read_paths_for_execution(&execution).await?,
                     worktree_path: worktree_path.clone(),
                     description,
                     agent_config,
@@ -1070,6 +1099,23 @@ impl TaskService {
             return Ok(current_execution);
         }
 
+        if is_review_execution && result.status == ExecutionOutcome::Completed {
+            if let Some(session_id) = result.agent_session_id.as_deref() {
+                if let Err(error) = ExecutionRepo::record_harness_session_result(
+                    &*self.db,
+                    &current_execution.id,
+                    session_id,
+                    &now_rfc3339(),
+                )
+                .await
+                {
+                    result.status = ExecutionOutcome::Failed;
+                    result.error = Some(format!(
+                        "Review native session isolation could not be established: {error}"
+                    ));
+                }
+            }
+        }
         if current_execution.role == "planner"
             && result.status == ExecutionOutcome::Completed
             && existing_plan_output.is_none()
@@ -1103,6 +1149,27 @@ impl TaskService {
             }
         }
 
+        if current_execution.work_unit_id.is_some()
+            && current_execution.role != "planner"
+            && !is_review_execution
+            && result.status == ExecutionOutcome::Completed
+        {
+            if let Some(output) = result
+                .assistant_output
+                .as_deref()
+                .filter(|output| !output.trim().is_empty())
+            {
+                if let Err(error) =
+                    crate::CollaborationService::new(self.db.clone(), self.event_bus.clone())
+                        .create_delivery_artifact_from_execution(&current_execution.id, output)
+                        .await
+                {
+                    result.status = ExecutionOutcome::Failed;
+                    result.error =
+                        Some(format!("WorkUnit delivery could not be recorded: {error}"));
+                }
+            }
+        }
         if crate::role_capabilities::execution_has_capability(
             &self.db,
             &current_execution.id,
@@ -1433,6 +1500,59 @@ impl TaskService {
         ))
     }
 
+    /// Review may read only explicitly bound result/workspace records. No
+    /// Agent profile, Task repository default, or latest Execution selects it.
+    pub(crate) async fn review_read_paths_for_execution(
+        &self,
+        execution: &Execution,
+    ) -> Result<Vec<String>> {
+        if !crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
+        {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::new();
+        if let Some(id) = execution.work_unit_id.as_deref() {
+            let subject = crate::task_rework::get_review_subject(&self.db, id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Formal WorkUnit review requires its exact persisted subject",
+                    )
+                })?;
+            if subject.task_id != execution.task_id {
+                return Err(ServiceError::invalid_operation(
+                    "Review subject belongs to another Task",
+                ));
+            }
+            if let Some(id) = subject.result_workspace_id {
+                ids.push(id);
+            }
+        }
+        if let Some(id) = execution.workspace_id.as_ref() {
+            ids.push(id.clone());
+        }
+        ids.sort();
+        ids.dedup();
+        let mut paths = Vec::new();
+        for id in ids {
+            let workspace = WorkspaceRepo::get_by_id(&*self.db, &id)
+                .await?
+                .filter(|workspace| workspace.task_id == execution.task_id)
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation("Exact review Workspace is unavailable")
+                })?;
+            paths.push(workspace.worktree_path);
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     async fn execution_start_params(
         &self,
         execution: &Execution,
@@ -1479,6 +1599,7 @@ impl TaskService {
                 &execution.id,
             )
             .await?,
+            review_read_paths: self.review_read_paths_for_execution(execution).await?,
             workspace_path,
             executor_type,
             executor_config,

@@ -4,7 +4,14 @@ import type {
   TaskCoordinationRequestResponse,
   TaskCoordinationTeamRoleResponse,
   TaskDispatchIntentResponse,
+  TaskReworkAutomationIntentResponse,
+  WorkUnitResponse,
 } from '@/types/generated'
+import {
+  deriveReviewFindingsProjection,
+  type ReviewFindingsDataState,
+  type ReviewFindingsProjection,
+} from './task-review-triage'
 
 export type CoordinationActionKind =
   | 'authorize'
@@ -73,6 +80,22 @@ export function isTurnBudgetExhausted(overview: TaskCoordinationOverviewResponse
   return overview.max_turns > 0 && overview.turn_count >= overview.max_turns
 }
 
+export function isProjectBatchScopedCoordination(
+  overview: TaskCoordinationOverviewResponse,
+): boolean {
+  return overview.project_plan_batch_scope !== null
+}
+
+export function canEditTaskCoordinationAuthorization(
+  overview: TaskCoordinationOverviewResponse,
+): boolean {
+  const batchScope = overview.project_plan_batch_scope
+  return (
+    overview.can_authorize &&
+    (!batchScope || ['revoked', 'completed'].includes(batchScope.batch_state))
+  )
+}
+
 export function isQualityBudgetExhausted(overview: TaskCoordinationOverviewResponse): boolean {
   return (
     overview.max_quality_requests > 0 &&
@@ -98,18 +121,13 @@ export function deriveCoordinationNextAction(
   overview: TaskCoordinationOverviewResponse,
   request: TaskCoordinationRequestResponse | null,
   plan: TaskCoordinationPlanResponse | null,
+  reviewContext: {
+    automationIntents?: TaskReworkAutomationIntentResponse[]
+    automationIntentsState?: ReviewFindingsDataState
+    workUnits?: WorkUnitResponse[]
+    workUnitsState?: ReviewFindingsDataState
+  } = {},
 ): CoordinationNextAction {
-  if (overview.lifecycle.state === 'cancelled' || overview.dispatch.state === 'cancelled') {
-    return {
-      summary: 'This Task is cancelled.',
-      detail:
-        'No new preparation, materialization, or dispatch is admitted. Existing plans, WorkUnits, reviews, and evidence remain in history.',
-      owner: 'Nobody',
-      kind: 'done',
-      tone: 'done',
-    }
-  }
-
   if (overview.lifecycle.state === 'done') {
     return {
       summary: 'The Task is done.',
@@ -131,6 +149,38 @@ export function deriveCoordinationNextAction(
       tone: 'wait',
     }
   }
+
+  if (overview.lifecycle.state === 'ready_to_merge') {
+    return {
+      summary: 'Task is ready for integration.',
+      detail:
+        'The current TaskLifecycle is ready_to_merge. Continue through the existing exact integration operation. Review triage does not change that state or admit integration.',
+      owner: 'You',
+      kind: 'wait',
+      tone: 'action',
+    }
+  }
+
+  if (overview.lifecycle.state === 'cancelled' || overview.dispatch.state === 'cancelled') {
+    return {
+      summary: 'This Task is cancelled.',
+      detail:
+        'No new preparation, materialization, or dispatch is admitted. Existing plans, WorkUnits, reviews, and evidence remain in history.',
+      owner: 'Nobody',
+      kind: 'done',
+      tone: 'done',
+    }
+  }
+
+  const reviewFindings: ReviewFindingsProjection | null = deriveReviewFindingsProjection({
+    overview,
+    request,
+    automationIntents: reviewContext.automationIntents,
+    automationIntentsState: reviewContext.automationIntentsState,
+    workUnits: reviewContext.workUnits,
+    workUnitsState: reviewContext.workUnitsState,
+  })
+  if (reviewFindings) return reviewFindings.action
 
   if (overview.revoked_at) {
     return {
@@ -154,11 +204,7 @@ export function deriveCoordinationNextAction(
     }
   }
 
-  if (
-    overview.blockers.some(
-      (blocker) => blocker.code === 'coordination.authorization_stale',
-    )
-  ) {
+  if (overview.blockers.some((blocker) => blocker.code === 'coordination.authorization_stale')) {
     return {
       summary: 'The saved Task team changed.',
       detail:
@@ -181,6 +227,37 @@ export function deriveCoordinationNextAction(
   }
 
   if (isTurnBudgetExhausted(overview)) {
+    const batchScope = overview.project_plan_batch_scope
+    if (batchScope?.blocker === 'coordination:coordination.budget_exhausted') {
+      if (batchScope.batch_state === 'running') {
+        return {
+          summary: 'The Project batch is waiting for a preparation turn.',
+          detail:
+            'A Project owner or admin can increase max_turns in Autonomy limits below. The scheduler retries this Task on its next tick only while the same batch is running and its exact authorization, team, and prerequisite checks pass.',
+          owner: 'You',
+          kind: 'blocked',
+          tone: 'blocked',
+        }
+      }
+      if (batchScope.batch_state === 'paused') {
+        return {
+          summary: 'The Project batch is paused.',
+          detail:
+            'Increasing max_turns will not restart a paused batch. Resume this exact batch before the scheduler can retry the Task.',
+          owner: 'You',
+          kind: 'blocked',
+          tone: 'blocked',
+        }
+      }
+      return {
+        summary: `The Project batch is ${batchScope.batch_state}.`,
+        detail:
+          'Increasing max_turns does not restart a revoked or completed batch. Its recorded Task and coordination history remains available.',
+        owner: 'You',
+        kind: 'blocked',
+        tone: 'blocked',
+      }
+    }
     return {
       summary: 'The preparation-turn limit is exhausted.',
       detail: `Forge recorded ${overview.turn_count} of ${overview.max_turns} preparation turns. It will not accept another automatic turn. Continue with existing work or through Advanced work; a new budget requires an explicit product decision.`,
@@ -204,6 +281,16 @@ export function deriveCoordinationNextAction(
   }
 
   if (request?.state === 'uncertain') {
+    if (overview.project_plan_batch_scope) {
+      return {
+        summary: 'The Project batch has an uncertain coordination result.',
+        detail:
+          'Inspect the exact Task request and Project batch blocker. This batch-scoped Task cannot use the generic request route; do not start a duplicate turn.',
+        owner: 'You',
+        kind: 'blocked',
+        tone: 'blocked',
+      }
+    }
     return {
       summary: 'The provider outcome is uncertain.',
       detail:
@@ -215,6 +302,16 @@ export function deriveCoordinationNextAction(
   }
 
   if (request?.state === 'failed') {
+    if (overview.project_plan_batch_scope) {
+      return {
+        summary: 'The Project batch coordination turn failed.',
+        detail:
+          'Inspect the exact recorded failure and Project batch blocker. This Task cannot use the generic coordination request route.',
+        owner: 'You',
+        kind: 'blocked',
+        tone: 'blocked',
+      }
+    }
     return {
       summary: 'Plan preparation failed.',
       detail: request.failure_message
@@ -259,16 +356,6 @@ export function deriveCoordinationNextAction(
   }
 
   if (plan?.materialization) {
-    if (overview.lifecycle.state === 'ready_to_merge') {
-      return {
-        summary: 'Delivery is ready for exact Gate review.',
-        detail:
-          'Evaluate the merge-readiness Gate against the current immutable review inputs, then mark the Task ready for integration or admit integration with that exact evaluation. A Gate does not run tests, review code, or merge.',
-        owner: 'You',
-        kind: 'wait',
-        tone: 'action',
-      }
-    }
     if (overview.dispatch.state === 'paused') {
       return {
         summary: 'Work is prepared, but new dispatch is paused.',
@@ -285,6 +372,68 @@ export function deriveCoordinationNextAction(
       owner: 'Forge dispatcher',
       kind: 'wait',
       tone: 'info',
+    }
+  }
+
+  const batchScope = overview.project_plan_batch_scope
+  if (batchScope) {
+    if (batchScope.blocker === 'coordination:coordination.budget_exhausted') {
+      if (batchScope.batch_state === 'running') {
+        return {
+          summary: 'The Project batch will retry this Task.',
+          detail:
+            'Preparation-turn budget is available again. The scheduler retries on its next tick after rechecking the same batch authorization, Task team, and prerequisites.',
+          owner: 'Project scheduler',
+          kind: 'wait',
+          tone: 'wait',
+        }
+      }
+      if (batchScope.batch_state === 'paused') {
+        return {
+          summary: 'The Project batch is paused.',
+          detail:
+            'Increasing max_turns does not resume the batch. Resume this exact batch before the scheduler can retry the Task.',
+          owner: 'You',
+          kind: 'blocked',
+          tone: 'blocked',
+        }
+      }
+      return {
+        summary: `The Project batch is ${batchScope.batch_state}.`,
+        detail:
+          'Increasing max_turns does not restart a revoked or completed batch. Its recorded Task and coordination history remains available.',
+        owner: 'You',
+        kind: 'blocked',
+        tone: 'blocked',
+      }
+    }
+    if (batchScope.batch_state === 'paused') {
+      return {
+        summary: 'The Project batch is paused.',
+        detail:
+          'No Task is admitted while this batch is paused. Resolve the recorded blocker and resume this exact batch when it is ready.',
+        owner: 'You',
+        kind: 'blocked',
+        tone: 'blocked',
+      }
+    }
+    if (batchScope.batch_state === 'revoked' || batchScope.batch_state === 'completed') {
+      return {
+        summary: `The Project batch is ${batchScope.batch_state}.`,
+        detail:
+          'The scheduler will not admit more Tasks from a revoked or completed batch. Its recorded Task and coordination history remains available.',
+        owner: 'You',
+        kind: 'blocked',
+        tone: 'blocked',
+      }
+    }
+    return {
+      summary: 'The Project batch controls the next coordination step.',
+      detail:
+        'This Task does not accept a generic coordination turn while its authorization is scoped to a Project batch. Resolve the batch blocker before continuing.',
+      owner: 'Project scheduler',
+      kind: 'wait',
+      tone: 'wait',
     }
   }
 

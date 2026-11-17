@@ -140,6 +140,10 @@ pub struct CodexConfig {
 /// Claude Code executor config. Field names compatible with Vibe Kanban.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ClaudeCodeConfig {
+    /// Runtime-enforced tool isolation for Task coordination and formal review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub forge_task_read_only: Option<bool>,
     pub model: Option<String>,
     /// Select Claude Code's explicit native plan permission mode. This is
     /// integration evidence for planning support; generic Purpose remains a

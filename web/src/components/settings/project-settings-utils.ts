@@ -1,6 +1,6 @@
 import { ApiError } from '@/api/client'
 import { getApiErrorMessage } from '@/lib/api-error'
-import type { Repo } from '@/types/generated'
+import type { PrProviderConfigRequest, Repo } from '@/types/generated'
 import type { RepoFormState } from '@/components/settings/RepoForm'
 
 export function settingsErrorMessage(error: unknown, fallback: string): string {
@@ -18,8 +18,24 @@ export function repoFormFromRepo(repo: Repo): RepoFormState {
     work_mode: repo.work_mode,
     pr_provider: repo.pr_provider_status?.provider_type ?? repo.pr_provider ?? 'github',
     pr_base_url: '',
-    pr_token: '',
+    credential_id: undefined,
+    credential_handle_id: repo.pr_provider_status?.credential_handle_id ?? null,
+    credential_label: repo.pr_provider_status?.credential_label ?? null,
+    credential_connected: Boolean(repo.pr_provider_status?.has_credential),
     pr_polling_interval_seconds: String(repo.pr_provider_status?.polling_interval_seconds ?? 60),
+  }
+}
+
+export function repoPrProviderConfigFromForm(
+  form: RepoFormState,
+): PrProviderConfigRequest | null {
+  if (form.work_mode !== 'pull_request') return null
+  return {
+    base_url: form.pr_provider === 'github' ? null : form.pr_base_url.trim() || null,
+    polling_interval_seconds: Number(form.pr_polling_interval_seconds.trim()),
+    ...(form.pr_provider === 'github' && form.credential_id !== undefined
+      ? { credential_id: form.credential_id }
+      : {}),
   }
 }
 

@@ -21,6 +21,84 @@ impl RepoRepo for SqliteDb {
             .ok_or(DbError::NotFound)
     }
 
+    async fn create_primary_with_pr_provider_config(
+        &self,
+        input: CreateRepo,
+        provider_config: Option<CreatePrProviderConfig>,
+    ) -> Result<Repo> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let primary_repo_id = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT primary_repo_id FROM project WHERE id = ?",
+        )
+        .bind(&input.project_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        if primary_repo_id.is_some() {
+            return Err(DbError::ProjectAlreadyHasPrimaryRepo);
+        }
+
+        sqlx::query("INSERT INTO repo (id, project_id, name, remote_url, local_path, work_mode, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&input.id)
+            .bind(&input.project_id)
+            .bind(&input.name)
+            .bind(&input.remote_url)
+            .bind(&input.local_path)
+            .bind(input.work_mode.to_string())
+            .bind(&input.default_branch)
+            .bind(&input.created_at)
+            .bind(&input.updated_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(check_error)?;
+
+        if let Some(config) = provider_config {
+            sqlx::query(
+                "INSERT INTO pr_provider_config (
+                    id, repo_id, provider_type, base_url, polling_interval_seconds,
+                    token_secret_ref, credential_handle_id, credential_owner_user_id,
+                    created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&config.id)
+            .bind(&input.id)
+            .bind(&config.provider_type)
+            .bind(&config.base_url)
+            .bind(config.polling_interval_seconds)
+            .bind(&config.token_secret_ref)
+            .bind(&config.credential_handle_id)
+            .bind(&config.credential_owner_user_id)
+            .bind(&config.created_at)
+            .bind(&config.updated_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(check_error)?;
+        }
+
+        let primary_update = sqlx::query(
+            "UPDATE project SET primary_repo_id = ?, updated_at = ?
+             WHERE id = ? AND primary_repo_id IS NULL",
+        )
+        .bind(&input.id)
+        .bind(&input.updated_at)
+        .bind(&input.project_id)
+        .execute(&mut *tx)
+        .await?;
+        if primary_update.rows_affected() != 1 {
+            return Err(DbError::ProjectAlreadyHasPrimaryRepo);
+        }
+
+        let repo = sqlx::query("SELECT * FROM repo WHERE id = ?")
+            .bind(&input.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(map_repo)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        tx.commit().await?;
+        Ok(repo)
+    }
+
     async fn get_by_id(&self, id: &str) -> Result<Option<Repo>> {
         sqlx::query("SELECT * FROM repo WHERE id = ?")
             .bind(id)

@@ -94,6 +94,11 @@ exposure is controlled by the published port.
 
 - Secrets belong in environment variables or mounted secret files, not in image
   layers, Compose files committed to Git, MCP URLs, or query strings.
+- CredentialService encrypts provider and GitHub SCM credentials using a key
+  derived from the resolved JWT secret. Preserve the same configured secret or
+  the data-directory `jwt_secret.bin` with `forge.db` across backup and restore.
+  Changing the resolved secret makes stored credential ciphertext
+  undecryptable; reconnect those credentials after an intentional rotation.
 - Execution logs and terminal transcripts may contain sensitive command output.
   Treat `/data` as private user data.
 - Request logging records the path without the query string. Authentication

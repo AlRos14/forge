@@ -340,7 +340,10 @@ async fn apply_project_scope(
 }
 
 fn project_mutation_tool(tool_name: &str) -> bool {
-    tool_name == "forge_create_task"
+    matches!(
+        tool_name,
+        "forge_create_task" | "forge_propose_project_plan" | "forge_apply_project_plan"
+    )
 }
 
 fn project_admin_tool(tool_name: &str) -> bool {
@@ -389,8 +392,14 @@ fn tool_accepts_project_id(tool_name: &str) -> bool {
         "forge_create_task"
             | "forge_list_tasks"
             | "forge_get_project"
+            | "forge_get_project_plan"
+            | "forge_propose_project_plan"
+            | "forge_apply_project_plan"
+            | "forge_list_project_repo_tree"
+            | "forge_read_project_repo_file"
             | "forge_update_project"
             | "forge_update_project_hooks"
+            | "forge_list_validation_checks"
     )
 }
 
@@ -425,7 +434,16 @@ fn task_scope_field(tool_name: &str) -> Option<&'static str> {
         | "forge_list_task_messages"
         | "forge_list_task_handoffs"
         | "forge_list_task_proposals"
-        | "forge_list_task_decisions" => Some("task_id"),
+        | "forge_list_task_decisions"
+        | "forge_list_task_validation_check_requests"
+        | "forge_list_task_validation_comparisons"
+        | "forge_list_task_human_decisions"
+        | "forge_list_task_fallback_receipts"
+        | "forge_list_task_micro_fixes"
+        | "forge_list_task_coordinator_replans"
+        | "forge_list_task_pr_feedback"
+        | "forge_list_task_pr_actions"
+        | "forge_list_task_pr_rework" => Some("task_id"),
         _ => None,
     }
 }
@@ -540,6 +558,18 @@ fn handle_tools_list(context: &McpContext) -> Result<Value, McpToolError> {
 
 fn copilot_tool_allowed(name: &str, task_scoped: bool) -> bool {
     if task_scoped && name == "forge_list_tasks" {
+        return false;
+    }
+    if task_scoped
+        && matches!(
+            name,
+            "forge_get_project_plan"
+                | "forge_propose_project_plan"
+                | "forge_apply_project_plan"
+                | "forge_list_project_repo_tree"
+                | "forge_read_project_repo_file"
+        )
+    {
         return false;
     }
     api_types::PROJECT_COPILOT_MCP_TOOLS.contains(&name)

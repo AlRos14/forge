@@ -182,6 +182,7 @@ impl AppState {
         let workspace_exec_locks = merge_service.workspace_exec_locks();
         let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
         merge_service.set_cleanup_scheduler(Arc::clone(&cleanup_scheduler));
+        merge_service.set_credential_service(Arc::clone(&credential_service));
         cleanup_scheduler.set_repo_cache_locks(Arc::clone(&repo_cache_locks));
         cleanup_scheduler.set_workspace_exec_locks(Arc::clone(&workspace_exec_locks));
         let work_unit_service = Arc::new(services::WorkUnitService::new(

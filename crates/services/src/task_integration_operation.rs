@@ -193,7 +193,11 @@ impl TaskIntegrationOperationManager {
             "provider_type": provider_config.provider_type,
             "base_url": provider_config.base_url,
             "polling_interval_seconds": provider_config.polling_interval_seconds,
-            "token_secret_ref": provider_config.token_secret_ref,
+            // The PR credential and feedback policy (not the retired
+            // `token_secret_ref`) are part of the frozen provider identity.
+            "credential_handle_id": provider_config.credential_handle_id,
+            "credential_owner_user_id": provider_config.credential_owner_user_id,
+            "feedback_policy_digest": db::pr_feedback_policy_digest(&provider_config.feedback_policy_json),
             "updated_at": provider_config.updated_at,
         });
         let remote_admission = db::CreateRemotePrAdmission {
@@ -208,6 +212,10 @@ impl TaskIntegrationOperationManager {
                 config_digest_payload.to_string().as_bytes(),
             )),
             provider_base_url: provider_config.base_url.clone(),
+            // Retired for PR use; copied verbatim only because the V173
+            // admission guard requires equality with the config row. The
+            // credential handle and policy are frozen by the repository in
+            // the same transaction.
             token_secret_ref: provider_config.token_secret_ref.clone(),
             remote_repo_identity: remote_repo_identity.to_owned(),
             source_branch: source_branch.to_owned(),
@@ -446,7 +454,7 @@ fn busy(task_id: &str) -> ServiceError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     type LegacyPrHistoryRow = (
         String,
         String,
@@ -606,15 +614,82 @@ mod tests {
         }
     }
 
-    struct Fixture {
-        db: Arc<SqliteDb>,
-        task_id: String,
-        repo_id: String,
-        user_id: String,
+    /// Deterministic fake provider (replaces the retired placeholder): creates
+    /// an Open PR and reports the status recorded in the PR metadata.
+    pub(crate) struct MetadataEchoPrProvider;
+
+    #[async_trait::async_trait]
+    impl crate::pr_service::PrProvider for MetadataEchoPrProvider {
+        async fn find_pr(
+            &self,
+            _request: &crate::pr_service::PrCreateRequest,
+        ) -> std::result::Result<
+            Option<crate::pr_service::PrRecord>,
+            crate::pr_service::PrProviderError,
+        > {
+            Ok(None)
+        }
+
+        async fn create_pr(
+            &self,
+            request: crate::pr_service::PrCreateRequest,
+        ) -> std::result::Result<crate::pr_service::PrRecord, crate::pr_service::PrProviderError>
+        {
+            Ok(crate::pr_service::PrRecord {
+                provider_pr_id: format!("fake-{}", request.idempotency_key),
+                pr_url: Some(format!(
+                    "https://github.example.invalid/pull/{}",
+                    request.idempotency_key
+                )),
+                status: crate::pr_service::RemotePrStatus::Open(crate::pr_service::PrObservation {
+                    provider_event_id: format!("fake-create:{}", request.idempotency_key),
+                    remote_repo_identity: request.repo_remote_url,
+                    source_branch: request.source_branch,
+                    target_branch: request.target_branch,
+                    head_sha: request.source_sha,
+                    merged_commit_sha: None,
+                }),
+            })
+        }
+
+        async fn get_pr_status(
+            &self,
+            admission: &db::RemotePrAdmission,
+            metadata: &db::PrMetadata,
+        ) -> std::result::Result<
+            crate::pr_service::RemotePrStatus,
+            crate::pr_service::PrProviderError,
+        > {
+            let observation = crate::pr_service::PrObservation {
+                provider_event_id: format!(
+                    "fake-status:{}:{}",
+                    metadata.provider_pr_id.as_deref().unwrap_or("unknown"),
+                    metadata.pr_state
+                ),
+                remote_repo_identity: admission.remote_repo_identity.clone(),
+                source_branch: admission.source_branch.clone(),
+                target_branch: admission.target_branch.clone(),
+                head_sha: admission.admitted_source_sha.clone(),
+                merged_commit_sha: (metadata.pr_state == "merged")
+                    .then(|| format!("fake-merge:{}", admission.admitted_source_sha)),
+            };
+            Ok(match metadata.pr_state.as_str() {
+                "merged" => crate::pr_service::RemotePrStatus::Merged(observation),
+                "closed" => crate::pr_service::RemotePrStatus::Closed(observation),
+                _ => crate::pr_service::RemotePrStatus::Open(observation),
+            })
+        }
+    }
+
+    pub(crate) struct Fixture {
+        pub(crate) db: Arc<SqliteDb>,
+        pub(crate) task_id: String,
+        pub(crate) repo_id: String,
+        pub(crate) user_id: String,
         workspace_id: String,
     }
 
-    async fn fixture(database_url: &str, root: &Path) -> Fixture {
+    pub(crate) async fn fixture(database_url: &str, root: &Path) -> Fixture {
         let pool = create_sqlite_pool(database_url).await.expect("pool");
         run_migrations(&pool).await.expect("migrations");
         seed_fixture(Arc::new(SqliteDb::new(pool)), root).await
@@ -817,22 +892,6 @@ mod tests {
         .expect("durable running operation")
     }
 
-    struct TestTokenEnv(String);
-
-    impl TestTokenEnv {
-        fn set() -> Self {
-            let key = format!("FORGE_TEST_PR_TOKEN_{}", new_uuid_v4().replace('-', "_"));
-            std::env::set_var(&key, "test-token");
-            Self(key)
-        }
-    }
-
-    impl Drop for TestTokenEnv {
-        fn drop(&mut self) {
-            std::env::remove_var(&self.0);
-        }
-    }
-
     async fn prepare_pr_admission(
         fixture: &Fixture,
         root: &Path,
@@ -844,7 +903,29 @@ mod tests {
         db::GateEvaluation,
         String,
         crate::gate_engine::GatePolicyDocument,
-        TestTokenEnv,
+    )> {
+        prepare_pr_admission_with_config(fixture, root, event_bus, None).await
+    }
+
+    /// Credential and feedback policy applied to the repo PR provider config
+    /// before the admission freezes it.
+    pub(crate) struct PrConfigSetup {
+        pub(crate) credentials: Arc<crate::credential_service::CredentialService>,
+        pub(crate) policy: db::PrFeedbackPolicy,
+    }
+
+    pub(crate) async fn prepare_pr_admission_with_config(
+        fixture: &Fixture,
+        root: &Path,
+        event_bus: Arc<EventBus>,
+        setup: Option<PrConfigSetup>,
+    ) -> crate::Result<(
+        TaskIntegrationOperationManager,
+        TaskIntegrationOperationGuard,
+        TaskIntegrationOperationGuard,
+        db::GateEvaluation,
+        String,
+        crate::gate_engine::GatePolicyDocument,
     )> {
         RepoRepo::update(
             &*fixture.db,
@@ -860,8 +941,7 @@ mod tests {
         )
         .await
         .expect("repository enters pull-request mode");
-        let token_env = TestTokenEnv::set();
-        let provider_config = PrProviderConfigRepo::create(
+        let mut provider_config = PrProviderConfigRepo::create(
             &*fixture.db,
             CreatePrProviderConfig {
                 id: new_uuid_v4(),
@@ -869,13 +949,38 @@ mod tests {
                 provider_type: "github".to_owned(),
                 base_url: Some("https://github.example.invalid".to_owned()),
                 polling_interval_seconds: 1,
-                token_secret_ref: Some(token_env.0.clone()),
+                token_secret_ref: None,
+                credential_handle_id: None,
+                credential_owner_user_id: None,
                 created_at: now_rfc3339(),
                 updated_at: now_rfc3339(),
             },
         )
         .await
         .expect("PR provider config");
+        if let Some(setup) = setup {
+            let handle = setup
+                .credentials
+                .connect_scm_credential(crate::credential_service::ConnectScmCredential {
+                    owner_user_id: fixture.user_id.clone(),
+                    provider: "github".to_owned(),
+                    label: "test github".to_owned(),
+                    credential: crate::credential_service::Secret::new(
+                        "ghp_test_feedback_token".to_owned(),
+                    ),
+                })
+                .await?;
+            let settings = crate::pr_provider_settings::PrProviderSettingsService::new(
+                Arc::clone(&fixture.db),
+                setup.credentials,
+            );
+            settings
+                .set_credential(&fixture.user_id, &fixture.repo_id, Some(&handle.id))
+                .await?;
+            provider_config = settings
+                .set_feedback_policy(&fixture.user_id, &fixture.repo_id, None, setup.policy)
+                .await?;
+        }
 
         let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task_id, false)
             .await
@@ -1024,7 +1129,6 @@ mod tests {
             evaluation.evaluation,
             gate.id,
             policy,
-            token_env,
         ))
     }
 
@@ -1520,7 +1624,7 @@ mod tests {
         label: &str,
     ) -> V113WrongHeadRework {
         let event_bus = Arc::new(EventBus::new(64));
-        let (_manager, merge, publish, _evaluation, _gate, policy, _token_env) =
+        let (_manager, merge, publish, _evaluation, _gate, policy) =
             prepare_pr_admission(&fixture, root, Arc::clone(&event_bus))
                 .await
                 .expect("exact remote admission at V113");
@@ -2661,7 +2765,7 @@ mod tests {
         let database_url = format!("sqlite://{}", temp.path().join("modern-v116.db").display());
         let fixture = fixture_at_v116(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(32));
-        let (_manager, merge, publish, _evaluation, _gate, _policy, _token_env) =
+        let (_manager, merge, publish, _evaluation, _gate, _policy) =
             prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
                 .await
                 .expect("modern V116 remote admission");
@@ -3014,7 +3118,7 @@ mod tests {
         let database_url = format!("sqlite://{}", temp.path().join("pr-intent.db").display());
         let fixture = fixture(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(32));
-        let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy) =
             prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
                 .await
                 .expect("PR publication admission");
@@ -3031,6 +3135,7 @@ mod tests {
         drop(merge);
 
         crate::pr_service::PrReconciler::new(Arc::clone(&fixture.db), Arc::clone(&event_bus), None)
+            .with_provider_for_test(Arc::new(MetadataEchoPrProvider))
             .reconcile_once()
             .await
             .expect("restart resumes the exact publication intent");
@@ -3092,7 +3197,7 @@ mod tests {
             fixture_with_legacy_pr(&database_url, temp.path(), "closed", "closed_without_merge")
                 .await;
         let event_bus = Arc::new(EventBus::new(32));
-        let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy) =
             prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
                 .await
                 .expect("PR publication admission");
@@ -3237,7 +3342,7 @@ mod tests {
         );
         let fixture = fixture(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(32));
-        let (_manager, merge, _publish, _evaluation, _gate_id, _policy, _token_env) =
+        let (_manager, merge, _publish, _evaluation, _gate_id, _policy) =
             prepare_pr_admission(&fixture, temp.path(), event_bus)
                 .await
                 .expect("PR publication admission");
@@ -3287,7 +3392,7 @@ mod tests {
         let database_url = format!("sqlite://{}", temp.path().join("pr-open.db").display());
         let fixture = fixture(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(32));
-        let (_manager, merge, publish, evaluation, gate_id, policy, _token_env) =
+        let (_manager, merge, publish, evaluation, gate_id, policy) =
             prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
                 .await
                 .expect("PR publication admission");
@@ -3330,7 +3435,8 @@ mod tests {
             Arc::clone(&fixture.db),
             Arc::clone(&event_bus),
             None,
-        );
+        )
+        .with_provider_for_test(Arc::new(MetadataEchoPrProvider));
         reconciler
             .reconcile_once()
             .await
@@ -3464,7 +3570,7 @@ mod tests {
         let database_url = format!("sqlite://{}", temp.path().join("pr-closed.db").display());
         let fixture = fixture(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(32));
-        let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy) =
             prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
                 .await
                 .expect("PR publication admission");
@@ -3477,6 +3583,7 @@ mod tests {
         drop(merge);
 
         crate::pr_service::PrReconciler::new(Arc::clone(&fixture.db), Arc::clone(&event_bus), None)
+            .with_provider_for_test(Arc::new(MetadataEchoPrProvider))
             .reconcile_once()
             .await
             .expect("provider Closed finishes exact admission");
@@ -3545,7 +3652,7 @@ mod tests {
         let database_url = format!("sqlite://{}", temp.path().join("pr-failed.db").display());
         let fixture = fixture(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(32));
-        let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy) =
             prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
                 .await
                 .expect("PR publication admission");
@@ -3675,7 +3782,7 @@ mod tests {
         let database_url = format!("sqlite://{}", temp.path().join("pr-unknown.db").display());
         let fixture = fixture(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(32));
-        let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy) =
             prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
                 .await
                 .expect("PR publication admission");
@@ -3970,7 +4077,7 @@ mod tests {
         );
         let fixture = fixture(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(32));
-        let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy) =
             prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
                 .await
                 .expect("PR publication admission");
@@ -4055,7 +4162,7 @@ mod tests {
         );
         let fixture = fixture(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(32));
-        let (_manager, merge, publish, _evaluation, _gate_id, _policy, _token_env) =
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy) =
             prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
                 .await
                 .expect("PR publication admission");
@@ -4437,7 +4544,7 @@ mod tests {
         let fixture = fixture(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(64));
 
-        let (_manager1, merge1, publish1, _evaluation1, gate_id, policy, _token_env) =
+        let (_manager1, merge1, publish1, _evaluation1, gate_id, policy) =
             prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
                 .await
                 .expect("PR1 admission");
@@ -4930,7 +5037,7 @@ mod tests {
         let database_url = format!("sqlite://{}", temp.path().join("active-pr.db").display());
         let fixture = fixture(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(32));
-        let (_manager, merge, publish, evaluation, _gate_id, _policy, _token_env) =
+        let (_manager, merge, publish, evaluation, _gate_id, _policy) =
             prepare_pr_admission(&fixture, temp.path(), event_bus)
                 .await
                 .expect("active PR1 admission");
@@ -4979,7 +5086,7 @@ mod tests {
         let database_url = format!("sqlite://{}", temp.path().join("v115-pr.db").display());
         let fixture = fixture_at_v115(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(32));
-        let (_manager1, merge1, publish1, _evaluation1, gate_id, policy, _token_env) =
+        let (_manager1, merge1, publish1, _evaluation1, gate_id, policy) =
             prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
                 .await
                 .expect("PR1 admission on V115");
@@ -5020,6 +5127,21 @@ mod tests {
         db::run_migrations(fixture.db.pool())
             .await
             .expect("upgrade terminal V115 database through V116");
+        // The upgrade ran on a live pool: drop statements prepared against the
+        // V115 schema so `SELECT *` metadata matches the migrated tables.
+        {
+            use sqlx::Connection;
+            let pool = fixture.db.pool();
+            let mut connections = Vec::new();
+            for _ in 0..pool.size() {
+                let mut connection = pool.acquire().await.expect("pooled connection");
+                connection
+                    .clear_cached_statements()
+                    .await
+                    .expect("clear prepared statement cache");
+                connections.push(connection);
+            }
+        }
         let backfilled: (String, String, String, String) = sqlx::query_as(
             "SELECT history_origin, provider_pr_id, pr_url, result_event_id
              FROM remote_pr_history WHERE task_merge_operation_id = ?",
@@ -5124,7 +5246,7 @@ mod tests {
         );
         let fixture = fixture(&database_url, temp.path()).await;
         let event_bus = Arc::new(EventBus::new(32));
-        let (_manager1, merge1, publish1, _evaluation1, gate_id, policy, _token_env) =
+        let (_manager1, merge1, publish1, _evaluation1, gate_id, policy) =
             prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
                 .await
                 .expect("PR1 admission");
@@ -5196,5 +5318,172 @@ mod tests {
         assert_eq!(history.5.as_deref(), Some("provider-event-mismatch"));
         assert_eq!(history.6.as_deref(), Some(mismatch_result.id.as_str()));
         assert_eq!(history.7, admission1.admitted_source_sha);
+    }
+
+    // Spike PS (plan: "Anexo PS"), updated by PX (D3'). These tests pin what the
+    // generic lifecycle and schema allow while a remote_waiting TaskMerge owns
+    // an open PR: only the typed pause of `pr_rework_*` leaves Merging for
+    // same-PR rework; every generic path stays rejected.
+    async fn pr_lifecycle_spike_open_admission(
+        temp: &TempDir,
+        name: &str,
+    ) -> (Fixture, Arc<EventBus>, String, String) {
+        let database_url = format!("sqlite://{}", temp.path().join(name).display());
+        let fixture = fixture(&database_url, temp.path()).await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let (_manager, merge, publish, _evaluation, _gate_id, _policy) =
+            prepare_pr_admission(&fixture, temp.path(), Arc::clone(&event_bus))
+                .await
+                .expect("PR publication admission");
+        let merge_id = merge.id().to_owned();
+        let publish_id = publish.id().to_owned();
+        drop(publish);
+        drop(merge);
+        crate::pr_service::PrReconciler::new(Arc::clone(&fixture.db), Arc::clone(&event_bus), None)
+            .with_provider_for_test(Arc::new(ScriptedPrProvider::default()))
+            .reconcile_once()
+            .await
+            .expect("reconciler opens the PR");
+        let admission =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, &merge_id)
+                .await
+                .expect("admission lookup")
+                .expect("admission exists");
+        assert_eq!(admission.state, "open");
+        (fixture, event_bus, merge_id, publish_id)
+    }
+
+    async fn pr_lifecycle_spike_assert_still_waiting(fixture: &Fixture, merge_id: &str) {
+        let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("lifecycle lookup")
+            .expect("lifecycle exists");
+        assert_eq!(lifecycle.state, db::TaskLifecycleState::Merging);
+        assert_eq!(lifecycle.reason_ref.as_deref(), Some(merge_id));
+        let merge = TaskIntegrationOperationRepo::get_by_id(&*fixture.db, merge_id)
+            .await
+            .expect("TaskMerge lookup")
+            .expect("TaskMerge exists");
+        assert_eq!(merge.status, TaskIntegrationOperationStatus::Running);
+        assert!(merge.remote_waiting);
+        let admission =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*fixture.db, merge_id)
+                .await
+                .expect("admission lookup")
+                .expect("admission exists");
+        assert_eq!(admission.state, "open");
+    }
+
+    #[tokio::test]
+    async fn pr_lifecycle_spike_merging_to_blocked_pr_feedback_is_rejected() {
+        let temp = TempDir::new().expect("temporary directory");
+        let (fixture, event_bus, merge_id, _publish_id) =
+            pr_lifecycle_spike_open_admission(&temp, "spike-blocked.db").await;
+        let service = crate::task_lifecycle::TaskLifecycleService::new(
+            Arc::clone(&fixture.db),
+            Arc::clone(&event_bus),
+        );
+        let attempt = |cause: crate::task_lifecycle::LifecycleCause, key: &str, version: i64| {
+            crate::task_lifecycle::TransitionLifecycleInput {
+                task_id: fixture.task_id.clone(),
+                expected_task_version: version,
+                to_state: db::TaskLifecycleState::Blocked,
+                cause,
+                reason_kind: Some("pr_feedback".to_owned()),
+                reason_ref: Some(merge_id.clone()),
+                idempotency_key: key.to_owned(),
+            }
+        };
+        let task_version = TaskRepo::get_by_id(&*fixture.db, &fixture.task_id, false)
+            .await
+            .expect("Task lookup")
+            .expect("Task exists")
+            .version;
+        // (a1) D3 as written: domain_event cause. The service demands the exact
+        // TaskMerge operation for any Merging -> Blocked transition.
+        assert!(service
+            .transition(attempt(
+                crate::task_lifecycle::LifecycleCause::DomainEvent(new_uuid_v4()),
+                "spike-domain-event",
+                task_version,
+            ))
+            .await
+            .is_err());
+        pr_lifecycle_spike_assert_still_waiting(&fixture, &merge_id).await;
+        // (a2) merge_operation cause with the still-running waiting TaskMerge:
+        // the V100 transition trigger requires a terminal operation
+        // (conflict, failed, abandoned).
+        assert!(service
+            .transition(attempt(
+                crate::task_lifecycle::LifecycleCause::MergeOperation(merge_id.clone()),
+                "spike-merge-operation",
+                task_version,
+            ))
+            .await
+            .is_err());
+        pr_lifecycle_spike_assert_still_waiting(&fixture, &merge_id).await;
+        // (a4) V175/D3': the only way out of Merging for same-PR rework is the
+        // typed pause (PrReworkService::supersede_for_rework). The receipt kind
+        // without its durable supersession is rejected; a waiting TaskMerge is
+        // never abandoned by a generic transition.
+        let mut pause = attempt(
+            crate::task_lifecycle::LifecycleCause::PrFeedbackRework {
+                supersession_id: new_uuid_v4(),
+            },
+            "spike-pr-feedback-rework",
+            task_version,
+        );
+        pause.reason_kind = Some("pr_feedback_rework".to_owned());
+        assert!(service.transition(pause).await.is_err());
+        pr_lifecycle_spike_assert_still_waiting(&fixture, &merge_id).await;
+        // (a3) Merging -> Active has no edge at all.
+        let mut to_active = attempt(
+            crate::task_lifecycle::LifecycleCause::DomainEvent(new_uuid_v4()),
+            "spike-to-active",
+            task_version,
+        );
+        to_active.to_state = db::TaskLifecycleState::Active;
+        assert!(service.transition(to_active).await.is_err());
+        pr_lifecycle_spike_assert_still_waiting(&fixture, &merge_id).await;
+    }
+
+    #[tokio::test]
+    async fn pr_lifecycle_spike_waiting_task_merge_blocks_every_other_operation() {
+        let temp = TempDir::new().expect("temporary directory");
+        let (fixture, _event_bus, merge_id, _publish_id) =
+            pr_lifecycle_spike_open_admission(&temp, "spike-ops.db").await;
+        let manager = TaskIntegrationOperationManager::new(
+            Arc::clone(&fixture.db),
+            temp.path().to_path_buf(),
+        );
+        // (c) V109 admission guard: no remote_waiting = 0 operation may start
+        // while the waiting TaskMerge is running, so rework WorkUnits cannot be
+        // created, prepared or integrated under the same admission.
+        for kind in [
+            TaskIntegrationOperationKind::WorkUnitCreate,
+            TaskIntegrationOperationKind::WorkUnitWorkspacePrepare,
+            TaskIntegrationOperationKind::WorkUnitIntegration,
+            TaskIntegrationOperationKind::IntegrationWorkspaceCleanup,
+        ] {
+            assert!(
+                manager
+                    .acquire(&fixture.task_id, kind, "spike-rework-owner")
+                    .await
+                    .is_err(),
+                "{kind} must be rejected while the waiting TaskMerge is running"
+            );
+            pr_lifecycle_spike_assert_still_waiting(&fixture, &merge_id).await;
+        }
+        // (b) Leaving Merging is not a cancellation path either: the local
+        // stale-recovery path never abandons a remote_waiting TaskMerge.
+        assert!(TaskIntegrationOperationRepo::abandon_stale(
+            &*fixture.db,
+            &fixture.task_id,
+            &now_rfc3339(),
+        )
+        .await
+        .expect("stale recovery")
+        .is_none());
+        pr_lifecycle_spike_assert_still_waiting(&fixture, &merge_id).await;
     }
 }
