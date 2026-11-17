@@ -13,12 +13,12 @@ use std::{
 };
 
 use chacha20poly1305::{
-    aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
     XChaCha20Poly1305, XNonce,
+    aead::{Aead, AeadCore, KeyInit, OsRng},
 };
 use db::{CredentialHandle, CredentialHandleRepo, SqliteDb};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::sync::Mutex;
@@ -214,11 +214,10 @@ impl CredentialStore {
     }
 
     fn seal(&self, plaintext: &[u8]) -> std::result::Result<(Vec<u8>, Vec<u8>), CredentialError> {
-        let mut nonce = [0_u8; 24];
-        OsRng.fill_bytes(&mut nonce);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let ciphertext = self
             .cipher
-            .encrypt(XNonce::from_slice(&nonce), plaintext)
+            .encrypt(&nonce, plaintext)
             .map_err(|_| CredentialError::Persistence)?;
         Ok((ciphertext, nonce.to_vec()))
     }
@@ -727,9 +726,10 @@ impl std::fmt::Debug for CredentialService {
 
 impl CredentialService {
     pub fn new(db: Arc<SqliteDb>, key_material: &[u8]) -> Self {
-        let digest = Sha256::digest(key_material);
-        let mut master_key = [0_u8; 32];
-        master_key.copy_from_slice(&digest);
+        let master_key: [u8; 32] = Sha256::digest(key_material)
+            .as_slice()
+            .try_into()
+            .expect("SHA-256 output is 32 bytes");
         Self {
             store: CredentialStore::new(Arc::clone(&db), master_key, 1),
             db,
@@ -1125,7 +1125,7 @@ impl CredentialService {
                 return Ok(ProviderUsageOutcome::unsupported(
                     entry.provider,
                     "provider credential could not be refreshed",
-                ))
+                ));
             }
         };
         let account_id = entry_provider_account_id(&entry);
@@ -1138,7 +1138,7 @@ impl CredentialService {
                 return Ok(ProviderUsageOutcome::unsupported(
                     entry.provider,
                     "usage probe client unavailable",
-                ))
+                ));
             }
         };
         let mut request = client
@@ -1472,8 +1472,8 @@ fn restricted_provider_ip(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
     use db::{
-        create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgentIdentity,
-        CreateAgentProfile, SelectAgentProfile,
+        AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile, SelectAgentProfile,
+        create_sqlite_pool, run_migrations,
     };
     use serde_json::json;
 
@@ -1635,9 +1635,11 @@ mod tests {
             adapter_snapshot["runtime_env"]["OPENAI_API_KEY"],
             json!(secret)
         );
-        assert!(!adapter_snapshot
-            .to_string()
-            .contains("replacement-profile-secret"));
+        assert!(
+            !adapter_snapshot
+                .to_string()
+                .contains("replacement-profile-secret")
+        );
 
         let profile_c_id = "credential-harness-profile-c".to_owned();
         db::AgentProfileRepo::create_profile(

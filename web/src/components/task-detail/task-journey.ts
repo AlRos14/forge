@@ -356,7 +356,7 @@ export function deriveJourney(input: JourneyInput): JourneyProjection {
       summary: 'Independent review passed',
       detail:
         maxRevision > 1
-          ? `The current result passed after ${String(maxRevision)} review revision${maxRevision === 1 ? '' : 's'}.`
+          ? `The current result passed after ${String(maxRevision)} review revisions.`
           : 'The current exact result has a passing ReviewReport.',
     }
   } else {
