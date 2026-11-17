@@ -438,6 +438,9 @@ fn task_scope_field(tool_name: &str) -> Option<&'static str> {
         | "forge_list_task_validation_check_requests"
         | "forge_list_task_validation_comparisons"
         | "forge_list_task_human_decisions"
+        | "forge_list_task_fallback_receipts"
+        | "forge_list_task_micro_fixes"
+        | "forge_list_task_coordinator_replans"
         | "forge_list_task_pr_feedback"
         | "forge_list_task_pr_actions"
         | "forge_list_task_pr_rework" => Some("task_id"),

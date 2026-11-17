@@ -192,9 +192,13 @@ jobs:
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p mcp-server --lib mcp_pr_feedback_
       - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib mcp_phase_three_receipt_tools_are_read_only_and_task_scoped
+      - if: ${{ !cancelled() }}
         run: cargo test --locked -p api --test coordinator_verification
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p api --test coordinator_verification_pr_loop
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test coordinator_phase3
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p api --test repos_endpoints
       - id: rust_api_project_plan

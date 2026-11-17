@@ -752,6 +752,49 @@ mod tests {
     }
 
     #[test]
+    fn phase_three_events_use_public_names_and_project_only_allowlisted_fields() {
+        let fallback = domain_event(
+            "task.work_unit_fallback",
+            r#"{"task_id":"task-1","work_unit_id":"work-unit-1","origin_execution_id":"execution-1","receipt_id":"receipt-1","task_role_id":"role-1","from_actor_id":"agent-old","to_actor_id":"agent-new","candidate_agent_id":"agent-new","chain_index":0,"cost_class":"economy","work_unit_version":3,"authorization_version":4,"envelope_digest":"digest-envelope","route_attempts_digest":"digest-route","outcome":"reassigned","reason":"executor_unavailable","chain_length":2,"path":"private/path","prompt":"private prompt","token":"secret"}"#,
+        );
+        let projected = project_domain_event(&fallback).expect("fallback event is public");
+        assert_eq!(projected.event_type, PublicEventType::TaskWorkUnitFallback);
+        let payload = projected.payload.expect("fallback payload");
+        assert_eq!(payload["receipt_id"], "receipt-1");
+        assert_eq!(payload["cost_class"], "economy");
+        assert!(payload.get("path").is_none());
+        assert!(payload.get("prompt").is_none());
+        assert!(payload.get("token").is_none());
+
+        let micro_fix = domain_event(
+            "micro_fix.bounds_exceeded",
+            r#"{"task_id":"task-1","micro_fix_receipt_id":"micro-fix-1","work_unit_id":"work-unit-2","result_commit_sha":"commit-1","bounds_violation":"too_many_lines","declared_paths":["private/path"],"body":"private"}"#,
+        );
+        let projected = project_domain_event(&micro_fix).expect("micro-fix event is public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::TaskMicroFixBoundsExceeded
+        );
+        let payload = projected.payload.expect("micro-fix payload");
+        assert_eq!(payload["micro_fix_receipt_id"], "micro-fix-1");
+        assert!(payload.get("declared_paths").is_none());
+        assert!(payload.get("body").is_none());
+
+        let replan = domain_event(
+            "task.coordinator_replan_proposed",
+            r#"{"task_id":"task-1","coordinator_replan_id":"replan-1","ordinal":1,"plan_request_id":"plan-request-1","authorization_version":4,"envelope_digest":"digest-envelope","reason":"private plan rationale"}"#,
+        );
+        let projected = project_domain_event(&replan).expect("replan event is public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::TaskCoordinatorReplanProposed
+        );
+        let payload = projected.payload.expect("replan payload");
+        assert_eq!(payload["coordinator_replan_id"], "replan-1");
+        assert!(payload.get("reason").is_none());
+    }
+
+    #[test]
     fn project_plan_event_projection_exposes_only_project_id() {
         let mut event = domain_event(
             "project.plan_proposed",

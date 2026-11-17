@@ -263,6 +263,39 @@ impl WorkUnitFallbackReceiptRepo for SqliteDb {
         .map(map_work_unit_fallback_receipt)
         .collect()
     }
+
+    async fn list_work_unit_fallback_receipts_by_task_page(
+        &self,
+        task_id: &str,
+        page: &PageRequest,
+    ) -> Result<Page<WorkUnitFallbackReceipt>> {
+        let cursor = decode_phase_three_cursor(&page.cursor)?;
+        let mut sql = "SELECT * FROM work_unit_fallback_receipt WHERE task_id = ?".to_owned();
+        if cursor.is_some() {
+            sql.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
+        }
+        sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+        let mut request = sqlx::query(&sql).bind(task_id);
+        if let Some(cursor) = cursor {
+            request = request
+                .bind(&cursor.sort_value)
+                .bind(&cursor.sort_value)
+                .bind(&cursor.id);
+        }
+        let items = request
+            .bind(limit(page) + 1)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(map_work_unit_fallback_receipt)
+            .collect::<Result<Vec<_>>>()?;
+        phase_three_page_from_items(
+            items,
+            page,
+            |item| item.created_at.clone(),
+            |item| item.id.clone(),
+        )
+    }
 }
 
 #[async_trait]
@@ -395,5 +428,51 @@ impl MicroFixReceiptRepo for SqliteDb {
             .into_iter()
             .map(map_micro_fix_receipt)
             .collect()
+    }
+
+    async fn list_micro_fix_receipts_by_task_page(
+        &self,
+        task_id: &str,
+        page: &PageRequest,
+    ) -> Result<Page<MicroFixReceipt>> {
+        let cursor = decode_phase_three_cursor(&page.cursor)?;
+        let after_ordinal = cursor
+            .map(|cursor| {
+                cursor
+                    .sort_value
+                    .parse::<i64>()
+                    .map_err(|_| DbError::InvalidCursor)
+            })
+            .transpose()?;
+        let rows = if let Some(after_ordinal) = after_ordinal {
+            sqlx::query(
+                "SELECT * FROM micro_fix_receipt WHERE task_id = ? AND ordinal > ?
+                 ORDER BY ordinal ASC LIMIT ?",
+            )
+            .bind(task_id)
+            .bind(after_ordinal)
+            .bind(limit(page) + 1)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT * FROM micro_fix_receipt WHERE task_id = ?
+                 ORDER BY ordinal ASC LIMIT ?",
+            )
+            .bind(task_id)
+            .bind(limit(page) + 1)
+            .fetch_all(&self.pool)
+            .await?
+        };
+        let items = rows
+            .into_iter()
+            .map(map_micro_fix_receipt)
+            .collect::<Result<Vec<_>>>()?;
+        phase_three_page_from_items(
+            items,
+            page,
+            |item| item.ordinal.to_string(),
+            |item| item.id.clone(),
+        )
     }
 }

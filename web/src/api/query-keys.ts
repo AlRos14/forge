@@ -29,6 +29,9 @@ export const qk = {
   taskValidationComparisons: (taskId: string) =>
     ['tasks', taskId, 'validation-comparisons'] as const,
   taskHumanDecisions: (taskId: string) => ['tasks', taskId, 'human-decisions'] as const,
+  taskFallbackReceipts: (taskId: string) => ['tasks', taskId, 'fallback-receipts'] as const,
+  taskMicroFixes: (taskId: string) => ['tasks', taskId, 'micro-fixes'] as const,
+  taskCoordinatorReplans: (taskId: string) => ['tasks', taskId, 'coordinator-replans'] as const,
   taskPrFeedback: (taskId: string) => ['tasks', taskId, 'pr-feedback'] as const,
   taskPrRework: (taskId: string) => ['tasks', taskId, 'pr-rework'] as const,
   taskPrActions: (taskId: string) => ['tasks', taskId, 'pr-actions'] as const,

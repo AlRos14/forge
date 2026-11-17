@@ -61,6 +61,7 @@ import { TaskQualityRequestsPanel } from './task-quality-requests-panel'
 import { TaskHumanDecisionsPanel } from './task-human-decisions-panel'
 import { TaskPrActionsPanel } from './task-pr-actions-panel'
 import { TaskPrFeedbackPanel } from './task-pr-feedback-panel'
+import { TaskCoordinationProfileGrants } from './task-coordination-profile-grants'
 import { TaskValidationPanel } from './task-validation-panel'
 
 type CoordinatorChoice = {
@@ -733,6 +734,12 @@ export function TaskCoordinationPanel({
           </div>
         </div>
       ) : null}
+
+      <TaskCoordinationProfileGrants
+        envelope={overview.envelope}
+        team={overview.team}
+        agents={agents}
+      />
 
       {overview.blockers.length ? (
         <div

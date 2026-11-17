@@ -2953,6 +2953,11 @@ pub trait TaskCoordinatorReplanRepo: Send + Sync {
         &self,
         task_id: &str,
     ) -> Result<Vec<TaskCoordinatorReplan>>;
+    async fn list_coordinator_replans_by_task_page(
+        &self,
+        task_id: &str,
+        page: &PageRequest,
+    ) -> Result<Page<TaskCoordinatorReplan>>;
 }
 
 /// Durable evidence for a cross-Agent fallback on one exact WorkUnit attempt.
@@ -2978,6 +2983,11 @@ pub trait WorkUnitFallbackReceiptRepo: Send + Sync {
         &self,
         work_unit_id: &str,
     ) -> Result<Vec<WorkUnitFallbackReceipt>>;
+    async fn list_work_unit_fallback_receipts_by_task_page(
+        &self,
+        task_id: &str,
+        page: &PageRequest,
+    ) -> Result<Page<WorkUnitFallbackReceipt>>;
 }
 
 /// Append-only micro-fix identity plus a single pending-to-terminal bounds update.
@@ -2997,6 +3007,11 @@ pub trait MicroFixReceiptRepo: Send + Sync {
     ) -> Result<MicroFixReceipt>;
     async fn get_micro_fix_receipt(&self, id: &str) -> Result<Option<MicroFixReceipt>>;
     async fn list_micro_fix_receipts_by_task(&self, task_id: &str) -> Result<Vec<MicroFixReceipt>>;
+    async fn list_micro_fix_receipts_by_task_page(
+        &self,
+        task_id: &str,
+        page: &PageRequest,
+    ) -> Result<Page<MicroFixReceipt>>;
 }
 
 /// Structured human decision requests (V174).

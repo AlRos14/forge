@@ -149,91 +149,90 @@ impl TaskDispatcher {
             return Ok(false);
         }
 
-        let Some(receipt) =
+        if let Some(receipt) =
             WorkUnitFallbackReceiptRepo::get_work_unit_fallback_receipt_by_origin_execution(
                 &*self.db,
                 &execution.id,
             )
             .await?
-        else {
-            if DomainEventRepo::get_event_by_dedupe(
-                &*self.db,
-                &format!("task.work_unit_fallback:{}", execution.id),
-            )
-            .await?
-            .is_some()
-            {
-                return Ok(false);
-            }
-            let Some(context) = self.load_fallback_context(&execution, &route).await? else {
-                return Ok(false);
-            };
-            let candidates = role_fallback_candidates(&context.envelope, &context.task_role_id);
-            if candidates.is_empty() {
-                self.record_fallback_block(&context, "chain_exhausted", None, 0)
-                    .await?;
-                return Ok(true);
-            }
-            let Some(work_unit) = WorkUnitRepo::get_by_id(&*self.db, &context.work_unit_id).await?
-            else {
-                return Ok(false);
-            };
-            let Some(role) = TaskRoleRepo::get_by_id(&*self.db, &context.task_role_id).await?
-            else {
-                return Ok(false);
-            };
-            if work_unit.task_id != context.task_id
-                || work_unit.role != role.role
-                || work_unit.version != context.work_unit_version
-                || work_unit.assigned_actor
-                    != Some(db::ActorRef::Agent(context.origin_agent_id.clone()))
-                || work_unit.status != db::WorkUnitStatus::Open
-            {
-                return Ok(false);
-            }
+        {
+            return self.complete_fallback_receipt(&execution, &receipt).await;
+        }
 
-            let dispatch_state: Option<String> =
-                sqlx::query_scalar("SELECT state FROM task_dispatch WHERE task_id = ?")
-                    .bind(&context.task_id)
-                    .fetch_optional(self.db.pool())
-                    .await?;
-            if dispatch_state.as_deref() != Some("running") {
-                return Ok(false);
-            }
-            let running_attempt: bool = sqlx::query_scalar(
-                "SELECT EXISTS(
+        if DomainEventRepo::get_event_by_dedupe(
+            &*self.db,
+            &format!("task.work_unit_fallback:{}", execution.id),
+        )
+        .await?
+        .is_some()
+        {
+            return Ok(false);
+        }
+        let Some(context) = self.load_fallback_context(&execution, &route).await? else {
+            return Ok(false);
+        };
+        let candidates = role_fallback_candidates(&context.envelope, &context.task_role_id);
+        if candidates.is_empty() {
+            self.record_fallback_block(&context, "chain_exhausted", None, 0)
+                .await?;
+            return Ok(true);
+        }
+        let Some(work_unit) = WorkUnitRepo::get_by_id(&*self.db, &context.work_unit_id).await?
+        else {
+            return Ok(false);
+        };
+        let Some(role) = TaskRoleRepo::get_by_id(&*self.db, &context.task_role_id).await? else {
+            return Ok(false);
+        };
+        if work_unit.task_id != context.task_id
+            || work_unit.role != role.role
+            || work_unit.version != context.work_unit_version
+            || work_unit.assigned_actor
+                != Some(db::ActorRef::Agent(context.origin_agent_id.clone()))
+            || work_unit.status != db::WorkUnitStatus::Open
+        {
+            return Ok(false);
+        }
+
+        let dispatch_state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM task_dispatch WHERE task_id = ?")
+                .bind(&context.task_id)
+                .fetch_optional(self.db.pool())
+                .await?;
+        if dispatch_state.as_deref() != Some("running") {
+            return Ok(false);
+        }
+        let running_attempt: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
                     SELECT 1 FROM execution
                     WHERE work_unit_id = ? AND status = 'running'
                 )",
+        )
+        .bind(&context.work_unit_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if running_attempt {
+            return Ok(false);
+        }
+
+        let last_receipt =
+            WorkUnitFallbackReceiptRepo::list_work_unit_fallback_receipts_by_work_unit(
+                &*self.db,
+                &context.work_unit_id,
             )
-            .bind(&context.work_unit_id)
-            .fetch_one(self.db.pool())
-            .await?;
-            if running_attempt {
+            .await?
+            .into_iter()
+            .filter(|receipt| receipt.task_role_id == context.task_role_id)
+            .max_by_key(|receipt| receipt.chain_index);
+        if let Some(last_receipt) = last_receipt.as_ref() {
+            if last_receipt.to_actor_id != context.origin_agent_id
+                || last_receipt.work_unit_version_after != context.work_unit_version
+            {
                 return Ok(false);
             }
-
-            let last_receipt =
-                WorkUnitFallbackReceiptRepo::list_work_unit_fallback_receipts_by_work_unit(
-                    &*self.db,
-                    &context.work_unit_id,
-                )
-                .await?
-                .into_iter()
-                .filter(|receipt| receipt.task_role_id == context.task_role_id)
-                .max_by_key(|receipt| receipt.chain_index);
-            if let Some(last_receipt) = last_receipt.as_ref() {
-                if last_receipt.to_actor_id != context.origin_agent_id
-                    || last_receipt.work_unit_version_after != context.work_unit_version
-                {
-                    return Ok(false);
-                }
-            }
-            self.apply_first_or_next_fallback(context, route, work_unit, candidates, last_receipt)
-                .await
-        };
-
-        self.complete_fallback_receipt(&execution, &receipt).await
+        }
+        self.apply_first_or_next_fallback(context, route, work_unit, candidates, last_receipt)
+            .await
     }
 
     async fn load_fallback_context(
@@ -459,26 +458,12 @@ impl TaskDispatcher {
             .to_string(),
             created_at: now.clone(),
         };
-        let allocated = WorkUnitRepo::allocate(
-            &*self.db,
-            db::AllocateWorkUnit {
-                id: work_unit.id.clone(),
-                expected_version: work_unit.version,
-                role: work_unit.role.clone(),
-                assigned_actor: Some(db::ActorRef::Agent(candidate.grant.agent_id.clone())),
-                updated_at: now.clone(),
-            },
-            allocation_event,
-        )
-        .await?;
-        DomainEventService::publish_committed_hint(&self.event_bus, &allocated.event);
-
         let receipt_input = CreateWorkUnitFallbackReceipt {
             id: db::new_uuid_v4(),
             task_id: context.task_id.clone(),
             work_unit_id: context.work_unit_id.clone(),
             work_unit_version_before: context.work_unit_version,
-            work_unit_version_after: allocated.record.version,
+            work_unit_version_after: next_version,
             origin_execution_id: context.origin_execution_id.clone(),
             failure_class: "executor_unavailable".to_owned(),
             route_attempts_digest: context.route_attempts_digest.clone(),
@@ -814,7 +799,8 @@ impl TaskDispatcher {
         payload: Value,
     ) -> Result<()> {
         if let Some(existing) = DomainEventRepo::get_event_by_dedupe(&*self.db, dedupe_key).await? {
-            let existing_payload: Value = serde_json::from_str(&existing.payload_json)?;
+            let existing_payload: Value = serde_json::from_str(&existing.payload_json)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
             if existing.event_type != "task.work_unit_fallback"
                 || existing.entity_type != "work_unit"
                 || existing.entity_id != context.work_unit_id

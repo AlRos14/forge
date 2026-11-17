@@ -48,6 +48,7 @@ import { WorkUnitHumanReviewPanel } from '@/components/task-detail/work-unit-rev
 import { ActorIdentity } from '@/features/task-roles/ActorIdentity'
 import { CopyReferenceButton } from '@/components/ui/copy-reference-button'
 import { TaskCoordinationPanel } from '@/components/task-detail/task-coordination-panel'
+import { TaskPhaseThreePanel } from '@/components/task-detail/task-phase-three-panel'
 import { readRequiredChecks } from '@/components/task-detail/task-verification'
 import { TaskJourneyPanel } from '@/components/task-detail/task-journey-panel'
 import type {
@@ -677,6 +678,9 @@ export function TaskDetailPage({
               daemons={daemons}
               onOpenAdvancedWork={() => setActiveTab('work')}
             />
+          </div>
+          <div className="min-w-0 lg:col-span-2">
+            <TaskPhaseThreePanel task={task} />
           </div>
           <section className="min-w-0 space-y-3 rounded-lg border p-4">
             <div className="flex flex-wrap items-center justify-between gap-2">

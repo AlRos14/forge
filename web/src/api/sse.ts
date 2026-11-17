@@ -245,6 +245,32 @@ export function routeSsePayload(
     }
   }
 
+  if (
+    eventType === 'task.work_unit_fallback' ||
+    eventType === 'task.micro_fix_bounds_exceeded' ||
+    eventType === 'task.coordinator_replan_proposed'
+  ) {
+    const taskId =
+      typeof facts.task_id === 'string'
+        ? facts.task_id
+        : payload.scope_type === 'task'
+          ? (payload.scope_id ?? undefined)
+          : undefined
+    if (taskId) {
+      void queryClient.invalidateQueries({ queryKey: qk.taskFallbackReceipts(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskMicroFixes(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskCoordinatorReplans(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskHumanDecisions(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskCoordination(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.workUnits(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDispatch(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.reviewLines(taskId) })
+    } else {
+      invalidateAllActiveQueries(queryClient)
+    }
+  }
+
   if (eventType.startsWith('task.intervention_')) {
     const taskId =
       typeof facts.task_id === 'string'
@@ -358,6 +384,9 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
             'task.pr_followup_proposed',
             'task.pr_action_requested',
             'task.pr_action_completed',
+            'task.work_unit_fallback',
+            'task.micro_fix_bounds_exceeded',
+            'task.coordinator_replan_proposed',
             'project.created',
             'project.updated',
             'project.deleted',

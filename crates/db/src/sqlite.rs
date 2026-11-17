@@ -120,6 +120,12 @@ struct Cursor {
     offset: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PhaseThreeKeysetCursor {
+    sort_value: String,
+    id: String,
+}
+
 impl SqliteDb {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -147,6 +153,53 @@ fn decode_offset(cursor: &Option<String>) -> Result<i64> {
 fn encode_offset(offset: i64) -> Result<String> {
     let bytes = serde_json::to_vec(&Cursor { offset }).map_err(|_| DbError::InvalidCursor)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_phase_three_cursor(cursor: &Option<String>) -> Result<Option<PhaseThreeKeysetCursor>> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| DbError::InvalidCursor)?;
+    let cursor: PhaseThreeKeysetCursor =
+        serde_json::from_slice(&bytes).map_err(|_| DbError::InvalidCursor)?;
+    if cursor.sort_value.trim().is_empty() || cursor.id.trim().is_empty() {
+        return Err(DbError::InvalidCursor);
+    }
+    Ok(Some(cursor))
+}
+
+fn encode_phase_three_cursor(sort_value: String, id: String) -> Result<String> {
+    let bytes = serde_json::to_vec(&PhaseThreeKeysetCursor { sort_value, id })
+        .map_err(|_| DbError::InvalidCursor)?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn phase_three_page_from_items<T>(
+    mut items: Vec<T>,
+    page: &PageRequest,
+    sort_value: impl Fn(&T) -> String,
+    id: impl Fn(&T) -> String,
+) -> Result<Page<T>> {
+    let page_limit = limit(page) as usize;
+    let has_next = items.len() > page_limit;
+    if has_next {
+        items.truncate(page_limit);
+    }
+    let next_cursor = if has_next {
+        items
+            .last()
+            .map(|last| encode_phase_three_cursor(sort_value(last), id(last)))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(Page {
+        items,
+        next_cursor,
+        total_count: None,
+    })
 }
 
 fn order_clause(page: &PageRequest) -> &'static str {

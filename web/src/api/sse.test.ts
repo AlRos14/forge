@@ -276,4 +276,29 @@ describe('routeSsePayload', () => {
       )
     }
   })
+
+  it('invalidates phase-three receipt, coordination, review and decision queries', () => {
+    for (const name of [
+      'task.work_unit_fallback',
+      'task.micro_fix_bounds_exceeded',
+      'task.coordinator_replan_proposed',
+    ] as const) {
+      const { queryClient, invalidateQueries } = createMocks()
+      routeSsePayload(
+        event(name, { scope_type: 'task', scope_id: 'task-1', payload: { task_id: 'task-1' } }),
+        queryClient,
+        { dispatch: vi.fn() },
+      )
+      expect(invalidateQueries.mock.calls).toEqual(
+        expect.arrayContaining([
+          [{ queryKey: ['tasks', 'task-1', 'fallback-receipts'] }],
+          [{ queryKey: ['tasks', 'task-1', 'micro-fixes'] }],
+          [{ queryKey: ['tasks', 'task-1', 'coordinator-replans'] }],
+          [{ queryKey: ['tasks', 'task-1', 'human-decisions'] }],
+          [{ queryKey: ['tasks', 'task-1', 'coordination'] }],
+          [{ queryKey: ['tasks', 'task-1', 'review-lines'] }],
+        ]),
+      )
+    }
+  })
 })

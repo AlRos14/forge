@@ -117,6 +117,9 @@ import type {
   CreateValidationCheckRequest,
   HumanDecisionListResponse,
   HumanDecisionResponse,
+  WorkUnitFallbackReceiptListResponse,
+  MicroFixReceiptListResponse,
+  CoordinatorReplanListResponse,
   RetireValidationCheckRequest,
   ValidationCheckDefinitionResponse,
   ValidationCheckListResponse,
@@ -805,6 +808,47 @@ export function useTaskHumanDecisionsQuery(taskId: string) {
     queryFn: () => apiFetch<HumanDecisionListResponse>(`/tasks/${taskId}/human-decisions`),
     enabled: Boolean(taskId),
     refetchInterval: 5_000,
+  })
+}
+
+const TASK_PHASE_THREE_PAGE_SIZE = 50
+
+export function useTaskFallbackReceiptsQuery(taskId: string) {
+  return useInfiniteQuery({
+    queryKey: qk.taskFallbackReceipts(taskId),
+    queryFn: ({ pageParam }) =>
+      apiFetch<WorkUnitFallbackReceiptListResponse>(`/tasks/${taskId}/fallback-receipts`, {
+        search: { cursor: pageParam as string | undefined, limit: TASK_PHASE_THREE_PAGE_SIZE },
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useTaskMicroFixesQuery(taskId: string) {
+  return useInfiniteQuery({
+    queryKey: qk.taskMicroFixes(taskId),
+    queryFn: ({ pageParam }) =>
+      apiFetch<MicroFixReceiptListResponse>(`/tasks/${taskId}/micro-fixes`, {
+        search: { cursor: pageParam as string | undefined, limit: TASK_PHASE_THREE_PAGE_SIZE },
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: Boolean(taskId),
+  })
+}
+
+export function useTaskCoordinatorReplansQuery(taskId: string) {
+  return useInfiniteQuery({
+    queryKey: qk.taskCoordinatorReplans(taskId),
+    queryFn: ({ pageParam }) =>
+      apiFetch<CoordinatorReplanListResponse>(`/tasks/${taskId}/coordinator-replans`, {
+        search: { cursor: pageParam as string | undefined, limit: TASK_PHASE_THREE_PAGE_SIZE },
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: Boolean(taskId),
   })
 }
 

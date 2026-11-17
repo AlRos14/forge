@@ -3368,6 +3368,9 @@ fn mcp_validation_tools_are_read_only_and_not_copilot_tools() {
             "forge_list_task_validation_check_requests",
             "forge_list_task_validation_comparisons",
             "forge_list_task_human_decisions",
+            "forge_list_task_fallback_receipts",
+            "forge_list_task_micro_fixes",
+            "forge_list_task_coordinator_replans",
         ] {
             assert!(names.contains(&name), "{name}");
             assert!(
@@ -3458,6 +3461,53 @@ fn mcp_validation_task_lists_are_empty_and_access_checked() {
             let error = call_tool_error_as(
                 &state,
                 &user_mcp_context("task-outsider"),
+                name,
+                json!({ "task_id": task.id }),
+            )
+            .await;
+            assert_eq!(error.code, -32001, "{name}");
+        }
+    });
+}
+
+#[test]
+fn mcp_phase_three_receipt_tools_are_read_only_and_task_scoped() {
+    run_async(async {
+        let state = sqlite_state().await;
+        add_user(&state, "phase3-outsider").await;
+        let task = seed_task(&state).await;
+        let tools = dispatch(&state, "tools/list", json!({}))
+            .await
+            .expect("tools/list succeeds");
+        let names = tools["tools"]
+            .as_array()
+            .expect("tool list")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+
+        for name in [
+            "forge_list_task_fallback_receipts",
+            "forge_list_task_micro_fixes",
+            "forge_list_task_coordinator_replans",
+        ] {
+            assert!(names.contains(&name), "{name}");
+            assert!(
+                !api_types::PROJECT_COPILOT_MCP_TOOLS.contains(&name),
+                "{name}"
+            );
+            let listed = call_tool_as(
+                &state,
+                &user_mcp_context("test-user"),
+                name,
+                json!({ "task_id": task.id, "limit": 1 }),
+            )
+            .await;
+            assert_eq!(listed["items"], json!([]), "{name}");
+            assert!(listed["next_cursor"].is_null(), "{name}");
+            let error = call_tool_error_as(
+                &state,
+                &user_mcp_context("phase3-outsider"),
                 name,
                 json!({ "task_id": task.id }),
             )

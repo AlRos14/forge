@@ -505,6 +505,18 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::human_decisions::answer_task_decision),
         )
         .route(
+            "/api/v1/tasks/{id}/fallback-receipts",
+            get(routes::phase_three::list_task_fallback_receipts),
+        )
+        .route(
+            "/api/v1/tasks/{id}/micro-fixes",
+            get(routes::phase_three::list_task_micro_fixes),
+        )
+        .route(
+            "/api/v1/tasks/{id}/coordinator-replans",
+            get(routes::phase_three::list_task_coordinator_replans),
+        )
+        .route(
             "/api/v1/tasks/{id}/pr-feedback",
             get(routes::pr_feedback::list_task_feedback),
         )

@@ -1109,6 +1109,11 @@ DTOs nuevos (`crates/api-types/src/`, `#[derive(Serialize, Deserialize, TS)]`, `
 `pr_feedback.rs` (fase 2): `ExternalFeedbackItemResponse` (incluye `body` solo para quien lee la Task; nunca en SSE), `PrFeedbackPolicy`, `UpdatePrFeedbackPolicyRequest {expected_updated_at?, policy}`, `PrExternalActionResponse`, `DecidePrExternalActionRequest {expected_version, note?, idempotency_key}`;
 ampliaciones en `task_coordination.rs`: `TaskCoordinationRequestResponse` gana `kind` ampliado (`validation_findings|external_feedback|human_decision_resume`), `source_subject_kind/id/digest`, `resumes_request_id`; `review_validation.rs`: `ValidationRunResponse` gana `run_origin`, `definition_digest`, `catalog_check_id`, `check_request_id`; `requests.rs`: `UpdatePrProviderConfigRequest` gana `credential_id`, `PrProviderStatus` pasa `has_token` → `has_credential`.
 
+Fase 3: `phase_three.rs` añade `WorkUnitFallbackReceiptResponse`,
+`MicroFixReceiptResponse` y `CoordinatorReplanResponse`, sus enums públicos y
+listas `{items, next_cursor}`; las respuestas incluyen recibos, clasificación
+y hechos medidos para los paneles de Task.
+
 REST (rutas finales; nuevas salvo indicación; todas con paginación por cursor opaco y campo `items`):
 
 | Método y ruta | Fase | Autoridad |
@@ -1125,13 +1130,17 @@ REST (rutas finales; nuevas salvo indicación; todas con paginación por cursor 
 | `GET /api/v1/tasks/{id}/pr-feedback` | 2 | lectura de la Task |
 | `GET /api/v1/tasks/{id}/pr-actions` | 2 | lectura de la Task |
 | `GET /api/v1/tasks/{id}/pr-rework` | 2 (D3') | lectura de la Task |
+| `GET /api/v1/tasks/{id}/fallback-receipts` | 3 | lectura de la Task |
+| `GET /api/v1/tasks/{id}/micro-fixes` | 3 | lectura de la Task |
+| `GET /api/v1/tasks/{id}/coordinator-replans` | 3 | lectura de la Task |
 | `POST /api/v1/tasks/{id}/pr-actions/{action_id}/approve` y `/reject` | 2 | Human con autoridad de mutar la Task (+ owner/admin si `post_comment` automático desactivado por política) |
 | `GET/PUT /api/v1/repos/{id}/pr-feedback-policy` | 2 | owner/admin |
 | `POST /api/v1/providers` con `provider:"github"`, `PATCH /api/v1/repos/{id}` con `credential_id` (existentes) | 2 | dueño del handle + owner/admin |
 
 Archivos de rutas (nodo API es dueño; `routes/mod.rs` y `lib.rs` los edita solo API):
-`routes/validation_checks.rs`, `routes/human_decisions.rs`, `routes/pr_feedback.rs`.
-MCP (solo lectura, `crates/mcp-server/src/tools/{descriptors,handlers}.rs`, nodo API): `forge_list_validation_checks`, `forge_list_task_validation_check_requests`, `forge_list_task_validation_comparisons`, `forge_list_task_human_decisions` (fase 1), `forge_list_task_pr_feedback`, `forge_list_task_pr_actions`, `forge_list_task_pr_rework` (fase 2). Ninguna herramienta responde decisiones, aprueba ni publica en GitHub; Project Copilot sin acceso a escritura.
+`routes/validation_checks.rs`, `routes/human_decisions.rs`, `routes/pr_feedback.rs` y
+`routes/phase_three.rs` (fase 3).
+MCP (solo lectura, `crates/mcp-server/src/tools/{descriptors,verification}.rs`, nodo API): `forge_list_validation_checks`, `forge_list_task_validation_check_requests`, `forge_list_task_validation_comparisons`, `forge_list_task_human_decisions` (fase 1), `forge_list_task_pr_feedback`, `forge_list_task_pr_actions`, `forge_list_task_pr_rework` (fase 2), y `forge_list_task_fallback_receipts`, `forge_list_task_micro_fixes`, `forge_list_task_coordinator_replans` (fase 3). Ninguna herramienta responde decisiones, aprueba ni publica en GitHub; Project Copilot sin acceso a escritura.
 SSE (`crates/api-types/src/public_events.rs`, nombres exactos; payload solo ids, digests, estados, nunca cuerpos ni tokens): fase 1 `task.validation_check_requested`, `task.validation_check_completed`, `task.validation_comparison_recorded`, `task.human_decision_requested`, `task.human_decision_answered`; fase 2 `task.pr_feedback_ingested`, `task.pr_action_requested`, `task.pr_action_completed`, y los de D3' (`task.pr_feedback_triaged`, `task.pr_rework_superseded`, `task.pr_rework_resumed`, `task.pr_rework_converged`, `task.pr_followup_proposed`; ver «Congelado 11» §11.9); fase 3 `task.work_unit_fallback`, `task.micro_fix_bounds_exceeded`, `task.coordinator_replan_proposed`. (Los eventos `validation_run.started|completed` existentes no cambian.)
 Códigos de error (`ApiError::bad_request_with_code`/409 donde se indica):
 `validation.check_not_authorized`, `validation.check_unknown`, `validation.check_stale_pin`, `validation.subject_not_resolvable`, `validation.subject_stale`, `validation.workspace_leased`, `validation.baseline_unavailable`, `validation.catalog_forbidden`, `human_decision.invalid_options`, `human_decision.evidence_invalid`, `human_decision.version_conflict` (409), `human_decision.authority_required`, `human_decision.not_open`, `coordination.output_not_permitted`, `coordination.replan_limit_reached`, `pr_feedback.policy_forbidden`, `pr_action.not_authorized`, `pr_action.remote_head_changed`, `pr_provider.credential_not_configured`, `credential.owner_not_authorized`, `repo.pr_provider_token_retired`, `micro_fix.bounds_exceeded`, `fallback.not_authorized`; fase 2 D3': `pr_feedback.extend_out_of_scope`, `pr_feedback.plan_without_extend`, `pr_rework.not_authorized`, `pr_rework.stale_request`, `pr_rework.not_fast_forward`, `pr_rework.reuse_target_missing`, `pr_rework.supersession_open`.
@@ -1623,9 +1632,9 @@ Cualquier cambio de contrato vuelve a N0.
 | PX | (Fase 2, nuevo por D3') Pausa no destructiva de admisión y base del rework: **V175** (`pr_rework_supersession`, columnas `rework_outcome`/`supersession_id`/`readmits_supersession_id` en `remote_pr_admission`, `task_external_feedback_disposition`, triggers recreados y nuevos de «Congelado 11» §11.2), repos `sqlite/pr_rework.rs`, `PrReworkService::{supersede_for_rework, resume_after_supersession, observe_remote}`, `LifecycleCause::PrFeedbackRework` (recibo `pr_feedback_rework`), exclusión `rework_outcome IS NULL` en selecciones de P1, actualización de `pr_lifecycle_spike_*`. Pruebas `v175_*` y `pr_rework_*`. | N0, A3, P0 | ver Congelado 10 | **IMPLEMENTADO / NOT RUN** (ver «Anexo PX») |
 | P3 | (Fase 2, redefinido por D3') Re-admisión sobre la misma PR (`find_open_pr_by_head`, `publish_pr` con `readmits_supersession_id`), `push_update` dentro de la admisión nueva (fast-forward, `expected_remote_head_sha`), `post_comment` del resumen de triage (también sobre admisión superseded), `PrReworkWatcher` (merge/cierre remoto durante rework, §11.6); Gate exacto, autorización por política congelada/Decisión (D5), idempotencia, `OutcomeUnknown`, recuperación; el merge nunca. | P0, PX, A3, C3 | `pr_external_action.rs`, `pr_service.rs`, `pr_github_client.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo P3) |
 | RT | (Fases 1–3, una pasada por fase) Cableado único y ordenado de las salidas nuevas en el runtime y coordinación; contexto exacto de validación y feedback; políticas `allowed_actions`. | R1, D1, M1, C2, P2 | `orchestrator_runtime.rs`, `task_coordination.rs` | **Fase 1 IMPLEMENTADO / NOT RUN** (ver Anexo RT); **fase 2 IMPLEMENTADO / NOT RUN** (ver Anexo RT fase 2; V178 añadida); fase 3 TODO |
-| API | (por fase) REST, MCP, SSE, DTOs, tipos generados, `forge-ctl` si procede. Ver «Contratos públicos». | RT, D1, C3, P3 | ver L6 | **FASE 1 IMPLEMENTADA / NOT RUN** (ver Anexo API fase 1); **FASE 2 IMPLEMENTADA / NOT RUN** (ver Anexo API fase 2); fase 3 TODO |
-| UI | (por fase) Paneles de decisión humana, checks (catálogo, solicitudes, comparación base), feedback de PR, estados de fallback/micro-fix en la journey. | API (fixtures desde N0) | ver L7 | **TODO** |
-| T | (por fase) Tests escritos contra interfaces congeladas (ver plan de pruebas). | N0 | ver L8 | **TODO** |
+| API | (por fase) REST, MCP, SSE, DTOs, tipos generados, `forge-ctl` si procede. Ver «Contratos públicos». | RT, D1, C3, P3 | ver L6 | **FASE 1 IMPLEMENTADA / NOT RUN** (ver Anexo API fase 1); **FASE 2 IMPLEMENTADA / NOT RUN** (ver Anexo API fase 2); **FASE 3 IMPLEMENTADA / NOT RUN** (ver Anexo API/UI fase 3) |
+| UI | (por fase) Paneles de decisión humana, checks (catálogo, solicitudes, comparación base), feedback de PR, estados de fallback/micro-fix en la journey. | API (fixtures desde N0) | ver L7 | **FASE 3 IMPLEMENTADA / NOT RUN** (ver Anexo API/UI fase 3) |
+| T | (por fase) Tests escritos contra interfaces congeladas (ver plan de pruebas). | N0 | ver L8 | **FASE 3 ESCRITAS / NOT RUN** (API, MCP y Vitest; ver Anexo API/UI fase 3) |
 | I | (por fase) Integración por ownership, revisión independiente estática, `cargo fmt --check` y `git diff --check` sin compilar. | todo lo anterior | root | **TODO** |
 | CI | Por fase: un único `workflow_dispatch` de `.github/workflows/build-local-linux.yml` con `run_checks=true` sobre el SHA integrado de la fase (pasos de lint/test web, browser smoke, fmt/Clippy y tests enfocados). Los pasos de tests nuevos los añade el nodo I (ver «Nota de workflow»). PASS/FAIL/BLOCKED/NOT RUN por check; sin trasladar PASS entre SHAs ni entre fases. | I | owner del workflow | **TODO** |
 | PIL | Piloto con Project/repo GitHub desechable y proveedor real; autorización expresa de cuotas, costes y acciones externas. | CI, autorización | owner del entorno | **TODO / NO AUTORIZADO** |
@@ -2680,11 +2689,9 @@ y rollback cuando falla el guard del recibo. Los filtros CI son
 DB. Estado: **IMPLEMENTADO / NOT RUN**;
 no se ejecutaron Cargo ni pnpm localmente. No se añadió migración.
 
-La unión TypeScript `PublicEventType` y la lista de eventos nombrados del
-cliente web quedan pendientes de generación/actualización: el comando del repo
-`pnpm generate:types` invoca `cargo test -p api-types`, ambos vedados en este
-nodo. El enum Rust, el allowlist SSE del servidor y la documentación API sí
-están actualizados.
+La unión TypeScript `PublicEventType` y la lista de listeners nombrados del
+cliente web se actualizaron manualmente en formato `ts-rs`; no se ejecutó el
+generador porque invoca `cargo test -p api-types`, prohibido en este nodo.
 
 ### Anexo M1/R1 (fase 3) — micro-fix y replan del coordinador (IMPLEMENTADO / NOT RUN)
 
@@ -2732,6 +2739,40 @@ se ejecutaron Cargo build/test/clippy ni pnpm. Solo se ejecutará `cargo fmt
 V180 cubre los recibos y V172 ya contiene el ledger/origen de replan.
 
 La unión TypeScript `PublicEventType` y la lista de listeners nombrados del
-cliente web aún requieren regeneración/actualización; no se ejecutó el generador
-porque invoca el `cargo test -p api-types` prohibido en esta sesión. La enum Rust,
-el allowlist del endpoint SSE y `docs/api.md` ya incluyen ambos eventos.
+cliente web se actualizaron manualmente en formato `ts-rs`; no se ejecutó el
+generador porque invoca el `cargo test -p api-types` prohibido en esta sesión.
+El endpoint SSE proyecta `micro_fix.bounds_exceeded` al nombre público
+`task.micro_fix_bounds_exceeded` y conserva su allowlist de campos.
+
+### Anexo API/UI (fase 3) — IMPLEMENTADO / NOT RUN
+
+REST añade `GET /api/v1/tasks/{id}/fallback-receipts`,
+`GET /api/v1/tasks/{id}/micro-fixes` y
+`GET /api/v1/tasks/{id}/coordinator-replans`. Los tres requieren visibilidad
+de Task y devuelven `{items, next_cursor}` con cursores keyset opacos. Los DTOs
+públicos son `WorkUnitFallbackReceiptResponse`, `MicroFixReceiptResponse` y
+`CoordinatorReplanResponse`, con sus listas/enums en `api-types` y bindings
+TypeScript escritos manualmente en el formato generado de `ts-rs`.
+
+MCP añade `forge_list_task_fallback_receipts`, `forge_list_task_micro_fixes` y
+`forge_list_task_coordinator_replans`, solo lectura y bajo el mismo acceso
+Task-scoped. La revisión del flujo existente confirma que
+`HumanDecisionSourceKind::CoordinatorReplan` ya se serializa en la respuesta;
+el `GET` conserva sus opciones exactas `approve_replan`, `reject` y
+`revise_scope`, y el endpoint humano existente
+`POST /tasks/{id}/human-decisions/{decision_id}/answer` acepta la opción elegida
+con su versión esperada y autoridad asociada.
+
+SSE entrega `task.work_unit_fallback`, `task.micro_fix_bounds_exceeded` y
+`task.coordinator_replan_proposed` tras proyección de campos allowlisted. La
+unión `PublicEventType` y los listeners de `web/src/api/sse.ts` incluyen los
+tres nombres. Task detail muestra los paneles Fallback, Micro-fixes y Replans,
+con clases de coste, bounds, hechos de clasificación y enlaces a decisiones;
+el panel de coordinación muestra la cadena fallback y el reviewer
+preautorizado con `cost_class`.
+
+Se añadieron `crates/api/tests/coordinator_phase3.rs`, la prueba MCP de lecturas
+fase 3, pruebas Vitest de ambos paneles y proyección SSE, y su registro en el
+workflow API. Esas pruebas quedan **NOT RUN** por el límite de validación de
+esta sesión; no se ejecutaron Cargo tests/build/clippy ni pnpm. No se añadió ni
+editó ninguna migración.

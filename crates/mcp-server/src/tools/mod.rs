@@ -187,6 +187,15 @@ pub(crate) async fn dispatch_tool(
         "forge_list_task_human_decisions" => {
             verification::forge_list_task_human_decisions(state, arguments).await
         }
+        "forge_list_task_fallback_receipts" => {
+            verification::forge_list_task_fallback_receipts(state, arguments).await
+        }
+        "forge_list_task_micro_fixes" => {
+            verification::forge_list_task_micro_fixes(state, arguments).await
+        }
+        "forge_list_task_coordinator_replans" => {
+            verification::forge_list_task_coordinator_replans(state, arguments).await
+        }
         "forge_list_task_pr_feedback" => {
             verification::forge_list_task_pr_feedback(state, arguments).await
         }

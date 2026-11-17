@@ -288,6 +288,9 @@ are in [the PR0 contract](plans/pr0-task-coordination-contract.md).
 | Method and route | Effect |
 |---|---|
 | `GET /tasks/{id}/coordination` | Read the current authorization version, resolved team (names, harness/host, capabilities), envelope, blockers, latest turn, latest plan, lifecycle, dispatch intent, and `project_plan_batch_scope` (`null` or `{ batch_id, batch_state, task_state, blocker }`) from the exact current authorization binding. Batch-scoped versions expose `can_request: false` because the generic turn route rejects their origin. `can_authorize` reports caller eligibility; it does not bypass a batch binding or its active-state preconditions. `0 WorkUnits` is a valid starting state. |
+| `GET /tasks/{id}/fallback-receipts` | Read Task-visible fallback receipts with the replaced and selected Actor, TaskRole, failure class, chain index, cost class, and exact authorization/envelope/route-attempt digests. |
+| `GET /tasks/{id}/micro-fixes` | Read bounded micro-fix receipts, declared findings and paths, diff counts, bounds outcome/violation, reviewer profile cost class, and exact commit references. |
+| `GET /tasks/{id}/coordinator-replans` | Read coordinator replan ordinal, reason, evidence links, deterministic classification and measured facts, state, and any linked Human decision. |
 | `POST /tasks/{id}/coordination/authorize` | Create or replace the versioned authorization. Body: `expected_task_version`, `expected_coordination_version`, `mode`, optional exact `coordinator_task_role_id` and `coordinator_actor`, optional `envelope`, `idempotency_key`. The coordinator TaskRole must currently have `orchestration` capability and the Actor must be an active member. If the current authorization is bound to a running or paused Project batch, the generic route returns `409 project_plan_batch_inactive`. Explicitly revoke the Task authorization or revoke/complete the Project batch before creating a fresh standalone Human authorization. The old batch grant then becomes stale and admits no further work; the new authorization does not revive it. |
 | `POST /tasks/{id}/coordination/revoke` | Revoke the authorization, advance its version, and preserve existing WorkUnits, plans, and history. Running Executions are not silently stopped. |
 | `POST /tasks/{id}/coordination/requests` | Request one bounded turn. Body: expected Task/coordination versions, `objective`, optional `constraints`/`context`, `acceptance_criteria`, idempotency key. A Human coordinator returns `422 coordination.human_turn_unsupported`; use manual editing. Replays return the same request. A version minted by a Project batch is scoped to that batch and returns `409 project_plan_batch_inactive` through this generic route, even after batch revocation or completion; create a fresh explicit TaskCoordination authorization to restore the standalone request flow. |
@@ -324,6 +327,11 @@ TaskRole action. Its plan is classified against the captured Task objective,
 team, WorkUnit budget, repository/path scope, and envelope; a scope or authority
 change requires an exact Human decision before materialization. The V172 ledger
 limits coordinator replans to two per Task.
+
+The coordination overview returns the authorized `fallback_agents` chain and
+optional `micro_fix_reviewer`; each grant includes its `cost_class`, which the
+team/coordination view displays so preauthorized lower-cost profiles remain
+visible.
 
 After atomic materialization commits, ready assigned Agent repository scopes
 are prepared through the existing WorkUnit workspace service before launch.
@@ -382,6 +390,12 @@ plan content, prompts, briefs, free-form escalation text, credentials, or paths.
 `route_limit`, the safe escalation code, and exact cycle request/TaskRole IDs
 when present. The free-form reason remains available on the durable request
 response only.
+
+The internal `micro_fix.bounds_exceeded` event is projected publicly as
+`task.micro_fix_bounds_exceeded`. Phase-3 event payloads use an explicit
+allowlist of identifiers, digests, classifications/statuses, cost class, and
+bounded counters; they contain no plan or findings bodies, declared paths,
+prompts, or credentials.
 
 Quality requests are limited to four admissions per durable source chain,
 in addition to the existing Task-global budget. The eight-round exact rework
@@ -509,7 +523,19 @@ All lists below return `{items, next_cursor}` with opaque cursors (`cursor`,
 | `GET /tasks/{id}/validation-check-requests` | Runner queue/outcomes for the Task (`state` filter). There is no REST enqueue: requests come only from the coordinator or the after-integration hook. |
 | `GET /tasks/{id}/validation-comparisons` | Immutable baseline comparisons (`regression`, `pre_existing_failure`, `fixed`, `both_pass`, `inconclusive`). |
 | `GET /tasks/{id}/human-decisions`, `GET /tasks/{id}/human-decisions/{decision_id}` | Structured decisions with options, evidence links (kind, id, digest), recommendation and state. |
-| `POST /tasks/{id}/human-decisions/{decision_id}/answer` | Body `{expected_version, option_id, note?, idempotency_key}`; the answering user is always the authenticated user. An option whose `authority_effect` is not `none` needs a Project owner/admin. Errors: `409 human_decision.version_conflict`, `409 human_decision.not_open`, `403 human_decision.authority_required`, `422 human_decision.invalid_options`. The response carries the decision and `resume` (`created|already_bound|deferred`). `idempotency_key` is validated; replay safety comes from `expected_version` (a repeated answer is `not_open`). Project Copilot never answers. |
+| `POST /tasks/{id}/human-decisions/{decision_id}/answer` | Body `{expected_version, option_id, note?, idempotency_key}`; the answering user is always the authenticated user. An option whose `authority_effect` is not `none` needs a Project owner/admin. This route also answers `source_kind: coordinator_replan` decisions; their exact options are `approve_replan`, `reject`, and `revise_scope`, and a scope/authority-changing approval requires owner/admin authority. Errors: `409 human_decision.version_conflict`, `409 human_decision.not_open`, `403 human_decision.authority_required`, `422 human_decision.invalid_options`. The response carries the decision and `resume` (`created|already_bound|deferred`). `idempotency_key` is validated; replay safety comes from `expected_version` (a repeated answer is `not_open`). Project Copilot never answers. |
+
+### Fallback, micro-fix, and coordinator replan receipts
+
+All three phase-3 reads require Task visibility and use `{items, next_cursor}`
+with opaque keyset cursors and `limit` from 1 to 100. Fallback receipts are
+ordered newest first; micro-fixes and replans are ordered by their Task-local
+ordinal. `failure_class` is the fallback reason class. Replan
+`classification_facts` is the stored deterministic fact set, and
+`human_decision_id` links to the corresponding decision under the same Task.
+Read-only MCP mirrors are `forge_list_task_fallback_receipts`,
+`forge_list_task_micro_fixes`, and `forge_list_task_coordinator_replans`.
+Decision answers remain Human REST operations.
 
 Gate policy `schema_version: 2` adds `required_checks`
 (`[{check_key, definition_digest, required_outcome:"passed"}]`) on
@@ -792,6 +818,8 @@ The MCP server advertises only registered tools. The current tool names are:
 - Verification (read-only): `forge_list_validation_checks`,
   `forge_list_task_validation_check_requests`,
   `forge_list_task_validation_comparisons`, `forge_list_task_human_decisions`,
+  `forge_list_task_fallback_receipts`, `forge_list_task_micro_fixes`,
+  `forge_list_task_coordinator_replans`,
   `forge_list_task_pr_feedback`, `forge_list_task_pr_actions`,
   `forge_list_task_pr_rework`.
   No MCP tool publishes a catalog version, answers a decision, or enqueues a

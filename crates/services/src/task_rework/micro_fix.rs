@@ -35,7 +35,7 @@ fn map_micro_fix_receipt_error(error: db::DbError) -> ServiceError {
 #[derive(Debug, Clone)]
 pub(super) struct MicroFixRequest {
     request_id: String,
-    authorization_version: i64,
+    pub(super) authorization_version: i64,
     review_producer_execution_id: String,
     report_digest: String,
     decision: MicroFixOutput,

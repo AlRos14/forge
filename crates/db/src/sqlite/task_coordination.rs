@@ -3216,4 +3216,50 @@ impl TaskCoordinatorReplanRepo for SqliteDb {
             .map(map_task_coordinator_replan)
             .collect()
     }
+
+    async fn list_coordinator_replans_by_task_page(
+        &self,
+        task_id: &str,
+        page: &PageRequest,
+    ) -> Result<Page<TaskCoordinatorReplan>> {
+        let cursor = decode_phase_three_cursor(&page.cursor)?;
+        let after_ordinal = cursor
+            .map(|cursor| {
+                cursor
+                    .sort_value
+                    .parse::<i64>()
+                    .map_err(|_| DbError::InvalidCursor)
+            })
+            .transpose()?;
+        let rows = if let Some(after_ordinal) = after_ordinal {
+            sqlx::query(
+                "SELECT * FROM task_coordinator_replan WHERE task_id = ? AND ordinal > ?
+                 ORDER BY ordinal ASC LIMIT ?",
+            )
+            .bind(task_id)
+            .bind(after_ordinal)
+            .bind(limit(page) + 1)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT * FROM task_coordinator_replan WHERE task_id = ?
+                 ORDER BY ordinal ASC LIMIT ?",
+            )
+            .bind(task_id)
+            .bind(limit(page) + 1)
+            .fetch_all(&self.pool)
+            .await?
+        };
+        let items = rows
+            .into_iter()
+            .map(map_task_coordinator_replan)
+            .collect::<Result<Vec<_>>>()?;
+        phase_three_page_from_items(
+            items,
+            page,
+            |item| item.ordinal.to_string(),
+            |item| item.id.clone(),
+        )
+    }
 }

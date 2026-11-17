@@ -10,8 +10,9 @@
 use std::sync::Arc;
 
 use db::{
-    PageRequest, PrExternalActionRepo, PrExternalActionState, PrReworkRepo, SortBy, SortOrder,
-    ValidationCheckRequestRepo, ValidationComparisonRepo,
+    MicroFixReceiptRepo, PageRequest, PrExternalActionRepo, PrExternalActionState, PrReworkRepo,
+    SortBy, SortOrder, TaskCoordinatorReplanRepo, ValidationCheckRequestRepo,
+    ValidationComparisonRepo, WorkUnitFallbackReceiptRepo,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -287,6 +288,162 @@ pub(super) async fn forge_list_task_human_decisions(
             "version": decision.version,
             "created_at": decision.created_at,
             "updated_at": decision.updated_at,
+        }));
+    }
+    Ok(json!({"items": items, "next_cursor": result.next_cursor}))
+}
+
+pub(super) async fn forge_list_task_fallback_receipts(
+    state: &AppState,
+    params: Value,
+) -> Result<Value, McpToolError> {
+    let params: TaskListParams = parse_params(params)?;
+    if params.state.is_some() {
+        return Err(McpToolError::new(
+            -32602,
+            "fallback receipts have no state filter",
+        ));
+    }
+    let result = WorkUnitFallbackReceiptRepo::list_work_unit_fallback_receipts_by_task_page(
+        &*state.db,
+        &params.task_id,
+        &page(params.cursor, params.limit),
+    )
+    .await?;
+    let items = result
+        .items
+        .into_iter()
+        .map(|receipt| {
+            json!({
+                "id": receipt.id,
+                "task_id": receipt.task_id,
+                "work_unit_id": receipt.work_unit_id,
+                "work_unit_version_before": receipt.work_unit_version_before,
+                "work_unit_version_after": receipt.work_unit_version_after,
+                "origin_execution_id": receipt.origin_execution_id,
+                "failure_class": receipt.failure_class,
+                "route_attempts_digest": receipt.route_attempts_digest,
+                "task_role_id": receipt.task_role_id,
+                "from_actor_kind": receipt.from_actor_kind.to_string(),
+                "from_actor_id": receipt.from_actor_id,
+                "to_actor_kind": receipt.to_actor_kind.to_string(),
+                "to_actor_id": receipt.to_actor_id,
+                "chain_index": receipt.chain_index,
+                "cost_class": receipt.cost_class.to_string(),
+                "authorization_version": receipt.authorization_version,
+                "envelope_digest": receipt.envelope_digest,
+                "new_execution_id": receipt.new_execution_id,
+                "created_at": receipt.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({"items": items, "next_cursor": result.next_cursor}))
+}
+
+pub(super) async fn forge_list_task_micro_fixes(
+    state: &AppState,
+    params: Value,
+) -> Result<Value, McpToolError> {
+    let params: TaskListParams = parse_params(params)?;
+    if params.state.is_some() {
+        return Err(McpToolError::new(
+            -32602,
+            "micro-fix receipts have no state filter",
+        ));
+    }
+    let result = MicroFixReceiptRepo::list_micro_fix_receipts_by_task_page(
+        &*state.db,
+        &params.task_id,
+        &page(params.cursor, params.limit),
+    )
+    .await?;
+    let mut items = Vec::with_capacity(result.items.len());
+    for receipt in result.items {
+        let finding_refs =
+            serde_json::from_str::<Value>(&receipt.finding_refs_json).map_err(|error| {
+                McpToolError::new(-32603, format!("invalid micro-fix finding refs: {error}"))
+            })?;
+        let declared_paths =
+            serde_json::from_str::<Value>(&receipt.declared_paths_json).map_err(|error| {
+                McpToolError::new(-32603, format!("invalid micro-fix declared paths: {error}"))
+            })?;
+        items.push(json!({
+            "id": receipt.id,
+            "task_id": receipt.task_id,
+            "request_id": receipt.request_id,
+            "source_kind": receipt.source_kind.to_string(),
+            "finding_refs": finding_refs,
+            "declared_paths": declared_paths,
+            "fix_work_unit_id": receipt.fix_work_unit_id,
+            "reviewed_commit_sha": receipt.reviewed_commit_sha,
+            "result_commit_sha": receipt.result_commit_sha,
+            "changed_files": receipt.changed_files,
+            "changed_lines": receipt.changed_lines,
+            "bounds_outcome": receipt.bounds_outcome.to_string(),
+            "bounds_violation": receipt.bounds_violation.map(|value| value.to_string()),
+            "reviewer_cost_class": receipt.reviewer_cost_class.map(|value| value.to_string()),
+            "reviewer_actor_kind": receipt.reviewer_actor_kind.map(|value| value.to_string()),
+            "reviewer_actor_id": receipt.reviewer_actor_id,
+            "envelope_digest": receipt.envelope_digest,
+            "ordinal": receipt.ordinal,
+            "created_at": receipt.created_at,
+            "updated_at": receipt.updated_at,
+        }));
+    }
+    Ok(json!({"items": items, "next_cursor": result.next_cursor}))
+}
+
+pub(super) async fn forge_list_task_coordinator_replans(
+    state: &AppState,
+    params: Value,
+) -> Result<Value, McpToolError> {
+    let params: TaskListParams = parse_params(params)?;
+    if params.state.is_some() {
+        return Err(McpToolError::new(
+            -32602,
+            "coordinator replans have no state filter",
+        ));
+    }
+    let result = TaskCoordinatorReplanRepo::list_coordinator_replans_by_task_page(
+        &*state.db,
+        &params.task_id,
+        &page(params.cursor, params.limit),
+    )
+    .await?;
+    let mut items = Vec::with_capacity(result.items.len());
+    for replan in result.items {
+        let evidence_links =
+            serde_json::from_str::<Value>(&replan.evidence_links_json).map_err(|error| {
+                McpToolError::new(-32603, format!("invalid replan evidence links: {error}"))
+            })?;
+        let classification_facts = replan
+            .classification_facts_json
+            .as_deref()
+            .map(serde_json::from_str::<Value>)
+            .transpose()
+            .map_err(|error| {
+                McpToolError::new(
+                    -32603,
+                    format!("invalid replan classification facts: {error}"),
+                )
+            })?;
+        items.push(json!({
+            "id": replan.id,
+            "task_id": replan.task_id,
+            "ordinal": replan.ordinal,
+            "authorization_version": replan.authorization_version,
+            "source_request_id": replan.source_request_id,
+            "producer_execution_id": replan.producer_execution_id,
+            "plan_request_id": replan.plan_request_id,
+            "reason": replan.reason,
+            "evidence_links": evidence_links,
+            "classification": replan.classification.map(|value| value.to_string()),
+            "classification_facts": classification_facts,
+            "human_decision_id": replan.human_decision_id,
+            "state": replan.state.to_string(),
+            "version": replan.version,
+            "created_at": replan.created_at,
+            "updated_at": replan.updated_at,
         }));
     }
     Ok(json!({"items": items, "next_cursor": result.next_cursor}))

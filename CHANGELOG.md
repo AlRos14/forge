@@ -20,6 +20,13 @@ PR14 audit on 2026-10-16.
   Gate. The coordinator can propose a bounded replan; Rust classifies scope and
   authority changes, requiring an exact Human decision before materialization.
 
+- Phase-3 receipts are available through paginated Task-visible REST and
+  read-only MCP reads. Task details show fallback substitutions and cost
+  classes, micro-fix bounds outcomes, and replan classifications/facts with
+  Human decision links. The coordination view displays the preauthorized
+  fallback chain and micro-fix reviewer cost classes; allowlisted SSE listeners
+  refresh the receipt panels.
+
 - Project repository settings can connect and select GitHub SCM credentials and
   edit per-repository PR feedback policy. Task details show paginated PR
   feedback, same-PR rework status, and proposed provider actions for owner/admin

@@ -9,8 +9,15 @@ use crate::{
 use db::{
     CoordinatorReplanClassification, CoordinatorReplanState, CreateCoordinatorReplan,
     DomainEventRepo, HumanDecisionSourceKind, TaskCoordinatorReplanRepo,
-    TransitionCoordinatorReplan,
+    TransitionCoordinatorReplan, WorkUnitRepo,
 };
+
+fn replan_actor_key(actor: &db::ActorRef) -> String {
+    match actor {
+        db::ActorRef::Human(id) => format!("human:{id}"),
+        db::ActorRef::Agent(id) => format!("agent:{id}"),
+    }
+}
 
 fn map_replan_db_error(error: db::DbError) -> ServiceError {
     if matches!(error, db::DbError::CoordinatorReplanLimitReached) {
@@ -118,7 +125,7 @@ impl TaskCoordinationService {
         let team = self.current_team(&source.task_id).await?;
         let work_units = WorkUnitRepo::list_by_task(&*self.db, &source.task_id).await?;
         let original = ReplanOriginalScope {
-            objective_digest: crate::coordinator_outputs::external_feedback::task_objective_digest(
+            objective_digest: super::external_feedback::task_objective_digest(
                 &task.title,
                 task.description.as_deref(),
             ),
@@ -137,7 +144,7 @@ impl TaskCoordinationService {
                 .flat_map(|role| {
                     role.members
                         .iter()
-                        .map(|member| crate::coordinator_outputs::actor_key(&member.actor_ref))
+                        .map(|member| replan_actor_key(&member.actor_ref))
                 })
                 .collect(),
             existing_work_units: work_units
@@ -308,7 +315,7 @@ impl TaskCoordinationService {
                 expected_task_version: task.version,
                 expected_coordination_version: coordination.authorization_version,
                 brief,
-                idempotency_key: key,
+                idempotency_key: key.clone(),
             };
             match binding {
                 Some(binding) => {
@@ -389,7 +396,7 @@ impl TaskCoordinationService {
         let team = self.current_team(&row.task_id).await?;
         let work_units = WorkUnitRepo::list_by_task(&*self.db, &row.task_id).await?;
         let scope = ReplanOriginalScope {
-            objective_digest: crate::coordinator_outputs::external_feedback::task_objective_digest(
+            objective_digest: super::external_feedback::task_objective_digest(
                 &task.title,
                 task.description.as_deref(),
             ),
@@ -408,7 +415,7 @@ impl TaskCoordinationService {
                 .flat_map(|role| {
                     role.members
                         .iter()
-                        .map(|member| crate::coordinator_outputs::actor_key(&member.actor_ref))
+                        .map(|member| replan_actor_key(&member.actor_ref))
                 })
                 .collect(),
             existing_work_units: work_units
@@ -427,7 +434,7 @@ impl TaskCoordinationService {
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))
     }
 
-    fn replan_classification(
+    pub(super) fn replan_classification(
         &self,
         request: &TaskCoordinationRequest,
         plan: &WorkUnitPlan,
@@ -438,11 +445,10 @@ impl TaskCoordinationService {
         let Some((id, mut original)) = parse_replan_context(&brief)? else {
             return Ok(None);
         };
-        original.current_objective_digest =
-            crate::coordinator_outputs::external_feedback::task_objective_digest(
-                &task.title,
-                task.description.as_deref(),
-            );
+        original.current_objective_digest = super::external_feedback::task_objective_digest(
+            &task.title,
+            task.description.as_deref(),
+        );
         original.current_repo_id = task.repo_id.clone();
         Ok(Some((id, classify_replan(plan, envelope, &original))))
     }

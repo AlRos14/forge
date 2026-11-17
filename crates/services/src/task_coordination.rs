@@ -3188,7 +3188,7 @@ impl TaskCoordinationService {
             }
             decision.instructions = scoped_instructions;
         }
-        let mut outputs = crate::coordinator_outputs::parse_outputs(
+        let outputs = crate::coordinator_outputs::parse_outputs(
             response.outputs,
             &self.envelope(&self.require_coordination(&request.task_id).await?)?,
             allowed_outputs,
@@ -3215,7 +3215,6 @@ impl TaskCoordinationService {
                 "one ReviewFindings turn cannot combine micro_fix and propose_replan",
             ));
         }
-        outputs.clear();
         crate::task_rework::TaskReworkService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),

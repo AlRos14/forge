@@ -952,8 +952,15 @@ mod rt_tests {
         ]))
         .unwrap();
         assert!(single_decision(two).is_err());
-        let micro: Vec<ValidationFindingsDecision> =
-            serde_json::from_value(json!([decision("correct", json!({"paths": []}))])).unwrap();
+        let micro: Vec<ValidationFindingsDecision> = serde_json::from_value(json!([decision(
+            "correct",
+            json!({
+                "finding_refs": ["missing assertion"],
+                "instructions": "fix the assertion",
+                "paths": ["src/check.rs"],
+            })
+        )]))
+        .unwrap();
         assert!(single_decision(micro).is_ok());
     }
 
