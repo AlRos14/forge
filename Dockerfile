@@ -15,6 +15,7 @@ FROM rust:1.89-bookworm AS builder
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
 COPY crates/forge-cli/Cargo.toml crates/forge-cli/Cargo.toml
 COPY crates/forge-client/Cargo.toml crates/forge-client/Cargo.toml
 COPY crates/forge-daemon/Cargo.toml crates/forge-daemon/Cargo.toml

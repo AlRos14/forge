@@ -9,6 +9,8 @@
 !crates/**
 !web
 !web/**
+!vendor
+!vendor/**
 
 target
 node_modules
