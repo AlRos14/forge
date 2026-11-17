@@ -867,6 +867,9 @@ fn tools_list_returns_descriptors() {
             "forge_list_task_pr_feedback",
             "forge_list_task_pr_actions",
             "forge_list_task_pr_rework",
+            "forge_list_task_fallback_receipts",
+            "forge_list_task_micro_fixes",
+            "forge_list_task_coordinator_replans",
         ]
         .into_iter()
         .map(str::to_owned)

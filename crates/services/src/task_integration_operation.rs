@@ -5127,6 +5127,21 @@ pub(crate) mod tests {
         db::run_migrations(fixture.db.pool())
             .await
             .expect("upgrade terminal V115 database through V116");
+        // The upgrade ran on a live pool: drop statements prepared against the
+        // V115 schema so `SELECT *` metadata matches the migrated tables.
+        {
+            use sqlx::Connection;
+            let pool = fixture.db.pool();
+            let mut connections = Vec::new();
+            for _ in 0..pool.size() {
+                let mut connection = pool.acquire().await.expect("pooled connection");
+                connection
+                    .clear_cached_statements()
+                    .await
+                    .expect("clear prepared statement cache");
+                connections.push(connection);
+            }
+        }
         let backfilled: (String, String, String, String) = sqlx::query_as(
             "SELECT history_origin, provider_pr_id, pr_url, result_event_id
              FROM remote_pr_history WHERE task_merge_operation_id = ?",

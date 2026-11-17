@@ -1032,7 +1032,7 @@ impl TaskCoordinationService {
         }
         let team = self.current_team(&task.id).await?;
         if input.envelope.is_none() {
-            envelope.allowed_review_roles = team
+            let team_review_roles: Vec<String> = team
                 .iter()
                 .filter(|role| {
                     role.capabilities
@@ -1040,6 +1040,11 @@ impl TaskCoordinationService {
                 })
                 .map(|role| role.role.clone())
                 .collect();
+            // A team without a formal-review role keeps the default review
+            // role list instead of failing default authorization.
+            if !team_review_roles.is_empty() {
+                envelope.allowed_review_roles = team_review_roles;
+            }
             envelope.validate()?;
         }
         let team_snapshot_json = self.team_snapshot_json(&team)?;
