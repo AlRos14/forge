@@ -93,9 +93,16 @@ Agents to be active members of the exact TaskRole under the Project owner's
 account and excludes the coordinator Agent from fallback chains. V180 persists
 immutable fallback and micro-fix receipts; a micro-fix bounds receipt can move
 once from `pending` to a terminal outcome. The coordinator-replan ledger remains
-the V172 record. These records and grants are the phase-3 foundation; the
-fallback dispatcher, micro-fix application, and replan classifier are separate
-runtime work.
+the V172 record. Runtime handling admits cross-Agent fallback only after an
+exhausted route and revalidates the exact TaskRole, membership, envelope, and
+Provider Start authority. A bounded micro-fix records its source and exact
+correction WorkUnit, measures the completed result diff against the reviewed
+commit, and sends every result through formal review and a fresh Gate. A
+coordinator replan opens a typed plan request under the `CoordinatorReplan`
+origin; Rust compares objective, team, WorkUnit budget, repository/path scope,
+and envelope grants. A scope or authority delta opens an exact Human decision
+and remains unmaterialized until approval. The replan ledger enforces two
+proposals per Task.
 
 Each quality chain also has a persisted quality-routing budget (four for
 historical Tasks, sixteen by default for new Tasks).

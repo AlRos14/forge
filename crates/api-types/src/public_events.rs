@@ -150,6 +150,15 @@ pub enum PublicEventType {
     #[serde(rename = "task.pr_action_completed")]
     #[ts(rename = "task.pr_action_completed")]
     TaskPrActionCompleted,
+    #[serde(rename = "task.work_unit_fallback")]
+    #[ts(rename = "task.work_unit_fallback")]
+    TaskWorkUnitFallback,
+    #[serde(rename = "task.micro_fix_bounds_exceeded")]
+    #[ts(rename = "task.micro_fix_bounds_exceeded")]
+    TaskMicroFixBoundsExceeded,
+    #[serde(rename = "task.coordinator_replan_proposed")]
+    #[ts(rename = "task.coordinator_replan_proposed")]
+    TaskCoordinatorReplanProposed,
     #[serde(rename = "project.created")]
     #[ts(rename = "project.created")]
     ProjectCreated,
@@ -233,6 +242,9 @@ impl PublicEventType {
             Self::TaskPrFollowupProposed => "task.pr_followup_proposed",
             Self::TaskPrActionRequested => "task.pr_action_requested",
             Self::TaskPrActionCompleted => "task.pr_action_completed",
+            Self::TaskWorkUnitFallback => "task.work_unit_fallback",
+            Self::TaskMicroFixBoundsExceeded => "task.micro_fix_bounds_exceeded",
+            Self::TaskCoordinatorReplanProposed => "task.coordinator_replan_proposed",
             Self::ProjectCreated => "project.created",
             Self::ProjectUpdated => "project.updated",
             Self::ProjectDeleted => "project.deleted",

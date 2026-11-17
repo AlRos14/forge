@@ -1,4 +1,5 @@
 use super::*;
+use crate::coordinator_outputs::MicroFixOutput;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -9,6 +10,8 @@ pub(crate) struct ReviewFindingsDecision {
     pub disposition: ReviewFindingsDisposition,
     pub rationale: String,
     pub instructions: String,
+    #[serde(default)]
+    pub micro_fix: Option<MicroFixOutput>,
 }
 
 use api_types::TaskReviewDisposition as ReviewFindingsDisposition;

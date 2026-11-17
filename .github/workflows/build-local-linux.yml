@@ -131,6 +131,12 @@ jobs:
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p db --lib v180_
       - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib fallback_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib micro_fix_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib coordinator_replan_
+      - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib validation_
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib gate_required_checks_

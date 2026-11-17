@@ -14,6 +14,7 @@ use crate::{project_plan::ProjectPlanService, Result, TaskService};
 
 mod active_recovery;
 mod dispatch;
+mod fallback;
 pub(crate) use dispatch::work_unit_consumption_context;
 
 pub use dispatch::DispatchOutcome;
@@ -122,8 +123,13 @@ impl TaskDispatcher {
         let plan_service =
             ProjectPlanService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
         let project_plan_requests = plan_service.check_once().await?;
+        let fallback_resolutions = self.process_work_unit_fallbacks().await?;
         let dispatched_units = self.dispatch_eligible_work_units().await?;
-        let dispatched = pending_starts + dispatched_units + auto_recovered + project_plan_requests;
+        let dispatched = pending_starts
+            + dispatched_units
+            + auto_recovered
+            + project_plan_requests
+            + fallback_resolutions;
 
         tracing::info!(
             dispatched_tasks = dispatched,

@@ -54,9 +54,18 @@ struct HumanDecisionResumeTurn {
     resumes_request_id: String,
     human_decision_id: String,
     answered_option_id: String,
+    #[serde(default)]
     validation_findings: Vec<ValidationFindingsDecision>,
     #[serde(default)]
+    coordinator_replan: Option<CoordinatorReplanResumeDecision>,
+    #[serde(default)]
     outputs: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoordinatorReplanResumeDecision {
+    decision: String,
 }
 
 fn turn_text(execution: &db::Execution, what: &str) -> Result<String> {
@@ -79,15 +88,6 @@ fn single_decision(
         ));
     }
     let decision = decisions.remove(0);
-    if decision
-        .micro_fix
-        .as_ref()
-        .is_some_and(|value| !value.is_null())
-    {
-        return Err(output_not_permitted(
-            "micro_fix is not available in this phase",
-        ));
-    }
     Ok(decision)
 }
 
@@ -101,6 +101,10 @@ impl TaskCoordinationService {
         allowed_outputs: Option<&[CoordinatorOutputKind]>,
     ) -> Result<()> {
         match request.kind {
+            TaskCoordinationRequestKind::ReviewFindings => {
+                self.complete_review_findings_turn(request, execution, allowed_outputs)
+                    .await
+            }
             TaskCoordinationRequestKind::ValidationFindings => {
                 self.complete_validation_findings_turn(request, execution, allowed_outputs)
                     .await
@@ -330,20 +334,110 @@ impl TaskCoordinationService {
                 "ValidationFindings requires schema 2 for its exact request and authorization",
             ));
         }
-        let decision = single_decision(turn.validation_findings)?;
+        let mut decision = single_decision(turn.validation_findings)?;
         self.ensure_decision_matches_source(request, &decision)
             .await?;
         let coordination = self.require_coordination(&request.task_id).await?;
         let envelope = self.envelope(&coordination)?;
+        let micro_fix = decision.micro_fix.clone();
+        if let Some(micro_fix) = micro_fix.as_ref() {
+            if decision.disposition != ValidationTriageDisposition::Correct {
+                return Err(output_not_permitted(
+                    "micro_fix requires validation disposition correct",
+                ));
+            }
+            coordinator_outputs::ensure_new_kind_permitted(
+                CoordinatorOutputKind::MicroFix,
+                allowed_outputs,
+            )
+            .map_err(ServiceError::from)?;
+            if !envelope
+                .micro_fix
+                .as_ref()
+                .is_some_and(|grant| grant.enabled)
+            {
+                return Err(output_not_permitted(
+                    "micro_fix requires envelope.micro_fix.enabled",
+                ));
+            }
+            let context = self.validation_source_context(request).await?;
+            if context
+                .pointer("/check/subject/kind")
+                .and_then(Value::as_str)
+                != Some("work_unit_result")
+                || context
+                    .pointer("/run/commit_sha")
+                    .and_then(Value::as_str)
+                    .is_none()
+                || context
+                    .pointer("/run/workspace_id")
+                    .and_then(Value::as_str)
+                    .is_none()
+            {
+                return Err(output_not_permitted(
+                    "micro_fix requires a checked WorkUnit result with an exact repository commit and Workspace",
+                ));
+            }
+            let stdout = context
+                .pointer("/run/stdout_tail")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let stderr = context
+                .pointer("/run/stderr_tail")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if micro_fix
+                .finding_refs
+                .iter()
+                .any(|finding| !stdout.contains(finding) && !stderr.contains(finding))
+                || micro_fix.paths.iter().any(|path| {
+                    !micro_fix
+                        .finding_refs
+                        .iter()
+                        .any(|finding| finding.contains(path))
+                })
+            {
+                return Err(output_not_permitted(
+                    "micro_fix findings and paths must be exact subsets of this validation output",
+                ));
+            }
+            let used = db::MicroFixReceiptRepo::list_micro_fix_receipts_by_task(
+                &*self.db,
+                &request.task_id,
+            )
+            .await?
+            .len();
+            if used
+                >= envelope
+                    .micro_fix
+                    .as_ref()
+                    .map_or(0, |grant| grant.max_per_task as usize)
+            {
+                return Err(output_not_permitted(
+                    "micro_fix.max_per_task is exhausted; route the finding through ordinary triage or a Human",
+                ));
+            }
+            decision.instructions = format!(
+                "{}\nDeclared micro-fix paths: {}",
+                micro_fix.instructions,
+                micro_fix.paths.join(", ")
+            );
+        }
         let outputs = coordinator_outputs::parse_outputs(turn.outputs, &envelope, allowed_outputs)?;
         let mut ask: Option<AskHumanOutput> = None;
         let mut validations = Vec::new();
+        let mut propose_replan = None;
         for output in outputs {
             match output {
                 CoordinatorOutput::RequestValidation(value) => validations.push(value),
                 CoordinatorOutput::AskHuman(value) => {
                     if ask.replace(value).is_some() {
                         return Err(invalid_plan("a turn may carry at most one ask_human"));
+                    }
+                }
+                CoordinatorOutput::ProposeReplan(value) => {
+                    if propose_replan.replace(value).is_some() {
+                        return Err(invalid_plan("a turn may carry at most one propose_replan"));
                     }
                 }
             }
@@ -390,6 +484,7 @@ impl TaskCoordinationService {
             }
             ValidationTriageDisposition::Correct => {}
         }
+        let validation_run_id = decision.validation_run_id.clone();
         let result = crate::task_rework::TaskReworkService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
@@ -416,7 +511,26 @@ impl TaskCoordinationService {
                     .ok();
             }
         }
-        result
+        result?;
+        if let Some(micro_fix) = micro_fix.as_ref() {
+            crate::task_rework::TaskReworkService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .ensure_validation_micro_fix_receipt(
+                &request.task_id,
+                &request.id,
+                request.authorization_version,
+                &validation_run_id,
+                micro_fix,
+            )
+            .await?;
+        }
+        if let Some(output) = propose_replan {
+            self.apply_propose_replan(request, execution, output)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn complete_human_decision_resume_turn(
@@ -468,12 +582,37 @@ impl TaskCoordinationService {
         .ok_or_else(|| {
             ServiceError::not_found("coordination request", turn.resumes_request_id.clone())
         })?;
+        if paused.kind == TaskCoordinationRequestKind::WorkUnitPlan
+            && decision_row.source_kind == HumanDecisionSourceKind::CoordinatorReplan
+        {
+            if !turn.validation_findings.is_empty() {
+                return Err(invalid_plan(
+                    "a coordinator replan resume cannot contain validation findings",
+                ));
+            }
+            let output = turn.coordinator_replan.ok_or_else(|| {
+                invalid_plan("a coordinator replan resume must echo the exact Human option")
+            })?;
+            return self
+                .complete_replan_human_resume(request, &decision_row, &paused, &output.decision)
+                .await;
+        }
+        if turn.coordinator_replan.is_some() {
+            return Err(invalid_plan(
+                "coordinator_replan output is only valid for an exact replan resume",
+            ));
+        }
         if paused.kind != TaskCoordinationRequestKind::ValidationFindings {
             return Err(output_not_permitted(
                 "only a paused validation_findings request can be resumed in this phase",
             ));
         }
         let decision = single_decision(turn.validation_findings)?;
+        if decision.micro_fix.is_some() {
+            return Err(output_not_permitted(
+                "micro_fix is only valid on the original authorized triage request",
+            ));
+        }
         if decision.disposition == ValidationTriageDisposition::Human {
             return Err(invalid_plan(
                 "a resumed validation decision must be correct or recheck",
@@ -534,6 +673,33 @@ impl TaskCoordinationService {
             .ok_or_else(|| ServiceError::not_found("coordination request", paused_id.to_owned()))?;
         let paused_context = if paused.kind == TaskCoordinationRequestKind::ValidationFindings {
             self.validation_source_context(&paused).await?
+        } else if paused.kind == TaskCoordinationRequestKind::WorkUnitPlan
+            && decision.source_kind == HumanDecisionSourceKind::CoordinatorReplan
+        {
+            let replan = db::TaskCoordinatorReplanRepo::get_coordinator_replan(
+                &*self.db,
+                &decision.source_id,
+            )
+            .await?
+            .filter(|row| row.task_id == request.task_id)
+            .ok_or_else(|| invalid_plan("resume no longer matches its coordinator replan"))?;
+            let plan = TaskCoordinationRepo::list_task_coordination_plans(
+                &*self.db,
+                &request.task_id,
+                100,
+            )
+            .await?
+            .into_iter()
+            .find(|plan| plan.request_id == paused.id)
+            .ok_or_else(|| invalid_plan("replan resume has no exact plan Artifact"))?;
+            json!({
+                "coordinator_replan_id": replan.id,
+                "plan_request_id": paused.id,
+                "plan_artifact_id": plan.artifact_id,
+                "plan_digest": plan.plan_digest,
+                "classification": replan.classification,
+                "classification_facts_json": replan.classification_facts_json,
+            })
         } else {
             Value::Null
         };
@@ -574,6 +740,23 @@ impl TaskCoordinationService {
             .and_then(|value| value.get("answered_option_id"))
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let resume_context = context.get("human_decision_resume").unwrap_or(context);
+        if resume_context
+            .get("human_decision_source_kind")
+            .and_then(Value::as_str)
+            == Some("coordinator_replan")
+        {
+            return Ok(format!(
+                "Return exactly one JSON object matching `{{\"schema_version\":2,\"request_id\":{request_id},\"task_id\":{task_id},\"authorization_version\":{authorization_version},\"resumes_request_id\":{paused},\"human_decision_id\":{decision},\"answered_option_id\":{answered},\"coordinator_replan\":{{\"decision\":\"approve_replan|reject|revise_scope\"}},\"outputs\":[]}}`. Echo the exact Human option as `coordinator_replan.decision`; this is read-only and must not change scope. Context: {context}",
+                request_id = serde_json::to_string(&request.id).unwrap(),
+                task_id = serde_json::to_string(&request.task_id).unwrap(),
+                authorization_version = request.authorization_version,
+                paused = serde_json::to_string(paused_id).unwrap(),
+                decision = serde_json::to_string(decision_id).unwrap(),
+                answered = serde_json::to_string(answered).unwrap(),
+                context = serde_json::to_string(context).unwrap_or_else(|_| "{}".to_owned()),
+            ));
+        }
         let digest = context
             .get("human_decision_resume")
             .and_then(|value| value.get("paused_source"))
@@ -759,7 +942,7 @@ mod rt_tests {
     }
 
     #[test]
-    fn rt_validation_turn_requires_one_decision_and_rejects_micro_fix() {
+    fn rt_validation_turn_requires_one_decision_and_preserves_micro_fix_shape() {
         let one: Vec<ValidationFindingsDecision> =
             serde_json::from_value(json!([decision("correct", Value::Null)])).unwrap();
         assert!(single_decision(one).is_ok());
@@ -771,8 +954,7 @@ mod rt_tests {
         assert!(single_decision(two).is_err());
         let micro: Vec<ValidationFindingsDecision> =
             serde_json::from_value(json!([decision("correct", json!({"paths": []}))])).unwrap();
-        let error = single_decision(micro).unwrap_err();
-        assert!(error.to_string().contains("micro_fix"));
+        assert!(single_decision(micro).is_ok());
     }
 
     #[test]

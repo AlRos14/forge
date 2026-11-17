@@ -126,6 +126,7 @@ enum OrchestratorAction {
     /// rejects them; they are applied in typed turns (`outputs`).
     RequestValidation(coordinator_outputs::RequestValidationOutput),
     AskHuman(coordinator_outputs::AskHumanOutput),
+    ProposeReplan(coordinator_outputs::ProposeReplanOutput),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -138,6 +139,8 @@ enum OrchestratorActionKind {
     ReviewFindings,
     RequestValidation,
     AskHuman,
+    ProposeReplan,
+    MicroFix,
 }
 
 /// New output kinds explicitly allowed by a policy; `None` denies them.
@@ -152,6 +155,8 @@ fn coordinator_output_kinds(
                     Some(CoordinatorOutputKind::RequestValidation)
                 }
                 OrchestratorActionKind::AskHuman => Some(CoordinatorOutputKind::AskHuman),
+                OrchestratorActionKind::ProposeReplan => Some(CoordinatorOutputKind::ProposeReplan),
+                OrchestratorActionKind::MicroFix => Some(CoordinatorOutputKind::MicroFix),
                 _ => None,
             })
             .collect()
@@ -226,7 +231,10 @@ impl TaskRoleOrchestratorPolicy {
         let kind = action.policy_kind();
         if matches!(
             kind,
-            OrchestratorActionKind::RequestValidation | OrchestratorActionKind::AskHuman
+            OrchestratorActionKind::RequestValidation
+                | OrchestratorActionKind::AskHuman
+                | OrchestratorActionKind::ProposeReplan
+                | OrchestratorActionKind::MicroFix
         ) {
             // Asymmetric rule: new kinds are never implied by an absent list.
             return self
@@ -937,6 +945,45 @@ impl OrchestratorRuntime {
                 WakeSignal {
                     work_unit_id: None,
                     target: WakeTarget::Task,
+                }
+            }
+            "micro_fix.bounds_exceeded" => {
+                if event.entity_type != "micro_fix_receipt" {
+                    return Ok(None);
+                }
+                let Some(receipt) =
+                    db::MicroFixReceiptRepo::get_micro_fix_receipt(&*self.db, &event.entity_id)
+                        .await?
+                else {
+                    return Ok(None);
+                };
+                let payload = parse_payload(event);
+                if receipt.task_id != task_id
+                    || receipt.bounds_outcome != db::MicroFixBoundsOutcome::BoundsExceeded
+                    || receipt.bounds_violation.is_none()
+                    || payload.get("micro_fix_receipt_id").and_then(Value::as_str)
+                        != Some(receipt.id.as_str())
+                    || payload.get("task_id").and_then(Value::as_str) != Some(task_id)
+                {
+                    return Ok(None);
+                }
+                let Some(coordination) =
+                    TaskCoordinationRepo::get_task_coordination(&*self.db, task_id).await?
+                else {
+                    return Ok(None);
+                };
+                if coordination.mode == db::TaskCoordinationMode::Manual
+                    || coordination.revoked_at.is_some()
+                    || coordination.team_stale
+                {
+                    return Ok(None);
+                }
+                let Some(actor) = coordination.coordinator_actor else {
+                    return Ok(None);
+                };
+                WakeSignal {
+                    work_unit_id: None,
+                    target: WakeTarget::Actor(actor),
                 }
             }
             "work_unit.completed"
@@ -3263,10 +3310,12 @@ impl OrchestratorRuntime {
             let action_type = action.action_type();
             if matches!(
                 action,
-                OrchestratorAction::RequestValidation(_) | OrchestratorAction::AskHuman(_)
+                OrchestratorAction::RequestValidation(_)
+                    | OrchestratorAction::AskHuman(_)
+                    | OrchestratorAction::ProposeReplan(_)
             ) {
                 return Err(crate::task_coordination::output_not_permitted(
-                    "request_validation and ask_human require a typed coordination request turn; the event-driven action channel has no request to anchor them",
+                    "typed coordination outputs require a typed request turn; the event-driven action channel has no request to anchor them",
                 ));
             }
             if self
@@ -3342,7 +3391,9 @@ impl OrchestratorRuntime {
             }
             let source = CollaborationActorSource::Execution(execution.id.clone());
             match action {
-                OrchestratorAction::RequestValidation(_) | OrchestratorAction::AskHuman(_) => {
+                OrchestratorAction::RequestValidation(_)
+                | OrchestratorAction::AskHuman(_)
+                | OrchestratorAction::ProposeReplan(_) => {
                     return Err(crate::task_coordination::output_not_permitted(
                         "typed outputs require a typed coordination request turn",
                     ));
@@ -4024,6 +4075,7 @@ impl OrchestratorAction {
             Self::Proposal { .. } => OrchestratorActionKind::Proposal,
             Self::RequestValidation(_) => OrchestratorActionKind::RequestValidation,
             Self::AskHuman(_) => OrchestratorActionKind::AskHuman,
+            Self::ProposeReplan(_) => OrchestratorActionKind::ProposeReplan,
         }
     }
 
@@ -4035,6 +4087,7 @@ impl OrchestratorAction {
             Self::Proposal { .. } => "proposal",
             Self::RequestValidation(_) => "request_validation",
             Self::AskHuman(_) => "ask_human",
+            Self::ProposeReplan(_) => "propose_replan",
         }
     }
 }

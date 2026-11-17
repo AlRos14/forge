@@ -3,10 +3,12 @@
 
 use super::{seed_agent, seed_project, seed_task, seed_user, sqlite_db};
 use crate::{
-    new_uuid_v4, now_rfc3339, ActorKind, AdvanceMicroFixReceiptBounds, CostClass,
-    CreateMicroFixReceipt, CreateRoleMembership, CreateTaskRole, CreateWorkUnitFallbackReceipt,
-    DbError, MicroFixBoundsOutcome, MicroFixBoundsViolation, MicroFixReceiptRepo,
-    MicroFixSourceKind, RoleMembershipRepo, SqliteDb, TaskRoleRepo, WorkUnitFallbackReceiptRepo,
+    new_uuid_v4, now_rfc3339, ActorKind, ActorRef, AdvanceMicroFixReceiptBounds, AllocateWorkUnit,
+    CostClass, CreateDomainEvent, CreateMicroFixReceipt, CreateRoleMembership, CreateTaskRole,
+    CreateWorkUnitFallbackReceipt, DbError, MicroFixBoundsOutcome, MicroFixBoundsViolation,
+    MicroFixReceiptRepo, MicroFixSourceKind, RoleMembershipRepo, SqliteDb, TaskDispatchOperation,
+    TaskDispatchState, TaskLifecycleRepo, TaskLifecycleState, TaskRepo, TaskRoleRepo,
+    TransitionTaskDispatch, TransitionTaskLifecycle, WorkUnitFallbackReceiptRepo,
 };
 use sha2::Digest as _;
 
@@ -66,7 +68,7 @@ async fn fixture() -> Fixture {
             id: role_id.clone(),
             task_id: task_id.clone(),
             role: "implementer".to_owned(),
-            coordination_mode: None,
+            coordination_mode: Some(crate::CoordinationMode::Collaborative),
             policy_json: "{}".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -307,6 +309,196 @@ async fn v180_fallback_receipt_is_immutable_and_unique_per_origin_execution() {
         .expect("receipt exists")
         .id,
         receipt.id
+    );
+}
+
+#[tokio::test]
+async fn v180_fallback_allocation_and_receipt_commit_atomically() {
+    let f = fixture().await;
+    let task = TaskRepo::get_by_id(&f.db, &f.task_id, false)
+        .await
+        .expect("Task lookup")
+        .expect("Task exists");
+    let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&f.db, &f.task_id)
+        .await
+        .expect("lifecycle lookup")
+        .expect("lifecycle exists");
+    let lifecycle_key = "fallback-atomic-block";
+    let lifecycle_now = now_rfc3339();
+    TaskLifecycleRepo::transition_task_lifecycle(
+        &f.db,
+        TransitionTaskLifecycle {
+            id: new_uuid_v4(),
+            task_id: f.task_id.clone(),
+            expected_task_version: task.version,
+            expected_lifecycle_version: lifecycle.version,
+            expected_state: TaskLifecycleState::Active,
+            to_state: TaskLifecycleState::Blocked,
+            cause_kind: "execution".to_owned(),
+            cause_ref: Some(f.origin_execution_id.clone()),
+            reason_kind: Some("executor_unavailable".to_owned()),
+            reason_ref: Some(f.origin_execution_id.clone()),
+            gate_evaluation_id: None,
+            idempotency_key: lifecycle_key.to_owned(),
+            updated_at: lifecycle_now.clone(),
+            event: CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "task.lifecycle_changed".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: f.task_id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: f.task_id.clone(),
+                correlation_id: lifecycle_key.to_owned(),
+                causation_id: Some(f.origin_execution_id.clone()),
+                causation_depth: 1,
+                dedupe_key: Some(format!("task-lifecycle:{}:{lifecycle_key}", f.task_id)),
+                payload_json: serde_json::json!({
+                    "task_id": f.task_id,
+                    "from_state": "active",
+                    "to_state": "blocked",
+                    "from_version": lifecycle.version,
+                    "to_version": lifecycle.version + 1,
+                    "cause_kind": "execution",
+                    "cause_ref": f.origin_execution_id,
+                    "gate_evaluation_id": null,
+                    "reason_kind": "executor_unavailable",
+                    "reason_ref": f.origin_execution_id,
+                })
+                .to_string(),
+                created_at: lifecycle_now.clone(),
+            },
+        },
+    )
+    .await
+    .expect("exact failed Execution owns the lifecycle block");
+    TaskLifecycleRepo::transition_task_dispatch(
+        &f.db,
+        TransitionTaskDispatch {
+            task_id: f.task_id.clone(),
+            operation: TaskDispatchOperation::Launch,
+            state: TaskDispatchState::Running,
+            expected_intent_version: 1,
+            requested_by_kind: "system".to_owned(),
+            requested_by_id: None,
+            reason: None,
+            idempotency_key: "fallback-atomic-launch".to_owned(),
+            request_digest: digest("fallback-atomic-launch"),
+            receipt_id: new_uuid_v4(),
+            created_at: lifecycle_now,
+        },
+    )
+    .await
+    .expect("Task dispatch is running for the exact Task");
+    sqlx::query(
+        "UPDATE work_unit
+         SET assigned_actor_id = ?, version = 1
+         WHERE id = ?",
+    )
+    .bind(&f.origin_agent_id)
+    .bind(&f.work_unit_id)
+    .execute(f.db.pool())
+    .await
+    .expect("restore exact source WorkUnit revision");
+
+    let now = now_rfc3339();
+    let input = fallback_input(&f, new_uuid_v4());
+    let (receipt, event) = WorkUnitFallbackReceiptRepo::allocate_work_unit_with_fallback_receipt(
+        &f.db,
+        AllocateWorkUnit {
+            id: f.work_unit_id.clone(),
+            expected_version: 1,
+            role: "implementer".to_owned(),
+            assigned_actor: Some(ActorRef::Agent(f.fallback_agent_id.clone())),
+            updated_at: now.clone(),
+        },
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "work_unit.allocation_changed".to_owned(),
+            entity_type: "work_unit".to_owned(),
+            entity_id: f.work_unit_id.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: f.task_id.clone(),
+            correlation_id: "fallback-atomic-success".to_owned(),
+            causation_id: Some(f.origin_execution_id.clone()),
+            causation_depth: 1,
+            dedupe_key: Some("fallback-atomic-success".to_owned()),
+            payload_json: serde_json::json!({"task_id":f.task_id}).to_string(),
+            created_at: now,
+        },
+        input,
+    )
+    .await
+    .expect("allocation, event, and receipt commit together");
+    assert_eq!(receipt.work_unit_version_after, 2);
+    assert_eq!(event.event_type, "work_unit.allocation_changed");
+
+    sqlx::query(
+        "UPDATE work_unit
+         SET assigned_actor_id = ?, version = 1
+         WHERE id = ?",
+    )
+    .bind(&f.origin_agent_id)
+    .bind(&f.work_unit_id)
+    .execute(f.db.pool())
+    .await
+    .expect("restore source revision for rejected write");
+
+    let mut invalid_input = fallback_input(&f, new_uuid_v4());
+    invalid_input.chain_index = 1;
+    let failed_event = CreateDomainEvent {
+        id: new_uuid_v4(),
+        event_type: "work_unit.allocation_changed".to_owned(),
+        entity_type: "work_unit".to_owned(),
+        entity_id: f.work_unit_id.clone(),
+        actor_type: "system".to_owned(),
+        actor_id: None,
+        scope_type: "task".to_owned(),
+        scope_id: f.task_id.clone(),
+        correlation_id: "fallback-atomic-rejected".to_owned(),
+        causation_id: Some(f.origin_execution_id.clone()),
+        causation_depth: 1,
+        dedupe_key: Some("fallback-atomic-rejected".to_owned()),
+        payload_json: serde_json::json!({"task_id":f.task_id}).to_string(),
+        created_at: now_rfc3339(),
+    };
+    assert!(
+        WorkUnitFallbackReceiptRepo::allocate_work_unit_with_fallback_receipt(
+            &f.db,
+            AllocateWorkUnit {
+                id: f.work_unit_id.clone(),
+                expected_version: 1,
+                role: "implementer".to_owned(),
+                assigned_actor: Some(ActorRef::Agent(f.fallback_agent_id.clone())),
+                updated_at: now_rfc3339(),
+            },
+            failed_event,
+            invalid_input,
+        )
+        .await
+        .is_err(),
+        "an unauthorized receipt rejects the allocation transaction"
+    );
+    let (version, assigned_actor_id): (i64, String) =
+        sqlx::query_as("SELECT version, assigned_actor_id FROM work_unit WHERE id = ?")
+            .bind(&f.work_unit_id)
+            .fetch_one(f.db.pool())
+            .await
+            .expect("WorkUnit remains readable");
+    assert_eq!(version, 1);
+    assert_eq!(assigned_actor_id, f.origin_agent_id);
+    let rejected_event_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM domain_event WHERE dedupe_key = 'fallback-atomic-rejected')",
+    )
+    .fetch_one(f.db.pool())
+    .await
+    .expect("allocation event lookup");
+    assert_eq!(
+        rejected_event_exists, 0,
+        "failed write rolls back its event"
     );
 }
 

@@ -5,16 +5,16 @@ use std::{
 
 use api_types::{ActorRef as ApiActorRef, TaskRoleCapability, TaskRoleConfiguration};
 use db::{
-    new_uuid_v4, now_rfc3339, ActorRef, AgentRepo, ArtifactKind, CollaborationRepo, CostClass,
-    CreateDomainEvent, ProjectPlanBatchAuthorizationBinding, ProjectPlanBatchRequestBinding,
-    ProjectPlanBatchRequestOrigin, RoleMembershipRepo, RoleMembershipStatus, SqliteDb, Task,
-    TaskCoordination, TaskCoordinationMaterialization, TaskCoordinationMode, TaskCoordinationPlan,
-    TaskCoordinationPlanState, TaskCoordinationRepo, TaskCoordinationRequest,
-    TaskCoordinationRequestKind, TaskCoordinationRequestState, TaskCoordinationWrite,
-    TaskIntervention, TaskInterventionKind, TaskInterventionState, TaskLifecycleRepo,
-    TaskLifecycleState, TaskQualityCategory, TaskQualityRequest, TaskQualityState,
-    TaskQualityTargetKind, TaskRepo, TaskRoleRepo, UserRepo, MAX_MICRO_FIX_CHANGED_LINES,
-    MAX_MICRO_FIX_FILES, MAX_MICRO_FIX_PER_TASK,
+    new_uuid_v4, now_rfc3339, ActorRef, AgentRepo, ArtifactKind, CollaborationRepo,
+    CoordinatorReplanState, CostClass, CreateDomainEvent, ProjectPlanBatchAuthorizationBinding,
+    ProjectPlanBatchRequestBinding, ProjectPlanBatchRequestOrigin, RoleMembershipRepo,
+    RoleMembershipStatus, SqliteDb, Task, TaskCoordination, TaskCoordinationMaterialization,
+    TaskCoordinationMode, TaskCoordinationPlan, TaskCoordinationPlanState, TaskCoordinationRepo,
+    TaskCoordinationRequest, TaskCoordinationRequestKind, TaskCoordinationRequestState,
+    TaskCoordinationWrite, TaskIntervention, TaskInterventionKind, TaskInterventionState,
+    TaskLifecycleRepo, TaskLifecycleState, TaskQualityCategory, TaskQualityRequest,
+    TaskQualityState, TaskQualityTargetKind, TaskRepo, TaskRoleRepo, UserRepo,
+    MAX_MICRO_FIX_CHANGED_LINES, MAX_MICRO_FIX_FILES, MAX_MICRO_FIX_PER_TASK,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -28,11 +28,13 @@ use crate::{
         CreateMessageInput, CreateProposalInput,
     },
     domain_event_service::DomainEventService,
+    replan_classifier::ReplanClassification,
     task_lifecycle::TaskLifecycleService,
     Result, ServiceError,
 };
 
 mod external_feedback;
+mod replan;
 mod turn_outputs;
 mod validation_findings;
 
@@ -2179,6 +2181,34 @@ impl TaskCoordinationService {
             Some(event),
         )
         .await?;
+        if let Some(replan) =
+            db::TaskCoordinatorReplanRepo::list_coordinator_replans_by_task(&*self.db, &task.id)
+                .await?
+                .into_iter()
+                .find(|replan| replan.plan_request_id.as_deref() == Some(plan.request_id.as_str()))
+        {
+            let next = if input.approve {
+                CoordinatorReplanState::Approved
+            } else {
+                CoordinatorReplanState::Rejected
+            };
+            if replan.state != next {
+                db::TaskCoordinatorReplanRepo::transition_coordinator_replan(
+                    &*self.db,
+                    db::TransitionCoordinatorReplan {
+                        id: replan.id,
+                        expected_version: replan.version,
+                        to_state: next,
+                        plan_request_id: None,
+                        classification: None,
+                        classification_facts_json: None,
+                        human_decision_id: None,
+                        updated_at: now_rfc3339(),
+                    },
+                )
+                .await?;
+            }
+        }
         self.plan_view(plan).await
     }
 
@@ -2223,6 +2253,13 @@ impl TaskCoordinationService {
             let (launch_intent_accepted, launch_blockers) = self
                 .launch_materialized_work(&task.id, user_id, existing.authorization_version)
                 .await?;
+            if let Some((replan_id, _)) = self.replan_context_for_request(&request)? {
+                self.mark_coordinator_replan_state(
+                    &replan_id,
+                    CoordinatorReplanState::Materialized,
+                )
+                .await?;
+            }
             return Ok(MaterializeOutcome {
                 plan: self.plan_view(plan).await?,
                 request,
@@ -2479,6 +2516,10 @@ impl TaskCoordinationService {
         let (launch_intent_accepted, launch_blockers) = self
             .launch_materialized_work(&task.id, user_id, materialization.authorization_version)
             .await?;
+        if let Some((replan_id, _)) = self.replan_context_for_request(&request)? {
+            self.mark_coordinator_replan_state(&replan_id, CoordinatorReplanState::Materialized)
+                .await?;
+        }
         Ok(MaterializeOutcome {
             plan: self.plan_view(plan).await?,
             request,
@@ -2610,7 +2651,9 @@ impl TaskCoordinationService {
         execution: &db::Execution,
     ) -> Result<()> {
         if request.kind == TaskCoordinationRequestKind::ReviewFindings {
-            return self.complete_review_findings_turn(request, execution).await;
+            return self
+                .complete_review_findings_turn(request, execution, None)
+                .await;
         }
         if matches!(
             request.kind,
@@ -2626,6 +2669,12 @@ impl TaskCoordinationService {
                 .into_iter()
                 .find(|plan| plan.request_id == request.id)
         {
+            if self
+                .reconcile_replan_plan_completion(request, execution, &existing)
+                .await?
+            {
+                return Ok(());
+            }
             if existing.state == TaskCoordinationPlanState::Approved {
                 let coordination = self.require_coordination(&request.task_id).await?;
                 let task_version = TaskRepo::get_by_id(&*self.db, &request.task_id, false)
@@ -2633,21 +2682,43 @@ impl TaskCoordinationService {
                     .map(|task| task.version)
                     .unwrap_or_default();
                 if let Some(authorizer) = coordination.requested_by.as_deref() {
-                    self.materialize(
-                        &request.task_id,
-                        &existing.artifact_id,
-                        authorizer,
-                        MaterializeInput {
-                            expected_task_version: task_version,
-                            expected_coordination_version: existing.authorization_version,
-                            expected_plan_digest: existing.plan_digest.clone(),
-                            expected_plan_version: existing.version,
-                            expected_request_version: request.version,
-                            idempotency_key: format!("coordination-auto:{}", existing.artifact_id),
-                        },
+                    if self
+                        .materialize(
+                            &request.task_id,
+                            &existing.artifact_id,
+                            authorizer,
+                            MaterializeInput {
+                                expected_task_version: task_version,
+                                expected_coordination_version: existing.authorization_version,
+                                expected_plan_digest: existing.plan_digest.clone(),
+                                expected_plan_version: existing.version,
+                                expected_request_version: request.version,
+                                idempotency_key: format!(
+                                    "coordination-auto:{}",
+                                    existing.artifact_id
+                                ),
+                            },
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        if let Some((replan_id, _)) = self.replan_context_for_request(request)? {
+                            self.mark_coordinator_replan_state(
+                                &replan_id,
+                                CoordinatorReplanState::Materialized,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+            if let Some((replan_id, _)) = self.replan_context_for_request(request)? {
+                if existing.state == TaskCoordinationPlanState::Materialized {
+                    self.mark_coordinator_replan_state(
+                        &replan_id,
+                        CoordinatorReplanState::Materialized,
                     )
-                    .await
-                    .ok();
+                    .await?;
                 }
             }
             return Ok(());
@@ -2678,15 +2749,20 @@ impl TaskCoordinationService {
             false,
         )
         .await?;
+        let replan_classification =
+            self.replan_classification(request, &parsed, &envelope, &task)?;
         let within_envelope = self.is_within_envelope(&envelope, &parsed);
         let plan_digest = sha256_hex(output.as_bytes());
         let artifact_id = new_uuid_v4();
-        let plan_state =
-            if request.mode == TaskCoordinationMode::PrepareAndExecute && within_envelope {
-                TaskCoordinationPlanState::Approved
-            } else {
-                TaskCoordinationPlanState::Proposed
-            };
+        let plan_state = if request.mode == TaskCoordinationMode::PrepareAndExecute
+            && within_envelope
+            && replan_classification.as_ref().is_none_or(|(_, result)| {
+                result.classification == ReplanClassification::WithinEnvelope
+            }) {
+            TaskCoordinationPlanState::Approved
+        } else {
+            TaskCoordinationPlanState::Proposed
+        };
         let now = now_rfc3339();
         let artifact_event = self.event(
             "artifact.created",
@@ -2757,6 +2833,23 @@ impl TaskCoordinationService {
         )
         .await?;
         if plan_state == TaskCoordinationPlanState::Proposed {
+            if let Some((replan_id, result)) =
+                replan_classification.as_ref().filter(|(_, result)| {
+                    result.classification == ReplanClassification::ScopeOrAuthorityChange
+                })
+            {
+                self.raise_replan_scope_decision(
+                    request,
+                    execution,
+                    &artifact_id,
+                    &plan_digest,
+                    replan_id,
+                    result.classification,
+                    result.classification_facts_json(),
+                )
+                .await?;
+                return Ok(());
+            }
             let proposal = self
                 .collaboration
                 .create_proposal_with_id(
@@ -2829,7 +2922,25 @@ impl TaskCoordinationService {
             .await?;
             write.plan = plan;
             write.request = updated_request;
+            if let Some((replan_id, result)) = replan_classification.as_ref() {
+                self.record_replan_classification(
+                    replan_id,
+                    CoordinatorReplanState::AwaitingHuman,
+                    result.classification,
+                    result.classification_facts_json(),
+                )
+                .await?;
+            }
         } else {
+            if let Some((replan_id, result)) = replan_classification.as_ref() {
+                self.record_replan_classification(
+                    replan_id,
+                    CoordinatorReplanState::Approved,
+                    result.classification,
+                    result.classification_facts_json(),
+                )
+                .await?;
+            }
             let authorizer = coordination.requested_by.clone().ok_or_else(|| {
                 coordination_error(
                     "coordination.not_authorized",
@@ -2852,7 +2963,15 @@ impl TaskCoordinationService {
                 )
                 .await;
             match materialize {
-                Ok(_) => {}
+                Ok(_) => {
+                    if let Some((replan_id, _)) = replan_classification.as_ref() {
+                        self.mark_coordinator_replan_state(
+                            replan_id,
+                            CoordinatorReplanState::Materialized,
+                        )
+                        .await?;
+                    }
+                }
                 Err(ServiceError::Coordination {
                     code: "coordination.paused",
                     message,
@@ -2865,10 +2984,11 @@ impl TaskCoordinationService {
         Ok(())
     }
 
-    async fn complete_review_findings_turn(
+    pub(super) async fn complete_review_findings_turn(
         &self,
         request: &TaskCoordinationRequest,
         execution: &db::Execution,
+        allowed_outputs: Option<&[crate::coordinator_outputs::CoordinatorOutputKind]>,
     ) -> Result<()> {
         const MAX_REVIEW_FINDINGS_BYTES: usize = 64 * 1024;
 
@@ -2888,11 +3008,13 @@ impl TaskCoordinationService {
             task_id: String,
             authorization_version: i64,
             review_findings: Vec<crate::task_rework::ReviewFindingsDecision>,
+            #[serde(default)]
+            outputs: Vec<Value>,
         }
         let response: ReviewFindingsTurn = serde_json::from_str(output).map_err(|_| {
             invalid_plan("the ReviewFindings output is not its typed JSON envelope")
         })?;
-        if response.schema_version != 1
+        if !matches!(response.schema_version, 1 | 2)
             || response.request_id != request.id
             || response.task_id != request.task_id
             || response.authorization_version != request.authorization_version
@@ -2902,11 +3024,18 @@ impl TaskCoordinationService {
                 "ReviewFindings requires exactly one decision for its exact request and authorization",
             ));
         }
-        let decision = response
+        let mut decision = response
             .review_findings
             .into_iter()
             .next()
             .expect("one ReviewFindings decision was checked");
+        if response.schema_version == 1
+            && (!response.outputs.is_empty() || decision.micro_fix.is_some())
+        {
+            return Err(invalid_plan(
+                "ReviewFindings schema 1 is frozen; micro_fix and outputs require schema 2",
+            ));
+        }
         if decision.authorization_version != request.authorization_version
             || request.review_report_artifact_id.as_deref()
                 != Some(decision.review_report_artifact_id.as_str())
@@ -2916,12 +3045,188 @@ impl TaskCoordinationService {
                 "ReviewFindings decision does not match its exact report and authorization",
             ));
         }
+        if let Some(micro_fix) = decision.micro_fix.as_ref() {
+            if response.schema_version != 2
+                || decision.disposition != api_types::TaskReviewDisposition::Correct
+            {
+                return Err(crate::task_coordination::output_not_permitted(
+                    "micro_fix requires ReviewFindings schema 2 with the correct disposition",
+                ));
+            }
+            let coordination = self.require_coordination(&request.task_id).await?;
+            let envelope = self.envelope(&coordination)?;
+            if !envelope
+                .micro_fix
+                .as_ref()
+                .is_some_and(|grant| grant.enabled)
+            {
+                return Err(crate::task_coordination::output_not_permitted(
+                    "micro_fix requires envelope.micro_fix.enabled",
+                ));
+            }
+            let exact_context = crate::task_rework::TaskReworkService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+            )
+            .exact_review_findings_context(request)
+            .await?;
+            if exact_context
+                .pointer("/reviewed_result/commit_sha")
+                .and_then(Value::as_str)
+                .is_none()
+                || exact_context
+                    .pointer("/reviewed_result/workspace_id")
+                    .and_then(Value::as_str)
+                    .is_none()
+            {
+                return Err(crate::task_coordination::output_not_permitted(
+                    "micro_fix requires the exact reviewed repository commit and Workspace",
+                ));
+            }
+            crate::coordinator_outputs::ensure_new_kind_permitted(
+                crate::coordinator_outputs::CoordinatorOutputKind::MicroFix,
+                allowed_outputs,
+            )
+            .map_err(ServiceError::from)?;
+            if let Some(reviewer) = envelope.micro_fix_reviewer.as_ref() {
+                let producer_id = request
+                    .review_producer_execution_id
+                    .as_deref()
+                    .ok_or_else(|| invalid_plan("ReviewFindings request has no report producer"))?;
+                let authority =
+                    db::ExecutionTaskRoleAuthorityRepo::get_by_execution_id(&*self.db, producer_id)
+                        .await?
+                        .ok_or_else(|| {
+                            invalid_plan("ReviewReport producer has no exact TaskRole authority")
+                        })?;
+                let configuration = crate::role_capabilities::current_task_role_configuration(
+                    &self.db,
+                    &authority.task_role_id,
+                )
+                .await?
+                .ok_or_else(|| invalid_plan("ReviewReport TaskRole configuration is missing"))?;
+                let route = configuration.rework.as_ref().ok_or_else(|| {
+                    invalid_plan("micro_fix requires the ReviewReport TaskRole rework route")
+                })?;
+                if route.next_review_role_id.as_deref() != Some(reviewer.task_role_id.as_str())
+                    || route.review_actor.as_ref().is_some_and(|actor| {
+                        actor != &ApiActorRef::Agent(reviewer.agent_id.clone())
+                    })
+                {
+                    return Err(crate::task_coordination::output_not_permitted(
+                        "micro_fix_reviewer must match the configured next formal review route",
+                    ));
+                }
+            }
+            let artifact =
+                CollaborationRepo::get_artifact(&*self.db, &decision.review_report_artifact_id)
+                    .await?
+                    .filter(|artifact| {
+                        artifact.task_id == request.task_id
+                            && artifact.digest.as_deref() == Some(decision.report_digest.as_str())
+                    })
+                    .ok_or_else(|| {
+                        ServiceError::not_found(
+                            "ReviewReport",
+                            decision.review_report_artifact_id.clone(),
+                        )
+                    })?;
+            let report: Value =
+                serde_json::from_str(artifact.content.as_deref().unwrap_or_default())
+                    .map_err(|_| invalid_plan("ReviewReport source is invalid JSON"))?;
+            let findings = report
+                .get("findings")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let exact_findings = findings
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            if micro_fix
+                .finding_refs
+                .iter()
+                .any(|reference| !exact_findings.contains(reference.as_str()))
+                || micro_fix.paths.iter().any(|path| {
+                    !micro_fix
+                        .finding_refs
+                        .iter()
+                        .any(|reference| reference.contains(path))
+                })
+            {
+                return Err(crate::task_coordination::output_not_permitted(
+                    "micro_fix findings and paths must be exact subsets of this ReviewReport",
+                ));
+            }
+            let used = db::MicroFixReceiptRepo::list_micro_fix_receipts_by_task(
+                &*self.db,
+                &request.task_id,
+            )
+            .await?
+            .len() as i64;
+            if used
+                >= envelope
+                    .micro_fix
+                    .as_ref()
+                    .map(|grant| grant.max_per_task as i64)
+                    .unwrap_or(0)
+            {
+                return Err(crate::task_coordination::output_not_permitted(
+                    "micro_fix.max_per_task is exhausted; route the finding through ordinary triage or a Human",
+                ));
+            }
+            let scoped_instructions = format!(
+                "{}\n{}\nDeclared micro-fix paths: {}",
+                decision.instructions,
+                micro_fix.instructions,
+                micro_fix.paths.join(", ")
+            );
+            if scoped_instructions.len() > 16 * 1024 {
+                return Err(crate::task_coordination::output_not_permitted(
+                    "micro_fix instructions exceed the durable correction instruction bound",
+                ));
+            }
+            decision.instructions = scoped_instructions;
+        }
+        let mut outputs = crate::coordinator_outputs::parse_outputs(
+            response.outputs,
+            &self.envelope(&self.require_coordination(&request.task_id).await?)?,
+            allowed_outputs,
+        )
+        .map_err(ServiceError::from)?;
+        let propose_replan = outputs.iter().find_map(|output| match output {
+            crate::coordinator_outputs::CoordinatorOutput::ProposeReplan(value) => {
+                Some(value.clone())
+            }
+            _ => None,
+        });
+        if outputs.iter().any(|output| {
+            !matches!(
+                output,
+                crate::coordinator_outputs::CoordinatorOutput::ProposeReplan(_)
+            )
+        }) {
+            return Err(crate::task_coordination::output_not_permitted(
+                "ReviewFindings supports propose_replan outputs in this phase",
+            ));
+        }
+        if decision.micro_fix.is_some() && propose_replan.is_some() {
+            return Err(invalid_plan(
+                "one ReviewFindings turn cannot combine micro_fix and propose_replan",
+            ));
+        }
+        outputs.clear();
         crate::task_rework::TaskReworkService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
         )
         .record_review_triage(&execution.id, &request.id, decision)
-        .await
+        .await?;
+        if let Some(output) = propose_replan {
+            self.apply_propose_replan(request, execution, output)
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn mark_turn_started(
@@ -3082,11 +3387,12 @@ impl TaskCoordinationService {
                 .as_deref()
                 .ok_or_else(|| invalid_plan("ReviewFindings request has no exact report digest"))?;
             return Ok(format!(
-                "You are the selected Task coordinator reviewing one exact request-changes ReviewReport. This execution is read-only and cannot change the report, its verdict, the reviewed result, or a Gate.\n\
-Return exactly one JSON object and no markdown fences. It must match this schema:\n\
-{{\"schema_version\":1,\"request_id\":{request_id},\"task_id\":{task_id},\"authorization_version\":{authorization_version},\"review_findings\":[{{\"authorization_version\":{authorization_version},\"review_report_artifact_id\":{report_id},\"report_digest\":{report_digest},\"disposition\":\"correct|recheck|human\",\"rationale\":\"...\",\"instructions\":\"...\"}}]}}\n\
-Return exactly one decision in `review_findings` and no `actions`, plan, or WorkUnits. `correct` confirms a reproducible defect and gives a bounded correction for the authorized implementer. `recheck` asks for a fresh formal review of the same frozen subject without changing implementation. `human` identifies the concrete decision that needs a Human. Use only the report and reviewed result in this context; do not blindly relay findings or widen scope. Keep rationale nonempty and under 8 KiB, and instructions nonempty and under 16 KiB.\n\
-Exact report: {report_id} ({report_digest})\nTask context: {context}",
+                r#"You are the selected Task coordinator reviewing one exact request-changes ReviewReport. This execution is read-only and cannot change the report, its verdict, the reviewed result, or a Gate.
+Return exactly one JSON object matching:
+{{"schema_version":2,"request_id":{request_id},"task_id":{task_id},"authorization_version":{authorization_version},"review_findings":[{{"authorization_version":{authorization_version},"review_report_artifact_id":{report_id},"report_digest":{report_digest},"disposition":"correct|recheck|human","rationale":"...","instructions":"...","micro_fix":null}}],"outputs":[]}}
+Return exactly one decision. `correct` confirms a reproducible defect and gives a bounded correction; `recheck` asks for a fresh formal review of the same frozen subject; `human` identifies the concrete decision that needs a Human. Optional `micro_fix` (schema 2 only) is valid only with `correct` and has `finding_refs` (exact report findings), `instructions` (<= 4 KiB) and `paths` (up to 3 paths explicitly named in those findings). It requests a bounded correction and never supplies a patch. Optional `outputs` (up to 4) may contain `propose_replan` with `reason`, `evidence_links`, and `plan_request.instructions` (<= 4 KiB); it requires an explicitly permitted TaskRole action and `envelope.allow_coordinator_replan`. Do not combine micro_fix with propose_replan. Never include commands, commits, workspace IDs, or arbitrary paths. Keep rationale under 8 KiB and decision instructions under 16 KiB.
+Exact report: {report_id} ({report_digest})
+Task context: {context}"#,
                 request_id = serde_json::to_string(&request.id).unwrap(),
                 task_id = serde_json::to_string(&request.task_id).unwrap(),
                 authorization_version = request.authorization_version,
@@ -5014,7 +5320,7 @@ mod tests {
             cost_class: CostClass::Economy,
             max_wait_seconds: 86_400,
         };
-        let mut envelope = CoordinationEnvelope {
+        let envelope = CoordinationEnvelope {
             schema_version: 2,
             micro_fix: Some(micro_fix.clone()),
             fallback_agents: vec![

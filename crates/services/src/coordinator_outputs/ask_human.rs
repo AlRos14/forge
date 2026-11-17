@@ -27,7 +27,7 @@ pub struct HumanDecisionOption {
 }
 
 /// Closed set mirrored by the V174 insert guard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
     Artifact,

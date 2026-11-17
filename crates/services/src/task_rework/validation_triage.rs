@@ -7,6 +7,7 @@
 //! receipt, so a replay of the completed turn converges.
 
 use super::*;
+use crate::coordinator_outputs::MicroFixOutput;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,7 +20,7 @@ pub(crate) struct ValidationFindingsDecision {
     pub rationale: String,
     pub instructions: String,
     #[serde(default)]
-    pub micro_fix: Option<serde_json::Value>,
+    pub micro_fix: Option<MicroFixOutput>,
 }
 
 pub(super) const AUTHORITY_SQL: &str = "SELECT c.task_id,c.authorization_version,e.actor_kind,e.actor_id

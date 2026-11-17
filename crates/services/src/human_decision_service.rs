@@ -226,9 +226,12 @@ fn resume_brief(
                 "team_digest": coordination.team_digest,
                 "envelope_digest": coordination.envelope_digest,
                 "human_decision_id": decision.id,
+                "human_decision_source_kind": decision.source_kind.to_string(),
+                "human_decision_source_id": decision.source_id,
                 "answered_option_id": decision.answered_option_id,
                 "resumes_request_id": binding.request_id,
                 "resumes_request_kind": binding.request_kind.to_string(),
+                "source_subject": binding.source_subject,
             })
             .to_string(),
         ),
@@ -842,9 +845,9 @@ impl HumanDecisionService {
                 }
             }
             HumanDecisionSourceKind::CoordinatorReplan => {
-                return Err(ServiceError::invalid_operation(format!(
-                    "human decision source {kind} is not available in this phase"
-                )));
+                db::TaskCoordinatorReplanRepo::get_coordinator_replan(&*self.db, source_id)
+                    .await?
+                    .map(|source| source.task_id)
             }
         };
         match source_task {
@@ -995,6 +998,14 @@ impl HumanDecisionService {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) async fn validate_evidence_link(
+        &self,
+        task_id: &str,
+        link: &EvidenceLink,
+    ) -> Result<()> {
+        self.validate_evidence(task_id, link).await
     }
 }
 

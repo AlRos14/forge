@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 mod external_feedback_triage;
+mod micro_fix;
 mod triage;
 mod validation_triage;
 pub(crate) use triage::ReviewFindingsDecision;
@@ -92,6 +93,14 @@ impl TaskReworkService {
     /// ReviewReport. The event itself is only a hint; all authority and
     /// subject fields are loaded again from SQLite.
     pub async fn process_domain_event(&self, event: &DomainEvent) -> Result<bool> {
+        if event.event_type == "execution.completed" && event.entity_type == "execution" {
+            return self.process_micro_fix_result(&event.entity_id).await;
+        }
+        if event.event_type == "work_unit.completed" && event.entity_type == "work_unit" {
+            return self
+                .process_micro_fix_work_unit_result(&event.entity_id)
+                .await;
+        }
         if event.event_type != "artifact.created" || event.entity_type != "artifact" {
             return Ok(false);
         }
@@ -184,6 +193,11 @@ impl TaskReworkService {
                     }
                 }
             }
+            let micro_fix_request = if triage.as_ref().is_some_and(|value| value.0 == "correct") {
+                self.micro_fix_request(&task_id, &report_id).await?
+            } else {
+                None
+            };
 
             let source = sqlx::query(
                 "SELECT role.version AS role_version, configuration.configuration_json,
@@ -317,7 +331,34 @@ impl TaskReworkService {
                 processed += 1;
                 continue;
             }
-            let Some(review_actor) = policy.review_actor.clone() else {
+            let review_actor = if let Some(micro_fix) = micro_fix_request.as_ref() {
+                match self
+                    .micro_fix_review_actor(
+                        &task_id,
+                        micro_fix.authorization_version,
+                        policy.next_review_role_id.as_deref(),
+                        policy.review_actor.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(Some(actor)) => Some(actor),
+                    Ok(None) => policy.review_actor.clone(),
+                    Err(error) => {
+                        self.finish_automation_intent(
+                            &intent_id,
+                            "blocked",
+                            Some(&error.to_string()),
+                            None,
+                        )
+                        .await?;
+                        processed += 1;
+                        continue;
+                    }
+                }
+            } else {
+                policy.review_actor.clone()
+            };
+            let Some(review_actor) = review_actor else {
                 self.finish_automation_intent(
                     &intent_id,
                     "blocked",
@@ -418,6 +459,12 @@ impl TaskReworkService {
                 .await
             {
                 Ok(result) => {
+                    self.ensure_micro_fix_receipt(
+                        &task_id,
+                        &report_id,
+                        &result.correction_work_unit.id,
+                    )
+                    .await?;
                     let round: i64 = sqlx::query_scalar(
                         "SELECT round FROM task_rework_receipt WHERE correction_work_unit_id=?",
                     )
@@ -795,6 +842,8 @@ impl TaskReworkService {
         let correction_id: String = receipt.try_get("correction_work_unit_id")?;
         let review_id: String = receipt.try_get("review_work_unit_id")?;
         let round: i64 = receipt.try_get("round")?;
+        self.ensure_micro_fix_receipt(task_id, report_id, &correction_id)
+            .await?;
         if receipt_idempotency_key == automatic_idempotency_key {
             self.finish_automation_intent(
                 intent_id,

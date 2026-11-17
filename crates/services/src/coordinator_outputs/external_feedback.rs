@@ -32,7 +32,7 @@ use sqlx::Row;
 
 use super::{
     ensure_new_kind_permitted, AskHumanOutput, CoordinatorOutput, CoordinatorOutputKind,
-    EvidenceKind, EvidenceLink, HumanDecisionOption, OutputError, OutputResult,
+    EvidenceKind, EvidenceLink, HumanDecisionOption, MicroFixOutput, OutputError, OutputResult,
     CODE_OUTPUT_NOT_PERMITTED, MAX_NEW_OUTPUTS_PER_TURN,
 };
 use crate::task_coordination::{CoordinationEnvelope, PlanWorkUnit};
@@ -204,9 +204,9 @@ pub struct ExternalFeedbackEntry {
     pub dismiss_reason: Option<DismissReason>,
     #[serde(default)]
     pub proposal: Option<FollowUpProposal>,
-    /// Reserved for phase 3; must be `null`.
+    /// A bounded correction variant for an exact `extend_task` item.
     #[serde(default)]
-    pub micro_fix: Option<Value>,
+    pub micro_fix: Option<MicroFixOutput>,
 }
 
 impl ExternalFeedbackEntry {
@@ -220,6 +220,12 @@ impl ExternalFeedbackEntry {
         hasher.update(self.rationale.as_bytes());
         hasher.update(b"|");
         hasher.update(self.instructions.as_bytes());
+        if let Some(micro_fix) = self.micro_fix.as_ref() {
+            if let Ok(encoded) = serde_json::to_vec(micro_fix) {
+                hasher.update(b"|micro_fix|");
+                hasher.update(encoded);
+            }
+        }
         hex::encode(hasher.finalize())
     }
 
@@ -234,14 +240,13 @@ impl ExternalFeedbackEntry {
                 "external_feedback instructions are limited to 4096 bytes",
             ));
         }
-        if self
-            .micro_fix
-            .as_ref()
-            .is_some_and(|value| !value.is_null())
-        {
-            return Err(OutputError::invalid(
-                "micro_fix is not available for external_feedback in this phase",
-            ));
+        if let Some(micro_fix) = self.micro_fix.as_ref() {
+            if self.disposition != FeedbackDisposition::ExtendTask {
+                return Err(OutputError::invalid(
+                    "micro_fix is only valid for an extend_task disposition",
+                ));
+            }
+            micro_fix.validate()?;
         }
         match (self.disposition, self.dismiss_reason) {
             (FeedbackDisposition::Dismiss, None) => {
@@ -477,6 +482,7 @@ pub struct ParsedExternalFeedback {
     pub entries: Vec<ExternalFeedbackEntry>,
     pub plan: Option<ExternalFeedbackPlan>,
     pub asks: Vec<HumanItemAsk>,
+    pub outputs: Vec<CoordinatorOutput>,
 }
 
 impl ParsedExternalFeedback {
@@ -595,42 +601,49 @@ pub fn parse_external_feedback_v2(
         )));
     }
     let mut asks = Vec::with_capacity(turn.outputs.len());
+    let mut outputs = Vec::with_capacity(turn.outputs.len());
     let mut asked = BTreeSet::new();
     for output in turn.outputs {
         let output = CoordinatorOutput::from_value(output)?;
         ensure_new_kind_permitted(output.kind(), allowed_actions)?;
-        let CoordinatorOutput::AskHuman(ask) = output else {
+        if !matches!(
+            output,
+            CoordinatorOutput::AskHuman(_) | CoordinatorOutput::ProposeReplan(_)
+        ) {
             return Err(not_permitted(
-                "external_feedback accepts only ask_human outputs",
-            ));
-        };
-        let item_id = {
-            let linked = ask
-                .evidence_links
-                .iter()
-                .filter(|link| link.kind == EvidenceKind::ExternalFeedback)
-                .map(|link| link.id.as_str())
-                .collect::<BTreeSet<_>>();
-            let mut linked = linked.into_iter();
-            match (linked.next(), linked.next()) {
-                (Some(id), None) => id.to_owned(),
-                _ => {
-                    return Err(OutputError::new(
-                        super::CODE_EVIDENCE_INVALID,
-                        "each ask_human must link exactly one external_feedback item",
-                    ));
-                }
-            }
-        };
-        if !human_ids.contains(item_id.as_str()) || !asked.insert(item_id.clone()) {
-            return Err(not_permitted(
-                "ask_human must target a distinct item with the human disposition",
+                "external_feedback supports ask_human and propose_replan outputs only",
             ));
         }
-        asks.push(HumanItemAsk {
-            feedback_item_id: item_id,
-            ask,
-        });
+        if let CoordinatorOutput::AskHuman(ask) = &output {
+            let item_id = {
+                let linked = ask
+                    .evidence_links
+                    .iter()
+                    .filter(|link| link.kind == EvidenceKind::ExternalFeedback)
+                    .map(|link| link.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let mut linked = linked.into_iter();
+                match (linked.next(), linked.next()) {
+                    (Some(id), None) => id.to_owned(),
+                    _ => {
+                        return Err(OutputError::new(
+                            super::CODE_EVIDENCE_INVALID,
+                            "each ask_human must link exactly one external_feedback item",
+                        ));
+                    }
+                }
+            };
+            if !human_ids.contains(item_id.as_str()) || !asked.insert(item_id.clone()) {
+                return Err(not_permitted(
+                    "ask_human must target a distinct item with the human disposition",
+                ));
+            }
+            asks.push(HumanItemAsk {
+                feedback_item_id: item_id,
+                ask: ask.clone(),
+            });
+        }
+        outputs.push(output);
     }
     if let Some(missing) = human_ids.iter().find(|id| !asked.contains(**id)) {
         return Err(not_permitted(format!(
@@ -641,6 +654,7 @@ pub fn parse_external_feedback_v2(
         entries: turn.external_feedback,
         plan: turn.work_unit_plan,
         asks,
+        outputs,
     })
 }
 
@@ -1643,6 +1657,7 @@ mod tests {
             entries: vec![],
             plan: None,
             asks: vec![],
+            outputs: vec![],
         };
         assert!(ensure_extend_within_scope(&no_extend, &classification).is_ok());
     }

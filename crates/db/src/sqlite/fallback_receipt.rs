@@ -61,6 +61,136 @@ fn map_micro_fix_receipt(row: SqliteRow) -> Result<MicroFixReceipt> {
 
 #[async_trait]
 impl WorkUnitFallbackReceiptRepo for SqliteDb {
+    async fn allocate_work_unit_with_fallback_receipt(
+        &self,
+        allocation: AllocateWorkUnit,
+        allocation_event: CreateDomainEvent,
+        input: CreateWorkUnitFallbackReceipt,
+    ) -> Result<(WorkUnitFallbackReceipt, DomainEvent)> {
+        let Some(ActorRef::Agent(to_actor_id)) = allocation.assigned_actor.as_ref() else {
+            return Err(DbError::Check(
+                "fallback reallocation requires an Agent assignment".to_owned(),
+            ));
+        };
+        let version_after = allocation
+            .expected_version
+            .checked_add(1)
+            .ok_or_else(|| DbError::Check("WorkUnit version cannot be incremented".to_owned()))?;
+        if allocation.id != input.work_unit_id
+            || allocation.expected_version != input.work_unit_version_before
+            || version_after != input.work_unit_version_after
+            || allocation.role.trim().is_empty()
+            || to_actor_id != &input.to_actor_id
+            || input.to_actor_kind != ActorKind::Agent
+            || allocation_event.event_type != "work_unit.allocation_changed"
+            || allocation_event.entity_type != "work_unit"
+            || allocation_event.entity_id != allocation.id
+        {
+            return Err(DbError::Check(
+                "fallback allocation and receipt do not identify the same WorkUnit write"
+                    .to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let admission_is_current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM task_lifecycle lifecycle
+                JOIN task_dispatch dispatch ON dispatch.task_id = lifecycle.task_id
+                JOIN task_coordination coordination ON coordination.task_id = lifecycle.task_id
+                WHERE lifecycle.task_id = ?
+                  AND lifecycle.state = 'blocked'
+                  AND lifecycle.reason_kind = 'executor_unavailable'
+                  AND lifecycle.reason_ref = ?
+                  AND dispatch.state = 'running'
+                  AND coordination.mode != 'manual'
+                  AND coordination.revoked_at IS NULL
+                  AND coordination.team_stale = 0
+                  AND coordination.authorization_version = ?
+                  AND coordination.envelope_digest = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM execution sibling
+                      WHERE sibling.work_unit_id = ? AND sibling.status = 'running'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM workspace_lease lease
+                      WHERE lease.work_unit_id = ? AND lease.status = 'active'
+                  )
+            )",
+        )
+        .bind(&input.task_id)
+        .bind(&input.origin_execution_id)
+        .bind(input.authorization_version)
+        .bind(&input.envelope_digest)
+        .bind(&input.work_unit_id)
+        .bind(&input.work_unit_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !admission_is_current {
+            return Err(DbError::Check(
+                "fallback Task, coordination, dispatch, or WorkspaceLease authority is stale"
+                    .to_owned(),
+            ));
+        }
+        let result = sqlx::query(
+            "UPDATE work_unit SET role = ?, assigned_actor_kind = 'agent',
+                 assigned_actor_id = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND status = 'open'",
+        )
+        .bind(&allocation.role)
+        .bind(to_actor_id)
+        .bind(&allocation.updated_at)
+        .bind(&allocation.id)
+        .bind(allocation.expected_version)
+        .execute(&mut *tx)
+        .await
+        .map_err(check_error)?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+
+        let event = DomainEventRepo::append_event_in_tx(self, &mut tx, &allocation_event).await?;
+        sqlx::query(
+            "INSERT INTO work_unit_fallback_receipt (
+                id, task_id, work_unit_id, work_unit_version_before,
+                work_unit_version_after, origin_execution_id, failure_class,
+                route_attempts_digest, task_role_id, from_actor_kind, from_actor_id,
+                to_actor_kind, to_actor_id, chain_index, cost_class,
+                authorization_version, envelope_digest, new_execution_id, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(&input.work_unit_id)
+        .bind(input.work_unit_version_before)
+        .bind(input.work_unit_version_after)
+        .bind(&input.origin_execution_id)
+        .bind(&input.failure_class)
+        .bind(&input.route_attempts_digest)
+        .bind(&input.task_role_id)
+        .bind(input.from_actor_kind.to_string())
+        .bind(&input.from_actor_id)
+        .bind(input.to_actor_kind.to_string())
+        .bind(&input.to_actor_id)
+        .bind(input.chain_index)
+        .bind(input.cost_class.to_string())
+        .bind(input.authorization_version)
+        .bind(&input.envelope_digest)
+        .bind(&input.new_execution_id)
+        .bind(&input.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(check_error)?;
+        let row = sqlx::query("SELECT * FROM work_unit_fallback_receipt WHERE id = ?")
+            .bind(&input.id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let receipt = map_work_unit_fallback_receipt(row)?;
+        tx.commit().await?;
+        Ok((receipt, event))
+    }
+
     async fn create_work_unit_fallback_receipt(
         &self,
         input: CreateWorkUnitFallbackReceipt,

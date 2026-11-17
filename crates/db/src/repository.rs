@@ -2958,6 +2958,14 @@ pub trait TaskCoordinatorReplanRepo: Send + Sync {
 /// Durable evidence for a cross-Agent fallback on one exact WorkUnit attempt.
 #[async_trait]
 pub trait WorkUnitFallbackReceiptRepo: Send + Sync {
+    /// Atomically reallocates the exact open WorkUnit revision, appends its
+    /// allocation event, and creates the immutable fallback receipt.
+    async fn allocate_work_unit_with_fallback_receipt(
+        &self,
+        allocation: AllocateWorkUnit,
+        allocation_event: CreateDomainEvent,
+        receipt: CreateWorkUnitFallbackReceipt,
+    ) -> Result<(WorkUnitFallbackReceipt, DomainEvent)>;
     async fn create_work_unit_fallback_receipt(
         &self,
         input: CreateWorkUnitFallbackReceipt,

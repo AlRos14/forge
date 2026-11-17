@@ -1612,10 +1612,10 @@ Cualquier cambio de contrato vuelve a N0.
 | C1 | Servicio de catálogo (escritura owner/admin), validación de pins del envelope, extracción del núcleo de `run_command` con identidad de catálogo sin alterar el camino legacy. | A1 | `validation_service.rs`, `validation_catalog.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo C1–C3) |
 | C2 | (Fase 1) `ValidationCheckRunner` (cola, claim, lease-free guard, lock de workspace), workspace de verificación en commit base, comparación determinista (baseline **incluido en v1**, D1). Decisión del lead (C2): el baseline es un worktree git desacoplado propiedad del runner, **sin fila `workspace` ni `workspace_scope`**; la fila `validation_comparison` guarda commit base, digest de snapshot y procedencia local, y el worktree se limpia tras la ejecución (ver «Decisiones del lead posteriores a N0»). | C1 | `validation_check_runner.rs`, `workspace` crate (solo uso), `workspace_cleanup.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo C1–C3) |
 | C3 | (Fase 1) Gate policy schema v2 `required_checks` con resolución por clave exacta (D2 resuelta); trigger post-integración; sin cambiar v1. | C2 | `gate_engine.rs`, `validation_post_integration.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo C1–C3) |
-| R1 | Parsers/validadores/aplicadores como módulos nuevos con tests unitarios. Fase 1: `request_validation`, `ask_human`; fase 2: `external_feedback`; fase 3: `micro_fix`, `propose_replan`. | A2 | `coordinator_outputs/*` | **IMPLEMENTADO / NOT RUN** (fase 1: `request_validation`, `ask_human`; ver Anexo R1/D1) |
+| R1 | Parsers/validadores/aplicadores como módulos nuevos con tests unitarios. Fase 1: `request_validation`, `ask_human`; fase 2: `external_feedback`; fase 3: `micro_fix`, `propose_replan`. | A2 | `coordinator_outputs/*` | **IMPLEMENTADO / NOT RUN** (fase 1: `request_validation`, `ask_human`; fase 2: `external_feedback`; fase 3: `micro_fix`, `propose_replan`; ver Anexo M1/R1) |
 | D1 | (Fase 1) Servicio de `human_decision_request`: creación validando evidencia, respuesta con `expected_version`, autoridad por `authority_effect`, evento durable y reanudación exacta. | A4, A2 | `human_decision_service.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo R1/D1) |
-| M1 | (Fase 3) Cálculo de bounds sobre diff, `micro_fix_bounds_exceeded`, presupuesto `max_per_task`, revisión formal con contexto delta. | A5, R1 | `task_rework*`, `diff.rs` (lectura) | **TODO** |
-| FB | (Fase 3) Fallback cross-Agent según F-c; cadena y perfiles solo si están en el envelope (D7); sin fallback del coordinador (D8). | A5 | `task_dispatcher/fallback.rs` | **TODO** |
+| M1 | (Fase 3) Cálculo de bounds sobre diff, `micro_fix_bounds_exceeded`, presupuesto `max_per_task`, revisión formal con contexto delta. | A5, R1 | `task_rework*`, `diff.rs` (lectura) | **IMPLEMENTADO / NOT RUN** (ver Anexo M1/R1) |
+| FB | (Fase 3) Fallback cross-Agent según F-c; cadena y perfiles solo si están en el envelope (D7); sin fallback del coordinador (D8). | A5 | `task_dispatcher/fallback.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo FB) |
 | P0 | (Fase 2) `GitHubPrProvider` real (`find/create/get_status`) con cliente HTTP, credencial desde `CredentialService` (D4), redacción de errores, pruebas contra servidor simulado local vía costura inyectable. | N0, A3 | `pr_github_client.rs`, `pr_service.rs` | **IMPLEMENTADO / NOT RUN** (ver Anexo P0) |
 | P1 | (Fase 2) `PrFeedbackIngestor` + clasificación de confianza + anti-bucle + `stale_head`. | P0, A3 | `pr_feedback.rs`, `pr_service.rs` (registro en `PrReconciler`) | **IMPLEMENTADO / NOT RUN** (ver Anexo P1) |
 | P2 | (Fase 2, redefinido por D3') Triage `external_feedback` **por disposición** (`extend_task|propose_task|human|dismiss`, Congelado 11 §11.1/11.7): parser schema_version 2, `classify_rework_scope`, `apply_external_feedback_triage` (triage V173 con mapeo legado + disposición V175 + `human_decision` + `post_comment`), `FollowUpTaskService` para `propose_task` aprobado; productor/contexto del turno (atomicidad request+origen+presupuesto+evento, replay, pause/revoke/restart) vía RT. | P1, A2, R1, PX | `coordinator_outputs/external_feedback.rs`, `pr_feedback_followup.rs`, `task_coordination.rs` (vía RT) | **IMPLEMENTADO / NOT RUN** (ver Anexo P2; el cableado del turno sigue en RT) |
@@ -2644,3 +2644,94 @@ ejecutaron Cargo build/test/clippy ni pnpm; sí se ejecutó `cargo fmt --all`.
 La verificación local también aplicó en orden todas las migraciones a SQLite
 `:memory:` con Python 3 y ejecutó `git diff --check`; CI de GitHub sigue siendo
 la validación de compilación y pruebas.
+
+### Anexo FB (fase 3) — fallback cross-Agent (IMPLEMENTADO / NOT RUN)
+
+`TaskDispatcher` revisa Executions terminales cuyo `failure_class` es
+`executor_unavailable` y exige una ruta no vacía agotada (`usage_exhausted`,
+`unavailable` o `skipped_cooldown`). Un `execution.provider_start_uncertain`
+durable siempre excluye el fallback. Un `retry_at` futuro dentro de
+`max_wait_seconds` mantiene la asignación; al llegar el plazo, se reintenta el
+mismo Agent con el recibo de follow-up existente. Un hint nulo o superior al
+límite habilita el siguiente Agent de la cadena declarada para el TaskRole.
+
+Antes de asignar, el dispatcher revalida coordinación vigente/no revocada,
+digest del envelope, TaskRole y versión exactos, membership activa, cuenta del
+owner canónico, exclusión del coordinador, independencia de review, estado de
+pausa y credencial protegida cuando el perfil declara un `credential_ref`.
+Mantiene WorkUnit, role, scope y Workspace; la nueva Execution pasa por la
+admisión y los guardas de Provider Start, que emiten su WorkspaceLease exacto.
+Reasignación, evento de allocation y recibo V180 se escriben en una transacción
+SQLite; el repo reutiliza los tipos A5 y deja `new_execution_id` nulo hasta la
+admisión ordinaria posterior sin actualizar el recibo inmutable. El recibo conserva cadena,
+`cost_class`, envelope y digest de route attempts. El evento público
+`task.work_unit_fallback` proyecta solo IDs,
+digests, coste, índice y estado/código de resultado. Una cadena agotada conserva
+el bloqueo `executor_unavailable` y emite un evento durable con
+`chain_exhausted`.
+
+Se añadieron pruebas unitarias `fallback_*` para agotamiento de ruta, política
+de `retry_at`, orden por TaskRole, exclusión del Actor origen/coordinador,
+digest de route attempts y binding de metadata al Execution. La prueba DB
+`v180_fallback_allocation_and_receipt_commit_atomically` cubre commit conjunto
+y rollback cuando falla el guard del recibo. Los filtros CI son
+`cargo test --locked -p services --lib fallback_` en
+`.github/workflows/build-local-linux.yml` y el filtro existente `v180_` para
+DB. Estado: **IMPLEMENTADO / NOT RUN**;
+no se ejecutaron Cargo ni pnpm localmente. No se añadió migración.
+
+La unión TypeScript `PublicEventType` y la lista de eventos nombrados del
+cliente web quedan pendientes de generación/actualización: el comando del repo
+`pnpm generate:types` invoca `cargo test -p api-types`, ambos vedados en este
+nodo. El enum Rust, el allowlist SSE del servidor y la documentación API sí
+están actualizados.
+
+### Anexo M1/R1 (fase 3) — micro-fix y replan del coordinador (IMPLEMENTADO / NOT RUN)
+
+`micro_fix` está disponible en `review_findings`, `validation_findings` y
+`external_feedback` solo con `envelope.micro_fix.enabled` y el permiso explícito
+`micro_fix` del TaskRole productor. Cada salida valida findings y paths contra su
+fuente exacta y escribe un `MicroFixReceipt` V180 para el WorkUnit corrector
+exacto. Tras su resultado, Forge mide `git diff --numstat` desde el commit
+revisado: máximo 3 archivos, 60 líneas, máximo `max_per_task` (≤ 3), paths
+declarados y exclusión permanente de manifests, lockfiles, migraciones,
+`.github/**` y `CLAUDE.md`. La única transición del recibo fija el commit,
+contadores y `bounds_violation`. Una violación emite `micro_fix.bounds_exceeded`
+con el valor tipado y devuelve la corrección a revisión formal/triage ordinario;
+ningún resultado se acepta por fast path.
+
+La revisión se ancla al `WorkUnitReviewSubject` del commit y snapshot exactos,
+exige un miembro independiente de un rol con `formal_review` dentro de
+`allowed_review_roles`, respeta el pin opcional `micro_fix_reviewer`, y crea un
+Gate nuevo de tipo `micro_fix_review` para la línea de revisión exacta. Los
+WorkUnits emparejados de `review_findings` conservan su revisión formal
+configurada; `validation_findings` y `external_feedback` crean su revisor formal
+determinista con contexto limitado al delta, findings y paths autorizados.
+
+`propose_replan` también requiere permiso explícito en `allowed_actions` y
+`envelope.allow_coordinator_replan`. El servicio registra `TaskCoordinatorReplan`
+en V172 (máximo dos por Task), conserva el origen `CoordinatorReplan` al abrir
+`work_unit_plan` y emite `task.coordinator_replan_proposed`. El clasificador
+`classify_replan(plan, envelope, original)` compara digest del objetivo, roles y
+actores del equipo, WorkUnits existentes no cancelados más los propuestos,
+presupuesto, repositorio, paths y grants del envelope. Los hechos medidos se
+serializan en `classification_facts_json`; cualquier falso produce
+`scope_or_authority_change`. En ese caso Forge crea un
+`human_decision_request(source_kind='coordinator_replan')` con evidencia del
+Artifact exacto y opciones `approve_replan`, `reject` y `revise_scope`; solo la
+respuesta `approve_replan` puede aprobar y materializar ese Artifact. Un plan
+`within_envelope` sigue el mecanismo vigente de aprobación/materialización.
+Fallos de cupo DB se traducen a `coordination.replan_limit_reached`.
+
+Se añadieron pruebas de servicios con prefijos `micro_fix_` y
+`coordinator_replan_`; el workflow registra los filtros
+`cargo test --locked -p services --lib micro_fix_` y
+`cargo test --locked -p services --lib coordinator_replan_`. En esta sesión no
+se ejecutaron Cargo build/test/clippy ni pnpm. Solo se ejecutará `cargo fmt
+--all` y `git diff --check`; CI queda como verificación. No se añadió migración:
+V180 cubre los recibos y V172 ya contiene el ledger/origen de replan.
+
+La unión TypeScript `PublicEventType` y la lista de listeners nombrados del
+cliente web aún requieren regeneración/actualización; no se ejecutó el generador
+porque invoca el `cargo test -p api-types` prohibido en esta sesión. La enum Rust,
+el allowlist del endpoint SSE y `docs/api.md` ya incluyen ambos eventos.

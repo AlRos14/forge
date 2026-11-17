@@ -702,6 +702,7 @@ async fn triage_fixture(
             disposition: api_types::TaskReviewDisposition::Human,
             rationale: "Needs a Human decision".into(),
             instructions: "Choose whether the evidence gap is acceptable".into(),
+            micro_fix: None,
         },
     ))
     .unwrap();
@@ -719,6 +720,7 @@ async fn triage_fixture(
         disposition: api_types::TaskReviewDisposition::Human,
         rationale: "Pause fence check".into(),
         instructions: "Wait for dispatch to resume".into(),
+        micro_fix: None,
     };
     let current_task = TaskRepo::get_by_id(&**db, &task.id, false)
         .await
@@ -776,6 +778,7 @@ async fn triage_fixture(
             disposition: api_types::TaskReviewDisposition::Recheck,
             rationale: "Check the exact acceptance evidence again".into(),
             instructions: "Independently verify the original delivery evidence".into(),
+            micro_fix: None,
         };
         submit_review_findings(&coordination, &request, &fixture.execution, &decision)
             .await
@@ -840,6 +843,7 @@ async fn triage_fixture(
         disposition,
         rationale: "Checked the requested evidence against the exact scope".into(),
         instructions: "Produce or independently verify the missing acceptance evidence".into(),
+        micro_fix: None,
     };
     let mut wrong = decision.clone();
     wrong.report_digest = "0".repeat(64);

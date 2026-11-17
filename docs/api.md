@@ -312,10 +312,18 @@ Project owner's account; the coordinator Agent cannot be in a fallback chain,
 and a micro-fix reviewer needs `formal_review` in an allowed review role.
 
 Unset v2 fields are omitted from serialization, preserving the historical
-canonical JSON and digest for envelopes that do not use these fields. The A5
-phase-3 slice records these preauthorizations and adds immutable fallback and
-micro-fix receipts; dispatcher, micro-fix application, and coordinator-replan
-runtime handling are supplied by later phase-3 lanes.
+canonical JSON and digest for envelopes that do not use these fields. The phase-3
+runtime uses these grants for exhausted-route fallback, bounded micro-fix
+corrections, and coordinator replans. A micro-fix is available only when the
+envelope grant and explicit TaskRole action both allow it. Forge checks the
+completed diff against the reviewed commit and declared paths; bounds violations
+emit a typed `micro_fix.bounds_exceeded` event and return the result to ordinary
+triage. Every correction still receives formal review of its exact result and a
+fresh Gate. `propose_replan` requires `allow_coordinator_replan` and an explicit
+TaskRole action. Its plan is classified against the captured Task objective,
+team, WorkUnit budget, repository/path scope, and envelope; a scope or authority
+change requires an exact Human decision before materialization. The V172 ledger
+limits coordinator replans to two per Task.
 
 After atomic materialization commits, ready assigned Agent repository scopes
 are prepared through the existing WorkUnit workspace service before launch.
@@ -332,7 +340,8 @@ Typed coordination errors use `403 coordination.not_authorized`,
 `409 coordination.already_materialized`, `409 coordination.plan_not_approved`,
 `409 coordination.paused`, `422 coordination.invalid_plan`,
 `422 coordination.unsupported_plan_item`, `422 coordination.human_turn_unsupported`,
-`429 coordination.budget_exhausted`, and `503 coordination.host_unavailable`.
+`429 coordination.budget_exhausted`, `503 coordination.host_unavailable`,
+`coordination.output_not_permitted`, and `coordination.replan_limit_reached`.
 The generic coordination request route can also return
 `409 project_plan_batch_inactive` when the supplied authorization version belongs to
 a Project batch; batch continuations must retain their exact scheduler, quality,
@@ -360,7 +369,13 @@ Public SSE events are `task.coordination_authorized`,
 `task.intervention_recorded`, `task.intervention_state_changed`,
 `task.validation_check_requested`, `task.validation_check_completed`,
 `task.validation_comparison_recorded`, `task.human_decision_requested`,
-`task.human_decision_answered`, and `task.human_decision_closed`. They carry
+`task.human_decision_answered`, `task.human_decision_closed`, and
+`task.work_unit_fallback`, `task.micro_fix_bounds_exceeded`, and
+`task.coordinator_replan_proposed`. Fallback events carry the WorkUnit and origin
+Execution IDs, receipt and TaskRole IDs when reassigned, source and destination
+Agent IDs, chain index, cost class, authorization version, envelope and route
+attempt digests, and outcome/reason state. An exhausted or no-longer-authorized
+chain remains blocked and emits its safe reason code. Events carry
 IDs, states, versions, digests, route counters, and safe escalation codes; never
 plan content, prompts, briefs, free-form escalation text, credentials, or paths.
 `task.quality_requested` carries `state`, `route_id`, `route_round`,
@@ -668,6 +683,13 @@ Public durable event types are:
   `task.pr_followup_proposed`; external action events
   `task.pr_action_requested` and `task.pr_action_completed`. Their payloads
   contain only allowlisted identifiers, digests, heads, kinds and states.
+- `task.work_unit_fallback` reports a preauthorized WorkUnit Agent reassignment
+  or a durable blocked outcome using only allowlisted IDs, digests, cost class,
+  chain index, outcome, and safe reason code.
+- `task.micro_fix_bounds_exceeded` carries the exact receipt, WorkUnit, result
+  commit, and typed bounds violation. `task.coordinator_replan_proposed` carries
+  the replan/request IDs, ordinal, authorization version, and envelope digest.
+  Neither event includes paths, plan contents, prompts, or free-form reasons.
 
 Runtime hint names are `project.created`, `project.updated`, `project.deleted`,
 `project.paused`, `project.resumed`, `project_hook.run_changed`,

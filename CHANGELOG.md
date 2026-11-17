@@ -13,8 +13,12 @@ PR14 audit on 2026-10-16.
 - Coordination envelope v2 accepts bounded micro-fix, reviewer, fallback-Agent,
   and coordinator-replan preauthorizations. V180 adds immutable fallback and
   micro-fix receipts, including the one-step bounds outcome transition. The
-  dispatcher, micro-fix application, and coordinator-replan runtime remain in
-  later phase-3 lanes.
+  dispatcher now applies cross-Agent fallback only after an exhausted route
+  when `retry_at` is absent or exceeds its envelope wait bound, recording an
+  immutable receipt and a public `task.work_unit_fallback` event. Micro-fix
+  corrections now record diff bounds and require a formal review with a fresh
+  Gate. The coordinator can propose a bounded replan; Rust classifies scope and
+  authority changes, requiring an exact Human decision before materialization.
 
 - Project repository settings can connect and select GitHub SCM credentials and
   edit per-repository PR feedback policy. Task details show paginated PR

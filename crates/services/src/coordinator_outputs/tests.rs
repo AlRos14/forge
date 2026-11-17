@@ -26,7 +26,72 @@ fn allow_all() -> Vec<CoordinatorOutputKind> {
     vec![
         CoordinatorOutputKind::RequestValidation,
         CoordinatorOutputKind::AskHuman,
+        CoordinatorOutputKind::ProposeReplan,
     ]
+}
+
+#[test]
+fn coordinator_replan_output_requires_explicit_permission_and_has_frozen_shape() {
+    let value = json!({
+        "type":"propose_replan",
+        "reason":"The accepted split cannot be completed safely",
+        "evidence_links":[{"kind":"artifact","id":"artifact-1","digest":"a".repeat(64)}],
+        "plan_request":{"instructions":"Split the remaining accepted scope"}
+    });
+    let denied = parse_outputs(vec![value.clone()], &pins(), None).unwrap_err();
+    assert_eq!(denied.code, CODE_OUTPUT_NOT_PERMITTED);
+    let allowed = [CoordinatorOutputKind::ProposeReplan];
+    let parsed = parse_outputs(vec![value], &pins(), Some(&allowed)).unwrap();
+    assert!(matches!(
+        parsed.as_slice(),
+        [CoordinatorOutput::ProposeReplan(_)]
+    ));
+    let mut unknown = json!({
+        "type":"propose_replan",
+        "reason":"reason",
+        "plan_request":{"instructions":"instructions","path":"src/secret.rs"}
+    });
+    assert!(CoordinatorOutput::from_value(std::mem::take(&mut unknown)).is_err());
+}
+
+#[test]
+fn micro_fix_output_is_bounded_and_rejects_unowned_paths() {
+    let valid = MicroFixOutput {
+        finding_refs: vec!["finding-1".to_owned()],
+        instructions: "Fix only this finding".to_owned(),
+        paths: vec!["crates/services/src/lib.rs".to_owned()],
+    };
+    valid.validate().unwrap();
+    assert!(MicroFixOutput {
+        paths: vec!["../Cargo.toml".to_owned()],
+        ..valid.clone()
+    }
+    .validate()
+    .is_err());
+    assert!(MicroFixOutput {
+        paths: vec!["src/file\n.rs".to_owned()],
+        ..valid.clone()
+    }
+    .validate()
+    .is_err());
+    assert!(MicroFixOutput {
+        finding_refs: vec!["finding".to_owned(); MAX_MICRO_FIX_FINDINGS + 1],
+        ..valid
+    }
+    .validate()
+    .is_err());
+}
+
+#[test]
+fn micro_fix_permission_is_never_implied_by_legacy_policy() {
+    assert_eq!(
+        ensure_new_kind_permitted(CoordinatorOutputKind::MicroFix, None)
+            .unwrap_err()
+            .code,
+        CODE_OUTPUT_NOT_PERMITTED
+    );
+    let allowed = [CoordinatorOutputKind::MicroFix];
+    ensure_new_kind_permitted(CoordinatorOutputKind::MicroFix, Some(&allowed)).unwrap();
 }
 
 #[test]

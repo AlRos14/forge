@@ -46,6 +46,7 @@ pub mod project_plan;
 pub mod provider_authorization;
 pub mod recovery;
 pub mod release_history;
+mod replan_classifier;
 pub mod role_capabilities;
 pub mod shared_media_cleanup;
 pub mod shutdown;
