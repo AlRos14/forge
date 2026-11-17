@@ -117,8 +117,11 @@ impl TaskReworkService {
                 "ReviewFindings turn exceeds its durable output bound",
             ));
         }
-        let turn: ReviewFindingsTurn = serde_json::from_str(&summary)
-            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        // A summary that is not a ReviewFindings turn carries no micro-fix
+        // grant; the ordinary correction path stays authoritative.
+        let Ok(turn) = serde_json::from_str::<ReviewFindingsTurn>(&summary) else {
+            return Ok(None);
+        };
         if turn.schema_version != 2
             || turn.request_id != request_id
             || turn.task_id != task_id

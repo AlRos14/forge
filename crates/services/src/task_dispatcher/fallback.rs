@@ -935,10 +935,7 @@ impl TaskDispatcher {
             }
         }
         let actor = api_types::ActorRef::Agent(agent.id.clone());
-        Ok(
-            crate::task_rework::reviewer_is_independent(&self.db, &context.work_unit_id, &actor)
-                .await?,
-        )
+        crate::task_rework::reviewer_is_independent(&self.db, &context.work_unit_id, &actor).await
     }
 }
 

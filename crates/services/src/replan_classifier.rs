@@ -202,11 +202,24 @@ mod tests {
     use super::*;
     use crate::task_coordination::{CoordinationEnvelope, PlanWorkUnit};
 
+    /// Restrictive baseline so tests can measure each newly granted flag.
+    fn base_envelope() -> CoordinationEnvelope {
+        CoordinationEnvelope {
+            max_work_units: 2,
+            allow_repository_write: false,
+            orchestrator_reviews_findings: false,
+            ..CoordinationEnvelope::default()
+        }
+    }
+
     fn original() -> ReplanOriginalScope {
         ReplanOriginalScope {
             objective_digest: "objective".to_owned(),
             current_objective_digest: "objective".to_owned(),
-            original_envelope: CoordinationEnvelope::default(),
+            original_envelope: CoordinationEnvelope {
+                max_work_units: 16,
+                ..base_envelope()
+            },
             team_roles: ["implementer".to_owned()].into_iter().collect(),
             team_actors: ["agent:a".to_owned()].into_iter().collect(),
             existing_work_units: 1,
@@ -248,10 +261,7 @@ mod tests {
 
     #[test]
     fn coordinator_replan_classifier_accepts_measured_in_envelope_plan() {
-        let envelope = CoordinationEnvelope {
-            max_work_units: 2,
-            ..CoordinationEnvelope::default()
-        };
+        let envelope = base_envelope();
         let result = classify_replan(
             &plan("src/module.rs", "implementer", None),
             &envelope,
@@ -266,10 +276,7 @@ mod tests {
 
     #[test]
     fn coordinator_replan_classifier_marks_scope_and_authority_deltas() {
-        let mut envelope = CoordinationEnvelope {
-            max_work_units: 2,
-            ..CoordinationEnvelope::default()
-        };
+        let mut envelope = base_envelope();
         assert_eq!(
             classify_replan(
                 &plan("outside/file.rs", "implementer", None),
@@ -308,8 +315,7 @@ mod tests {
     fn coordinator_replan_classifier_requires_unchanged_objective_digest() {
         let mut original = original();
         original.current_objective_digest = "changed".to_owned();
-        let mut envelope = CoordinationEnvelope::default();
-        envelope.max_work_units = 2;
+        let envelope = base_envelope();
         let result = classify_replan(
             &plan("src/module.rs", "implementer", None),
             &envelope,
@@ -326,8 +332,7 @@ mod tests {
     fn coordinator_replan_classifier_counts_existing_work_units_and_repository_changes() {
         let mut original = original();
         original.existing_work_units = 2;
-        let mut envelope = CoordinationEnvelope::default();
-        envelope.max_work_units = 2;
+        let mut envelope = base_envelope();
         let result = classify_replan(
             &plan("src/module.rs", "implementer", None),
             &envelope,
@@ -356,8 +361,7 @@ mod tests {
 
     #[test]
     fn coordinator_replan_classifier_rejects_new_envelope_grants() {
-        let mut envelope = CoordinationEnvelope::default();
-        envelope.max_work_units = 2;
+        let mut envelope = base_envelope();
         envelope.allow_new_task_roles = true;
         assert_eq!(
             classify_replan(
