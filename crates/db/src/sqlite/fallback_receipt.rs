@@ -276,7 +276,7 @@ impl WorkUnitFallbackReceiptRepo for SqliteDb {
         }
         sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
         let mut request = sqlx::query(&sql).bind(task_id);
-        if let Some(cursor) = cursor {
+        if let Some(cursor) = &cursor {
             request = request
                 .bind(&cursor.sort_value)
                 .bind(&cursor.sort_value)
