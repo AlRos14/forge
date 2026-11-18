@@ -17,7 +17,7 @@ When behavior or a public contract changes, update the affected documentation in
 
 ## Product state
 
-The workspace source version is 0.9.0. This repository has no verified published GitHub release as of 2026-11-17. Build from this repository to use the current implementation; do not present ForgeAILab npm, Homebrew, installer, or release artifacts as this fork's distribution.
+The workspace source version is 0.9.1. Releases are published on GitHub Releases of AlRos14/forge from `v*` tags (first: v0.9.0 on 2026-11-17). Do not present ForgeAILab npm, Homebrew, installer, or release artifacts as this fork's distribution.
 
 PR0–PR15 are merged. The current implementation uses the Actor and harness orchestration model, TaskLifecycle, TaskRole/RoleMembership, WorkUnits, explicit Executions and HarnessSessions, deterministic Gates, and generic collaboration. Task launch is a durable dispatch intent: prepared Agent WorkUnits are admitted by the dispatcher, Human-assigned WorkUnits remain pending human work, and manual Execution creation is retired. Execution purpose is retired from public and active persistence; historical values remain migration evidence. Main Agent, Project Agent, Agent Chat, Product Genesis, Project OS operations, legacy Attention, and the old WorkflowEngine are retired from current runtime/public authority. Their migration provenance and historical snapshots remain historical evidence.
 

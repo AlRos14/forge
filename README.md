@@ -1,6 +1,6 @@
 # Forge
 
-Forge 0.9.0 is an orchestrated autonomous delivery platform for Human and
+Forge is an orchestrated autonomous delivery platform for Human and
 harness-bound Agent work. Humans set scope and make reserved decisions; Forge
 coordinates durable Tasks, assigned WorkUnits, deterministic validation, review,
 repository delivery, and recovery within that authority.
@@ -31,8 +31,9 @@ lists exact REST routes, MCP tool names, and SSE event names.
 
 ## Build this repository
 
-This fork has no verified published GitHub release as of 2026-11-17. Build from
-source to use the current implementation. The build requires stable Rust, Git,
+Prebuilt archives for Linux (x86-64 and ARM64, GNU and musl) and macOS (x86-64
+and ARM64), with `SHA256SUMS`, are published on [GitHub Releases](https://github.com/AlRos14/forge/releases).
+Verify downloads with `sha256sum -c SHA256SUMS`. To build from source instead: The build requires stable Rust, Git,
 Node.js 24, and pnpm 10; building forge-cli also builds the web UI.
 
     git clone https://github.com/AlRos14/forge.git
@@ -64,7 +65,7 @@ exposure.
 
 ## Project identity and history
 
-The workspace source version is 0.9.0; it does not identify a published release.
+The workspace source version is 0.9.1.
 The current schema contains migrations through V180. Migration records,
 historical specifications, earlier design documents, and ProjectRelease
 snapshots remain historical evidence.
