@@ -8,7 +8,7 @@ The user-facing entry point is [README.md](README.md). Current implementation co
 - [docs/migration/architecture-v2.md](docs/migration/architecture-v2.md) — ordered PR0–PR15 migration contract and invariants INV-001–INV-040.
 - [docs/concepts/](docs/concepts/) — Actor, role, execution, WorkUnit, review, validation, Gate, and collaboration contracts.
 - [docs/api.md](docs/api.md) — REST, MCP, and SSE.
-- [docs/getting-started.md](docs/getting-started.md) — source build and end-to-end REST walkthrough.
+- [docs/getting-started.md](docs/getting-started.md) — release install, source build, and end-to-end REST walkthrough.
 - [docs/cli.md](docs/cli.md) — forge-ctl reference.
 - [docs/deployment.md](docs/deployment.md) — container identity, persistence, and network exposure.
 - [docs/upstream.md](docs/upstream.md) — origin, independent maintenance, and MIT attribution.
