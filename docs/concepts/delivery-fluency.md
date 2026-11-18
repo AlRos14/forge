@@ -1,6 +1,6 @@
 # Orchestrated delivery
 
-Forge 0.9.0 coordinates Human and harness-bound Agent work through durable
+Forge 0.9.1 coordinates Human and harness-bound Agent work through durable
 Tasks, WorkUnits, Executions, evidence, and lifecycle transitions. Autonomy
 comes from explicitly authorized routes and deterministic services; a harness
 does not grant itself new roles, repository scope, or external action rights.

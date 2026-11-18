@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the 0.9.0 source implementation, including the current schema through V180. The ordered migration contract and invariants are in [Architecture V2](migration/architecture-v2.md); domain details are in [concepts](concepts/).
+This document describes the 0.9.1 source implementation, including the current schema through V180. The ordered migration contract and invariants are in [Architecture V2](migration/architecture-v2.md); domain details are in [concepts](concepts/).
 
 > The Orchestrator owns work boundaries. The harness owns cognition.
 

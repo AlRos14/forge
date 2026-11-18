@@ -1,6 +1,6 @@
 # Security Policy
 
-The maintained source is this repository. Releases are built by this repository's workflow for `v*` tags; no published GitHub release has been verified as of 2026-11-17. A version in the source tree does not establish that a release artifact exists.
+The maintained source is this repository. Releases are published on [GitHub Releases](https://github.com/AlRos14/forge/releases) by this repository's workflow for `v*` tags, starting with v0.9.0. Security fixes target the latest release and `main`.
 
 ## Reporting a vulnerability
 

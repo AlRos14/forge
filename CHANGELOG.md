@@ -1,12 +1,27 @@
 # Changelog
 
-This changelog preserves the source repository's recorded history. The 0.9.0
-section describes the current source state of AlRos14/forge; historical entries
-do not assert that this fork published matching artifacts. The workspace source
-version is 0.9.0. This repository has no verified published GitHub release as
-of 2026-11-17.
+This changelog preserves the source repository's recorded history. Sections
+from 0.9.0 onward describe releases of AlRos14/forge, published on GitHub
+Releases from `v*` tags. Entries for 0.8.0 and earlier are inherited history
+and do not assert that this fork published matching artifacts. The workspace
+source version is 0.9.1.
 
 ## [Unreleased]
+
+## [0.9.1] - 2026-11-18
+
+Packaging fix for 0.9.0. No runtime, API, or schema changes.
+
+### Fixed
+
+- The container image build now includes the vendored `sqlx-sqlite` patch in
+  its build context. The 0.9.0 release published binaries and checksums but no
+  GHCR image because of this; 0.9.1 is the first release with an image.
+
+### Changed
+
+- The release workflow builds both macOS archives (arm64 and cross-compiled
+  x86-64) on one macOS runner, keeping the same archive names.
 
 ## [0.9.0] - 2026-11-17
 
