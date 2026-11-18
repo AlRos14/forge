@@ -1,15 +1,49 @@
 # Getting Started
 
-This guide builds this repository, starts Forge locally, registers a harness
+This guide installs or builds Forge, starts it locally, registers a harness
 Agent, and starts one explicitly scoped WorkUnit. It uses REST so each ID and
 version comes from the server response. Values such as `<PROJECT_ID>` in other
 examples are placeholders; the commands below extract their own IDs.
 
-## 1. Build and start Forge
+## 1. Install or build, then start Forge
 
-Install Rust stable, Git, Node.js 24, pnpm 10, Bash, curl, and jq. The
-`forge-cli` build script runs `pnpm install --frozen-lockfile` and builds
-`web/` unless `FORGE_SKIP_WEB_BUILD=1` is set.
+The walkthrough needs Bash, curl, and jq. Choose one way to obtain Forge.
+
+### From a release
+
+Release archives on [GitHub Releases](https://github.com/AlRos14/forge/releases)
+are named `forge-<arch>-<os>[-musl].tar.gz` (for example
+`forge-x86_64-linux.tar.gz`, `forge-aarch64-macos.tar.gz`) and contain `forge`,
+`forge-ctl`, and `web/dist`. The installer selects the archive for the current
+platform and installs the binaries to `$PREFIX/bin` and the web UI to
+`$PREFIX/share/forge/web/dist`. `PREFIX` defaults to `/usr/local` and the
+installer uses `sudo` only when that location is not writable.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AlRos14/forge/main/install.sh | bash
+mkdir -p forge-walkthrough && cd forge-walkthrough
+forge --data-dir ./test
+```
+
+To install manually, download the archive and `SHA256SUMS` from the same
+release, then verify and extract:
+
+```bash
+sha256sum -c --ignore-missing SHA256SUMS
+mkdir -p ~/forge && tar -xzf forge-x86_64-linux.tar.gz -C ~/forge
+```
+
+`forge` looks for the web UI in `FORGE_WEB_DIST_DIR`, then `./web/dist` in the
+current directory, then `<prefix>/share/forge/web/dist` next to `<prefix>/bin/forge`.
+Running an extracted archive from another directory therefore needs
+`FORGE_WEB_DIST_DIR=~/forge/web/dist ~/forge/forge`; without web assets the API
+still runs and Forge logs a warning.
+
+### From source
+
+Install Rust stable, Git, Node.js 24, and pnpm 10. The `forge-cli` build script
+runs `pnpm install --frozen-lockfile` and builds `web/` unless
+`FORGE_SKIP_WEB_BUILD=1` is set.
 
 ```bash
 git clone https://github.com/AlRos14/forge.git
@@ -26,8 +60,10 @@ wipe. The server binds to loopback on an OS-selected port and records the
 address in `<data-dir>/server.json`. Open the `management_url` printed in the
 server log. Leave this terminal running.
 
-The embedded daemon starts by default. In another terminal, from the cloned
-repository, discover the saved server URL:
+### Discover the server URL
+
+The embedded daemon starts by default. In another terminal, from the directory
+where you started Forge, discover the saved server URL:
 
 ```bash
 export FORGE_DATA_DIR="$PWD/test"

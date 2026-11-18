@@ -1,8 +1,9 @@
 # Deployment and container permissions
 
 This page covers the supported local container deployment for this repository.
-No published image or release is implied. Build the image from the checked-out
-source.
+Each release publishes a multi-tag image to `ghcr.io/alros14/forge`
+(`<version>`, `<major>.<minor>`, and `latest`). You can also build the image
+from the checked-out source.
 
 ## Identity and filesystem contract
 
@@ -22,11 +23,25 @@ Do not solve permission failures with `chmod 777` or a blind recursive
 
 ## Clean install
 
+From the published image, without a source checkout, using the same settings as
+the repository `docker-compose.yml`:
+
+```bash
+docker run -d --name forge --init --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 -v forge-data:/data \
+  ghcr.io/alros14/forge:0.9.1
+docker logs -f forge
+```
+
+From the checked-out source with Compose:
+
 ```bash
 docker compose build
 docker compose up -d
 docker compose logs -f forge
 ```
+
+Set `FORGE_PORT` to publish a different host port if `8080` is taken.
 
 Compose binds the host port to `127.0.0.1:8080` by default. Open the URL printed
 by Forge, or `http://127.0.0.1:8080`. The named volume `forge-data` persists

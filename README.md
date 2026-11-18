@@ -29,12 +29,24 @@ Use the REST API, registered MCP tools, forge-ctl, or the web UI. All surfaces
 use the same durable domain services and authorization. The [API reference](docs/api.md)
 lists exact REST routes, MCP tool names, and SSE event names.
 
-## Build this repository
+## Install and run
 
 Prebuilt archives for Linux (x86-64 and ARM64, GNU and musl) and macOS (x86-64
 and ARM64), with `SHA256SUMS`, are published on [GitHub Releases](https://github.com/AlRos14/forge/releases).
-Verify downloads with `sha256sum -c SHA256SUMS`. To build from source instead: The build requires stable Rust, Git,
-Node.js 24, and pnpm 10; building forge-cli also builds the web UI.
+The installer downloads the latest release for the current platform and
+installs `forge`, `forge-ctl`, and the web UI under `/usr/local` (set `PREFIX`
+to change it):
+
+    curl -fsSL https://raw.githubusercontent.com/AlRos14/forge/main/install.sh | bash
+    forge
+
+Forge binds to loopback on an OS-selected port and prints the `management_url`
+to open; the first account registered on a new data directory is the
+administrator. The container image is `ghcr.io/alros14/forge`; see
+[deployment](docs/deployment.md).
+
+To build from source instead, install stable Rust, Git, Node.js 24, and pnpm 10;
+building forge-cli also builds the web UI.
 
     git clone https://github.com/AlRos14/forge.git
     cd forge
