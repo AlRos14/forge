@@ -48,6 +48,7 @@ pub struct ValidationSubject {
     pub kind: ValidationSubjectKind,
     pub id: String,
     pub version: i64,
+    #[serde(default)]
     pub repo_id: String,
 }
 

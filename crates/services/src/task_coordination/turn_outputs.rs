@@ -928,7 +928,7 @@ mod rt_tests {
         let output = json!({
             "type": "request_validation",
             "check_key": "unit",
-            "subject": {"kind": "work_unit_result", "id": "wu", "version": 3},
+            "subject": {"kind": "work_unit_result", "id": "wu", "version": 3, "repo_id": "repo"},
             "baseline": true,
             "reason": "touches validation",
         });

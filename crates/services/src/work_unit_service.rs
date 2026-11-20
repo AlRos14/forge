@@ -1672,8 +1672,15 @@ impl WorkUnitService {
                 // execution path.
                 continue;
             }
-            if formal_review {
-                self.freeze_review_subject_repositories(&id).await?;
+            if formal_review
+                && self
+                    .freeze_review_subject_repositories(&id)
+                    .await?
+                    .is_empty()
+            {
+                // Artifact-only reviews keep the isolated context and
+                // receive no implicit repository WorkspaceGroup.
+                continue;
             }
             match self.readiness(source.clone(), &id).await {
                 Ok(readiness) if readiness.runnable => {}
@@ -1737,7 +1744,7 @@ impl WorkUnitService {
                     })?;
                 members.push(WorkspaceGroupMember {
                     repo,
-                    role: repository.role.clone(),
+                    role: repository.role,
                     base_sha,
                     read_only: true,
                 });
@@ -1821,7 +1828,7 @@ impl WorkUnitService {
             };
             members.push(WorkspaceGroupMember {
                 repo,
-                role: repository.role.clone(),
+                role: repository.role,
                 base_sha,
                 read_only: false,
             });
@@ -1855,7 +1862,7 @@ impl WorkUnitService {
                 .map_err(|_| invalid("pinned context repository commit is unavailable"))?;
             members.push(WorkspaceGroupMember {
                 repo,
-                role: repository.role.clone(),
+                role: repository.role,
                 base_sha: pin.commit_sha,
                 read_only: true,
             });
@@ -1875,6 +1882,13 @@ impl WorkUnitService {
         let mut repositories =
             WorkUnitRepo::list_review_subject_repositories(&*self.db, review_work_unit_id).await?;
         if repositories.is_empty() {
+            let reviewed = WorkUnitRepo::get_by_id(&*self.db, &subject.reviewed_work_unit_id)
+                .await?
+                .filter(|reviewed| reviewed.task_id == subject.task_id)
+                .ok_or_else(|| not_found("work_unit", subject.reviewed_work_unit_id.clone()))?;
+            if subject.result_workspace_id.is_none() && !reviewed.requires_integration {
+                return Ok(repositories);
+            }
             return Err(invalid("Review subject has no repository result rows"));
         }
         if repositories.iter().any(|repository| {
@@ -2890,15 +2904,14 @@ async fn write_workspace_group_instructions(
     if !root.is_dir() {
         return Err(invalid("WorkspaceGroup root is unavailable"));
     }
-    let mut index = String::from(
-        "# Forge workspace group\n\nEach repository is a sibling directory. ".to_owned()
-            + "Only repositories marked writable may be changed. Read-only repositories "
-            + "are pinned inputs and must remain unchanged.\n\n"
-            + "Before editing a repository, read its own `AGENTS.md` and `CLAUDE.md` "
-            + "when present. These group instructions are generated outside the repositories.\n\n"
-            + "| Directory | Task repository role | Access | Base commit |\n"
-            + "|---|---|---|---|\n",
-    );
+    let mut index = "# Forge workspace group\n\nEach repository is a sibling directory. "
+        .to_owned()
+        + "Only repositories marked writable may be changed. Read-only repositories "
+        + "are pinned inputs and must remain unchanged.\n\n"
+        + "Before editing a repository, read its own `AGENTS.md` and `CLAUDE.md` "
+        + "when present. These group instructions are generated outside the repositories.\n\n"
+        + "| Directory | Task repository role | Access | Base commit |\n"
+        + "|---|---|---|---|\n";
     for member in members {
         let role = match member.role {
             db::TaskRepositoryRole::Primary => "primary",

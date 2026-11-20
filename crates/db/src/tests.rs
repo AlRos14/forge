@@ -6402,6 +6402,19 @@ async fn multirepo_result_review_and_requirement_rows_bind_exact_execution() {
         None,
     )
     .await;
+    let reviewer_role = TaskRoleRepo::get_by_task_and_role(&db, &fixture.task_id, "reviewer")
+        .await
+        .expect("reviewer TaskRole lookup succeeds")
+        .expect("reviewer TaskRole exists");
+    sqlx::query(
+        "UPDATE task_role_capability_configuration
+         SET configuration_json = ? WHERE task_role_id = ?",
+    )
+    .bind(r#"{"schema_version":1,"display_label":null,"capabilities":["formal_review"],"rework":null}"#)
+    .bind(&reviewer_role.id)
+    .execute(db.pool())
+    .await
+    .expect("reviewer fixture receives its formal_review capability");
     insert_test_review_subject_scalar(
         &db,
         &valid_review_work_unit_id,

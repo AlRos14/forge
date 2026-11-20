@@ -12,7 +12,7 @@ use crate::{
     errors::{ApiError, ApiResult},
     routes::{
         auth::AuthenticatedUser, execution_response_with_repository_results,
-        execution_response_with_usage, execution_usage_response, page_request, paginated,
+        execution_response_with_usage, execution_usage_response, page_request,
         task_usage_summary_response, tasks::require_task_visible, ListParams,
     },
     state::AppState,
@@ -35,7 +35,7 @@ pub async fn list_executions(
         items,
         next_cursor: page.next_cursor,
         has_more,
-        total_count: page.total_count,
+        total_count: page.total_count.and_then(|count| u64::try_from(count).ok()),
     }))
 }
 

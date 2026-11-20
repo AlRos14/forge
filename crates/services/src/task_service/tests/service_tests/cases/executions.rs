@@ -200,6 +200,12 @@ fn make_review_tree_writable(path: &std::path::Path) {
         return;
     }
     let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(permissions.mode() | if metadata.is_dir() { 0o700 } else { 0o600 });
+    }
+    #[cfg(not(unix))]
     permissions.set_readonly(false);
     std::fs::set_permissions(path, permissions).expect("Review worktree permissions update");
     if metadata.is_dir() {
@@ -1913,7 +1919,6 @@ async fn pr8_local_review_fails_if_reviewer_mutates_the_frozen_repository_group(
         workspace_root.path(),
     )
     .await;
-    let worktree = std::path::Path::new(&workspace.worktree_path);
     let repo_id = workspace.repo_id.clone();
 
     let failed = service

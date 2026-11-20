@@ -569,7 +569,9 @@ impl TaskService {
                 let expected_root = manager
                     .work_unit_group_path(&task.id, &work_unit.id, &group.id)
                     .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-                if PathBuf::from(&group.root_path) != expected_root || !expected_root.is_dir() {
+                if std::path::Path::new(&group.root_path) != expected_root.as_path()
+                    || !expected_root.is_dir()
+                {
                     return Err(ServiceError::invalid_operation(
                         "WorkspaceGroup root path does not match its exact persisted identity",
                     ));
@@ -601,7 +603,7 @@ impl TaskService {
                         || scope.task_id != task.id
                         || scope.work_unit_id.as_deref() != Some(work_unit.id.as_str())
                         || scope.workspace_group_id.as_deref() != Some(group.id.as_str())
-                        || PathBuf::from(&workspace.worktree_path) != expected_path
+                        || std::path::Path::new(&workspace.worktree_path) != expected_path.as_path()
                     {
                         return Err(ServiceError::invalid_operation(
                             "WorkspaceGroup contains a non-ready or mismatched repository Workspace",

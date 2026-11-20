@@ -20,8 +20,8 @@ use services::{DiffService, ServiceError};
 use crate::{
     errors::{ApiError, ApiResult},
     routes::{
-        auth::AuthenticatedUser, execution_response, parse_csv, task_page_request, task_response,
-        task_response_light, workspace_response, ListParams,
+        auth::AuthenticatedUser, parse_csv, task_page_request, task_response, task_response_light,
+        workspace_response, ListParams,
     },
     state::AppState,
 };

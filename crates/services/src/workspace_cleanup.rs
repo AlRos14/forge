@@ -463,31 +463,29 @@ impl WorkspaceCleanupScheduler {
                     .await)
             }
         };
-        if worktree_exists {
-            if !workspace.branch.starts_with("detached:") {
-                let current_branch = match git::get_current_branch(&expected_path).await {
-                    Ok(branch) => branch,
-                    Err(error) => {
-                        return Err(self
-                            .record_work_unit_cleanup_error(
-                                workspace_id,
-                                format!(
-                                    "could not confirm the WorkUnit worktree branch; explicit recovery is required: {error}"
-                                ),
-                            )
-                            .await)
-                    }
-                };
-                if current_branch != workspace.branch {
+        if worktree_exists && !workspace.branch.starts_with("detached:") {
+            let current_branch = match git::get_current_branch(&expected_path).await {
+                Ok(branch) => branch,
+                Err(error) => {
                     return Err(self
                         .record_work_unit_cleanup_error(
                             workspace_id,
                             format!(
-                                "WorkUnit Workspace path is attached to unexpected branch {current_branch}; explicit recovery is required"
+                                "could not confirm the WorkUnit worktree branch; explicit recovery is required: {error}"
                             ),
                         )
-                        .await);
+                        .await)
                 }
+            };
+            if current_branch != workspace.branch {
+                return Err(self
+                    .record_work_unit_cleanup_error(
+                        workspace_id,
+                        format!(
+                            "WorkUnit Workspace path is attached to unexpected branch {current_branch}; explicit recovery is required"
+                        ),
+                    )
+                    .await);
             }
         }
 

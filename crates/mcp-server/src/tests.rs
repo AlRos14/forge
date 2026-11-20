@@ -3665,37 +3665,175 @@ fn multirepo_result_reader_tools_expose_repo_results() {
             )
             .await
             .expect("Task receives the affected Repo");
-        let execution_id = seed_execution(&state, task.id.clone()).await;
-        let mut results = Vec::new();
-        for (repo_id, index) in [(primary_repo_id.clone(), 1), (affected.id.clone(), 2)] {
-            let workspace_id = new_uuid_v4();
-            WorkspaceRepo::create(
+        if TaskRoleRepo::get_by_task_and_role(&*state.db, &task.id, "implementer")
+            .await
+            .expect("implementer TaskRole lookup succeeds")
+            .is_none()
+        {
+            TaskRoleRepo::create_with_configuration(
                 &*state.db,
-                CreateWorkspace {
-                    id: workspace_id.clone(),
+                CreateTaskRole {
+                    id: new_uuid_v4(),
                     task_id: task.id.clone(),
-                    repo_id: repo_id.clone(),
-                    worktree_path: format!("/tmp/forge-mcp-{workspace_id}"),
-                    branch: format!("test/{index}"),
-                    status: WorkspaceStatus::Ready,
-                    before_sha: Some(format!("{index:040x}")),
+                    role: "implementer".to_owned(),
+                    coordination_mode: Some(db::CoordinationMode::Collaborative),
+                    policy_json: "{}".to_owned(),
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 },
+                r#"{"schema_version":1,"display_label":null,"capabilities":[],"rework":null}"#,
             )
             .await
-            .expect("integration Workspace creates");
-            results.push(db::ExecutionRepositoryResult {
-                execution_id: execution_id.clone(),
-                task_id: task.id.clone(),
-                repo_id,
-                workspace_id,
-                before_sha: Some(format!("{index:040x}")),
-                after_sha: Some(format!("{:040x}", index + 10)),
-                snapshot_digest: Some("a".repeat(64)),
-                created_at: now.clone(),
-            });
+            .expect("implementer TaskRole creates");
         }
+        let work_unit_id = new_uuid_v4();
+        db::WorkUnitRepo::create(
+            &*state.db,
+            db::CreateWorkUnit {
+                id: work_unit_id.clone(),
+                task_id: task.id.clone(),
+                parent_work_unit_id: None,
+                title: "Read repository result rows".to_owned(),
+                scope: "Expose exact results for both writable repositories".to_owned(),
+                execution_instructions: None,
+                role: "implementer".to_owned(),
+                assigned_actor: None,
+                requires_integration: true,
+                provenance: None,
+                artifact_input_ids: Vec::new(),
+                repository_ids: Vec::new(),
+                review_approval_gate_id: None,
+                review_approval_line_id: None,
+                created_by: db::ActorRef::Human("test-user".to_owned()),
+                created_at: now.clone(),
+            },
+            db::CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "work_unit.created".to_owned(),
+                entity_type: "work_unit".to_owned(),
+                entity_id: work_unit_id.clone(),
+                actor_type: "human".to_owned(),
+                actor_id: Some("test-user".to_owned()),
+                scope_type: "task".to_owned(),
+                scope_id: task.id.clone(),
+                correlation_id: work_unit_id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!("work-unit-created:{work_unit_id}")),
+                payload_json: json!({
+                    "work_unit_id": work_unit_id,
+                    "task_id": task.id,
+                })
+                .to_string(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .expect("repository WorkUnit creates");
+        let group_id = new_uuid_v4();
+        WorkspaceRepo::create_group_for_work_unit(
+            &*state.db,
+            db::CreateWorkspaceGroup {
+                id: group_id.clone(),
+                task_id: task.id.clone(),
+                work_unit_id: work_unit_id.clone(),
+                root_path: format!("/tmp/forge-mcp-group-{group_id}"),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .expect("WorkUnit WorkspaceGroup creates");
+        let mut workspaces = Vec::new();
+        for (repo_id, index) in [(primary_repo_id.clone(), 1), (affected.id.clone(), 2)] {
+            let workspace_id = new_uuid_v4();
+            let workspace = db::WorkUnitWorkspaceRepo::create_for_work_unit(
+                &*state.db,
+                db::CreateWorkUnitWorkspace {
+                    workspace: CreateWorkspace {
+                        id: workspace_id,
+                        task_id: task.id.clone(),
+                        repo_id: repo_id.clone(),
+                        worktree_path: format!("/tmp/forge-mcp-{group_id}-{repo_id}"),
+                        branch: format!("agent/{}-{work_unit_id}", task.id),
+                        status: WorkspaceStatus::Ready,
+                        before_sha: Some(format!("{index:040x}")),
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    },
+                    work_unit_id: work_unit_id.clone(),
+                    workspace_group_id: group_id.clone(),
+                },
+            )
+            .await
+            .expect("WorkUnit Workspace creates");
+            workspaces.push((repo_id, index, workspace.id));
+        }
+        let execution_id = new_uuid_v4();
+        ExecutionRepo::create(
+            &*state.db,
+            CreateExecution {
+                id: execution_id.clone(),
+                task_id: task.id.clone(),
+                agent_id: None,
+                actor_ref: None,
+                harness_session_id: None,
+                role: "implementer".to_owned(),
+                status: ExecutionStatus::Completed,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("implementer Execution creates");
+        let (primary_index, primary_workspace) = workspaces
+            .iter()
+            .find(|(repo_id, _, _)| repo_id == &primary_repo_id)
+            .map(|(_, index, workspace_id)| (*index, workspace_id.clone()))
+            .expect("primary WorkUnit Workspace exists");
+        sqlx::query(
+            "UPDATE execution
+             SET work_unit_id = ?, work_unit_version = 1, workspace_id = ?,
+                 before_sha = ?, after_sha = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&work_unit_id)
+        .bind(&primary_workspace)
+        .bind(format!("{primary_index:040x}"))
+        .bind(format!("{:040x}", primary_index + 10))
+        .bind(&now)
+        .bind(&execution_id)
+        .execute(state.db.pool())
+        .await
+        .expect("Execution binds to its exact WorkUnit workspace group");
+        let results = workspaces
+            .iter()
+            .map(
+                |(repo_id, index, workspace_id)| db::ExecutionRepositoryResult {
+                    execution_id: execution_id.clone(),
+                    task_id: task.id.clone(),
+                    repo_id: repo_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    before_sha: Some(format!("{index:040x}")),
+                    after_sha: Some(format!("{:040x}", *index + 10)),
+                    snapshot_digest: (repo_id != &primary_repo_id).then(|| "a".repeat(64)),
+                    created_at: now.clone(),
+                },
+            )
+            .collect::<Vec<_>>();
         ExecutionRepo::record_repository_results(&*state.db, &execution_id, &results)
             .await
             .expect("Execution repository results record");

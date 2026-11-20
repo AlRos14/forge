@@ -410,9 +410,7 @@ async fn validate_work_unit_execution_leases_in_tx(
     };
 
     if requires_integration && !reviewer && expected_workspaces.is_empty() {
-        return Err(DbError::Check(
-            "repository WorkUnit Execution requires at least one writable Workspace".to_owned(),
-        ));
+        return Err(DbError::WorkUnitWorkspaceUnavailable);
     }
 
     let primary_workspace_id: Option<String> = sqlx::query_scalar(

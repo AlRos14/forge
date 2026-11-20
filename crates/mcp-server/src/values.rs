@@ -1,16 +1,6 @@
 use api_types::parse_project_hooks_json;
-use db::{Agent, AgentProfile, Execution, Page, Project};
+use db::{Agent, AgentProfile, Execution, Project};
 use serde_json::{json, Value};
-
-pub(crate) fn execution_page_value(page: Page<Execution>) -> Value {
-    let has_more = page.next_cursor.is_some();
-    json!({
-        "items": page.items.into_iter().map(execution_value).collect::<Vec<_>>(),
-        "next_cursor": page.next_cursor,
-        "has_more": has_more,
-        "total_count": page.total_count,
-    })
-}
 
 pub(crate) fn project_page_value(page: Page<Project>) -> Result<Value, crate::error::McpToolError> {
     let has_more = page.next_cursor.is_some();

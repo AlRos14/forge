@@ -145,6 +145,53 @@ BEGIN
     SELECT RAISE(ABORT, 'Execution repository results are immutable outside Project teardown');
 END;
 
+-- Legacy single-repository producers still update the scalar Execution result.
+-- Materialize that exact Workspace result in the same transaction, after the
+-- completed Execution is bound to its WorkUnit. Multi-repository producers
+-- write every result explicitly before terminalization; this fills only a
+-- missing scalar repository row and leaves those exact rows untouched.
+CREATE TRIGGER execution_repository_result_legacy_scalar_after_update
+AFTER UPDATE OF status, work_unit_id, work_unit_version ON execution
+WHEN NEW.status = 'completed'
+ AND NEW.work_unit_id IS NOT NULL
+ AND NEW.workspace_id IS NOT NULL
+ AND NEW.after_sha IS NOT NULL
+BEGIN
+    INSERT INTO execution_repository_result(
+        execution_id, task_id, repo_id, workspace_id,
+        before_sha, after_sha, snapshot_digest, created_at
+    )
+    SELECT NEW.id, NEW.task_id, workspace.repo_id, workspace.id,
+           workspace.before_sha, NEW.after_sha, NULL, NEW.updated_at
+    FROM workspace
+    JOIN task_repository repository
+      ON repository.task_id = NEW.task_id
+     AND repository.repo_id = workspace.repo_id
+     AND repository.role IN ('primary', 'affected')
+    WHERE workspace.id = NEW.workspace_id
+      AND workspace.task_id = NEW.task_id
+      AND (NOT EXISTS (
+          SELECT 1 FROM work_unit_repository selected
+          WHERE selected.work_unit_id = NEW.work_unit_id
+      ) OR EXISTS (
+          SELECT 1 FROM work_unit_repository selected
+          WHERE selected.work_unit_id = NEW.work_unit_id
+            AND selected.repo_id = workspace.repo_id
+      ))
+      AND EXISTS (
+          SELECT 1 FROM workspace_scope scope
+          WHERE scope.workspace_id = workspace.id
+            AND scope.task_id = NEW.task_id
+            AND scope.scope_kind = 'work_unit'
+            AND scope.work_unit_id = NEW.work_unit_id
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM execution_repository_result existing
+          WHERE existing.execution_id = NEW.id
+            AND existing.repo_id = workspace.repo_id
+      );
+END;
+
 CREATE TABLE work_unit_review_subject_repository (
     review_work_unit_id        TEXT NOT NULL,
     task_id                    TEXT NOT NULL,
@@ -448,15 +495,14 @@ WHEN (NEW.scope_kind = 'integration' AND EXISTS (
                                   WHERE selected.work_unit_id = w.id
                                     AND selected.repo_id = ws.repo_id
                               )))
-                          OR (lower(trim(w.role)) = 'reviewer'
-                              AND EXISTS (
+                          OR EXISTS (
                                   SELECT 1 FROM work_unit_review_subject_repository subject
                                   WHERE subject.review_work_unit_id = w.id
                                     AND subject.task_id = t.id
                                     AND subject.repo_id = ws.repo_id
                                     AND subject.result_execution_id IS NOT NULL
                                     AND subject.result_commit_sha IS ws.before_sha
-                              ))
+                              )
                       )
                 ))
         )
@@ -594,7 +640,11 @@ BEGIN
         WHEN EXISTS (
             SELECT 1 FROM work_unit w
             WHERE w.id = NEW.work_unit_id AND w.task_id = NEW.task_id
-              AND lower(trim(w.role)) = 'reviewer'
+              AND EXISTS (
+                  SELECT 1 FROM work_unit_review_subject_repository subject_scope
+                  WHERE subject_scope.review_work_unit_id = w.id
+                    AND subject_scope.task_id = w.task_id
+              )
               AND (
                   NEW.workspace_id IS NOT NULL
                   OR NOT EXISTS (

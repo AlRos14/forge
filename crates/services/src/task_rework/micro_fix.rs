@@ -1497,6 +1497,7 @@ fn classify_bounds_violation(
     None
 }
 
+#[cfg(test)]
 fn micro_fix_base_sha<'a>(
     requirements: &'a [db::WorkUnitResultRequirementRepository],
     repo_id: &str,

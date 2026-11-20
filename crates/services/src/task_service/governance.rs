@@ -346,7 +346,11 @@ impl TaskService {
             workspace_id: Some(workspace.id.clone()),
             task_version: task.version,
             execution_id: execution.id.clone(),
-            operation_idempotency_key: execution.id.clone(),
+            operation_idempotency_key: if group.is_some() {
+                format!("{}:workspace:{}", execution.id, workspace.repo_id)
+            } else {
+                execution.id.clone()
+            },
             repository_binding_id: repo_id.to_owned(),
             base_ref,
             role: canonical_role.to_owned(),
@@ -587,13 +591,18 @@ impl TaskService {
         let canonical_role = self
             .workspace_lease_role_for_task_role(task, &unit.role)
             .await?;
+        let expected_operation_idempotency_key = if group.is_some() {
+            format!("{execution_id}:workspace:{repo_id}")
+        } else {
+            execution_id.to_owned()
+        };
         if lease.status != "active"
             || lease.project_id != task.project_id
             || lease.task_id != task.id
             || lease.work_unit_id.as_deref() != Some(work_unit_id)
             || lease.workspace_id.as_deref() != Some(workspace.id.as_str())
             || lease.execution_id != execution_id
-            || lease.operation_idempotency_key != execution_id
+            || lease.operation_idempotency_key != expected_operation_idempotency_key
             || lease.repository_binding_id != repo_id
             || lease.base_ref != base_ref
             || lease.role != canonical_role
