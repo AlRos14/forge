@@ -7,6 +7,25 @@ import { TaskWorkManagement } from './task-work-management'
 
 const { createTaskMutation } = vi.hoisted(() => ({ createTaskMutation: vi.fn() }))
 
+vi.mock('@/components/ui/markdown-editor', () => ({
+  MarkdownEditor: ({
+    ariaLabel,
+    value,
+    onChange,
+  }: {
+    ariaLabel?: string
+    value: string
+    onChange: (value: string) => void
+  }) => (
+    <textarea
+      aria-label={ariaLabel}
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+    />
+  ),
+  MarkdownView: ({ content }: { content: string }) => <div>{content}</div>,
+}))
+
 vi.mock('@/api/hooks', () => ({
   useAgentsInfiniteQuery: () => ({
     data: { pages: [{ items: [] }] },
@@ -24,11 +43,13 @@ vi.mock('@/api/hooks', () => ({
   }),
   useProjectTaskRoleDefaultsQuery: () => ({
     data: {
-      roles: [{
-        role: 'implementer',
-        configuration: { display_label: 'Implementer', capabilities: [] },
-        members: [],
-      }],
+      roles: [
+        {
+          role: 'implementer',
+          configuration: { display_label: 'Implementer', capabilities: [] },
+          members: [],
+        },
+      ],
     },
     isError: false,
     isLoading: false,
@@ -131,11 +152,14 @@ describe('TaskWorkManagement reviewer setup', () => {
     const fetchMock = vi.spyOn(window, 'fetch').mockImplementation(async (input, init) => {
       const path = new URL(input.toString()).pathname
       if (path === '/api/v1/task-role-capabilities') {
-        return new Response(JSON.stringify({
-          schema_version: 1,
-          capabilities: ['formal_review', 'orchestration', 'request_rework'],
-          templates: [],
-        }), { status: 200, headers: { 'content-type': 'application/json' } })
+        return new Response(
+          JSON.stringify({
+            schema_version: 1,
+            capabilities: ['formal_review', 'orchestration', 'request_rework'],
+            templates: [],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
       }
       if (path.endsWith('/dependencies')) return new Response('[]', { status: 200 })
       if (path === '/api/v1/tasks/task-1/work-units' && init?.method === 'POST') {
@@ -186,9 +210,10 @@ describe('TaskWorkManagement reviewer setup', () => {
     fireEvent.click(createButton)
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalled())
-    const createRequest = fetchMock.mock.calls.find(([input, init]) =>
-      new URL(input.toString()).pathname === '/api/v1/tasks/task-1/work-units' &&
-      init?.method === 'POST',
+    const createRequest = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        new URL(input.toString()).pathname === '/api/v1/tasks/task-1/work-units' &&
+        init?.method === 'POST',
     )
     expect(createRequest).toBeDefined()
     expect(JSON.parse(String(createRequest?.[1]?.body))).toMatchObject({
@@ -205,22 +230,28 @@ describe('TaskWorkManagement reviewer setup', () => {
     const fetchMock = vi.spyOn(window, 'fetch').mockImplementation(async (input, init) => {
       const path = new URL(input.toString()).pathname
       if (path === '/api/v1/projects/project-1/repos') {
-        return new Response(JSON.stringify({
-          items: [
-            { id: 'repo-ui', name: 'Web UI' },
-            { id: 'repo-api', name: 'API' },
-          ],
-          next_cursor: null,
-          has_more: false,
-          total_count: 2,
-        }), { status: 200, headers: { 'content-type': 'application/json' } })
+        return new Response(
+          JSON.stringify({
+            items: [
+              { id: 'repo-ui', name: 'Web UI' },
+              { id: 'repo-api', name: 'API' },
+            ],
+            next_cursor: null,
+            has_more: false,
+            total_count: 2,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
       }
       if (path === '/api/v1/task-role-capabilities') {
-        return new Response(JSON.stringify({
-          schema_version: 1,
-          capabilities: ['formal_review', 'orchestration', 'request_rework'],
-          templates: [],
-        }), { status: 200, headers: { 'content-type': 'application/json' } })
+        return new Response(
+          JSON.stringify({
+            schema_version: 1,
+            capabilities: ['formal_review', 'orchestration', 'request_rework'],
+            templates: [],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
       }
       if (path.endsWith('/dependencies')) return new Response('[]', { status: 200 })
       if (path === '/api/v1/tasks/task-1/work-units' && init?.method === 'POST') {
@@ -281,9 +312,10 @@ describe('TaskWorkManagement reviewer setup', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Create WorkUnit' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalled())
-    const workUnitRequest = fetchMock.mock.calls.find(([input, init]) =>
-      new URL(input.toString()).pathname === '/api/v1/tasks/task-1/work-units' &&
-      init?.method === 'POST',
+    const workUnitRequest = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        new URL(input.toString()).pathname === '/api/v1/tasks/task-1/work-units' &&
+        init?.method === 'POST',
     )
     expect(workUnitRequest).toBeDefined()
     expect(JSON.parse(String(workUnitRequest?.[1]?.body))).toMatchObject({

@@ -329,11 +329,10 @@ impl TaskRepo for SqliteDb {
             }
         }
 
-        let mut position = 1_i64;
-        for row in rows
-            .iter()
-            .filter(|row| row.role != crate::TaskRepositoryRole::Primary)
-        {
+        for (position, row) in (1_i64..).zip(
+            rows.iter()
+                .filter(|row| row.role != crate::TaskRepositoryRole::Primary),
+        ) {
             sqlx::query(
                 "UPDATE task_repository SET role = ?, position = ?
                  WHERE task_id = ? AND repo_id = ?",
@@ -344,7 +343,6 @@ impl TaskRepo for SqliteDb {
             .bind(&row.repo_id)
             .execute(&mut **tx)
             .await?;
-            position += 1;
         }
 
         TaskRepo::get_by_id_in_tx(self, tx, task_id, false)

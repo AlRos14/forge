@@ -1,4 +1,5 @@
 use super::*;
+use sqlx::Row;
 
 impl TaskService {
     #[allow(clippy::too_many_arguments)]
