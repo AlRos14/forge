@@ -225,7 +225,7 @@ impl WorkUnitService {
             .collaboration
             .authorize_mutation_source(&task_id, &source)
             .await?;
-        validate_work_unit_repository_ids(&*self.db, &task.id, &repository_ids).await?;
+        validate_work_unit_repository_ids(&self.db, &task.id, &repository_ids).await?;
         if let Some(existing) = self
             .existing_work_unit_for_create(&id, &actor, &requested_input, request_digest.as_deref())
             .await?

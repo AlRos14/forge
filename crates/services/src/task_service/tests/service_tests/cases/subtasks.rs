@@ -1188,7 +1188,22 @@ async fn multirepo_task_create_defaults_to_primary_and_inherits_subtask_scope() 
     let child_repositories = db::TaskRepo::list_repositories(&*db, &child.id)
         .await
         .expect("subtask repository set loads");
-    assert_eq!(root_repositories, child_repositories);
+    let repository_scope = |repositories: &[db::TaskRepository]| {
+        repositories
+            .iter()
+            .map(|repository| {
+                (
+                    repository.repo_id.clone(),
+                    repository.role,
+                    repository.position,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        repository_scope(&root_repositories),
+        repository_scope(&child_repositories)
+    );
     assert_eq!(
         child_repositories
             .iter()
