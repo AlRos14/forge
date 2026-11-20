@@ -246,10 +246,21 @@ struct MultiRepoExecutionFixture {
     work_unit_service: crate::work_unit_service::WorkUnitService,
     task: db::Task,
     agent_id: String,
+    reviewer_agent_id: String,
     user_id: String,
     repo_ids: [String; 3],
     _repo_roots: Vec<TempDir>,
     _workspace_root: TempDir,
+}
+
+impl MultiRepoExecutionFixture {
+    fn agent_for_role(&self, role: &str) -> &str {
+        if role == "reviewer" {
+            &self.reviewer_agent_id
+        } else {
+            &self.agent_id
+        }
+    }
 }
 
 fn initialize_multirepo_test_repository(path: &std::path::Path, label: &str) {
@@ -335,6 +346,9 @@ async fn multirepo_execution_fixture() -> MultiRepoExecutionFixture {
         .with_workspace_root(workspace_root.path().to_path_buf())
         .with_workspace_exec_locks(Arc::clone(&workspace_exec_locks));
     let agent_id = seed_agent(&db).await;
+    // Formal review by the contributing Agent needs a fresh HarnessSession
+    // (V162); the fixture uses an independent reviewer Agent instead.
+    let reviewer_agent_id = seed_agent(&db).await;
     if TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
         .await
         .expect("implementer role lookup succeeds")
@@ -382,6 +396,7 @@ async fn multirepo_execution_fixture() -> MultiRepoExecutionFixture {
         work_unit_service,
         task,
         agent_id,
+        reviewer_agent_id,
         user_id,
         repo_ids: [primary_repo_id, affected_repo_id, context_repo_id],
         _repo_roots: vec![primary_root, affected_root, context_root],
@@ -406,7 +421,7 @@ async fn create_multirepo_fixture_work_unit(
                 execution_instructions: None,
                 role: role.to_owned(),
                 parent_work_unit_id: None,
-                assigned_actor: Some(db::ActorRef::Agent(fixture.agent_id.clone())),
+                assigned_actor: Some(db::ActorRef::Agent(fixture.agent_for_role(role).to_owned())),
                 requires_integration: true,
                 provenance: None,
                 review_subject,
@@ -435,6 +450,7 @@ async fn admit_multirepo_fixture_execution(
         (Some(workspace.id.clone()), workspace.before_sha.clone())
     };
     let execution_time = now_rfc3339();
+    let agent_id = fixture.agent_for_role(&work_unit.role).to_owned();
     fixture
         .task_service
         .create_running_work_unit_execution_with_artifact_inputs(
@@ -443,8 +459,8 @@ async fn admit_multirepo_fixture_execution(
             db::CreateExecution {
                 id: db::new_uuid_v4(),
                 task_id: fixture.task.id.clone(),
-                agent_id: Some(fixture.agent_id.clone()),
-                actor_ref: Some(db::ActorRef::Agent(fixture.agent_id.clone())),
+                agent_id: Some(agent_id.clone()),
+                actor_ref: Some(db::ActorRef::Agent(agent_id.clone())),
                 harness_session_id: None,
                 role: work_unit.role.clone(),
                 status: ExecutionStatus::Running,
@@ -461,8 +477,7 @@ async fn admit_multirepo_fixture_execution(
                 after_sha: None,
                 error: None,
                 executor_config_snapshot_json: Some(
-                    authorized_execution_snapshot(&fixture.db, &fixture.task, &fixture.agent_id)
-                        .await,
+                    authorized_execution_snapshot(&fixture.db, &fixture.task, &agent_id).await,
                 ),
                 workspace_id,
                 created_at: execution_time.clone(),
@@ -714,7 +729,7 @@ async fn multirepo_workspace_review_group_is_read_only_and_exact_subject_scoped(
         .add_task_role_member(
             &fixture.task.id,
             "reviewer",
-            ActorRef::Agent(fixture.agent_id.clone()),
+            ActorRef::Agent(fixture.reviewer_agent_id.clone()),
         )
         .await
         .expect("Agent joins formal reviewer role");

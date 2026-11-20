@@ -1,5 +1,5 @@
 use api_types::parse_project_hooks_json;
-use db::{Agent, AgentProfile, Execution, Project};
+use db::{Agent, AgentProfile, Execution, Page, Project};
 use serde_json::{json, Value};
 
 pub(crate) fn project_page_value(page: Page<Project>) -> Result<Value, crate::error::McpToolError> {
