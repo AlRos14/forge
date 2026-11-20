@@ -2520,6 +2520,7 @@ mod tests {
         db::TaskRepo::create(
             &*db,
             db::CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id,
                 repo_id: None,
@@ -3090,6 +3091,7 @@ mod tests {
         db::TaskRepo::create(
             &*db,
             db::CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id,
                 repo_id: None,
@@ -3140,6 +3142,7 @@ mod tests {
         WorkUnitRepo::create(
             &*db,
             db::CreateWorkUnit {
+                repository_ids: Vec::new(),
                 id: unit_id.clone(),
                 task_id: task_id.clone(),
                 parent_work_unit_id: None,
@@ -3393,6 +3396,7 @@ mod tests {
         db::TaskRepo::create(
             &*db,
             db::CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id,
                 repo_id: None,

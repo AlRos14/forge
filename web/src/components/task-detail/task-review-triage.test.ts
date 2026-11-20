@@ -140,6 +140,7 @@ function workUnit(
   return {
     id,
     task_id: 'task-1',
+    repository_ids: [],
     parent_work_unit_id: null,
     title: 'Recheck exact result',
     scope: 'Same frozen result',

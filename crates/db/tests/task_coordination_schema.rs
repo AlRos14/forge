@@ -91,6 +91,7 @@ async fn seed_task(db: &SqliteDb) -> (String, String) {
     TaskRepo::create(
         db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id: db::RepoRepo::get_by_id(db, &repo_id)
                 .await

@@ -858,6 +858,7 @@ fn tools_list_returns_descriptors() {
             "forge_update_project",
             "forge_update_project_hooks",
             "forge_update_task",
+            "forge_update_task_repositories",
             "forge_update_task_role",
             "forge_update_work_unit",
             "forge_list_validation_checks",
@@ -887,6 +888,63 @@ fn tools_list_returns_descriptors() {
             .expect("follow-up required params are an array")
             .iter()
             .any(|required| required == "idempotency_key"));
+    });
+}
+
+#[test]
+fn multirepo_task_mcp_task_and_work_unit_schemas() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let result = dispatch(&state, "tools/list", json!({}))
+            .await
+            .expect("tools/list succeeds");
+        let tools = result["tools"].as_array().expect("tool list");
+        let schema = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} descriptor exists"))["inputSchema"]
+                .clone()
+        };
+
+        let create_task = schema("forge_create_task");
+        assert_eq!(create_task["additionalProperties"], false);
+        let repositories = &create_task["properties"]["repositories"];
+        assert_eq!(repositories["items"]["additionalProperties"], false);
+        assert_eq!(
+            repositories["items"]["properties"]["role"]["enum"],
+            json!(["primary", "affected", "context"])
+        );
+
+        let create_work_unit = schema("forge_create_work_unit");
+        assert_eq!(create_work_unit["additionalProperties"], false);
+        assert_eq!(
+            create_work_unit["properties"]["repository_ids"]["items"]["type"],
+            "string"
+        );
+
+        let update_repositories = schema("forge_update_task_repositories");
+        assert_eq!(update_repositories["additionalProperties"], false);
+        assert_eq!(
+            update_repositories["properties"]["repositories"]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            update_repositories["required"],
+            json!(["task_id", "expected_version", "repositories"])
+        );
+
+        let update_project = schema("forge_update_project");
+        assert_eq!(update_project["properties"]["version"]["type"], "integer");
+        assert_eq!(
+            update_project["properties"]["primary_repo_id"]["oneOf"],
+            json!([{"type":"string"}, {"type":"null"}])
+        );
+        assert!(update_project["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .any(|field| field == "version"));
     });
 }
 
@@ -1779,11 +1837,15 @@ fn user_scoped_mcp_isolates_projects_and_derived_resources() {
         );
         assert_eq!(private_agent_b["config_json"]["safe"], "visible");
 
+        let project_a_record = ProjectRepo::get_by_id(&*state.db, &project_a)
+            .await
+            .unwrap()
+            .unwrap();
         let updated_project = call_tool_as(
             &state,
             &user_a,
             "forge_update_project",
-            json!({ "project_id": project_a, "name": "Project A updated" }),
+            json!({ "project_id": project_a, "version": project_a_record.version, "name": "Project A updated" }),
         )
         .await;
         assert_eq!(updated_project["name"], "Project A updated");
@@ -1808,11 +1870,15 @@ fn user_scoped_mcp_isolates_projects_and_derived_resources() {
         )
         .await;
         assert_eq!(error.code, -32001);
+        let project_b_record = ProjectRepo::get_by_id(&*state.db, &project_b)
+            .await
+            .unwrap()
+            .unwrap();
         let error = call_tool_error_as(
             &state,
             &user_a,
             "forge_update_project",
-            json!({ "project_id": project_b, "name": "cross-user write" }),
+            json!({ "project_id": project_b, "version": project_b_record.version, "name": "cross-user write" }),
         )
         .await;
         assert_eq!(error.code, -32001);
@@ -2137,11 +2203,15 @@ fn mcp_project_visibility_does_not_grant_mutation_authority() {
         .await;
         assert_eq!(task_read["id"], owner_task["id"]);
 
+        let project_a_record = ProjectRepo::get_by_id(&*state.db, &project_a)
+            .await
+            .unwrap()
+            .unwrap();
         let updated = call_tool_as(
             &state,
             &admin,
             "forge_update_project",
-            json!({"project_id":project_a,"name":"Admin Project update"}),
+            json!({"project_id":project_a,"version":project_a_record.version,"name":"Admin Project update"}),
         )
         .await;
         assert_eq!(updated["name"], "Admin Project update");
@@ -2159,12 +2229,12 @@ fn mcp_project_visibility_does_not_grant_mutation_authority() {
             (
                 &member,
                 "forge_update_project",
-                json!({"project_id":project_a,"name":"Member Project update"}),
+                json!({"project_id":project_a,"version":updated["version"],"name":"Member Project update"}),
             ),
             (
                 &viewer,
                 "forge_update_project",
-                json!({"project_id":project_a,"name":"Viewer Project update"}),
+                json!({"project_id":project_a,"version":updated["version"],"name":"Viewer Project update"}),
             ),
         ] {
             let error = call_tool_error_as(&state, context, name, arguments).await;
@@ -2268,7 +2338,7 @@ fn mcp_project_visibility_does_not_grant_mutation_authority() {
             &state,
             &outsider,
             "forge_update_project",
-            json!({"project_id":ownerless.id,"name":"World writable"}),
+            json!({"project_id":ownerless.id,"version":ownerless.version,"name":"World writable"}),
         )
         .await;
         assert_eq!(ownerless_update.code, -32003);
@@ -2394,6 +2464,7 @@ fn forge_update_task_rejects_cross_repo_parent_without_partial_write() {
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
+                repositories: Vec::new(),
                 merge_config: None,
                 created_at: now.clone(),
                 updated_at: now,
@@ -2625,11 +2696,16 @@ fn forge_update_project_updates_mutable_fields() {
     run_async(async {
         let state = sqlite_state().await;
         let (project_id, _) = seed_project_repo(&state).await;
+        let project = ProjectRepo::get_by_id(&*state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
         let result = call_tool(
             &state,
             "forge_update_project",
             json!({
                 "project_id": project_id,
+                "version": project.version,
                 "name": "Updated Forge",
                 "paused": true
             }),
@@ -2789,6 +2865,7 @@ fn forge_create_sub_tasks_nested_rejected() {
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
+                repositories: Vec::new(),
                 subtask_order: Some(0),
                 merge_config: None,
                 created_at: now.clone(),

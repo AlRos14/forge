@@ -5,6 +5,7 @@
  */
 export type PublicEventType =
   | 'task.lifecycle_changed'
+  | 'task.repositories_changed'
   | 'gate.created'
   | 'gate.policy_revised'
   | 'gate.evaluated'

@@ -352,6 +352,10 @@ pub fn api_router(state: AppState) -> Router {
                 .delete(routes::tasks::delete_task),
         )
         .route(
+            "/api/v1/tasks/{id}/repositories",
+            patch(routes::tasks::update_task_repositories),
+        )
+        .route(
             "/api/v1/tasks/{id}/subtasks/reorder",
             post(routes::tasks::reorder_subtasks),
         )

@@ -154,6 +154,24 @@ export function ProjectSettingsPage({
     )
   }
 
+  const savePrimaryRepo = (primaryRepoId: string | null) => {
+    if (!project || updateProject.isPending) return
+    updateProject.mutate(
+      {
+        projectId,
+        body: {
+          version: project.version,
+          primary_repo_id: primaryRepoId,
+        },
+      },
+      {
+        onError: (error) =>
+          toast.error(settingsErrorMessage(error, 'Primary repository update failed')),
+        onSuccess: () => toast.success('Primary repository saved for new Tasks'),
+      },
+    )
+  }
+
   const toggleProjectPaused = () => {
     if (!project) return
     const mutation = project.paused ? resumeProject : pauseProject
@@ -254,7 +272,14 @@ export function ProjectSettingsPage({
             />
           )}
 
-          {initialTab === 'repos' && <ReposTab project={project} projectId={projectId} />}
+          {initialTab === 'repos' && (
+            <ReposTab
+              project={project}
+              projectId={projectId}
+              isUpdatingPrimaryRepo={updateProject.isPending}
+              onUpdatePrimaryRepo={savePrimaryRepo}
+            />
+          )}
 
           {initialTab === 'members' && <MembersTab projectId={projectId} />}
 

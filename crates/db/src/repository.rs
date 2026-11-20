@@ -10,6 +10,15 @@ pub trait TaskRepo: Send + Sync {
         transaction: &mut Transaction<'_, Sqlite>,
         input: CreateTask,
     ) -> Result<Task>;
+    async fn list_repositories(&self, task_id: &str) -> Result<Vec<TaskRepository>>;
+    async fn replace_repositories_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+        expected_version: i64,
+        rows: &[TaskRepositoryWrite],
+        updated_at: &str,
+    ) -> Result<Task>;
     async fn get_by_id(&self, id: &str, include_deleted: bool) -> Result<Option<Task>>;
     async fn get_by_id_in_tx(
         &self,
@@ -810,6 +819,7 @@ pub trait WorkUnitRepo: Send + Sync {
     async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_by_id(&self, id: &str) -> Result<Option<WorkUnit>>;
     async fn list_by_task(&self, task_id: &str) -> Result<Vec<WorkUnit>>;
+    async fn list_repository_ids(&self, work_unit_id: &str) -> Result<Vec<String>>;
     async fn update(
         &self,
         input: UpdateWorkUnit,
@@ -2125,6 +2135,7 @@ pub struct CreateWorkUnit {
     pub requires_integration: bool,
     pub provenance: Option<WorkUnitProvenance>,
     pub artifact_input_ids: Vec<String>,
+    pub repository_ids: Vec<String>,
     pub review_approval_gate_id: Option<String>,
     pub review_approval_line_id: Option<String>,
     pub created_by: ActorRef,
@@ -2450,6 +2461,7 @@ pub struct CreateTask {
     pub id: String,
     pub project_id: String,
     pub repo_id: Option<String>,
+    pub repositories: Vec<TaskRepositoryWrite>,
     pub parent_task_id: Option<String>,
     pub title: String,
     pub description: Option<String>,
@@ -2460,6 +2472,12 @@ pub struct CreateTask {
     pub merge_config: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRepositoryWrite {
+    pub repo_id: String,
+    pub role: TaskRepositoryRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

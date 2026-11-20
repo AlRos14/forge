@@ -31,9 +31,10 @@ use crate::{
         ListWorkUnitsParams, RegisterAgentParams, RemoveTaskDependencyParams, RequestReworkParams,
         ReviewExecutionParams, ReviewTaskParams, ReviseGatePolicyParams,
         SubmitWorkUnitReviewParams, TaskDispatchActionParams, TransitionTaskLifecycleParams,
-        UpdateProjectHooksParams, UpdateProjectParams, UpdateTaskParams, UpdateTaskRoleParams,
-        UpdateWorkUnitParams, ValidationRunParams, ValidationTaskParams, WorkUnitDependencyParams,
-        WorkUnitIdParams, WorkUnitTransitionParams,
+        UpdateProjectHooksParams, UpdateProjectParams, UpdateTaskParams,
+        UpdateTaskRepositoriesParams, UpdateTaskRoleParams, UpdateWorkUnitParams,
+        ValidationRunParams, ValidationTaskParams, WorkUnitDependencyParams, WorkUnitIdParams,
+        WorkUnitTransitionParams,
     },
     protocol::McpContext,
     state::AppState,
@@ -94,14 +95,28 @@ pub(super) async fn forge_create_task(
             })),
         ));
     }
+    let repositories = params.repositories.map(|repositories| {
+        repositories
+            .into_iter()
+            .map(|repository| db::TaskRepositoryWrite {
+                repo_id: repository.repo_id,
+                role: match repository.role {
+                    api_types::TaskRepositoryRole::Primary => db::TaskRepositoryRole::Primary,
+                    api_types::TaskRepositoryRole::Affected => db::TaskRepositoryRole::Affected,
+                    api_types::TaskRepositoryRole::Context => db::TaskRepositoryRole::Context,
+                },
+            })
+            .collect()
+    });
     let task = state
         .task_service
-        .create_task(
+        .create_task_with_repositories(
             params.project_id,
             params.title,
             params.description,
             params.parent_task_id,
             params.priority,
+            repositories,
             None,
             None,
         )
@@ -557,7 +572,7 @@ pub(super) async fn forge_create_work_unit(
     });
     let unit = state
         .work_unit_service
-        .create_idempotent(
+        .create_idempotent_with_repository_ids(
             source.clone(),
             services::CreateWorkUnitInput {
                 task_id: params.task_id,
@@ -576,6 +591,7 @@ pub(super) async fn forge_create_work_unit(
                     .map(|subject| subject.reviewed_work_unit_id),
             },
             &params.idempotency_key,
+            params.repository_ids.unwrap_or_default(),
         )
         .await?;
     work_unit_value_for(state, source, unit).await
@@ -873,6 +889,7 @@ async fn work_unit_value_for(
     unit: db::WorkUnit,
 ) -> Result<Value, McpToolError> {
     let readiness = state.work_unit_service.readiness(source, &unit.id).await?;
+    let repository_ids = WorkUnitRepo::list_repository_ids(&*state.db, &unit.id).await?;
     let review_subject = services::task_rework::get_review_subject(&state.db, &unit.id)
         .await?
         .as_ref()
@@ -902,6 +919,7 @@ async fn work_unit_value_for(
             "awaiting_acceptance": readiness.awaiting_acceptance,
         },
         "review_subject": review_subject,
+        "repository_ids": repository_ids,
     }))
 }
 
@@ -1048,8 +1066,11 @@ pub(super) async fn forge_get_project(
 pub(super) async fn forge_update_project(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let params: UpdateProjectParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    require_project_admin_access(state, &params.project_id, user_id).await?;
     if params
         .name
         .as_deref()
@@ -1058,19 +1079,66 @@ pub(super) async fn forge_update_project(
         return Err(McpToolError::new(-32602, "name must not be empty"));
     }
 
-    let project = ProjectRepo::update(
-        &*state.db,
-        UpdateProject {
-            id: params.project_id,
-            name: params.name,
-            settings: None,
-            primary_repo_id: None,
-            paused_at: params.paused.map(|paused| paused.then(now_rfc3339)),
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await?;
+    let project = services::ProjectRepositoryService::new(Arc::clone(&state.db))
+        .update_project_at_version(
+            UpdateProject {
+                id: params.project_id,
+                name: params.name,
+                settings: None,
+                primary_repo_id: params.primary_repo_id,
+                paused_at: params.paused.map(|paused| paused.then(now_rfc3339)),
+                updated_at: now_rfc3339(),
+            },
+            params.version,
+            None,
+            user_id,
+        )
+        .await?;
     project_value(project)
+}
+
+pub(super) async fn forge_update_task_repositories(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let params: UpdateTaskRepositoriesParams = parse_params(params)?;
+    let user_id = authenticated_user(context)?;
+    let task = require_task_access(state, &params.task_id, user_id).await?;
+    if context.copilot_run_id.is_some() {
+        return Err(McpToolError::new(
+            -32003,
+            "Task repository changes are outside the Copilot delegation",
+        ));
+    }
+    if context
+        .project_id
+        .as_deref()
+        .is_some_and(|project_id| project_id != task.project_id)
+    {
+        return Err(McpToolError::new(
+            -32602,
+            "task does not belong to scoped MCP project",
+        ));
+    }
+    require_project_write_access(state, &task.project_id, user_id).await?;
+    let repositories = params
+        .repositories
+        .into_iter()
+        .map(|repository| db::TaskRepositoryWrite {
+            repo_id: repository.repo_id,
+            role: match repository.role {
+                api_types::TaskRepositoryRole::Primary => db::TaskRepositoryRole::Primary,
+                api_types::TaskRepositoryRole::Affected => db::TaskRepositoryRole::Affected,
+                api_types::TaskRepositoryRole::Context => db::TaskRepositoryRole::Context,
+            },
+        })
+        .collect();
+    let task = state
+        .task_service
+        .replace_task_repositories(&params.task_id, params.expected_version, repositories)
+        .await?;
+    task_public_value(state, task).await
 }
 
 pub(super) async fn forge_update_project_hooks(
@@ -1316,10 +1384,24 @@ async fn task_public_value(state: &AppState, task: Task) -> Result<Value, McpToo
             "updated_at": role.updated_at,
         }));
     }
+    let repositories = TaskRepo::list_repositories(&*state.db, &task.id)
+        .await?
+        .into_iter()
+        .map(|repository| {
+            json!({
+                "repo_id": repository.repo_id,
+                "role": repository.role.to_string(),
+                "position": repository.position,
+                "merge": null,
+                "pull_request": null,
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(json!({
         "id": task.id,
         "project_id": task.project_id,
         "repo_id": task.repo_id,
+        "repositories": repositories,
         "parent_task_id": task.parent_task_id,
         "title": task.title,
         "description": task.description,

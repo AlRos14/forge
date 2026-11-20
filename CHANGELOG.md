@@ -8,6 +8,15 @@ source version is 0.9.1.
 
 ## [Unreleased]
 
+### Added
+
+- Add durable Task repository scopes with `primary`, `affected`, and `context`
+  roles. Task creation inherits the parent Task scope or Project primary unless
+  repositories are supplied; an explicit empty list creates a repo-less Task.
+- Add versioned Task repository replacement, versioned Project primary-repo
+  updates for future Tasks, and writable repository selection for WorkUnits in
+  REST and MCP.
+
 ## [0.9.1] - 2026-11-18
 
 Packaging fix for 0.9.0. No runtime, API, or schema changes.

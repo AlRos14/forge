@@ -18,6 +18,33 @@ impl TaskService {
             description,
             parent_task_id,
             priority,
+            None,
+            initial_lifecycle_state,
+            merge_config,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_task_with_repositories(
+        &self,
+        project_id: impl Into<String>,
+        title: impl Into<String>,
+        description: Option<String>,
+        parent_task_id: Option<String>,
+        priority: Option<i64>,
+        repositories: Option<Vec<db::TaskRepositoryWrite>>,
+        initial_lifecycle_state: Option<db::TaskLifecycleState>,
+        merge_config: Option<Value>,
+    ) -> Result<Task> {
+        self.create_task_inner(
+            project_id,
+            title,
+            description,
+            parent_task_id,
+            priority,
+            repositories,
             initial_lifecycle_state,
             merge_config,
             None,
@@ -40,6 +67,7 @@ impl TaskService {
             description,
             None,
             None,
+            None,
             Some(db::TaskLifecycleState::Backlog),
             None,
             Some((user_id, import_key, grant)),
@@ -55,6 +83,7 @@ impl TaskService {
         description: Option<String>,
         parent_task_id: Option<String>,
         priority: Option<i64>,
+        repositories: Option<Vec<db::TaskRepositoryWrite>>,
         initial_lifecycle_state: Option<db::TaskLifecycleState>,
         merge_config: Option<Value>,
         plan_import: Option<(&str, &str, Option<&db::ProjectCopilotRunGrant>)>,
@@ -106,8 +135,9 @@ impl TaskService {
                 return task.ok_or_else(|| ServiceError::not_found("task", task_id));
             }
         }
-        let (repo_id, subtask_order) = if let Some(parent_id) = parent_task_id.as_deref() {
-            let parent = super::subtask::validate_parent_placement_in_tx(
+        let (subtask_order, repository_writes) = if let Some(parent_id) = parent_task_id.as_deref()
+        {
+            super::subtask::validate_parent_placement_in_tx(
                 &self.db,
                 &mut transaction,
                 None,
@@ -117,10 +147,56 @@ impl TaskService {
             .await?;
             let order =
                 TaskRepo::next_subtask_order_in_tx(&*self.db, &mut transaction, parent_id).await?;
-            (parent.repo_id, Some(order))
+            let inherited = if let Some(repositories) = repositories {
+                repositories
+            } else {
+                let rows = sqlx::query(
+                    "SELECT repo_id, role FROM task_repository WHERE task_id = ? ORDER BY position",
+                )
+                .bind(parent_id)
+                .fetch_all(&mut *transaction)
+                .await?;
+                let mut inherited = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let repo_id: String = row.try_get("repo_id")?;
+                    let role: String = row.try_get("role")?;
+                    let role = match role.as_str() {
+                        "primary" => db::TaskRepositoryRole::Primary,
+                        "affected" => db::TaskRepositoryRole::Affected,
+                        "context" => db::TaskRepositoryRole::Context,
+                        _ => return Err(ServiceError::TaskRepositoriesInvalid),
+                    };
+                    inherited.push(db::TaskRepositoryWrite { repo_id, role });
+                }
+                inherited
+            };
+            (Some(order), inherited)
         } else {
-            (project.primary_repo_id.clone(), None)
+            let inherited = repositories.unwrap_or_else(|| {
+                project
+                    .primary_repo_id
+                    .clone()
+                    .map(|repo_id| {
+                        vec![db::TaskRepositoryWrite {
+                            repo_id,
+                            role: db::TaskRepositoryRole::Primary,
+                        }]
+                    })
+                    .unwrap_or_default()
+            });
+            (None, inherited)
         };
+        super::repositories::validate_task_repository_writes(&repository_writes)?;
+        super::repositories::validate_repositories_belong_to_project_in_tx(
+            &mut transaction,
+            &project_id,
+            &repository_writes,
+        )
+        .await?;
+        let repo_id = repository_writes
+            .iter()
+            .find(|repository| repository.role == db::TaskRepositoryRole::Primary)
+            .map(|repository| repository.repo_id.clone());
         let no_repo = repo_id.is_none();
         // New Task progress starts in the aggregate lifecycle directly. A
         // project workflow state name must not decide whether the Task is
@@ -141,6 +217,7 @@ impl TaskService {
             lifecycle_state,
             is_automation: false,
             priority: priority.unwrap_or(0),
+            repositories: repository_writes,
             merge_config: serialize_config(merge_config)?,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -246,7 +323,7 @@ impl TaskService {
         let create_task = CreateTask {
             id: new_uuid_v4(),
             project_id,
-            repo_id,
+            repo_id: repo_id.clone(),
             parent_task_id: None,
             subtask_order: None,
             title,
@@ -254,6 +331,15 @@ impl TaskService {
             lifecycle_state,
             is_automation: true,
             priority: 0,
+            repositories: repo_id
+                .clone()
+                .map(|repo_id| {
+                    vec![db::TaskRepositoryWrite {
+                        repo_id,
+                        role: db::TaskRepositoryRole::Primary,
+                    }]
+                })
+                .unwrap_or_default(),
             merge_config: serialize_config(merge_config)?,
             created_at: now.clone(),
             updated_at: now.clone(),

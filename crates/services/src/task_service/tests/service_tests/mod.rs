@@ -358,6 +358,7 @@ async fn seed_task_with_status(
     TaskRepo::create(
         db,
         CreateTask {
+            repositories: Vec::new(),
             id: new_uuid_v4(),
             project_id: project_id.to_owned(),
             repo_id: Some(repo_id.to_owned()),
@@ -408,6 +409,7 @@ async fn seed_subtask_with_status(
     TaskRepo::create(
         db,
         CreateTask {
+            repositories: Vec::new(),
             id: new_uuid_v4(),
             project_id: parent.project_id.clone(),
             repo_id: parent.repo_id.clone(),

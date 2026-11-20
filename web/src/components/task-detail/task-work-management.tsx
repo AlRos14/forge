@@ -6,6 +6,7 @@ import {
   useAgentsQuery,
   useMembersQuery,
   useProjectQuery,
+  useReposQuery,
   useTaskGatesQuery,
   useTaskReviewLinesQuery,
   useWorkUnitArtifactPackageQuery,
@@ -125,6 +126,7 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
     staleTime: 5 * 60 * 1000,
   })
   const projectQuery = useProjectQuery(task.project_id)
+  const reposQuery = useReposQuery(task.project_id)
   const agentsQuery = useAgentsQuery()
   const membersQuery = useMembersQuery(task.project_id)
   const gatesQuery = useTaskGatesQuery(task.id)
@@ -169,7 +171,14 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
     provenanceKind: '',
     provenanceRef: '',
     provenanceActor: '',
+    repositoryIds: [] as string[],
   })
+  const writableRepositories = (task.repositories ?? []).filter(
+    (repository) => repository.role === 'primary' || repository.role === 'affected',
+  )
+
+  const repositoryLabel = (repoId: string) =>
+    reposQuery.data?.items.find((repository) => repository.id === repoId)?.name ?? repoId
 
   useEffect(() => {
     setRoleDrafts(
@@ -363,6 +372,9 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
       ...(formalReviewRole
         ? { review_subject: { reviewed_work_unit_id: creation.reviewedWorkUnitId } }
         : {}),
+      ...(creation.repositoryIds.length
+        ? { repository_ids: creation.repositoryIds }
+        : {}),
     }
     try {
       await postOrPatch<WorkUnitResponse>(`/tasks/${task.id}/work-units`, 'POST', body)
@@ -382,6 +394,7 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
         provenanceKind: '',
         provenanceRef: '',
         provenanceActor: '',
+        repositoryIds: [],
       })
       await onChanged()
     } catch (error) {
@@ -830,6 +843,38 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
               }
             />
           </label>
+          {writableRepositories.length ? (
+            <fieldset className="space-y-2 rounded-md border p-3 text-xs md:col-span-2">
+              <legend className="px-1 font-medium">Writable repositories</legend>
+              <p className="text-muted-foreground">
+                Leave all unchecked to include every writable Task repository. Context repositories
+                remain read-only and cannot be selected here.
+              </p>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {writableRepositories.map((repository) => (
+                  <label key={repository.repo_id} className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={creation.repositoryIds.includes(repository.repo_id)}
+                      onChange={(event) =>
+                        setCreation((current) => ({
+                          ...current,
+                          repositoryIds: event.target.checked
+                            ? [...current.repositoryIds, repository.repo_id]
+                            : current.repositoryIds.filter(
+                                (repoId) => repoId !== repository.repo_id,
+                              ),
+                        }))
+                      }
+                    />
+                    <span className="truncate">
+                      {repositoryLabel(repository.repo_id)} · {repository.role}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+          ) : null}
           <label className="space-y-1 text-xs md:col-span-2">
             <span>Harness execution instructions (optional)</span>
             <Textarea

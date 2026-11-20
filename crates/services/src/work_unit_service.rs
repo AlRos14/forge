@@ -95,7 +95,18 @@ impl WorkUnitService {
         source: CollaborationActorSource,
         input: CreateWorkUnitInput,
     ) -> Result<WorkUnit> {
-        self.create_with_id(source, input, new_uuid_v4()).await
+        self.create_with_repository_ids(source, input, Vec::new())
+            .await
+    }
+
+    pub async fn create_with_repository_ids(
+        &self,
+        source: CollaborationActorSource,
+        input: CreateWorkUnitInput,
+        repository_ids: Vec<String>,
+    ) -> Result<WorkUnit> {
+        self.create_with_request_digest(source, input, new_uuid_v4(), None, repository_ids)
+            .await
     }
 
     /// Create or replay a WorkUnit by a caller-scoped idempotency key.
@@ -109,6 +120,17 @@ impl WorkUnitService {
         source: CollaborationActorSource,
         input: CreateWorkUnitInput,
         idempotency_key: &str,
+    ) -> Result<WorkUnit> {
+        self.create_idempotent_with_repository_ids(source, input, idempotency_key, Vec::new())
+            .await
+    }
+
+    pub async fn create_idempotent_with_repository_ids(
+        &self,
+        source: CollaborationActorSource,
+        input: CreateWorkUnitInput,
+        idempotency_key: &str,
+        repository_ids: Vec<String>,
     ) -> Result<WorkUnit> {
         if idempotency_key.trim().is_empty() {
             return Err(invalid("WorkUnit idempotency key must not be empty"));
@@ -152,6 +174,7 @@ impl WorkUnitService {
             "review_subject": input.review_subject,
             "artifact_inputs": input.artifact_inputs,
             "review_approval": input.review_approval,
+            "repository_ids": repository_ids,
         }))
         .map_err(|_| invalid("WorkUnit request could not be encoded"))?;
         let request_digest = hex::encode(Sha256::digest(intent));
@@ -160,6 +183,7 @@ impl WorkUnitService {
             input,
             Uuid::from_bytes(id_bytes).to_string(),
             Some(request_digest),
+            repository_ids,
         )
         .await
     }
@@ -170,7 +194,7 @@ impl WorkUnitService {
         input: CreateWorkUnitInput,
         id: String,
     ) -> Result<WorkUnit> {
-        self.create_with_request_digest(source, input, id, None)
+        self.create_with_request_digest(source, input, id, None, Vec::new())
             .await
     }
 
@@ -180,6 +204,7 @@ impl WorkUnitService {
         input: CreateWorkUnitInput,
         id: String,
         request_digest: Option<String>,
+        repository_ids: Vec<String>,
     ) -> Result<WorkUnit> {
         let requested_input = input.clone();
         let CreateWorkUnitInput {
@@ -200,6 +225,7 @@ impl WorkUnitService {
             .collaboration
             .authorize_mutation_source(&task_id, &source)
             .await?;
+        validate_work_unit_repository_ids(&*self.db, &task.id, &repository_ids).await?;
         if let Some(existing) = self
             .existing_work_unit_for_create(&id, &actor, &requested_input, request_digest.as_deref())
             .await?
@@ -445,6 +471,7 @@ impl WorkUnitService {
         let work_unit_input = CreateWorkUnit {
                 id,
                 task_id: task_id.clone(),
+                repository_ids,
                 parent_work_unit_id,
                 title,
                 scope,
@@ -2258,6 +2285,41 @@ impl WorkUnitService {
     }
 }
 
+async fn validate_work_unit_repository_ids(
+    db: &SqliteDb,
+    task_id: &str,
+    repository_ids: &[String],
+) -> Result<()> {
+    let mut selected = std::collections::HashSet::with_capacity(repository_ids.len());
+    if repository_ids
+        .iter()
+        .any(|repo_id| !selected.insert(repo_id.as_str()))
+    {
+        return Err(ServiceError::WorkUnitRepositoriesInvalid);
+    }
+    if repository_ids.is_empty() {
+        return Ok(());
+    }
+    let task_repositories = TaskRepo::list_repositories(db, task_id).await?;
+    let writable: std::collections::HashSet<&str> = task_repositories
+        .iter()
+        .filter(|repository| {
+            matches!(
+                repository.role,
+                db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+            )
+        })
+        .map(|repository| repository.repo_id.as_str())
+        .collect();
+    if repository_ids
+        .iter()
+        .any(|repo_id| !writable.contains(repo_id.as_str()))
+    {
+        return Err(ServiceError::WorkUnitRepositoriesInvalid);
+    }
+    Ok(())
+}
+
 fn work_unit_provenance_intent(provenance: Option<&WorkUnitProvenance>) -> serde_json::Value {
     match provenance {
         None => serde_json::Value::Null,
@@ -2659,6 +2721,7 @@ mod tests {
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
+                repositories: Vec::new(),
                 subtask_order: None,
                 merge_config: None,
                 created_at: now.clone(),
@@ -3029,6 +3092,7 @@ mod tests {
                 lifecycle_state: db::TaskLifecycleState::Ready,
                 is_automation: false,
                 priority: 0,
+                repositories: Vec::new(),
                 subtask_order: None,
                 merge_config: None,
                 created_at: now.clone(),
@@ -3178,6 +3242,7 @@ mod tests {
                     requires_integration: true,
                     provenance: None,
                     artifact_input_ids: Vec::new(),
+                    repository_ids: Vec::new(),
                     review_approval_gate_id: None,
                     review_approval_line_id: None,
                     created_by: ActorRef::Human(human_id.to_owned()),
@@ -3374,6 +3439,7 @@ mod tests {
                 requires_integration: false,
                 provenance: None,
                 artifact_input_ids: Vec::new(),
+                repository_ids: Vec::new(),
                 review_approval_gate_id: None,
                 review_approval_line_id: None,
                 created_by: ActorRef::Human(human_id.clone()),

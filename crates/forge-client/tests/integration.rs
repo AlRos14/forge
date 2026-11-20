@@ -111,6 +111,7 @@ async fn forge_client_runs_task_flow_and_deletes_task() {
         .post(
             &format!("/api/v1/projects/{}/tasks", project.id),
             &CreateTaskRequest {
+                repositories: None,
                 title: "Client task".to_owned(),
                 description: None,
                 parent_task_id: None,
@@ -461,6 +462,7 @@ fn task_response(
 ) -> TaskResponse {
     let task_id = id.clone();
     TaskResponse {
+        repositories: Vec::new(),
         id,
         project_id,
         repo_id: None,

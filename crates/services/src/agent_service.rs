@@ -666,6 +666,7 @@ mod tests {
         let task = TaskRepo::create(
             db,
             CreateTask {
+                repositories: Vec::new(),
                 id: new_uuid_v4(),
                 project_id,
                 repo_id: Some(repo_id),

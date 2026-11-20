@@ -1093,6 +1093,23 @@ pub struct Task {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRepository {
+    pub task_id: String,
+    pub repo_id: String,
+    pub role: TaskRepositoryRole,
+    pub position: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkUnitRepositoryScope {
+    pub work_unit_id: String,
+    pub task_id: String,
+    pub repo_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Execution {
     pub id: String,
     pub task_id: String,
@@ -1684,6 +1701,19 @@ macro_rules! enum_strings {
         }
     };
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRepositoryRole {
+    Primary,
+    Affected,
+    Context,
+}
+
+enum_strings!(TaskRepositoryRole {
+    Primary => "primary",
+    Affected => "affected",
+    Context => "context",
+});
 
 enum_strings!(ValidationRunStatus {
     Running => "running",

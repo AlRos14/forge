@@ -1929,6 +1929,7 @@ async fn pr8_review_subject_uses_exact_workunit_workspace_and_matching_evidence(
     db::WorkUnitRepo::create(
         &*db,
         db::CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: work_unit_id.clone(),
             task_id: task.id.clone(),
             parent_work_unit_id: None,
@@ -4167,6 +4168,7 @@ async fn blocked_recovery_fixture_for_executor(
         let work_unit = db::WorkUnitRepo::create(
             &*db,
             db::CreateWorkUnit {
+                repository_ids: Vec::new(),
                 id: work_unit_id.clone(),
                 task_id: task.id.clone(),
                 parent_work_unit_id: None,
@@ -5501,6 +5503,7 @@ async fn launch_work_unit_for_override_snapshot(
     let work_unit = db::WorkUnitRepo::create(
         db,
         db::CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: work_unit_id.clone(),
             task_id: task.id.clone(),
             parent_work_unit_id: None,
@@ -5599,6 +5602,7 @@ async fn create_simple_execution_work_unit(
     db::WorkUnitRepo::create(
         db,
         db::CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: id.clone(),
             task_id: task.id.clone(),
             parent_work_unit_id: None,

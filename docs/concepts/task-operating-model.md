@@ -84,6 +84,15 @@ No exigir información innecesaria para el tipo de tarea. Un repo no es requisit
 universal para investigación o entregables en Artifacts. Si falta acceso,
 capacidad o un Actor, preguntar por ese bloqueo concreto.
 
+El alcance puede asociar varios repositorios del Proyecto como `primary`,
+`affected` o `context`. El repositorio primary se copia a Tasks nuevas y las
+subtareas heredan la selección de su padre. Los repositorios context son de
+solo lectura. Cada WorkUnit puede limitarse a repositorios primary/affected
+concretos; después de una Execution, cambiar el alcance de la Task requiere un
+replan versionado. Antes de una Execution, un cambio no puede quitar un
+repositorio seleccionado explícitamente por un WorkUnit ni convertirlo en
+context.
+
 ## Arranque y coordinación
 
 Un turno de coordinación debe poder admitirse desde Task + equipo + autorización,

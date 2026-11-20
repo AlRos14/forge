@@ -998,6 +998,7 @@ impl TaskReworkService {
         let write = WorkUnitRepo::create_with_review_subject(
             &*self.db,
             db::CreateWorkUnit {
+                repository_ids: Vec::new(),
                 id: id.clone(),
                 task_id: receipt.task_id.clone(),
                 parent_work_unit_id: None,

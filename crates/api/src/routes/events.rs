@@ -117,6 +117,12 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "reason_ref",
             ],
         ),
+        "task.repositories_changed" => {
+            let projected = project_fields(&source, &["task_id", "task_version", "repositories"]);
+            let payload: api_types::TaskRepositoriesChangedPayload =
+                serde_json::from_value(projected).ok()?;
+            serde_json::to_value(payload).ok()?
+        }
         "project.plan_proposed"
         | "project.plan_applied"
         | "project.plan_dependencies_changed"
@@ -454,6 +460,7 @@ async fn project_is_visible(db: &SqliteDb, project_id: &str, user_id: &str) -> b
 fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
     Some(match event_type {
         "task.lifecycle_changed" => PublicEventType::TaskLifecycleChanged,
+        "task.repositories_changed" => PublicEventType::TaskRepositoriesChanged,
         "gate.created" => PublicEventType::GateCreated,
         "gate.policy_revised" => PublicEventType::GatePolicyRevised,
         "gate.evaluated" => PublicEventType::GateEvaluated,
@@ -583,6 +590,22 @@ fn project_runtime_hint(event: &events::ForgeEvent) -> Option<PublicEventEnvelop
     // public payload to identifiers and status fields; never serialize the
     // internal EventContext wholesale.
     let (event_type, payload) = match (event.event_type.as_str(), &event.context) {
+        (
+            events::TASK_REPOSITORIES_CHANGED_EVENT,
+            events::EventContext::TaskRepositoriesChanged {
+                task_id,
+                task_version,
+                repositories,
+            },
+        ) => (
+            PublicEventType::TaskRepositoriesChanged,
+            serde_json::to_value(api_types::TaskRepositoriesChangedPayload {
+                task_id: task_id.clone(),
+                task_version: *task_version,
+                repositories: repositories.clone(),
+            })
+            .ok()?,
+        ),
         ("project.created", events::EventContext::ProjectCreated { .. }) => {
             (PublicEventType::ProjectCreated, json!({}))
         }
@@ -652,6 +675,9 @@ fn project_runtime_hint(event: &events::ForgeEvent) -> Option<PublicEventEnvelop
         }
         events::EventContext::ProjectHookRunChanged { project_id, .. } => {
             (Some("project".to_owned()), Some(project_id.clone()))
+        }
+        events::EventContext::TaskRepositoriesChanged { task_id, .. } => {
+            (Some("task".to_owned()), Some(task_id.clone()))
         }
         events::EventContext::NotificationCreated { project_id, .. } => {
             (Some("project".to_owned()), Some(project_id.clone()))
@@ -938,6 +964,7 @@ mod tests {
         db::TaskRepo::create(
             &db,
             db::CreateTask {
+                repositories: Vec::new(),
                 id: "private-task".to_owned(),
                 project_id: "private-project".to_owned(),
                 repo_id: None,

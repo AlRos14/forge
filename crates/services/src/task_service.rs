@@ -38,6 +38,7 @@ pub(crate) mod logs;
 mod memberships;
 mod orchestrator;
 mod reorder_subtasks;
+mod repositories;
 mod review;
 mod roles;
 mod subtask;

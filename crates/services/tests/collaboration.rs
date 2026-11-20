@@ -86,6 +86,7 @@ async fn fixture() -> Fixture {
         TaskRepo::create(
             &*db,
             CreateTask {
+                repositories: Vec::new(),
                 id: task_id.to_string(),
                 project_id: project_id.clone(),
                 repo_id: Some(repo_id.clone()),
@@ -198,6 +199,7 @@ async fn create_foreign_project(f: &Fixture) -> ForeignProjectFixture {
     TaskRepo::create(
         &*f.db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id: project_id.clone(),
             repo_id: Some(repo_id.clone()),

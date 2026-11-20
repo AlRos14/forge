@@ -4,7 +4,7 @@ use ts_rs::TS;
 
 use crate::{
     ActorRef, AgentStatus, ExecutionRole, ExecutionStatus, ResumePolicy, StopReason,
-    TaskLifecycleResponse, TaskRoleResponse, WorkspaceResponse,
+    TaskLifecycleResponse, TaskRepositoryResponse, TaskRoleResponse, WorkspaceResponse,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -32,6 +32,8 @@ pub struct TaskResponse {
     pub id: String,
     pub project_id: String,
     pub repo_id: Option<String>,
+    #[serde(default)]
+    pub repositories: Vec<TaskRepositoryResponse>,
     pub parent_task_id: Option<String>,
     pub title: String,
     pub description: Option<String>,

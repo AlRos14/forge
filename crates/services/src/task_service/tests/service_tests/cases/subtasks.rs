@@ -934,6 +934,7 @@ async fn reparent_requires_the_same_exact_repo() {
             lifecycle_state: db::TaskLifecycleState::Ready,
             is_automation: false,
             priority: 0,
+            repositories: Vec::new(),
             merge_config: None,
             created_at: now.clone(),
             updated_at: now,
@@ -1076,4 +1077,333 @@ async fn reorder_subtasks_updates_order() {
     assert_eq!(reordered[0].title, "C");
     assert_eq!(reordered[1].title, "B");
     assert_eq!(reordered[2].title, "A");
+}
+
+#[tokio::test]
+async fn multirepo_task_create_defaults_to_primary_and_inherits_subtask_scope() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, primary_repo_id, _) = seed_project_repo(&db).await;
+    let now = now_rfc3339();
+    let affected_repo = db::RepoRepo::create(
+        &*db,
+        db::CreateRepo {
+            id: db::new_uuid_v4(),
+            project_id: project_id.clone(),
+            name: "affected".to_owned(),
+            remote_url: "https://example.invalid/affected.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("affected repository creates");
+    let context_repo = db::RepoRepo::create(
+        &*db,
+        db::CreateRepo {
+            id: db::new_uuid_v4(),
+            project_id: project_id.clone(),
+            name: "context".to_owned(),
+            remote_url: "https://example.invalid/context.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("context repository creates");
+
+    let default_task = service
+        .create_task(
+            project_id.clone(),
+            "Default primary",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("default Task creates");
+    let default_repositories = db::TaskRepo::list_repositories(&*db, &default_task.id)
+        .await
+        .expect("default Task repositories list");
+    assert_eq!(
+        default_task.repo_id.as_deref(),
+        Some(primary_repo_id.as_str())
+    );
+    assert_eq!(default_repositories.len(), 1);
+    assert_eq!(default_repositories[0].repo_id, primary_repo_id);
+    assert_eq!(
+        default_repositories[0].role,
+        db::TaskRepositoryRole::Primary
+    );
+
+    let root = service
+        .create_task_with_repositories(
+            project_id.clone(),
+            "Explicit repository set",
+            None,
+            None,
+            None,
+            Some(vec![
+                db::TaskRepositoryWrite {
+                    repo_id: primary_repo_id.clone(),
+                    role: db::TaskRepositoryRole::Primary,
+                },
+                db::TaskRepositoryWrite {
+                    repo_id: affected_repo.id.clone(),
+                    role: db::TaskRepositoryRole::Affected,
+                },
+                db::TaskRepositoryWrite {
+                    repo_id: context_repo.id.clone(),
+                    role: db::TaskRepositoryRole::Context,
+                },
+            ]),
+            None,
+            None,
+        )
+        .await
+        .expect("explicit repository set creates");
+    let child = service
+        .create_task(
+            project_id,
+            "Inherited repository set",
+            None,
+            Some(root.id.clone()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("subtask inherits repository set");
+    let root_repositories = db::TaskRepo::list_repositories(&*db, &root.id)
+        .await
+        .expect("root repository set loads");
+    let child_repositories = db::TaskRepo::list_repositories(&*db, &child.id)
+        .await
+        .expect("subtask repository set loads");
+    assert_eq!(root_repositories, child_repositories);
+    assert_eq!(
+        child_repositories
+            .iter()
+            .map(|repository| (&repository.repo_id, repository.role))
+            .collect::<Vec<_>>(),
+        vec![
+            (&primary_repo_id, db::TaskRepositoryRole::Primary),
+            (&affected_repo.id, db::TaskRepositoryRole::Affected),
+            (&context_repo.id, db::TaskRepositoryRole::Context),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn multirepo_task_repository_replace_conflicts_after_execution_or_stale_version() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, primary_repo_id, _) = seed_project_repo(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Repository change",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Task creates");
+    let stale = service
+        .replace_task_repositories(
+            &task.id,
+            task.version - 1,
+            vec![db::TaskRepositoryWrite {
+                repo_id: primary_repo_id.clone(),
+                role: db::TaskRepositoryRole::Primary,
+            }],
+        )
+        .await;
+    assert!(matches!(
+        stale,
+        Err(ServiceError::Db(db::DbError::TaskVersionConflict { .. }))
+            | Err(ServiceError::Db(db::DbError::VersionConflict))
+    ));
+
+    let now = now_rfc3339();
+    db::ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            actor_ref: None,
+            role: "implementer".to_owned(),
+            status: db::ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            harness_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Execution fixture creates");
+    let changed = service
+        .replace_task_repositories(
+            &task.id,
+            task.version,
+            vec![db::TaskRepositoryWrite {
+                repo_id: primary_repo_id,
+                role: db::TaskRepositoryRole::Primary,
+            }],
+        )
+        .await;
+    assert!(matches!(
+        changed,
+        Err(ServiceError::TaskRepositoryReplanRequired)
+    ));
+}
+
+#[tokio::test]
+async fn multirepo_task_project_primary_update_is_versioned_and_future_only() {
+    let db = Arc::new(sqlite_db().await);
+    let owner_id = seed_human_user(&db).await;
+    let now = now_rfc3339();
+    let project = db::ProjectRepo::create_with_owner_membership(
+        &*db,
+        db::CreateProject {
+            id: db::new_uuid_v4(),
+            name: "Primary repository".to_owned(),
+            settings: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some(owner_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        &db::new_uuid_v4(),
+    )
+    .await
+    .expect("owned Project creates");
+    let primary = db::RepoRepo::create(
+        &*db,
+        db::CreateRepo {
+            id: db::new_uuid_v4(),
+            project_id: project.id.clone(),
+            name: "primary".to_owned(),
+            remote_url: "https://example.invalid/primary.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("first repository creates");
+    db::ProjectRepo::update(
+        &*db,
+        db::UpdateProject {
+            id: project.id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(primary.id.clone())),
+            paused_at: None,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project primary is initially selected");
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let existing_task = service
+        .create_task(
+            project.id.clone(),
+            "Existing Task",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("existing Task creates");
+    let next_primary = db::RepoRepo::create(
+        &*db,
+        db::CreateRepo {
+            id: db::new_uuid_v4(),
+            project_id: project.id.clone(),
+            name: "next-primary".to_owned(),
+            remote_url: "https://example.invalid/next-primary.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("next primary repository creates");
+    let current_project = db::ProjectRepo::get_by_id(&*db, &project.id)
+        .await
+        .expect("Project loads")
+        .expect("Project exists");
+    let repository_service =
+        crate::project_repository_service::ProjectRepositoryService::new(Arc::clone(&db));
+    let updated_project = repository_service
+        .update_primary_repo(
+            &project.id,
+            current_project.version,
+            Some(next_primary.id.clone()),
+            &owner_id,
+        )
+        .await
+        .expect("versioned primary update succeeds");
+    assert_eq!(
+        updated_project.primary_repo_id.as_deref(),
+        Some(next_primary.id.as_str())
+    );
+    assert_eq!(updated_project.version, current_project.version + 1);
+    assert_eq!(existing_task.repo_id.as_deref(), Some(primary.id.as_str()));
+
+    let future_task = service
+        .create_task(
+            project.id.clone(),
+            "Future Task",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("future Task creates");
+    assert_eq!(
+        future_task.repo_id.as_deref(),
+        Some(next_primary.id.as_str())
+    );
+
+    let stale = repository_service
+        .update_primary_repo(&project.id, current_project.version, None, &owner_id)
+        .await;
+    assert!(matches!(
+        stale,
+        Err(ServiceError::Db(db::DbError::VersionConflict))
+    ));
 }

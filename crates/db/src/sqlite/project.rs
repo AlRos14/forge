@@ -142,6 +142,20 @@ impl ProjectRepo for SqliteDb {
         if let Some(paused_at) = input.paused_at {
             project.paused_at = paused_at;
         }
+        if let Some(repo_id) = project.primary_repo_id.as_deref() {
+            let belongs_to_project: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM repo WHERE id = ? AND project_id = ?)",
+            )
+            .bind(repo_id)
+            .bind(&project.id)
+            .fetch_one(&self.pool)
+            .await?;
+            if belongs_to_project == 0 {
+                return Err(DbError::Check(
+                    "project.primary_repo_not_in_project".to_owned(),
+                ));
+            }
+        }
         project.updated_at = input.updated_at;
         sqlx::query(
             "UPDATE project SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?, project_hooks_json = ?, project_work_epoch = ?, updated_at = ? WHERE id = ?",
@@ -202,6 +216,20 @@ impl ProjectRepo for SqliteDb {
         }
         if let Some(project_hooks_json) = project_hooks_json {
             project.project_hooks_json = project_hooks_json;
+        }
+        if let Some(repo_id) = project.primary_repo_id.as_deref() {
+            let belongs_to_project: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM repo WHERE id = ? AND project_id = ?)",
+            )
+            .bind(repo_id)
+            .bind(&project.id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if belongs_to_project == 0 {
+                return Err(DbError::Check(
+                    "project.primary_repo_not_in_project".to_owned(),
+                ));
+            }
         }
         project.updated_at = input.updated_at;
         let result = sqlx::query(

@@ -46,7 +46,17 @@ import { productTerm } from '@/lib/i18n'
 import { useAuthStore } from '@/stores/auth'
 import type { CreateRepoRequest, Project, Repo, UpdateRepoRequest } from '@/types/generated'
 
-export function ReposTab({ project, projectId }: { project?: Project; projectId: string }) {
+export function ReposTab({
+  project,
+  projectId,
+  isUpdatingPrimaryRepo,
+  onUpdatePrimaryRepo,
+}: {
+  project?: Project
+  projectId: string
+  isUpdatingPrimaryRepo: boolean
+  onUpdatePrimaryRepo: (repoId: string | null) => void
+}) {
   const isAdmin = useAuthStore((s) => Boolean(s.user?.is_admin))
   const userId = useAuthStore((s) => s.user?.id)
   const membersQuery = useMembersQuery(projectId)
@@ -66,6 +76,11 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
   const [repoDialogOpen, setRepoDialogOpen] = useState(false)
   const [repoForm, setRepoForm] = useState<RepoFormState>(emptyRepoForm)
   const [editingRepoId, setEditingRepoId] = useState<string | null>(null)
+  const [primaryRepoDraft, setPrimaryRepoDraft] = useState(project?.primary_repo_id ?? '')
+
+  useEffect(() => {
+    setPrimaryRepoDraft(project?.primary_repo_id ?? '')
+  }, [project?.primary_repo_id])
 
   // Inline branch edit state
   const [branchEditMode, setBranchEditMode] = useState(false)
@@ -294,6 +309,52 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
           onRetry={() => void reposQuery.refetch()}
         />
       )}
+
+      <div className="mb-6 space-y-3 rounded-md border p-4">
+        <div>
+          <label htmlFor="project-primary-repository" className="text-sm font-medium">
+            Primary repository for new Tasks
+          </label>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Changing this affects Tasks created after the update. Existing Tasks keep their repo
+            set.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            id="project-primary-repository"
+            aria-label="Primary repository for new Tasks"
+            className="h-9 min-w-56 flex-1 rounded-md border bg-background px-2 text-sm"
+            value={primaryRepoDraft}
+            disabled={
+              !canManageRepo || reposQuery.isLoading || reposQuery.isError || isUpdatingPrimaryRepo
+            }
+            onChange={(event) => setPrimaryRepoDraft(event.target.value)}
+          >
+            <option value="">No primary repository</option>
+            {repos.map((repo) => (
+              <option key={repo.id} value={repo.id}>
+                {repo.name}
+              </option>
+            ))}
+          </select>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={
+              !canManageRepo ||
+              !project ||
+              reposQuery.isLoading ||
+              reposQuery.isError ||
+              isUpdatingPrimaryRepo ||
+              primaryRepoDraft === (project.primary_repo_id ?? '')
+            }
+            onClick={() => onUpdatePrimaryRepo(primaryRepoDraft || null)}
+          >
+            {isUpdatingPrimaryRepo ? 'Saving…' : 'Save primary repository'}
+          </Button>
+        </div>
+      </div>
 
       {reposQuery.isLoading ? (
         <div className="rounded-md border p-4 space-y-3">

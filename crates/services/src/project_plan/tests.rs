@@ -83,6 +83,7 @@ async fn seed_task(db: &SqliteDb, project_id: &str, title: &str) -> String {
     TaskRepo::create(
         db,
         CreateTask {
+            repositories: Vec::new(),
             id: id.clone(),
             project_id: project_id.to_owned(),
             repo_id: None,
@@ -115,6 +116,7 @@ async fn seed_repo_task(
     TaskRepo::create(
         db,
         CreateTask {
+            repositories: Vec::new(),
             id: id.clone(),
             project_id: project_id.to_owned(),
             repo_id: Some(repo_id.to_owned()),
@@ -277,6 +279,7 @@ async fn seed_repository_work_unit(
     WorkUnitRepo::create(
         db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: work_unit_id.clone(),
             task_id: task_id.to_owned(),
             parent_work_unit_id: None,

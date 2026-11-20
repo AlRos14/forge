@@ -1416,3 +1416,122 @@ impl Drop for TestDir {
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
+
+#[tokio::test]
+async fn multirepo_task_create_request_omission_and_explicit_repositories() {
+    let repo_dir = TestDir::new("multirepo-task-api-repo");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let workspace_root = TestDir::new("multirepo-task-api-workspaces");
+    let harness = test_app(workspace_root.path()).await;
+    let (project_id, primary_repo_id) =
+        common::create_project_and_repo(&harness.app, "Multirepo Task API", &repo_path).await;
+
+    let now = db::now_rfc3339();
+    let affected_repo = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.clone(),
+            name: "affected".to_owned(),
+            remote_url: "https://example.invalid/affected.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("affected repository creates");
+    let context_repo = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.clone(),
+            name: "context".to_owned(),
+            remote_url: "https://example.invalid/context.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("context repository creates");
+
+    let omitted: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Omitted repositories" }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(omitted.repo_id.as_deref(), Some(primary_repo_id.as_str()));
+    assert_eq!(omitted.repositories.len(), 1);
+    assert_eq!(omitted.repositories[0].repo_id, primary_repo_id);
+    assert_eq!(
+        omitted.repositories[0].role,
+        api_types::TaskRepositoryRole::Primary
+    );
+
+    let explicit: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({
+            "title": "Explicit repositories",
+            "repositories": [
+                { "repo_id": primary_repo_id, "role": "primary" },
+                { "repo_id": affected_repo.id, "role": "affected" },
+                { "repo_id": context_repo.id, "role": "context" }
+            ]
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(explicit.repositories.len(), 3);
+    assert_eq!(
+        explicit.repositories[0].role,
+        api_types::TaskRepositoryRole::Primary
+    );
+    assert_eq!(
+        explicit.repositories[1].role,
+        api_types::TaskRepositoryRole::Affected
+    );
+    assert_eq!(
+        explicit.repositories[2].role,
+        api_types::TaskRepositoryRole::Context
+    );
+
+    let repo_less: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Explicit repo-less", "repositories": [] }),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(repo_less.repo_id.is_none());
+    assert!(repo_less.repositories.is_empty());
+    assert_eq!(repo_less.lifecycle.state, TaskLifecycleState::Backlog);
+
+    let updated: TaskResponse = json_request(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/tasks/{}/repositories", repo_less.id),
+        json!({
+            "expected_version": repo_less.version,
+            "repositories": [
+                { "repo_id": primary_repo_id, "role": "primary" },
+                { "repo_id": affected_repo.id, "role": "affected" }
+            ]
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(updated.repo_id.as_deref(), Some(primary_repo_id.as_str()));
+    assert_eq!(updated.repositories.len(), 2);
+    assert!(updated.version > repo_less.version);
+}

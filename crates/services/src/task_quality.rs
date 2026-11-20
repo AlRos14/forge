@@ -548,6 +548,7 @@ impl TaskQualityService {
         let write = WorkUnitRepo::create(
             &*self.db,
             CreateWorkUnit {
+                repository_ids: Vec::new(),
                 id,
                 task_id: request.task_id.clone(),
                 parent_work_unit_id: None,

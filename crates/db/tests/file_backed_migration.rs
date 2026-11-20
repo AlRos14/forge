@@ -90,6 +90,7 @@ async fn file_backed_migrations_apply_and_task_operation_claim_is_atomic_across_
     TaskRepo::create(
         &db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id,
             repo_id: None,
@@ -1038,6 +1039,7 @@ async fn historical_task_modes_are_removed_without_losing_task_rows() {
     let discovery = TaskRepo::create(
         &db,
         CreateTask {
+            repositories: Vec::new(),
             id: "discovery-task".to_owned(),
             project_id: "discovery-project".to_owned(),
             repo_id: Some("discovery-repo".to_owned()),

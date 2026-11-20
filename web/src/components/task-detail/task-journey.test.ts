@@ -91,6 +91,7 @@ function workUnit(overrides: Partial<WorkUnitResponse> = {}): WorkUnitResponse {
   return {
     id: 'unit-1',
     task_id: 'task-1',
+    repository_ids: [],
     parent_work_unit_id: null,
     title: 'Implement',
     scope: 'Scope',

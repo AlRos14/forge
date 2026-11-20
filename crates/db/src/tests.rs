@@ -669,6 +669,7 @@ async fn seed_task(
             id: task_id.clone(),
             project_id: project_id.to_owned(),
             repo_id: Some(repo_id.to_owned()),
+            repositories: Vec::new(),
             parent_task_id: None,
             subtask_order: None,
             title: title.to_owned(),
@@ -1879,6 +1880,7 @@ async fn pr6_cross_task_event_cannot_admit_an_orchestrator_wake() {
             id: second_task_id.clone(),
             project_id: source_task.project_id,
             repo_id: source_task.repo_id,
+            repositories: Vec::new(),
             parent_task_id: None,
             subtask_order: None,
             title: "Different Task scope".to_owned(),
@@ -2984,6 +2986,7 @@ async fn seed_ordered_task(
             id: new_uuid_v4(),
             project_id: project_id.to_owned(),
             repo_id: Some(repo_id.to_owned()),
+            repositories: Vec::new(),
             parent_task_id: parent_task_id.map(str::to_owned),
             subtask_order,
             title: title.to_owned(),
@@ -5039,6 +5042,7 @@ async fn migration_creates_schema_and_enforces_foreign_keys() {
             id: task_id.clone(),
             project_id: project_id.clone(),
             repo_id: Some(repo_id.clone()),
+            repositories: Vec::new(),
             parent_task_id: None,
             title: "Build DB foundation".to_owned(),
             description: None,
@@ -5078,6 +5082,7 @@ async fn migration_creates_schema_and_enforces_foreign_keys() {
             id: rejected_task_id.clone(),
             project_id: project_id.clone(),
             repo_id: Some(repo_id.clone()),
+            repositories: Vec::new(),
             parent_task_id: None,
             title: "Must roll back without lifecycle".to_owned(),
             description: None,
@@ -6303,6 +6308,7 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             id: task_id.clone(),
             project_id: project_id.clone(),
             repo_id: Some(repo_id.clone()),
+            repositories: Vec::new(),
             parent_task_id: None,
             subtask_order: None,
             title: "Implement repo".to_owned(),
@@ -6815,6 +6821,7 @@ async fn sqlite_repositories_enforce_versions_and_cursors() {
             id: task_id.clone(),
             project_id,
             repo_id: Some(repo_id),
+            repositories: Vec::new(),
             parent_task_id: None,
             subtask_order: None,
             title: "Claim me".to_owned(),
@@ -8281,6 +8288,7 @@ async fn v141_v144_backfill_dispatch_and_preserve_execution_purpose_history() {
             id: task_id.clone(),
             project_id: project_id.clone(),
             repo_id: None,
+            repositories: Vec::new(),
             parent_task_id: None,
             title: "Historical task".to_owned(),
             description: None,
@@ -8753,3 +8761,317 @@ mod v175;
 mod v177;
 mod v178;
 mod v180;
+
+async fn multirepo_seed_repo(db: &SqliteDb, project_id: &str, name: &str) -> String {
+    let now = now_rfc3339();
+    let repo_id = new_uuid_v4();
+    RepoRepo::create(
+        db,
+        CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.to_owned(),
+            name: name.to_owned(),
+            remote_url: format!("https://example.com/{name}.git"),
+            local_path: None,
+            work_mode: WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("repository creates");
+    repo_id
+}
+
+async fn multirepo_seed_task(
+    db: &SqliteDb,
+    project_id: &str,
+    primary_repo_id: &str,
+    repositories: Vec<crate::TaskRepositoryWrite>,
+) -> String {
+    let now = now_rfc3339();
+    let task_id = new_uuid_v4();
+    TaskRepo::create(
+        db,
+        CreateTask {
+            id: task_id.clone(),
+            project_id: project_id.to_owned(),
+            repo_id: Some(primary_repo_id.to_owned()),
+            repositories,
+            parent_task_id: None,
+            title: "Multirepo test Task".to_owned(),
+            description: None,
+            lifecycle_state: crate::TaskLifecycleState::Ready,
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Task creates");
+    task_id
+}
+
+#[tokio::test]
+async fn multirepo_task_backfills_primary_and_preserves_repo_less_tasks() {
+    let migrations = tempfile::tempdir().expect("migration temp directory");
+    copy_migrations_through(180, migrations.path());
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool creates");
+    run_migrations_from(&pool, migrations.path())
+        .await
+        .expect("migrations through V180 run");
+    let db = SqliteDb::new(pool.clone());
+
+    let project_id = seed_project(&db, "M1 backfill", None).await;
+    let repo_id = multirepo_seed_repo(&db, &project_id, "backfill-primary").await;
+    let now = now_rfc3339();
+    let primary_task_id = new_uuid_v4();
+    TaskRepo::create(
+        &db,
+        CreateTask {
+            id: primary_task_id.clone(),
+            project_id: project_id.clone(),
+            repo_id: Some(repo_id.clone()),
+            repositories: Vec::new(),
+            parent_task_id: None,
+            title: "Historical repo-backed Task".to_owned(),
+            description: None,
+            lifecycle_state: crate::TaskLifecycleState::Ready,
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("historical repo-backed Task creates");
+    let repo_less_task_id = new_uuid_v4();
+    TaskRepo::create(
+        &db,
+        CreateTask {
+            id: repo_less_task_id.clone(),
+            project_id,
+            repo_id: None,
+            repositories: Vec::new(),
+            parent_task_id: None,
+            title: "Historical repo-less Task".to_owned(),
+            description: None,
+            lifecycle_state: crate::TaskLifecycleState::Ready,
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            merge_config: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("historical repo-less Task creates");
+
+    let migration = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations/V181__multirepo_task_repositories.sql");
+    fs::copy(
+        &migration,
+        migrations
+            .path()
+            .join("V181__multirepo_task_repositories.sql"),
+    )
+    .expect("V181 migration copies into the fixture");
+    run_migrations_from(&pool, migrations.path())
+        .await
+        .expect("V181 migration runs");
+
+    let primary_rows = TaskRepo::list_repositories(&db, &primary_task_id)
+        .await
+        .expect("primary associations load");
+    assert_eq!(primary_rows.len(), 1);
+    assert_eq!(primary_rows[0].repo_id, repo_id);
+    assert_eq!(primary_rows[0].role, crate::TaskRepositoryRole::Primary);
+    assert_eq!(primary_rows[0].position, 0);
+    assert!(TaskRepo::list_repositories(&db, &repo_less_task_id)
+        .await
+        .expect("repo-less associations load")
+        .is_empty());
+    assert_eq!(
+        TaskRepo::get_by_id(&db, &repo_less_task_id, false)
+            .await
+            .expect("repo-less Task loads")
+            .expect("repo-less Task exists")
+            .repo_id,
+        None
+    );
+}
+
+#[tokio::test]
+async fn multirepo_task_primary_mirror_tracks_association_changes() {
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "M1 mirror", None).await;
+    let primary_repo_id = multirepo_seed_repo(&db, &project_id, "mirror-primary").await;
+    let affected_repo_id = multirepo_seed_repo(&db, &project_id, "mirror-affected").await;
+    let context_repo_id = multirepo_seed_repo(&db, &project_id, "mirror-context").await;
+    let task_id = multirepo_seed_task(
+        &db,
+        &project_id,
+        &primary_repo_id,
+        vec![
+            crate::TaskRepositoryWrite {
+                repo_id: primary_repo_id.clone(),
+                role: crate::TaskRepositoryRole::Primary,
+            },
+            crate::TaskRepositoryWrite {
+                repo_id: affected_repo_id.clone(),
+                role: crate::TaskRepositoryRole::Affected,
+            },
+            crate::TaskRepositoryWrite {
+                repo_id: context_repo_id.clone(),
+                role: crate::TaskRepositoryRole::Context,
+            },
+        ],
+    )
+    .await;
+
+    let replacement = vec![
+        crate::TaskRepositoryWrite {
+            repo_id: affected_repo_id.clone(),
+            role: crate::TaskRepositoryRole::Primary,
+        },
+        crate::TaskRepositoryWrite {
+            repo_id: primary_repo_id.clone(),
+            role: crate::TaskRepositoryRole::Affected,
+        },
+        crate::TaskRepositoryWrite {
+            repo_id: context_repo_id.clone(),
+            role: crate::TaskRepositoryRole::Context,
+        },
+    ];
+    let updated_at = now_rfc3339();
+    let mut tx = db.pool().begin().await.expect("transaction begins");
+    let task =
+        TaskRepo::replace_repositories_in_tx(&db, &mut tx, &task_id, 1, &replacement, &updated_at)
+            .await
+            .expect("primary and associations replace atomically");
+    tx.commit().await.expect("replacement commits");
+    assert_eq!(task.repo_id.as_deref(), Some(affected_repo_id.as_str()));
+    assert_eq!(task.version, 2);
+
+    let rows = TaskRepo::list_repositories(&db, &task_id)
+        .await
+        .expect("updated associations load");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].repo_id, affected_repo_id);
+    assert_eq!(rows[0].role, crate::TaskRepositoryRole::Primary);
+    assert_eq!(rows[0].position, 0);
+    assert_eq!(rows[1].repo_id, primary_repo_id);
+    assert_eq!(rows[1].role, crate::TaskRepositoryRole::Affected);
+    assert_eq!(rows[1].position, 1);
+    assert_eq!(rows[2].repo_id, context_repo_id);
+    assert_eq!(rows[2].role, crate::TaskRepositoryRole::Context);
+    assert_eq!(rows[2].position, 2);
+
+    let updated_at = now_rfc3339();
+    let mut tx = db.pool().begin().await.expect("clear transaction begins");
+    let task = TaskRepo::replace_repositories_in_tx(&db, &mut tx, &task_id, 2, &[], &updated_at)
+        .await
+        .expect("empty repository set replaces atomically");
+    tx.commit().await.expect("clear commits");
+    assert_eq!(task.repo_id, None);
+    assert!(TaskRepo::list_repositories(&db, &task_id)
+        .await
+        .expect("cleared associations load")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn multirepo_task_rejects_cross_project_and_duplicate_repository_roles() {
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "M1 repository owner", None).await;
+    let other_project_id = seed_project(&db, "M1 other project", None).await;
+    let primary_repo_id = multirepo_seed_repo(&db, &project_id, "owned-primary").await;
+    let affected_repo_id = multirepo_seed_repo(&db, &project_id, "owned-affected").await;
+    let foreign_repo_id = multirepo_seed_repo(&db, &other_project_id, "foreign-repo").await;
+    let task_id = multirepo_seed_task(
+        &db,
+        &project_id,
+        &primary_repo_id,
+        vec![crate::TaskRepositoryWrite {
+            repo_id: primary_repo_id.clone(),
+            role: crate::TaskRepositoryRole::Primary,
+        }],
+    )
+    .await;
+    let now = now_rfc3339();
+
+    let cross_project = sqlx::query(
+        "INSERT INTO task_repository(task_id, repo_id, role, position, created_at)
+         VALUES (?, ?, 'context', 1, ?)",
+    )
+    .bind(&task_id)
+    .bind(&foreign_repo_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await;
+    assert!(cross_project.is_err(), "cross-Project repo is rejected");
+
+    sqlx::query(
+        "INSERT INTO task_repository(task_id, repo_id, role, position, created_at)
+         VALUES (?, ?, 'affected', 1, ?)",
+    )
+    .bind(&task_id)
+    .bind(&affected_repo_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("first same-Project association inserts");
+    let duplicate_repository = sqlx::query(
+        "INSERT INTO task_repository(task_id, repo_id, role, position, created_at)
+         VALUES (?, ?, 'context', 2, ?)",
+    )
+    .bind(&task_id)
+    .bind(&affected_repo_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await;
+    assert!(
+        duplicate_repository.is_err(),
+        "one Task/repository pair cannot have duplicate roles"
+    );
+
+    let project = ProjectRepo::get_by_id(&db, &project_id)
+        .await
+        .expect("Project loads")
+        .expect("Project exists");
+    let invalid_primary = ProjectRepo::update_at_version(
+        &db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(foreign_repo_id)),
+            paused_at: None,
+            updated_at: now,
+        },
+        project.version,
+        None,
+        None,
+    )
+    .await
+    .expect_err("cross-Project Project primary is rejected");
+    assert!(matches!(
+        invalid_primary,
+        DbError::Check(message) if message == "project.primary_repo_not_in_project"
+    ));
+    let unchanged = ProjectRepo::get_by_id(&db, &project_id)
+        .await
+        .expect("Project reloads")
+        .expect("Project still exists");
+    assert_eq!(unchanged.version, project.version);
+    assert_eq!(unchanged.primary_repo_id, None);
+}

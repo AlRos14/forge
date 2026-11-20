@@ -98,6 +98,7 @@ async fn running_non_repository_execution_for_cancel(
     let work_unit = db::WorkUnitRepo::create(
         db,
         db::CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: work_unit_id.clone(),
             task_id: task.id.clone(),
             parent_work_unit_id: None,
@@ -518,6 +519,7 @@ async fn work_unit_leases_bind_exact_execution_workspace_actor_and_revoke_indepe
         let work_unit = db::WorkUnitRepo::create(
             database,
             db::CreateWorkUnit {
+                repository_ids: Vec::new(),
                 id: work_unit_id.clone(),
                 task_id: task.id.clone(),
                 parent_work_unit_id: None,

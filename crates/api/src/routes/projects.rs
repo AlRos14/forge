@@ -231,6 +231,7 @@ pub async fn update_project(
         name,
         paused,
         project_hooks,
+        primary_repo_id,
         version,
     } = request;
     let project_hooks_json = match project_hooks {
@@ -243,21 +244,21 @@ pub async fn update_project(
         }
         None => None,
     };
-    let project = ProjectRepo::update_at_version(
-        &*state.db,
-        UpdateProject {
-            id,
-            name,
-            settings: None,
-            primary_repo_id: None,
-            paused_at: paused.map(|paused: bool| paused.then(now_rfc3339)),
-            updated_at: now_rfc3339(),
-        },
-        version,
-        project_hooks_json,
-        Some(&user.user_id),
-    )
-    .await?;
+    let project = services::ProjectRepositoryService::new(state.db.clone())
+        .update_project_at_version(
+            UpdateProject {
+                id,
+                name,
+                settings: None,
+                primary_repo_id,
+                paused_at: paused.map(|paused: bool| paused.then(now_rfc3339)),
+                updated_at: now_rfc3339(),
+            },
+            version,
+            project_hooks_json,
+            &user.user_id,
+        )
+        .await?;
     state.event_bus.publish(ForgeEvent {
         event_type: "project.updated".to_owned(),
         entity_id: project.id.clone(),

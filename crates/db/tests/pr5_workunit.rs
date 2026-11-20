@@ -321,6 +321,7 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
     TaskRepo::create(
         db,
         CreateTask {
+            repositories: Vec::new(),
             id: fixture.task_id.clone(),
             project_id: fixture.project_id.clone(),
             repo_id: Some(fixture.repo_id.clone()),
@@ -370,6 +371,7 @@ async fn cleanup_admission_fixture(db: &SqliteDb, root: &Path) -> CleanupAdmissi
     WorkUnitRepo::create(
         db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: fixture.work_unit_id.clone(),
             task_id: fixture.task_id.clone(),
             parent_work_unit_id: None,
@@ -456,6 +458,7 @@ async fn integration_lookup_stays_exact_with_multiple_work_unit_workspaces() {
     WorkUnitRepo::create(
         &db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: second_work_unit_id.clone(),
             task_id: fixture.task_id.clone(),
             parent_work_unit_id: None,
@@ -820,6 +823,7 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
     WorkUnitRepo::create(
         &db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: dependent_work_unit_id.clone(),
             task_id: blocked_dependency.task_id.clone(),
             parent_work_unit_id: None,
@@ -850,6 +854,7 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
     WorkUnitRepo::create(
         &db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: prerequisite_id.clone(),
             task_id: blocked_dependency.task_id.clone(),
             parent_work_unit_id: None,
@@ -1168,6 +1173,7 @@ async fn work_unit_task_binding_is_immutable_without_provenance() {
         TaskRepo::create(
             &db,
             CreateTask {
+                repositories: Vec::new(),
                 id: id.clone(),
                 project_id: project_id.clone(),
                 repo_id: None,
@@ -1205,6 +1211,7 @@ async fn work_unit_task_binding_is_immutable_without_provenance() {
     WorkUnitRepo::create(
         &db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: work_unit_id.clone(),
             task_id: task_id.clone(),
             parent_work_unit_id: None,
@@ -1349,6 +1356,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
         TaskRepo::create(
             &db,
             CreateTask {
+                repositories: Vec::new(),
                 id: id.clone(),
                 project_id: project_id.clone(),
                 repo_id: Some(repo_id.clone()),
@@ -1432,6 +1440,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
 
     let create =
         |id: String, task: &str, creator: &str, requires_integration: bool| CreateWorkUnit {
+            repository_ids: Vec::new(),
             id,
             task_id: task.to_owned(),
             parent_work_unit_id: None,
@@ -1466,6 +1475,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     let provenance = WorkUnitRepo::create(
         &db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: provenance_id.clone(),
             task_id: task_id.clone(),
             parent_work_unit_id: None,
@@ -1505,6 +1515,7 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
     assert!(WorkUnitRepo::create(
         &db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: invalid_provenance_id.clone(),
             task_id: task_id.clone(),
             parent_work_unit_id: None,

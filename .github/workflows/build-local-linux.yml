@@ -218,3 +218,15 @@ jobs:
         run: cargo test --locked -p api --test pr12_public_surface
       - if: ${{ !cancelled() }}
         run: cargo test --locked --no-fail-fast -p api --test task_rework --test task_autonomy --test task_dispatch --test work_unit_reviews --test work_unit_artifact_package --test happy_path --test autonomous_delivery_fluency
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p db --lib multirepo_task_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib multirepo_task_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test happy_path multirepo_task_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test repos_endpoints multirepo_task_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test work_units multirepo_task_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib multirepo_task_

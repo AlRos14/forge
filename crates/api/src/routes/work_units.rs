@@ -65,6 +65,7 @@ fn work_unit_response(
     unit: WorkUnit,
     readiness: services::WorkUnitReadiness,
     review_subject: Option<api_types::ReviewSubjectResponse>,
+    repository_ids: Vec<String>,
 ) -> WorkUnitResponse {
     WorkUnitResponse {
         id: unit.id,
@@ -94,6 +95,7 @@ fn work_unit_response(
         updated_at: unit.updated_at,
         readiness: readiness_to_api(readiness),
         review_subject,
+        repository_ids,
     }
 }
 
@@ -115,7 +117,13 @@ pub(crate) async fn response_for(
         .map_err(ApiError::from)?
         .as_ref()
         .map(services::task_rework::review_subject_response);
-    Ok(work_unit_response(unit, readiness, review_subject))
+    let repository_ids = db::WorkUnitRepo::list_repository_ids(&*state.db, &unit.id).await?;
+    Ok(work_unit_response(
+        unit,
+        readiness,
+        review_subject,
+        repository_ids,
+    ))
 }
 
 pub async fn create_work_unit(
@@ -134,7 +142,7 @@ pub async fn create_work_unit(
     });
     let unit = state
         .work_unit_service
-        .create(
+        .create_with_repository_ids(
             CollaborationActorSource::Human(user.user_id.clone()),
             services::CreateWorkUnitInput {
                 task_id,
@@ -152,6 +160,7 @@ pub async fn create_work_unit(
                     .review_subject
                     .map(|subject| subject.reviewed_work_unit_id),
             },
+            body.repository_ids.unwrap_or_default(),
         )
         .await
         .map_err(ApiError::from)?;

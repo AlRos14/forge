@@ -4567,6 +4567,7 @@ mod tests {
             TaskRepo::create(
                 &**database,
                 CreateTask {
+                    repositories: Vec::new(),
                     id: id.clone(),
                     project_id: project_id.to_owned(),
                     repo_id: None,
@@ -6045,6 +6046,7 @@ mod tests {
         TaskRepo::create(
             &*database,
             CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id,
                 repo_id: None,
@@ -7723,6 +7725,7 @@ mod tests {
         TaskRepo::create(
             &*database,
             CreateTask {
+                repositories: Vec::new(),
                 id: task_id.clone(),
                 project_id,
                 repo_id: None,

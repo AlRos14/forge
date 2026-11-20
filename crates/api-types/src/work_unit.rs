@@ -70,6 +70,9 @@ pub struct CreateWorkUnitRequest {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub review_subject: Option<CreateWorkUnitReviewSubjectRequest>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub repository_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -175,6 +178,8 @@ pub struct WorkUnitResponse {
     pub updated_at: String,
     pub readiness: WorkUnitReadinessResponse,
     pub review_subject: Option<crate::ReviewSubjectResponse>,
+    #[serde(default)]
+    pub repository_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

@@ -43,6 +43,7 @@ import { getApiErrorMessage } from '@/lib/api-error'
 import { useAuthStore } from '@/stores/auth'
 import { TaskTerminalPanel } from '@/components/task-detail/task-terminal-panel'
 import { TaskWorkManagement } from '@/components/task-detail/task-work-management'
+import { TaskRepositoryPanel } from '@/components/task-detail/task-repository-panel'
 import { TaskReworkPanel } from '@/components/task-detail/task-rework-panel'
 import { WorkUnitHumanReviewPanel } from '@/components/task-detail/work-unit-review-panel'
 import { ActorIdentity } from '@/features/task-roles/ActorIdentity'
@@ -682,6 +683,7 @@ export function TaskDetailPage({
           <div className="min-w-0 lg:col-span-2">
             <TaskPhaseThreePanel task={task} />
           </div>
+          <TaskRepositoryPanel task={task} />
           <section className="min-w-0 space-y-3 rounded-lg border p-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h2 className="font-semibold">Task status</h2>

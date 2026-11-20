@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the 0.9.1 source implementation, including the current schema through V180. The ordered migration contract and invariants are in [Architecture V2](migration/architecture-v2.md); domain details are in [concepts](concepts/).
+This document describes the current workspace implementation on the 0.9.1 source baseline, including migration V181 for Task and WorkUnit repository scopes. The ordered migration contract and invariants are in [Architecture V2](migration/architecture-v2.md); domain details are in [concepts](concepts/).
 
 > The Orchestrator owns work boundaries. The harness owns cognition.
 
@@ -43,6 +43,12 @@ Tasks have no classification or Task-level repository access mode. An Agent
 that passes the current TaskRole, ownership, and WorkspaceLease checks receives
 the `repository_write` capability for its repository WorkUnit. Task instructions
 describe the intended outcome; they do not select repository capability.
+
+A Task has an ordered repository scope with one primary repository when the
+scope is non-empty; affected and context repositories remain in that Task's
+Project. A WorkUnit may explicitly select a subset of the Task's writable
+repositories. An empty WorkUnit selection means all writable Task repositories;
+context repositories are never writable.
 
 ## Authority and lifecycle
 
@@ -213,7 +219,7 @@ A Gate is a deterministic policy over exact durable records. Its immutable GateE
 
 ## Persistence and history
 
-SQLite is the current persistence layer. Numbered migrations V001–V180 and their receipts remain in migration order; do not edit historical migration files (V176 is unused because V177–V179 already exist). PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add Task coordination, plans, materialization, quality requests, interventions, and resolution records; V161 adds durable quality-route counters and Human-escalation evidence. V167 adds optional Project plans and batch authorization. V171–V172 add the validation catalog, request kinds, and coordinator-replan ledger; V173–V175 add SCM credential references, PR feedback, Human decisions, and same-PR rework records. V180 adds immutable fallback and micro-fix receipts.
+SQLite is the current persistence layer. Numbered migrations V001–V181 and their receipts remain in migration order; do not edit historical migration files (V176 is unused because V177–V179 already exist). V181 adds ordered Task repository scopes, mirrors the primary repository to `task.repo_id`, and stores explicit WorkUnit repository selections. PR13 preserved exact legacy provenance in dedicated history tables and removed retired runtime schemas after history cutovers. V135 repairs the canonical Project owner membership representation without inventing owners for ownerless Projects. V149–V156 add versioned TaskRole capability configuration and admission snapshots, durable automatic rework intents, Project defaults, review lines, exact approval inputs, immutable Artifact input/manifests, and audited reconciliation with an exact manual rework receipt. V157 advances a review line from its exact reviewed result across reports. V158–V160 add Task coordination, plans, materialization, quality requests, interventions, and resolution records; V161 adds durable quality-route counters and Human-escalation evidence. V167 adds optional Project plans and batch authorization. V171–V172 add the validation catalog, request kinds, and coordinator-replan ledger; V173–V175 add SCM credential references, PR feedback, Human decisions, and same-PR rework records. V180 adds immutable fallback and micro-fix receipts.
 
 Historical `agent_session_history`, immutable Execution records, ProjectRelease snapshots, Artifact and Evidence references, HarnessSession identities, cross-record IDs, migration decisions, ADRs, and upstream license attribution remain readable history. History does not regain runtime authority. ProjectRelease is a read-only historical snapshot and does not create a current Charter, milestone, readiness workflow, or release operation.
 

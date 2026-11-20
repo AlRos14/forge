@@ -1890,6 +1890,7 @@ mod tests {
         let task = TaskRepo::create(
             db,
             CreateTask {
+                repositories: Vec::new(),
                 id: new_uuid_v4(),
                 project_id,
                 repo_id: Some(repo_id),
@@ -2042,6 +2043,7 @@ mod tests {
         let work_unit = db::WorkUnitRepo::create(
             db,
             db::CreateWorkUnit {
+                repository_ids: Vec::new(),
                 id: work_unit_id.clone(),
                 task_id: task_id.clone(),
                 parent_work_unit_id: None,

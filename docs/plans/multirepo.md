@@ -1,9 +1,10 @@
 # Plan — Soporte multirepo por Task (0.9.2)
 
 Fecha: 2026-11-18. Baseline inspeccionado: `feat/multirepo` en `22a02b98`
-(0.9.1, esquema hasta V180). Este documento es un plan: no declara ninguna capacidad como
-implementada ni aceptada. Ninguna evidencia de este plan se ha obtenido
-compilando o ejecutando tests localmente; la validación será solo en CI.
+(0.9.1, esquema hasta V180). Este documento congela los contratos y registra
+el estado por anexo: M0 no declara capacidad implementada y el Anexo M1 marca
+la integración como IMPLEMENTADO / NOT RUN, sin aceptación de CI. No se
+compiló ni ejecutó tests localmente; la validación será solo en CI.
 
 **Estado:** M0 DONE (estático) — 2026-11-18.
 
@@ -1355,3 +1356,30 @@ cargo test --locked -p mcp-server --lib multirepo_task_
 ~~~
 
 Estos filtros no se ejecutaron en M0.
+
+## Anexo M1 — 2026-11-19
+
+**Estado: M1 IMPLEMENTADO / NOT RUN.** La implementación y la revisión estática
+están completas; la validación de ejecución queda reservada a CI.
+
+Trabajo integrado:
+
+- Se añadió V181, sus modelos y repositorios, los alcances de repositorios para
+  Tasks y WorkUnits, la herencia de alcance al crear subtareas y la actualización
+  versionada del repo principal de Project para Tasks futuras.
+- Se integraron REST, MCP y web con los DTO congelados, los errores tipados y
+  los campos requeridos en los literales Rust y fixtures TypeScript de todo el
+  workspace; README y arquitectura reflejan ahora el esquema V181.
+- Se añadió `task.repositories_changed` como runtime hint posterior al commit,
+  con payload `{task_id, task_version, repositories}`, proyección SSE acotada,
+  tipo público generado y documentación.
+- Se revisaron los registros de rutas y herramientas, las exportaciones Rust y
+  TypeScript, los mapeos de errores y las firmas de helpers. Los 11 nombres de
+  test M1 del plan aparecen exactamente una vez.
+- `rustfmt --edition 2021` y `git diff --check` pasaron; el barrido estático no
+  encontró campos requeridos ausentes ni espacios finales.
+
+Desviaciones y límites: una Task con Execution no admite todavía una
+replanificación autorizada de repositorios; el reemplazo responde `409
+task.repositories.replan_required`. No se ejecutaron builds, tests, clippy ni
+comandos pnpm; su resultado es NOT RUN y no constituye aceptación de CI.

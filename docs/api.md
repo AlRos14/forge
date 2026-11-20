@@ -19,7 +19,7 @@ own workspace. Gate evaluation verifies the report against the durable
 review-subject relation and source attempt. A WorkUnit-scoped review Gate
 targets the reviewed WorkUnit, rather than its separate reviewer WorkUnit.
 
-Forge exposes the versioned REST API at `/api/v1`. This reference describes the 0.9.1 public contract through migration V180 for Project, Task, Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and TaskLifecycle records.
+Forge exposes the versioned REST API at `/api/v1`. This reference describes the 0.9.1 public contract through migration V180 for Project, Task, Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and TaskLifecycle records. M1 adds the Task and WorkUnit repository associations from V181.
 
 > The orchestrator owns work. The harness owns cognition.
 
@@ -57,6 +57,15 @@ unsupported lifecycle request, `401` for missing/invalid credentials, `404`
 for absent or invisible records, `409` for version or authority conflicts,
 and `422` for malformed DTOs or unknown request fields.
 
+Repository-scope errors use `task.repositories.invalid` (`400`) for a missing
+or repeated primary and duplicate repository IDs, `task.repositories.repo_not_in_project`
+(`422`) for a repository outside its Project, `task.repositories.replan_required`
+(`409`) after an Execution or when a change would invalidate an explicit
+WorkUnit repository selection, `work_unit.repositories.invalid`
+(`422`) for duplicate or non-writable WorkUnit repository IDs, and
+`project.primary_repo_not_in_project` (`422`) for a primary repository outside
+its Project. Stale Task or Project versions return `409 version_conflict`.
+
 If a provider Start may have taken effect but its response is uncertain, Forge
 does not send another Start. A launch response can admit an Execution without
 listing it in `started_execution_ids`; read that exact Execution and its
@@ -85,7 +94,7 @@ the maximum is 100.
 | `POST /projects` | Create an ordinary Project from `{ name }`. It does not create a Charter, Genesis session, baseline, Agent binding, or Task. |
 | `GET /projects` | List Projects visible to the authenticated user. |
 | `GET /projects/{id}` | Read a Project and its generic Project hook configuration. |
-| `PATCH /projects/{id}` | Update Project identity, pause state, and supported generic hooks. |
+| `PATCH /projects/{id}` | Update Project identity, pause state, supported generic hooks, or nullable `primary_repo_id`; include the expected `version`. The selected repository must belong to the Project. A primary change affects future Tasks only. |
 | `GET /projects/{id}/task-role-defaults`, `PUT /projects/{id}/task-role-defaults` | Read or replace the role-to-worker template copied into new ordinary Tasks. Reads require Project visibility; updates require owner/admin membership and `expected_version`. Humans must be current Project members. Agents must be owned by the canonical Project owner; global visibility alone is not consent to run an Agent from another account. |
 | `GET /projects/{id}/copilot`, `PUT /projects/{id}/copilot` | Read or assign the Project Copilot. Assignment accepts `expected_version` and nullable `agent_id`, requires current Project owner/admin authority and same-account Agent ownership. |
 | `GET /projects/{id}/copilot/messages`, `POST /projects/{id}/copilot/messages` | Read the durable Project conversation using an opaque cursor, or send `{content, idempotency_key, task_id?}`. Sending requires Project write authority and enabled MCP, returns HTTP 202 with the durable run and user message. An optional Task must belong to the same Project. |
@@ -193,7 +202,8 @@ provenance and active defaults use an exact `default_implementer` ActorRef.
 
 | Method and path | Contract |
 | --- | --- |
-| `POST /projects/{project_id}/tasks` | Create a Task. Supported fields are `title`, `description`, `parent_task_id`, and `priority`; Task classification and access modes are not part of the contract. Project task-role defaults are copied atomically. |
+| `POST /projects/{project_id}/tasks` | Create a Task. Supported fields include `title`, `description`, `parent_task_id`, `priority`, and optional `repositories: [{repo_id, role}]`, where role is `primary`, `affected`, or `context`. Omission inherits the parent scope or Project primary; `repositories: []` creates a repo-less Task. Project task-role defaults are copied atomically. |
+| `PATCH /tasks/{id}/repositories` | Replace the repository scope with `{expected_version, repositories}`. A non-empty set has exactly one primary; all repositories must belong to the Task Project. After an Execution, an authorized replan is required. Before an Execution, the update cannot remove or make read-only a repository explicitly selected by an existing WorkUnit. |
 | `GET /projects/{project_id}/tasks` | List Tasks. Filter with `lifecycle_state`, `priority`, and `q`; order with the supported Task sort fields. Task classification is not a filter. `status`, `include_cancelled`, and `include_archived` are rejected. |
 | `GET /tasks/{id}`, `PATCH /tasks/{id}`, `DELETE /tasks/{id}` | Read, update, or delete a Task. Updates require the Task `version`. |
 | `POST /tasks/{id}/subtasks/reorder` | Reorder exact child Task IDs. |
@@ -559,7 +569,7 @@ The REST and MCP error codes include credential.invalid, credential.purpose_inva
 
 | Method and path | Contract |
 | --- | --- |
-| `GET /tasks/{task_id}/work-units`, `POST /tasks/{task_id}/work-units` | List or create Task-scoped WorkUnits. Creation accepts optional `execution_instructions` passed to the assigned harness instead of the generic Task/WorkUnit prompt, exact `artifact_inputs` IDs to pin on every Execution, and `review_approval: { gate_id, review_line_id }` to require a current satisfied review Gate before admission. |
+| `GET /tasks/{task_id}/work-units`, `POST /tasks/{task_id}/work-units` | List or create Task-scoped WorkUnits. Creation accepts `repository_ids` as a subset of the Task's primary/affected repositories; omission or an empty list means all writable Task repositories. Context repositories cannot be selected. It also accepts optional `execution_instructions` passed to the assigned harness instead of the generic Task/WorkUnit prompt, exact `artifact_inputs` IDs to pin on every Execution, and `review_approval: { gate_id, review_line_id }` to require a current satisfied review Gate before admission. |
 | `GET /work-units/{id}`, `PATCH /work-units/{id}` | Read or update an exact WorkUnit. |
 | `GET /work-units/{id}/artifact-package` | Read the WorkUnit's exact immutable Artifact input bindings and result manifests, including producer Executions and digests. |
 | `POST /work-units/{id}/allocation`, `POST /work-units/{id}/status` | Allocate a WorkUnit or request its target state transition. |
@@ -681,7 +691,11 @@ Public durable event types are:
 - PR feedback events: `task.pr_feedback_ingested` and `task.pr_feedback_triaged`; rework events: `task.pr_rework_superseded`, `task.pr_rework_resumed`, `task.pr_rework_converged`, and `task.pr_followup_proposed`; external action events: `task.pr_action_requested` and `task.pr_action_completed`. Their payloads contain only allowlisted identifiers, digests, heads, kinds, and states.
 - Phase-3 events: `task.work_unit_fallback`, `task.micro_fix_bounds_exceeded`, and `task.coordinator_replan_proposed` carry allowlisted receipt and authorization facts. They omit provider text, paths, plan contents, prompts, and free-form reasons.
 
-Runtime hint names are `project.created`, `project.updated`, `project.deleted`,
+Runtime hint names include `task.repositories_changed`, emitted after the Task
+repository scope transaction commits with payload `{task_id, task_version,
+repositories}`; each repository contains `repo_id` and `role` (`primary`,
+`affected`, or `context`). Other runtime hint names are `project.created`,
+`project.updated`, `project.deleted`,
 `project.paused`, `project.resumed`, `project_hook.run_changed`,
 `notification.created`, and `operations.status_changed`.
 `events.resync_required` asks clients to refetch active queries after an EventBus

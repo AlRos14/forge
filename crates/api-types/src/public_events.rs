@@ -9,6 +9,9 @@ pub enum PublicEventType {
     #[serde(rename = "task.lifecycle_changed")]
     #[ts(rename = "task.lifecycle_changed")]
     TaskLifecycleChanged,
+    #[serde(rename = "task.repositories_changed")]
+    #[ts(rename = "task.repositories_changed")]
+    TaskRepositoriesChanged,
     #[serde(rename = "gate.created")]
     #[ts(rename = "gate.created")]
     GateCreated,
@@ -191,10 +194,20 @@ pub enum PublicEventType {
     EventsResyncRequired,
 }
 
+/// Public payload for the Task repository-scope runtime hint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRepositoriesChangedPayload {
+    pub task_id: String,
+    pub task_version: i64,
+    pub repositories: Vec<crate::TaskRepositoryInput>,
+}
+
 impl PublicEventType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TaskLifecycleChanged => "task.lifecycle_changed",
+            Self::TaskRepositoriesChanged => "task.repositories_changed",
             Self::GateCreated => "gate.created",
             Self::GatePolicyRevised => "gate.policy_revised",
             Self::GateEvaluated => "gate.evaluated",

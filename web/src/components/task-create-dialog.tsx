@@ -1,5 +1,6 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { Link } from '@tanstack/react-router'
+import { apiFetch } from '@/api/client'
 import {
   useAgentsInfiniteQuery,
   useCreateTask,
@@ -21,13 +22,29 @@ import { MarkdownEditor } from '@/components/ui/markdown-editor'
 import { ActorIdentity } from '@/features/task-roles/ActorIdentity'
 import { toastApiError } from '@/lib/api-error'
 import { splitTaskContent } from '@/lib/task-content'
-import type { Task } from '@/types/generated'
+import type {
+  PaginatedResponse,
+  Repo,
+  Task,
+  TaskRepositoryInput,
+  TaskRepositoryRole,
+} from '@/types/generated'
 
 interface TaskCreateDialogProps {
   open: boolean
   projectId: string
   onOpenChange: (open: boolean) => void
   onCreated?: (task: Task) => void
+}
+
+function projectRepositoryRoles(
+  repos: Repo[],
+  primaryRepoId: string | null | undefined,
+): Record<string, TaskRepositoryRole | ''> {
+  return repos.reduce<Record<string, TaskRepositoryRole | ''>>((roles, repo) => {
+    roles[repo.id] = repo.id === primaryRepoId ? 'primary' : ''
+    return roles
+  }, {})
 }
 
 export function TaskCreateDialog({
@@ -48,9 +65,53 @@ export function TaskCreateDialog({
     (agent) => projectQuery.data?.owner_id != null && agent.owner_id === projectQuery.data.owner_id,
   )
   const daemons = daemonsQuery.data?.items ?? []
+  const [repos, setRepos] = useState<Repo[]>([])
+  const [reposLoading, setReposLoading] = useState(false)
+  const [reposLoaded, setReposLoaded] = useState(false)
+  const [reposError, setReposError] = useState(false)
+  const [repositoryRoles, setRepositoryRoles] = useState<Record<string, TaskRepositoryRole | ''>>(
+    {},
+  )
+
+  useEffect(() => {
+    if (!open) return
+    let active = true
+    setRepos([])
+    setReposLoaded(false)
+    setReposError(false)
+    setReposLoading(true)
+    void apiFetch<PaginatedResponse<Repo>>(`/projects/${projectId}/repos`)
+      .then((response) => {
+        if (!active) return
+        setRepos(response.items)
+        setReposLoaded(true)
+      })
+      .catch(() => {
+        if (active) setReposError(true)
+      })
+      .finally(() => {
+        if (active) setReposLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [open, projectId])
+
+  useEffect(() => {
+    if (!open || !reposLoaded || projectQuery.isLoading) return
+    setRepositoryRoles(projectRepositoryRoles(repos, projectQuery.data?.primary_repo_id))
+  }, [open, projectQuery.data?.primary_repo_id, projectQuery.isLoading, reposLoaded, repos])
+
+  const repositoryInputs: TaskRepositoryInput[] = repos.flatMap((repo) => {
+    const role = repositoryRoles[repo.id]
+    return role ? [{ repo_id: repo.id, role }] : []
+  })
+  const hasRepositoryPrimary = repositoryInputs.some((repository) => repository.role === 'primary')
+  const repositorySelectionInvalid = repositoryInputs.length > 0 && !hasRepositoryPrimary
 
   const reset = () => {
     setContent('')
+    setRepositoryRoles(projectRepositoryRoles(repos, projectQuery.data?.primary_repo_id))
   }
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -62,6 +123,7 @@ export function TaskCreateDialog({
       {
         ...taskContent,
         priority: 0,
+        ...(reposLoaded && !projectQuery.isLoading ? { repositories: repositoryInputs } : {}),
       },
       {
         onError: (error) => toastApiError(error, 'Task creation failed'),
@@ -98,6 +160,66 @@ export function TaskCreateDialog({
               title. The remaining text is saved as the Markdown description.
             </p>
           </div>
+          <section className="space-y-3 rounded-lg border border-border-subtle bg-muted/20 p-4">
+            <div>
+              <h3 className="text-sm font-semibold">Task repositories</h3>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                Choose one primary repository and mark any additional repositories as affected or
+                context. Context repositories are read-only. Leave every repository unselected to
+                create a repo-less Task.
+              </p>
+            </div>
+            {reposLoading ? (
+              <p className="text-sm text-muted-foreground">Loading Project repositories…</p>
+            ) : null}
+            {reposError ? (
+              <p role="alert" className="text-sm text-destructive">
+                Project repositories could not be loaded. This Task will use the Project default.
+              </p>
+            ) : null}
+            {reposLoaded && repos.length ? (
+              <div className="space-y-2">
+                {repos.map((repo) => (
+                  <label key={repo.id} className="grid gap-2 text-sm sm:grid-cols-[1fr_12rem]">
+                    <span className="self-center truncate">{repo.name}</span>
+                    <select
+                      aria-label={`Repository role for ${repo.name}`}
+                      className="h-9 rounded-md border bg-background px-2 text-sm"
+                      value={repositoryRoles[repo.id] ?? ''}
+                      disabled={projectQuery.isLoading}
+                      onChange={(event) => {
+                        const nextRole = event.target.value as TaskRepositoryRole | ''
+                        setRepositoryRoles((current) => {
+                          const next = { ...current, [repo.id]: nextRole }
+                          if (nextRole === 'primary') {
+                            for (const otherRepo of repos) {
+                              if (otherRepo.id !== repo.id && next[otherRepo.id] === 'primary') {
+                                next[otherRepo.id] = 'affected'
+                              }
+                            }
+                          }
+                          return next
+                        })
+                      }}
+                    >
+                      <option value="">Not part of this Task</option>
+                      <option value="primary">Primary</option>
+                      <option value="affected">Affected · writable</option>
+                      <option value="context">Context · read only</option>
+                    </select>
+                  </label>
+                ))}
+                {repositorySelectionInvalid ? (
+                  <p role="alert" className="text-xs text-destructive">
+                    Choose a primary repository when adding affected or context repositories.
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+            {reposLoaded && repos.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No repositories are configured.</p>
+            ) : null}
+          </section>
           <section
             className="space-y-3 rounded-lg border border-border-subtle bg-muted/20 p-4"
             aria-labelledby="task-team-preview-title"
@@ -206,7 +328,10 @@ export function TaskCreateDialog({
             >
               Cancel
             </Button>
-            <Button disabled={createTask.isPending || !content.trim()} type="submit">
+            <Button
+              disabled={createTask.isPending || !content.trim() || repositorySelectionInvalid}
+              type="submit"
+            >
               {createTask.isPending ? 'Creating...' : 'Create Task'}
             </Button>
           </DialogFooter>

@@ -43,6 +43,7 @@ pub mod project_deletion;
 pub mod project_hooks;
 pub mod project_member_service;
 pub mod project_plan;
+pub mod project_repository_service;
 pub mod provider_authorization;
 pub mod recovery;
 pub mod release_history;
@@ -107,6 +108,7 @@ pub use orchestrator_runtime::{OrchestratorRun, OrchestratorRuntime};
 pub use project_copilot::ProjectCopilotService;
 pub use project_hooks::ProjectHookService;
 pub use project_member_service::ProjectMemberService;
+pub use project_repository_service::ProjectRepositoryService;
 pub use provider_authorization::ProviderAuthorizationService;
 pub use recovery::{CrashRecovery, HeartbeatMonitor};
 pub use release_history::HistoricalReleaseReader;
@@ -183,6 +185,21 @@ pub enum ServiceError {
 
     #[error("project {project_id} has no primary repo")]
     MissingPrimaryRepo { project_id: String },
+
+    #[error("Task repositories are invalid")]
+    TaskRepositoriesInvalid,
+
+    #[error("a Task repository does not belong to the Project")]
+    TaskRepositoryNotInProject,
+
+    #[error("Task repository scope cannot change after an Execution or invalidate an explicit WorkUnit repository selection")]
+    TaskRepositoryReplanRequired,
+
+    #[error("WorkUnit repository scope is invalid")]
+    WorkUnitRepositoriesInvalid,
+
+    #[error("the Project primary repository must belong to the Project")]
+    ProjectPrimaryRepoNotInProject,
 
     #[error("repo does not match primary repo for project {project_id}")]
     RepoMismatch { project_id: String },

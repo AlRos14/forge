@@ -13,4 +13,4 @@ artifact_inputs?: Array<string> | null, review_approval?: WorkUnitReviewApproval
  * Exact WorkUnit result this reviewer WorkUnit will inspect. The target
  * version is frozen when its first result Execution is admitted.
  */
-review_subject?: CreateWorkUnitReviewSubjectRequest | null, };
+review_subject?: CreateWorkUnitReviewSubjectRequest | null, repository_ids?: Array<string> | null, };

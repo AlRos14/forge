@@ -42,6 +42,20 @@ External provenance remains an opaque reference. Old V091 Actor references
 that cannot be resolved unambiguously remain readable as `legacy_actor` and
 cannot be written by new requests.
 
+## Repository scope
+
+A Task may associate repositories as `primary`, `affected`, or `context`. The
+primary repository is mirrored by `Task.repo_id`; primary and affected
+repositories are writable, while context repositories are read-only. A
+WorkUnit may select a subset of the Task's writable repository IDs. An omitted
+or empty WorkUnit selection means all writable Task repositories. A repository
+outside the Task scope or with the context role cannot be selected for writes.
+An explicit WorkUnit selection remains writable for the life of that scope. A
+Task scope update cannot remove one of its selected repositories or change it
+to context. After an Execution exists, Task scope changes require an authorized
+replan. An empty selection continues to mean all writable repositories in the
+current Task scope until its first Execution.
+
 ## Allocation
 
 `RoleMembership` says which Actors may participate in a TaskRole. WorkUnit

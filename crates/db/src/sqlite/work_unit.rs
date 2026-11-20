@@ -436,6 +436,9 @@ fn work_unit_write_error(error: sqlx::Error) -> DbError {
         if message.contains("version") || message.contains("immutable") {
             return DbError::VersionConflict;
         }
+        if message.contains("workunit repository scope must be writable") {
+            return DbError::Check(database_error.message().to_owned());
+        }
         if message.contains("constraint failed")
             || message.contains("invalid")
             || message == "review subject must name an exact same-task result and independent formal reviewer"
@@ -490,6 +493,19 @@ async fn create_work_unit_row(
     .execute(&mut *tx)
     .await
     .map_err(work_unit_write_error)?;
+    for repo_id in &input.repository_ids {
+        sqlx::query(
+            "INSERT INTO work_unit_repository (work_unit_id, task_id, repo_id, created_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(repo_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(work_unit_write_error)?;
+    }
     for artifact_id in &input.artifact_input_ids {
         let artifact = sqlx::query(
             "SELECT artifact.digest, producer.execution_id
@@ -701,6 +717,20 @@ impl WorkUnitRepo for SqliteDb {
             .into_iter()
             .map(map_work_unit)
             .collect()
+    }
+
+    async fn list_repository_ids(&self, work_unit_id: &str) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT scope.repo_id
+             FROM work_unit_repository scope
+             JOIN task_repository repository
+               ON repository.task_id = scope.task_id AND repository.repo_id = scope.repo_id
+             WHERE scope.work_unit_id = ?
+             ORDER BY repository.position, scope.repo_id",
+        )
+        .bind(work_unit_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     async fn update(

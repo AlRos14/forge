@@ -106,6 +106,7 @@ async fn fixture(suffix: &str) -> Fixture {
     TaskRepo::create(
         &*db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id,
             repo_id: None,
@@ -827,6 +828,7 @@ async fn plan_materialized_delivery_completes_after_exact_execution_result() {
     WorkUnitRepo::create(
         &*fixture.db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: unit_id.clone(),
             task_id: fixture.task_id.clone(),
             parent_work_unit_id: None,
@@ -1095,6 +1097,7 @@ async fn rework_correction_completion_freezes_result_for_its_review() {
         WorkUnitRepo::create(
             &*fixture.db,
             CreateWorkUnit {
+                repository_ids: Vec::new(),
                 id: id.clone(),
                 task_id: fixture.task_id.clone(),
                 parent_work_unit_id: None,

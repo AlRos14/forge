@@ -103,6 +103,35 @@ async fn update_task_fields_in_tx(
     Ok(task)
 }
 
+fn validate_task_repository_writes(
+    task_repo_id: Option<&str>,
+    rows: &[crate::TaskRepositoryWrite],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut repo_ids = HashSet::with_capacity(rows.len());
+    for row in rows {
+        if !repo_ids.insert(row.repo_id.as_str()) {
+            return Err(DbError::Check(
+                "Task repository set contains a duplicate repository".to_owned(),
+            ));
+        }
+    }
+
+    let primary = rows
+        .iter()
+        .filter(|row| row.role == crate::TaskRepositoryRole::Primary)
+        .collect::<Vec<_>>();
+    if primary.len() != 1 || task_repo_id != Some(primary[0].repo_id.as_str()) {
+        return Err(DbError::Check(
+            "non-empty Task repository set must have a matching primary repository".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl TaskRepo for SqliteDb {
     async fn create(&self, input: CreateTask) -> Result<Task> {
@@ -117,6 +146,7 @@ impl TaskRepo for SqliteDb {
         transaction: &mut Transaction<'_, Sqlite>,
         input: CreateTask,
     ) -> Result<Task> {
+        validate_task_repository_writes(input.repo_id.as_deref(), &input.repositories)?;
         sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, title, description, is_automation, priority, board_position, subtask_order, merge_config, metadata_json, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(board_position), 0.0) + 1.0, ?, ?, ?, ?, ? FROM task WHERE project_id = ?")
             .bind(&input.id)
             .bind(&input.project_id)
@@ -134,6 +164,25 @@ impl TaskRepo for SqliteDb {
             .bind(&input.project_id)
             .execute(&mut **transaction)
             .await?;
+        let mut position = 0_i64;
+        for repository in input
+            .repositories
+            .iter()
+            .filter(|repository| repository.role != crate::TaskRepositoryRole::Primary)
+        {
+            position += 1;
+            sqlx::query(
+                "INSERT INTO task_repository (task_id, repo_id, role, position, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&input.id)
+            .bind(&repository.repo_id)
+            .bind(repository.role.to_string())
+            .bind(position)
+            .bind(&input.created_at)
+            .execute(&mut **transaction)
+            .await?;
+        }
         sqlx::query(
             "INSERT INTO task_lifecycle (task_id, state, version, reason_kind, reason_ref, created_at, updated_at) VALUES (?, ?, 1, NULL, NULL, ?, ?)",
         )
@@ -148,6 +197,159 @@ impl TaskRepo for SqliteDb {
             .fetch_one(&mut **transaction)
             .await?;
         map_task(row)
+    }
+
+    async fn list_repositories(&self, task_id: &str) -> Result<Vec<crate::TaskRepository>> {
+        let rows = sqlx::query(
+            "SELECT task_id, repo_id, role, position, created_at
+             FROM task_repository WHERE task_id = ? ORDER BY position, repo_id",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let role: String = row.try_get("role")?;
+                Ok(crate::TaskRepository {
+                    task_id: row.try_get("task_id")?,
+                    repo_id: row.try_get("repo_id")?,
+                    role: role.parse().map_err(DbError::Check)?,
+                    position: row.try_get("position")?,
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn replace_repositories_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+        expected_version: i64,
+        rows: &[crate::TaskRepositoryWrite],
+        updated_at: &str,
+    ) -> Result<Task> {
+        let current = TaskRepo::get_by_id_in_tx(self, tx, task_id, true)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        if current.version != expected_version {
+            return Err(DbError::TaskVersionConflict {
+                expected: expected_version,
+                actual: current.version,
+            });
+        }
+        if current.deleted_at.is_some() {
+            return Err(DbError::InvalidSoftDelete);
+        }
+
+        let next_primary = rows
+            .iter()
+            .find(|row| row.role == crate::TaskRepositoryRole::Primary)
+            .map(|row| row.repo_id.as_str());
+        validate_task_repository_writes(next_primary, rows)?;
+
+        let result = sqlx::query(
+            "UPDATE task SET repo_id = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND deleted_at IS NULL",
+        )
+        .bind(next_primary)
+        .bind(updated_at)
+        .bind(task_id)
+        .bind(expected_version)
+        .execute(&mut **tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+
+        if rows.is_empty() {
+            sqlx::query("DELETE FROM task_repository WHERE task_id = ?")
+                .bind(task_id)
+                .execute(&mut **tx)
+                .await?;
+        } else {
+            let mut delete =
+                sqlx::QueryBuilder::<Sqlite>::new("DELETE FROM task_repository WHERE task_id = ");
+            delete.push_bind(task_id).push(" AND repo_id NOT IN (");
+            {
+                let mut separated = delete.separated(", ");
+                for row in rows {
+                    separated.push_bind(&row.repo_id);
+                }
+            }
+            delete.push(")");
+            delete.build().execute(&mut **tx).await?;
+        }
+
+        let max_position: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(position), 0) FROM task_repository WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        let offset = max_position
+            .saturating_add(rows.len() as i64)
+            .saturating_add(1);
+        sqlx::query(
+            "UPDATE task_repository SET position = position + ?
+             WHERE task_id = ? AND role != 'primary'",
+        )
+        .bind(offset)
+        .bind(task_id)
+        .execute(&mut **tx)
+        .await?;
+
+        let mut temporary_position = max_position.saturating_add(offset).saturating_add(1);
+        for row in rows {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM task_repository WHERE task_id = ? AND repo_id = ?)",
+            )
+            .bind(task_id)
+            .bind(&row.repo_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            if !exists {
+                let position = if row.role == crate::TaskRepositoryRole::Primary {
+                    0
+                } else {
+                    temporary_position += 1;
+                    temporary_position
+                };
+                sqlx::query(
+                    "INSERT INTO task_repository (task_id, repo_id, role, position, created_at)
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(task_id)
+                .bind(&row.repo_id)
+                .bind(row.role.to_string())
+                .bind(position)
+                .bind(updated_at)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+
+        let mut position = 1_i64;
+        for row in rows
+            .iter()
+            .filter(|row| row.role != crate::TaskRepositoryRole::Primary)
+        {
+            sqlx::query(
+                "UPDATE task_repository SET role = ?, position = ?
+                 WHERE task_id = ? AND repo_id = ?",
+            )
+            .bind(row.role.to_string())
+            .bind(position)
+            .bind(task_id)
+            .bind(&row.repo_id)
+            .execute(&mut **tx)
+            .await?;
+            position += 1;
+        }
+
+        TaskRepo::get_by_id_in_tx(self, tx, task_id, false)
+            .await?
+            .ok_or(DbError::NotFound)
     }
 
     async fn get_by_id(&self, id: &str, include_deleted: bool) -> Result<Option<Task>> {

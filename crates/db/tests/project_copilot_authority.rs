@@ -179,6 +179,7 @@ async fn seed_running_run() -> Fixture {
     TaskRepo::create(
         &db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id: project_id.clone(),
             repo_id: None,

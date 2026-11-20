@@ -50,6 +50,7 @@ function reviewUnit(): WorkUnitResponse {
   return {
     id: 'unit-review',
     task_id: 'task-1',
+    repository_ids: [],
     parent_work_unit_id: null,
     title: 'Review implementation',
     scope: 'Check the implementation against the exact result.',

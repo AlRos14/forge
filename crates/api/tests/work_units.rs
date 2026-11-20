@@ -5,7 +5,7 @@ use api_types::{
 };
 use axum::http::{Method, StatusCode};
 use common::*;
-use serde_json::json;
+use serde_json::{json, Value};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -115,6 +115,119 @@ async fn work_unit_api_creates_lists_and_rejects_cross_task_parent() {
     )
     .await;
     assert_eq!(unknown_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn multirepo_task_work_unit_accepts_repository_ids() {
+    let repo_dir = TestDir::new("multirepo-work-unit-api-repo");
+    let repo_path = setup_git_repo(repo_dir.path());
+    let workspace_root = TestDir::new("multirepo-work-unit-api-workspaces");
+    let harness = test_app(workspace_root.path(), "multirepo-work-unit-api").await;
+    let (project_id, primary_repo_id) =
+        create_project_and_repo(&harness.app, "Multirepo WorkUnit", &repo_path).await;
+
+    let now = db::now_rfc3339();
+    let affected_repo = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.clone(),
+            name: "affected".to_owned(),
+            remote_url: "https://example.invalid/multirepo-affected.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("affected repository creates");
+    let context_repo = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.clone(),
+            name: "context".to_owned(),
+            remote_url: "https://example.invalid/multirepo-context.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("context repository creates");
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({
+            "title": "WorkUnit repository scope",
+            "repositories": [
+                { "repo_id": primary_repo_id, "role": "primary" },
+                { "repo_id": affected_repo.id, "role": "affected" },
+                { "repo_id": context_repo.id, "role": "context" }
+            ]
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let role = format!("multirepo-{}", uuid::Uuid::new_v4());
+    let now = db::now_rfc3339();
+    db::TaskRoleRepo::create(
+        &*harness.state.db,
+        db::CreateTaskRole {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            role: role.clone(),
+            coordination_mode: None,
+            policy_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("TaskRole exists for WorkUnit allocation context");
+
+    let work_unit: WorkUnitResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/work-units", task.id),
+        json!({
+            "title": "Affected repository scope",
+            "scope": "Write only in the affected repository",
+            "role": role,
+            "parent_work_unit_id": null,
+            "assigned_actor": null,
+            "requires_integration": true,
+            "provenance": null,
+            "repository_ids": [affected_repo.id]
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(work_unit.repository_ids, vec![affected_repo.id.clone()]);
+
+    let context_scope: Value = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/work-units", task.id),
+        json!({
+            "title": "Reject context writes",
+            "scope": "Context repositories are read-only",
+            "role": format!("multirepo-context-{}", uuid::Uuid::new_v4()),
+            "parent_work_unit_id": null,
+            "assigned_actor": null,
+            "requires_integration": true,
+            "provenance": null,
+            "repository_ids": [context_repo.id]
+        }),
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
+    .await;
+    assert_eq!(context_scope["code"], "work_unit.repositories.invalid");
 }
 
 #[tokio::test]

@@ -1,13 +1,48 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { TaskCreateDialog } from '@/components/task-create-dialog'
 import type { Task, WorkUnitResponse } from '@/types/generated'
 import { TaskWorkManagement } from './task-work-management'
 
+const { createTaskMutation } = vi.hoisted(() => ({ createTaskMutation: vi.fn() }))
+
 vi.mock('@/api/hooks', () => ({
+  useAgentsInfiniteQuery: () => ({
+    data: { pages: [{ items: [] }] },
+    isError: false,
+    isLoading: false,
+  }),
   useAgentsQuery: () => ({ data: { items: [] }, isError: false, isLoading: false }),
+  useCreateTask: () => ({ mutate: createTaskMutation, isPending: false }),
+  useDaemonsQuery: () => ({ data: { items: [] }, isError: false, isLoading: false }),
   useMembersQuery: () => ({ data: [], isError: false, isLoading: false }),
-  useProjectQuery: () => ({ data: { owner_id: 'owner-1' }, isError: false, isLoading: false }),
+  useProjectQuery: () => ({
+    data: { owner_id: 'owner-1', primary_repo_id: 'repo-ui' },
+    isError: false,
+    isLoading: false,
+  }),
+  useProjectTaskRoleDefaultsQuery: () => ({
+    data: {
+      roles: [{
+        role: 'implementer',
+        configuration: { display_label: 'Implementer', capabilities: [] },
+        members: [],
+      }],
+    },
+    isError: false,
+    isLoading: false,
+  }),
+  useReposQuery: () => ({
+    data: {
+      items: [
+        { id: 'repo-ui', name: 'Web UI' },
+        { id: 'repo-api', name: 'API' },
+      ],
+    },
+    isError: false,
+    isLoading: false,
+  }),
   useTaskGatesQuery: () => ({ data: [], isLoading: false }),
   useTaskReviewLinesQuery: () => ({ data: [], isLoading: false }),
   useWorkUnitArtifactPackageQuery: () => ({
@@ -40,6 +75,7 @@ function sourceUnit(): WorkUnitResponse {
   return {
     id: 'unit-implementation',
     task_id: 'task-1',
+    repository_ids: [],
     parent_work_unit_id: null,
     title: 'Implement feature',
     scope: 'Implement the requested feature.',
@@ -69,7 +105,10 @@ function sourceUnit(): WorkUnitResponse {
 }
 
 describe('TaskWorkManagement reviewer setup', () => {
-  afterEach(() => vi.restoreAllMocks())
+  afterEach(() => {
+    vi.restoreAllMocks()
+    createTaskMutation.mockReset()
+  })
 
   it('creates a reviewer WorkUnit pinned to the selected implementation WorkUnit', async () => {
     const created = {
@@ -158,6 +197,98 @@ describe('TaskWorkManagement reviewer setup', () => {
       artifact_inputs: ['artifact-a', 'artifact-b'],
     })
     expect(onChanged).toHaveBeenCalledTimes(1)
+    queryClient.clear()
+  })
+
+  it('multirepo_task_create_and_work_unit_repository_selectors', async () => {
+    const created = sourceUnit()
+    const fetchMock = vi.spyOn(window, 'fetch').mockImplementation(async (input, init) => {
+      const path = new URL(input.toString()).pathname
+      if (path === '/api/v1/projects/project-1/repos') {
+        return new Response(JSON.stringify({
+          items: [
+            { id: 'repo-ui', name: 'Web UI' },
+            { id: 'repo-api', name: 'API' },
+          ],
+          next_cursor: null,
+          has_more: false,
+          total_count: 2,
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (path === '/api/v1/task-role-capabilities') {
+        return new Response(JSON.stringify({
+          schema_version: 1,
+          capabilities: ['formal_review', 'orchestration', 'request_rework'],
+          templates: [],
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (path.endsWith('/dependencies')) return new Response('[]', { status: 200 })
+      if (path === '/api/v1/tasks/task-1/work-units' && init?.method === 'POST') {
+        return new Response(JSON.stringify(created), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      return new Response('[]', { status: 200 })
+    })
+    const taskCreate = render(
+      <TaskCreateDialog open projectId="project-1" onOpenChange={vi.fn()} />,
+    )
+    fireEvent.change(screen.getByLabelText('Task'), {
+      target: { value: '# Update Web UI\nImplement the new interface.' },
+    })
+    fireEvent.change(await screen.findByLabelText('Repository role for API'), {
+      target: { value: 'affected' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Create Task' }))
+
+    await waitFor(() => expect(createTaskMutation).toHaveBeenCalled())
+    expect(createTaskMutation.mock.calls[0]?.[0]).toMatchObject({
+      repositories: [
+        { repo_id: 'repo-ui', role: 'primary' },
+        { repo_id: 'repo-api', role: 'affected' },
+      ],
+    })
+    taskCreate.unmount()
+
+    const task = {
+      id: 'task-1',
+      project_id: 'project-1',
+      repositories: [
+        { repo_id: 'repo-ui', role: 'primary', position: 0 },
+        { repo_id: 'repo-api', role: 'affected', position: 1 },
+        { repo_id: 'repo-contracts', role: 'context', position: 2 },
+      ],
+      task_roles: [role('role-implementer', 'implementer')],
+    } as unknown as Task
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <TaskWorkManagement task={task} workUnits={[]} executions={[]} onChanged={vi.fn()} />
+      </QueryClientProvider>,
+    )
+
+    const form = screen.getByRole('button', { name: 'Create WorkUnit' }).closest('form')
+    if (!form) throw new Error('WorkUnit create form is missing')
+    fireEvent.change(within(form).getByLabelText('Title'), {
+      target: { value: 'Update API' },
+    })
+    fireEvent.change(within(form).getByLabelText('Scope'), {
+      target: { value: 'Update the API contract.' },
+    })
+    fireEvent.click(screen.getByRole('checkbox', { name: 'API · affected' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create WorkUnit' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    const workUnitRequest = fetchMock.mock.calls.find(([input, init]) =>
+      new URL(input.toString()).pathname === '/api/v1/tasks/task-1/work-units' &&
+      init?.method === 'POST',
+    )
+    expect(workUnitRequest).toBeDefined()
+    expect(JSON.parse(String(workUnitRequest?.[1]?.body))).toMatchObject({
+      repository_ids: ['repo-api'],
+    })
     queryClient.clear()
   })
 })

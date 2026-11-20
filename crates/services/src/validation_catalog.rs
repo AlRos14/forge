@@ -369,6 +369,7 @@ pub(crate) mod test_support {
         TaskRepo::create(
             db,
             CreateTask {
+                repositories: Vec::new(),
                 id: db::new_uuid_v4(),
                 project_id: project_id.to_owned(),
                 repo_id: Some(repo_id.to_owned()),

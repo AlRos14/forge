@@ -8,7 +8,7 @@ use api_types::{
 use db::{
     ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, Page, PageRequest,
     Project, Repo, RoleMembership, RoleMembershipRepo, SortBy, SortOrder, Task, TaskLifecycleRepo,
-    TaskLifecycleState as DbTaskLifecycleState, TaskRoleRepo, Workspace, WorkspaceRepo,
+    TaskLifecycleState as DbTaskLifecycleState, TaskRepo, TaskRoleRepo, Workspace, WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -170,6 +170,21 @@ pub async fn task_response_light(db: &db::SqliteDb, task: Task) -> ApiResult<Tas
 
 async fn task_response_inner(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
     let task_roles = task_roles_response(db, &task.id, false).await?;
+    let repositories = TaskRepo::list_repositories(db, &task.id)
+        .await?
+        .into_iter()
+        .map(|repository| api_types::TaskRepositoryResponse {
+            repo_id: repository.repo_id,
+            role: match repository.role {
+                db::TaskRepositoryRole::Primary => api_types::TaskRepositoryRole::Primary,
+                db::TaskRepositoryRole::Affected => api_types::TaskRepositoryRole::Affected,
+                db::TaskRepositoryRole::Context => api_types::TaskRepositoryRole::Context,
+            },
+            position: repository.position,
+            merge: None,
+            pull_request: None,
+        })
+        .collect();
     let lifecycle = TaskLifecycleRepo::get_task_lifecycle(db, &task.id)
         .await?
         .ok_or_else(|| ApiError::not_found("task lifecycle", task.id.clone()))?;
@@ -201,6 +216,7 @@ async fn task_response_inner(db: &db::SqliteDb, task: Task) -> ApiResult<TaskRes
         id: task.id,
         project_id: task.project_id,
         repo_id: task.repo_id,
+        repositories,
         parent_task_id: task.parent_task_id.clone(),
         title: task.title,
         description: task.description,

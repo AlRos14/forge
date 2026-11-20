@@ -1,4 +1,16 @@
 use super::*;
+use api_types::{TaskRepositoryInput, UpdateTaskRepositoriesRequest};
+
+fn task_repository_write(input: TaskRepositoryInput) -> db::TaskRepositoryWrite {
+    db::TaskRepositoryWrite {
+        repo_id: input.repo_id,
+        role: match input.role {
+            api_types::TaskRepositoryRole::Primary => db::TaskRepositoryRole::Primary,
+            api_types::TaskRepositoryRole::Affected => db::TaskRepositoryRole::Affected,
+            api_types::TaskRepositoryRole::Context => db::TaskRepositoryRole::Context,
+        },
+    }
+}
 
 pub async fn create_task(
     State(state): State<AppState>,
@@ -10,14 +22,39 @@ pub async fn create_task(
     let request: CreateTaskRequest = serde_json::from_value(body)?;
     let task = state
         .task_service
-        .create_task(
+        .create_task_with_repositories(
             project_id,
             request.title,
             request.description,
             request.parent_task_id,
             request.priority,
+            request
+                .repositories
+                .map(|rows| rows.into_iter().map(task_repository_write).collect()),
             None,
             None,
+        )
+        .await?;
+    Ok(Json(task_response(&state.db, task).await?))
+}
+
+pub async fn update_task_repositories(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    user: AuthenticatedUser,
+    Json(request): Json<UpdateTaskRepositoriesRequest>,
+) -> ApiResult<Json<TaskResponse>> {
+    require_task_mutable(&state, &id, &user).await?;
+    let task = state
+        .task_service
+        .replace_task_repositories(
+            &id,
+            request.expected_version,
+            request
+                .repositories
+                .into_iter()
+                .map(task_repository_write)
+                .collect(),
         )
         .await?;
     Ok(Json(task_response(&state.db, task).await?))

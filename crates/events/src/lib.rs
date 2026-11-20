@@ -5,6 +5,7 @@ use tokio::sync::broadcast;
 
 pub const PROJECT_HOOK_RUN_CHANGED_EVENT: &str = "project_hook.run_changed";
 pub const OPERATIONS_STATUS_CHANGED_EVENT: &str = "operations.status_changed";
+pub const TASK_REPOSITORIES_CHANGED_EVENT: &str = "task.repositories_changed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForgeEvent {
@@ -55,6 +56,11 @@ pub enum EventContext {
     },
     TaskUpdated {
         project_id: String,
+    },
+    TaskRepositoriesChanged {
+        task_id: String,
+        task_version: i64,
+        repositories: Vec<api_types::TaskRepositoryInput>,
     },
     TaskDeleted {
         project_id: String,

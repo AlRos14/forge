@@ -142,6 +142,7 @@ async fn create_implementation_work_unit(
     WorkUnitRepo::create(
         &*state.db,
         CreateWorkUnit {
+            repository_ids: Vec::new(),
             id: id.clone(),
             task_id: task.id.clone(),
             parent_work_unit_id: None,
@@ -652,6 +653,7 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
     let task = TaskRepo::create(
         &*state.db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id: project_id.clone(),
             repo_id: None,
@@ -834,6 +836,7 @@ pub async fn seed_startable_execution_for_daemon(
     let task = TaskRepo::create(
         &*state.db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id: project_id.clone(),
             repo_id: Some(repo_id.clone()),
@@ -1040,6 +1043,7 @@ pub async fn seed_local_terminal_task(state: &AppState) -> TerminalTaskFixture {
     TaskRepo::create(
         &*state.db,
         CreateTask {
+            repositories: Vec::new(),
             id: task_id.clone(),
             project_id,
             repo_id: Some(repo_id.clone()),

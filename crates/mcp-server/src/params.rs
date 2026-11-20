@@ -31,6 +31,8 @@ pub(crate) struct CreateTaskParams {
     #[serde(default)]
     pub(crate) parent_task_id: Option<String>,
     pub(crate) priority: Option<i64>,
+    #[serde(default)]
+    pub(crate) repositories: Option<Vec<api_types::TaskRepositoryInput>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +143,8 @@ pub(crate) struct CreateWorkUnitParams {
     #[serde(default)]
     pub(crate) review_approval: Option<api_types::WorkUnitReviewApprovalRequest>,
     pub(crate) review_subject: Option<CreateWorkUnitReviewSubjectRequest>,
+    #[serde(default)]
+    pub(crate) repository_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,8 +283,18 @@ pub(crate) struct GetProjectParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpdateProjectParams {
     pub(crate) project_id: String,
+    pub(crate) version: i64,
     pub(crate) name: Option<String>,
     pub(crate) paused: Option<bool>,
+    #[serde(default, deserialize_with = "nullable_string_if_present")]
+    pub(crate) primary_repo_id: Option<Option<String>>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateTaskRepositoriesParams {
+    pub(crate) task_id: String,
+    pub(crate) expected_version: i64,
+    pub(crate) repositories: Vec<api_types::TaskRepositoryInput>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
