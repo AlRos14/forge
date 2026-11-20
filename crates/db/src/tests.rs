@@ -6145,7 +6145,7 @@ async fn multirepo_workspace_v182_allows_multiple_scopes_and_active_repo_leases(
             "status": "running",
         })
         .to_string(),
-        created_at: now,
+        created_at: now.clone(),
     };
     WorkUnitExecutionRepo::create_for_work_unit(
         &db,

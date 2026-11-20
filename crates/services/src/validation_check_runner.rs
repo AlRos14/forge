@@ -25,7 +25,7 @@ use db::{
     ValidationCheckRequest, ValidationCheckRequestRepo, ValidationCheckRequestState,
     ValidationCheckRequestTrigger, ValidationCheckRequestWrite, ValidationCheckSubjectKind,
     ValidationComparisonRepo, ValidationRun, ValidationRunOrigin, ValidationRunStatus,
-    WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceRepo, WorkspaceStatus,
+    WorkUnitRepo, WorkUnitStatus, Workspace, WorkspaceRepo, WorkspaceStatus,
 };
 use events::EventBus;
 use tokio::{process::Command, sync::watch, task::JoinHandle, time::interval};
@@ -931,7 +931,9 @@ mod tests {
         test_support::{seed_project, seed_task},
         PublishCheckInput, ValidationCatalogService,
     };
-    use db::{CreateTaskRole, CreateWorkspace, TaskRoleRepo, ValidationRunRepo};
+    use db::{
+        CreateTaskRole, CreateWorkspace, TaskRoleRepo, ValidationRunRepo, WorkUnitWorkspaceRepo,
+    };
     use tempfile::TempDir;
 
     struct Fixture {

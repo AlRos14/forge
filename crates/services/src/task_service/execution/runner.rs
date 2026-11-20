@@ -692,7 +692,7 @@ impl TaskService {
         }
 
         execution = self
-            .freeze_review_subject_and_inputs(execution_before_launch)
+            .freeze_review_subject_and_inputs(execution_before_launch.clone())
             .await?;
         let review_subject = if let Some(snapshot) = review_worktree_snapshot.as_ref() {
             let workspace = working_context.workspace.as_ref().ok_or_else(|| {
@@ -1755,12 +1755,16 @@ impl TaskService {
                         workspace.repo_id
                     )));
                 }
-                subject.result_commit_sha.as_deref().ok_or_else(|| {
-                    ServiceError::invalid_operation(format!(
-                        "repository {} Review subject has no exact result SHA",
-                        workspace.repo_id
-                    ))
-                })?
+                subject
+                    .result_commit_sha
+                    .as_deref()
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(format!(
+                            "repository {} Review subject has no exact result SHA",
+                            workspace.repo_id
+                        ))
+                    })?
+                    .to_owned()
             } else if expected_context.contains(&workspace.repo_id) {
                 let pinned_sha: Option<String> = sqlx::query_scalar(
                     "SELECT commit_sha FROM task_repository_context_snapshot
@@ -1770,7 +1774,7 @@ impl TaskService {
                 .bind(&workspace.repo_id)
                 .fetch_optional(self.db.pool())
                 .await?;
-                pinned_sha.as_deref().ok_or_else(|| {
+                pinned_sha.ok_or_else(|| {
                     ServiceError::invalid_operation(format!(
                         "context repository {} has no immutable Task snapshot",
                         workspace.repo_id
@@ -1779,7 +1783,6 @@ impl TaskService {
             } else {
                 continue;
             };
-            let expected_sha = expected_sha.to_owned();
             if workspace.branch != format!("detached:{expected_sha}") {
                 return Err(ServiceError::invalid_operation(format!(
                     "read-only repository {} is not detached at its pinned commit {}",

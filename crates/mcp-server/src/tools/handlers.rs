@@ -674,7 +674,7 @@ pub(super) async fn forge_submit_work_unit_review(
         .await?;
     Ok(json!({
         "review_execution": {
-            "execution": execution_value(execution),
+            "execution": execution_value_with_repository_results(state, execution).await?,
             "report": artifact_value(report.clone())?,
         },
         "report": artifact_value(report)?,
@@ -1230,7 +1230,7 @@ pub(super) async fn forge_follow_up_execution(
 
     Ok(json!({
         "task": task,
-        "execution": execution_value(launched.execution),
+        "execution": execution_value_with_repository_results(state, launched.execution).await?,
         "workspace": launched.workspace.map(|workspace| json!({
             "id": workspace.id,
             "task_id": workspace.task_id,

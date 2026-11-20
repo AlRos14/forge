@@ -400,7 +400,7 @@ async fn create_multirepo_fixture_work_unit(
                 execution_instructions: None,
                 role: role.to_owned(),
                 parent_work_unit_id: None,
-                assigned_actor: Some(ActorRef::Agent(fixture.agent_id.clone())),
+                assigned_actor: Some(db::ActorRef::Agent(fixture.agent_id.clone())),
                 requires_integration: true,
                 provenance: None,
                 review_subject,
@@ -438,7 +438,7 @@ async fn admit_multirepo_fixture_execution(
                 id: db::new_uuid_v4(),
                 task_id: fixture.task.id.clone(),
                 agent_id: Some(fixture.agent_id.clone()),
-                actor_ref: Some(ActorRef::Agent(fixture.agent_id.clone())),
+                actor_ref: Some(db::ActorRef::Agent(fixture.agent_id.clone())),
                 harness_session_id: None,
                 role: work_unit.role.clone(),
                 status: ExecutionStatus::Running,
@@ -1933,8 +1933,8 @@ async fn pr8_local_review_fails_if_reviewer_mutates_the_frozen_repository_group(
         .error
         .as_deref()
         .is_some_and(|error| { error.contains(&repo_id) && error.contains("changed") }));
-    assert!(db::CollaborationRepo::get_execution_artifact_output(
-        &db,
+    assert!(CollaborationRepo::get_execution_artifact_output(
+        &*db,
         &execution.id,
         db::ArtifactKind::ReviewReport,
     )
@@ -1959,7 +1959,6 @@ async fn pr8_local_review_fails_closed_when_a_group_member_git_marker_disappears
         workspace_root.path(),
     )
     .await;
-    let worktree = std::path::Path::new(&workspace.worktree_path);
     let repo_id = workspace.repo_id.clone();
 
     let failed = service

@@ -2210,12 +2210,16 @@ impl WorkUnitService {
                 let root = manager
                     .work_unit_group_path(&task.id, &unit.id, &id)
                     .map_err(|error| invalid(error.to_string()))?;
-                if tokio::fs::try_exists(&root).await? {
+                if tokio::fs::try_exists(&root).await.map_err(|error| {
+                    invalid(format!("failed to inspect WorkspaceGroup root: {error}"))
+                })? {
                     return Err(invalid(
                         "WorkspaceGroup root already exists without its durable group record",
                     ));
                 }
-                tokio::fs::create_dir_all(&root).await?;
+                tokio::fs::create_dir_all(&root).await.map_err(|error| {
+                    invalid(format!("failed to create WorkspaceGroup root: {error}"))
+                })?;
                 WorkspaceRepo::create_group_for_work_unit(
                     &*self.db,
                     db::CreateWorkspaceGroup {
@@ -2912,9 +2916,15 @@ async fn write_workspace_group_instructions(
         ));
     }
     let instructions = "# Forge workspace instructions\n\nThe current directory contains sibling repository worktrees. Read `FORGE_WORKSPACE.md` first.\n\nChange files only in repositories marked writable there. Treat read-only repositories as pinned inputs. Before editing a repository, read its own `AGENTS.md` and `CLAUDE.md` when present.\n";
-    tokio::fs::write(root.join("FORGE_WORKSPACE.md"), index).await?;
-    tokio::fs::write(root.join("AGENTS.md"), instructions).await?;
-    tokio::fs::write(root.join("CLAUDE.md"), instructions).await?;
+    tokio::fs::write(root.join("FORGE_WORKSPACE.md"), index)
+        .await
+        .map_err(|error| invalid(format!("failed to write WorkspaceGroup index: {error}")))?;
+    tokio::fs::write(root.join("AGENTS.md"), instructions)
+        .await
+        .map_err(|error| invalid(format!("failed to write WorkspaceGroup AGENTS.md: {error}")))?;
+    tokio::fs::write(root.join("CLAUDE.md"), instructions)
+        .await
+        .map_err(|error| invalid(format!("failed to write WorkspaceGroup CLAUDE.md: {error}")))?;
     Ok(())
 }
 

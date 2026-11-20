@@ -313,18 +313,18 @@ impl WorkspaceCleanupScheduler {
                 "WorkUnit Workspace Task binding changed during cleanup",
             ));
         }
-        let scope_matches = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, workspace_id)
+        let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, workspace_id)
             .await?
-            .is_some_and(|scope| {
+            .filter(|scope| {
                 scope.kind == WorkspaceScopeKind::WorkUnit
                     && scope.task_id == task_id
                     && scope.work_unit_id.as_deref() == Some(work_unit_id)
-            });
-        if !scope_matches {
-            return Err(ServiceError::invalid_operation(
-                "WorkUnit Workspace cleanup identity does not match its durable scope",
-            ));
-        }
+            })
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "WorkUnit Workspace cleanup identity does not match its durable scope",
+                )
+            })?;
         let work_unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
             .await?
             .filter(|unit| unit.task_id == task_id)

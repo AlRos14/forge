@@ -611,8 +611,7 @@ impl TaskReworkService {
                         ServiceError::not_found("workspace", result.workspace_id.clone())
                     })?;
                 let current_head =
-                    crate::git::get_current_sha(std::path::Path::new(&workspace.worktree_path))
-                        .await?;
+                    git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await?;
                 if current_head != result_sha {
                     return Err(ServiceError::invalid_operation(format!(
                         "micro-fix repository {} Workspace no longer matches its exact result",

@@ -738,10 +738,11 @@ async fn assert_failed_admission_has_no_execution_lease_or_event(
     expected: DbError,
 ) {
     let execution_id = attempt.execution.id.clone();
-    let lease_id = attempt
-        .workspace_lease
-        .as_ref()
-        .map(|lease| lease.id.clone());
+    let lease_ids = attempt
+        .workspace_leases
+        .iter()
+        .map(|lease| lease.id.clone())
+        .collect::<Vec<_>>();
     let result = WorkUnitExecutionRepo::create_for_work_unit(db, attempt, event_input).await;
     assert!(
         matches!(&result, Err(error) if std::mem::discriminant(error) == std::mem::discriminant(&expected)),
@@ -767,7 +768,7 @@ async fn assert_failed_admission_has_no_execution_lease_or_event(
     assert_eq!(execution_count, 0, "rejected execution was rolled back");
     assert_eq!(lease_count, 0, "rejected lease was rolled back");
     assert_eq!(event_count, 0, "rejected events were rolled back");
-    if let Some(lease_id) = lease_id {
+    for lease_id in lease_ids {
         let lease_by_id: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM workspace_lease WHERE id = ?")
                 .bind(lease_id)
@@ -972,7 +973,7 @@ async fn work_unit_admission_guard_classifies_each_live_rejection_without_partia
     let (mut attempt, mut event_input) = cleanup_admission_attempt(&db, &integration_human).await;
     attempt.execution.actor_ref = Some(ActorRef::Human(integration_human.human_id.clone()));
     attempt.execution.agent_id = None;
-    attempt.workspace_lease = None;
+    attempt.workspace_leases.clear();
     event_input.actor_type = "human".to_owned();
     event_input.actor_id = Some(integration_human.human_id.clone());
     assert_failed_admission_has_no_execution_lease_or_event(

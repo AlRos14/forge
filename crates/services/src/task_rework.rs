@@ -1064,7 +1064,8 @@ impl TaskReworkService {
                 .any(|subject_repository| {
                     !result_repository_results.iter().any(|result| {
                         result.repo_id == subject_repository.repo_id
-                            && result.workspace_id == subject_repository.result_workspace_id
+                            && Some(result.workspace_id.as_str())
+                                == subject_repository.result_workspace_id.as_deref()
                             && result.after_sha == subject_repository.result_commit_sha
                             && result.snapshot_digest
                                 == subject_repository.workspace_snapshot_digest
@@ -1221,6 +1222,20 @@ impl TaskReworkService {
                 .iter()
                 .find(|result| result.repo_id == repo_id)
         });
+        let (primary_result_commit_sha, primary_result_workspace_id, primary_result_snapshot) =
+            match primary_result {
+                Some(result) => (
+                    result.after_sha.as_deref(),
+                    Some(result.workspace_id.as_str()),
+                    result.snapshot_digest.as_deref(),
+                ),
+                None if result_repository_results.is_empty() && task.repo_id.is_some() => (
+                    producer_subject.result_commit_sha.as_deref(),
+                    producer_subject.result_workspace_id.as_deref(),
+                    producer_subject.workspace_snapshot_digest.as_deref(),
+                ),
+                None => (None, None, None),
+            };
         let result_pins = FrozenRepositoryResultSet {
             task_id: &task.id,
             source_work_unit_id: &reviewed.id,
@@ -1521,9 +1536,9 @@ impl TaskReworkService {
         .bind(reviewed_version)
         .bind(&result_execution.id)
         .bind(producer_subject.result_artifact_id.as_deref())
-        .bind(primary_result.and_then(|result| result.after_sha.as_deref()))
-        .bind(primary_result.map(|result| result.workspace_id.as_str()))
-        .bind(primary_result.and_then(|result| result.snapshot_digest.as_deref()))
+        .bind(primary_result_commit_sha)
+        .bind(primary_result_workspace_id)
+        .bind(primary_result_snapshot)
         .bind(&now)
         .execute(&mut *tx)
         .await?;
@@ -2305,23 +2320,28 @@ pub async fn populate_review_subject_result(
             .iter()
             .find(|result| result.repo_id == repo_id)
     });
-    sqlx::query(
-        "UPDATE work_unit_review_subject
-         SET result_execution_id = ?, result_commit_sha = ?, result_workspace_id = ?,
-             workspace_snapshot_digest = ?
-         WHERE task_id = ? AND reviewed_work_unit_id = ?
-           AND reviewed_work_unit_version = ?
-           AND result_execution_id IS NULL",
-    )
-    .bind(&execution.id)
-    .bind(primary_result.and_then(|result| result.after_sha.as_deref()))
-    .bind(primary_result.map(|result| result.workspace_id.as_str()))
-    .bind(primary_result.and_then(|result| result.snapshot_digest.as_deref()))
-    .bind(task_id)
-    .bind(completed_work_unit_id)
-    .bind(completed_work_unit_version)
-    .execute(db.pool())
-    .await?;
+    let mut legacy_primary_snapshot_digest = None;
+    if repository_results.is_empty() {
+        if let (Some(primary_repo_id), Some(workspace_id)) =
+            (task.repo_id.as_deref(), execution.workspace_id.as_deref())
+        {
+            let workspace = db::WorkspaceRepo::get_by_id(db, workspace_id)
+                .await?
+                .filter(|workspace| {
+                    workspace.task_id == task_id && workspace.repo_id == primary_repo_id
+                })
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+            let live_head =
+                git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await?;
+            if execution.after_sha.as_deref() != Some(live_head.as_str()) {
+                return Err(ServiceError::invalid_operation(
+                    "completed result Workspace no longer matches its exact Execution commit",
+                ));
+            }
+            legacy_primary_snapshot_digest =
+                Some(crate::ValidationService::snapshot_digest(&workspace.worktree_path).await?);
+        }
+    }
     for result in &repository_results {
         let workspace = db::WorkspaceRepo::get_by_id(db, &result.workspace_id)
             .await?
@@ -2344,20 +2364,66 @@ pub async fn populate_review_subject_result(
             }
         }
     }
-    let subject = get_review_subject(db, &review_work_unit_id)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("review subject", review_work_unit_id.to_owned()))?;
-    let result_pins = FrozenRepositoryResultSet {
-        task_id,
-        source_work_unit_id: completed_work_unit_id,
-        source_work_unit_version: completed_work_unit_version,
-        result_execution_id: &execution.id,
-        result_artifact_id: subject.result_artifact_id.as_deref(),
-        results: &repository_results,
-        created_at: &subject.created_at,
+    let (primary_commit_sha, primary_workspace_id, primary_snapshot_digest) = match primary_result {
+        Some(result) => (
+            result.after_sha.as_deref(),
+            Some(result.workspace_id.as_str()),
+            result.snapshot_digest.as_deref(),
+        ),
+        None if repository_results.is_empty() && task.repo_id.is_some() => (
+            execution.after_sha.as_deref(),
+            execution.workspace_id.as_deref(),
+            legacy_primary_snapshot_digest.as_deref(),
+        ),
+        None => (None, None, None),
     };
-    let frozen = frozen_review_subject_repositories(&review_work_unit_id, &result_pins);
-    WorkUnitRepo::freeze_review_subject_repositories(db, &review_work_unit_id, &frozen).await?;
+    sqlx::query(
+        "UPDATE work_unit_review_subject
+         SET result_execution_id = ?, result_commit_sha = ?, result_workspace_id = ?,
+             workspace_snapshot_digest = ?
+         WHERE task_id = ? AND reviewed_work_unit_id = ?
+           AND reviewed_work_unit_version = ?
+           AND result_execution_id IS NULL",
+    )
+    .bind(&execution.id)
+    .bind(primary_commit_sha)
+    .bind(primary_workspace_id)
+    .bind(primary_snapshot_digest)
+    .bind(task_id)
+    .bind(completed_work_unit_id)
+    .bind(completed_work_unit_version)
+    .execute(db.pool())
+    .await?;
+    let review_work_unit_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT review_work_unit_id
+         FROM work_unit_review_subject
+         WHERE task_id = ? AND reviewed_work_unit_id = ?
+           AND reviewed_work_unit_version = ? AND result_execution_id = ?",
+    )
+    .bind(task_id)
+    .bind(completed_work_unit_id)
+    .bind(completed_work_unit_version)
+    .bind(&execution.id)
+    .fetch_all(db.pool())
+    .await?;
+    for review_work_unit_id in review_work_unit_ids {
+        let subject = get_review_subject(db, &review_work_unit_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("review subject", review_work_unit_id.clone())
+            })?;
+        let result_pins = FrozenRepositoryResultSet {
+            task_id,
+            source_work_unit_id: completed_work_unit_id,
+            source_work_unit_version: completed_work_unit_version,
+            result_execution_id: &execution.id,
+            result_artifact_id: subject.result_artifact_id.as_deref(),
+            results: &repository_results,
+            created_at: &subject.created_at,
+        };
+        let frozen = frozen_review_subject_repositories(&review_work_unit_id, &result_pins);
+        WorkUnitRepo::freeze_review_subject_repositories(db, &review_work_unit_id, &frozen).await?;
+    }
     Ok(())
 }
 
