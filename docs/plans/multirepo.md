@@ -162,11 +162,16 @@ Para un WorkUnit con N repos escribibles y M repos de contexto:
 - Una fila `workspace` (y su `workspace_scope`) por repo, todas ligadas al
   WorkUnit; un grupo nuevo `workspace_group(id, task_id, work_unit_id,
   root_path)` les da una raíz común.
-- Un lease por workspace escribible; el lease de contexto es de solo lectura.
+- Un lease writable por cada workspace escribible. Los workspaces context no
+  reciben WorkspaceLease; su acceso es de solo lectura y se comprueba después
+  de la Execution.
 - El harness arranca en la raíz del grupo. Así ve todos los repos como
   carpetas hermanas, igual que una sesión de Claude o Codex en `~/Proyectos`.
-- Los repos de contexto se preparan en el commit fijado al crear la Task (o al
-  aceptar un replan), con permisos de solo lectura en disco.
+- Los repos de contexto se fijan en el primer `workspace_group` que los necesite
+  (o al aceptar un replan), antes de iniciar la Execution. V181 no conserva un
+  SHA del repo al crear la Task; M2 lo registra sin inventar un valor histórico
+  y todos los grupos posteriores de esa Task reutilizan ese pin. Se preparan con
+  permisos de solo lectura en disco.
 - `FORGE_WORKSPACE.md` (y el `AGENTS.md`/`CLAUDE.md` de raíz que lee cada
   harness) se generan fuera de los repos y no se versionan.
 
@@ -185,15 +190,21 @@ Al terminar la Execution, Forge:
    fuera del conjunto en la raíz.
 
 `work_unit_review_subject` y `work_unit_result_requirement` ganan una tabla
-hija por repo con el mismo patrón; las columnas actuales quedan para el
-`primary`.
+hija por repo. La identidad común del resultado conserva el Execution y la
+versión; commit, Workspace y snapshot escalares reflejan el `primary` solo si
+está en el scope, y quedan NULL si no lo está.
 
 ### Revisión
 
 El revisor recibe un workspace de grupo con los commits de resultado de cada
 repo y el diff por repo. El ReviewReport sigue siendo uno; los hallazgos pueden
-llevar ruta prefijada por repo. Micro-fix, fallback y rework operan sobre el
-mismo grupo.
+llevar ruta prefijada por repo. Un fallback del mismo WorkUnit reutiliza
+exactamente su grupo. Rework y micro-fix crean grupos nuevos y basan cada repo
+en el resultado por repo fijado; no reciclan una raíz mutable de otra
+Execution.
+El grupo del revisor es de solo lectura, contiene solo los repos congelados en
+su Review Subject y no recibe WorkspaceLease; su Execution mantiene
+`workspace_id = NULL`.
 
 ### Validación y Gate
 
@@ -318,10 +329,11 @@ Pruebas mínimas:
 
 ## Contratos congelados (M0)
 
-Congelado sobre `feat/multirepo` (`22a02b98`), fuente 0.9.1 y V180. La prueba
-SQL indicada abajo es local y estática; Cargo, builds y tests Rust quedan para
-CI. Los archivos citados son el alcance previsto de implementación, no cambios
-incluidos en este plan.
+Congelado inicialmente sobre `feat/multirepo` (`22a02b98`), fuente 0.9.1 y V180.
+Revalidado contra el HEAD actual `ac87ab85d0c466ca1e73c22bbdedfa186a065aee`,
+con M1 en el árbol. La prueba SQL indicada abajo es local y estática; Cargo,
+builds y tests Rust quedan para CI. Los archivos citados son el alcance previsto
+de implementación, no cambios incluidos en este plan.
 
 Correcciones del baseline ya aplicadas arriba: `task.repo_id` no es UNIQUE;
 `workspace_lease.workspace_id` tampoco es UNIQUE y
@@ -332,6 +344,49 @@ Project Plan vive en `context_json` con digest. No apareció otro hallazgo del
 baseline que contradiga el código inspeccionado. También se corrigió la
 procedencia del guard `workspace_scope_insert_guard`: su definición vigente es
 V091, no V142/V170.
+
+Revalidación tras M1 (2026-11-20): las firmas M1 de `TaskRepo`,
+`WorkUnitRepo::list_repository_ids`, `TaskService::create_task_with_repositories`,
+`TaskService::replace_task_repositories`, `ProjectRepositoryService::update_primary_repo`
+y `UpdateProject.primary_repo_id` coinciden con la implementación actual. Se
+corrige V182 y el contrato M2 por estos hallazgos del código actual:
+
+- `workspace_scope` aún tiene `idx_workspace_scope_work_unit UNIQUE(work_unit_id)`
+  (V091), que impide guardar más de un repo en un WorkUnit. V182 debe retirarlo
+  y crear un índice no único por `(work_unit_id, workspace_id)`.
+- `work_unit_execution_admission_guard` (V091) también fija `workspace.repo_id`
+  a `task.repo_id` y exige siempre `execution.workspace_id`. V182 debe
+  reemplazarlo: admitir el grupo completo listo, aceptar primary como espejo
+  escalar solo si está seleccionado y permitir NULL cuando el scope excluye el
+  primary. No basta con cambiar los guards de `workspace_scope` y leases.
+- `workspace_lease` tiene `idx_workspace_lease_active_work_unit UNIQUE(work_unit_id)`
+  (V091), mientras cada lease enlaza un solo `workspace_id`. V182 debe acotar la
+  unicidad activa a `(work_unit_id, workspace_id)`. La admisión y la autoridad
+  pasan de un lease a una lista de leases por Execution.
+- V181 guarda rol y orden de `task_repository`, pero no el SHA de repos `context`.
+  V182 añade `task_repository_context_snapshot`; el primer grupo que use cada
+  repo fija su SHA y no se hace backfill ficticio desde SQLite. El pin depende
+  de Task y Repo, no de la fila mutable de asociación, y sobrevive al cambio
+  versionado de alcance. Esto reemplaza la frase anterior “fijado al crear la
+  Task”, imposible con el esquema M1.
+- `WorkUnitService::prepare_workspace` recibe `CollaborationActorSource` y
+  comprueba la autoridad antes de cargar/crear un workspace. La firma M2
+  propuesta sin `source` omitía esa frontera y queda corregida abajo.
+- Las tablas hijas de Review Subject y Result Requirement deben quedar ligadas
+  al sujeto escalar común ya existente. El guard de Result Requirement también
+  debe comparar `Execution.work_unit_version` con
+  `source_work_unit_version`; ambos guards comparan snapshot con igualdad
+  NULL-safe, sin permitir sustituir un NULL por un digest inventado.
+- M1 permite que un WorkUnit seleccione un subconjunto writable sin incluir el
+  primary. Por ello `Execution.workspace_id/before_sha/after_sha` son el espejo
+  escalar del primary solo cuando está dentro del scope; en caso contrario son
+  NULL y `repository_results` es la evidencia completa. En los sujetos, el
+  Execution y la versión son identidad común; commit, Workspace y snapshot
+  escalares reflejan el primary solo si está seleccionado. El resultado común
+  de Artifact conserva la semántica existente.
+- La prueba de regresión de un solo repo ya no puede exigir idénticas filas SQL:
+  M2 añade por diseño un grupo y una fila de resultado. Debe exigir la misma
+  respuesta escalar de 0.9.1 y exactamente un workspace y resultado del repo.
 
 ### Migraciones y esquema
 
@@ -501,12 +556,73 @@ CREATE TABLE workspace_group (
     FOREIGN KEY (work_unit_id, task_id)
         REFERENCES work_unit(id, task_id) ON DELETE CASCADE
 );
+CREATE TRIGGER workspace_group_immutable_update
+BEFORE UPDATE ON workspace_group
+BEGIN
+    SELECT RAISE(ABORT, 'WorkspaceGroup identity and root are immutable');
+END;
+CREATE TRIGGER workspace_group_immutable_delete
+BEFORE DELETE ON workspace_group
+WHEN NOT EXISTS (
+    SELECT 1 FROM task t JOIN project_deletion_guard g ON g.project_id = t.project_id
+    WHERE t.id = OLD.task_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'WorkspaceGroup is immutable outside Project teardown');
+END;
 ALTER TABLE workspace_scope
     ADD COLUMN workspace_group_id TEXT
         REFERENCES workspace_group(id) ON DELETE RESTRICT;
+DROP INDEX IF EXISTS idx_workspace_scope_work_unit;
+CREATE INDEX idx_workspace_scope_work_unit
+    ON workspace_scope(work_unit_id, workspace_id)
+    WHERE scope_kind = 'work_unit';
 CREATE INDEX idx_workspace_scope_group
     ON workspace_scope(workspace_group_id, workspace_id)
     WHERE workspace_group_id IS NOT NULL;
+
+-- V181 has no Git SHA for a context repository. Pin on first group preparation;
+-- all later WorkUnit groups for the Task reuse it, even across a repo-set
+-- replan. The insert guard checks the current context association.
+CREATE TABLE task_repository_context_snapshot (
+    task_id      TEXT NOT NULL,
+    repo_id      TEXT NOT NULL REFERENCES repo(id) ON DELETE RESTRICT,
+    commit_sha   TEXT NOT NULL CHECK (length(trim(commit_sha)) > 0),
+    captured_at  TEXT NOT NULL,
+    PRIMARY KEY (task_id, repo_id),
+    FOREIGN KEY (task_id) REFERENCES task(id) ON DELETE CASCADE
+);
+CREATE TRIGGER task_repository_context_snapshot_insert_guard
+BEFORE INSERT ON task_repository_context_snapshot
+WHEN NOT EXISTS (
+    SELECT 1 FROM task_repository tr
+    WHERE tr.task_id = NEW.task_id AND tr.repo_id = NEW.repo_id
+      AND tr.role = 'context'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'context snapshot must bind a context repository of its Task');
+END;
+CREATE TRIGGER task_repository_context_snapshot_immutable_update
+BEFORE UPDATE ON task_repository_context_snapshot
+BEGIN
+    SELECT RAISE(ABORT, 'context repository snapshot is immutable');
+END;
+CREATE TRIGGER task_repository_context_snapshot_immutable_delete
+BEFORE DELETE ON task_repository_context_snapshot
+WHEN NOT EXISTS (
+    SELECT 1 FROM task t JOIN project_deletion_guard g ON g.project_id = t.project_id
+    WHERE t.id = OLD.task_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'context repository snapshot is immutable outside Project teardown');
+END;
+
+-- One active lease per WorkUnit/repository Workspace; retain the legacy
+-- Task-wide lease uniqueness for non-WorkUnit records.
+DROP INDEX IF EXISTS idx_workspace_lease_active_work_unit;
+CREATE UNIQUE INDEX idx_workspace_lease_active_work_unit
+    ON workspace_lease(work_unit_id, workspace_id)
+    WHERE status = 'active' AND work_unit_id IS NOT NULL;
 
 CREATE TABLE execution_repository_result (
     execution_id    TEXT NOT NULL REFERENCES execution(id) ON DELETE CASCADE,
@@ -542,9 +658,38 @@ WHEN NOT EXISTS (
            OR EXISTS (SELECT 1 FROM work_unit_repository s
                       WHERE s.work_unit_id = e.work_unit_id
                         AND s.repo_id = NEW.repo_id))
+      AND (e.work_unit_id IS NULL AND EXISTS (
+               SELECT 1 FROM workspace_scope ws
+               WHERE ws.workspace_id = w.id AND ws.task_id = e.task_id
+                 AND ws.scope_kind = 'integration'
+           ) OR e.work_unit_id IS NOT NULL AND EXISTS (
+               SELECT 1 FROM workspace_scope ws
+               WHERE ws.workspace_id = w.id AND ws.task_id = e.task_id
+                 AND ws.scope_kind = 'work_unit'
+                 AND ws.work_unit_id = e.work_unit_id
+                 AND (ws.workspace_group_id IS NULL OR EXISTS (
+                     SELECT 1 FROM workspace_group g
+                     WHERE g.id = ws.workspace_group_id
+                       AND g.task_id = e.task_id AND g.work_unit_id = e.work_unit_id
+                 ))
+           ))
 )
 BEGIN
     SELECT RAISE(ABORT, 'repository result must bind the exact Execution, writable repo, and workspace');
+END;
+CREATE TRIGGER execution_repository_result_immutable_update
+BEFORE UPDATE ON execution_repository_result
+BEGIN
+    SELECT RAISE(ABORT, 'Execution repository results are immutable');
+END;
+CREATE TRIGGER execution_repository_result_immutable_delete
+BEFORE DELETE ON execution_repository_result
+WHEN NOT EXISTS (
+    SELECT 1 FROM task t JOIN project_deletion_guard g ON g.project_id = t.project_id
+    WHERE t.id = OLD.task_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Execution repository results are immutable outside Project teardown');
 END;
 
 CREATE TABLE work_unit_review_subject_repository (
@@ -587,15 +732,39 @@ WHEN NOT EXISTS (
     JOIN work_unit reviewed_wu
       ON reviewed_wu.id = NEW.reviewed_work_unit_id
      AND reviewed_wu.task_id = NEW.task_id
+    JOIN work_unit_review_subject scalar_subject
+      ON scalar_subject.review_work_unit_id = NEW.review_work_unit_id
+     AND scalar_subject.task_id = NEW.task_id
+     AND scalar_subject.reviewed_work_unit_id = NEW.reviewed_work_unit_id
+     AND scalar_subject.reviewed_work_unit_version IS NEW.reviewed_work_unit_version
+     AND scalar_subject.result_execution_id IS NEW.result_execution_id
     JOIN task_repository tr
       ON tr.task_id = NEW.task_id AND tr.repo_id = NEW.repo_id
      AND tr.role IN ('primary', 'affected')
     WHERE review_wu.id = NEW.review_work_unit_id
       AND review_wu.task_id = NEW.task_id
+      AND (NOT EXISTS (
+          SELECT 1 FROM work_unit_repository scope
+          WHERE scope.work_unit_id = NEW.reviewed_work_unit_id
+      ) OR EXISTS (
+          SELECT 1 FROM work_unit_repository scope
+          WHERE scope.work_unit_id = NEW.reviewed_work_unit_id
+            AND scope.repo_id = NEW.repo_id
+      ))
       AND (NEW.result_execution_id IS NULL OR EXISTS (
           SELECT 1 FROM execution e
           WHERE e.id = NEW.result_execution_id AND e.task_id = NEW.task_id
             AND e.work_unit_id = NEW.reviewed_work_unit_id
+            AND e.status = 'completed'
+            AND e.work_unit_version = NEW.reviewed_work_unit_version
+            AND EXISTS (
+                SELECT 1 FROM execution_repository_result rr
+                WHERE rr.execution_id = e.id AND rr.task_id = e.task_id
+                  AND rr.repo_id = NEW.repo_id
+                  AND rr.workspace_id = NEW.result_workspace_id
+                  AND rr.after_sha IS NEW.result_commit_sha
+                  AND rr.snapshot_digest IS NEW.workspace_snapshot_digest
+            )
       ))
       AND (NEW.result_workspace_id IS NULL OR EXISTS (
           SELECT 1 FROM workspace w
@@ -605,6 +774,45 @@ WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'review subject repo must bind exact same-Task WorkUnits and result');
+END;
+CREATE TRIGGER work_unit_review_subject_repository_freeze_update
+BEFORE UPDATE ON work_unit_review_subject_repository
+WHEN OLD.reviewed_work_unit_version IS NOT NULL OR OLD.result_execution_id IS NOT NULL
+  OR NEW.review_work_unit_id IS NOT OLD.review_work_unit_id
+  OR NEW.task_id IS NOT OLD.task_id OR NEW.repo_id IS NOT OLD.repo_id
+  OR NEW.reviewed_work_unit_id IS NOT OLD.reviewed_work_unit_id
+  OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.reviewed_work_unit_version IS NULL OR NEW.result_execution_id IS NULL
+  OR NOT EXISTS (
+      SELECT 1 FROM work_unit_review_subject scalar_subject
+      WHERE scalar_subject.review_work_unit_id = NEW.review_work_unit_id
+        AND scalar_subject.task_id = NEW.task_id
+        AND scalar_subject.reviewed_work_unit_id = NEW.reviewed_work_unit_id
+        AND scalar_subject.reviewed_work_unit_version IS NEW.reviewed_work_unit_version
+        AND scalar_subject.result_execution_id IS NEW.result_execution_id
+  )
+  OR NOT EXISTS (
+      SELECT 1 FROM execution e
+      JOIN execution_repository_result rr
+        ON rr.execution_id = e.id AND rr.task_id = e.task_id AND rr.repo_id = NEW.repo_id
+      WHERE e.id = NEW.result_execution_id AND e.task_id = NEW.task_id
+        AND e.work_unit_id = NEW.reviewed_work_unit_id AND e.status = 'completed'
+        AND e.work_unit_version = NEW.reviewed_work_unit_version
+        AND rr.workspace_id = NEW.result_workspace_id
+        AND rr.after_sha IS NEW.result_commit_sha
+        AND rr.snapshot_digest IS NEW.workspace_snapshot_digest
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'review subject repo may only freeze its exact completed repository result');
+END;
+CREATE TRIGGER work_unit_review_subject_repository_immutable_delete
+BEFORE DELETE ON work_unit_review_subject_repository
+WHEN NOT EXISTS (
+    SELECT 1 FROM task t JOIN project_deletion_guard g ON g.project_id = t.project_id
+    WHERE t.id = OLD.task_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Review subject repository is immutable outside Project teardown');
 END;
 
 CREATE TABLE work_unit_result_requirement_repository (
@@ -644,7 +852,23 @@ WHEN NOT EXISTS (
     JOIN execution e
       ON e.id = NEW.result_execution_id AND e.task_id = NEW.task_id
      AND e.work_unit_id = NEW.source_work_unit_id
+     AND e.work_unit_version = NEW.source_work_unit_version
+     AND e.status = 'completed'
+    JOIN execution_repository_result rr
+      ON rr.execution_id = e.id AND rr.task_id = e.task_id
+     AND rr.repo_id = NEW.repo_id
     WHERE wu.id = NEW.work_unit_id AND wu.task_id = NEW.task_id
+      AND rr.workspace_id = NEW.result_workspace_id
+      AND rr.after_sha IS NEW.result_commit_sha
+      AND rr.snapshot_digest IS NEW.workspace_snapshot_digest
+      AND EXISTS (
+          SELECT 1 FROM work_unit_result_requirement scalar_requirement
+          WHERE scalar_requirement.work_unit_id = NEW.work_unit_id
+            AND scalar_requirement.task_id = NEW.task_id
+            AND scalar_requirement.source_work_unit_id = NEW.source_work_unit_id
+            AND scalar_requirement.source_work_unit_version = NEW.source_work_unit_version
+            AND scalar_requirement.result_execution_id = NEW.result_execution_id
+      )
       AND (NEW.result_workspace_id IS NULL OR EXISTS (
           SELECT 1 FROM workspace w
           WHERE w.id = NEW.result_workspace_id AND w.task_id = NEW.task_id
@@ -653,6 +877,20 @@ WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'result requirement repo must bind exact same-Task WorkUnits and result');
+END;
+CREATE TRIGGER work_unit_result_requirement_repository_immutable_update
+BEFORE UPDATE ON work_unit_result_requirement_repository
+BEGIN
+    SELECT RAISE(ABORT, 'WorkUnit result requirement repositories are immutable');
+END;
+CREATE TRIGGER work_unit_result_requirement_repository_immutable_delete
+BEFORE DELETE ON work_unit_result_requirement_repository
+WHEN NOT EXISTS (
+    SELECT 1 FROM task t JOIN project_deletion_guard g ON g.project_id = t.project_id
+    WHERE t.id = OLD.task_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'WorkUnit result requirement repositories are immutable outside Project teardown');
 END;
 
 -- Backfill only completed exact Executions with a Workspace. Unknown SHA and
@@ -677,10 +915,13 @@ INSERT INTO work_unit_review_subject_repository(
 )
 SELECT s.review_work_unit_id, s.task_id, w.repo_id, s.reviewed_work_unit_id,
        s.reviewed_work_unit_version, s.result_execution_id, s.result_artifact_id,
-       s.result_commit_sha, s.result_workspace_id, s.workspace_snapshot_digest,
+       rr.after_sha, rr.workspace_id, rr.snapshot_digest,
        s.created_at
 FROM work_unit_review_subject s
 JOIN workspace w ON w.id = s.result_workspace_id AND w.task_id = s.task_id
+JOIN execution_repository_result rr
+  ON rr.execution_id = s.result_execution_id AND rr.task_id = s.task_id
+ AND rr.repo_id = w.repo_id AND rr.workspace_id = s.result_workspace_id
 JOIN task_repository tr
   ON tr.task_id = s.task_id AND tr.repo_id = w.repo_id
  AND tr.role IN ('primary', 'affected');
@@ -692,10 +933,13 @@ INSERT INTO work_unit_result_requirement_repository(
 )
 SELECT r.work_unit_id, r.task_id, w.repo_id, r.source_work_unit_id,
        r.source_work_unit_version, r.result_execution_id, r.result_artifact_id,
-       r.result_commit_sha, r.result_workspace_id, r.workspace_snapshot_digest,
+       rr.after_sha, rr.workspace_id, rr.snapshot_digest,
        r.created_at
 FROM work_unit_result_requirement r
 JOIN workspace w ON w.id = r.result_workspace_id AND w.task_id = r.task_id
+JOIN execution_repository_result rr
+  ON rr.execution_id = r.result_execution_id AND rr.task_id = r.task_id
+ AND rr.repo_id = w.repo_id AND rr.workspace_id = r.result_workspace_id
 JOIN task_repository tr
   ON tr.task_id = r.task_id AND tr.repo_id = w.repo_id
  AND tr.role IN ('primary', 'affected');
@@ -703,20 +947,36 @@ JOIN task_repository tr
 
 V182 reemplaza `workspace_scope_insert_guard` (V091; no hay reemplazo suyo en
 V142/V170): verifica repo asociado a la Task, solo permite context como
-Workspace de solo lectura, y limita WorkUnit a role primary/affected y a su
-scope vacío-o-explícito. Reemplaza también `workspace_lease_scope_guard_insert`
+Workspace de solo lectura, y limita un WorkUnit escritor a repos primary/
+affected y a su scope vacío-o-explícito. Un WorkUnit reviewer solo puede tener
+scopes read-only para los repos de su Review Subject congelado. También verifica
+que `workspace_group_id` pertenezca al mismo Task y WorkUnit. Reemplaza
+`work_unit_execution_admission_guard` (V091), que hoy exige siempre el repo
+primary y un solo Workspace: la admisión de un escritor requiere el grupo
+completo listo, todas sus filas scope exactas y un lease por repo writable;
+`execution.workspace_id` es el Workspace primary solo cuando está seleccionado.
+La admisión de un reviewer exige sus repos sujetos exactos, `workspace_id = NULL`
+y cero leases. Se reemplaza la unicidad
+`idx_workspace_scope_work_unit` por un índice no único: un WorkUnit contiene
+una fila scope por repo. Reemplaza también `workspace_lease_scope_guard_insert`
 y `workspace_lease_active_renewal_guard` (cuerpos vigentes V120), además de
 `workspace_lease_work_unit_binding_guard` y
 `workspace_lease_work_unit_active_renewal_guard` (V091): cada uno conserva sus
 checks actuales de Actor, RoleMembership, TaskRole, Execution, lease,
 provider-start, workspace listo y capability digest, pero resuelve repo desde
 `workspace.repo_id` + `task_repository` y el scope del WorkUnit, nunca desde
-`task.repo_id`. Se conservan `workspace_lease_legacy_scope_guard`,
+`task.repo_id`. Cada workspace writable del grupo recibe un lease ligado al
+mismo Execution; el guard exige que `execution.workspace_id` sea el workspace
+primary del grupo si el scope lo incluye y permite NULL si no lo incluye. Los
+context no reciben WorkspaceLease. `workspace_lease_active_renewal_guard` y
+`workspace_lease_work_unit_binding_guard` validan que cada workspace del lease
+pertenezca al grupo exacto. Se conserva la unicidad activa legacy por Task y
+`idx_workspace_lease_active_work_unit` pasa a ser único por
+`(work_unit_id, workspace_id)`. Se conservan `workspace_lease_legacy_scope_guard`,
 `workspace_lease_scope_pair_guard`, los guards de binding inmutable y los
 guards de inmutabilidad/terminalidad, además de
-`workspace_scope_immutable_update`. Se conservan las unicidades de lease
-activo por WorkUnit y del lease legacy por Task. Los grupos históricos quedan
-sin `workspace_group_id`.
+`workspace_scope_immutable_update`. Los grupos históricos quedan sin
+`workspace_group_id`; V182 no construye grupos ni contexto retrospectivo.
 
 **V183 — M3: operaciones y PR por repo.**
 
@@ -1131,6 +1391,13 @@ Open => "open", Merged => "merged", Conflict => "conflict", Closed =>
 
 Modelos M2 adicionales: `CreateWorkspaceGroup { id: String, task_id: String,
 work_unit_id: String, root_path: String, created_at: String }`;
+`TaskRepositoryContextSnapshot { task_id: String, repo_id: String,
+commit_sha: String, captured_at: String }` y
+`CreateTaskRepositoryContextSnapshot` con los mismos campos;
+`ExecutionRepositoryResult {
+execution_id: String, task_id: String, repo_id: String, workspace_id: String,
+before_sha: Option<String>, after_sha: Option<String>,
+snapshot_digest: Option<String>, created_at: String }`;
 `WorkUnitReviewSubjectRepository { review_work_unit_id: String, task_id: String,
 repo_id: String, reviewed_work_unit_id: String,
 reviewed_work_unit_version: Option<i64>, result_execution_id: Option<String>,
@@ -1142,15 +1409,15 @@ source_work_unit_version: i64,
 result_execution_id: String, result_artifact_id: Option<String>,
 result_commit_sha: Option<String>, result_workspace_id: Option<String>,
 workspace_snapshot_digest: Option<String>, created_at: String }`.
-`WorkUnitRepo::list_review_subject_repositories(&self, work_unit_id: &str) ->
-db::Result<Vec<WorkUnitReviewSubjectRepository>>` y
-`replace_result_requirement_repositories(&self, work_unit_id: &str, rows:
-&[WorkUnitResultRequirementRepository]) -> db::Result<Vec<WorkUnitResultRequirementRepository>>` mantienen el Task y versionado exactos.
+`WorkspaceScope.workspace_group_id: Option<String>` une cada Workspace nuevo a
+su grupo; los scopes históricos quedan NULL. `WorkUnitRepo` crea de forma
+atómica el sujeto escalar y sus filas repo; las filas de resultado de Review
+se congelan una vez desde el Execution exacto.
 
 | Fase | Modelos, métodos y firmas congelados | Archivos exactos |
 |---|---|---|
 | M1 | `TaskRepository { task_id: String, repo_id: String, role: TaskRepositoryRole, position: i64, created_at: String }`; `TaskRepositoryWrite { repo_id: String, role: TaskRepositoryRole }`; `WorkUnitRepositoryScope { work_unit_id: String, task_id: String, repo_id: String, created_at: String }`. `TaskRepo::list_repositories(&self, task_id: &str) -> db::Result<Vec<TaskRepository>>`; `replace_repositories_in_tx(&self, tx: &mut Transaction<'_, Sqlite>, task_id: &str, expected_version: i64, rows: &[TaskRepositoryWrite], updated_at: &str) -> db::Result<Task>`. `WorkUnitRepo::list_repository_ids(&self, work_unit_id: &str) -> db::Result<Vec<String>>`; `CreateTask.repositories: Vec<TaskRepositoryWrite>` y `CreateWorkUnit.repository_ids: Vec<String>` se materializan en las transacciones existentes. `TaskService::create_task_with_repositories(&self, project_id: impl Into<String>, title: impl Into<String>, description: Option<String>, parent_task_id: Option<String>, priority: Option<i64>, repositories: Option<Vec<TaskRepositoryWrite>>, initial_lifecycle_state: Option<TaskLifecycleState>, merge_config: Option<Value>) -> services::Result<Task>`; `replace_task_repositories(&self, task_id: &str, expected_version: i64, repositories: Vec<TaskRepositoryWrite>) -> services::Result<Task>` (409 tras Execution, salvo replan autorizado). `UpdateProject.primary_repo_id: Option<Option<String>>`; `ProjectRepositoryService::update_primary_repo(&self, project_id: &str, expected_version: i64, primary_repo_id: Option<String>, caller_user_id: &str) -> services::Result<Project>`; mantiene `ProjectRepo::update_at_version`. | `crates/db/src/models.rs`, `crates/db/src/repository.rs`, `crates/db/src/sqlite/task.rs`, `crates/db/src/sqlite/project.rs`, `crates/db/src/sqlite/work_unit.rs`, `crates/services/src/task_service/create.rs`, nuevo `crates/services/src/task_service/repositories.rs`, `crates/services/src/task_service.rs`, nuevo `crates/services/src/project_repository_service.rs`, `crates/services/src/lib.rs`, `crates/services/src/work_unit_service.rs`. |
-| M2 | `WorkspaceGroup { id: String, task_id: String, work_unit_id: String, root_path: String, created_at: String }`; `ExecutionRepositoryResult { execution_id: String, task_id: String, repo_id: String, workspace_id: String, before_sha: Option<String>, after_sha: Option<String>, snapshot_digest: Option<String>, created_at: String }`; `WorkUnitReviewSubjectRepository` y `WorkUnitResultRequirementRepository` conservan los campos exactos de sus tablas V182. `WorkspaceRepo::create_group_for_work_unit(&self, input: CreateWorkspaceGroup) -> db::Result<WorkspaceGroup>`; `ExecutionRepo::record_repository_results(&self, execution_id: &str, rows: &[ExecutionRepositoryResult]) -> db::Result<Vec<ExecutionRepositoryResult>>`; `WorkUnitService::prepare_workspace_group(&self, task_id: &str, work_unit_id: &str) -> services::Result<WorkspaceGroup>`; `TaskService::record_execution_repository_results(&self, execution_id: &str) -> services::Result<Vec<ExecutionRepositoryResult>>`; `ValidationService::run_for_repository(&self, task_id: &str, repo_id: &str, check_key: &str, workspace_id: &str, commit_sha: &str) -> services::Result<ValidationRun>`. `ValidationRunResponse` añade `repo_id: String`, resuelto del workspace exacto. | `crates/db/src/models.rs`, `crates/db/src/repository.rs`, `crates/db/src/sqlite/workspace.rs`, `crates/db/src/sqlite/workspace_lease.rs`, `crates/db/src/sqlite/execution.rs`, `crates/db/src/sqlite/work_unit.rs`, `crates/services/src/task_service/workspace.rs`, `crates/services/src/task_service/execution/runner.rs`, `crates/services/src/work_unit_service.rs`, `crates/services/src/validation_service.rs`, `crates/services/src/collaboration_service.rs`, `crates/api-types/src/execution.rs`, `crates/api-types/src/work_unit.rs`, `crates/api-types/src/task_dispatch.rs`, `crates/api-types/src/review_validation.rs`, `crates/api/src/routes/work_units.rs`, `crates/api/src/routes/work_unit_reviews.rs`, `crates/api/src/routes/reviews.rs`. |
+| M2 | `WorkspaceGroup { id, task_id, work_unit_id, root_path, created_at }`; `WorkspaceScope.workspace_group_id: Option<String>`; `TaskRepositoryContextSnapshot { task_id, repo_id, commit_sha, captured_at }`; `ExecutionRepositoryResult { execution_id, task_id, repo_id, workspace_id, before_sha: Option<String>, after_sha: Option<String>, snapshot_digest: Option<String>, created_at }`; `CreateWorkUnitWorkspace.workspace_group_id: String`; `CreateWorkUnitExecution.workspace_leases: Vec<CreateWorkspaceLease>` (sustituye el actual `Option` singular). `WorkspaceRepo::create_group_for_work_unit(&self, input: CreateWorkspaceGroup) -> db::Result<WorkspaceGroup>` y `get_group_by_work_unit_id(&self, work_unit_id: &str) -> db::Result<Option<WorkspaceGroup>>`; `WorkUnitWorkspaceRepo::list_by_work_unit_id(&self, work_unit_id: &str) -> db::Result<Vec<Workspace>>`; `WorkspaceLeaseRepo::list_active_for_work_unit(&self, work_unit_id: &str) -> db::Result<Vec<WorkspaceLease>>` y `get_active_for_execution_workspace(&self, execution_id: &str, workspace_id: &str) -> db::Result<Option<WorkspaceLease>>`; `TaskRepo::pin_context_repository_snapshot(&self, input: CreateTaskRepositoryContextSnapshot) -> db::Result<TaskRepositoryContextSnapshot>` (insert-or-return del primer pin); `ExecutionRepo::record_repository_results(&self, execution_id: &str, rows: &[ExecutionRepositoryResult]) -> db::Result<Vec<ExecutionRepositoryResult>>` y `list_repository_results(&self, execution_id: &str) -> db::Result<Vec<ExecutionRepositoryResult>>`; `WorkUnitRepo::create_with_review_subject_repositories(&self, input: CreateWorkUnit, subject: CreateWorkUnitReviewSubject, repositories: &[WorkUnitReviewSubjectRepository], event: CreateDomainEvent) -> db::Result<CollaborationWrite<WorkUnit>>`, `list_review_subject_repositories(&self, work_unit_id: &str) -> db::Result<Vec<WorkUnitReviewSubjectRepository>>`, `freeze_review_subject_repositories(&self, review_work_unit_id: &str, rows: &[WorkUnitReviewSubjectRepository]) -> db::Result<Vec<WorkUnitReviewSubjectRepository>>`, `list_result_requirement_repositories(&self, work_unit_id: &str) -> db::Result<Vec<WorkUnitResultRequirementRepository>>` y `insert_result_requirement_repositories_in_tx(&self, tx: &mut Transaction<'_, Sqlite>, rows: &[WorkUnitResultRequirementRepository]) -> db::Result<()>`. `WorkUnitService::prepare_workspace_group(&self, source: CollaborationActorSource, work_unit_id: &str) -> services::Result<WorkspaceGroup>`; `TaskService::record_execution_repository_results(&self, execution_id: &str) -> services::Result<Vec<ExecutionRepositoryResult>>`; `ValidationService::run_for_repository(&self, task_id: &str, repo_id: &str, check_key: &str, workspace_id: &str, commit_sha: &str) -> services::Result<ValidationRun>`. `EnqueueCheckRequest.repo_id: String` y `ValidationSubject.repo_id: String` seleccionan el miembro exacto de `(repo_id, check_key)`; `ValidationRunResponse` añade `repo_id: String` resuelto del Workspace exacto. | `crates/db/migrations/V182__multirepo_workspaces_results.sql`, `crates/db/src/models.rs`, `crates/db/src/repository.rs`, `crates/db/src/sqlite/task.rs`, `crates/db/src/sqlite/workspace.rs`, `crates/db/src/sqlite/work_unit.rs`, `crates/db/src/sqlite/workspace_lease.rs`, `crates/db/src/sqlite/execution.rs`, `crates/db/src/tests.rs`, `crates/services/src/task_service/workspace.rs`, `crates/services/src/task_service/execution/runner.rs`, `crates/services/src/work_unit_service.rs`, `crates/services/src/validation_service.rs`, `crates/services/src/validation_check_runner.rs`, `crates/services/src/task_coordination/turn_outputs.rs`, `crates/services/src/validation_post_integration.rs`, `crates/services/src/coordinator_outputs/validation_request.rs`, `crates/services/src/coordinator_outputs/tests.rs`, `crates/services/src/collaboration_service.rs`, `crates/api-types/src/execution.rs`, `crates/api-types/src/work_unit.rs`, `crates/api-types/src/task_dispatch.rs`, `crates/api-types/src/review_validation.rs`, `crates/api/src/routes/work_units.rs`, `crates/api/src/routes/work_unit_reviews.rs`, `crates/api/src/routes/reviews.rs`. |
 | M3 | `TaskRepositoryMergeBatch { id: String, task_id: String, gate_evaluation_id: String, repository_set_digest: Option<String>, state: TaskRepositoryMergeBatchState, version: i64, created_at: String, updated_at: String }`; `TaskRepositoryMergeBatchRepoRow { batch_id: String, task_id: String, repo_id: String, position: i64, state: TaskRepositoryMergeBatchRepoState, work_unit_integration_id: Option<String>, task_merge_operation_id: Option<String>, pr_metadata_id: Option<String>, before_sha: Option<String>, after_sha: Option<String>, created_at: String, updated_at: String }`. `TaskIntegrationOperation` gains `repo_id: Option<String>` y `repository_merge_batch_id: Option<String>`; `PrMetadata.repo_id: Option<String>` (NULL solo para metadata histórica no admitida); `RemotePrAdmission.repo_id: String` (todo histórico se asocia en V183; los inserts nuevos no admiten NULL). `TaskRepositoryMergeBatchRepo::create(&self, batch: &TaskRepositoryMergeBatch, repos: &[TaskRepositoryMergeBatchRepoRow]) -> db::Result<TaskRepositoryMergeBatch>`; `transition_repo(&self, batch_id: &str, repo_id: &str, expected_version: i64, state: TaskRepositoryMergeBatchRepoState, work_unit_integration_id: Option<&str>, task_merge_operation_id: Option<&str>, pr_metadata_id: Option<&str>, before_sha: Option<&str>, after_sha: Option<&str>) -> db::Result<TaskRepositoryMergeBatchRepoRow>`. `PrMetadataRepo::list_by_task(&self, task_id: &str) -> db::Result<Vec<PrMetadata>>`; `get_by_task_repo(&self, task_id: &str, repo_id: &str) -> db::Result<Option<PrMetadata>>`; retires ambiguous `get_by_task_id`. `TaskIntegrationOperationManager::integrate_repositories(&self, task_id: &str, gate_evaluation_id: &str, ordered_repo_ids: &[String], idempotency_key: &str) -> services::Result<Vec<TaskRepositoryIntegrationResult>>`; `PrService::list_task_prs(&self, task_id: &str) -> services::Result<Vec<TaskRepositoryPrStatus>>`; `GateEngine::evaluate_required_checks_by_repo(&self, task_id: &str, repository_results: &[ExecutionRepositoryResult]) -> services::Result<GateEvaluation>`; `ProjectPlanService::verify_handoffs_by_repository(&self, predecessor_task_id: &str, successor_task_id: &str) -> services::Result<Vec<ProjectPlanRepositoryHandoff>>`. TaskLifecycle Merging fija `reason_kind = "task_repository_merge_batch"`, `reason_ref = batch.id`; no cambia su autoridad. | `crates/db/src/models.rs`, `crates/db/src/repository.rs`, `crates/db/src/sqlite.rs` (registro de módulo), nuevo `crates/db/src/sqlite/task_repository_merge_batch.rs`, `crates/db/src/sqlite/task_integration_operation.rs`, `crates/db/src/sqlite/pr_metadata.rs`, `crates/services/src/task_integration_operation.rs`, `crates/services/src/merge_service.rs`, `crates/services/src/pr_service.rs`, `crates/services/src/pr_feedback.rs`, `crates/services/src/gate_engine.rs`, `crates/services/src/validation_service.rs`, `crates/services/src/project_plan.rs`, `crates/services/src/task_coordination/replan.rs`, `crates/services/src/replan_classifier.rs`, `crates/services/src/task_lifecycle.rs`, `crates/api-types/src/task_repositories.rs`, `crates/api-types/src/integration.rs`, `crates/api-types/src/pr_feedback.rs`, `crates/api-types/src/public_events.rs`, `crates/api/src/routes/tasks/gates.rs`, `crates/api/src/routes/pr_feedback.rs`, `crates/api/src/routes/events.rs`. |
 
 Tipos de retorno M3 definidos en sus módulos de servicio: `TaskRepositoryIntegrationResult { repo_id: String, state: TaskRepositoryMergeBatchRepoState, work_unit_integration_id: Option<String>, before_sha: Option<String>, after_sha: Option<String> }`; `TaskRepositoryPrStatus { repo_id: String, pr_metadata_id: String, provider_pr_id: Option<String>, pr_url: Option<String>, pr_state: String, merge_status: String, admission_status: String }`; `ProjectPlanRepositoryHandoff { repo_id: String, predecessor_commit_sha: Option<String>, successor_base_sha: Option<String>, ancestry_verified: bool }`.
@@ -1391,3 +1658,284 @@ comandos pnpm; su resultado es NOT RUN y no constituye aceptación de CI.
 `explicit_auto_deref`), `use sqlx::Row` en `task_service/create.rs`, mock del
 editor Markdown en el test de selectores web y comparación del alcance heredado
 por repo/rol/posición. M1 queda **DONE**.
+
+### Propiedad de archivos y pruebas de M2
+
+**Revalidación M0/M1 contra el árbol actual.** HEAD revisado:
+`ac87ab85d0c466ca1e73c22bbdedfa186a065aee`; M1 está integrado y CI PASS según
+el Anexo M1. Las firmas M1 de `TaskRepo`, `WorkUnitRepo::list_repository_ids`,
+`TaskService::create_task_with_repositories`, `replace_task_repositories`,
+`ProjectRepositoryService::update_primary_repo` y `UpdateProject.primary_repo_id`
+coinciden con el código actual. M0 queda corregido en el sitio, no solo en este
+anexo: V182 elimina la unicidad por WorkUnit de `workspace_scope` y de leases,
+reemplaza también `work_unit_execution_admission_guard`, fija el SHA context
+en la primera preparación de grupo y conserva la barrera de autorización
+`CollaborationActorSource`. La respuesta escalar queda NULL para el primary si
+el WorkUnit no lo seleccionó. El contexto es de solo lectura sin
+`WorkspaceLease`; fallback conserva el grupo del mismo WorkUnit, mientras
+rework y micro-fix crean grupos nuevos desde cada resultado repo congelado.
+
+Los nombres y firmas M2 congelados en “Tipos Rust, repositorios y servicios”
+sustituyen la firma previa de `prepare_workspace_group(task_id, work_unit_id)`:
+recibe `source` antes de cargar o crear datos. `CreateWorkUnitExecution` pasa de
+`workspace_lease: Option<_>` a `workspace_leases: Vec<_>`, y la lectura singular
+`get_by_work_unit_id` pasa a `list_by_work_unit_id`. No se backfillea un SHA
+context inventado ni se crean grupos para Workspaces históricos. V182 se
+revalidó con `python3 -I` en SQLite 3.46.1: se aplicaron los 179 archivos de
+migración disponibles hasta V181 y el bloque V182; `PRAGMA foreign_key_check`
+devolvió cero filas, el índice de scope quedó no único y el índice activo de
+leases quedó único por `(work_unit_id, workspace_id)`; se instalaron los guards
+de grupo, pin context, resultados, freeze y borrado inmutable. PASS. Esto valida
+la aplicación DDL, los índices y las FK, no el comportamiento de cada trigger;
+ese comportamiento queda para los tests M2 indicados abajo. Cargo, pnpm, builds
+y tests no se ejecutaron.
+
+**Call paths actuales que cambia M2** (líneas del HEAD citado):
+
+- **Preparar grupo, Workspaces y leases.**
+  `WorkUnitService::prepare_coordination_workspaces`
+  (`crates/services/src/work_unit_service.rs:1562`) omite actualmente la
+  preparación si `get_by_work_unit_id` devuelve un Workspace (1594) y llama a
+  `prepare_workspace` (1608). `WorkUnitService::prepare_workspace`
+  (`work_unit_service.rs:1615`) autoriza primero mediante `source` (1620),
+  prepara el integration Workspace primary (1651), lee un único
+  `work_unit_result_requirement.result_commit_sha` (1663), carga un Workspace
+  singular (1681) o crea su fila scope (1775). M2 lo convierte en preparación
+  idempotente de todas las filas scope del grupo; cada repo writable toma su
+  propio base fijado y cada repo context toma el snapshot Task inmutable.
+  `WorkUnitService::bind_execution` (`work_unit_service.rs:1457`) hoy comprueba
+  un Workspace (1511–1527), llama a
+  `TaskService::prepare_work_unit_workspace_lease`
+  (`crates/services/src/task_service/governance.rs:19`) y pasa un lease singular
+  al `CreateWorkUnitExecution` en `work_unit_service.rs:1545–1555`.
+  `TaskService::verify_active_workspace_lease` (governance.rs:148),
+  `verify_active_work_unit_workspace_lease` (179), `workspace_lease_inputs`
+  (304), `verify_execution_workspace_authority` (387) y
+  `revoke_active_workspace_lease_for_execution` (349) también asumen un lease
+  único y repo primary: M2 verifica, renueva y revoca el conjunto exacto por
+  `(Execution, Workspace)`.
+  `prepare_integration_workspace_for_work_unit`
+  (`crates/services/src/task_service/workspace.rs:9`) y `create_fresh_workspace`
+  (253) aún resuelven `task.repo_id`; `resolve_repo_source` (339) ya resuelve un
+  Repo exacto. M2 usa este último por repo para el grupo y deja la integración
+  Task para el alcance que ya tiene.
+- **Raíz y ciclo de vida físico.**
+  `WorkspaceManager::create_work_unit_worktree`
+  (`crates/workspace/src/lib.rs:136`), `recover_work_unit_worktree` (183),
+  `cleanup_work_unit_worktree` (231) y `work_unit_worktree_path` (294) crean o
+  resuelven hoy una carpeta por Workspace. `WorkspaceCleanupService::cleanup_work_unit_workspace`
+  (`crates/services/src/workspace_cleanup.rs:293`) valida scope (316), ruta
+  exacta (373) y borra un hijo (462). M2 persiste una raíz de grupo y conserva
+  la recuperación/limpieza por cada hijo; limpiar uno no puede borrar hermanos.
+  El generador de `FORGE_WORKSPACE.md` y las instrucciones raíz para harnesses
+  son nuevos; hoy no hay generador con ese nombre.
+- **CWD del harness.**
+  `TaskDispatcher::dispatch_task_once` (`crates/services/src/task_dispatcher/dispatch.rs:39`)
+  prepara coordinación (85), llama `launch_work_unit_execution` (116) y
+  `start_execution` (133). `TaskService::launch_work_unit_execution`
+  (`crates/services/src/task_service/execution/launch.rs:362`) carga un
+  Workspace singular (408–440). `TaskService::resolve_execution_working_context`
+  (`crates/services/src/task_service.rs:519`) valida el lease y entrega el
+  `workspace.worktree_path` (543–559); `TaskService::execution_start_params`
+  (`crates/services/src/task_service/execution/runner.rs:1556`) lo envía como
+  `workspace_path`. `TaskService::run_execution`
+  (`crates/services/src/task_service/execution/runner.rs:438`) resuelve ese
+  contexto (477) y entrega `ExecutionContext.worktree_path` a
+  `TaskExecutor::execute` (957–978); hoy `has_repository_workspace` se deriva
+  de `execution.workspace_id.is_some()` (968), que es falso cuando el primary
+  no forma parte del scope y para un review group. M2 lo deriva del grupo y sus
+  scopes exactos. El contrato atraviesa
+  `HarnessAdapter::{start,execute}` (`crates/executors/src/adapter.rs:113,
+  166–170`), `ExecutionContext` (crates/executors/src/lib.rs:41–53),
+  `handle_request_with_terminal` (crates/forge-daemon/src/commands.rs:19,
+  110–114) y `DaemonRuntime::start`
+  (crates/forge-client/src/daemon_runtime.rs:369–415). Los CWD efectivos son
+  `ClaudeCodeAdapter::execute` (`crates/cli-adapters/src/claude.rs:910`) y
+  `run` (claude.rs:372–416), `CodexAdapter::execute`
+  (`crates/cli-adapters/src/codex.rs:421–424`), `CursorAdapter::execute`
+  (`crates/cli-adapters/src/cursor.rs:527–579`), `GeminiAdapter::execute`
+  (`crates/cli-adapters/src/gemini.rs:399–422`), `OpencodeAdapter::execute`
+  (`crates/cli-adapters/src/opencode.rs:377–464`), `SmithAdapter::execute`
+  (`crates/cli-adapters/src/smith.rs:229–238`), y `ShellAdapter::execute`
+  (`crates/cli-adapters/src/shell.rs:98`) → `ShellExecutor::execute`
+  (`crates/executors/src/shell.rs:111–136`). Todos ya usan el campo
+  `worktree_path`; M2 debe pasarles la raíz de grupo, no el hijo primary.
+  `prepare_non_repository_work_unit_context`
+  (`crates/services/src/task_service.rs:439`), llamado desde la rama no
+  mutante de `resolve_execution_working_context` (task_service.rs:561–589),
+  arranca hoy en el directorio aislado
+  `.forge-workunit-context`; `review_read_paths_for_execution`
+  (runner.rs:1505–1554) devuelve un solo Workspace sujeto. M2 arranca al
+  reviewer en su grupo read-only y entrega solo los hijos exactos del Review
+  Subject.
+- **Resultados antes del cierre.**
+  `TaskService::launch_work_unit_execution`
+  (`crates/services/src/task_service/execution/launch.rs:362`) inicializa hoy
+  `Execution.before_sha` y `workspace_id` desde ese único Workspace (524–530).
+  `TaskService::run_execution` (runner.rs:438) hoy captura el SHA de un único
+  worktree y detecta cambios sin commit en 1050–1079; actualiza Execution y
+  emite su evento vía `ExecutionRepo::update_with_event` en 1302–1324 y después
+  revoca el lease en 1329. M2 inspecciona todos los hijos antes de ese update,
+  falla cerrado ante cualquier cambio context o repo Git nuevo bajo la raíz,
+  y persiste un `ExecutionRepositoryResult` por repo writable antes del evento
+  terminal. `execution.workspace_id/before_sha/after_sha` reflejan primary solo
+  cuando forma parte del scope; los resultados por repo son la evidencia
+  completa.
+- **Review y requirements.**
+  `WorkUnitService::create_with_request_digest`
+  (`crates/services/src/work_unit_service.rs:201`) crea el review subject escalar
+  en `WorkUnitRepo::create_with_review_subject` (628–647).
+  `TaskReworkService::request_rework` (`crates/services/src/task_rework.rs:871`)
+  inserta un result requirement y el review subject pendiente en 1457–1487.
+  `review_subject_ready` (2009), `get_review_subject` (2039),
+  `result_requirement_available` (2145), `populate_review_subject_result`
+  (2162) y `review_subject_response` (2224) son lectores/escritores escalares.
+  `TaskService::freeze_review_subject_and_inputs`
+  (`crates/services/src/task_service/execution/runner.rs:36`) y
+  `review_read_paths_for_execution` (1505) congelan/leen un Workspace;
+  `CollaborationService::ensure_review_subject_current`
+  (`crates/services/src/collaboration_service.rs:113`) y
+  `create_review_report_from_execution` (671), más
+  `TaskService::submit_human_review_report`
+  (`crates/services/src/task_service/review.rs:351`), consumen ese sujeto.
+  `TaskReworkService::process_micro_fix_result`
+  (`crates/services/src/task_rework/micro_fix.rs:479`) y
+  `ensure_micro_fix_review_work_unit` (922) también enlazan un único SHA,
+  Workspace y subject (998–1037). M2 crea/congela/expone hijos por repo; el
+  ReviewReport sigue siendo uno.
+- **Selección de Workspace de validación.**
+  `resolve_subject` (`crates/services/src/validation_check_runner.rs:75`)
+  elige hoy `get_by_work_unit_id` (100) para `WorkUnitResult` o el integration
+  Workspace único (112), y toma HEAD/digest en 122–124.
+  `RequestValidationOutput` y `ValidationSubject`
+  (`crates/services/src/coordinator_outputs/validation_request.rs:47–63`) hoy no
+  llevan repo; `apply_request_validation`
+  (`crates/services/src/task_coordination/turn_outputs.rs:184–209`),
+  `enqueue_recheck` (217, 262–277) y `enqueue_after_integration`
+  (`crates/services/src/validation_post_integration.rs:25, 57–71`) construyen
+  `EnqueueCheckRequest` sin `repo_id`. M2 añade el repo requerido.
+  `enqueue_check_request` (`crates/services/src/validation_check_runner.rs:138`)
+  fija el sujeto; `process_request` (401) carga `request.workspace_id` (426) y
+  ejecuta `ValidationService::run_check_core`
+  (`crates/services/src/validation_service.rs:115`) con el commit/digest exactos
+  (validation_check_runner.rs:500–519). M2 resuelve `(repo_id, check_key)` al
+  Workspace/commit de ese resultado y conserva el pin hasta el fin del run; el
+  repo queda ligado al Workspace exacto guardado en la request.
+- **Respuestas REST/MCP/web.**
+  `execution_response` (`crates/api/src/routes/mod.rs:431`) y
+  `execution_response_with_usage` (467) proyectan hoy solo escalares;
+  `response_for` de WorkUnit (`crates/api/src/routes/work_units.rs:102–124`)
+  carga el sujeto escalar mediante `get_review_subject` (115–119), y
+  `validation_run_response` (`crates/api/src/routes/reviews.rs:130–152`) arma
+  el DTO sin repo. `forge_get_task` (`crates/mcp-server/src/tools/handlers.rs:286`)
+  y `forge_get_work_unit` (656) proyectan esos mismos DTOs. M2 hidrata
+  `repository_results` desde repos DB exactos; C añade
+  `execution_response_with_repository_results(db: &db::SqliteDb,
+  execution: Execution) -> ApiResult<ExecutionResponse>` y hace que todos los
+  response paths lo usen. Web consume esa lista en
+  `ExecutionDetailSidebar` (execution-detail/ExecutionDetailSidebar.tsx:155),
+  el panel de review y el de validation; nunca infiere repo por `task.repo_id`.
+- **Fallback, rework y micro-fix.**
+  `process_work_unit_fallbacks`
+  (`crates/services/src/task_dispatcher/fallback.rs:61`),
+  `process_unavailable_work_unit_execution` (135) y `activate_fallback` (612)
+  reasignan Actor conservando el mismo WorkUnit: vuelven a usar su grupo ya
+  preparado. `request_rework` (task_rework.rs:871) y
+  `process_micro_fix_result` / `ensure_micro_fix_review_work_unit`
+  (micro_fix.rs:479, 922) crean WorkUnits nuevos; su grupo nuevo deriva la base
+  de cada repo de `work_unit_result_requirement_repository`, nunca del último
+  Execution ni del repo primary por defecto.
+
+**Lanes M2: propiedad exclusiva por archivo.** No hay ownership compartido.
+B posee `work_unit_service.rs` y `task_service/execution/runner.rs` completos;
+C consume sus contratos sin editar esos archivos. A implementa primero la
+superficie DB indicada en la tabla M2 de arriba.
+
+| Lane | Alcance y archivos exclusivos |
+|---|---|
+| **A — DB/V182** | Migración `crates/db/migrations/V182__multirepo_workspaces_results.sql`; `crates/db/src/models.rs`, `repository.rs`, `sqlite/task.rs`, `sqlite/workspace.rs`, `sqlite/work_unit.rs`, `sqlite/workspace_lease.rs`, `sqlite/execution.rs`, `tests.rs`. Implementa los índices y guards V182, snapshot context, grupo/scope, leases por repo, resultados y tablas hijas de Review/Requirement, con row mappers y métodos exactos de M0. No toca servicios ni contratos públicos. |
+| **B — grupo, autoridad y Execution** | `crates/workspace/src/lib.rs`; `crates/services/src/work_unit_service.rs`; `crates/services/src/task_service.rs`, `task_service/workspace.rs`, `task_service/governance.rs`, `task_service/execution/launch.rs`, `task_service/execution/runner.rs`; `crates/services/src/task_dispatcher/dispatch.rs`, `task_dispatcher/fallback.rs`; `crates/services/src/workspace_cleanup.rs`, `recovery.rs`; `crates/executors/src/adapter.rs`, `lib.rs`, `shell.rs`; `crates/cli-adapters/src/claude.rs`, `codex.rs`, `cursor.rs`, `gemini.rs`, `opencode.rs`, `shell.rs`, `smith.rs`; `crates/forge-daemon/src/commands.rs`; `crates/forge-client/src/daemon_runtime.rs`; prueba de ejecución en `crates/services/src/task_service/tests/service_tests/cases/executions.rs` y prueba inline de fallback en `task_dispatcher/fallback.rs`. B implementa `WorkUnitService::prepare_workspace_group(&self, source: CollaborationActorSource, work_unit_id: &str) -> services::Result<WorkspaceGroup>` y `TaskService::record_execution_repository_results(&self, execution_id: &str) -> services::Result<Vec<ExecutionRepositoryResult>>`; registra resultados antes del evento terminal. B también adapta la creación directa de review subject en `work_unit_service.rs` para llamar el método DB atómico de A. |
+| **C — resultados derivados y superficies** | `crates/services/src/task_rework.rs`, `task_rework/micro_fix.rs`, `task_rework/validation_triage.rs`, `validation_check_runner.rs`, `validation_service.rs`, `validation_post_integration.rs`, `task_coordination/turn_outputs.rs`, `coordinator_outputs/validation_request.rs`, `coordinator_outputs/tests.rs`, `collaboration_service.rs`, `task_service/review.rs`; `crates/api-types/src/execution.rs`, `work_unit.rs`, `task_dispatch.rs`, `review_validation.rs`, `public_events.rs`, `lib.rs`; `crates/api/src/routes/mod.rs`, `executions.rs`, `work_units.rs`, `work_unit_reviews.rs`, `reviews.rs`, `tasks/reviews.rs`, `events.rs`; `crates/api/tests/happy_path.rs`, `work_units.rs`, `work_unit_reviews.rs`; `crates/mcp-server/src/tools/descriptors.rs`, `tools/handlers.rs`, `tests.rs`; `web/src/api/hooks.ts`, `pages/TaskDetailPage.tsx`, `components/execution-detail/ExecutionDetailSidebar.tsx`, `components/task-detail/task-validation-panel.tsx`, `task-verification.ts`, `task-verification.test.ts`, `work-unit-review-panel.tsx`, `work-unit-review-panel.test.tsx`, `web/src/types/generated/`; `.github/workflows/build-local-linux.yml`, `CHANGELOG.md`, `docs/api.md`, `docs/concepts/executions.md`, `docs/concepts/work-units.md`, `docs/concepts/review-and-validation.md`. C publica `ExecutionResponse.repository_results`, resultados de subject por repo, `ValidationRunResponse.repo_id` y el evento `execution.repository_results_recorded`; valida cada check contra un Workspace y commit exactos. |
+
+**Frontera entre B y C.** B es dueño de toda la preparación/admisión en
+`work_unit_service.rs` y del congelado de inputs en `runner.rs`; C llama
+`WorkUnitService::prepare_workspace_group(source, work_unit_id)`, consume
+`ExecutionRepo::list_repository_results(execution_id)` y
+`WorkUnitRepo::{list_review_subject_repositories,
+list_result_requirement_repositories}` de A, y modifica solo sus archivos.
+Para crear subjects por repo, B y C llaman
+`WorkUnitRepo::create_with_review_subject_repositories(input, subject,
+repositories, event)` de A para altas atómicas y usa
+`insert_result_requirement_repositories_in_tx(tx, rows)` en la transacción de
+rework; C no añade SQL de escritura al archivo de B. La congelación de hijos de
+Review Subject usa `freeze_review_subject_repositories(review_work_unit_id,
+rows)` de A. El fallback de B mantiene el grupo del WorkUnit exacto; los
+WorkUnits nuevos de C reciben grupos propios basados en sus filas de result
+requirement.
+
+**Tests M2 exactos y ubicación.** Cada nombre empieza por uno de los dos
+prefijos congelados; los casos requeridos son obligatorios:
+
+- DB: `multirepo_workspace_v182_allows_multiple_scopes_and_active_repo_leases`
+  y `multirepo_workspace_context_snapshot_pins_once_and_is_immutable` —
+  `crates/db/src/tests.rs`; `multirepo_result_rows_require_exact_task_repo_and_workspace`
+  y `multirepo_result_review_and_requirement_rows_bind_exact_execution` —
+  mismo archivo; rechaza versión de WorkUnit distinta, huérfanos del padre
+  escalar y digest distinto incluso cuando el resultado guarda NULL.
+- Grupo con **dos repos writable y uno context**:
+  `multirepo_workspace_group_prepares_two_writable_and_one_context_repo` —
+  `crates/services/src/task_service/tests/service_tests/cases/executions.rs`.
+  Comprueba tres worktrees hermanos, dos leases, pin context compartido y raíz
+  `FORGE_WORKSPACE.md` fuera de los repos.
+- Review group: `multirepo_workspace_review_group_is_read_only_and_exact_subject_scoped`
+  — mismo `executions.rs`; solo contiene los repos/SHA del subject y no admite
+  WorkspaceLease.
+- Escritura accidental en context:
+  `multirepo_workspace_context_write_fails_execution_with_reason` — mismo
+  `executions.rs`; modifica HEAD, tracked y/o untracked del repo context y exige
+  Execution failed con repo y motivo persistidos, sin resultado exitoso.
+- Regresión de **un solo repo**:
+  `multirepo_workspace_single_repo_preserves_legacy_scalar_response` —
+  `crates/api/tests/happy_path.rs`; conserva JSON escalar existente y devuelve
+  exactamente un Workspace y un repository result.
+- B: `multirepo_result_records_all_repo_shas_before_terminal_event` —
+  `executions.rs`; `multirepo_workspace_fallback_reuses_same_work_unit_group`
+  — `crates/services/src/task_dispatcher/fallback.rs`.
+- C: `multirepo_result_review_subject_freezes_each_repo` y
+  `multirepo_result_rework_requirement_pins_each_repo_base` —
+  `crates/services/src/task_rework.rs`; `multirepo_result_micro_fix_uses_exact_repo_bases`
+  — `crates/services/src/task_rework/micro_fix.rs`;
+  `multirepo_result_validation_output_requires_repo_id` —
+  `crates/services/src/coordinator_outputs/tests.rs`;
+  `multirepo_result_validation_selects_requested_repo_workspace` —
+  `crates/services/src/validation_check_runner.rs`.
+- API: `multirepo_result_execution_response_lists_each_repo` y
+  `multirepo_result_validation_response_names_exact_repo` —
+  `crates/api/tests/work_units.rs`; `multirepo_result_review_response_lists_each_repo`
+  — `crates/api/tests/work_unit_reviews.rs`.
+- MCP: `multirepo_result_reader_tools_expose_repo_results` —
+  `crates/mcp-server/src/tests.rs`.
+- Web: `multirepo_result_execution_sidebar_renders_repo_shas` — nuevo
+  `web/src/components/execution-detail/ExecutionDetailSidebar.test.tsx`;
+  `multirepo_result_review_panel_lists_subject_repos` —
+  `web/src/components/task-detail/work-unit-review-panel.test.tsx`;
+  `multirepo_result_validation_labels_repo` —
+  `web/src/components/task-detail/task-verification.test.ts`.
+
+Añadir estos filtros a `.github/workflows/build-local-linux.yml` junto a los de
+M1 (no ejecutados al congelar este plan):
+
+~~~sh
+cargo test --locked -p db --lib multirepo_workspace_
+cargo test --locked -p db --lib multirepo_result_
+cargo test --locked -p services --lib multirepo_workspace_
+cargo test --locked -p services --lib multirepo_result_
+cargo test --locked -p api --test happy_path multirepo_workspace_
+cargo test --locked -p api --test work_units multirepo_result_
+cargo test --locked -p api --test work_unit_reviews multirepo_result_
+cargo test --locked -p mcp-server --lib multirepo_result_
+~~~
+
+Las pruebas web conservan la suite pnpm existente; la validación M2 de Rust se
+filtra por los nombres anteriores. Ninguno de estos filtros se ejecuta al
+congelar M2.
