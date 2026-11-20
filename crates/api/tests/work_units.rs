@@ -81,7 +81,135 @@ async fn multirepo_result_execution_response_lists_each_repo() {
     )
     .await;
     let now = db::now_rfc3339();
+    if db::TaskRoleRepo::get_by_task_and_role(&*harness.state.db, &task.id, "implementer")
+        .await
+        .expect("implementer TaskRole lookup succeeds")
+        .is_none()
+    {
+        db::TaskRoleRepo::create_with_configuration(
+            &*harness.state.db,
+            db::CreateTaskRole {
+                id: uuid::Uuid::new_v4().to_string(),
+                task_id: task.id.clone(),
+                role: "implementer".to_owned(),
+                coordination_mode: Some(db::CoordinationMode::Collaborative),
+                policy_json: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            r#"{"schema_version":1,"display_label":null,"capabilities":[],"rework":null}"#,
+        )
+        .await
+        .expect("implementer TaskRole creates");
+    }
+    let work_unit_id = uuid::Uuid::new_v4().to_string();
+    db::WorkUnitRepo::create(
+        &*harness.state.db,
+        db::CreateWorkUnit {
+            id: work_unit_id.clone(),
+            task_id: task.id.clone(),
+            parent_work_unit_id: None,
+            title: "Read repository result rows".to_owned(),
+            scope: "Expose exact results for both writable repositories".to_owned(),
+            execution_instructions: None,
+            role: "implementer".to_owned(),
+            assigned_actor: None,
+            requires_integration: true,
+            provenance: None,
+            artifact_input_ids: Vec::new(),
+            repository_ids: Vec::new(),
+            review_approval_gate_id: None,
+            review_approval_line_id: None,
+            created_by: db::ActorRef::Human("test-user-id".to_owned()),
+            created_at: now.clone(),
+        },
+        db::CreateDomainEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            event_type: "work_unit.created".to_owned(),
+            entity_type: "work_unit".to_owned(),
+            entity_id: work_unit_id.clone(),
+            actor_type: "human".to_owned(),
+            actor_id: Some("test-user-id".to_owned()),
+            scope_type: "task".to_owned(),
+            scope_id: task.id.clone(),
+            correlation_id: work_unit_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("work-unit-created:{work_unit_id}")),
+            payload_json: json!({
+                "work_unit_id": work_unit_id,
+                "task_id": task.id,
+            })
+            .to_string(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("repository WorkUnit creates");
+    let group_id = uuid::Uuid::new_v4().to_string();
+    let group_root = workspace_root.path().join(format!("group-{group_id}"));
+    tokio::fs::create_dir_all(&group_root)
+        .await
+        .expect("WorkUnit WorkspaceGroup root creates");
+    db::WorkspaceRepo::create_group_for_work_unit(
+        &*harness.state.db,
+        db::CreateWorkspaceGroup {
+            id: group_id.clone(),
+            task_id: task.id.clone(),
+            work_unit_id: work_unit_id.clone(),
+            root_path: group_root.to_string_lossy().into_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("WorkUnit WorkspaceGroup creates");
     let execution_id = uuid::Uuid::new_v4().to_string();
+    let mut results = Vec::new();
+    let mut primary_workspace_id = None;
+    let mut primary_sha = None;
+    for (repo_id, repo_path) in [
+        (primary_repo_id.clone(), primary_path),
+        (affected_repo_id.clone(), affected_path),
+    ] {
+        let sha = git_head(&repo_path);
+        let workspace_id = uuid::Uuid::new_v4().to_string();
+        let workspace = db::WorkUnitWorkspaceRepo::create_for_work_unit(
+            &*harness.state.db,
+            db::CreateWorkUnitWorkspace {
+                workspace: db::CreateWorkspace {
+                    id: workspace_id.clone(),
+                    task_id: task.id.clone(),
+                    repo_id: repo_id.clone(),
+                    worktree_path: group_root.join(&repo_id).to_string_lossy().into_owned(),
+                    branch: format!("agent/{}-{work_unit_id}", task.id),
+                    status: db::WorkspaceStatus::Ready,
+                    before_sha: Some(sha.clone()),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                work_unit_id: work_unit_id.clone(),
+                workspace_group_id: group_id.clone(),
+            },
+        )
+        .await
+        .expect("WorkUnit Workspace creates");
+        if repo_id == primary_repo_id {
+            primary_workspace_id = Some(workspace.id.clone());
+            primary_sha = Some(sha.clone());
+        }
+        results.push(db::ExecutionRepositoryResult {
+            execution_id: execution_id.clone(),
+            task_id: task.id.clone(),
+            repo_id: repo_id.clone(),
+            workspace_id: workspace.id,
+            before_sha: Some(sha.clone()),
+            after_sha: Some(sha),
+            snapshot_digest: (repo_id != primary_repo_id).then(|| "a".repeat(64)),
+            created_at: now.clone(),
+        });
+    }
+    let primary_workspace_id = primary_workspace_id.expect("primary Workspace exists");
+    let primary_sha = primary_sha.expect("primary Workspace has a base SHA");
     db::ExecutionRepo::create(
         &*harness.state.db,
         db::CreateExecution {
@@ -101,8 +229,8 @@ async fn multirepo_result_execution_response_lists_each_repo() {
             last_activity_at: None,
             summary: None,
             logs_path: None,
-            before_sha: Some(git_head(&primary_path)),
-            after_sha: Some(git_head(&primary_path)),
+            before_sha: None,
+            after_sha: None,
             error: None,
             executor_config_snapshot_json: None,
             workspace_id: None,
@@ -112,40 +240,21 @@ async fn multirepo_result_execution_response_lists_each_repo() {
     )
     .await
     .expect("Execution creates");
-    let mut results = Vec::new();
-    for (repo_id, repo_path) in [
-        (primary_repo_id.clone(), primary_path),
-        (affected_repo_id.clone(), affected_path),
-    ] {
-        let sha = git_head(&repo_path);
-        let workspace_id = uuid::Uuid::new_v4().to_string();
-        db::WorkspaceRepo::create(
-            &*harness.state.db,
-            db::CreateWorkspace {
-                id: workspace_id.clone(),
-                task_id: task.id.clone(),
-                repo_id: repo_id.clone(),
-                worktree_path: repo_path.to_string_lossy().into_owned(),
-                branch: "main".to_owned(),
-                status: db::WorkspaceStatus::Ready,
-                before_sha: Some(sha.clone()),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("integration Workspace creates");
-        results.push(db::ExecutionRepositoryResult {
-            execution_id: execution_id.clone(),
-            task_id: task.id.clone(),
-            repo_id,
-            workspace_id,
-            before_sha: Some(sha.clone()),
-            after_sha: Some(sha),
-            snapshot_digest: Some("a".repeat(64)),
-            created_at: now.clone(),
-        });
-    }
+    sqlx::query(
+        "UPDATE execution
+         SET work_unit_id = ?, work_unit_version = 1, workspace_id = ?,
+             before_sha = ?, after_sha = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&work_unit_id)
+    .bind(&primary_workspace_id)
+    .bind(&primary_sha)
+    .bind(&primary_sha)
+    .bind(&now)
+    .bind(&execution_id)
+    .execute(harness.state.db.pool())
+    .await
+    .expect("Execution binds to its exact WorkUnit WorkspaceGroup");
     db::ExecutionRepo::record_repository_results(&*harness.state.db, &execution_id, &results)
         .await
         .expect("repository results record");

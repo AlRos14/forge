@@ -151,7 +151,7 @@ END;
 -- write every result explicitly before terminalization; this fills only a
 -- missing scalar repository row and leaves those exact rows untouched.
 CREATE TRIGGER execution_repository_result_legacy_scalar_after_update
-AFTER UPDATE OF status, work_unit_id, work_unit_version ON execution
+AFTER UPDATE OF status, work_unit_id, work_unit_version, after_sha ON execution
 WHEN NEW.status = 'completed'
  AND NEW.work_unit_id IS NOT NULL
  AND NEW.workspace_id IS NOT NULL

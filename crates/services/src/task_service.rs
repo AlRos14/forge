@@ -1638,40 +1638,6 @@ impl TaskService {
                 ));
             }
         }
-        let (status, stop_reason, stopped_by, resume_policy, stopped_at, error) =
-            match outcome.as_str() {
-                "completed" => (
-                    ExecutionStatus::Completed,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(None),
-                ),
-                "cancelled" => (
-                    ExecutionStatus::Cancelled,
-                    Some(Some(db::StopReason::ExecutorCancelled)),
-                    Some(Some(
-                        Actor::system(api_types::SystemComponent::Executor).display(),
-                    )),
-                    Some(Some(db::ResumePolicy::Manual)),
-                    Some(Some(notification.ts.clone())),
-                    Some(None),
-                ),
-                _ => (
-                    ExecutionStatus::Failed,
-                    Some(Some(db::StopReason::ExecutorFailed)),
-                    Some(Some(
-                        Actor::system(api_types::SystemComponent::Executor).display(),
-                    )),
-                    Some(Some(db::ResumePolicy::Manual)),
-                    Some(Some(notification.ts.clone())),
-                    Some(Some(review_result_error.unwrap_or_else(|| {
-                        remote_terminal_error_message(notification.exit_code, signal, error)
-                    }))),
-                ),
-            };
-
         let executor_unavailable = notification.failure_class
             == Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable);
         let route_effective_cwd = if notification
@@ -1739,6 +1705,67 @@ impl TaskService {
             .or(current_execution.executor_config_snapshot_json.as_deref())
             .map(ToOwned::to_owned);
 
+        let mut terminal_after_sha = notification.after_sha.clone().map(Some);
+        if outcome == "completed" && !is_formal_review && current_execution.work_unit_id.is_some() {
+            match self
+                .record_execution_repository_results(&current_execution.id)
+                .await
+            {
+                Ok(repository_results) if !repository_results.is_empty() => {
+                    terminal_after_sha = Some(current_execution.workspace_id.as_deref().and_then(
+                        |workspace_id| {
+                            repository_results
+                                .iter()
+                                .find(|result| result.workspace_id == workspace_id)
+                                .and_then(|result| result.after_sha.clone())
+                        },
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    outcome = "failed".to_owned();
+                    terminal_after_sha = Some(None);
+                    review_result_error = Some(format!(
+                        "repository result capture failed before terminalization: {error}"
+                    ));
+                }
+            }
+        }
+
+        let (status, stop_reason, stopped_by, resume_policy, stopped_at, error) =
+            match outcome.as_str() {
+                "completed" => (
+                    ExecutionStatus::Completed,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(None),
+                ),
+                "cancelled" => (
+                    ExecutionStatus::Cancelled,
+                    Some(Some(db::StopReason::ExecutorCancelled)),
+                    Some(Some(
+                        Actor::system(api_types::SystemComponent::Executor).display(),
+                    )),
+                    Some(Some(db::ResumePolicy::Manual)),
+                    Some(Some(notification.ts.clone())),
+                    Some(None),
+                ),
+                _ => (
+                    ExecutionStatus::Failed,
+                    Some(Some(db::StopReason::ExecutorFailed)),
+                    Some(Some(
+                        Actor::system(api_types::SystemComponent::Executor).display(),
+                    )),
+                    Some(Some(db::ResumePolicy::Manual)),
+                    Some(Some(notification.ts.clone())),
+                    Some(Some(review_result_error.unwrap_or_else(|| {
+                        remote_terminal_error_message(notification.exit_code, signal, error)
+                    }))),
+                ),
+            };
+
         let execution_id = notification.execution_id.clone();
         let terminal_ts = notification.ts.clone();
         let updated_at = now_rfc3339();
@@ -1759,7 +1786,7 @@ impl TaskService {
                 summary: notification.summary.map(Some),
                 logs_path: None,
                 before_sha: None,
-                after_sha: notification.after_sha.map(Some),
+                after_sha: terminal_after_sha,
                 error,
                 executor_config_snapshot_json: snapshot_update.map(Some),
                 updated_at,

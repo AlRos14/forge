@@ -633,7 +633,9 @@ impl WorkUnitService {
                 }
                 (None, None)
             };
-            let repository_subjects = if let Some(result_execution_id) =
+            let repository_subjects = if !reviewed.requires_integration {
+                Vec::new()
+            } else if let Some(result_execution_id) =
                 result_execution_id.as_deref()
             {
                 ExecutionRepo::list_repository_results(&*self.db, result_execution_id)

@@ -1695,8 +1695,41 @@ impl ExecutionRepo for SqliteDb {
                                 AND coordination.team_stale = 0
                           )
                       )
-                      AND ((w.requires_integration = 1 AND ? IS NOT NULL)
-                           OR (w.requires_integration = 0 AND ? IS NULL))
+                      AND ? IS (
+                          SELECT primary_scope.workspace_id
+                          FROM task current_task
+                          JOIN workspace_scope primary_scope
+                            ON primary_scope.work_unit_id = w.id
+                           AND primary_scope.task_id = w.task_id
+                           AND primary_scope.scope_kind = 'work_unit'
+                          JOIN workspace primary_workspace
+                            ON primary_workspace.id = primary_scope.workspace_id
+                           AND primary_workspace.task_id = primary_scope.task_id
+                          WHERE current_task.id = w.task_id
+                            AND w.requires_integration = 1
+                            AND primary_workspace.repo_id = current_task.repo_id
+                            AND (NOT EXISTS (
+                                SELECT 1 FROM work_unit_repository selected
+                                WHERE selected.work_unit_id = w.id
+                            ) OR EXISTS (
+                                SELECT 1 FROM work_unit_repository selected
+                                WHERE selected.work_unit_id = w.id
+                                  AND selected.repo_id = current_task.repo_id
+                            ))
+                            AND (
+                                (primary_scope.workspace_group_id IS NULL AND NOT EXISTS (
+                                    SELECT 1 FROM workspace_group group_row
+                                    WHERE group_row.work_unit_id = w.id
+                                ))
+                                OR EXISTS (
+                                    SELECT 1 FROM workspace_group group_row
+                                    WHERE group_row.id = primary_scope.workspace_group_id
+                                      AND group_row.task_id = w.task_id
+                                      AND group_row.work_unit_id = w.id
+                                )
+                            )
+                          LIMIT 1
+                      )
                 )",
             )
             .bind(&execution.id)
@@ -1711,7 +1744,6 @@ impl ExecutionRepo for SqliteDb {
             .bind(&actor_kind)
             .bind(&actor_id)
             .bind(execution.workspace_id.as_deref())
-            .bind(execution.workspace_id.as_deref())
             .fetch_one(&mut *tx)
             .await?;
             if !work_unit_authority_is_current {
@@ -1720,45 +1752,142 @@ impl ExecutionRepo for SqliteDb {
             }
         }
 
-        if let (Some(work_unit_id), Some(workspace_id)) = (
-            execution.work_unit_id.as_deref(),
-            execution.workspace_id.as_deref(),
-        ) {
-            let actor_id = execution
-                .actor_ref()
-                .map(|actor| actor.id().to_owned())
-                .ok_or_else(|| {
-                    DbError::Check("provider start claim has no exact Workspace Actor".to_owned())
-                })?;
-            let lease_is_current: bool = sqlx::query_scalar(
+        if let Some(work_unit_id) = execution.work_unit_id.as_deref() {
+            let repository_lease_required: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
-                    SELECT 1 FROM workspace_lease
-                    WHERE task_id = ? AND work_unit_id = ? AND workspace_id = ?
-                      AND execution_id = ? AND operation_idempotency_key = ?
-                      AND role = CASE WHEN EXISTS (
+                    SELECT 1 FROM work_unit
+                    WHERE id = ? AND task_id = ? AND requires_integration = 1
+                      AND NOT EXISTS (
                           SELECT 1 FROM execution_task_role_authority authority
                           JOIN json_each(authority.capabilities_json) capability
                           WHERE authority.execution_id = ?
                             AND capability.type = 'text'
                             AND capability.value = 'formal_review'
-                      ) THEN 'reviewer' ELSE 'worker' END
-                      AND assigned_principal_type = 'agent' AND assigned_principal_id = ?
-                      AND status = 'active' AND expires_at > ?
+                      )
                 )",
             )
-            .bind(&execution.task_id)
             .bind(work_unit_id)
-            .bind(workspace_id)
+            .bind(&execution.task_id)
             .bind(&execution.id)
-            .bind(&execution.id)
-            .bind(&execution.id)
-            .bind(&actor_id)
-            .bind(crate::now_rfc3339())
             .fetch_one(&mut *tx)
             .await?;
-            if !lease_is_current {
-                tx.commit().await?;
-                return Ok(ProviderStartClaim::AuthorityLost);
+            if repository_lease_required {
+                let actor_id = execution
+                    .actor_ref()
+                    .map(|actor| actor.id().to_owned())
+                    .ok_or_else(|| {
+                        DbError::Check(
+                            "provider start claim has no exact Workspace Actor".to_owned(),
+                        )
+                    })?;
+                let lease_is_current: bool = sqlx::query_scalar(
+                    "WITH expected AS (
+                    SELECT workspace.id AS workspace_id, repository.repo_id,
+                           scope.workspace_group_id, task.project_id,
+                           CASE WHEN workspace.id IS NOT NULL
+                                  AND workspace.status = 'ready'
+                                  AND (
+                                      (scope.workspace_group_id IS NULL AND NOT EXISTS (
+                                          SELECT 1 FROM workspace_group group_row
+                                          WHERE group_row.work_unit_id = unit.id
+                                      ))
+                                      OR EXISTS (
+                                          SELECT 1 FROM workspace_group group_row
+                                          WHERE group_row.id = scope.workspace_group_id
+                                            AND group_row.task_id = task.id
+                                            AND group_row.work_unit_id = unit.id
+                                      )
+                                  )
+                                THEN 1 ELSE 0 END AS scope_is_current,
+                           COALESCE(workspace.before_sha, repo.default_branch) AS base_ref
+                    FROM work_unit unit
+                    JOIN task ON task.id = unit.task_id
+                    JOIN task_repository repository
+                      ON repository.task_id = task.id
+                     AND repository.role IN ('primary', 'affected')
+                    JOIN repo ON repo.id = repository.repo_id
+                    LEFT JOIN workspace ON workspace.task_id = task.id
+                      AND workspace.repo_id = repository.repo_id
+                      AND EXISTS (
+                          SELECT 1 FROM workspace_scope candidate_scope
+                          WHERE candidate_scope.workspace_id = workspace.id
+                            AND candidate_scope.task_id = task.id
+                            AND candidate_scope.scope_kind = 'work_unit'
+                            AND candidate_scope.work_unit_id = unit.id
+                      )
+                    LEFT JOIN workspace_scope scope
+                      ON scope.workspace_id = workspace.id AND scope.task_id = task.id
+                     AND scope.scope_kind = 'work_unit'
+                     AND scope.work_unit_id = unit.id
+                    WHERE unit.id = ? AND unit.task_id = ?
+                      AND unit.requires_integration = 1
+                      AND (NOT EXISTS (
+                          SELECT 1 FROM work_unit_repository selected
+                          WHERE selected.work_unit_id = unit.id
+                      ) OR EXISTS (
+                          SELECT 1 FROM work_unit_repository selected
+                          WHERE selected.work_unit_id = unit.id
+                            AND selected.repo_id = repository.repo_id
+                      ))
+                ), expected_count AS (
+                    SELECT COUNT(*) AS total FROM expected
+                )
+                SELECT EXISTS(
+                    SELECT 1 FROM expected_count
+                    WHERE total > 0
+                      AND total = (
+                          SELECT COUNT(*) FROM workspace_lease lease
+                          WHERE lease.task_id = ? AND lease.work_unit_id = ?
+                            AND lease.execution_id = ? AND lease.status = 'active'
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM expected
+                          WHERE scope_is_current != 1 OR NOT EXISTS (
+                              SELECT 1 FROM workspace_lease lease
+                              WHERE lease.project_id = expected.project_id
+                                AND lease.task_id = ? AND lease.work_unit_id = ?
+                                AND lease.workspace_id = expected.workspace_id
+                                AND lease.execution_id = ?
+                                AND lease.operation_idempotency_key = CASE
+                                    WHEN expected.workspace_group_id IS NULL THEN ?
+                                    ELSE ? || ':workspace:' || expected.repo_id
+                                END
+                                AND lease.repository_binding_id = expected.repo_id
+                                AND lease.base_ref = expected.base_ref
+                                AND lease.role = CASE WHEN EXISTS (
+                                    SELECT 1 FROM execution_task_role_authority authority
+                                    JOIN json_each(authority.capabilities_json) capability
+                                    WHERE authority.execution_id = ?
+                                      AND capability.type = 'text'
+                                      AND capability.value = 'formal_review'
+                                ) THEN 'reviewer' ELSE 'worker' END
+                                AND lease.assigned_principal_type = 'agent'
+                                AND lease.assigned_principal_id = ?
+                                AND lease.status = 'active'
+                                AND lease.expires_at > ?
+                          )
+                      )
+                )",
+                )
+                .bind(work_unit_id)
+                .bind(&execution.task_id)
+                .bind(&execution.task_id)
+                .bind(work_unit_id)
+                .bind(&execution.id)
+                .bind(&execution.task_id)
+                .bind(work_unit_id)
+                .bind(&execution.id)
+                .bind(&execution.id)
+                .bind(&execution.id)
+                .bind(&execution.id)
+                .bind(&actor_id)
+                .bind(crate::now_rfc3339())
+                .fetch_one(&mut *tx)
+                .await?;
+                if !lease_is_current {
+                    tx.commit().await?;
+                    return Ok(ProviderStartClaim::AuthorityLost);
+                }
             }
         }
 

@@ -1239,13 +1239,13 @@ impl TaskService {
             }
         }
 
-        if result.status == ExecutionOutcome::Completed && working_context.workspace_group.is_some()
+        if result.status == ExecutionOutcome::Completed && current_execution.work_unit_id.is_some()
         {
             match self
                 .record_execution_repository_results(&current_execution.id)
                 .await
             {
-                Ok(repository_results) => {
+                Ok(repository_results) if !repository_results.is_empty() => {
                     result.after_sha =
                         current_execution
                             .workspace_id
@@ -1257,6 +1257,7 @@ impl TaskService {
                                     .and_then(|repository| repository.after_sha.clone())
                             });
                 }
+                Ok(_) => {}
                 Err(error) => {
                     result.status = ExecutionOutcome::Failed;
                     result.after_sha = None;
@@ -1845,29 +1846,81 @@ impl TaskService {
         let Some(work_unit_id) = execution.work_unit_id.as_deref() else {
             return Ok(Vec::new());
         };
-        let Some(group) = WorkspaceRepo::get_group_by_work_unit_id(&*self.db, work_unit_id).await?
-        else {
-            return Ok(Vec::new());
-        };
-        if group.task_id != execution.task_id || execution.status != ExecutionStatus::Running {
+        if execution.status != ExecutionStatus::Running {
             return Err(ServiceError::invalid_operation(
-                "repository results require the exact running WorkspaceGroup Execution",
+                "repository results require the exact running WorkUnit Execution",
             ));
         }
-        self.verify_execution_workspace_authority(&execution)
-            .await?;
-        let working_context = self.resolve_execution_working_context(&execution).await?;
-        self.verify_read_only_group_members(&execution, &working_context)
-            .await?;
-        if crate::role_capabilities::execution_has_capability(
+        let unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
+            .await?
+            .filter(|unit| unit.task_id == execution.task_id)
+            .ok_or_else(|| ServiceError::not_found("work_unit", work_unit_id.to_owned()))?;
+        let group = WorkspaceRepo::get_group_by_work_unit_id(&*self.db, work_unit_id).await?;
+        let formal_review = crate::role_capabilities::execution_has_capability(
             &self.db,
             &execution.id,
             api_types::TaskRoleCapability::FormalReview,
         )
-        .await?
-        {
+        .await?;
+        let result_workspaces = if let Some(group) = group.as_ref() {
+            if group.task_id != execution.task_id || group.work_unit_id != work_unit_id {
+                return Err(ServiceError::invalid_operation(
+                    "repository results require the exact WorkUnit WorkspaceGroup",
+                ));
+            }
+            let working_context = self.resolve_execution_working_context(&execution).await?;
+            self.verify_read_only_group_members(&execution, &working_context)
+                .await?;
+            if formal_review {
+                return Ok(Vec::new());
+            }
+            working_context.workspaces
+        } else if formal_review {
             return Ok(Vec::new());
-        }
+        } else if !unit.requires_integration {
+            if execution.workspace_id.is_some() {
+                return Err(ServiceError::invalid_operation(
+                    "non-repository WorkUnit Execution cannot produce repository results",
+                ));
+            }
+            return Ok(Vec::new());
+        } else {
+            let _working_context = self.resolve_execution_working_context(&execution).await?;
+            let workspaces =
+                WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, work_unit_id).await?;
+            let primary_repo_id = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+                .await?
+                .and_then(|task| task.repo_id)
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "group-less repository WorkUnit requires its primary Task repository",
+                    )
+                })?;
+            if workspaces.len() != 1
+                || workspaces[0].repo_id != primary_repo_id
+                || execution.workspace_id.as_deref() != Some(workspaces[0].id.as_str())
+            {
+                return Err(ServiceError::invalid_operation(
+                    "group-less repository WorkUnit requires its exact single primary Workspace",
+                ));
+            }
+            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &workspaces[0].id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("workspace scope", workspaces[0].id.clone())
+                })?;
+            if scope.task_id != execution.task_id
+                || scope.kind != db::WorkspaceScopeKind::WorkUnit
+                || scope.work_unit_id.as_deref() != Some(work_unit_id)
+                || scope.workspace_group_id.is_some()
+                || workspaces[0].status != WorkspaceStatus::Ready
+            {
+                return Err(ServiceError::invalid_operation(
+                    "group-less repository result is outside its exact single WorkUnit Workspace",
+                ));
+            }
+            workspaces
+        };
         let task_repositories = TaskRepo::list_repositories(&*self.db, &execution.task_id).await?;
         let selected = WorkUnitRepo::list_repository_ids(&*self.db, work_unit_id).await?;
         let writable_ids = task_repositories
@@ -1881,7 +1934,7 @@ impl TaskService {
             .map(|repository| repository.repo_id.as_str())
             .collect::<HashSet<_>>();
         let mut rows = Vec::with_capacity(writable_ids.len());
-        for workspace in &working_context.workspaces {
+        for workspace in &result_workspaces {
             if !writable_ids.contains(workspace.repo_id.as_str()) {
                 continue;
             }
@@ -1890,11 +1943,12 @@ impl TaskService {
                 .ok_or_else(|| ServiceError::not_found("workspace scope", workspace.id.clone()))?;
             if scope.task_id != execution.task_id
                 || scope.work_unit_id.as_deref() != Some(work_unit_id)
-                || scope.workspace_group_id.as_deref() != Some(group.id.as_str())
+                || scope.workspace_group_id.as_deref()
+                    != group.as_ref().map(|group| group.id.as_str())
                 || workspace.status != WorkspaceStatus::Ready
             {
                 return Err(ServiceError::invalid_operation(format!(
-                    "repository {} result Workspace is outside the exact group scope",
+                    "repository {} result Workspace is outside the exact WorkUnit scope",
                     workspace.repo_id
                 )));
             }
@@ -1938,7 +1992,7 @@ impl TaskService {
         }
         if rows.len() != writable_ids.len() {
             return Err(ServiceError::invalid_operation(
-                "WorkspaceGroup is missing a writable repository result Workspace",
+                "WorkUnit scope is missing a writable repository result Workspace",
             ));
         }
         let recorded =

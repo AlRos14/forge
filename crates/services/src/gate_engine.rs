@@ -304,6 +304,54 @@ struct InputDraft {
     status: String,
 }
 
+fn exact_reviewed_result_matches(
+    actual: &Value,
+    expected: &crate::task_rework::WorkUnitReviewSubject,
+) -> bool {
+    let mut expected_json = json!({
+        "execution_id": expected.result_execution_id,
+        "artifact_id": expected.result_artifact_id,
+        "commit_sha": expected.result_commit_sha,
+        "workspace_id": expected.result_workspace_id,
+        "workspace_snapshot_digest": expected.workspace_snapshot_digest,
+    });
+    if actual.get("repository_results").is_some() {
+        expected_json["repository_results"] = json!(expected
+            .repositories
+            .iter()
+            .map(|repository| json!({
+                "repo_id": repository.repo_id,
+                "reviewed_work_unit_version": repository.reviewed_work_unit_version,
+                "result_execution_id": repository.result_execution_id,
+                "result_artifact_id": repository.result_artifact_id,
+                "result_commit_sha": repository.result_commit_sha,
+                "result_workspace_id": repository.result_workspace_id,
+                "workspace_snapshot_digest": repository.workspace_snapshot_digest,
+            }))
+            .collect::<Vec<_>>());
+    } else {
+        // Reports written before M2 carried only the scalar result. Accept
+        // that shape only when its scalar pins fully represent the repository
+        // set (empty for workspace-free work, or one matching primary result).
+        let legacy_scalar_is_exact = match expected.repositories.as_slice() {
+            [] => true,
+            [repository] => {
+                repository.reviewed_work_unit_version == expected.reviewed_work_unit_version
+                    && repository.result_execution_id == expected.result_execution_id
+                    && repository.result_artifact_id == expected.result_artifact_id
+                    && repository.result_commit_sha == expected.result_commit_sha
+                    && repository.result_workspace_id == expected.result_workspace_id
+                    && repository.workspace_snapshot_digest == expected.workspace_snapshot_digest
+            }
+            _ => false,
+        };
+        if !legacy_scalar_is_exact {
+            return false;
+        }
+    }
+    actual == &expected_json
+}
+
 impl GateEngine {
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<events::EventBus>) -> Self {
         Self { db, event_bus }
@@ -1417,14 +1465,9 @@ impl GateEngine {
                             .get("reviewed_work_unit_version")
                             .and_then(Value::as_i64)
                             == result.reviewed_work_unit_version
-                        && subject.get("reviewed_result")
-                            == Some(&serde_json::json!({
-                                "execution_id": result.result_execution_id,
-                                "artifact_id": result.result_artifact_id,
-                                "commit_sha": result.result_commit_sha,
-                                "workspace_id": result.result_workspace_id,
-                                "workspace_snapshot_digest": result.workspace_snapshot_digest,
-                            }))
+                        && subject
+                            .get("reviewed_result")
+                            .is_some_and(|actual| exact_reviewed_result_matches(actual, result))
                 }),
                 None => {
                     execution.work_unit_id.is_none() && subject.get("reviewed_result").is_none()
