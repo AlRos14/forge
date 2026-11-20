@@ -315,8 +315,10 @@ impl ProjectPlanService {
                 "repository WorkUnit has no exact Workspace base",
             ));
         };
-        let exact = db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, work_unit_id)
+        let exact = db::WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, work_unit_id)
             .await?
+            .into_iter()
+            .find(|candidate| candidate.id == workspace.id)
             .ok_or_else(|| {
                 ServiceError::invalid_operation("repository WorkUnit has no exact Workspace scope")
             })?;
@@ -474,15 +476,33 @@ impl ProjectPlanService {
         if !work_unit.requires_integration {
             return Ok(());
         }
-        let workspace =
-            db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, work_unit_id).await?;
-        if workspace.as_ref().is_some_and(|workspace| {
-            execution.workspace_id.as_deref() != Some(workspace.id.as_str())
-        }) {
+        let workspaces =
+            db::WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, work_unit_id).await?;
+        if execution
+            .workspace_id
+            .as_deref()
+            .is_some_and(|workspace_id| {
+                !workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == workspace_id)
+            })
+        {
             return Err(db::DbError::ProjectDependencyUnsatisfied.into());
         }
-        self.verify_handoff_workspace_base(&execution.task_id, work_unit_id, workspace.as_ref())
-            .await
+        if workspaces.is_empty() {
+            self.verify_handoff_workspace_base(&execution.task_id, work_unit_id, None)
+                .await?;
+        } else {
+            for workspace in &workspaces {
+                self.verify_handoff_workspace_base(
+                    &execution.task_id,
+                    work_unit_id,
+                    Some(workspace),
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn pause_for_handoff_blocker(

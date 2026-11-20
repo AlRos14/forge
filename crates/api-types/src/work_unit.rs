@@ -208,6 +208,7 @@ pub struct WorkUnitIntegrationResponse {
     pub id: String,
     pub task_id: String,
     pub work_unit_id: String,
+    pub repo_id: String,
     pub execution_id: String,
     pub source_workspace_id: String,
     pub source_sha: String,

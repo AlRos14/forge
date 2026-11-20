@@ -19,13 +19,13 @@ use std::{
 };
 
 use db::{
-    new_uuid_v4, now_rfc3339, CreateValidationCheckRequest, CreateValidationComparison, SqliteDb,
-    TaskCoordinationMode, TaskCoordinationRepo, TaskRepo, TransitionValidationCheckRequest,
-    ValidationCatalogRepo, ValidationCheckDefinition, ValidationCheckRequest,
-    ValidationCheckRequestRepo, ValidationCheckRequestState, ValidationCheckRequestTrigger,
-    ValidationCheckRequestWrite, ValidationCheckSubjectKind, ValidationComparisonRepo,
-    ValidationRun, ValidationRunOrigin, ValidationRunStatus, WorkUnitRepo, WorkUnitStatus,
-    WorkUnitWorkspaceRepo, Workspace, WorkspaceRepo, WorkspaceStatus,
+    new_uuid_v4, now_rfc3339, CreateValidationCheckRequest, CreateValidationComparison,
+    ExecutionRepo, SqliteDb, TaskCoordinationMode, TaskCoordinationRepo, TaskRepo,
+    TransitionValidationCheckRequest, ValidationCatalogRepo, ValidationCheckDefinition,
+    ValidationCheckRequest, ValidationCheckRequestRepo, ValidationCheckRequestState,
+    ValidationCheckRequestTrigger, ValidationCheckRequestWrite, ValidationCheckSubjectKind,
+    ValidationComparisonRepo, ValidationRun, ValidationRunOrigin, ValidationRunStatus,
+    WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceRepo, WorkspaceStatus,
 };
 use events::EventBus;
 use tokio::{process::Command, sync::watch, task::JoinHandle, time::interval};
@@ -52,6 +52,7 @@ const BASELINE_DIR: &str = "validation-baselines";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnqueueCheckRequest {
     pub task_id: String,
+    pub repo_id: String,
     pub check_key: String,
     pub trigger: ValidationCheckRequestTrigger,
     pub subject_kind: ValidationCheckSubjectKind,
@@ -72,12 +73,20 @@ struct ResolvedSubject {
     snapshot_digest: String,
 }
 
+fn result_for_repository<'a>(
+    results: &'a [db::ExecutionRepositoryResult],
+    repo_id: &str,
+) -> Option<&'a db::ExecutionRepositoryResult> {
+    results.iter().find(|result| result.repo_id == repo_id)
+}
+
 async fn resolve_subject(
     db: &SqliteDb,
     task: &db::Task,
     kind: ValidationCheckSubjectKind,
     subject_id: &str,
     subject_version: i64,
+    repo_id: &str,
 ) -> Result<ResolvedSubject> {
     let workspace = match kind {
         ValidationCheckSubjectKind::WorkUnitResult => {
@@ -97,7 +106,66 @@ async fn resolve_subject(
                     "only a completed WorkUnit result can be validated",
                 ));
             }
-            WorkUnitWorkspaceRepo::get_by_work_unit_id(db, &unit.id).await?
+            let execution_id: Option<String> = sqlx::query_scalar(
+                "SELECT e.id FROM execution e
+                 JOIN execution_repository_result rr ON rr.execution_id=e.id
+                 WHERE e.task_id=? AND e.work_unit_id=? AND e.work_unit_version=?
+                   AND e.status='completed' AND rr.repo_id=?
+                 ORDER BY e.created_at DESC, e.id DESC LIMIT 1",
+            )
+            .bind(&task.id)
+            .bind(&unit.id)
+            .bind(subject_version)
+            .bind(repo_id)
+            .fetch_optional(db.pool())
+            .await?;
+            let execution_id = execution_id.ok_or_else(|| {
+                validation_error(
+                    "validation.subject_unavailable",
+                    "the exact WorkUnit result has no repository result for the requested repo",
+                )
+            })?;
+            let results = ExecutionRepo::list_repository_results(db, &execution_id).await?;
+            let result = result_for_repository(&results, repo_id)
+                .ok_or_else(|| {
+                    validation_error(
+                        "validation.subject_unavailable",
+                        "the exact WorkUnit result has no repository result for the requested repo",
+                    )
+                })?;
+            let workspace = WorkspaceRepo::get_by_id(db, &result.workspace_id)
+                .await?
+                .filter(|workspace| {
+                    workspace.task_id == task.id
+                        && workspace.repo_id == repo_id
+                        && workspace.status == WorkspaceStatus::Ready
+                })
+                .ok_or_else(|| {
+                    validation_error(
+                        "validation.subject_unavailable",
+                        "the exact repository result has no Ready Workspace",
+                    )
+                })?;
+            let commit_sha = read_head(&workspace.worktree_path).await?;
+            if result.after_sha.as_deref() != Some(commit_sha.as_str()) {
+                return Err(validation_error(
+                    "validation.subject_stale",
+                    "the repository Workspace no longer matches the exact completed result commit",
+                ));
+            }
+            let snapshot_digest =
+                ValidationService::snapshot_digest(&workspace.worktree_path).await?;
+            if result.snapshot_digest.as_deref() != Some(snapshot_digest.as_str()) {
+                return Err(validation_error(
+                    "validation.subject_stale",
+                    "the repository Workspace no longer matches the exact completed result snapshot",
+                ));
+            }
+            return Ok(ResolvedSubject {
+                workspace,
+                commit_sha,
+                snapshot_digest,
+            });
         }
         ValidationCheckSubjectKind::TaskIntegration => {
             if subject_id != task.id {
@@ -109,10 +177,16 @@ async fn resolve_subject(
                     "the Task version no longer matches the requested subject",
                 ));
             }
-            WorkspaceRepo::get_integration_by_task_id(db, &task.id).await?
+            WorkspaceRepo::get_integration_by_task_id(db, &task.id)
+                .await?
+                .filter(|workspace| workspace.repo_id == repo_id)
         }
     }
-    .filter(|workspace| workspace.task_id == task.id && workspace.status == WorkspaceStatus::Ready)
+    .filter(|workspace| {
+        workspace.task_id == task.id
+            && workspace.repo_id == repo_id
+            && workspace.status == WorkspaceStatus::Ready
+    })
     .ok_or_else(|| {
         validation_error(
             "validation.subject_unavailable",
@@ -189,7 +263,7 @@ pub async fn enqueue_check_request(
     let definition = resolve_pin(
         db,
         &task.project_id,
-        task.repo_id.as_deref(),
+        Some(&input.repo_id),
         &pin.check_key,
         &pin.definition_digest,
     )
@@ -200,10 +274,11 @@ pub async fn enqueue_check_request(
         input.subject_kind,
         &input.subject_id,
         input.subject_version,
+        &input.repo_id,
     )
     .await?;
     let idempotency_key = digest_json(&(
-        "validation_check_request:v1",
+        "validation_check_request:v2",
         &task.id,
         coordination.authorization_version,
         &definition.id,
@@ -212,6 +287,7 @@ pub async fn enqueue_check_request(
         input.subject_kind.to_string(),
         &input.subject_id,
         input.subject_version,
+        &input.repo_id,
         &subject.workspace.id,
         &subject.commit_sha,
         &subject.snapshot_digest,
@@ -236,6 +312,7 @@ pub async fn enqueue_check_request(
             "subject_kind": input.subject_kind,
             "subject_id": input.subject_id,
             "subject_version": input.subject_version,
+            "repo_id": subject.workspace.repo_id,
             "workspace_id": subject.workspace.id,
             "commit_sha": subject.commit_sha,
             "baseline": input.baseline,
@@ -986,6 +1063,11 @@ mod tests {
     fn after_integration(fixture: &Fixture, baseline: bool) -> EnqueueCheckRequest {
         EnqueueCheckRequest {
             task_id: fixture.task.id.clone(),
+            repo_id: fixture
+                .task
+                .repo_id
+                .clone()
+                .expect("after-integration fixture has a primary repository"),
             check_key: "no-bad".to_owned(),
             trigger: ValidationCheckRequestTrigger::AfterIntegration,
             subject_kind: ValidationCheckSubjectKind::TaskIntegration,
@@ -999,6 +1081,37 @@ mod tests {
     }
 
     use sha2::Digest as _;
+
+    #[test]
+    fn multirepo_result_validation_selects_requested_repo_workspace() {
+        let results = [
+            db::ExecutionRepositoryResult {
+                execution_id: "execution".to_owned(),
+                task_id: "task".to_owned(),
+                repo_id: "repo-a".to_owned(),
+                workspace_id: "workspace-a".to_owned(),
+                before_sha: Some("base-a".to_owned()),
+                after_sha: Some("commit-a".to_owned()),
+                snapshot_digest: Some("digest-a".to_owned()),
+                created_at: "now".to_owned(),
+            },
+            db::ExecutionRepositoryResult {
+                execution_id: "execution".to_owned(),
+                task_id: "task".to_owned(),
+                repo_id: "repo-b".to_owned(),
+                workspace_id: "workspace-b".to_owned(),
+                before_sha: Some("base-b".to_owned()),
+                after_sha: Some("commit-b".to_owned()),
+                snapshot_digest: Some("digest-b".to_owned()),
+                created_at: "now".to_owned(),
+            },
+        ];
+        let selected = result_for_repository(&results, "repo-b").expect("repo-b is exact");
+        assert_eq!(selected.workspace_id, "workspace-b");
+        assert_eq!(selected.after_sha.as_deref(), Some("commit-b"));
+        assert_eq!(selected.snapshot_digest.as_deref(), Some("digest-b"));
+        assert!(result_for_repository(&results, "repo-c").is_none());
+    }
 
     #[tokio::test]
     async fn validation_check_runner_enqueue_requires_the_exact_envelope_pin() {

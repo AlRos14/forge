@@ -89,6 +89,7 @@ pub enum ValidationRunStatus {
 pub struct ValidationRunResponse {
     pub id: String,
     pub task_id: String,
+    pub repo_id: String,
     pub work_unit_id: Option<String>,
     pub caused_by_execution_id: Option<String>,
     pub check_identity: String,

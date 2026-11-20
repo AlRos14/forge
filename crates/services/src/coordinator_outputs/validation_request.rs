@@ -48,6 +48,7 @@ pub struct ValidationSubject {
     pub kind: ValidationSubjectKind,
     pub id: String,
     pub version: i64,
+    pub repo_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +77,13 @@ impl RequestValidationOutput {
         if self.subject.id.trim().is_empty() || self.subject.id.len() > MAX_SUBJECT_ID_BYTES {
             return Err(OutputError::invalid(
                 "request_validation subject id must contain 1 to 128 bytes",
+            ));
+        }
+        if self.subject.repo_id.trim().is_empty()
+            || self.subject.repo_id.len() > MAX_SUBJECT_ID_BYTES
+        {
+            return Err(OutputError::invalid(
+                "request_validation subject repo_id must contain 1 to 128 bytes",
             ));
         }
         if self.subject.version < 1 {

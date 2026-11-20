@@ -1,5 +1,15 @@
 use super::*;
 
+fn map_workspace_group(row: SqliteRow) -> Result<crate::WorkspaceGroup> {
+    Ok(crate::WorkspaceGroup {
+        id: row.try_get("id")?,
+        task_id: row.try_get("task_id")?,
+        work_unit_id: row.try_get("work_unit_id")?,
+        root_path: row.try_get("root_path")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
 #[async_trait]
 impl WorkspaceRepo for SqliteDb {
     async fn create(&self, input: CreateWorkspace) -> Result<Workspace> {
@@ -32,6 +42,70 @@ impl WorkspaceRepo for SqliteDb {
         let workspace = map_workspace(row)?;
         tx.commit().await?;
         Ok(workspace)
+    }
+
+    async fn create_group_for_work_unit(
+        &self,
+        input: crate::CreateWorkspaceGroup,
+    ) -> Result<crate::WorkspaceGroup> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(row) = sqlx::query(
+            "SELECT id, task_id, work_unit_id, root_path, created_at
+             FROM workspace_group WHERE work_unit_id = ?",
+        )
+        .bind(&input.work_unit_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let group = map_workspace_group(row)?;
+            if group.id != input.id
+                || group.task_id != input.task_id
+                || group.root_path != input.root_path
+                || group.created_at != input.created_at
+            {
+                return Err(DbError::IdempotencyConflict);
+            }
+            tx.commit().await?;
+            return Ok(group);
+        }
+
+        sqlx::query(
+            "INSERT INTO workspace_group (id, task_id, work_unit_id, root_path, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(&input.work_unit_id)
+        .bind(&input.root_path)
+        .bind(&input.created_at)
+        .execute(&mut *tx)
+        .await?;
+        let group = map_workspace_group(
+            sqlx::query(
+                "SELECT id, task_id, work_unit_id, root_path, created_at
+                 FROM workspace_group WHERE work_unit_id = ?",
+            )
+            .bind(&input.work_unit_id)
+            .fetch_one(&mut *tx)
+            .await?,
+        )?;
+        tx.commit().await?;
+        Ok(group)
+    }
+
+    async fn get_group_by_work_unit_id(
+        &self,
+        work_unit_id: &str,
+    ) -> Result<Option<crate::WorkspaceGroup>> {
+        sqlx::query(
+            "SELECT id, task_id, work_unit_id, root_path, created_at
+             FROM workspace_group WHERE work_unit_id = ?",
+        )
+        .bind(work_unit_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(map_workspace_group)
+        .transpose()
     }
 
     async fn get_task_id(&self, id: &str) -> Result<Option<String>> {

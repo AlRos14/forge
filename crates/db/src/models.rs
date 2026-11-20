@@ -670,6 +670,15 @@ pub struct Workspace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceGroup {
+    pub id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub root_path: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceStatus {
     Creating,
     Ready,
@@ -940,6 +949,7 @@ pub struct WorkspaceScope {
     pub task_id: String,
     pub kind: WorkspaceScopeKind,
     pub work_unit_id: Option<String>,
+    pub workspace_group_id: Option<String>,
     pub created_at: String,
 }
 
@@ -1102,6 +1112,14 @@ pub struct TaskRepository {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRepositoryContextSnapshot {
+    pub task_id: String,
+    pub repo_id: String,
+    pub commit_sha: String,
+    pub captured_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkUnitRepositoryScope {
     pub work_unit_id: String,
     pub task_id: String,
@@ -1138,6 +1156,48 @@ pub struct Execution {
     pub work_unit_version: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionRepositoryResult {
+    pub execution_id: String,
+    pub task_id: String,
+    pub repo_id: String,
+    pub workspace_id: String,
+    pub before_sha: Option<String>,
+    pub after_sha: Option<String>,
+    pub snapshot_digest: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkUnitReviewSubjectRepository {
+    pub review_work_unit_id: String,
+    pub task_id: String,
+    pub repo_id: String,
+    pub reviewed_work_unit_id: String,
+    pub reviewed_work_unit_version: Option<i64>,
+    pub result_execution_id: Option<String>,
+    pub result_artifact_id: Option<String>,
+    pub result_commit_sha: Option<String>,
+    pub result_workspace_id: Option<String>,
+    pub workspace_snapshot_digest: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkUnitResultRequirementRepository {
+    pub work_unit_id: String,
+    pub task_id: String,
+    pub repo_id: String,
+    pub source_work_unit_id: String,
+    pub source_work_unit_version: i64,
+    pub result_execution_id: String,
+    pub result_artifact_id: Option<String>,
+    pub result_commit_sha: Option<String>,
+    pub result_workspace_id: Option<String>,
+    pub workspace_snapshot_digest: Option<String>,
+    pub created_at: String,
 }
 
 /// Immutable Workspace, commit, and working-tree identity reviewed by one

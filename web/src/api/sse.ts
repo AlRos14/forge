@@ -345,6 +345,7 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
             'execution.failed',
             'execution.cancelled',
             'execution.stalled',
+            'execution.repository_results_recorded',
             'validation_run.started',
             'validation_run.completed',
             'evidence.created',

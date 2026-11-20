@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 
 const EXECUTION_LOG_BATCH_MAX_ENTRIES: usize = 50;
 const EXECUTION_LOG_BATCH_MAX_WAIT: Duration = Duration::from_millis(500);
@@ -508,50 +509,23 @@ impl TaskService {
             })?;
         }
 
-        if let (Some(terminal_activity), Some(workspace)) = (
-            self.terminal_activity.as_ref(),
-            working_context.workspace.as_ref(),
-        ) {
-            if terminal_activity
-                .workspace_has_active_terminal(&workspace.id)
-                .await
-            {
-                return Err(ServiceError::TerminalActiveExecution {
-                    workspace_id: workspace.id.clone(),
-                });
+        if let Some(terminal_activity) = self.terminal_activity.as_ref() {
+            for workspace in &working_context.workspaces {
+                if terminal_activity
+                    .workspace_has_active_terminal(&workspace.id)
+                    .await
+                {
+                    return Err(ServiceError::TerminalActiveExecution {
+                        workspace_id: workspace.id.clone(),
+                    });
+                }
             }
         }
         let _exec_lock_guard = if let Some(locks) = self.workspace_exec_locks.as_ref() {
             if let Some(guard) = locks.try_acquire(execution_lock_key) {
-                if let (Some(terminal_activity), Some(workspace)) = (
-                    self.terminal_activity.as_ref(),
-                    working_context.workspace.as_ref(),
-                ) {
-                    if terminal_activity
-                        .workspace_has_active_terminal(&workspace.id)
-                        .await
-                    {
-                        return Err(ServiceError::TerminalActiveExecution {
-                            workspace_id: workspace.id.clone(),
-                        });
-                    }
-                }
                 Some(guard)
             } else {
-                if let (Some(terminal_activity), Some(workspace)) = (
-                    self.terminal_activity.as_ref(),
-                    working_context.workspace.as_ref(),
-                ) {
-                    if terminal_activity
-                        .workspace_has_active_terminal(&workspace.id)
-                        .await
-                    {
-                        return Err(ServiceError::TerminalActiveExecution {
-                            workspace_id: workspace.id.clone(),
-                        });
-                    }
-                }
-                if let Some(workspace) = working_context.workspace.as_ref() {
+                for workspace in &working_context.workspaces {
                     self.event_bus.publish(events::ForgeEvent {
                         event_type: "workspace.execution_waiting".to_owned(),
                         entity_id: workspace.id.clone(),
@@ -567,6 +541,31 @@ impl TaskService {
         } else {
             None
         };
+        let mut workspace_ids = working_context
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.as_str())
+            .collect::<Vec<_>>();
+        workspace_ids.sort_unstable();
+        workspace_ids.dedup();
+        let mut _workspace_guards = Vec::with_capacity(workspace_ids.len());
+        if let Some(locks) = self.workspace_exec_locks.as_ref() {
+            for workspace_id in workspace_ids {
+                _workspace_guards.push(locks.acquire(workspace_id).await);
+            }
+        }
+        if let Some(terminal_activity) = self.terminal_activity.as_ref() {
+            for workspace in &working_context.workspaces {
+                if terminal_activity
+                    .workspace_has_active_terminal(&workspace.id)
+                    .await
+                {
+                    return Err(ServiceError::TerminalActiveExecution {
+                        workspace_id: workspace.id.clone(),
+                    });
+                }
+            }
+        }
 
         let execution_before_launch = ExecutionRepo::get_by_id(&*self.db, &execution_id)
             .await?
@@ -608,6 +607,19 @@ impl TaskService {
             api_types::TaskRoleCapability::FormalReview,
         )
         .await?;
+        if is_review_execution && working_context.workspace_group.is_some() {
+            if let Err(error) = self
+                .verify_read_only_group_members(&execution_before_launch, &working_context)
+                .await
+            {
+                return self
+                    .fail_execution_before_dispatch(
+                        &execution_before_launch.id,
+                        format!("Review WorkspaceGroup failed exact subject verification: {error}"),
+                    )
+                    .await;
+            }
+        }
         let mut review_worktree_snapshot = None;
         let mut review_snapshot_digest = None;
         if is_review_execution && execution_before_launch.workspace_id.is_some() {
@@ -965,7 +977,7 @@ impl TaskService {
                         &execution.id,
                     )
                     .await?,
-                    has_repository_workspace: execution.workspace_id.is_some(),
+                    has_repository_workspace: working_context.has_repository_workspace,
                     review_read_paths: self.review_read_paths_for_execution(&execution).await?,
                     worktree_path: worktree_path.clone(),
                     description,
@@ -1047,9 +1059,21 @@ impl TaskService {
             }
             result
         };
+        if working_context.workspace_group.is_some() {
+            if let Err(error) = self
+                .verify_read_only_group_members(&execution_before_launch, &working_context)
+                .await
+            {
+                result.status = ExecutionOutcome::Failed;
+                result.error = Some(format!(
+                    "WorkspaceGroup context or Review repository changed: {error}"
+                ));
+            }
+        }
         if result.status == ExecutionOutcome::Completed
             && result.after_sha.is_none()
             && execution.workspace_id.is_some()
+            && working_context.workspace_group.is_none()
         {
             let workspace_path = std::path::Path::new(&worktree_path);
             match git::is_worktree_clean(workspace_path).await {
@@ -1211,6 +1235,34 @@ impl TaskService {
                         "completed Review Execution did not return a complete structured result"
                             .to_owned(),
                     );
+                }
+            }
+        }
+
+        if result.status == ExecutionOutcome::Completed && working_context.workspace_group.is_some()
+        {
+            match self
+                .record_execution_repository_results(&current_execution.id)
+                .await
+            {
+                Ok(repository_results) => {
+                    result.after_sha =
+                        current_execution
+                            .workspace_id
+                            .as_deref()
+                            .and_then(|workspace_id| {
+                                repository_results
+                                    .iter()
+                                    .find(|repository| repository.workspace_id == workspace_id)
+                                    .and_then(|repository| repository.after_sha.clone())
+                            });
+                }
+                Err(error) => {
+                    result.status = ExecutionOutcome::Failed;
+                    result.after_sha = None;
+                    result.error = Some(format!(
+                        "repository result capture failed before terminalization: {error}"
+                    ));
                 }
             }
         }
@@ -1529,6 +1581,20 @@ impl TaskService {
                     "Review subject belongs to another Task",
                 ));
             }
+            for repository in WorkUnitRepo::list_review_subject_repositories(&*self.db, id).await? {
+                if repository.result_workspace_id.is_none()
+                    || repository.result_execution_id.is_none()
+                    || repository.result_commit_sha.is_none()
+                {
+                    return Err(ServiceError::invalid_operation(format!(
+                        "Review subject repository {} is not frozen to an exact result",
+                        repository.repo_id
+                    )));
+                }
+                ids.push(repository.result_workspace_id.ok_or_else(|| {
+                    ServiceError::invalid_operation("Review subject result Workspace is missing")
+                })?);
+            }
             if let Some(id) = subject.result_workspace_id {
                 ids.push(id);
             }
@@ -1546,11 +1612,371 @@ impl TaskService {
                 .ok_or_else(|| {
                     ServiceError::invalid_operation("Exact review Workspace is unavailable")
                 })?;
+            if let Some(work_unit_id) = execution.work_unit_id.as_deref() {
+                let subject_rows =
+                    WorkUnitRepo::list_review_subject_repositories(&*self.db, work_unit_id).await?;
+                if !subject_rows.is_empty()
+                    && !subject_rows.iter().any(|subject| {
+                        subject.result_workspace_id.as_deref() == Some(workspace.id.as_str())
+                            && subject.repo_id == workspace.repo_id
+                    })
+                    && WorkspaceRepo::get_group_by_work_unit_id(&*self.db, work_unit_id)
+                        .await?
+                        .is_some()
+                {
+                    return Err(ServiceError::invalid_operation(
+                        "Review read path is outside the exact repository subject",
+                    ));
+                }
+            }
             paths.push(workspace.worktree_path);
         }
         paths.sort();
         paths.dedup();
         Ok(paths)
+    }
+
+    async fn verify_read_only_group_members(
+        &self,
+        execution: &Execution,
+        working_context: &super::super::ExecutionWorkingContext,
+    ) -> Result<()> {
+        let Some(group) = working_context.workspace_group.as_ref() else {
+            return Ok(());
+        };
+        let is_review = crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?;
+        let task_repositories = TaskRepo::list_repositories(&*self.db, &execution.task_id).await?;
+        let work_unit_id = execution.work_unit_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation("WorkspaceGroup Execution has no WorkUnit")
+        })?;
+        let selected = WorkUnitRepo::list_repository_ids(&*self.db, work_unit_id).await?;
+        let mut expected_context = HashSet::new();
+        if !is_review {
+            expected_context.extend(
+                task_repositories
+                    .iter()
+                    .filter(|repository| repository.role == db::TaskRepositoryRole::Context)
+                    .map(|repository| repository.repo_id.clone()),
+            );
+        }
+        let subject_rows = if is_review {
+            let work_unit_id = execution.work_unit_id.as_deref().ok_or_else(|| {
+                ServiceError::invalid_operation("Review Execution has no exact WorkUnit")
+            })?;
+            WorkUnitRepo::list_review_subject_repositories(&*self.db, work_unit_id).await?
+        } else {
+            Vec::new()
+        };
+        let expected_group_repos = if is_review {
+            subject_rows
+                .iter()
+                .map(|repository| repository.repo_id.clone())
+                .collect::<HashSet<_>>()
+        } else {
+            task_repositories
+                .iter()
+                .filter(|repository| {
+                    repository.role == db::TaskRepositoryRole::Context
+                        || (matches!(
+                            repository.role,
+                            db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                        ) && (selected.is_empty() || selected.contains(&repository.repo_id)))
+                })
+                .map(|repository| repository.repo_id.clone())
+                .collect::<HashSet<_>>()
+        };
+        if expected_group_repos.len() != working_context.workspaces.len()
+            || working_context
+                .workspaces
+                .iter()
+                .any(|workspace| !expected_group_repos.contains(&workspace.repo_id))
+        {
+            return Err(ServiceError::invalid_operation(
+                "WorkspaceGroup changed outside its exact Task and WorkUnit repository set",
+            ));
+        }
+        ensure_no_unexpected_git_repositories(Path::new(&group.root_path), &expected_group_repos)?;
+        for workspace in &working_context.workspaces {
+            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &workspace.id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace scope", workspace.id.clone()))?;
+            if scope.task_id != execution.task_id
+                || scope.work_unit_id.as_deref() != Some(work_unit_id)
+                || scope.workspace_group_id.as_deref() != Some(group.id.as_str())
+                || workspace.status != WorkspaceStatus::Ready
+            {
+                return Err(ServiceError::invalid_operation(format!(
+                    "repository {} is not an exact ready WorkspaceGroup member",
+                    workspace.repo_id
+                )));
+            }
+            let is_pinned_read_only = is_review || expected_context.contains(&workspace.repo_id);
+            if is_pinned_read_only && !workspace.branch.starts_with("detached:") {
+                return Err(ServiceError::invalid_operation(format!(
+                    "repository {} is not an exact read-only WorkspaceGroup member",
+                    workspace.repo_id
+                )));
+            }
+            if !is_pinned_read_only {
+                let expected_branch = ::workspace::work_unit_branch_name(
+                    &execution.task_id,
+                    work_unit_id,
+                    &workspace.id,
+                )
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+                if workspace.branch != expected_branch {
+                    return Err(ServiceError::invalid_operation(format!(
+                        "writable repository {} is not on its exact WorkUnit branch",
+                        workspace.repo_id
+                    )));
+                }
+            }
+            let expected_sha = if is_review {
+                let subject = subject_rows
+                    .iter()
+                    .find(|subject| subject.repo_id == workspace.repo_id)
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(format!(
+                            "repository {} is outside the exact Review subject",
+                            workspace.repo_id
+                        ))
+                    })?;
+                if subject.result_workspace_id.is_none()
+                    || subject.result_execution_id.is_none()
+                    || subject.workspace_snapshot_digest.is_none()
+                {
+                    return Err(ServiceError::invalid_operation(format!(
+                        "repository {} Review subject is not frozen to a complete result",
+                        workspace.repo_id
+                    )));
+                }
+                subject.result_commit_sha.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "repository {} Review subject has no exact result SHA",
+                        workspace.repo_id
+                    ))
+                })?
+            } else if expected_context.contains(&workspace.repo_id) {
+                let pinned_sha: Option<String> = sqlx::query_scalar(
+                    "SELECT commit_sha FROM task_repository_context_snapshot
+                     WHERE task_id = ? AND repo_id = ?",
+                )
+                .bind(&execution.task_id)
+                .bind(&workspace.repo_id)
+                .fetch_optional(self.db.pool())
+                .await?;
+                pinned_sha.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "context repository {} has no immutable Task snapshot",
+                        workspace.repo_id
+                    ))
+                })?
+            } else {
+                continue;
+            };
+            let expected_sha = expected_sha.to_owned();
+            if workspace.branch != format!("detached:{expected_sha}") {
+                return Err(ServiceError::invalid_operation(format!(
+                    "read-only repository {} is not detached at its pinned commit {}",
+                    workspace.repo_id, expected_sha
+                )));
+            }
+            let path = Path::new(&workspace.worktree_path);
+            let head = git::get_current_sha(path).await.map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "repository {} HEAD could not be verified: {error}",
+                    workspace.repo_id
+                ))
+            })?;
+            let clean = git::is_worktree_clean(path).await.map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "repository {} working tree could not be verified: {error}",
+                    workspace.repo_id
+                ))
+            })?;
+            if head != expected_sha
+                || !clean
+                || workspace.before_sha.as_deref() != Some(expected_sha.as_str())
+            {
+                return Err(ServiceError::invalid_operation(format!(
+                    "context/review repository {} changed from pinned commit {} (HEAD {}, clean {})",
+                    workspace.repo_id, expected_sha, head, clean
+                )));
+            }
+            if is_review {
+                let subject = subject_rows
+                    .iter()
+                    .find(|subject| subject.repo_id == workspace.repo_id)
+                    .ok_or_else(|| ServiceError::invalid_operation("Review subject changed"))?;
+                let digest = crate::ValidationService::snapshot_digest(&workspace.worktree_path)
+                    .await
+                    .map_err(|error| {
+                        ServiceError::invalid_operation(format!(
+                            "review repository {} snapshot could not be verified: {error}",
+                            workspace.repo_id
+                        ))
+                    })?;
+                if subject.workspace_snapshot_digest.as_deref() != Some(digest.as_str()) {
+                    return Err(ServiceError::invalid_operation(format!(
+                        "review repository {} working tree differs from its frozen snapshot",
+                        workspace.repo_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn record_execution_repository_results(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<db::ExecutionRepositoryResult>> {
+        let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;
+        let Some(work_unit_id) = execution.work_unit_id.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let Some(group) = WorkspaceRepo::get_group_by_work_unit_id(&*self.db, work_unit_id).await?
+        else {
+            return Ok(Vec::new());
+        };
+        if group.task_id != execution.task_id || execution.status != ExecutionStatus::Running {
+            return Err(ServiceError::invalid_operation(
+                "repository results require the exact running WorkspaceGroup Execution",
+            ));
+        }
+        self.verify_execution_workspace_authority(&execution)
+            .await?;
+        let working_context = self.resolve_execution_working_context(&execution).await?;
+        self.verify_read_only_group_members(&execution, &working_context)
+            .await?;
+        if crate::role_capabilities::execution_has_capability(
+            &self.db,
+            &execution.id,
+            api_types::TaskRoleCapability::FormalReview,
+        )
+        .await?
+        {
+            return Ok(Vec::new());
+        }
+        let task_repositories = TaskRepo::list_repositories(&*self.db, &execution.task_id).await?;
+        let selected = WorkUnitRepo::list_repository_ids(&*self.db, work_unit_id).await?;
+        let writable_ids = task_repositories
+            .iter()
+            .filter(|repository| {
+                matches!(
+                    repository.role,
+                    db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                ) && (selected.is_empty() || selected.contains(&repository.repo_id))
+            })
+            .map(|repository| repository.repo_id.as_str())
+            .collect::<HashSet<_>>();
+        let mut rows = Vec::with_capacity(writable_ids.len());
+        for workspace in &working_context.workspaces {
+            if !writable_ids.contains(workspace.repo_id.as_str()) {
+                continue;
+            }
+            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &workspace.id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace scope", workspace.id.clone()))?;
+            if scope.task_id != execution.task_id
+                || scope.work_unit_id.as_deref() != Some(work_unit_id)
+                || scope.workspace_group_id.as_deref() != Some(group.id.as_str())
+                || workspace.status != WorkspaceStatus::Ready
+            {
+                return Err(ServiceError::invalid_operation(format!(
+                    "repository {} result Workspace is outside the exact group scope",
+                    workspace.repo_id
+                )));
+            }
+            let path = Path::new(&workspace.worktree_path);
+            if !git::is_worktree_clean(path).await.map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "repository {} result working tree could not be checked: {error}",
+                    workspace.repo_id
+                ))
+            })? {
+                return Err(ServiceError::invalid_operation(format!(
+                    "repository {} has uncommitted changes; a successful result SHA cannot be recorded",
+                    workspace.repo_id
+                )));
+            }
+            let after_sha = git::get_current_sha(path).await.map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "repository {} result SHA could not be read: {error}",
+                    workspace.repo_id
+                ))
+            })?;
+            let snapshot_digest =
+                crate::ValidationService::snapshot_digest(&workspace.worktree_path)
+                    .await
+                    .map_err(|error| {
+                        ServiceError::invalid_operation(format!(
+                            "repository {} result snapshot could not be read: {error}",
+                            workspace.repo_id
+                        ))
+                    })?;
+            rows.push(db::ExecutionRepositoryResult {
+                execution_id: execution.id.clone(),
+                task_id: execution.task_id.clone(),
+                repo_id: workspace.repo_id.clone(),
+                workspace_id: workspace.id.clone(),
+                before_sha: workspace.before_sha.clone(),
+                after_sha: Some(after_sha),
+                snapshot_digest: Some(snapshot_digest),
+                created_at: now_rfc3339(),
+            });
+        }
+        if rows.len() != writable_ids.len() {
+            return Err(ServiceError::invalid_operation(
+                "WorkspaceGroup is missing a writable repository result Workspace",
+            ));
+        }
+        let recorded =
+            ExecutionRepo::record_repository_results(&*self.db, execution_id, &rows).await?;
+        let actor = execution.actor_ref();
+        crate::DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+            .append(db::CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "execution.repository_results_recorded".to_owned(),
+                entity_type: "execution".to_owned(),
+                entity_id: execution.id.clone(),
+                actor_type: actor
+                    .as_ref()
+                    .map(|actor| actor.kind().to_string())
+                    .unwrap_or_else(|| "system".to_owned()),
+                actor_id: actor.as_ref().map(|actor| actor.id().to_owned()),
+                scope_type: "task".to_owned(),
+                scope_id: execution.task_id.clone(),
+                correlation_id: execution.id.clone(),
+                causation_id: execution.parent_execution_id.clone(),
+                causation_depth: i64::from(execution.parent_execution_id.is_some()),
+                dedupe_key: Some(format!(
+                    "execution.repository_results_recorded:{}",
+                    execution.id
+                )),
+                payload_json: serde_json::json!({
+                    "task_id": execution.task_id,
+                    "execution_id": execution.id,
+                    "repository_results": recorded.iter().map(|result| serde_json::json!({
+                        "repo_id": result.repo_id,
+                        "workspace_id": result.workspace_id,
+                        "before_sha": result.before_sha,
+                        "after_sha": result.after_sha,
+                        "snapshot_digest": result.snapshot_digest,
+                    })).collect::<Vec<_>>(),
+                })
+                .to_string(),
+                created_at: now_rfc3339(),
+            })
+            .await?;
+        Ok(recorded)
     }
 
     async fn execution_start_params(
@@ -1608,6 +2034,108 @@ impl TaskService {
             max_turns,
         })
     }
+}
+
+fn ensure_no_unexpected_git_repositories(
+    group_root: &Path,
+    expected_repo_ids: &HashSet<String>,
+) -> Result<()> {
+    if group_root.join(".git").exists() {
+        return Err(ServiceError::invalid_operation(
+            "unexpected Git repository at the WorkspaceGroup root",
+        ));
+    }
+    let entries = std::fs::read_dir(group_root).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "could not inspect WorkspaceGroup root for unexpected Git repositories: {error}"
+        ))
+    })?;
+    let mut seen = HashSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "could not inspect WorkspaceGroup entry: {error}"
+            ))
+        })?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let file_type = entry.file_type().map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "could not inspect WorkspaceGroup entry {}: {error}",
+                path.display()
+            ))
+        })?;
+        if expected_repo_ids.contains(&name) {
+            if !file_type.is_dir() || !path.join(".git").exists() {
+                return Err(ServiceError::invalid_operation(format!(
+                    "expected repository {name} is not a Git worktree beneath the WorkspaceGroup root"
+                )));
+            }
+            if let Some(nested) = nested_git_repository(&path, true)? {
+                return Err(ServiceError::invalid_operation(format!(
+                    "unexpected nested Git repository beneath authorized repository {name}: {}",
+                    nested.display()
+                )));
+            }
+            seen.insert(name);
+        } else if file_type.is_dir() {
+            if let Some(unexpected) = nested_git_repository(&path, false)? {
+                return Err(ServiceError::invalid_operation(format!(
+                    "unexpected Git repository beneath WorkspaceGroup root: {}",
+                    unexpected.display()
+                )));
+            }
+        } else if file_type.is_symlink() && path.join(".git").exists() {
+            return Err(ServiceError::invalid_operation(format!(
+                "unexpected Git repository through WorkspaceGroup symlink: {}",
+                path.display()
+            )));
+        }
+    }
+    if seen != *expected_repo_ids {
+        return Err(ServiceError::invalid_operation(
+            "WorkspaceGroup is missing one or more exact repository worktrees",
+        ));
+    }
+    Ok(())
+}
+
+fn nested_git_repository(path: &Path, allow_root_git: bool) -> Result<Option<std::path::PathBuf>> {
+    let entries = std::fs::read_dir(path).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "could not inspect {} for nested Git repositories: {error}",
+            path.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "could not inspect nested WorkspaceGroup entry: {error}"
+            ))
+        })?;
+        let child = entry.path();
+        let name = entry.file_name();
+        if name == ".git" {
+            if !allow_root_git {
+                return Ok(Some(child));
+            }
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "could not inspect {}: {error}",
+                child.display()
+            ))
+        })?;
+        if file_type.is_dir() {
+            if let Some(nested) = nested_git_repository(&child, false)? {
+                return Ok(Some(nested));
+            }
+        } else if file_type.is_symlink() && child.join(".git").exists() {
+            return Ok(Some(child));
+        }
+    }
+    Ok(None)
 }
 
 fn execution_description(execution: &Execution, task: &Task) -> String {

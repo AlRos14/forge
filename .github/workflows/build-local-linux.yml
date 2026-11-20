@@ -230,3 +230,19 @@ jobs:
         run: cargo test --locked -p api --test work_units multirepo_task_
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p mcp-server --lib multirepo_task_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p db --lib multirepo_workspace_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p db --lib multirepo_result_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib multirepo_workspace_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib multirepo_result_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test happy_path multirepo_workspace_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test work_units multirepo_result_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test work_unit_reviews multirepo_result_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib multirepo_result_

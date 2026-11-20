@@ -294,6 +294,16 @@ pub struct ExecutionLogsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+pub struct ExecutionRepositoryResultResponse {
+    pub repo_id: String,
+    pub workspace_id: String,
+    pub before_sha: Option<String>,
+    pub after_sha: Option<String>,
+    pub snapshot_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ExecutionResponse {
     pub id: String,
     pub task_id: String,
@@ -318,6 +328,8 @@ pub struct ExecutionResponse {
     pub work_unit_id: Option<String>,
     #[ts(type = "number | null")]
     pub work_unit_version: Option<i64>,
+    #[serde(default)]
+    pub repository_results: Vec<ExecutionRepositoryResultResponse>,
     pub usage: Option<Vec<ExecutionUsageResponse>>,
     #[serde(default)]
     #[ts(type = "Record<string, unknown> | null")]

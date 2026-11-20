@@ -19,11 +19,11 @@ use axum::{
 use db::{
     AgentRepo, AgentStatus, CreateAgent, CreateDomainEvent, CreateExecution, CreateProject,
     CreateRepo, CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkUnit,
-    CreateWorkUnitExecution, CreateWorkUnitWorkspace, CreateWorkspace, CreateWorkspaceLease,
-    DaemonRepo, DaemonStatus, Execution, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo,
-    RoleMembershipRepo, RoleMembershipStatus, TaskRepo, TaskRoleRepo, UpdateDaemonReport,
-    UpsertDaemon, UserRepo, WorkMode, WorkUnit, WorkUnitExecutionRepo, WorkUnitRepo,
-    WorkUnitWorkspaceRepo, WorkspaceRepo, WorkspaceStatus,
+    CreateWorkUnitExecution, CreateWorkUnitWorkspace, CreateWorkspace, CreateWorkspaceGroup,
+    CreateWorkspaceLease, DaemonRepo, DaemonStatus, Execution, ExecutionRepo, ExecutionStatus,
+    ProjectRepo, RepoRepo, RoleMembershipRepo, RoleMembershipStatus, TaskRepo, TaskRoleRepo,
+    UpdateDaemonReport, UpsertDaemon, UserRepo, WorkMode, WorkUnit, WorkUnitExecutionRepo,
+    WorkUnitRepo, WorkUnitWorkspaceRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -748,7 +748,7 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
             execution,
             work_unit_id: work_unit.id.clone(),
             work_unit_version: work_unit.version,
-            workspace_lease: None,
+            workspace_leases: Vec::new(),
         },
         test_domain_event(
             "execution.started",
@@ -886,6 +886,23 @@ pub async fn seed_startable_execution_for_daemon(
     .expect("agent creates");
     let executor_snapshot = authorized_daemon_execution_snapshot(state, &agent_id, "shell").await;
     let work_unit = create_implementation_work_unit(state, &task, &agent_id, true).await;
+    let workspace_group_id = uuid::Uuid::new_v4().to_string();
+    WorkspaceRepo::create_group_for_work_unit(
+        &*state.db,
+        CreateWorkspaceGroup {
+            id: workspace_group_id.clone(),
+            task_id: task_id.clone(),
+            work_unit_id: work_unit.id.clone(),
+            root_path: workspace_path
+                .parent()
+                .unwrap_or(&workspace_path)
+                .to_string_lossy()
+                .into_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("WorkUnit WorkspaceGroup creates");
     let workspace = WorkUnitWorkspaceRepo::create_for_work_unit(
         &*state.db,
         CreateWorkUnitWorkspace {
@@ -901,6 +918,7 @@ pub async fn seed_startable_execution_for_daemon(
                 updated_at: now.clone(),
             },
             work_unit_id: work_unit.id.clone(),
+            workspace_group_id,
         },
     )
     .await
@@ -943,7 +961,7 @@ pub async fn seed_startable_execution_for_daemon(
             execution: execution_input,
             work_unit_id: work_unit.id.clone(),
             work_unit_version: work_unit.version,
-            workspace_lease: Some(CreateWorkspaceLease {
+            workspace_leases: vec![CreateWorkspaceLease {
                 id: uuid::Uuid::new_v4().to_string(),
                 project_id,
                 task_id: task_id.clone(),
@@ -970,7 +988,7 @@ pub async fn seed_startable_execution_for_daemon(
                 expires_at: "2099-01-01T00:00:00+00:00".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
-            }),
+            }],
         },
         test_domain_event(
             "execution.started",

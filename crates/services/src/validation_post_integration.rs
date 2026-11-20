@@ -52,6 +52,9 @@ pub(crate) async fn enqueue_after_integration(
     let Some(task) = TaskRepo::get_by_id(db, task_id, false).await? else {
         return Ok(0);
     };
+    let Some(repo_id) = task.repo_id.clone() else {
+        return Ok(0);
+    };
     let mut enqueued = 0;
     for pin in pins {
         let outcome = enqueue_check_request(
@@ -59,6 +62,7 @@ pub(crate) async fn enqueue_after_integration(
             event_bus,
             EnqueueCheckRequest {
                 task_id: task.id.clone(),
+                repo_id: repo_id.clone(),
                 check_key: pin.check_key.clone(),
                 trigger: ValidationCheckRequestTrigger::AfterIntegration,
                 subject_kind: ValidationCheckSubjectKind::TaskIntegration,

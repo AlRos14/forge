@@ -11,6 +11,10 @@ pub trait TaskRepo: Send + Sync {
         input: CreateTask,
     ) -> Result<Task>;
     async fn list_repositories(&self, task_id: &str) -> Result<Vec<TaskRepository>>;
+    async fn pin_context_repository_snapshot(
+        &self,
+        input: CreateTaskRepositoryContextSnapshot,
+    ) -> Result<TaskRepositoryContextSnapshot>;
     async fn replace_repositories_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
@@ -712,6 +716,12 @@ pub struct ReserveOrchestratorAction {
 #[async_trait]
 pub trait WorkspaceRepo: Send + Sync {
     async fn create(&self, input: CreateWorkspace) -> Result<Workspace>;
+    async fn create_group_for_work_unit(
+        &self,
+        input: CreateWorkspaceGroup,
+    ) -> Result<WorkspaceGroup>;
+    async fn get_group_by_work_unit_id(&self, work_unit_id: &str)
+        -> Result<Option<WorkspaceGroup>>;
     async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Workspace>>;
     /// Resolve the Task's explicitly scoped integration Workspace. WorkUnit
@@ -757,7 +767,7 @@ pub trait WorkspaceRepo: Send + Sync {
 #[async_trait]
 pub trait WorkUnitWorkspaceRepo: Send + Sync {
     async fn get_scope_by_id(&self, id: &str) -> Result<Option<WorkspaceScope>>;
-    async fn get_by_work_unit_id(&self, work_unit_id: &str) -> Result<Option<Workspace>>;
+    async fn list_by_work_unit_id(&self, work_unit_id: &str) -> Result<Vec<Workspace>>;
     async fn create_for_work_unit(&self, input: CreateWorkUnitWorkspace) -> Result<Workspace>;
     async fn list_by_task(&self, task_id: &str) -> Result<Vec<Workspace>>;
 }
@@ -815,11 +825,36 @@ pub trait WorkUnitRepo: Send + Sync {
         subject: CreateWorkUnitReviewSubject,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<WorkUnit>>;
+    async fn create_with_review_subject_repositories(
+        &self,
+        input: CreateWorkUnit,
+        subject: CreateWorkUnitReviewSubject,
+        repositories: &[WorkUnitReviewSubjectRepository],
+        event: CreateDomainEvent,
+    ) -> Result<CollaborationWrite<WorkUnit>>;
     /// Scope-only lookup for the auth-before-load boundary.
     async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_by_id(&self, id: &str) -> Result<Option<WorkUnit>>;
     async fn list_by_task(&self, task_id: &str) -> Result<Vec<WorkUnit>>;
     async fn list_repository_ids(&self, work_unit_id: &str) -> Result<Vec<String>>;
+    async fn list_review_subject_repositories(
+        &self,
+        work_unit_id: &str,
+    ) -> Result<Vec<WorkUnitReviewSubjectRepository>>;
+    async fn freeze_review_subject_repositories(
+        &self,
+        review_work_unit_id: &str,
+        rows: &[WorkUnitReviewSubjectRepository],
+    ) -> Result<Vec<WorkUnitReviewSubjectRepository>>;
+    async fn list_result_requirement_repositories(
+        &self,
+        work_unit_id: &str,
+    ) -> Result<Vec<WorkUnitResultRequirementRepository>>;
+    async fn insert_result_requirement_repositories_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        rows: &[WorkUnitResultRequirementRepository],
+    ) -> Result<()>;
     async fn update(
         &self,
         input: UpdateWorkUnit,
@@ -937,7 +972,12 @@ pub trait WorkspaceLeaseRepo: Send + Sync {
     async fn issue(&self, input: CreateWorkspaceLease) -> Result<WorkspaceLease>;
     async fn get_by_id(&self, id: &str) -> Result<Option<WorkspaceLease>>;
     async fn get_active_for_task(&self, task_id: &str) -> Result<Option<WorkspaceLease>>;
-    async fn get_active_for_work_unit(&self, work_unit_id: &str) -> Result<Option<WorkspaceLease>>;
+    async fn list_active_for_work_unit(&self, work_unit_id: &str) -> Result<Vec<WorkspaceLease>>;
+    async fn get_active_for_execution_workspace(
+        &self,
+        execution_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<WorkspaceLease>>;
     async fn revoke(
         &self,
         id: &str,
@@ -987,6 +1027,15 @@ pub trait RuntimeRepo: Send + Sync {
 #[async_trait]
 pub trait ExecutionRepo: Send + Sync {
     async fn create(&self, input: CreateExecution) -> Result<Execution>;
+    async fn record_repository_results(
+        &self,
+        execution_id: &str,
+        rows: &[ExecutionRepositoryResult],
+    ) -> Result<Vec<ExecutionRepositoryResult>>;
+    async fn list_repository_results(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<ExecutionRepositoryResult>>;
     async fn create_with_event(
         &self,
         input: CreateExecution,
@@ -2117,9 +2166,27 @@ pub struct CreateWorkspace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkspaceGroup {
+    pub id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub root_path: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTaskRepositoryContextSnapshot {
+    pub task_id: String,
+    pub repo_id: String,
+    pub commit_sha: String,
+    pub captured_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateWorkUnitWorkspace {
     pub workspace: CreateWorkspace,
     pub work_unit_id: String,
+    pub workspace_group_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2248,7 +2315,7 @@ pub struct CreateWorkUnitExecution {
     pub execution: CreateExecution,
     pub work_unit_id: String,
     pub work_unit_version: i64,
-    pub workspace_lease: Option<CreateWorkspaceLease>,
+    pub workspace_leases: Vec<CreateWorkspaceLease>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

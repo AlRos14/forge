@@ -5,18 +5,20 @@ use crate::{
     CoordinationMode, CreateAgent, CreateAgentIdentity, CreateAgentProfile, CreateDomainEvent,
     CreateEvidence, CreateExecution, CreateOrchestratorWake, CreateProject, CreateProjectMember,
     CreateProviderAuthorizationOperation, CreateRepo, CreateRoleMembership, CreateSkill,
-    CreateTask, CreateTaskRole, CreateTerminalSession, CreateValidationRun,
-    CreateValidationRunArtifact, CreateWorkspace, CreateWorkspaceLease, CredentialHandleRepo,
-    DaemonRepo, DaemonStatus, DbError, DomainEventRepo, ExecutionRepo, ExecutionStatus,
-    FinishValidationRun, NotificationListQuery, NotificationRepo, OrchestratorWakeRepo,
-    PageRequest, ProjectMemberRepo, ProjectRepo, ProviderAuthorizationRepo, RepoRepo,
-    ReserveOrchestratorAction, RoleMembershipRepo, RoleMembershipStatus, SelectAgentProfile,
-    SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskDependencyRepo, TaskLifecycleRepo,
-    TaskListQuery, TaskRepo, TaskRoleRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
-    UpdateDaemonReport, UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation,
-    UpdateRepo, UpdateRoleMembership, UpdateSkill, UpdateTask, UpdateTaskRole,
-    UpdateTerminalSessionStatus, UpsertDaemon, ValidationRunRepo, ValidationRunStatus, WorkMode,
-    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    CreateTask, CreateTaskRepositoryContextSnapshot, CreateTaskRole, CreateTerminalSession,
+    CreateValidationRun, CreateValidationRunArtifact, CreateWorkUnitExecution,
+    CreateWorkUnitWorkspace, CreateWorkspace, CreateWorkspaceGroup, CreateWorkspaceLease,
+    CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo, ExecutionRepo,
+    ExecutionStatus, FinishValidationRun, NotificationListQuery, NotificationRepo,
+    OrchestratorWakeRepo, PageRequest, ProjectMemberRepo, ProjectRepo, ProviderAuthorizationRepo,
+    RepoRepo, ReserveOrchestratorAction, RoleMembershipRepo, RoleMembershipStatus,
+    SelectAgentProfile, SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskDependencyRepo,
+    TaskLifecycleRepo, TaskListQuery, TaskRepo, TaskRepositoryRole, TaskRepositoryWrite,
+    TaskRoleRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent, UpdateDaemonReport,
+    UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo,
+    UpdateRoleMembership, UpdateSkill, UpdateTask, UpdateTaskRole, UpdateTerminalSessionStatus,
+    UpsertDaemon, ValidationRunRepo, ValidationRunStatus, WorkMode, WorkUnitExecutionRepo,
+    WorkUnitWorkspaceRepo, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use sha2::Digest as _;
@@ -726,6 +728,348 @@ async fn seed_task(
         .expect("role membership creates");
     }
     task_id
+}
+
+struct MultiRepoFixture {
+    project_id: String,
+    task_id: String,
+    primary_repo_id: String,
+    affected_repo_id: String,
+    context_repo_id: Option<String>,
+    agent_id: String,
+}
+
+async fn add_task_repository(
+    db: &SqliteDb,
+    project_id: &str,
+    task_id: &str,
+    role: TaskRepositoryRole,
+    name: &str,
+) -> String {
+    let now = now_rfc3339();
+    let repo_id = new_uuid_v4();
+    RepoRepo::create(
+        db,
+        CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.to_owned(),
+            name: name.to_owned(),
+            remote_url: format!("https://example.com/{name}.git"),
+            local_path: Some(format!("/tmp/{name}")),
+            work_mode: WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("additional repository creates");
+    let current_repositories = TaskRepo::list_repositories(db, task_id)
+        .await
+        .expect("Task repositories list");
+    let mut repository_writes = current_repositories
+        .into_iter()
+        .map(|repository| TaskRepositoryWrite {
+            repo_id: repository.repo_id,
+            role: repository.role,
+        })
+        .collect::<Vec<_>>();
+    repository_writes.push(TaskRepositoryWrite {
+        repo_id: repo_id.clone(),
+        role,
+    });
+    let task = TaskRepo::get_by_id(db, task_id, true)
+        .await
+        .expect("Task lookup")
+        .expect("Task exists");
+    let mut tx = db
+        .pool()
+        .begin()
+        .await
+        .expect("Task repository transaction");
+    TaskRepo::replace_repositories_in_tx(
+        db,
+        &mut tx,
+        task_id,
+        task.version,
+        &repository_writes,
+        &now,
+    )
+    .await
+    .expect("Task repository association updates");
+    tx.commit()
+        .await
+        .expect("Task repository transaction commits");
+    repo_id
+}
+
+async fn seed_multirepo_fixture(db: &SqliteDb, with_context: bool) -> MultiRepoFixture {
+    let (project_id, primary_repo_id, agent_id) = seed_authorized_project_repo_agent(db).await;
+    let task_id = seed_task(
+        db,
+        &project_id,
+        &primary_repo_id,
+        Some(&agent_id),
+        "working".to_owned(),
+        "M2 repository task",
+    )
+    .await;
+    let affected_repo_id = add_task_repository(
+        db,
+        &project_id,
+        &task_id,
+        TaskRepositoryRole::Affected,
+        "affected-repo",
+    )
+    .await;
+    let context_repo_id = if with_context {
+        Some(
+            add_task_repository(
+                db,
+                &project_id,
+                &task_id,
+                TaskRepositoryRole::Context,
+                "context-repo",
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    MultiRepoFixture {
+        project_id,
+        task_id,
+        primary_repo_id,
+        affected_repo_id,
+        context_repo_id,
+        agent_id,
+    }
+}
+
+async fn ensure_task_role(db: &SqliteDb, task_id: &str, role_name: &str) {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_role WHERE task_id = ? AND role = ?)")
+            .bind(task_id)
+            .bind(role_name)
+            .fetch_one(db.pool())
+            .await
+            .expect("TaskRole lookup");
+    if !exists {
+        let now = now_rfc3339();
+        TaskRoleRepo::create(
+            db,
+            CreateTaskRole {
+                id: new_uuid_v4(),
+                task_id: task_id.to_owned(),
+                role: role_name.to_owned(),
+                coordination_mode: None,
+                policy_json: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("TaskRole creates");
+    }
+}
+
+async fn insert_test_work_unit(
+    db: &SqliteDb,
+    task_id: &str,
+    agent_id: &str,
+    role: &str,
+    requires_integration: bool,
+    assigned_actor_id: Option<&str>,
+) -> String {
+    ensure_task_role(db, task_id, role).await;
+    let now = now_rfc3339();
+    let work_unit_id = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO work_unit (
+            id, task_id, title, scope, status, role, assigned_actor_kind,
+            assigned_actor_id, requires_integration, created_by_kind,
+            created_by_id, version, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, 'agent', ?, 1, ?, ?)",
+    )
+    .bind(&work_unit_id)
+    .bind(task_id)
+    .bind(format!("{role} M2 WorkUnit"))
+    .bind("M2 database fixture")
+    .bind(role)
+    .bind(assigned_actor_id.map(|_| "agent"))
+    .bind(assigned_actor_id)
+    .bind(i64::from(requires_integration))
+    .bind(agent_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("WorkUnit fixture inserts");
+    work_unit_id
+}
+
+async fn create_test_work_unit_workspace(
+    db: &SqliteDb,
+    task_id: &str,
+    work_unit_id: &str,
+    group_id: &str,
+    repo_id: &str,
+    before_sha: &str,
+) -> String {
+    let now = now_rfc3339();
+    let workspace_id = new_uuid_v4();
+    WorkUnitWorkspaceRepo::create_for_work_unit(
+        db,
+        CreateWorkUnitWorkspace {
+            workspace: CreateWorkspace {
+                id: workspace_id.clone(),
+                task_id: task_id.to_owned(),
+                repo_id: repo_id.to_owned(),
+                worktree_path: format!("/tmp/forge-groups/{group_id}/{repo_id}"),
+                branch: format!("agent/{task_id}-{work_unit_id}"),
+                status: WorkspaceStatus::Ready,
+                before_sha: Some(before_sha.to_owned()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            work_unit_id: work_unit_id.to_owned(),
+            workspace_group_id: group_id.to_owned(),
+        },
+    )
+    .await
+    .expect("WorkUnit Workspace creates");
+    workspace_id
+}
+
+async fn insert_legacy_completed_execution(
+    db: &SqliteDb,
+    task_id: &str,
+    workspace_id: Option<&str>,
+) -> String {
+    let now = now_rfc3339();
+    let execution_id = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO execution (
+            id, task_id, role, status, workspace_id, created_at, updated_at
+         ) VALUES (?, ?, 'executor', 'completed', ?, ?, ?)",
+    )
+    .bind(&execution_id)
+    .bind(task_id)
+    .bind(workspace_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("completed Execution fixture inserts");
+    execution_id
+}
+
+async fn insert_review_subject_repository(
+    db: &SqliteDb,
+    row: &crate::WorkUnitReviewSubjectRepository,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO work_unit_review_subject_repository (
+            review_work_unit_id, task_id, repo_id, reviewed_work_unit_id,
+            reviewed_work_unit_version, result_execution_id, result_artifact_id,
+            result_commit_sha, result_workspace_id, workspace_snapshot_digest,
+            created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&row.review_work_unit_id)
+    .bind(&row.task_id)
+    .bind(&row.repo_id)
+    .bind(&row.reviewed_work_unit_id)
+    .bind(row.reviewed_work_unit_version)
+    .bind(row.result_execution_id.as_deref())
+    .bind(row.result_artifact_id.as_deref())
+    .bind(row.result_commit_sha.as_deref())
+    .bind(row.result_workspace_id.as_deref())
+    .bind(row.workspace_snapshot_digest.as_deref())
+    .bind(&row.created_at)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+async fn insert_test_review_subject_scalar(
+    db: &SqliteDb,
+    review_work_unit_id: &str,
+    task_id: &str,
+    reviewed_work_unit_id: &str,
+    execution_id: &str,
+) -> sqlx::Result<()> {
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO work_unit_review_subject (
+            review_work_unit_id, task_id, reviewed_work_unit_id,
+            reviewed_work_unit_version, result_execution_id, result_artifact_id,
+            result_commit_sha, result_workspace_id, workspace_snapshot_digest,
+            created_at
+         ) VALUES (?, ?, ?, 1, ?, NULL, NULL, NULL, NULL, ?)",
+    )
+    .bind(review_work_unit_id)
+    .bind(task_id)
+    .bind(reviewed_work_unit_id)
+    .bind(execution_id)
+    .bind(now)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+async fn insert_test_result_requirement_scalar(
+    db: &SqliteDb,
+    work_unit_id: &str,
+    task_id: &str,
+    source_work_unit_id: &str,
+    execution_id: &str,
+) -> sqlx::Result<()> {
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO work_unit_result_requirement (
+            work_unit_id, task_id, source_work_unit_id,
+            source_work_unit_version, result_execution_id, result_artifact_id,
+            result_commit_sha, result_workspace_id, workspace_snapshot_digest,
+            created_at
+         ) VALUES (?, ?, ?, 1, ?, NULL, NULL, NULL, NULL, ?)",
+    )
+    .bind(work_unit_id)
+    .bind(task_id)
+    .bind(source_work_unit_id)
+    .bind(execution_id)
+    .bind(now)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+async fn insert_result_requirement_repository(
+    db: &SqliteDb,
+    row: &crate::WorkUnitResultRequirementRepository,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO work_unit_result_requirement_repository (
+            work_unit_id, task_id, repo_id, source_work_unit_id,
+            source_work_unit_version, result_execution_id, result_artifact_id,
+            result_commit_sha, result_workspace_id, workspace_snapshot_digest,
+            created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&row.work_unit_id)
+    .bind(&row.task_id)
+    .bind(&row.repo_id)
+    .bind(&row.source_work_unit_id)
+    .bind(row.source_work_unit_version)
+    .bind(&row.result_execution_id)
+    .bind(row.result_artifact_id.as_deref())
+    .bind(row.result_commit_sha.as_deref())
+    .bind(row.result_workspace_id.as_deref())
+    .bind(row.workspace_snapshot_digest.as_deref())
+    .bind(&row.created_at)
+    .execute(db.pool())
+    .await?;
+    Ok(())
 }
 
 async fn seed_legacy_task_before_lifecycle(
@@ -5670,6 +6014,573 @@ async fn migration_runner_is_idempotent() {
         })
         .count() as i64;
     assert_eq!(applied_count, expected_count);
+}
+
+#[tokio::test]
+async fn multirepo_workspace_v182_allows_multiple_scopes_and_active_repo_leases() {
+    let db = sqlite_db().await;
+    let fixture = seed_multirepo_fixture(&db, false).await;
+    let work_unit_id = insert_test_work_unit(
+        &db,
+        &fixture.task_id,
+        &fixture.agent_id,
+        "implementer",
+        true,
+        Some(&fixture.agent_id),
+    )
+    .await;
+    let now = now_rfc3339();
+    let group = WorkspaceRepo::create_group_for_work_unit(
+        &db,
+        CreateWorkspaceGroup {
+            id: new_uuid_v4(),
+            task_id: fixture.task_id.clone(),
+            work_unit_id: work_unit_id.clone(),
+            root_path: format!("/tmp/forge-m2-groups/{work_unit_id}"),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("WorkUnit workspace group creates");
+    let primary_workspace_id = create_test_work_unit_workspace(
+        &db,
+        &fixture.task_id,
+        &work_unit_id,
+        &group.id,
+        &fixture.primary_repo_id,
+        "primary-base",
+    )
+    .await;
+    let affected_workspace_id = create_test_work_unit_workspace(
+        &db,
+        &fixture.task_id,
+        &work_unit_id,
+        &group.id,
+        &fixture.affected_repo_id,
+        "affected-base",
+    )
+    .await;
+    let workspaces = WorkUnitWorkspaceRepo::list_by_work_unit_id(&db, &work_unit_id)
+        .await
+        .expect("all WorkUnit Workspaces list");
+    assert_eq!(workspaces.len(), 2);
+
+    let task = TaskRepo::get_by_id(&db, &fixture.task_id, true)
+        .await
+        .expect("Task lookup")
+        .expect("Task exists");
+    let execution_id = new_uuid_v4();
+    let execution = CreateExecution {
+        id: execution_id.clone(),
+        task_id: fixture.task_id.clone(),
+        agent_id: Some(fixture.agent_id.clone()),
+        actor_ref: Some(crate::ActorRef::Agent(fixture.agent_id.clone())),
+        role: "implementer".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        harness_session_id: None,
+        agent_message_id: None,
+        last_activity_at: Some(now.clone()),
+        summary: None,
+        logs_path: None,
+        before_sha: Some("primary-base".to_owned()),
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: Some(
+            authorized_agent_execution_snapshot(&db, &fixture.agent_id).await,
+        ),
+        workspace_id: Some(primary_workspace_id.clone()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let lease_for = |workspace_id: &str, repo_id: &str, base_ref: &str, operation_suffix: &str| {
+        CreateWorkspaceLease {
+            id: new_uuid_v4(),
+            project_id: fixture.project_id.clone(),
+            task_id: fixture.task_id.clone(),
+            work_unit_id: Some(work_unit_id.clone()),
+            workspace_id: Some(workspace_id.to_owned()),
+            task_version: task.version,
+            execution_id: execution_id.clone(),
+            operation_idempotency_key: format!("{execution_id}:{operation_suffix}"),
+            repository_binding_id: repo_id.to_owned(),
+            base_ref: base_ref.to_owned(),
+            role: "worker".to_owned(),
+            capabilities_json: r#"["repository_write"]"#.to_owned(),
+            assigned_principal_type: "agent".to_owned(),
+            assigned_principal_id: fixture.agent_id.clone(),
+            capability_profile_revision: "forge.capability-profile/v1".to_owned(),
+            capability_profile_digest:
+                "sha256:eeb061a14ab862e1a7b16989ef637293ba538f46122ff28b30313d330dbae4a8".to_owned(),
+            issuing_principal_type: "system".to_owned(),
+            issuing_principal_id: "task-service-scheduler".to_owned(),
+            issued_at: now.clone(),
+            expires_at: "9999-01-01T00:00:00Z".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        }
+    };
+    let event = CreateDomainEvent {
+        id: new_uuid_v4(),
+        event_type: "execution.started".to_owned(),
+        entity_type: "execution".to_owned(),
+        entity_id: execution_id.clone(),
+        actor_type: "agent".to_owned(),
+        actor_id: Some(fixture.agent_id.clone()),
+        scope_type: "task".to_owned(),
+        scope_id: fixture.task_id.clone(),
+        correlation_id: execution_id.clone(),
+        causation_id: None,
+        causation_depth: 0,
+        dedupe_key: Some(format!("execution.started:{execution_id}")),
+        payload_json: serde_json::json!({
+            "execution_id": execution_id,
+            "task_id": fixture.task_id,
+            "work_unit_id": work_unit_id,
+            "agent_id": fixture.agent_id,
+            "status": "running",
+        })
+        .to_string(),
+        created_at: now,
+    };
+    WorkUnitExecutionRepo::create_for_work_unit(
+        &db,
+        CreateWorkUnitExecution {
+            execution,
+            work_unit_id: work_unit_id.clone(),
+            work_unit_version: 1,
+            workspace_leases: vec![
+                lease_for(
+                    &primary_workspace_id,
+                    &fixture.primary_repo_id,
+                    "primary-base",
+                    "primary",
+                ),
+                lease_for(
+                    &affected_workspace_id,
+                    &fixture.affected_repo_id,
+                    "affected-base",
+                    "affected",
+                ),
+            ],
+        },
+        event,
+    )
+    .await
+    .expect("one Execution admits leases for both writable repositories");
+
+    let active_leases = WorkspaceLeaseRepo::list_active_for_work_unit(&db, &work_unit_id)
+        .await
+        .expect("active WorkUnit leases list");
+    assert_eq!(active_leases.len(), 2);
+    assert!(active_leases
+        .iter()
+        .any(|lease| lease.workspace_id.as_deref() == Some(primary_workspace_id.as_str())));
+    assert!(active_leases
+        .iter()
+        .any(|lease| lease.workspace_id.as_deref() == Some(affected_workspace_id.as_str())));
+}
+
+#[tokio::test]
+async fn multirepo_workspace_context_snapshot_pins_once_and_is_immutable() {
+    let db = sqlite_db().await;
+    let fixture = seed_multirepo_fixture(&db, true).await;
+    let context_repo_id = fixture
+        .context_repo_id
+        .as_deref()
+        .expect("fixture has a context repository");
+    let first = TaskRepo::pin_context_repository_snapshot(
+        &db,
+        CreateTaskRepositoryContextSnapshot {
+            task_id: fixture.task_id.clone(),
+            repo_id: context_repo_id.to_owned(),
+            commit_sha: "context-first-pin".to_owned(),
+            captured_at: "2026-11-20T10:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("first context snapshot pins");
+    let replay = TaskRepo::pin_context_repository_snapshot(
+        &db,
+        CreateTaskRepositoryContextSnapshot {
+            task_id: fixture.task_id.clone(),
+            repo_id: context_repo_id.to_owned(),
+            commit_sha: "context-later-head".to_owned(),
+            captured_at: "2026-11-20T11:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("context pin replay returns the first snapshot");
+    assert_eq!(replay, first);
+
+    let update = sqlx::query(
+        "UPDATE task_repository_context_snapshot
+         SET commit_sha = 'invented-replacement'
+         WHERE task_id = ? AND repo_id = ?",
+    )
+    .bind(&fixture.task_id)
+    .bind(context_repo_id)
+    .execute(db.pool())
+    .await
+    .expect_err("context snapshot cannot be updated");
+    assert!(update
+        .to_string()
+        .contains("context repository snapshot is immutable"));
+}
+
+#[tokio::test]
+async fn multirepo_result_rows_require_exact_task_repo_and_workspace() {
+    let db = sqlite_db().await;
+    let fixture = seed_multirepo_fixture(&db, false).await;
+    let now = now_rfc3339();
+    let workspace = WorkspaceRepo::create(
+        &db,
+        CreateWorkspace {
+            id: new_uuid_v4(),
+            task_id: fixture.task_id.clone(),
+            repo_id: fixture.primary_repo_id.clone(),
+            worktree_path: format!("/tmp/forge-m2-integration/{}", fixture.task_id),
+            branch: "agent/m2-result".to_owned(),
+            status: WorkspaceStatus::Ready,
+            before_sha: Some("primary-base".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("primary integration Workspace creates");
+    let execution_id =
+        insert_legacy_completed_execution(&db, &fixture.task_id, Some(&workspace.id)).await;
+    let valid = crate::ExecutionRepositoryResult {
+        execution_id: execution_id.clone(),
+        task_id: fixture.task_id.clone(),
+        repo_id: fixture.primary_repo_id.clone(),
+        workspace_id: workspace.id.clone(),
+        before_sha: Some("primary-base".to_owned()),
+        after_sha: Some("primary-head".to_owned()),
+        snapshot_digest: None,
+        created_at: now.clone(),
+    };
+    let recorded = ExecutionRepo::record_repository_results(&db, &execution_id, &[valid])
+        .await
+        .expect("the exact Task repository and Workspace result records");
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].repo_id, fixture.primary_repo_id);
+
+    let wrong_repo_execution =
+        insert_legacy_completed_execution(&db, &fixture.task_id, Some(&workspace.id)).await;
+    let wrong_repo = crate::ExecutionRepositoryResult {
+        execution_id: wrong_repo_execution.clone(),
+        task_id: fixture.task_id.clone(),
+        repo_id: fixture.affected_repo_id.clone(),
+        workspace_id: workspace.id.clone(),
+        before_sha: Some("primary-base".to_owned()),
+        after_sha: Some("affected-head".to_owned()),
+        snapshot_digest: None,
+        created_at: now.clone(),
+    };
+    assert!(
+        ExecutionRepo::record_repository_results(&db, &wrong_repo_execution, &[wrong_repo])
+            .await
+            .is_err()
+    );
+
+    let other_task_id = seed_task(
+        &db,
+        &fixture.project_id,
+        &fixture.primary_repo_id,
+        None,
+        "todo".to_owned(),
+        "Other result task",
+    )
+    .await;
+    let cross_task = crate::ExecutionRepositoryResult {
+        execution_id,
+        task_id: other_task_id,
+        repo_id: fixture.primary_repo_id,
+        workspace_id: workspace.id,
+        before_sha: Some("primary-base".to_owned()),
+        after_sha: Some("wrong-task-head".to_owned()),
+        snapshot_digest: None,
+        created_at: now,
+    };
+    let cross_task_execution_id = recorded[0].execution_id.clone();
+    assert!(
+        ExecutionRepo::record_repository_results(&db, &cross_task_execution_id, &[cross_task])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn multirepo_result_review_and_requirement_rows_bind_exact_execution() {
+    let db = sqlite_db().await;
+    let fixture = seed_multirepo_fixture(&db, false).await;
+    let source_work_unit_id = insert_test_work_unit(
+        &db,
+        &fixture.task_id,
+        &fixture.agent_id,
+        "implementer",
+        true,
+        Some(&fixture.agent_id),
+    )
+    .await;
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO work_unit_repository (work_unit_id, task_id, repo_id, created_at)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(&source_work_unit_id)
+    .bind(&fixture.task_id)
+    .bind(&fixture.affected_repo_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("source WorkUnit selects the non-primary affected repository");
+    let group = WorkspaceRepo::create_group_for_work_unit(
+        &db,
+        CreateWorkspaceGroup {
+            id: new_uuid_v4(),
+            task_id: fixture.task_id.clone(),
+            work_unit_id: source_work_unit_id.clone(),
+            root_path: format!("/tmp/forge-m2-results/{source_work_unit_id}"),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("selected WorkUnit group creates");
+    let affected_workspace_id = create_test_work_unit_workspace(
+        &db,
+        &fixture.task_id,
+        &source_work_unit_id,
+        &group.id,
+        &fixture.affected_repo_id,
+        "affected-base",
+    )
+    .await;
+
+    let execution_id = insert_legacy_completed_execution(&db, &fixture.task_id, None).await;
+    sqlx::query("UPDATE execution SET work_unit_id = ?, work_unit_version = 1 WHERE id = ?")
+        .bind(&source_work_unit_id)
+        .bind(&execution_id)
+        .execute(db.pool())
+        .await
+        .expect("fixture Execution binds to the selected WorkUnit result");
+    let execution_result = crate::ExecutionRepositoryResult {
+        execution_id: execution_id.clone(),
+        task_id: fixture.task_id.clone(),
+        repo_id: fixture.affected_repo_id.clone(),
+        workspace_id: affected_workspace_id.clone(),
+        before_sha: Some("affected-base".to_owned()),
+        after_sha: Some("affected-head".to_owned()),
+        snapshot_digest: None,
+        created_at: now.clone(),
+    };
+    ExecutionRepo::record_repository_results(&db, &execution_id, &[execution_result])
+        .await
+        .expect("selected repository result records");
+    sqlx::query(
+        "UPDATE work_unit SET status = 'completed', version = version + 1, updated_at = ?
+         WHERE id = ? AND version = 1",
+    )
+    .bind(&now)
+    .bind(&source_work_unit_id)
+    .execute(db.pool())
+    .await
+    .expect("WorkUnit completion accepts the exact non-primary repository result");
+
+    let valid_review_work_unit_id = insert_test_work_unit(
+        &db,
+        &fixture.task_id,
+        &fixture.agent_id,
+        "reviewer",
+        false,
+        None,
+    )
+    .await;
+    insert_test_review_subject_scalar(
+        &db,
+        &valid_review_work_unit_id,
+        &fixture.task_id,
+        &source_work_unit_id,
+        &execution_id,
+    )
+    .await
+    .expect("review subject scalar binds exact completed source Execution");
+    let valid_review_repository = crate::WorkUnitReviewSubjectRepository {
+        review_work_unit_id: valid_review_work_unit_id,
+        task_id: fixture.task_id.clone(),
+        repo_id: fixture.affected_repo_id.clone(),
+        reviewed_work_unit_id: source_work_unit_id.clone(),
+        reviewed_work_unit_version: Some(1),
+        result_execution_id: Some(execution_id.clone()),
+        result_artifact_id: None,
+        result_commit_sha: Some("affected-head".to_owned()),
+        result_workspace_id: Some(affected_workspace_id.clone()),
+        workspace_snapshot_digest: None,
+        created_at: now.clone(),
+    };
+    insert_review_subject_repository(&db, &valid_review_repository)
+        .await
+        .expect("per-repository review subject binds the exact Execution result");
+
+    let wrong_version_review_work_unit_id = insert_test_work_unit(
+        &db,
+        &fixture.task_id,
+        &fixture.agent_id,
+        "reviewer",
+        false,
+        None,
+    )
+    .await;
+    insert_test_review_subject_scalar(
+        &db,
+        &wrong_version_review_work_unit_id,
+        &fixture.task_id,
+        &source_work_unit_id,
+        &execution_id,
+    )
+    .await
+    .expect("second review subject scalar inserts");
+    let wrong_version = crate::WorkUnitReviewSubjectRepository {
+        review_work_unit_id: wrong_version_review_work_unit_id,
+        reviewed_work_unit_version: Some(2),
+        ..valid_review_repository.clone()
+    };
+    assert!(insert_review_subject_repository(&db, &wrong_version)
+        .await
+        .is_err());
+
+    let orphan_review_work_unit_id = insert_test_work_unit(
+        &db,
+        &fixture.task_id,
+        &fixture.agent_id,
+        "reviewer",
+        false,
+        None,
+    )
+    .await;
+    let orphan_review = crate::WorkUnitReviewSubjectRepository {
+        review_work_unit_id: orphan_review_work_unit_id,
+        ..valid_review_repository.clone()
+    };
+    assert!(insert_review_subject_repository(&db, &orphan_review)
+        .await
+        .is_err());
+
+    let digest_review_work_unit_id = insert_test_work_unit(
+        &db,
+        &fixture.task_id,
+        &fixture.agent_id,
+        "reviewer",
+        false,
+        None,
+    )
+    .await;
+    insert_test_review_subject_scalar(
+        &db,
+        &digest_review_work_unit_id,
+        &fixture.task_id,
+        &source_work_unit_id,
+        &execution_id,
+    )
+    .await
+    .expect("digest review subject scalar inserts");
+    let digest_mismatch = crate::WorkUnitReviewSubjectRepository {
+        review_work_unit_id: digest_review_work_unit_id,
+        workspace_snapshot_digest: Some("a".repeat(64)),
+        ..valid_review_repository.clone()
+    };
+    assert!(insert_review_subject_repository(&db, &digest_mismatch)
+        .await
+        .is_err());
+
+    let valid_correction_work_unit_id = insert_test_work_unit(
+        &db,
+        &fixture.task_id,
+        &fixture.agent_id,
+        "implementer",
+        false,
+        None,
+    )
+    .await;
+    insert_test_result_requirement_scalar(
+        &db,
+        &valid_correction_work_unit_id,
+        &fixture.task_id,
+        &source_work_unit_id,
+        &execution_id,
+    )
+    .await
+    .expect("result requirement scalar inserts");
+    let valid_requirement_repository = crate::WorkUnitResultRequirementRepository {
+        work_unit_id: valid_correction_work_unit_id,
+        task_id: fixture.task_id.clone(),
+        repo_id: fixture.affected_repo_id.clone(),
+        source_work_unit_id: source_work_unit_id.clone(),
+        source_work_unit_version: 1,
+        result_execution_id: execution_id.clone(),
+        result_artifact_id: None,
+        result_commit_sha: Some("affected-head".to_owned()),
+        result_workspace_id: Some(affected_workspace_id.clone()),
+        workspace_snapshot_digest: None,
+        created_at: now.clone(),
+    };
+    insert_result_requirement_repository(&db, &valid_requirement_repository)
+        .await
+        .expect("result requirement binds its exact repository result");
+
+    let wrong_version_correction_id = insert_test_work_unit(
+        &db,
+        &fixture.task_id,
+        &fixture.agent_id,
+        "implementer",
+        false,
+        None,
+    )
+    .await;
+    insert_test_result_requirement_scalar(
+        &db,
+        &wrong_version_correction_id,
+        &fixture.task_id,
+        &source_work_unit_id,
+        &execution_id,
+    )
+    .await
+    .expect("second result requirement scalar inserts");
+    let wrong_requirement_version = crate::WorkUnitResultRequirementRepository {
+        work_unit_id: wrong_version_correction_id,
+        source_work_unit_version: 2,
+        ..valid_requirement_repository.clone()
+    };
+    assert!(
+        insert_result_requirement_repository(&db, &wrong_requirement_version)
+            .await
+            .is_err()
+    );
+
+    let orphan_correction_id = insert_test_work_unit(
+        &db,
+        &fixture.task_id,
+        &fixture.agent_id,
+        "implementer",
+        false,
+        None,
+    )
+    .await;
+    let orphan_requirement = crate::WorkUnitResultRequirementRepository {
+        work_unit_id: orphan_correction_id,
+        ..valid_requirement_repository
+    };
+    assert!(
+        insert_result_requirement_repository(&db, &orphan_requirement)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

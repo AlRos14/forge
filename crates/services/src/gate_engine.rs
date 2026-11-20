@@ -3201,7 +3201,7 @@ mod tests {
                 },
                 work_unit_id: unit_id.clone(),
                 work_unit_version: 1,
-                workspace_lease: None,
+                workspace_leases: Vec::new(),
             },
             gate_event(
                 "execution.started",

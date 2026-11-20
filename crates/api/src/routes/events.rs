@@ -158,6 +158,7 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
         | "proposal.created"
         | "proposal.withdrawn"
         | "decision.recorded" => json!({}),
+        "execution.repository_results_recorded" => project_execution_repository_results(&source),
         "task.coordination_authorized" => project_fields(
             &source,
             &[
@@ -468,6 +469,9 @@ fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
         "execution.completed" => PublicEventType::ExecutionCompleted,
         "execution.failed" => PublicEventType::ExecutionFailed,
         "execution.cancelled" => PublicEventType::ExecutionCancelled,
+        "execution.repository_results_recorded" => {
+            PublicEventType::ExecutionRepositoryResultsRecorded
+        }
         "execution.stalled" => PublicEventType::ExecutionStalled,
         "validation_run.started" => PublicEventType::ValidationRunStarted,
         "validation_run.completed" => PublicEventType::ValidationRunCompleted,
@@ -560,6 +564,7 @@ fn project_validation_check(source: &Value, event_type: &str) -> Value {
             "subject_kind",
             "subject_id",
             "subject_version",
+            "repo_id",
             "workspace_id",
             "baseline",
             "state",
@@ -583,6 +588,35 @@ fn project_fields(source: &Value, fields: &[&str]) -> Value {
         }
     }
     Value::Object(projected)
+}
+
+fn project_execution_repository_results(source: &Value) -> Value {
+    let repository_results = source
+        .get("repository_results")
+        .and_then(Value::as_array)
+        .map(|results| {
+            results
+                .iter()
+                .map(|result| {
+                    project_fields(
+                        result,
+                        &[
+                            "repo_id",
+                            "workspace_id",
+                            "before_sha",
+                            "after_sha",
+                            "snapshot_digest",
+                        ],
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "task_id": source.get("task_id"),
+        "execution_id": source.get("execution_id"),
+        "repository_results": repository_results,
+    })
 }
 
 fn project_runtime_hint(event: &events::ForgeEvent) -> Option<PublicEventEnvelope> {
@@ -732,6 +766,29 @@ mod tests {
         assert_eq!(projected.event_type, PublicEventType::TaskLifecycleChanged);
         assert_eq!(projected.payload.as_ref().unwrap()["to_state"], "active");
         assert!(projected.payload.as_ref().unwrap().get("prompt").is_none());
+    }
+
+    #[test]
+    fn multirepo_execution_results_event_exposes_repo_results_without_paths() {
+        let event = domain_event(
+            "execution.repository_results_recorded",
+            r#"{"task_id":"task-1","execution_id":"execution-1","repository_results":[{"repo_id":"repo-a","workspace_id":"workspace-a","before_sha":"base-a","after_sha":"head-a","snapshot_digest":"digest-a","worktree_path":"/private/a","token":"secret"}],"worktree_path":"/private"}"#,
+        );
+        let projected = project_domain_event(&event).expect("repository result event");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::ExecutionRepositoryResultsRecorded
+        );
+        let payload = projected.payload.expect("payload");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["execution_id"], "execution-1");
+        assert_eq!(payload["repository_results"][0]["repo_id"], "repo-a");
+        assert_eq!(payload["repository_results"][0]["after_sha"], "head-a");
+        assert!(payload["repository_results"][0]
+            .get("worktree_path")
+            .is_none());
+        assert!(payload.get("worktree_path").is_none());
+        assert!(payload["repository_results"][0].get("token").is_none());
     }
 
     #[test]

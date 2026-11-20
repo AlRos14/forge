@@ -1047,10 +1047,10 @@ async fn project_batch_coordinator_materializes_work_and_binds_worker_review_and
                         .await
                         .expect("WorkUnit active Execution diagnostics load");
                 let workspace =
-                    db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*database, &unit.id)
+                    db::WorkUnitWorkspaceRepo::list_by_work_unit_id(&*database, &unit.id)
                         .await
                         .expect("WorkUnit Workspace diagnostics load");
-                let lease = db::WorkspaceLeaseRepo::get_active_for_work_unit(&*database, &unit.id)
+                let lease = db::WorkspaceLeaseRepo::list_active_for_work_unit(&*database, &unit.id)
                     .await
                     .expect("WorkUnit WorkspaceLease diagnostics load");
                 diagnostics.push((

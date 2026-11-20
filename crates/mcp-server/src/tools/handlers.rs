@@ -9,7 +9,7 @@ use db::{
     CollaborationRepo, CreateProject, ExecutionRepo, GateRepo, GateScopeKind, PageRequest,
     ProjectRepo, RoleMembershipRepo, SortBy, SortOrder, Task, TaskDependencyRepo,
     TaskLifecycleRepo, TaskListQuery, TaskRepo, TaskRoleRepo, UpdateProject, UpdateTask,
-    ValidationRunRepo, WorkUnitDependency, WorkUnitRepo,
+    ValidationRunRepo, WorkUnitDependency, WorkUnitRepo, WorkspaceRepo,
 };
 use executors::ExecutionOverrides;
 use serde_json::{json, Map, Value};
@@ -39,8 +39,7 @@ use crate::{
     protocol::McpContext,
     state::AppState,
     values::{
-        agent_profile_value, agent_value, execution_page_value, execution_value,
-        project_page_value, project_value,
+        agent_profile_value, agent_value, execution_value, project_page_value, project_value,
     },
 };
 
@@ -317,7 +316,36 @@ pub(super) async fn forge_list_executions(
         page_request(params.cursor, params.limit, None)?,
     )
     .await?;
-    Ok(execution_page_value(page))
+    let mut items = Vec::with_capacity(page.items.len());
+    for execution in page.items {
+        items.push(execution_value_with_repository_results(state, execution).await?);
+    }
+    let has_more = page.next_cursor.is_some();
+    Ok(json!({
+        "items": items,
+        "next_cursor": page.next_cursor,
+        "has_more": has_more,
+        "total_count": page.total_count,
+    }))
+}
+
+async fn execution_value_with_repository_results(
+    state: &AppState,
+    execution: db::Execution,
+) -> Result<Value, McpToolError> {
+    let results = ExecutionRepo::list_repository_results(&*state.db, &execution.id).await?;
+    let mut value = execution_value(execution);
+    value["repository_results"] = json!(results
+        .into_iter()
+        .map(|result| json!({
+            "repo_id": result.repo_id,
+            "workspace_id": result.workspace_id,
+            "before_sha": result.before_sha,
+            "after_sha": result.after_sha,
+            "snapshot_digest": result.snapshot_digest,
+        }))
+        .collect::<Vec<_>>());
+    Ok(value)
 }
 
 pub(super) async fn forge_get_task_dispatch(
@@ -2651,7 +2679,10 @@ async fn review_execution_value(
     )
     .await?;
     let report = report.map(artifact_value).transpose()?;
-    Ok(json!({"execution": execution_value(execution), "report": report}))
+    Ok(json!({
+        "execution": execution_value_with_repository_results(state, execution).await?,
+        "report": report,
+    }))
 }
 
 pub(super) async fn forge_list_validation_runs(
@@ -2682,12 +2713,16 @@ async fn validation_run_value(
     state: &AppState,
     run: db::ValidationRun,
 ) -> Result<Value, McpToolError> {
+    let workspace = WorkspaceRepo::get_by_id(&*state.db, &run.workspace_id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("workspace", run.workspace_id.clone()))?;
     let evidence = ValidationRunRepo::list_evidence_for_validation_run(&*state.db, &run.id).await?;
     let artifact =
         ValidationRunRepo::get_validation_run_artifact_output(&*state.db, &run.id).await?;
     Ok(json!({
         "id": run.id,
         "task_id": run.task_id,
+        "repo_id": workspace.repo_id,
         "work_unit_id": run.work_unit_id,
         "caused_by_execution_id": run.caused_by_execution_id,
         "check_identity": run.check_identity,

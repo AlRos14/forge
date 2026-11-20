@@ -5,6 +5,7 @@ import {
   canManageValidationCatalog,
   comparisonBadge,
   readRequiredChecks,
+  validationRepositoryLabel,
 } from './task-verification'
 
 describe('comparison badge mapping', () => {
@@ -55,5 +56,11 @@ describe('required checks', () => {
       }),
     ).toEqual([{ check_key: 'unit', definition_digest: 'abc', required_outcome: 'passed' }])
     expect(readRequiredChecks({})).toEqual([])
+  })
+})
+
+describe('validation repository label', () => {
+  it('multirepo_result_validation_labels_repo', () => {
+    expect(validationRepositoryLabel({ repo_id: 'repo-api' })).toBe('Repository repo-api')
   })
 })

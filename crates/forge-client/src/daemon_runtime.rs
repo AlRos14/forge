@@ -404,9 +404,12 @@ impl DaemonRuntime {
             execution_id: params.execution_id.clone(),
             role: params.role.clone(),
             task_role_capabilities: params.task_role_capabilities.clone(),
-            // The daemon ExecutionStart contract supplies an exact workspace
-            // path; non-repository WorkUnits are admitted only on the local host.
-            has_repository_workspace: true,
+            // The daemon contract carries the exact root path. A group root
+            // has repositories as children; legacy repository scopes carry
+            // their own .git marker. Isolated cognitive contexts have neither.
+            has_repository_workspace: executors::workspace_group_writable_paths(&worktree_path)
+                .is_some()
+                || worktree_path.join(".git").exists(),
             review_read_paths,
             worktree_path: worktree_path.to_string_lossy().into_owned(),
             description,

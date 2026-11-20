@@ -405,7 +405,24 @@ impl HarnessAdapter for SmithAdapter {
             stream.agent_session_id.as_deref(),
         )?;
 
+        let group_worktrees =
+            executors::workspace_group_writable_paths(Path::new(&ctx.worktree_path));
         let after_sha = if ctx.has_repository_workspace
+            && let Some(worktrees) = group_worktrees.as_ref()
+        {
+            let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
+            for worktree in worktrees {
+                crate::commit::commit_worktree_changes(worktree, &subject)
+                    .await
+                    .map_err(|error| {
+                        ExecutorError::Other(format!(
+                            "failed to commit group worktree changes: {error}"
+                        ))
+                    })?;
+            }
+            None
+        } else if ctx.has_repository_workspace
+            && group_worktrees.is_none()
             && let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
         {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);

@@ -9,8 +9,8 @@ use db::{
     ExecutionStatus, RecordWorkUnitIntegration, RepoRepo, SqliteDb, Task, TaskRepo,
     TransitionWorkUnit, UpdateWorkUnit, WorkUnit, WorkUnitDependency, WorkUnitExecutionRepo,
     WorkUnitIntegration, WorkUnitIntegrationOutcome, WorkUnitProvenance, WorkUnitRepo,
-    WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceRepo, WorkspaceScopeKind,
-    WorkspaceStatus,
+    WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceGroup, WorkspaceRepo,
+    WorkspaceScopeKind, WorkspaceStatus,
 };
 use events::EventBus;
 use sha2::{Digest, Sha256};
@@ -36,6 +36,14 @@ pub struct WorkUnitReadiness {
     pub awaiting_integration: bool,
     pub awaiting_acceptance: bool,
     pub awaiting_review_approval: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceGroupMember {
+    repo: db::Repo,
+    role: db::TaskRepositoryRole,
+    base_sha: String,
+    read_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -625,7 +633,55 @@ impl WorkUnitService {
                 }
                 (None, None)
             };
-            WorkUnitRepo::create_with_review_subject(
+            let repository_subjects = if let Some(result_execution_id) =
+                result_execution_id.as_deref()
+            {
+                ExecutionRepo::list_repository_results(&*self.db, result_execution_id)
+                    .await?
+                    .into_iter()
+                    .map(|result| db::WorkUnitReviewSubjectRepository {
+                        review_work_unit_id: review_work_unit_id.clone(),
+                        task_id: task.id.clone(),
+                        repo_id: result.repo_id,
+                        reviewed_work_unit_id: reviewed.id.clone(),
+                        reviewed_work_unit_version,
+                        result_execution_id: Some(result.execution_id),
+                        result_artifact_id: result_artifact_id.clone(),
+                        result_commit_sha: result.after_sha,
+                        result_workspace_id: Some(result.workspace_id),
+                        workspace_snapshot_digest: result.snapshot_digest,
+                        created_at: now.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                let task_repositories = TaskRepo::list_repositories(&*self.db, &task.id).await?;
+                let selected_repository_ids =
+                    WorkUnitRepo::list_repository_ids(&*self.db, &reviewed.id).await?;
+                task_repositories
+                    .into_iter()
+                    .filter(|repository| {
+                        matches!(
+                            repository.role,
+                            db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                        ) && (selected_repository_ids.is_empty()
+                            || selected_repository_ids.contains(&repository.repo_id))
+                    })
+                    .map(|repository| db::WorkUnitReviewSubjectRepository {
+                        review_work_unit_id: review_work_unit_id.clone(),
+                        task_id: task.id.clone(),
+                        repo_id: repository.repo_id,
+                        reviewed_work_unit_id: reviewed.id.clone(),
+                        reviewed_work_unit_version: None,
+                        result_execution_id: None,
+                        result_artifact_id: None,
+                        result_commit_sha: None,
+                        result_workspace_id: None,
+                        workspace_snapshot_digest: None,
+                        created_at: now.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            WorkUnitRepo::create_with_review_subject_repositories(
                 &*self.db,
                 work_unit_input,
                 CreateWorkUnitReviewSubject {
@@ -642,6 +698,7 @@ impl WorkUnitService {
                     manifest_digest,
                     created_at: now,
                 },
+                &repository_subjects,
                 event,
             )
             .await?
@@ -823,9 +880,9 @@ impl WorkUnitService {
             return Err(db::DbError::VersionConflict.into());
         }
         if requires_integration.is_some_and(|next| next != unit.requires_integration)
-            && (WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, id)
+            && (!WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, id)
                 .await?
-                .is_some()
+                .is_empty()
                 || sqlx::query_scalar::<_, i64>(
                     "SELECT EXISTS(SELECT 1 FROM execution WHERE work_unit_id = ?)",
                 )
@@ -1009,12 +1066,27 @@ impl WorkUnitService {
                 let has_result: i64 = sqlx::query_scalar(
                     "SELECT EXISTS(
                         SELECT 1 FROM execution e
-                        JOIN workspace_scope s
-                          ON s.workspace_id = e.workspace_id AND s.task_id = e.task_id
                         WHERE e.work_unit_id = ? AND e.task_id = ?
                           AND e.work_unit_version = ?
-                          AND e.status = 'completed' AND e.after_sha IS NOT NULL
-                          AND s.scope_kind = 'work_unit' AND s.work_unit_id = e.work_unit_id
+                          AND e.status = 'completed'
+                          AND (
+                              EXISTS (
+                                  SELECT 1 FROM execution_repository_result result
+                                  WHERE result.execution_id = e.id
+                                    AND result.task_id = e.task_id
+                                    AND result.after_sha IS NOT NULL
+                              )
+                              OR (
+                                  e.workspace_id IS NOT NULL AND e.after_sha IS NOT NULL
+                                  AND EXISTS (
+                                      SELECT 1 FROM workspace_scope scope
+                                      WHERE scope.workspace_id = e.workspace_id
+                                        AND scope.task_id = e.task_id
+                                        AND scope.scope_kind = 'work_unit'
+                                        AND scope.work_unit_id = e.work_unit_id
+                                  )
+                              )
+                          )
                     )",
                 )
                 .bind(id)
@@ -1024,7 +1096,7 @@ impl WorkUnitService {
                 .await?;
                 if has_result == 0 {
                     return Err(invalid(
-                        "Repository WorkUnit requires a completed Execution result SHA",
+                        "Repository WorkUnit requires a completed repository result SHA",
                     ));
                 }
             }
@@ -1489,53 +1561,31 @@ impl WorkUnitService {
         if current.version != expected_version || current.status != WorkUnitStatus::Open {
             return Err(db::DbError::VersionConflict.into());
         }
-        let _workspace_guard = if current.requires_integration {
-            let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
-                invalid("repository WorkUnit Execution requires its exact Workspace")
-            })?;
-            Some(self.integration_locks.acquire(workspace_id).await)
-        } else {
-            if execution.workspace_id.is_some() {
-                return Err(invalid(
-                    "non-mutating WorkUnit Execution cannot bind a repository Workspace",
-                ));
-            }
-            None
-        };
+        let mut workspace_lock_keys = vec![format!("work-unit-workspace:{id}")];
+        workspace_lock_keys.extend(
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, id)
+                .await?
+                .into_iter()
+                .map(|workspace| workspace.id),
+        );
+        workspace_lock_keys.sort();
+        workspace_lock_keys.dedup();
+        let mut _workspace_guards = Vec::with_capacity(workspace_lock_keys.len());
+        for lock_key in workspace_lock_keys {
+            _workspace_guards.push(self.integration_locks.acquire(&lock_key).await);
+        }
         let current = WorkUnitRepo::get_by_id(&*self.db, id)
             .await?
             .ok_or_else(|| not_found("work_unit", id))?;
         if current.version != expected_version || current.status != WorkUnitStatus::Open {
             return Err(db::DbError::VersionConflict.into());
         }
-        let workspace_lease = if current.requires_integration {
-            let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
-                invalid("repository WorkUnit Execution requires its exact Workspace")
-            })?;
-            let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-                .await?
-                .ok_or_else(|| not_found("workspace", workspace_id))?;
-            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, workspace_id)
-                .await?
-                .ok_or_else(|| not_found("workspace", workspace_id))?;
-            if scope.task_id != task.id
-                || scope.kind != WorkspaceScopeKind::WorkUnit
-                || scope.work_unit_id.as_deref() != Some(id)
-                || workspace.status != WorkspaceStatus::Ready
-            {
-                return Err(not_found("workspace", workspace_id));
-            }
-            Some(
-                crate::task_service::TaskService::new(
-                    Arc::clone(&self.db),
-                    Arc::clone(&self.event_bus),
-                )
-                .prepare_work_unit_workspace_lease(&task, &current, &workspace, &execution, &actor)
-                .await?,
-            )
-        } else {
-            None
-        };
+        let workspace_leases = crate::task_service::TaskService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .prepare_work_unit_workspace_leases(&task, &current, &execution, &actor)
+        .await?;
         let now = execution.created_at.clone();
         let event = self.event(
             "execution.started", "execution", &execution.id, &task, &actor,
@@ -1548,7 +1598,7 @@ impl WorkUnitService {
                 execution,
                 work_unit_id: id.to_owned(),
                 work_unit_version: expected_version,
-                workspace_lease,
+                workspace_leases,
             },
             event,
         )
@@ -1569,7 +1619,7 @@ impl WorkUnitService {
             "SELECT DISTINCT unit.id FROM work_unit unit
              JOIN task_coordination coordination ON coordination.task_id = unit.task_id
              WHERE unit.task_id = ? AND unit.status = 'open'
-               AND unit.requires_integration = 1 AND unit.assigned_actor_kind = 'agent'
+               AND unit.assigned_actor_kind = 'agent'
                AND coordination.mode != 'manual' AND coordination.revoked_at IS NULL
                AND coordination.team_stale = 0 AND coordination.authorization_version = ?
                AND (
@@ -1591,11 +1641,39 @@ impl WorkUnitService {
         let source = CollaborationActorSource::Human(user_id.to_owned());
         let mut blockers = Vec::new();
         for id in ids {
-            if WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, &id)
-                .await?
-                .is_some()
-            {
+            let Some(unit) = WorkUnitRepo::get_by_id(&*self.db, &id).await? else {
                 continue;
+            };
+            let Some(role) = db::canonical_task_role_name(&unit.role) else {
+                continue;
+            };
+            let Some(task_role) =
+                db::TaskRoleRepo::get_by_task_and_role(&*self.db, task_id, &role).await?
+            else {
+                continue;
+            };
+            let formal_review = crate::role_capabilities::current_task_role_has_capability(
+                &self.db,
+                &task_role.id,
+                api_types::TaskRoleCapability::FormalReview,
+            )
+            .await?;
+            if !unit.requires_integration && !formal_review {
+                continue;
+            }
+            let group = WorkspaceRepo::get_group_by_work_unit_id(&*self.db, &id).await?;
+            if group.is_none()
+                && !WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, &id)
+                    .await?
+                    .is_empty()
+            {
+                // A V181 single-Workspace WorkUnit is historical evidence. It
+                // has no safe group root to infer, so leave it on its original
+                // execution path.
+                continue;
+            }
+            if formal_review {
+                self.freeze_review_subject_repositories(&id).await?;
             }
             match self.readiness(source.clone(), &id).await {
                 Ok(readiness) if readiness.runnable => {}
@@ -1605,18 +1683,450 @@ impl WorkUnitService {
                     continue;
                 }
             }
-            if let Err(error) = self.prepare_workspace(source.clone(), &id).await {
+            if let Err(error) = self.prepare_workspace_group(source.clone(), &id).await {
                 blockers.push(format!("workspace_preparation_failed: {id}: {error}"));
             }
         }
         Ok(blockers)
     }
 
-    pub async fn prepare_workspace(
+    async fn workspace_group_members(
+        &self,
+        task: &Task,
+        work_unit: &db::WorkUnit,
+        formal_review: bool,
+    ) -> Result<Vec<WorkspaceGroupMember>> {
+        let task_repositories = TaskRepo::list_repositories(&*self.db, &task.id).await?;
+        let mut members = Vec::new();
+        if formal_review {
+            let subject = self
+                .freeze_review_subject_repositories(&work_unit.id)
+                .await?;
+            for row in subject {
+                let base_sha = row.result_commit_sha.clone().ok_or_else(|| {
+                    invalid("Review subject repository has no exact result commit")
+                })?;
+                if row.result_workspace_id.is_none()
+                    || row.result_execution_id.is_none()
+                    || row.reviewed_work_unit_version.is_none()
+                {
+                    return Err(invalid(
+                        "Review subject repository is not frozen to an exact result Workspace",
+                    ));
+                }
+                let repository = task_repositories
+                    .iter()
+                    .find(|repository| repository.repo_id == row.repo_id)
+                    .filter(|repository| {
+                        matches!(
+                            repository.role,
+                            db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                        )
+                    })
+                    .ok_or_else(|| {
+                        invalid("Review subject repository is not writable in the Task scope")
+                    })?;
+                let repo = RepoRepo::get_by_id(&*self.db, &repository.repo_id)
+                    .await?
+                    .ok_or_else(|| not_found("repo", repository.repo_id.clone()))?;
+                let repo_path = resolve_repo_source(&repo, &self.workspace_root).await?;
+                git::commit_parents(Path::new(&repo_path), &base_sha)
+                    .await
+                    .map_err(|_| {
+                        invalid("Review result commit is unavailable in its repository")
+                    })?;
+                members.push(WorkspaceGroupMember {
+                    repo,
+                    role: repository.role.clone(),
+                    base_sha,
+                    read_only: true,
+                });
+            }
+            members.sort_by_key(|member| {
+                task_repositories
+                    .iter()
+                    .find(|repository| repository.repo_id == member.repo.id)
+                    .map(|repository| repository.position)
+                    .unwrap_or(i64::MAX)
+            });
+            return Ok(members);
+        }
+
+        let selected = WorkUnitRepo::list_repository_ids(&*self.db, &work_unit.id).await?;
+        let existing_workspaces =
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, &work_unit.id).await?;
+        let requirements =
+            WorkUnitRepo::list_result_requirement_repositories(&*self.db, &work_unit.id).await?;
+        for repository in &task_repositories {
+            if !matches!(
+                repository.role,
+                db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+            ) || (!selected.is_empty() && !selected.contains(&repository.repo_id))
+            {
+                continue;
+            }
+            let repo = RepoRepo::get_by_id(&*self.db, &repository.repo_id)
+                .await?
+                .ok_or_else(|| not_found("repo", repository.repo_id.clone()))?;
+            let repo_path = resolve_repo_source(&repo, &self.workspace_root).await?;
+            let required = requirements
+                .iter()
+                .find(|requirement| requirement.repo_id == repo.id);
+            let previous_base = existing_workspaces
+                .iter()
+                .find(|workspace| workspace.repo_id == repo.id)
+                .and_then(|workspace| workspace.before_sha.clone());
+            let required_base = if let Some(requirement) = required {
+                let base_sha = requirement.result_commit_sha.as_deref().ok_or_else(|| {
+                    invalid("consumed repository result has no exact base commit")
+                })?;
+                git::commit_parents(Path::new(&repo_path), base_sha)
+                    .await
+                    .map_err(|_| {
+                        invalid(
+                            "consumed WorkUnit result commit is not available in the repository",
+                        )
+                    })?;
+                Some(base_sha.to_owned())
+            } else if task.repo_id.as_deref() == Some(repo.id.as_str()) && previous_base.is_none() {
+                let integration = prepare_integration_workspace_for_work_unit(
+                    &self.db,
+                    &self.workspace_root,
+                    task,
+                    Some(Arc::clone(&self.repo_cache_locks)),
+                )
+                .await?;
+                if integration.repo_id != repo.id {
+                    return Err(invalid(
+                        "Task integration Workspace does not match its primary repository",
+                    ));
+                }
+                Some(git::get_current_sha(Path::new(&integration.worktree_path)).await?)
+            } else {
+                None
+            };
+            if required_base
+                .as_deref()
+                .zip(previous_base.as_deref())
+                .is_some_and(|(required, previous)| required != previous)
+            {
+                return Err(invalid(
+                    "existing WorkspaceGroup base differs from its pinned result requirement",
+                ));
+            }
+            let base_sha = match (required_base, previous_base) {
+                (Some(required), _) => required,
+                (None, Some(previous)) => previous,
+                (None, None) => git::get_current_sha(Path::new(&repo_path)).await?,
+            };
+            members.push(WorkspaceGroupMember {
+                repo,
+                role: repository.role.clone(),
+                base_sha,
+                read_only: false,
+            });
+        }
+        if members.iter().all(|member| member.read_only) {
+            return Err(invalid(
+                "repository WorkUnit has no writable repository scope",
+            ));
+        }
+        for repository in &task_repositories {
+            if repository.role != db::TaskRepositoryRole::Context {
+                continue;
+            }
+            let repo = RepoRepo::get_by_id(&*self.db, &repository.repo_id)
+                .await?
+                .ok_or_else(|| not_found("repo", repository.repo_id.clone()))?;
+            let repo_path = resolve_repo_source(&repo, &self.workspace_root).await?;
+            let observed_sha = git::get_current_sha(Path::new(&repo_path)).await?;
+            let pin = TaskRepo::pin_context_repository_snapshot(
+                &*self.db,
+                db::CreateTaskRepositoryContextSnapshot {
+                    task_id: task.id.clone(),
+                    repo_id: repo.id.clone(),
+                    commit_sha: observed_sha,
+                    captured_at: now_rfc3339(),
+                },
+            )
+            .await?;
+            git::commit_parents(Path::new(&repo_path), &pin.commit_sha)
+                .await
+                .map_err(|_| invalid("pinned context repository commit is unavailable"))?;
+            members.push(WorkspaceGroupMember {
+                repo,
+                role: repository.role.clone(),
+                base_sha: pin.commit_sha,
+                read_only: true,
+            });
+        }
+        Ok(members)
+    }
+
+    async fn freeze_review_subject_repositories(
+        &self,
+        review_work_unit_id: &str,
+    ) -> Result<Vec<db::WorkUnitReviewSubjectRepository>> {
+        let subject = crate::task_rework::get_review_subject(&self.db, review_work_unit_id)
+            .await?
+            .ok_or_else(|| {
+                invalid("Formal WorkUnit review requires its exact persisted subject")
+            })?;
+        let mut repositories =
+            WorkUnitRepo::list_review_subject_repositories(&*self.db, review_work_unit_id).await?;
+        if repositories.is_empty() {
+            return Err(invalid("Review subject has no repository result rows"));
+        }
+        if repositories.iter().any(|repository| {
+            repository.result_execution_id.is_none()
+                || repository.reviewed_work_unit_version.is_none()
+        }) {
+            let result_execution_id = subject
+                .result_execution_id
+                .as_deref()
+                .ok_or_else(|| invalid("Review subject has no completed result Execution"))?;
+            let execution = ExecutionRepo::get_by_id(&*self.db, result_execution_id)
+                .await?
+                .filter(|execution| {
+                    execution.task_id == subject.task_id
+                        && execution.work_unit_id.as_deref()
+                            == Some(subject.reviewed_work_unit_id.as_str())
+                        && execution.status == ExecutionStatus::Completed
+                })
+                .ok_or_else(|| {
+                    invalid("Review subject result Execution is not exact and complete")
+                })?;
+            let version = subject
+                .reviewed_work_unit_version
+                .ok_or_else(|| invalid("Review subject has no exact WorkUnit version"))?;
+            if execution.work_unit_version != Some(version) {
+                return Err(invalid("Review subject result Execution version differs"));
+            }
+            let results =
+                ExecutionRepo::list_repository_results(&*self.db, result_execution_id).await?;
+            let mut frozen = Vec::with_capacity(repositories.len());
+            for repository in &repositories {
+                let result = results
+                    .iter()
+                    .find(|result| result.repo_id == repository.repo_id)
+                    .ok_or_else(|| invalid("Review subject repository result is missing"))?;
+                frozen.push(db::WorkUnitReviewSubjectRepository {
+                    reviewed_work_unit_version: Some(version),
+                    result_execution_id: Some(result_execution_id.to_owned()),
+                    result_artifact_id: repository
+                        .result_artifact_id
+                        .clone()
+                        .or_else(|| subject.result_artifact_id.clone()),
+                    result_commit_sha: result.after_sha.clone(),
+                    result_workspace_id: Some(result.workspace_id.clone()),
+                    workspace_snapshot_digest: result.snapshot_digest.clone(),
+                    ..repository.clone()
+                });
+            }
+            WorkUnitRepo::freeze_review_subject_repositories(
+                &*self.db,
+                review_work_unit_id,
+                &frozen,
+            )
+            .await?;
+            repositories =
+                WorkUnitRepo::list_review_subject_repositories(&*self.db, review_work_unit_id)
+                    .await?;
+        }
+        if !crate::task_rework::review_subject_ready(&self.db, review_work_unit_id).await? {
+            return Err(invalid("Review subject repository results are not ready"));
+        }
+        Ok(repositories)
+    }
+
+    async fn prepare_group_member(
+        &self,
+        manager: &WorkspaceManager,
+        task: &Task,
+        work_unit: &db::WorkUnit,
+        group: &WorkspaceGroup,
+        member: &WorkspaceGroupMember,
+    ) -> Result<Workspace> {
+        let expected_path = manager
+            .work_unit_group_worktree_path(&task.id, &work_unit.id, &group.id, &member.repo.id)
+            .map_err(|error| invalid(error.to_string()))?;
+        let mut existing = WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, &work_unit.id)
+            .await?
+            .into_iter()
+            .find(|workspace| workspace.repo_id == member.repo.id);
+        if let Some(workspace) = existing.as_ref() {
+            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &workspace.id)
+                .await?
+                .ok_or_else(|| not_found("workspace scope", workspace.id.clone()))?;
+            let expected_branch = if member.read_only {
+                format!("detached:{}", member.base_sha)
+            } else {
+                workspace::work_unit_branch_name(&task.id, &work_unit.id, &workspace.id)
+                    .map_err(|error| invalid(error.to_string()))?
+            };
+            if workspace.task_id != task.id
+                || workspace.repo_id != member.repo.id
+                || workspace.before_sha.as_deref() != Some(member.base_sha.as_str())
+                || workspace.branch != expected_branch
+                || scope.kind != WorkspaceScopeKind::WorkUnit
+                || scope.task_id != task.id
+                || scope.work_unit_id.as_deref() != Some(work_unit.id.as_str())
+                || scope.workspace_group_id.as_deref() != Some(group.id.as_str())
+                || Path::new(&workspace.worktree_path) != expected_path.as_path()
+            {
+                return Err(invalid(
+                    "WorkspaceGroup member identity differs from its exact scope",
+                ));
+            }
+            if workspace.status == WorkspaceStatus::Cleaning {
+                return Err(invalid("WorkspaceGroup member cleanup is in progress"));
+            }
+            let repo_path = resolve_repo_source(&member.repo, &self.workspace_root).await?;
+            if !expected_path.exists() {
+                let branch_exists = if member.read_only {
+                    git::commit_parents(Path::new(&repo_path), &member.base_sha)
+                        .await
+                        .is_ok()
+                } else {
+                    git::branch_exists(Path::new(&repo_path), &workspace.branch).await?
+                };
+                if branch_exists {
+                    manager
+                        .recover_group_worktree(
+                            &repo_path,
+                            workspace::GroupWorktreeIdentity {
+                                task_id: &task.id,
+                                work_unit_id: &work_unit.id,
+                                group_id: &group.id,
+                                workspace_id: &workspace.id,
+                                repo_id: &member.repo.id,
+                            },
+                            &workspace.branch,
+                        )
+                        .await
+                        .map_err(|error| invalid(error.to_string()))?;
+                } else {
+                    manager
+                        .create_group_worktree(
+                            &repo_path,
+                            workspace::GroupWorktreeIdentity {
+                                task_id: &task.id,
+                                work_unit_id: &work_unit.id,
+                                group_id: &group.id,
+                                workspace_id: &workspace.id,
+                                repo_id: &member.repo.id,
+                            },
+                            &member.base_sha,
+                            member.read_only,
+                        )
+                        .await
+                        .map_err(|error| invalid(error.to_string()))?;
+                }
+            }
+            if member.read_only {
+                manager
+                    .set_group_worktree_read_only(
+                        &task.id,
+                        &work_unit.id,
+                        &group.id,
+                        &member.repo.id,
+                    )
+                    .await
+                    .map_err(|error| invalid(error.to_string()))?;
+                if git::get_current_sha(&expected_path).await? != member.base_sha
+                    || !git::is_worktree_clean(&expected_path).await?
+                {
+                    return Err(invalid(format!(
+                        "read-only repository {} changed from its pinned result",
+                        member.repo.id
+                    )));
+                }
+            } else if git::get_current_branch(&expected_path).await? != workspace.branch {
+                return Err(invalid(
+                    "WorkspaceGroup writable member is on another branch",
+                ));
+            }
+            WorkspaceRepo::update_status(
+                &*self.db,
+                &workspace.id,
+                WorkspaceStatus::Ready,
+                None,
+                &now_rfc3339(),
+            )
+            .await?;
+            existing = WorkspaceRepo::get_by_id(&*self.db, &workspace.id).await?;
+        } else {
+            let workspace_id = new_uuid_v4();
+            let branch = if member.read_only {
+                format!("detached:{}", member.base_sha)
+            } else {
+                workspace::work_unit_branch_name(&task.id, &work_unit.id, &workspace_id)
+                    .map_err(|error| invalid(error.to_string()))?
+            };
+            let created_at = now_rfc3339();
+            let workspace = WorkUnitWorkspaceRepo::create_for_work_unit(
+                &*self.db,
+                db::CreateWorkUnitWorkspace {
+                    workspace: db::CreateWorkspace {
+                        id: workspace_id.clone(),
+                        task_id: task.id.clone(),
+                        repo_id: member.repo.id.clone(),
+                        worktree_path: expected_path.to_string_lossy().into_owned(),
+                        branch: branch.clone(),
+                        status: WorkspaceStatus::Creating,
+                        before_sha: Some(member.base_sha.clone()),
+                        created_at: created_at.clone(),
+                        updated_at: created_at,
+                    },
+                    work_unit_id: work_unit.id.clone(),
+                    workspace_group_id: group.id.clone(),
+                },
+            )
+            .await?;
+            let repo_path = resolve_repo_source(&member.repo, &self.workspace_root).await?;
+            if let Err(error) = manager
+                .create_group_worktree(
+                    &repo_path,
+                    workspace::GroupWorktreeIdentity {
+                        task_id: &task.id,
+                        work_unit_id: &work_unit.id,
+                        group_id: &group.id,
+                        workspace_id: &workspace.id,
+                        repo_id: &member.repo.id,
+                    },
+                    &member.base_sha,
+                    member.read_only,
+                )
+                .await
+            {
+                let _ = WorkspaceRepo::update_status(
+                    &*self.db,
+                    &workspace.id,
+                    WorkspaceStatus::Error,
+                    Some(error.to_string()),
+                    &now_rfc3339(),
+                )
+                .await;
+                return Err(invalid(error.to_string()));
+            }
+            WorkspaceRepo::update_status(
+                &*self.db,
+                &workspace.id,
+                WorkspaceStatus::Ready,
+                None,
+                &now_rfc3339(),
+            )
+            .await?;
+            existing = WorkspaceRepo::get_by_id(&*self.db, &workspace.id).await?;
+        }
+        existing.ok_or_else(|| not_found("workspace", member.repo.id.clone()))
+    }
+
+    pub async fn prepare_workspace_group(
         &self,
         source: CollaborationActorSource,
         work_unit_id: &str,
-    ) -> Result<Workspace> {
+    ) -> Result<WorkspaceGroup> {
         let (task, _) = self.authorize_work_unit(&source, work_unit_id).await?;
         let _preparation_guard = self
             .integration_locks
@@ -1635,192 +2145,118 @@ impl WorkUnitService {
             )
             .await?;
         let result = async {
-        let unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
-            .await?
-            .ok_or_else(|| not_found("work_unit", work_unit_id))?;
-        if !unit.requires_integration {
-            return Err(invalid(
-                "WorkUnit does not require a repository Workspace or integration",
-            ));
-        }
-        if unit.status != WorkUnitStatus::Open
-            || !self.readiness(source, work_unit_id).await?.runnable
-        {
-            return Err(invalid("WorkUnit is not runnable"));
-        }
-        let integration = prepare_integration_workspace_for_work_unit(
-            &self.db,
-            &self.workspace_root,
-            &task,
-            Some(Arc::clone(&self.repo_cache_locks)),
-        )
-        .await?;
-        let _integration_workspace_guard = self.integration_locks.acquire(&integration.id).await;
-        let repo = RepoRepo::get_by_id(&*self.db, &integration.repo_id)
-            .await?
-            .ok_or_else(|| not_found("repo", integration.repo_id.clone()))?;
-        let repo_path = resolve_repo_source(&repo, &self.workspace_root).await?;
-        let required_base_sha: Option<String> = sqlx::query_scalar(
-            "SELECT result_commit_sha FROM work_unit_result_requirement
-             WHERE work_unit_id = ? AND result_commit_sha IS NOT NULL",
-        )
-        .bind(work_unit_id)
-        .fetch_optional(self.db.pool())
-        .await?;
-        if let Some(base_sha) = required_base_sha.as_deref() {
-            git::commit_parents(Path::new(&repo_path), base_sha)
-                .await
-                .map_err(|_| {
-                    invalid(
-                        "consumed WorkUnit result commit is not available in the repository",
-                    )
-                })?;
-        }
-        let manager = WorkspaceManager::new(self.workspace_root.clone())
-            .with_repo_cache_locks(Arc::clone(&self.repo_cache_locks));
-        if let Some(existing) =
-            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, work_unit_id).await?
-        {
-            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &existing.id)
+            let unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
                 .await?
-                .ok_or_else(|| not_found("workspace", existing.id.clone()))?;
-            if scope.kind != WorkspaceScopeKind::WorkUnit
-                || scope.work_unit_id.as_deref() != Some(work_unit_id)
+                .ok_or_else(|| not_found("work_unit", work_unit_id))?;
+            let role = db::canonical_task_role_name(&unit.role)
+                .ok_or_else(|| invalid("WorkUnit role is not a TaskRole"))?;
+            let task_role = db::TaskRoleRepo::get_by_task_and_role(&*self.db, &task.id, &role)
+                .await?
+                .ok_or_else(|| invalid("WorkUnit requires an existing TaskRole"))?;
+            let formal_review = crate::role_capabilities::current_task_role_has_capability(
+                &self.db,
+                &task_role.id,
+                api_types::TaskRoleCapability::FormalReview,
+            )
+            .await?;
+            if formal_review {
+                self.freeze_review_subject_repositories(work_unit_id).await?;
+            }
+            if unit.status != WorkUnitStatus::Open
+                || !self.readiness(source, work_unit_id).await?.runnable
             {
-                return Err(invalid("Workspace scope does not match WorkUnit"));
+                return Err(invalid("WorkUnit is not runnable"));
             }
-            if required_base_sha.as_deref().is_some_and(|required| {
-                existing.before_sha.as_deref() != Some(required)
-            }) {
+            if !unit.requires_integration && !formal_review {
                 return Err(invalid(
-                    "WorkUnit Workspace base does not match the consumed result commit",
+                    "WorkUnit does not require a repository WorkspaceGroup",
                 ));
             }
-            if existing.status == WorkspaceStatus::Cleaning {
+            let members = self
+                .workspace_group_members(&task, &unit, formal_review)
+                .await?;
+            if members.is_empty() {
                 return Err(invalid(
-                    "WorkUnit workspace cleanup is still in progress",
+                    "repository WorkUnit has no exact repository WorkspaceGroup members",
                 ));
             }
-            let branch_exists = git::branch_exists(Path::new(&repo_path), &existing.branch).await?;
-            if existing.status == WorkspaceStatus::Cleaned && !branch_exists {
-                return Err(invalid(
-                    "cleaned WorkUnit Workspace branch is missing; explicit reset or recovery is required",
-                ));
-            }
-            if Path::new(&existing.worktree_path).exists() {
-                git::get_current_sha(Path::new(&existing.worktree_path)).await?;
-                if existing.status == WorkspaceStatus::Cleaned {
-                    let worktree_path = Path::new(&existing.worktree_path);
-                    if git::get_current_branch(worktree_path).await? != existing.branch
-                        || !git::is_worktree_clean(worktree_path).await?
-                    {
-                        return Err(invalid(
-                            "cleaned WorkUnit Workspace does not match its preserved branch; explicit recovery is required",
-                        ));
-                    }
-                }
-            } else if branch_exists {
-                manager
-                    .recover_work_unit_worktree(
-                        &repo_path,
-                        &task.id,
-                        work_unit_id,
-                        &existing.id,
-                        &repo.id,
-                        &existing.branch,
-                    )
-                    .await
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            } else {
-                let base = existing
-                    .before_sha
-                    .as_deref()
-                    .ok_or_else(|| invalid("WorkUnit Workspace has no recorded base SHA"))?;
-                manager
-                    .create_work_unit_worktree(
-                        &repo_path,
-                        &task.id,
-                        work_unit_id,
-                        &existing.id,
-                        &repo.id,
-                        base,
-                    )
-                    .await
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            }
-            let now = now_rfc3339();
-            WorkspaceRepo::update_status(
+            let manager = WorkspaceManager::new(self.workspace_root.clone())
+                .with_repo_cache_locks(Arc::clone(&self.repo_cache_locks));
+            let existing_workspaces = WorkUnitWorkspaceRepo::list_by_work_unit_id(
                 &*self.db,
-                &existing.id,
-                WorkspaceStatus::Ready,
-                None,
-                &now,
-            )
-            .await?;
-            return WorkspaceRepo::get_by_id(&*self.db, &existing.id)
-                .await?
-                .ok_or_else(|| not_found("workspace", existing.id));
-        }
-        let workspace_id = new_uuid_v4();
-        let before_sha = match required_base_sha {
-            Some(base_sha) => base_sha,
-            None => git::get_current_sha(Path::new(&integration.worktree_path)).await?,
-        };
-        let branch = workspace::work_unit_branch_name(&task.id, work_unit_id, &workspace_id)
-            .map_err(|error| invalid(error.to_string()))?;
-        let path = manager
-            .work_unit_worktree_path(&task.id, work_unit_id, &workspace_id, &repo.id)
-            .map_err(|error| invalid(error.to_string()))?;
-        let now = now_rfc3339();
-        let workspace = WorkUnitWorkspaceRepo::create_for_work_unit(
-            &*self.db,
-            db::CreateWorkUnitWorkspace {
-                workspace: db::CreateWorkspace {
-                    id: workspace_id.clone(),
-                    task_id: task.id.clone(),
-                    repo_id: repo.id,
-                    worktree_path: path.to_string_lossy().into_owned(),
-                    branch,
-                    status: WorkspaceStatus::Creating,
-                    before_sha: Some(before_sha.clone()),
-                    created_at: now.clone(),
-                    updated_at: now,
-                },
-                work_unit_id: work_unit_id.to_owned(),
-            },
-        )
-        .await?;
-        match manager
-            .create_work_unit_worktree(
-                &repo_path,
-                &task.id,
                 work_unit_id,
-                &workspace.id,
-                &integration.repo_id,
-                &before_sha,
             )
-            .await
-        {
-            Ok(_) => {}
-            Err(error) => {
-                let now = now_rfc3339();
-                let _ = WorkspaceRepo::update_status(
-                    &*self.db,
-                    &workspace.id,
-                    WorkspaceStatus::Error,
-                    Some(error.to_string()),
-                    &now,
-                )
-                .await;
-                return Err(invalid(error.to_string()));
-            }
-        };
-        let now = now_rfc3339();
-        WorkspaceRepo::update_status(&*self.db, &workspace.id, WorkspaceStatus::Ready, None, &now)
             .await?;
-        WorkspaceRepo::get_by_id(&*self.db, &workspace.id)
-            .await?
-            .ok_or_else(|| not_found("workspace", workspace.id))
+            let existing_group =
+                WorkspaceRepo::get_group_by_work_unit_id(&*self.db, work_unit_id).await?;
+            let group = if let Some(group) = existing_group {
+                if group.task_id != task.id || group.work_unit_id != unit.id {
+                    return Err(invalid("WorkspaceGroup identity does not match WorkUnit"));
+                }
+                let expected_root = manager
+                    .work_unit_group_path(&task.id, &unit.id, &group.id)
+                    .map_err(|error| invalid(error.to_string()))?;
+                if Path::new(&group.root_path) != expected_root.as_path() {
+                    return Err(invalid("WorkspaceGroup root differs from its exact identity"));
+                }
+                group
+            } else {
+                if !existing_workspaces.is_empty() {
+                    return Err(invalid(
+                        "historical WorkUnit workspaces remain group-less and cannot be rewritten",
+                    ));
+                }
+                let id = new_uuid_v4();
+                let root = manager
+                    .work_unit_group_path(&task.id, &unit.id, &id)
+                    .map_err(|error| invalid(error.to_string()))?;
+                if tokio::fs::try_exists(&root).await? {
+                    return Err(invalid(
+                        "WorkspaceGroup root already exists without its durable group record",
+                    ));
+                }
+                tokio::fs::create_dir_all(&root).await?;
+                WorkspaceRepo::create_group_for_work_unit(
+                    &*self.db,
+                    db::CreateWorkspaceGroup {
+                        id,
+                        task_id: task.id.clone(),
+                        work_unit_id: unit.id.clone(),
+                        root_path: root.to_string_lossy().into_owned(),
+                        created_at: now_rfc3339(),
+                    },
+                )
+                .await?
+            };
+            let expected_repo_ids = members
+                .iter()
+                .map(|member| member.repo.id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if existing_workspaces
+                .iter()
+                .any(|workspace| !expected_repo_ids.contains(workspace.repo_id.as_str()))
+            {
+                return Err(invalid(
+                    "WorkspaceGroup contains a repository outside the exact WorkUnit scope",
+                ));
+            }
+            write_workspace_group_instructions(&group, &members).await?;
+            for member in &members {
+                self.prepare_group_member(&manager, &task, &unit, &group, member)
+                    .await?;
+            }
+            let prepared = WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, work_unit_id)
+                .await?;
+            if prepared.len() != members.len()
+                || prepared
+                    .iter()
+                    .any(|workspace| !expected_repo_ids.contains(workspace.repo_id.as_str()))
+            {
+                return Err(invalid(
+                    "WorkspaceGroup repository members do not match the exact Task and WorkUnit scope",
+                ));
+            }
+            Ok::<_, ServiceError>(group)
         }
         .await;
         let finish_result = operation
@@ -1831,7 +2267,7 @@ impl WorkUnitService {
             })
             .await;
         match (result, finish_result) {
-            (Ok(workspace), Ok(_)) => Ok(workspace),
+            (Ok(group), Ok(_)) => Ok(group),
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }
@@ -2238,9 +2674,9 @@ impl WorkUnitService {
     }
 
     async fn ensure_dependencies_not_pinned(&self, id: &str) -> Result<()> {
-        if WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, id)
+        if !WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, id)
             .await?
-            .is_some()
+            .is_empty()
         {
             return Err(ServiceError::conflict(
                 "WorkUnit dependencies are fixed after its repository Workspace is prepared",
@@ -2440,6 +2876,46 @@ fn invalid(message: impl Into<String>) -> ServiceError {
     ServiceError::InvalidOperation {
         message: message.into(),
     }
+}
+
+async fn write_workspace_group_instructions(
+    group: &WorkspaceGroup,
+    members: &[WorkspaceGroupMember],
+) -> Result<()> {
+    let root = Path::new(&group.root_path);
+    if !root.is_dir() {
+        return Err(invalid("WorkspaceGroup root is unavailable"));
+    }
+    let mut index = String::from(
+        "# Forge workspace group\n\nEach repository is a sibling directory. ".to_owned()
+            + "Only repositories marked writable may be changed. Read-only repositories "
+            + "are pinned inputs and must remain unchanged.\n\n"
+            + "Before editing a repository, read its own `AGENTS.md` and `CLAUDE.md` "
+            + "when present. These group instructions are generated outside the repositories.\n\n"
+            + "| Directory | Task repository role | Access | Base commit |\n"
+            + "|---|---|---|---|\n",
+    );
+    for member in members {
+        let role = match member.role {
+            db::TaskRepositoryRole::Primary => "primary",
+            db::TaskRepositoryRole::Affected => "affected",
+            db::TaskRepositoryRole::Context => "context",
+        };
+        let access = if member.read_only {
+            "read-only"
+        } else {
+            "writable"
+        };
+        index.push_str(&format!(
+            "| `{}` | {} | {} | `{}` |\n",
+            member.repo.id, role, access, member.base_sha
+        ));
+    }
+    let instructions = "# Forge workspace instructions\n\nThe current directory contains sibling repository worktrees. Read `FORGE_WORKSPACE.md` first.\n\nChange files only in repositories marked writable there. Treat read-only repositories as pinned inputs. Before editing a repository, read its own `AGENTS.md` and `CLAUDE.md` when present.\n";
+    tokio::fs::write(root.join("FORGE_WORKSPACE.md"), index).await?;
+    tokio::fs::write(root.join("AGENTS.md"), instructions).await?;
+    tokio::fs::write(root.join("CLAUDE.md"), instructions).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2810,10 +3286,10 @@ mod tests {
             .await
             .expect("manual mode remains manual");
         assert!(
-            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &units[0].id)
                 .await
-                .expect("workspace")
-                .is_none()
+                .expect("workspaces")
+                .is_empty()
         );
         let task = TaskRepo::get_by_id(&*db, &task_id, false)
             .await
@@ -2842,10 +3318,10 @@ mod tests {
             .await
             .expect("unlinked work remains manual");
         assert!(
-            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &units[0].id)
                 .await
-                .expect("workspace")
-                .is_none()
+                .expect("workspaces")
+                .is_empty()
         );
         let quality = coordination
             .create_quality_request(
@@ -2900,10 +3376,10 @@ mod tests {
                 .await
                 .expect("closed authority fence");
             assert!(
-                WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+                WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &units[0].id)
                     .await
-                    .expect("workspace")
-                    .is_none()
+                    .expect("workspaces")
+                    .is_empty()
             );
         }
         let blockers = service
@@ -2911,25 +3387,29 @@ mod tests {
             .await
             .expect("authorized preparation");
         assert!(blockers.is_empty(), "{blockers:?}");
-        let workspace = WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+        let workspace = WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &units[0].id)
             .await
-            .expect("workspace")
+            .expect("workspaces")
+            .into_iter()
+            .next()
             .expect("prepared exact scope");
         assert_eq!(workspace.before_sha.as_deref(), Some(base_sha.as_str()));
         assert!(
-            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[1].id)
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &units[1].id)
                 .await
-                .expect("workspace")
-                .is_none()
+                .expect("workspaces")
+                .is_empty()
         );
         service
             .prepare_coordination_workspaces(&task_id, &human_id, 2)
             .await
             .expect("idempotent preparation");
         assert_eq!(
-            WorkUnitWorkspaceRepo::get_by_work_unit_id(&*db, &units[0].id)
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &units[0].id)
                 .await
-                .expect("workspace")
+                .expect("workspaces")
+                .into_iter()
+                .next()
                 .expect("row")
                 .id,
             workspace.id
@@ -3260,19 +3740,40 @@ mod tests {
             .expect("WorkUnit")
             .record;
             let workspace_id = new_uuid_v4();
-            let branch = workspace::work_unit_branch_name(task_id, &unit_id, &workspace_id)
-                .expect("branch name");
-            let path = manager
-                .create_work_unit_worktree(
+            let workspace_group_id = new_uuid_v4();
+            let group_root = manager
+                .work_unit_group_path(task_id, &unit_id, &workspace_group_id)
+                .expect("WorkUnit WorkspaceGroup root");
+            tokio::fs::create_dir_all(&group_root)
+                .await
+                .expect("WorkUnit WorkspaceGroup root creates");
+            WorkspaceRepo::create_group_for_work_unit(
+                db,
+                db::CreateWorkspaceGroup {
+                    id: workspace_group_id.clone(),
+                    task_id: task_id.to_owned(),
+                    work_unit_id: unit_id.clone(),
+                    root_path: group_root.to_string_lossy().into_owned(),
+                    created_at: now.clone(),
+                },
+            )
+            .await
+            .expect("WorkUnit WorkspaceGroup");
+            let (path, branch) = manager
+                .create_group_worktree(
                     &repository_path.to_string_lossy(),
-                    task_id,
-                    &unit_id,
-                    &workspace_id,
-                    repo_id,
+                    workspace::GroupWorktreeIdentity {
+                        task_id,
+                        work_unit_id: &unit_id,
+                        group_id: &workspace_group_id,
+                        workspace_id: &workspace_id,
+                        repo_id,
+                    },
                     base_sha,
+                    false,
                 )
                 .await
-                .expect("WorkUnit worktree");
+                .expect("WorkUnit group worktree");
             let workspace = WorkUnitWorkspaceRepo::create_for_work_unit(
                 db,
                 db::CreateWorkUnitWorkspace {
@@ -3288,6 +3789,7 @@ mod tests {
                         updated_at: now.clone(),
                     },
                     work_unit_id: unit_id.clone(),
+                    workspace_group_id,
                 },
             )
             .await
@@ -4077,13 +4579,20 @@ mod tests {
             )
             .await
             .expect("open repository WorkUnit");
-        let original_workspace = service
-            .prepare_workspace(
+        service
+            .prepare_workspace_group(
                 CollaborationActorSource::Human(human_id.clone()),
                 &retryable_unit.id,
             )
             .await
-            .expect("WorkUnit Workspace prepares");
+            .expect("WorkUnit WorkspaceGroup prepares");
+        let original_workspace =
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &retryable_unit.id)
+                .await
+                .expect("WorkUnit repository workspaces")
+                .into_iter()
+                .find(|workspace| workspace.repo_id == task.repo_id.as_deref().unwrap())
+                .expect("primary repository Workspace prepares");
         let first_attempt = running_repository_execution(
             &db,
             &task_id,
@@ -4148,10 +4657,10 @@ mod tests {
         .await
         .expect("failed attempt remains historical");
         assert!(
-            db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &retryable_unit.id,)
+            db::WorkspaceLeaseRepo::list_active_for_work_unit(&*db, &retryable_unit.id,)
                 .await
                 .expect("failed attempt lease lookup")
-                .is_none()
+                .is_empty()
         );
         let failed_lease_status: String =
             sqlx::query_scalar("SELECT status FROM workspace_lease WHERE execution_id = ?")
@@ -4203,13 +4712,20 @@ mod tests {
                 .status,
             WorkspaceStatus::Cleaned
         );
-        let recovered_workspace = service
-            .prepare_workspace(
+        service
+            .prepare_workspace_group(
                 CollaborationActorSource::Human(human_id.clone()),
                 &retryable_unit.id,
             )
             .await
-            .expect("Cleaned WorkUnit Workspace recovers from its branch");
+            .expect("Cleaned WorkspaceGroup member recovers from its branch");
+        let recovered_workspace =
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*db, &retryable_unit.id)
+                .await
+                .expect("recovered WorkUnit repository workspaces")
+                .into_iter()
+                .find(|workspace| workspace.repo_id == task.repo_id.as_deref().unwrap())
+                .expect("recovered primary repository Workspace");
         assert_eq!(recovered_workspace.id, original_workspace.id);
         assert_eq!(recovered_workspace.branch, original_workspace.branch);
         assert_eq!(
@@ -4242,9 +4758,11 @@ mod tests {
             .await
             .expect("retry binds to the recovered Workspace");
         let retry_lease =
-            db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &retryable_unit.id)
+            db::WorkspaceLeaseRepo::list_active_for_work_unit(&*db, &retryable_unit.id)
                 .await
                 .expect("retried WorkUnit lease lookup")
+                .into_iter()
+                .next()
                 .expect("retry receives exact active lease");
         assert_eq!(
             retry_lease.workspace_id.as_deref(),
@@ -4275,10 +4793,10 @@ mod tests {
         .await
         .expect("retry attempt can stop");
         assert!(
-            db::WorkspaceLeaseRepo::get_active_for_work_unit(&*db, &retryable_unit.id)
+            db::WorkspaceLeaseRepo::list_active_for_work_unit(&*db, &retryable_unit.id)
                 .await
                 .expect("retry lease lookup")
-                .is_none()
+                .is_empty()
         );
         let retry_lease_status: String =
             sqlx::query_scalar("SELECT status FROM workspace_lease WHERE execution_id = ?")

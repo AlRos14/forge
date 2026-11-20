@@ -3620,3 +3620,100 @@ fn mcp_human_decision_list_rejects_unknown_state_and_has_no_answer_tool() {
         assert!(error.code == -32601 || error.code == -32602);
     });
 }
+
+#[test]
+fn multirepo_result_reader_tools_expose_repo_results() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+        let primary_repo_id = task
+            .repo_id
+            .clone()
+            .expect("fixture Task has a primary Repo");
+        let now = now_rfc3339();
+        let affected = RepoRepo::create(
+            &*state.db,
+            CreateRepo {
+                id: new_uuid_v4(),
+                project_id: task.project_id.clone(),
+                name: "affected".to_owned(),
+                local_path: None,
+                remote_url: "https://example.com/affected.git".to_owned(),
+                work_mode: db::WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("affected Repo creates");
+        state
+            .task_service
+            .replace_task_repositories(
+                &task.id,
+                task.version,
+                vec![
+                    db::TaskRepositoryWrite {
+                        repo_id: primary_repo_id.clone(),
+                        role: db::TaskRepositoryRole::Primary,
+                    },
+                    db::TaskRepositoryWrite {
+                        repo_id: affected.id.clone(),
+                        role: db::TaskRepositoryRole::Affected,
+                    },
+                ],
+            )
+            .await
+            .expect("Task receives the affected Repo");
+        let execution_id = seed_execution(&state, task.id.clone()).await;
+        let mut results = Vec::new();
+        for (repo_id, index) in [(primary_repo_id.clone(), 1), (affected.id.clone(), 2)] {
+            let workspace_id = new_uuid_v4();
+            WorkspaceRepo::create(
+                &*state.db,
+                CreateWorkspace {
+                    id: workspace_id.clone(),
+                    task_id: task.id.clone(),
+                    repo_id: repo_id.clone(),
+                    worktree_path: format!("/tmp/forge-mcp-{workspace_id}"),
+                    branch: format!("test/{index}"),
+                    status: WorkspaceStatus::Ready,
+                    before_sha: Some(format!("{index:040x}")),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("integration Workspace creates");
+            results.push(db::ExecutionRepositoryResult {
+                execution_id: execution_id.clone(),
+                task_id: task.id.clone(),
+                repo_id,
+                workspace_id,
+                before_sha: Some(format!("{index:040x}")),
+                after_sha: Some(format!("{:040x}", index + 10)),
+                snapshot_digest: Some("a".repeat(64)),
+                created_at: now.clone(),
+            });
+        }
+        ExecutionRepo::record_repository_results(&*state.db, &execution_id, &results)
+            .await
+            .expect("Execution repository results record");
+
+        let page = call_tool(&state, "forge_list_executions", json!({"task_id":task.id})).await;
+        let execution = &page["items"][0];
+        let repository_results = execution["repository_results"]
+            .as_array()
+            .expect("MCP Execution includes repository results");
+        assert_eq!(repository_results.len(), 2);
+        assert!(repository_results
+            .iter()
+            .any(|result| result["repo_id"] == primary_repo_id));
+        assert!(repository_results
+            .iter()
+            .any(|result| result["repo_id"] == affected.id));
+        assert!(repository_results
+            .iter()
+            .all(|result| result.get("worktree_path").is_none()));
+    });
+}

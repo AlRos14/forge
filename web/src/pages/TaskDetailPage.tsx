@@ -50,7 +50,7 @@ import { ActorIdentity } from '@/features/task-roles/ActorIdentity'
 import { CopyReferenceButton } from '@/components/ui/copy-reference-button'
 import { TaskCoordinationPanel } from '@/components/task-detail/task-coordination-panel'
 import { TaskPhaseThreePanel } from '@/components/task-detail/task-phase-three-panel'
-import { readRequiredChecks } from '@/components/task-detail/task-verification'
+import { readRequiredChecks, validationRepositoryLabel } from '@/components/task-detail/task-verification'
 import { TaskJourneyPanel } from '@/components/task-detail/task-journey-panel'
 import type {
   GateEvaluationResponse,
@@ -1327,7 +1327,7 @@ export function TaskDetailPage({
                   </summary>
                   <div className="mt-1 space-y-1 break-all">
                     <p>
-                      ValidationRun {run.id} · Workspace {run.workspace_id} · commit{' '}
+                      ValidationRun {run.id} · {validationRepositoryLabel(run)} · Workspace {run.workspace_id} · commit{' '}
                       {run.commit_sha}
                     </p>
                     <p>Snapshot {run.workspace_snapshot_digest}</p>

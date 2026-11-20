@@ -3,6 +3,33 @@ use crate::{
     now_rfc3339, ActorKind, AgentExecutionStats, ExecutionStatus, ExecutionTaskRoleAuthority,
     ExecutionTaskRoleAuthorityRepo, PendingProviderStartFailure, RunningExecutionFailure,
 };
+use std::collections::HashSet;
+
+fn map_execution_repository_result(row: SqliteRow) -> Result<crate::ExecutionRepositoryResult> {
+    Ok(crate::ExecutionRepositoryResult {
+        execution_id: row.try_get("execution_id")?,
+        task_id: row.try_get("task_id")?,
+        repo_id: row.try_get("repo_id")?,
+        workspace_id: row.try_get("workspace_id")?,
+        before_sha: row.try_get("before_sha")?,
+        after_sha: row.try_get("after_sha")?,
+        snapshot_digest: row.try_get("snapshot_digest")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn same_execution_repository_result(
+    left: &crate::ExecutionRepositoryResult,
+    right: &crate::ExecutionRepositoryResult,
+) -> bool {
+    left.execution_id == right.execution_id
+        && left.task_id == right.task_id
+        && left.repo_id == right.repo_id
+        && left.workspace_id == right.workspace_id
+        && left.before_sha == right.before_sha
+        && left.after_sha == right.after_sha
+        && left.snapshot_digest == right.snapshot_digest
+}
 
 fn map_review_execution_subject(row: SqliteRow) -> Result<ReviewExecutionSubject> {
     Ok(ReviewExecutionSubject {
@@ -261,6 +288,122 @@ impl ExecutionRepo for SqliteDb {
         let execution = Self::create_execution_in_tx(&mut transaction, &input, None).await?;
         transaction.commit().await?;
         Ok(execution)
+    }
+
+    async fn record_repository_results(
+        &self,
+        execution_id: &str,
+        rows: &[crate::ExecutionRepositoryResult],
+    ) -> Result<Vec<crate::ExecutionRepositoryResult>> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let execution_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution WHERE id = ?)")
+                .bind(execution_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !execution_exists {
+            return Err(DbError::NotFound);
+        }
+
+        let mut repo_ids = HashSet::with_capacity(rows.len());
+        for row in rows {
+            if row.execution_id != execution_id || !repo_ids.insert(row.repo_id.as_str()) {
+                return Err(DbError::Check(
+                    "Execution repository results must use the exact Execution and unique repositories"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        let existing_rows = sqlx::query(
+            "SELECT execution_id, task_id, repo_id, workspace_id, before_sha,
+                    after_sha, snapshot_digest, created_at
+             FROM execution_repository_result WHERE execution_id = ?",
+        )
+        .bind(execution_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_execution_repository_result)
+        .collect::<Result<Vec<_>>>()?;
+        if existing_rows.iter().any(|existing| {
+            !rows
+                .iter()
+                .any(|row| same_execution_repository_result(row, existing))
+        }) {
+            return Err(DbError::VersionConflict);
+        }
+
+        for row in rows {
+            if existing_rows
+                .iter()
+                .any(|existing| same_execution_repository_result(row, existing))
+            {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO execution_repository_result (
+                    execution_id, task_id, repo_id, workspace_id, before_sha,
+                    after_sha, snapshot_digest, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&row.execution_id)
+            .bind(&row.task_id)
+            .bind(&row.repo_id)
+            .bind(&row.workspace_id)
+            .bind(row.before_sha.as_deref())
+            .bind(row.after_sha.as_deref())
+            .bind(row.snapshot_digest.as_deref())
+            .bind(&row.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let stored = sqlx::query(
+            "SELECT execution_id, task_id, repo_id, workspace_id, before_sha,
+                    after_sha, snapshot_digest, created_at
+             FROM execution_repository_result WHERE execution_id = ?
+             ORDER BY repo_id",
+        )
+        .bind(execution_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(map_execution_repository_result)
+        .collect::<Result<Vec<_>>>()?;
+        if stored.len() != rows.len()
+            || stored.iter().any(|stored_row| {
+                !rows
+                    .iter()
+                    .any(|row| same_execution_repository_result(row, stored_row))
+            })
+        {
+            return Err(DbError::VersionConflict);
+        }
+        tx.commit().await?;
+        Ok(stored)
+    }
+
+    async fn list_repository_results(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<crate::ExecutionRepositoryResult>> {
+        sqlx::query(
+            "SELECT result.execution_id, result.task_id, result.repo_id,
+                    result.workspace_id, result.before_sha, result.after_sha,
+                    result.snapshot_digest, result.created_at
+             FROM execution_repository_result result
+             LEFT JOIN task_repository repository
+               ON repository.task_id = result.task_id AND repository.repo_id = result.repo_id
+             WHERE result.execution_id = ?
+             ORDER BY repository.position, result.repo_id",
+        )
+        .bind(execution_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_execution_repository_result)
+        .collect()
     }
 
     async fn create_with_event(

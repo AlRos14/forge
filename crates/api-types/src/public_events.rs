@@ -33,6 +33,9 @@ pub enum PublicEventType {
     #[serde(rename = "execution.cancelled")]
     #[ts(rename = "execution.cancelled")]
     ExecutionCancelled,
+    #[serde(rename = "execution.repository_results_recorded")]
+    #[ts(rename = "execution.repository_results_recorded")]
+    ExecutionRepositoryResultsRecorded,
     #[serde(rename = "execution.stalled")]
     #[ts(rename = "execution.stalled")]
     ExecutionStalled,
@@ -215,6 +218,7 @@ impl PublicEventType {
             Self::ExecutionCompleted => "execution.completed",
             Self::ExecutionFailed => "execution.failed",
             Self::ExecutionCancelled => "execution.cancelled",
+            Self::ExecutionRepositoryResultsRecorded => "execution.repository_results_recorded",
             Self::ExecutionStalled => "execution.stalled",
             Self::ValidationRunStarted => "validation_run.started",
             Self::ValidationRunCompleted => "validation_run.completed",

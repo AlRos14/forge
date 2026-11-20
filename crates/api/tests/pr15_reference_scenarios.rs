@@ -885,9 +885,11 @@ async fn s02_three_shell_processes_write_concurrently_in_isolated_work_unit_work
         assert_eq!(workspace.task_id, task.id);
         assert_eq!(workspace.status, db::WorkspaceStatus::Ready);
         let lease =
-            db::WorkspaceLeaseRepo::get_active_for_work_unit(&*harness.state.db, &work_unit.id)
+            db::WorkspaceLeaseRepo::list_active_for_work_unit(&*harness.state.db, &work_unit.id)
                 .await
                 .expect("exact active WorkUnit lease loads")
+                .into_iter()
+                .find(|lease| lease.workspace_id.as_deref() == Some(workspace.id.as_str()))
                 .expect("each admitted Execution has an active lease");
         assert_eq!(lease.task_id, task.id);
         assert_eq!(lease.work_unit_id.as_deref(), Some(work_unit.id.as_str()));

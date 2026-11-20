@@ -1939,3 +1939,38 @@ cargo test --locked -p mcp-server --lib multirepo_result_
 Las pruebas web conservan la suite pnpm existente; la validación M2 de Rust se
 filtra por los nombres anteriores. Ninguno de estos filtros se ejecuta al
 congelar M2.
+
+### Anexo M2 — integración del workspace
+
+**Estado: INTEGRADO / NOT RUN.** Se reconciliaron los cambios A/B/C en el
+árbol compartido. Los llamadores de `get_by_work_unit_id` ahora consumen la
+lista de Workspaces; las lecturas de leases consumen la lista activa o la
+consulta exacta por `(Execution, Workspace)`. Todas las construcciones de
+`CreateWorkUnitWorkspace` llevan `workspace_group_id` y las admisiones usan
+`workspace_leases`, incluso en fixtures históricos. Se conserva la lectura
+escalar para ejecuciones de un repo y Workspaces históricos sin grupo.
+
+Se crean filas pendientes de Review Subject para cada repo writable del
+WorkUnit fuente abierto; el congelado posterior las completa desde sus
+resultados exactos. El productor existente registra y publica
+`execution.repository_results_recorded` después de guardar los resultados y
+antes del evento terminal; se verificó en `runner.rs` y no se duplicó. SSE se
+suscribe al nombre explícito. La comprobación de un Execution con `workspace_id`
+NULL valida el grupo, sus scopes y los resultados por repo, incluido el caso
+en que el repo primary no pertenece al alcance seleccionado. Los lectores de
+orquestación y ciclo de vida ahora consumen el conjunto completo del grupo.
+
+**Desviaciones:** no se cambiaron los nombres ni firmas M2 congelados. Los
+ajustes adicionales se limitan a adaptar fixtures y lectores singulares al
+modelo de grupo; el payload de coordinación conserva su miembro primary
+singular cuando existe y añade la lista completa por repo. `ci.yml` ejecuta
+`scripts/ci-rust.sh`, cuya suite incluye `cargo test --workspace --all-targets`;
+los filtros M2 explícitos están en `build-local-linux.yml`.
+
+**Comprobaciones estáticas:** los 22 nombres de prueba M2 del contrato aparecen
+exactamente una vez en sus archivos; los ocho filtros requeridos están en el
+workflow local. `cargo fmt --all` y `git diff --check` pasan. Los builds,
+checks, tests, clippy, pnpm y CI quedan **NOT RUN** por la restricción de esta
+integración; la compilación y el comportamiento de runtime requieren el CI.
+Riesgo residual: la lógica Rust y los fixtures de grupos nuevos solo recibieron
+revisión estática hasta que CI ejecute el workspace completo.

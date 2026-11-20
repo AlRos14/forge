@@ -47,6 +47,7 @@ const review = {
     task_id: 'task-1',
     role: 'reviewer',
     status: 'completed',
+    repository_results: [],
   },
   report: {
     id: 'artifact-review-1',

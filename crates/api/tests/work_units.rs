@@ -1,12 +1,228 @@
 mod common;
 
 use api_types::{
-    AgentResponse, ExecutionResponse, ProjectResponse, TaskResponse, WorkUnitResponse,
+    AgentResponse, ExecutionResponse, ProjectResponse, TaskResponse, ValidationRunResponse,
+    WorkUnitResponse,
 };
 use axum::http::{Method, StatusCode};
 use common::*;
 use serde_json::{json, Value};
+use std::{path::Path, sync::Arc};
 use tower::ServiceExt;
+
+fn git_head(path: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .output()
+        .expect("git resolves HEAD");
+    assert!(output.status.success(), "git rev-parse succeeds");
+    String::from_utf8(output.stdout)
+        .expect("git SHA is UTF-8")
+        .trim()
+        .to_owned()
+}
+
+async fn create_multirepo_task(
+    harness: &Harness,
+    project_id: &str,
+    primary_repo_id: &str,
+    title: &str,
+) -> (TaskResponse, String) {
+    let now = db::now_rfc3339();
+    let affected = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.to_owned(),
+            name: "affected".to_owned(),
+            remote_url: "https://example.invalid/affected.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("affected repository creates");
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({
+            "title": title,
+            "repositories": [
+                { "repo_id": primary_repo_id, "role": "primary" },
+                { "repo_id": affected.id, "role": "affected" }
+            ]
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    (task, affected.id)
+}
+
+#[tokio::test]
+async fn multirepo_result_execution_response_lists_each_repo() {
+    let primary_dir = TestDir::new("multirepo-execution-response-primary");
+    let primary_path = setup_git_repo(primary_dir.path());
+    let affected_dir = TestDir::new("multirepo-execution-response-affected");
+    let affected_path = setup_git_repo(affected_dir.path());
+    let workspace_root = TestDir::new("multirepo-execution-response-workspaces");
+    let harness = test_app(workspace_root.path(), "multirepo-execution-response").await;
+    let (project_id, primary_repo_id) =
+        create_project_and_repo(&harness.app, "Execution response", &primary_path).await;
+    let (task, affected_repo_id) = create_multirepo_task(
+        &harness,
+        &project_id,
+        &primary_repo_id,
+        "Two repository results",
+    )
+    .await;
+    let now = db::now_rfc3339();
+    let execution_id = uuid::Uuid::new_v4().to_string();
+    db::ExecutionRepo::create(
+        &*harness.state.db,
+        db::CreateExecution {
+            id: execution_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            actor_ref: None,
+            harness_session_id: None,
+            role: "implementer".to_owned(),
+            status: db::ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: Some(git_head(&primary_path)),
+            after_sha: Some(git_head(&primary_path)),
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Execution creates");
+    let mut results = Vec::new();
+    for (repo_id, repo_path) in [
+        (primary_repo_id.clone(), primary_path),
+        (affected_repo_id.clone(), affected_path),
+    ] {
+        let sha = git_head(&repo_path);
+        let workspace_id = uuid::Uuid::new_v4().to_string();
+        db::WorkspaceRepo::create(
+            &*harness.state.db,
+            db::CreateWorkspace {
+                id: workspace_id.clone(),
+                task_id: task.id.clone(),
+                repo_id: repo_id.clone(),
+                worktree_path: repo_path.to_string_lossy().into_owned(),
+                branch: "main".to_owned(),
+                status: db::WorkspaceStatus::Ready,
+                before_sha: Some(sha.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("integration Workspace creates");
+        results.push(db::ExecutionRepositoryResult {
+            execution_id: execution_id.clone(),
+            task_id: task.id.clone(),
+            repo_id,
+            workspace_id,
+            before_sha: Some(sha.clone()),
+            after_sha: Some(sha),
+            snapshot_digest: Some("a".repeat(64)),
+            created_at: now.clone(),
+        });
+    }
+    db::ExecutionRepo::record_repository_results(&*harness.state.db, &execution_id, &results)
+        .await
+        .expect("repository results record");
+
+    let page: api_types::PaginatedResponse<ExecutionResponse> = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/executions", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    let response = page
+        .items
+        .iter()
+        .find(|item| item.id == execution_id)
+        .expect("Execution appears in REST response");
+    assert_eq!(response.repository_results.len(), 2);
+    assert!(response
+        .repository_results
+        .iter()
+        .any(|result| result.repo_id == primary_repo_id));
+    assert!(response
+        .repository_results
+        .iter()
+        .any(|result| result.repo_id == affected_repo_id));
+}
+
+#[tokio::test]
+async fn multirepo_result_validation_response_names_exact_repo() {
+    let repo_dir = TestDir::new("multirepo-validation-response-repo");
+    let repo_path = setup_git_repo(repo_dir.path());
+    let workspace_root = TestDir::new("multirepo-validation-response-workspaces");
+    let harness = test_app(workspace_root.path(), "multirepo-validation-response").await;
+    let (project_id, repo_id) =
+        create_project_and_repo(&harness.app, "Validation response", &repo_path).await;
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({"title":"Validation names Workspace repository"}),
+        StatusCode::OK,
+    )
+    .await;
+    let now = db::now_rfc3339();
+    let workspace = db::WorkspaceRepo::create(
+        &*harness.state.db,
+        db::CreateWorkspace {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            repo_id: repo_id.clone(),
+            worktree_path: repo_path.to_string_lossy().into_owned(),
+            branch: "main".to_owned(),
+            status: db::WorkspaceStatus::Ready,
+            before_sha: Some(git_head(&repo_path)),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("validation Workspace creates");
+    let result = services::ValidationService::new(
+        Arc::clone(&harness.state.db),
+        Arc::clone(&harness.state.event_bus),
+    )
+    .run_command(&task.id, &workspace.id, "true", 0, None, None)
+    .await
+    .expect("deterministic validation completes");
+    let response: ValidationRunResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/validation-runs/{}", result.run.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(response.repo_id, repo_id);
+    assert_eq!(response.workspace_id, workspace.id);
+}
 
 #[tokio::test]
 async fn work_unit_api_creates_lists_and_rejects_cross_task_parent() {

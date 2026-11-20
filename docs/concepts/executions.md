@@ -11,6 +11,7 @@ Execution
   work_unit_id?
   harness_session_id?
   workspace_id?
+  repository_results[]
   parent_execution_id?
   status
   configuration_snapshot
@@ -49,6 +50,21 @@ the `repository_write` capability through WorkspaceLease admission after the
 current TaskRole, ownership, and workspace checks pass. The WorkUnit
 `requires_integration` mode and the exact Role do not grant a broader
 capability.
+
+## Repository results
+
+A multi-repository WorkUnit runs from one persisted workspace group containing
+its exact repository worktrees. Each writable repository receives its own
+Workspace and WorkspaceLease; selected context repositories are pinned
+read-only inputs and receive no lease. The root-level `FORGE_WORKSPACE.md`
+describes the exact repo IDs and writable status.
+
+Before a terminal Execution event, Forge records one immutable repository
+result for each selected writable repo: its `repo_id`, `workspace_id`, base and
+result commits, and captured workspace snapshot digest. `Execution.workspace_id`,
+`before_sha`, and `after_sha` continue to represent the primary repository only
+when the WorkUnit selected it. For a single-repository WorkUnit, the scalar
+fields retain their prior values and the result list has one row.
 
 Actor-driven validation cognition, such as investigation, reproduction, or
 interpretation, is ordinary WorkUnit work. Deterministic commands and trusted

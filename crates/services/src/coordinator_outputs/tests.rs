@@ -9,7 +9,7 @@ fn pins() -> Vec<String> {
 
 fn request_validation() -> Value {
     json!({"type":"request_validation","check_key":"services-tests",
-        "subject":{"kind":"work_unit_result","id":"wu-1","version":7},
+        "subject":{"kind":"work_unit_result","id":"wu-1","version":7,"repo_id":"repo-1"},
         "baseline":true,"reason":"touches validation_service"})
 }
 
@@ -167,6 +167,7 @@ fn coordinator_outputs_request_validation_bounds() {
         |v| v["check_key"] = json!(""),
         |v| v["subject"]["version"] = json!(0),
         |v| v["subject"]["id"] = json!(" "),
+        |v| v["subject"]["repo_id"] = json!(" "),
         |v| v["reason"] = json!("x".repeat(MAX_REASON_BYTES + 1)),
         |v| v["reason"] = json!(""),
         |v| v["subject"]["kind"] = json!("workspace"),
@@ -184,6 +185,23 @@ fn coordinator_outputs_request_validation_bounds() {
         panic!();
     };
     assert!(!request.baseline);
+}
+
+#[test]
+fn multirepo_result_validation_output_requires_repo_id() {
+    let mut value = request_validation();
+    value["subject"].as_object_mut().unwrap().remove("repo_id");
+    assert!(CoordinatorOutput::from_value(value).is_err());
+
+    let mut value = request_validation();
+    value["subject"]["repo_id"] = json!("");
+    assert!(CoordinatorOutput::from_value(value).is_err());
+
+    let parsed = CoordinatorOutput::from_value(request_validation()).unwrap();
+    let CoordinatorOutput::RequestValidation(output) = parsed else {
+        panic!("request_validation expected");
+    };
+    assert_eq!(output.subject.repo_id, "repo-1");
 }
 
 #[test]

@@ -9,7 +9,7 @@ use db::{
     TaskDispatchOperation, TaskDispatchState, TaskDispatchWrite, TaskIntegrationOperationRepo,
     TaskLifecycle, TaskLifecycleRepo, TaskLifecycleState, TaskLifecycleTransitionWrite, TaskRepo,
     TransitionTaskDispatch, ValidationRunRepo, WorkUnitIntegrationOutcome, WorkUnitRepo,
-    WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceStatus,
+    WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
 };
 use events::EventBus;
 use serde_json::json;
@@ -234,9 +234,68 @@ impl TaskLifecycleService {
                 None => (false, false),
             };
             let workspace_ready = if unit.requires_integration {
-                WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, &unit.id)
-                    .await?
-                    .is_some_and(|workspace| workspace.status == WorkspaceStatus::Ready)
+                let workspaces =
+                    WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, &unit.id).await?;
+                match WorkspaceRepo::get_group_by_work_unit_id(&*self.db, &unit.id).await? {
+                    None => {
+                        workspaces.len() == 1
+                            && workspaces
+                                .first()
+                                .is_some_and(|workspace| workspace.status == WorkspaceStatus::Ready)
+                    }
+                    Some(group) => {
+                        let repositories =
+                            TaskRepo::list_repositories(&*self.db, &unit.task_id).await?;
+                        let selected =
+                            WorkUnitRepo::list_repository_ids(&*self.db, &unit.id).await?;
+                        let expected = repositories
+                            .iter()
+                            .filter(|repository| {
+                                repository.role == db::TaskRepositoryRole::Context
+                                    || (matches!(
+                                        repository.role,
+                                        db::TaskRepositoryRole::Primary
+                                            | db::TaskRepositoryRole::Affected
+                                    ) && (selected.is_empty()
+                                        || selected.contains(&repository.repo_id)))
+                            })
+                            .map(|repository| repository.repo_id.as_str())
+                            .collect::<HashSet<_>>();
+                        if group.task_id != unit.task_id
+                            || group.work_unit_id != unit.id
+                            || expected.is_empty()
+                            || workspaces.len() != expected.len()
+                        {
+                            false
+                        } else {
+                            let mut actual = HashSet::new();
+                            let mut exact = true;
+                            for workspace in &workspaces {
+                                let scope = WorkUnitWorkspaceRepo::get_scope_by_id(
+                                    &*self.db,
+                                    &workspace.id,
+                                )
+                                .await?;
+                                if workspace.status != WorkspaceStatus::Ready
+                                    || !expected.contains(workspace.repo_id.as_str())
+                                    || !actual.insert(workspace.repo_id.as_str())
+                                    || scope.as_ref().is_none_or(|scope| {
+                                        scope.task_id != unit.task_id
+                                            || scope.kind != WorkspaceScopeKind::WorkUnit
+                                            || scope.work_unit_id.as_deref()
+                                                != Some(unit.id.as_str())
+                                            || scope.workspace_group_id.as_deref()
+                                                != Some(group.id.as_str())
+                                    })
+                                {
+                                    exact = false;
+                                    break;
+                                }
+                            }
+                            exact && actual == expected
+                        }
+                    }
+                }
             } else {
                 true
             };

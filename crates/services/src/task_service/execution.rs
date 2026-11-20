@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent_capacity::count_running_executions;
 use db::{
-    ExecutionUsageRepo, UpdateTask, WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo,
+    ExecutionUsageRepo, TaskRepo, UpdateTask, WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo,
     WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
 };
 
@@ -20,8 +20,8 @@ pub(crate) fn should_block_task_for_failed_execution(execution: &Execution) -> b
 }
 
 /// Confirm that a historical Execution still names its exact target WorkUnit
-/// and, when repository work is required, its exact ready WorkUnit Workspace.
-/// A Task-scoped Workspace is never substituted for a missing WorkUnit link.
+/// and its exact ready WorkUnit Workspace or WorkspaceGroup. A Task-scoped
+/// Workspace is never substituted for a missing WorkUnit link.
 pub(crate) async fn has_exact_work_unit_target(
     db: &db::SqliteDb,
     task_id: &str,
@@ -50,10 +50,7 @@ pub(crate) async fn has_exact_work_unit_target(
         Some(db::ActorRef::Human(_)) if execution.agent_id.is_none() => {}
         _ => return Ok(false),
     }
-    if work_unit.requires_integration {
-        let Some(workspace_id) = execution.workspace_id.as_deref() else {
-            return Ok(false);
-        };
+    if let Some(workspace_id) = execution.workspace_id.as_deref() {
         let Some(workspace) = WorkspaceRepo::get_by_id(db, workspace_id).await? else {
             return Ok(false);
         };
@@ -65,11 +62,133 @@ pub(crate) async fn has_exact_work_unit_target(
             && scope.task_id == task_id
             && scope.kind == WorkspaceScopeKind::WorkUnit
             && scope.work_unit_id.as_deref() == Some(work_unit_id))
+    } else if let Some(group) = WorkspaceRepo::get_group_by_work_unit_id(db, work_unit_id).await? {
+        if group.task_id != task_id || group.work_unit_id != work_unit_id {
+            return Ok(false);
+        }
+        let workspaces = WorkUnitWorkspaceRepo::list_by_work_unit_id(db, work_unit_id).await?;
+        if workspaces.is_empty() {
+            return Ok(false);
+        }
+
+        let selected_repository_ids = WorkUnitRepo::list_repository_ids(db, work_unit_id).await?;
+        let task_repositories = TaskRepo::list_repositories(db, task_id).await?;
+        let role_name = db::canonical_task_role_name(&work_unit.role);
+        let formal_review = if let Some(role_name) = role_name {
+            if let Some(task_role) =
+                db::TaskRoleRepo::get_by_task_and_role(db, task_id, &role_name).await?
+            {
+                crate::role_capabilities::current_task_role_has_capability(
+                    db,
+                    &task_role.id,
+                    api_types::TaskRoleCapability::FormalReview,
+                )
+                .await?
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let expected_repo_ids = if formal_review {
+            WorkUnitRepo::list_review_subject_repositories(db, work_unit_id)
+                .await?
+                .into_iter()
+                .map(|repository| repository.repo_id)
+                .collect::<std::collections::HashSet<_>>()
+        } else if work_unit.requires_integration {
+            task_repositories
+                .iter()
+                .filter(|repository| {
+                    repository.role == db::TaskRepositoryRole::Context
+                        || (matches!(
+                            repository.role,
+                            db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                        ) && (selected_repository_ids.is_empty()
+                            || selected_repository_ids.contains(&repository.repo_id)))
+                })
+                .map(|repository| repository.repo_id.clone())
+                .collect::<std::collections::HashSet<_>>()
+        } else {
+            return Ok(false);
+        };
+        if expected_repo_ids.is_empty() || workspaces.len() != expected_repo_ids.len() {
+            return Ok(false);
+        }
+
+        let mut workspace_ids_by_repo = std::collections::HashMap::new();
+        for workspace in &workspaces {
+            let Some(scope) = WorkUnitWorkspaceRepo::get_scope_by_id(db, &workspace.id).await?
+            else {
+                return Ok(false);
+            };
+            if !expected_repo_ids.contains(&workspace.repo_id)
+                || workspace.task_id != task_id
+                || workspace.status != WorkspaceStatus::Ready
+                || scope.task_id != task_id
+                || scope.kind != WorkspaceScopeKind::WorkUnit
+                || scope.work_unit_id.as_deref() != Some(work_unit_id)
+                || scope.workspace_group_id.as_deref() != Some(group.id.as_str())
+                || workspace_ids_by_repo
+                    .insert(workspace.repo_id.as_str(), workspace.id.as_str())
+                    .is_some()
+            {
+                return Ok(false);
+            }
+        }
+
+        let repository_results =
+            db::ExecutionRepo::list_repository_results(db, &execution.id).await?;
+        if !repository_results.is_empty() {
+            if formal_review {
+                return Ok(false);
+            }
+            let expected_result_ids = task_repositories
+                .iter()
+                .filter(|repository| {
+                    matches!(
+                        repository.role,
+                        db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                    ) && (selected_repository_ids.is_empty()
+                        || selected_repository_ids.contains(&repository.repo_id))
+                })
+                .map(|repository| repository.repo_id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            if repository_results.len() != expected_result_ids.len() {
+                return Ok(false);
+            }
+            for result in &repository_results {
+                let workspace = workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == result.workspace_id);
+                if result.execution_id != execution.id
+                    || result.task_id != task_id
+                    || !expected_result_ids.contains(&result.repo_id)
+                    || workspace_ids_by_repo.get(result.repo_id.as_str()).copied()
+                        != Some(result.workspace_id.as_str())
+                    || workspace.is_none_or(|workspace| {
+                        result.before_sha.as_deref() != workspace.before_sha.as_deref()
+                    })
+                    || result.after_sha.is_none()
+                    || result.snapshot_digest.is_none()
+                {
+                    return Ok(false);
+                }
+            }
+        } else if work_unit.requires_integration
+            && !formal_review
+            && execution.status == ExecutionStatus::Completed
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    } else if work_unit.requires_integration {
+        Ok(false)
     } else {
         Ok(execution.workspace_id.is_none()
-            && WorkUnitWorkspaceRepo::get_by_work_unit_id(db, work_unit_id)
+            && WorkUnitWorkspaceRepo::list_by_work_unit_id(db, work_unit_id)
                 .await?
-                .is_none())
+                .is_empty())
     }
 }
 

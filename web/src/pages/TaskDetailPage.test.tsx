@@ -162,6 +162,7 @@ function makeReview(
       status,
       actor_ref,
       workspace_id: null,
+      repository_results: [],
       before_sha: null,
       after_sha: null,
     } as ReviewExecutionResponse['execution'],

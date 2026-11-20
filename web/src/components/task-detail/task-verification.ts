@@ -4,6 +4,7 @@ import type {
   HumanDecisionState,
   ValidationCheckRequestState,
   ValidationComparisonClass,
+  ValidationRunResponse,
 } from '@/types/generated'
 
 export type ComparisonBadge = {
@@ -44,6 +45,12 @@ export const comparisonBadges: Record<ValidationComparisonClass, ComparisonBadge
 
 export function comparisonBadge(classification: ValidationComparisonClass): ComparisonBadge {
   return comparisonBadges[classification]
+}
+
+export function validationRepositoryLabel(
+  run: Pick<ValidationRunResponse, 'repo_id'>,
+): string {
+  return `Repository ${run.repo_id}`
 }
 
 export const checkRequestStateLabels: Record<ValidationCheckRequestState, string> = {

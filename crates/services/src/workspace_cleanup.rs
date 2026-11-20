@@ -370,11 +370,50 @@ impl WorkspaceCleanupScheduler {
             manager = manager.with_repo_cache_locks(Arc::clone(locks));
         }
 
-        let expected_branch = workspace::work_unit_branch_name(task_id, work_unit_id, workspace_id)
-            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-        let expected_path = manager
-            .work_unit_worktree_path(task_id, work_unit_id, workspace_id, &workspace.repo_id)
-            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let group = match scope.workspace_group_id.as_deref() {
+            Some(group_id) => {
+                let group = WorkspaceRepo::get_group_by_work_unit_id(&*self.db, work_unit_id)
+                    .await?
+                    .filter(|group| {
+                        group.id == group_id
+                            && group.task_id == task_id
+                            && group.work_unit_id == work_unit_id
+                    })
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "WorkspaceGroup cleanup identity does not match its exact scope",
+                        )
+                    })?;
+                Some(group)
+            }
+            None => None,
+        };
+        let expected_branch = if workspace.branch.starts_with("detached:") {
+            workspace.branch.clone()
+        } else {
+            workspace::work_unit_branch_name(task_id, work_unit_id, workspace_id)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
+        };
+        let expected_path = if let Some(group) = group.as_ref() {
+            let root = manager
+                .work_unit_group_path(task_id, work_unit_id, &group.id)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+            if Path::new(&group.root_path) != root.as_path() {
+                return Err(self
+                    .record_work_unit_cleanup_error(
+                        workspace_id,
+                        "WorkspaceGroup root differs from its exact durable identity",
+                    )
+                    .await);
+            }
+            manager
+                .work_unit_group_worktree_path(task_id, work_unit_id, &group.id, &workspace.repo_id)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
+        } else {
+            manager
+                .work_unit_worktree_path(task_id, work_unit_id, workspace_id, &workspace.repo_id)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
+        };
         if workspace.branch != expected_branch
             || Path::new(&workspace.worktree_path) != expected_path.as_path()
         {
@@ -385,16 +424,21 @@ impl WorkspaceCleanupScheduler {
                 )
                 .await);
         }
-        let branch_exists = match git::branch_exists(Path::new(&repo_path), &workspace.branch).await
-        {
-            Ok(exists) => exists,
-            Err(error) => {
-                return Err(self
-                    .record_work_unit_cleanup_error(
-                        workspace_id,
-                        format!("could not verify the exact WorkUnit branch: {error}"),
-                    )
-                    .await)
+        let branch_exists = if let Some(commit_sha) = workspace.branch.strip_prefix("detached:") {
+            git::commit_parents(Path::new(&repo_path), commit_sha)
+                .await
+                .is_ok()
+        } else {
+            match git::branch_exists(Path::new(&repo_path), &workspace.branch).await {
+                Ok(exists) => exists,
+                Err(error) => {
+                    return Err(self
+                        .record_work_unit_cleanup_error(
+                            workspace_id,
+                            format!("could not verify the exact WorkUnit branch: {error}"),
+                        )
+                        .await)
+                }
             }
         };
         if !branch_exists {
@@ -420,28 +464,30 @@ impl WorkspaceCleanupScheduler {
             }
         };
         if worktree_exists {
-            let current_branch = match git::get_current_branch(&expected_path).await {
-                Ok(branch) => branch,
-                Err(error) => {
+            if !workspace.branch.starts_with("detached:") {
+                let current_branch = match git::get_current_branch(&expected_path).await {
+                    Ok(branch) => branch,
+                    Err(error) => {
+                        return Err(self
+                            .record_work_unit_cleanup_error(
+                                workspace_id,
+                                format!(
+                                    "could not confirm the WorkUnit worktree branch; explicit recovery is required: {error}"
+                                ),
+                            )
+                            .await)
+                    }
+                };
+                if current_branch != workspace.branch {
                     return Err(self
                         .record_work_unit_cleanup_error(
                             workspace_id,
                             format!(
-                                "could not confirm the WorkUnit worktree branch; explicit recovery is required: {error}"
+                                "WorkUnit Workspace path is attached to unexpected branch {current_branch}; explicit recovery is required"
                             ),
                         )
-                        .await)
+                        .await);
                 }
-            };
-            if current_branch != workspace.branch {
-                return Err(self
-                    .record_work_unit_cleanup_error(
-                        workspace_id,
-                        format!(
-                            "WorkUnit Workspace path is attached to unexpected branch {current_branch}; explicit recovery is required"
-                        ),
-                    )
-                    .await);
             }
         }
 
@@ -459,16 +505,28 @@ impl WorkspaceCleanupScheduler {
                 .cleanup_workspace_terminals(workspace_id)
                 .await?;
         }
-        if let Err(error) = manager
-            .cleanup_work_unit_worktree(
-                &repo_path,
-                task_id,
-                &work_unit.id,
-                workspace_id,
-                &workspace.repo_id,
-            )
-            .await
-        {
+        let cleanup = if let Some(group) = group.as_ref() {
+            manager
+                .cleanup_group_worktree(
+                    &repo_path,
+                    task_id,
+                    &work_unit.id,
+                    &group.id,
+                    &workspace.repo_id,
+                )
+                .await
+        } else {
+            manager
+                .cleanup_work_unit_worktree(
+                    &repo_path,
+                    task_id,
+                    &work_unit.id,
+                    workspace_id,
+                    &workspace.repo_id,
+                )
+                .await
+        };
+        if let Err(error) = cleanup {
             return Err(self
                 .record_work_unit_cleanup_error(
                     workspace_id,

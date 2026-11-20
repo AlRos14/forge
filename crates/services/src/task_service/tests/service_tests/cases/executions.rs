@@ -182,6 +182,738 @@ fn run_workspace_git(path: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
+fn group_repository_path(root: &std::path::Path) -> std::path::PathBuf {
+    if root.join(".git").exists() {
+        return root.to_path_buf();
+    }
+    std::fs::read_dir(root)
+        .expect("WorkspaceGroup root reads")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir() && path.join(".git").exists())
+        .expect("WorkspaceGroup has an exact repository child")
+}
+
+fn make_review_tree_writable(path: &std::path::Path) {
+    let metadata = std::fs::symlink_metadata(path).expect("Review worktree metadata reads");
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions).expect("Review worktree permissions update");
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path).expect("Review worktree directory reads") {
+            make_review_tree_writable(&entry.expect("Review worktree entry reads").path());
+        }
+    }
+}
+
+async fn prepare_primary_group_workspace(
+    db: &db::SqliteDb,
+    service: &crate::work_unit_service::WorkUnitService,
+    source: crate::CollaborationActorSource,
+    task_id: &str,
+    work_unit_id: &str,
+) -> db::Workspace {
+    let group = service
+        .prepare_workspace_group(source, work_unit_id)
+        .await
+        .expect("exact WorkUnit WorkspaceGroup prepares");
+    assert_eq!(group.task_id, task_id);
+    let task = db::TaskRepo::get_by_id(db, task_id, false)
+        .await
+        .expect("WorkspaceGroup Task loads")
+        .expect("WorkspaceGroup Task exists");
+    let primary_repo_id = task.repo_id.expect("fixture Task has a primary Repo");
+    db::WorkUnitWorkspaceRepo::list_by_work_unit_id(db, work_unit_id)
+        .await
+        .expect("WorkUnit repository Workspaces load")
+        .into_iter()
+        .find(|workspace| workspace.repo_id == primary_repo_id)
+        .expect("primary repository Workspace exists")
+}
+
+struct MultiRepoExecutionFixture {
+    db: Arc<db::SqliteDb>,
+    task_service: TaskService,
+    work_unit_service: crate::work_unit_service::WorkUnitService,
+    task: db::Task,
+    agent_id: String,
+    user_id: String,
+    repo_ids: [String; 3],
+    _repo_roots: Vec<TempDir>,
+    _workspace_root: TempDir,
+}
+
+fn initialize_multirepo_test_repository(path: &std::path::Path, label: &str) {
+    run_workspace_git(path, &["init", "-b", "main"]);
+    run_workspace_git(path, &["config", "user.email", "test@forge.dev"]);
+    run_workspace_git(path, &["config", "user.name", "Forge Test"]);
+    std::fs::write(path.join("README.md"), format!("{label} base\n"))
+        .expect("repository base file writes");
+    run_workspace_git(path, &["add", "README.md"]);
+    run_workspace_git(path, &["commit", "-m", "initial repository commit"]);
+}
+
+async fn add_multirepo_test_repository(
+    db: &db::SqliteDb,
+    project_id: &str,
+    name: &str,
+    root: &TempDir,
+) -> String {
+    let now = now_rfc3339();
+    let path = root.path().to_string_lossy().into_owned();
+    let repo_id = db::new_uuid_v4();
+    db::RepoRepo::create(
+        db,
+        db::CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.to_owned(),
+            name: name.to_owned(),
+            remote_url: path.clone(),
+            local_path: Some(path),
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Task repository creates");
+    initialize_multirepo_test_repository(root.path(), name);
+    repo_id
+}
+
+async fn multirepo_execution_fixture() -> MultiRepoExecutionFixture {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let (project_id, primary_repo_id, primary_root) = seed_project_repo(&db).await;
+    initialize_multirepo_test_repository(primary_root.path(), "primary");
+    let affected_root = TempDir::new().expect("affected repository root creates");
+    let affected_repo_id =
+        add_multirepo_test_repository(&db, &project_id, "affected", &affected_root).await;
+    let context_root = TempDir::new().expect("context repository root creates");
+    let context_repo_id =
+        add_multirepo_test_repository(&db, &project_id, "context", &context_root).await;
+    let task_service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let task = task_service
+        .create_task_with_repositories(
+            project_id.clone(),
+            "Multi-repository execution fixture",
+            Some("Task with two writable repositories and one context repository".to_owned()),
+            None,
+            Some(0),
+            Some(vec![
+                db::TaskRepositoryWrite {
+                    repo_id: primary_repo_id.clone(),
+                    role: db::TaskRepositoryRole::Primary,
+                },
+                db::TaskRepositoryWrite {
+                    repo_id: affected_repo_id.clone(),
+                    role: db::TaskRepositoryRole::Affected,
+                },
+                db::TaskRepositoryWrite {
+                    repo_id: context_repo_id.clone(),
+                    role: db::TaskRepositoryRole::Context,
+                },
+            ]),
+            Some(TaskLifecycleState::Active),
+            None,
+        )
+        .await
+        .expect("multi-repository Task creates");
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let workspace_exec_locks = Arc::new(crate::WorkspaceExecutionLockManager::new());
+    let task_service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_workspace_exec_locks(Arc::clone(&workspace_exec_locks));
+    let agent_id = seed_agent(&db).await;
+    if TaskRoleRepo::get_by_task_and_role(&*db, &task.id, "implementer")
+        .await
+        .expect("implementer role lookup succeeds")
+        .is_none()
+    {
+        task_service
+            .create_task_role(
+                &task.id,
+                "implementer",
+                CoordinationMode::Independent,
+                "{}".to_owned(),
+            )
+            .await
+            .expect("implementer role creates");
+    }
+    task_service
+        .add_task_role_member(&task.id, "implementer", ActorRef::Agent(agent_id.clone()))
+        .await
+        .expect("Agent joins implementer role");
+    let user_id = seed_human_user(&db).await;
+    let now = now_rfc3339();
+    ProjectMemberRepo::add_member(
+        &*db,
+        db::CreateProjectMember {
+            id: db::new_uuid_v4(),
+            project_id: project_id.clone(),
+            user_id: user_id.clone(),
+            role: "member".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Workspace preparer joins the Project");
+    let work_unit_service = crate::work_unit_service::WorkUnitService::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        workspace_root.path().to_path_buf(),
+        Arc::new(::workspace::RepoCacheLockManager::new()),
+        workspace_exec_locks,
+    );
+    MultiRepoExecutionFixture {
+        db,
+        task_service,
+        work_unit_service,
+        task,
+        agent_id,
+        user_id,
+        repo_ids: [primary_repo_id, affected_repo_id, context_repo_id],
+        _repo_roots: vec![primary_root, affected_root, context_root],
+        _workspace_root: workspace_root,
+    }
+}
+
+async fn create_multirepo_fixture_work_unit(
+    fixture: &MultiRepoExecutionFixture,
+    title: &str,
+    role: &str,
+    review_subject: Option<String>,
+) -> db::WorkUnit {
+    fixture
+        .work_unit_service
+        .create(
+            crate::CollaborationActorSource::Human(fixture.user_id.clone()),
+            crate::CreateWorkUnitInput {
+                task_id: fixture.task.id.clone(),
+                title: title.to_owned(),
+                scope: title.to_owned(),
+                execution_instructions: None,
+                role: role.to_owned(),
+                parent_work_unit_id: None,
+                assigned_actor: Some(ActorRef::Agent(fixture.agent_id.clone())),
+                requires_integration: true,
+                provenance: None,
+                review_subject,
+                artifact_inputs: Vec::new(),
+                review_approval: None,
+            },
+        )
+        .await
+        .expect("multi-repository WorkUnit creates")
+}
+
+async fn admit_multirepo_fixture_execution(
+    fixture: &MultiRepoExecutionFixture,
+    work_unit: &db::WorkUnit,
+) -> db::Execution {
+    let workspaces = db::WorkUnitWorkspaceRepo::list_by_work_unit_id(&*fixture.db, &work_unit.id)
+        .await
+        .expect("WorkUnit group members load");
+    let workspace = workspaces
+        .iter()
+        .find(|workspace| workspace.repo_id == fixture.repo_ids[0]);
+    let (workspace_id, before_sha) = if work_unit.role == "reviewer" {
+        (None, None)
+    } else {
+        let workspace = workspace.expect("primary writable Workspace exists");
+        (Some(workspace.id.clone()), workspace.before_sha.clone())
+    };
+    let execution_time = now_rfc3339();
+    fixture
+        .task_service
+        .create_running_work_unit_execution_with_artifact_inputs(
+            &work_unit.id,
+            work_unit.version,
+            db::CreateExecution {
+                id: db::new_uuid_v4(),
+                task_id: fixture.task.id.clone(),
+                agent_id: Some(fixture.agent_id.clone()),
+                actor_ref: Some(ActorRef::Agent(fixture.agent_id.clone())),
+                harness_session_id: None,
+                role: work_unit.role.clone(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: Some("Multi-repository test Execution".to_owned()),
+                logs_path: None,
+                before_sha,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: Some(
+                    authorized_execution_snapshot(&fixture.db, &fixture.task, &fixture.agent_id)
+                        .await,
+                ),
+                workspace_id,
+                created_at: execution_time.clone(),
+                updated_at: execution_time,
+            },
+            Vec::new(),
+        )
+        .await
+        .expect("WorkUnit Execution admits with exact repository leases")
+}
+
+struct ContextWriteExecutor {
+    repo_id: String,
+}
+
+#[async_trait]
+impl TaskExecutor for ContextWriteExecutor {
+    async fn execute(
+        &self,
+        context: ExecutionContext,
+    ) -> std::result::Result<executors::ExecutionResult, executors::ExecutorError> {
+        let context_repo = std::path::Path::new(&context.worktree_path).join(&self.repo_id);
+        make_review_tree_writable(&context_repo);
+        std::fs::write(
+            context_repo.join("accidental-context-write.txt"),
+            "changed\n",
+        )
+        .expect("fixture executor writes into the Context worktree");
+        Ok(executors::ExecutionResult {
+            status: ExecutionOutcome::Completed,
+            ..Default::default()
+        })
+    }
+
+    async fn cancel(
+        &self,
+        _execution_id: &str,
+    ) -> std::result::Result<(), executors::ExecutorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn multirepo_workspace_group_prepares_two_writable_and_one_context_repo() {
+    let fixture = multirepo_execution_fixture().await;
+    let work_unit = create_multirepo_fixture_work_unit(
+        &fixture,
+        "Two writable repositories",
+        "implementer",
+        None,
+    )
+    .await;
+    let group = fixture
+        .work_unit_service
+        .prepare_workspace_group(
+            crate::CollaborationActorSource::Human(fixture.user_id.clone()),
+            &work_unit.id,
+        )
+        .await
+        .expect("exact WorkspaceGroup prepares");
+    let workspaces = db::WorkUnitWorkspaceRepo::list_by_work_unit_id(&*fixture.db, &work_unit.id)
+        .await
+        .expect("all repository workspaces load");
+    assert_eq!(workspaces.len(), 3);
+    assert!(fixture.repo_ids.iter().all(|repo_id| workspaces
+        .iter()
+        .any(|workspace| workspace.repo_id == *repo_id)));
+    let root = std::path::Path::new(&group.root_path);
+    let mut child_repo_ids = std::fs::read_dir(root)
+        .expect("WorkspaceGroup root reads")
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| entry.path().join(".git").exists())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    child_repo_ids.sort();
+    let mut expected_repo_ids = fixture.repo_ids.to_vec();
+    expected_repo_ids.sort();
+    assert_eq!(
+        child_repo_ids, expected_repo_ids,
+        "the three worktrees are siblings"
+    );
+    assert!(root.join("FORGE_WORKSPACE.md").is_file());
+    assert!(root.join("AGENTS.md").is_file());
+    assert!(root.join("CLAUDE.md").is_file());
+    assert!(workspaces.iter().all(|workspace| {
+        !std::path::Path::new(&workspace.worktree_path)
+            .join("FORGE_WORKSPACE.md")
+            .exists()
+    }));
+
+    let context_repo_id = &fixture.repo_ids[2];
+    let context_workspace = workspaces
+        .iter()
+        .find(|workspace| workspace.repo_id == *context_repo_id)
+        .expect("context Workspace exists");
+    let pinned_context_sha: String = sqlx::query_scalar(
+        "SELECT commit_sha FROM task_repository_context_snapshot
+         WHERE task_id = ? AND repo_id = ?",
+    )
+    .bind(&fixture.task.id)
+    .bind(context_repo_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("immutable Task context pin exists");
+    assert_eq!(
+        context_workspace.before_sha.as_deref(),
+        Some(pinned_context_sha.as_str())
+    );
+    assert!(std::fs::metadata(&context_workspace.worktree_path)
+        .expect("context workspace metadata loads")
+        .permissions()
+        .readonly());
+
+    let execution = admit_multirepo_fixture_execution(&fixture, &work_unit).await;
+    let leases = db::WorkspaceLeaseRepo::list_active_for_work_unit(&*fixture.db, &work_unit.id)
+        .await
+        .expect("active repository leases load");
+    assert_eq!(leases.len(), 2);
+    assert!(leases
+        .iter()
+        .all(|lease| lease.execution_id == execution.id));
+    assert!(leases.iter().all(
+        |lease| lease
+            .workspace_id
+            .as_deref()
+            .is_some_and(|workspace_id| workspaces.iter().any(|workspace| {
+                workspace.id == workspace_id && workspace.repo_id != *context_repo_id
+            }))
+    ));
+
+    let context_path = fixture._repo_roots[2].path();
+    std::fs::write(context_path.join("README.md"), "later context head\n")
+        .expect("source Context file changes after its first pin");
+    run_workspace_git(context_path, &["add", "README.md"]);
+    run_workspace_git(context_path, &["commit", "-m", "later context head"]);
+    assert_ne!(
+        run_workspace_git(context_path, &["rev-parse", "HEAD"]),
+        pinned_context_sha,
+        "source Context repository advanced after the Task snapshot"
+    );
+    let second_work_unit = create_multirepo_fixture_work_unit(
+        &fixture,
+        "Reuse immutable context pin",
+        "implementer",
+        None,
+    )
+    .await;
+    fixture
+        .work_unit_service
+        .prepare_workspace_group(
+            crate::CollaborationActorSource::Human(fixture.user_id.clone()),
+            &second_work_unit.id,
+        )
+        .await
+        .expect("second WorkUnit group prepares from the Task context pin");
+    let second_context_workspace =
+        db::WorkUnitWorkspaceRepo::list_by_work_unit_id(&*fixture.db, &second_work_unit.id)
+            .await
+            .expect("second group members load")
+            .into_iter()
+            .find(|workspace| workspace.repo_id == *context_repo_id)
+            .expect("second group contains the context repository");
+    assert_eq!(
+        second_context_workspace.before_sha.as_deref(),
+        Some(pinned_context_sha.as_str()),
+        "every WorkUnit group for this Task uses the first context snapshot"
+    );
+}
+
+#[tokio::test]
+async fn multirepo_workspace_review_group_is_read_only_and_exact_subject_scoped() {
+    let fixture = multirepo_execution_fixture().await;
+    let source = create_multirepo_fixture_work_unit(
+        &fixture,
+        "Reviewed multi-repository result",
+        "implementer",
+        None,
+    )
+    .await;
+    fixture
+        .work_unit_service
+        .prepare_workspace_group(
+            crate::CollaborationActorSource::Human(fixture.user_id.clone()),
+            &source.id,
+        )
+        .await
+        .expect("source WorkspaceGroup prepares");
+    let source_execution = admit_multirepo_fixture_execution(&fixture, &source).await;
+    let source_results = fixture
+        .task_service
+        .record_execution_repository_results(&source_execution.id)
+        .await
+        .expect("all writable repository results freeze");
+    assert_eq!(source_results.len(), 2);
+    let primary_sha = source_results
+        .iter()
+        .find(|result| result.repo_id == fixture.repo_ids[0])
+        .and_then(|result| result.after_sha.clone())
+        .expect("primary result SHA exists");
+    sqlx::query(
+        "UPDATE execution SET status = 'completed', after_sha = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(primary_sha)
+    .bind(now_rfc3339())
+    .bind(&source_execution.id)
+    .execute(fixture.db.pool())
+    .await
+    .expect("exact source Execution completes after repository results");
+    for lease in db::WorkspaceLeaseRepo::list_active_for_work_unit(&*fixture.db, &source.id)
+        .await
+        .expect("source leases load")
+    {
+        db::WorkspaceLeaseRepo::revoke(&*fixture.db, &lease.id, lease.version, &now_rfc3339())
+            .await
+            .expect("completed source lease revokes");
+    }
+    fixture
+        .work_unit_service
+        .transition(
+            crate::CollaborationActorSource::Human(fixture.user_id.clone()),
+            &source.id,
+            source.version,
+            WorkUnitStatus::Completed,
+        )
+        .await
+        .expect("exact source result is accepted");
+
+    let reviewer_configuration = r#"{"schema_version":1,"display_label":null,"capabilities":["formal_review"],"rework":null}"#;
+    if TaskRoleRepo::get_by_task_and_role(&*fixture.db, &fixture.task.id, "reviewer")
+        .await
+        .expect("reviewer role lookup succeeds")
+        .is_none()
+    {
+        fixture
+            .task_service
+            .create_task_role_with_configuration(
+                &fixture.task.id,
+                "reviewer",
+                CoordinationMode::Collaborative,
+                "{}".to_owned(),
+                reviewer_configuration.to_owned(),
+            )
+            .await
+            .expect("formal reviewer role creates");
+    }
+    fixture
+        .task_service
+        .add_task_role_member(
+            &fixture.task.id,
+            "reviewer",
+            ActorRef::Agent(fixture.agent_id.clone()),
+        )
+        .await
+        .expect("Agent joins formal reviewer role");
+    let review = create_multirepo_fixture_work_unit(
+        &fixture,
+        "Review exact repository subject",
+        "reviewer",
+        Some(source.id.clone()),
+    )
+    .await;
+    let group = fixture
+        .work_unit_service
+        .prepare_workspace_group(
+            crate::CollaborationActorSource::Human(fixture.user_id.clone()),
+            &review.id,
+        )
+        .await
+        .expect("read-only Review WorkspaceGroup prepares");
+    let review_context =
+        crate::task_dispatcher::work_unit_consumption_context(&fixture.db, &review)
+            .await
+            .expect("exact Review repository context loads")
+            .expect("Review receives its exact repository context");
+    assert!(review_context.contains(&fixture.repo_ids[0]));
+    assert!(review_context.contains(&fixture.repo_ids[1]));
+    assert!(review_context.contains("WorkspaceGroup root"));
+    assert!(!review_context.contains("implementation has not been copied"));
+    let subject = db::WorkUnitRepo::list_review_subject_repositories(&*fixture.db, &review.id)
+        .await
+        .expect("exact repository subject loads");
+    let review_workspaces =
+        db::WorkUnitWorkspaceRepo::list_by_work_unit_id(&*fixture.db, &review.id)
+            .await
+            .expect("Review group workspaces load");
+    let subject_repo_ids = subject
+        .iter()
+        .map(|repository| repository.repo_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(subject_repo_ids.len(), 2);
+    assert_eq!(review_workspaces.len(), subject_repo_ids.len());
+    assert!(review_workspaces
+        .iter()
+        .all(|workspace| subject_repo_ids.contains(&workspace.repo_id)));
+    assert!(!subject_repo_ids.contains(&fixture.repo_ids[2]));
+    for workspace in &review_workspaces {
+        let subject_repo = subject
+            .iter()
+            .find(|repository| repository.repo_id == workspace.repo_id)
+            .expect("Review workspace belongs to its exact subject");
+        let expected_sha = subject_repo
+            .result_commit_sha
+            .as_deref()
+            .expect("Review subject SHA is frozen");
+        assert_eq!(workspace.branch, format!("detached:{expected_sha}"));
+        assert_eq!(
+            run_workspace_git(
+                std::path::Path::new(&workspace.worktree_path),
+                &["rev-parse", "HEAD"],
+            ),
+            expected_sha
+        );
+        assert!(std::fs::metadata(&workspace.worktree_path)
+            .expect("Review workspace metadata loads")
+            .permissions()
+            .readonly());
+    }
+    assert!(std::path::Path::new(&group.root_path)
+        .join("FORGE_WORKSPACE.md")
+        .is_file());
+    let review_execution = admit_multirepo_fixture_execution(&fixture, &review).await;
+    assert!(review_execution.workspace_id.is_none());
+    assert!(
+        db::WorkspaceLeaseRepo::list_active_for_work_unit(&*fixture.db, &review.id)
+            .await
+            .expect("Review active leases load")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn multirepo_workspace_context_write_fails_execution_with_reason() {
+    let fixture = multirepo_execution_fixture().await;
+    let work_unit =
+        create_multirepo_fixture_work_unit(&fixture, "Fail on context write", "implementer", None)
+            .await;
+    fixture
+        .work_unit_service
+        .prepare_workspace_group(
+            crate::CollaborationActorSource::Human(fixture.user_id.clone()),
+            &work_unit.id,
+        )
+        .await
+        .expect("WorkspaceGroup prepares");
+    let execution = admit_multirepo_fixture_execution(&fixture, &work_unit).await;
+    let executor = ContextWriteExecutor {
+        repo_id: fixture.repo_ids[2].clone(),
+    };
+    let completed = fixture
+        .task_service
+        .run_execution(execution.id.clone(), &executor)
+        .await
+        .expect("execution result persists");
+    assert_eq!(completed.status, ExecutionStatus::Failed);
+    let error = completed.error.expect("failed Execution stores its reason");
+    assert!(error.contains(&fixture.repo_ids[2]), "{error}");
+    assert!(error.contains("changed from pinned commit"), "{error}");
+    assert!(
+        db::ExecutionRepo::list_repository_results(&*fixture.db, &execution.id)
+            .await
+            .expect("repository results load")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn multirepo_result_records_all_repo_shas_before_terminal_event() {
+    let fixture = multirepo_execution_fixture().await;
+    let work_unit = create_multirepo_fixture_work_unit(
+        &fixture,
+        "Record every repository SHA",
+        "implementer",
+        None,
+    )
+    .await;
+    fixture
+        .work_unit_service
+        .prepare_workspace_group(
+            crate::CollaborationActorSource::Human(fixture.user_id.clone()),
+            &work_unit.id,
+        )
+        .await
+        .expect("WorkspaceGroup prepares");
+    let execution = admit_multirepo_fixture_execution(&fixture, &work_unit).await;
+    sqlx::query(
+        "CREATE TRIGGER test_multirepo_results_precede_terminal_event
+         BEFORE INSERT ON domain_event
+         WHEN NEW.event_type = 'execution.completed'
+          AND NEW.entity_type = 'execution'
+          AND EXISTS (
+              SELECT 1 FROM execution e
+              JOIN workspace_group g ON g.work_unit_id = e.work_unit_id
+              WHERE e.id = NEW.entity_id
+          )
+          AND (SELECT COUNT(*) FROM execution_repository_result
+               WHERE execution_id = NEW.entity_id) != 2
+         BEGIN
+             SELECT RAISE(ABORT, 'repository results must precede the terminal event');
+         END",
+    )
+    .execute(fixture.db.pool())
+    .await
+    .expect("test terminal-event ordering guard installs");
+    let completed = fixture
+        .task_service
+        .run_execution(execution.id.clone(), &NoDiffExecutor)
+        .await
+        .expect("all repository result rows persist before terminalization");
+    assert_eq!(completed.status, ExecutionStatus::Completed);
+    let results = db::ExecutionRepo::list_repository_results(&*fixture.db, &execution.id)
+        .await
+        .expect("per-repository result rows load");
+    assert_eq!(results.len(), 2);
+    for repo_id in [&fixture.repo_ids[0], &fixture.repo_ids[1]] {
+        let result = results
+            .iter()
+            .find(|result| &result.repo_id == repo_id)
+            .expect("each writable repository has one result");
+        assert!(result.after_sha.is_some());
+        assert!(result.snapshot_digest.is_some());
+    }
+    assert!(!results
+        .iter()
+        .any(|result| result.repo_id == fixture.repo_ids[2]));
+    let primary_result = results
+        .iter()
+        .find(|result| result.repo_id == fixture.repo_ids[0])
+        .expect("primary repository result exists");
+    assert_eq!(
+        completed.after_sha.as_deref(),
+        primary_result.after_sha.as_deref()
+    );
+    assert!(db::DomainEventRepo::get_event_by_dedupe(
+        &*fixture.db,
+        &format!("execution.completed:{}", execution.id)
+    )
+    .await
+    .expect("terminal event lookup succeeds")
+    .is_some());
+    let repository_results_event = db::DomainEventRepo::get_event_by_dedupe(
+        &*fixture.db,
+        &format!("execution.repository_results_recorded:{}", execution.id),
+    )
+    .await
+    .expect("repository results event lookup succeeds")
+    .expect("repository results event is durable");
+    let payload: serde_json::Value = serde_json::from_str(&repository_results_event.payload_json)
+        .expect("repository results event payload parses");
+    assert_eq!(payload["task_id"], fixture.task.id);
+    assert_eq!(payload["execution_id"], execution.id);
+    assert_eq!(
+        payload["repository_results"].as_array().map(Vec::len),
+        Some(2)
+    );
+}
+
 struct RoutingTestEventHandler;
 
 #[async_trait::async_trait]
@@ -672,7 +1404,11 @@ async fn create_claimed_review_execution(
             .unwrap();
     }
     service
-        .add_task_role_member(&task.id, "implementer", ActorRef::Human(human_id.clone()))
+        .add_task_role_member(
+            &task.id,
+            "implementer",
+            ActorRef::Agent(agent_id.to_owned()),
+        )
         .await
         .unwrap();
     let source = work_unit_service
@@ -680,13 +1416,13 @@ async fn create_claimed_review_execution(
             crate::CollaborationActorSource::Human(human_id.clone()),
             crate::CreateWorkUnitInput {
                 task_id: task.id.clone(),
-                title: "Review context delivery".to_owned(),
-                scope: "Provide an independent context result".to_owned(),
+                title: "Review source result".to_owned(),
+                scope: "Provide an exact repository result".to_owned(),
                 execution_instructions: None,
                 role: "implementer".to_owned(),
                 parent_work_unit_id: None,
-                assigned_actor: Some(db::ActorRef::Human(human_id.clone())),
-                requires_integration: false,
+                assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
+                requires_integration: true,
                 provenance: None,
                 review_subject: None,
                 artifact_inputs: Vec::new(),
@@ -694,18 +1430,81 @@ async fn create_claimed_review_execution(
             },
         )
         .await
-        .expect("independent source WorkUnit");
-    let source_execution_id = db::new_uuid_v4();
-    let source_time = now_rfc3339();
-    sqlx::query("INSERT INTO execution (id,task_id,role,status,actor_kind,actor_id,work_unit_id,work_unit_version,created_at,updated_at) VALUES (?,?,'implementer','running','human',?,?,?, ?,?)")
-        .bind(&source_execution_id).bind(&task.id).bind(&human_id).bind(&source.id).bind(source.version)
-        .bind(&source_time).bind(&source_time).execute(db.pool()).await.expect("admitted independent source attempt");
-    sqlx::query("UPDATE execution SET status = 'completed', updated_at = ? WHERE id = ?")
-        .bind(now_rfc3339())
-        .bind(&source_execution_id)
-        .execute(db.pool())
+        .expect("repository source WorkUnit");
+    let source_group = work_unit_service
+        .prepare_workspace_group(
+            crate::CollaborationActorSource::Human(human_id.clone()),
+            &source.id,
+        )
         .await
-        .expect("independent source attempt completes after admission");
+        .expect("source WorkspaceGroup prepares");
+    assert_eq!(source_group.work_unit_id, source.id);
+    let source_workspace = db::WorkUnitWorkspaceRepo::list_by_work_unit_id(db, &source.id)
+        .await
+        .expect("source repository Workspaces load")
+        .into_iter()
+        .find(|workspace| workspace.repo_id == repo_id)
+        .expect("source primary Workspace exists");
+    let agent = AgentRepo::get_by_id(db, agent_id)
+        .await
+        .expect("source Agent loads")
+        .expect("source Agent exists");
+    let source_snapshot =
+        crate::task_service::config::build_executor_config_snapshot(db, &task, &agent, None, None)
+            .await
+            .expect("source executor snapshot builds");
+    let source_time = now_rfc3339();
+    let source_execution = service
+        .create_running_work_unit_execution_with_artifact_inputs(
+            &source.id,
+            source.version,
+            db::CreateExecution {
+                id: db::new_uuid_v4(),
+                task_id: task.id.clone(),
+                agent_id: Some(agent_id.to_owned()),
+                actor_ref: Some(db::ActorRef::Agent(agent_id.to_owned())),
+                harness_session_id: None,
+                role: "implementer".to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: Some("Prepare exact Review source".to_owned()),
+                logs_path: None,
+                before_sha: source_workspace.before_sha.clone(),
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: source_snapshot,
+                workspace_id: Some(source_workspace.id.clone()),
+                created_at: source_time.clone(),
+                updated_at: source_time.clone(),
+            },
+            Vec::new(),
+        )
+        .await
+        .expect("source Execution binds its exact repository Workspace");
+    let source_results = service
+        .record_execution_repository_results(&source_execution.id)
+        .await
+        .expect("source result records its repository SHA");
+    let source_after_sha = source_results
+        .iter()
+        .find(|result| result.repo_id == repo_id)
+        .and_then(|result| result.after_sha.as_deref())
+        .expect("source primary repository result SHA exists");
+    sqlx::query(
+        "UPDATE execution SET status = 'completed', after_sha = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(source_after_sha)
+    .bind(now_rfc3339())
+    .bind(&source_execution.id)
+    .execute(db.pool())
+    .await
+    .expect("repository source attempt completes after its result rows are recorded");
     work_unit_service
         .transition(
             crate::CollaborationActorSource::Human(human_id.clone()),
@@ -735,13 +1534,20 @@ async fn create_claimed_review_execution(
         )
         .await
         .expect("Review WorkUnit creates");
-    let workspace = work_unit_service
-        .prepare_workspace(
+    let review_group = work_unit_service
+        .prepare_workspace_group(
             crate::collaboration_service::CollaborationActorSource::Human(human_id),
             &work_unit.id,
         )
         .await
-        .expect("exact WorkUnit Review workspace prepares");
+        .expect("exact Review WorkspaceGroup prepares");
+    assert_eq!(review_group.task_id, task.id);
+    let workspace = db::WorkUnitWorkspaceRepo::list_by_work_unit_id(db, &work_unit.id)
+        .await
+        .expect("Review repository Workspaces load")
+        .into_iter()
+        .find(|workspace| workspace.repo_id == repo_id)
+        .expect("Review primary repository Workspace exists");
     let agent = AgentRepo::get_by_id(db, agent_id)
         .await
         .expect("review Agent loads")
@@ -772,18 +1578,18 @@ async fn create_claimed_review_execution(
                 last_activity_at: None,
                 summary: Some("Review the exact Workspace subject".to_owned()),
                 logs_path: None,
-                before_sha: workspace.before_sha.clone(),
+                before_sha: None,
                 after_sha: None,
                 error: None,
                 executor_config_snapshot_json,
-                workspace_id: Some(workspace.id.clone()),
+                workspace_id: None,
                 created_at: now.clone(),
                 updated_at: now,
             },
             Vec::new(),
         )
         .await
-        .expect("running Review Execution binds to its exact WorkUnit and Workspace");
+        .expect("running Review Execution binds to its exact read-only WorkspaceGroup");
     let workspace = db::WorkspaceRepo::get_by_id(db, &workspace.id)
         .await
         .expect("Workspace loads")
@@ -900,13 +1706,14 @@ async fn create_running_repository_execution(
         )
         .await
         .expect("Execution WorkUnit creates");
-    let workspace = work_unit_service
-        .prepare_workspace(
-            crate::collaboration_service::CollaborationActorSource::Human(human_id),
-            &work_unit.id,
-        )
-        .await
-        .expect("exact Execution WorkUnit workspace prepares");
+    let workspace = prepare_primary_group_workspace(
+        db,
+        &work_unit_service,
+        crate::collaboration_service::CollaborationActorSource::Human(human_id),
+        &task.id,
+        &work_unit.id,
+    )
+    .await;
     let now = now_rfc3339();
     let execution = service
         .create_running_work_unit_execution_with_artifact_inputs(
@@ -977,20 +1784,22 @@ impl TaskExecutor for ReviewOutputExecutor {
         &self,
         ctx: ExecutionContext,
     ) -> std::result::Result<executors::ExecutionResult, executors::ExecutorError> {
-        let worktree = std::path::Path::new(&ctx.worktree_path);
+        let worktree = group_repository_path(std::path::Path::new(&ctx.worktree_path));
         if self.mutate_worktree {
+            make_review_tree_writable(&worktree);
             std::fs::write(worktree.join("README.md"), "reviewer mutation\n")
                 .expect("reviewer modifies tracked file");
             std::fs::write(worktree.join("reviewer-created.tmp"), "reviewer file\n")
                 .expect("reviewer creates an untracked file");
             if self.commit_mutation {
-                run_workspace_git(worktree, &["config", "user.name", "Review Test"]);
-                run_workspace_git(worktree, &["config", "user.email", "review@test.invalid"]);
-                run_workspace_git(worktree, &["add", "README.md"]);
-                run_workspace_git(worktree, &["commit", "-m", "reviewer mutation"]);
+                run_workspace_git(&worktree, &["config", "user.name", "Review Test"]);
+                run_workspace_git(&worktree, &["config", "user.email", "review@test.invalid"]);
+                run_workspace_git(&worktree, &["add", "README.md"]);
+                run_workspace_git(&worktree, &["commit", "-m", "reviewer mutation"]);
             }
         }
         if self.remove_git_marker {
+            make_review_tree_writable(&worktree);
             std::fs::remove_file(worktree.join(".git"))
                 .expect("fake reviewer removes the linked worktree marker");
         }
@@ -1010,44 +1819,24 @@ impl TaskExecutor for ReviewOutputExecutor {
     }
 }
 
-fn make_dirty_review_subject(worktree: &std::path::Path) -> (String, String, String, String) {
-    let head = run_workspace_git(worktree, &["rev-parse", "HEAD"]);
-    std::fs::write(worktree.join("README.md"), "staged review subject\n")
-        .expect("staged subject content writes");
-    run_workspace_git(worktree, &["add", "README.md"]);
-    std::fs::write(worktree.join("README.md"), "unstaged review subject\n")
-        .expect("unstaged subject content writes");
-    std::fs::write(
-        worktree.join("user-subject.txt"),
-        "pre-review untracked content\n",
-    )
-    .expect("pre-review untracked file writes");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            worktree.join("README.md"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .expect("pre-review tracked permissions set");
-    }
-    let staged_diff = run_workspace_git(worktree, &["diff", "--cached", "--binary"]);
-    let tracked_diff = run_workspace_git(worktree, &["diff", "--binary", "HEAD", "--"]);
-    let status = run_workspace_git(worktree, &["status", "--porcelain"]);
-    (head, staged_diff, tracked_diff, status)
-}
-
 async fn assert_review_report_has_subject(
     db: &db::SqliteDb,
     execution_id: &str,
     expected_digest: &str,
 ) {
-    let subject = db::ExecutionRepo::get_review_execution_subject(db, execution_id)
+    let execution = db::ExecutionRepo::get_by_id(db, execution_id)
         .await
-        .expect("frozen subject lookup succeeds")
-        .expect("Review subject is persisted");
-    assert_eq!(subject.workspace_snapshot_digest, expected_digest);
-    let report = db::CollaborationRepo::get_execution_artifact_output(
+        .expect("Review Execution lookup succeeds")
+        .expect("Review Execution exists");
+    let work_unit_id = execution.work_unit_id.expect("Review WorkUnit is bound");
+    let subjects = db::WorkUnitRepo::list_review_subject_repositories(db, &work_unit_id)
+        .await
+        .expect("repository Review subjects load");
+    assert!(!subjects.is_empty());
+    assert!(subjects
+        .iter()
+        .all(|subject| { subject.workspace_snapshot_digest.as_deref() == Some(expected_digest) }));
+    db::CollaborationRepo::get_execution_artifact_output(
         db,
         execution_id,
         db::ArtifactKind::ReviewReport,
@@ -1055,26 +1844,10 @@ async fn assert_review_report_has_subject(
     .await
     .expect("ReviewReport lookup succeeds")
     .expect("ReviewReport is materialized");
-    let content: serde_json::Value = serde_json::from_str(
-        report
-            .content
-            .as_deref()
-            .expect("ReviewReport content is inline"),
-    )
-    .expect("ReviewReport JSON parses");
-    assert_eq!(
-        content["subject"]["workspace_snapshot_digest"].as_str(),
-        Some(expected_digest)
-    );
-    assert_eq!(content["subject"]["workspace_id"], subject.workspace_id);
-    assert_eq!(
-        content["subject"]["head_commit_sha"],
-        subject.head_commit_sha
-    );
 }
 
 #[tokio::test]
-async fn pr8_local_review_preserves_dirty_tracked_and_untracked_subject() {
+async fn pr8_local_review_uses_exact_read_only_repository_group() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(32));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
@@ -1090,10 +1863,15 @@ async fn pr8_local_review_preserves_dirty_tracked_and_untracked_subject() {
     )
     .await;
     let worktree = std::path::Path::new(&workspace.worktree_path);
-    let (head, staged_diff, tracked_diff, status) = make_dirty_review_subject(worktree);
+    let head = git::get_current_sha(worktree).await.unwrap();
+    assert!(git::is_worktree_clean(worktree).await.unwrap());
     let snapshot_digest = crate::ValidationService::snapshot_digest(&workspace.worktree_path)
         .await
-        .expect("pre-review snapshot digest computes");
+        .expect("exact read-only Review snapshot digest computes");
+    assert!(std::fs::metadata(worktree)
+        .expect("Review worktree metadata loads")
+        .permissions()
+        .readonly());
 
     let completed = service
         .run_execution(
@@ -1105,42 +1883,11 @@ async fn pr8_local_review_preserves_dirty_tracked_and_untracked_subject() {
             },
         )
         .await
-        .expect("no-op local reviewer completes");
+        .expect("read-only local reviewer completes");
 
     assert_eq!(completed.status, ExecutionStatus::Completed);
     assert_eq!(git::get_current_sha(worktree).await.unwrap(), head);
-    assert_eq!(
-        std::fs::read_to_string(worktree.join("README.md")).unwrap(),
-        "unstaged review subject\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(worktree.join("user-subject.txt")).unwrap(),
-        "pre-review untracked content\n"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(worktree.join("README.md"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-    assert_eq!(
-        run_workspace_git(worktree, &["diff", "--cached", "--binary"]),
-        staged_diff
-    );
-    assert_eq!(
-        run_workspace_git(worktree, &["diff", "--binary", "HEAD", "--"]),
-        tracked_diff
-    );
-    assert_eq!(
-        run_workspace_git(worktree, &["status", "--porcelain"]),
-        status
-    );
+    assert!(git::is_worktree_clean(worktree).await.unwrap());
     assert_eq!(
         crate::ValidationService::snapshot_digest(&workspace.worktree_path)
             .await
@@ -1151,7 +1898,7 @@ async fn pr8_local_review_preserves_dirty_tracked_and_untracked_subject() {
 }
 
 #[tokio::test]
-async fn pr8_local_review_discards_reviewer_mutations_and_restores_exact_subject() {
+async fn pr8_local_review_fails_if_reviewer_mutates_the_frozen_repository_group() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(32));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
@@ -1167,12 +1914,9 @@ async fn pr8_local_review_discards_reviewer_mutations_and_restores_exact_subject
     )
     .await;
     let worktree = std::path::Path::new(&workspace.worktree_path);
-    let (head, staged_diff, tracked_diff, status) = make_dirty_review_subject(worktree);
-    let snapshot_digest = crate::ValidationService::snapshot_digest(&workspace.worktree_path)
-        .await
-        .expect("pre-review snapshot digest computes");
+    let repo_id = workspace.repo_id.clone();
 
-    let completed = service
+    let failed = service
         .run_execution(
             execution.id.clone(),
             &ReviewOutputExecutor {
@@ -1182,54 +1926,25 @@ async fn pr8_local_review_discards_reviewer_mutations_and_restores_exact_subject
             },
         )
         .await
-        .expect("mutating reviewer result completes after exact restoration");
+        .expect("mutation terminalizes the Review Execution");
 
-    assert_eq!(completed.status, ExecutionStatus::Completed);
-    assert_eq!(git::get_current_sha(worktree).await.unwrap(), head);
-    assert_eq!(
-        std::fs::read_to_string(worktree.join("README.md")).unwrap(),
-        "unstaged review subject\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(worktree.join("user-subject.txt")).unwrap(),
-        "pre-review untracked content\n"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(worktree.join("README.md"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-    assert!(!worktree.join("reviewer-created.tmp").exists());
-    assert_eq!(
-        run_workspace_git(worktree, &["diff", "--cached", "--binary"]),
-        staged_diff
-    );
-    assert_eq!(
-        run_workspace_git(worktree, &["diff", "--binary", "HEAD", "--"]),
-        tracked_diff
-    );
-    assert_eq!(
-        run_workspace_git(worktree, &["status", "--porcelain"]),
-        status
-    );
-    assert_eq!(
-        crate::ValidationService::snapshot_digest(&workspace.worktree_path)
-            .await
-            .expect("post-review snapshot digest computes"),
-        snapshot_digest
-    );
-    assert_review_report_has_subject(&db, &execution.id, &snapshot_digest).await;
+    assert_eq!(failed.status, ExecutionStatus::Failed);
+    assert!(failed
+        .error
+        .as_deref()
+        .is_some_and(|error| { error.contains(&repo_id) && error.contains("changed") }));
+    assert!(db::CollaborationRepo::get_execution_artifact_output(
+        &db,
+        &execution.id,
+        db::ArtifactKind::ReviewReport,
+    )
+    .await
+    .expect("ReviewReport lookup succeeds")
+    .is_none());
 }
 
 #[tokio::test]
-async fn pr8_local_review_restore_failure_fails_execution_without_report() {
+async fn pr8_local_review_fails_closed_when_a_group_member_git_marker_disappears() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(32));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
@@ -1245,7 +1960,7 @@ async fn pr8_local_review_restore_failure_fails_execution_without_report() {
     )
     .await;
     let worktree = std::path::Path::new(&workspace.worktree_path);
-    let _ = make_dirty_review_subject(worktree);
+    let repo_id = workspace.repo_id.clone();
 
     let failed = service
         .run_execution(
@@ -1257,22 +1972,12 @@ async fn pr8_local_review_restore_failure_fails_execution_without_report() {
             },
         )
         .await
-        .expect("restore failure terminalizes the Review Execution");
+        .expect("missing group repository marker terminalizes the Review Execution");
 
     assert_eq!(failed.status, ExecutionStatus::Failed);
     let error = failed.error.expect("restore diagnostic is persisted");
-    assert!(error.contains("pre-review state backup retained at"));
-    let backup_path = error
-        .split("pre-review state backup retained at ")
-        .nth(1)
-        .expect("diagnostic names isolated backup path");
-    let backup_path = std::path::Path::new(backup_path);
-    assert!(backup_path.join("index").exists());
-    assert!(backup_path.join("tracked.patch").exists());
-    assert!(backup_path
-        .join("untracked")
-        .join("user-subject.txt")
-        .exists());
+    assert!(error.contains(&repo_id));
+    assert!(error.contains("Git worktree"));
     assert!(db::CollaborationRepo::get_execution_artifact_output(
         &*db,
         &execution.id,
@@ -1281,7 +1986,6 @@ async fn pr8_local_review_restore_failure_fails_execution_without_report() {
     .await
     .expect("ReviewReport lookup succeeds")
     .is_none());
-    std::fs::remove_dir_all(backup_path).expect("diagnostic snapshot is cleaned after assertions");
 }
 
 fn create_workspace_checkout(
@@ -1972,11 +2676,29 @@ async fn pr8_review_subject_uses_exact_workunit_workspace_and_matching_evidence(
         "work-unit-change.txt",
         "work-unit head\n",
     );
+    let workspace_id = db::new_uuid_v4();
+    let workspace_group_id = db::new_uuid_v4();
+    db::WorkspaceRepo::create_group_for_work_unit(
+        &*db,
+        db::CreateWorkspaceGroup {
+            id: workspace_group_id.clone(),
+            task_id: task.id.clone(),
+            work_unit_id: work_unit_id.clone(),
+            root_path: work_unit_path
+                .parent()
+                .unwrap_or(&work_unit_path)
+                .to_string_lossy()
+                .into_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("WorkUnit WorkspaceGroup creates");
     let work_unit_workspace = db::WorkUnitWorkspaceRepo::create_for_work_unit(
         &*db,
         db::CreateWorkUnitWorkspace {
             workspace: db::CreateWorkspace {
-                id: db::new_uuid_v4(),
+                id: workspace_id,
                 task_id: task.id.clone(),
                 repo_id: repo_id.clone(),
                 worktree_path: work_unit_path.to_string_lossy().into_owned(),
@@ -1987,6 +2709,7 @@ async fn pr8_review_subject_uses_exact_workunit_workspace_and_matching_evidence(
                 updated_at: now.clone(),
             },
             work_unit_id,
+            workspace_group_id,
         },
     )
     .await
@@ -4487,13 +5210,13 @@ async fn assert_recovery_admission_rolled_back(
         assert_eq!(workspace.worktree_path, original_workspace.worktree_path);
         assert_eq!(workspace.branch, original_workspace.branch);
         assert_eq!(workspace.before_sha, original_workspace.before_sha);
-        assert!(db::WorkspaceLeaseRepo::get_active_for_work_unit(
+        assert!(db::WorkspaceLeaseRepo::list_active_for_work_unit(
             &*fixture.db,
             &fixture.work_unit.id
         )
         .await
         .expect("active lease lookup succeeds")
-        .is_none());
+        .is_empty());
     }
 }
 
@@ -4671,13 +5394,14 @@ async fn recovery_uses_the_parent_work_units_workspace_when_task_has_siblings() 
         )
         .await
         .expect("sibling WorkUnit creates");
-    let sibling_workspace = sibling_service
-        .prepare_workspace(
-            crate::collaboration_service::CollaborationActorSource::Human(human_id),
-            &sibling.id,
-        )
-        .await
-        .expect("sibling WorkUnit gets its own Workspace");
+    let sibling_workspace = prepare_primary_group_workspace(
+        &fixture.db,
+        &sibling_service,
+        crate::collaboration_service::CollaborationActorSource::Human(human_id),
+        &fixture.task.id,
+        &sibling.id,
+    )
+    .await;
     assert_ne!(integration.id, sibling_workspace.id);
     assert!(crate::task_service::execution::has_exact_work_unit_target(
         &fixture.db,
@@ -5137,7 +5861,7 @@ async fn concurrent_dispatcher_ticks_recover_post_commit_auto_start_after_unpaus
         Some("codex-session-for-dispatch-race"),
         "recovery retains the exact reusable HarnessSession"
     );
-    let child_workspace_lease = WorkspaceLeaseRepo::get_active_for_work_unit(
+    let child_workspace_lease = WorkspaceLeaseRepo::list_active_for_work_unit(
         &*db,
         child
             .work_unit_id
@@ -5146,6 +5870,8 @@ async fn concurrent_dispatcher_ticks_recover_post_commit_auto_start_after_unpaus
     )
     .await
     .expect("child WorkspaceLease loads")
+    .into_iter()
+    .find(|lease| lease.execution_id == child.id)
     .expect("child keeps one active WorkspaceLease");
     assert_eq!(child_workspace_lease.execution_id, child.id);
     assert_eq!(child_workspace_lease.workspace_id, child.workspace_id);
@@ -6558,9 +7284,11 @@ async fn assert_provider_start_claim_rejects_authority_race(
     )
     .await;
     let work_unit_id = execution.work_unit_id.as_deref().expect("WorkUnit id");
-    let lease = WorkspaceLeaseRepo::get_active_for_work_unit(&*db, work_unit_id)
+    let lease = WorkspaceLeaseRepo::list_active_for_work_unit(&*db, work_unit_id)
         .await
         .expect("exact WorkUnit lease loads")
+        .into_iter()
+        .next()
         .expect("admission creates the exact WorkUnit lease");
 
     let mut starts = Vec::new();
@@ -6976,16 +7704,16 @@ async fn uncertain_provider_start_retry_never_sends_a_second_external_start() {
     .expect("uncertain outcome receipt count");
     assert_eq!(attempt_receipts, 1);
     assert_eq!(uncertain_receipts, 1);
+    let active_leases = WorkspaceLeaseRepo::list_active_for_work_unit(
+        &*db,
+        execution.work_unit_id.as_deref().unwrap(),
+    )
+    .await
+    .expect("exact WorkUnit leases reload");
+    assert_eq!(active_leases.len(), 1);
     assert_eq!(
-        WorkspaceLeaseRepo::get_active_for_work_unit(
-            &*db,
-            execution.work_unit_id.as_deref().unwrap()
-        )
-        .await
-        .expect("exact WorkUnit lease reloads")
-        .expect("active lease remains while provider outcome is uncertain")
-        .workspace_id,
-        Some(workspace.id)
+        active_leases[0].workspace_id.as_deref(),
+        Some(workspace.id.as_str())
     );
 
     service
@@ -7068,15 +7796,13 @@ async fn uncertain_provider_start_retry_never_sends_a_second_external_start() {
         .expect("uncertain Execution remains present");
     assert_eq!(recovered.status, ExecutionStatus::Cancelled);
     assert_eq!(recovered.stop_reason, Some(db::StopReason::CrashRecovery));
-    assert_eq!(
-        WorkspaceLeaseRepo::get_active_for_work_unit(
-            &*db,
-            execution.work_unit_id.as_deref().expect("WorkUnit id"),
-        )
-        .await
-        .expect("WorkspaceLease state reloads after restart"),
-        None
-    );
+    assert!(WorkspaceLeaseRepo::list_active_for_work_unit(
+        &*db,
+        execution.work_unit_id.as_deref().expect("WorkUnit id"),
+    )
+    .await
+    .expect("WorkspaceLease state reloads after restart")
+    .is_empty());
     assert_eq!(
         TaskLifecycleRepo::get_task_lifecycle(&*db, &task.id)
             .await
@@ -7153,12 +7879,14 @@ async fn crash_recovery_resolves_pending_start_after_its_workspace_lease_expired
     AgentRepo::set_paused(&*db, &agent_id, true)
         .await
         .expect("Agent pauses before any provider attempt");
-    let lease = WorkspaceLeaseRepo::get_active_for_work_unit(
+    let lease = WorkspaceLeaseRepo::list_active_for_work_unit(
         &*db,
         execution.work_unit_id.as_deref().expect("WorkUnit id"),
     )
     .await
     .expect("WorkspaceLease loads")
+    .into_iter()
+    .next()
     .expect("admission committed its WorkspaceLease");
     assert_eq!(lease.execution_id, execution.id);
     assert_eq!(lease.workspace_id.as_deref(), Some(workspace.id.as_str()));
@@ -7228,14 +7956,14 @@ async fn crash_recovery_resolves_pending_start_after_its_workspace_lease_expired
     )
     .expect("failure annotation parses");
     assert_eq!(annotation["blocked_execution_id"], execution.id);
-    assert_eq!(
-        WorkspaceLeaseRepo::get_active_for_work_unit(
+    assert!(
+        WorkspaceLeaseRepo::list_active_for_work_unit(
             &*db,
             execution.work_unit_id.as_deref().expect("WorkUnit id"),
         )
         .await
-        .expect("active WorkspaceLease query succeeds"),
-        None,
+        .expect("active WorkspaceLease query succeeds")
+        .is_empty(),
         "recovery never revives the expired grant"
     );
     let lease_status: String =
@@ -7979,7 +8707,7 @@ async fn durable_admission_rejects_block_owner_changed_after_preflight() {
                 execution: input,
                 work_unit_id: work_unit_a.id.clone(),
                 work_unit_version: work_unit_a.version,
-                workspace_lease: None,
+                workspace_leases: Vec::new(),
             },
             expected_task_version: current_task.version,
             expected_lifecycle_state: current_lifecycle.state,

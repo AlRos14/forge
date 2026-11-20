@@ -10,7 +10,10 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use db::{ActorRef, WorkUnit, WorkUnitDependency, WorkUnitIntegration};
+use db::{
+    ActorRef, WorkUnit, WorkUnitDependency, WorkUnitIntegration, WorkUnitWorkspaceRepo,
+    WorkspaceRepo,
+};
 use services::CollaborationActorSource;
 
 use crate::{
@@ -348,11 +351,16 @@ pub async fn prepare_workspace(
     Path(id): Path<String>,
     user: AuthenticatedUser,
 ) -> ApiResult<Json<api_types::WorkspaceResponse>> {
-    let workspace = state
+    state
         .work_unit_service
-        .prepare_workspace(CollaborationActorSource::Human(user.user_id.clone()), &id)
+        .prepare_workspace_group(CollaborationActorSource::Human(user.user_id.clone()), &id)
         .await
         .map_err(ApiError::from)?;
+    let workspace = WorkUnitWorkspaceRepo::list_by_work_unit_id(&*state.db, &id)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::not_found("workspace", id.clone()))?;
     Ok(Json(crate::routes::workspace_response(workspace)))
 }
 
@@ -372,7 +380,10 @@ pub async fn integrate(
         )
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(integration_response(integration)))
+    let workspace = WorkspaceRepo::get_by_id(&*state.db, &integration.source_workspace_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("workspace", integration.source_workspace_id.clone()))?;
+    Ok(Json(integration_response(integration, workspace.repo_id)))
 }
 
 fn dependency_response(dependency: WorkUnitDependency) -> WorkUnitDependencyResponse {
@@ -384,11 +395,15 @@ fn dependency_response(dependency: WorkUnitDependency) -> WorkUnitDependencyResp
     }
 }
 
-fn integration_response(integration: WorkUnitIntegration) -> WorkUnitIntegrationResponse {
+fn integration_response(
+    integration: WorkUnitIntegration,
+    repo_id: String,
+) -> WorkUnitIntegrationResponse {
     WorkUnitIntegrationResponse {
         id: integration.id,
         task_id: integration.task_id,
         work_unit_id: integration.work_unit_id,
+        repo_id,
         execution_id: integration.execution_id,
         source_workspace_id: integration.source_workspace_id,
         source_sha: integration.source_sha,

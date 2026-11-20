@@ -535,7 +535,32 @@ impl HarnessAdapter for GeminiAdapter {
             )
         };
 
-        let after_sha = if outcome == ExecutionOutcome::Completed && ctx.has_repository_workspace {
+        let group_worktrees =
+            executors::workspace_group_writable_paths(Path::new(&ctx.worktree_path));
+        let after_sha = if outcome == ExecutionOutcome::Completed
+            && ctx.has_repository_workspace
+            && let Some(worktrees) = group_worktrees.as_ref()
+        {
+            let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
+            for worktree in worktrees {
+                if let Err(error) = crate::commit::commit_worktree_changes(worktree, &subject).await
+                {
+                    return Ok(ExecutionResult {
+                        status: ExecutionOutcome::Failed,
+                        after_sha: None,
+                        agent_session_id: None,
+                        summary: stream.summary,
+                        error: Some(error.to_string()),
+                        usage: None,
+                        ..Default::default()
+                    });
+                }
+            }
+            None
+        } else if outcome == ExecutionOutcome::Completed
+            && ctx.has_repository_workspace
+            && group_worktrees.is_none()
+        {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
             match crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
                 .await

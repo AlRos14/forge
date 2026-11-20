@@ -11,9 +11,9 @@ use services::ServiceError;
 use crate::{
     errors::{ApiError, ApiResult},
     routes::{
-        auth::AuthenticatedUser, execution_response, execution_response_with_usage,
-        execution_usage_response, page_request, paginated, task_usage_summary_response,
-        tasks::require_task_visible, ListParams,
+        auth::AuthenticatedUser, execution_response_with_repository_results,
+        execution_response_with_usage, execution_usage_response, page_request, paginated,
+        task_usage_summary_response, tasks::require_task_visible, ListParams,
     },
     state::AppState,
 };
@@ -26,7 +26,17 @@ pub async fn list_executions(
 ) -> ApiResult<Json<PaginatedResponse<ExecutionResponse>>> {
     require_task_visible(&state, &task_id, &user).await?;
     let page = ExecutionRepo::list_by_task(&*state.db, &task_id, page_request(&params)?).await?;
-    Ok(Json(paginated(page, execution_response)))
+    let mut items = Vec::with_capacity(page.items.len());
+    for execution in page.items {
+        items.push(execution_response_with_repository_results(&state.db, execution).await?);
+    }
+    let has_more = page.next_cursor.is_some();
+    Ok(Json(PaginatedResponse {
+        items,
+        next_cursor: page.next_cursor,
+        has_more,
+        total_count: page.total_count,
+    }))
 }
 
 pub async fn start_task_execution(
@@ -256,7 +266,9 @@ pub async fn cancel_execution(
         .task_service
         .cancel_execution(id, "cancelled by user".to_owned())
         .await?;
-    Ok(Json(execution_response(execution)))
+    Ok(Json(
+        execution_response_with_repository_results(&state.db, execution).await?,
+    ))
 }
 
 fn map_follow_up_error(error: ServiceError) -> ApiError {

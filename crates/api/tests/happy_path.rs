@@ -134,9 +134,11 @@ async fn forge_happy_path_end_to_end() {
     let execution_id = execution.id.clone();
 
     let source_workspace =
-        db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*harness.state.db, &work_unit.id)
+        db::WorkUnitWorkspaceRepo::list_by_work_unit_id(&*harness.state.db, &work_unit.id)
             .await
             .expect("WorkUnit Workspace lookup succeeds")
+            .into_iter()
+            .next()
             .expect("Execution created its exact WorkUnit Workspace");
     let source_worktree_path = PathBuf::from(&source_workspace.worktree_path);
     poll_until_workspace_written(
@@ -181,6 +183,7 @@ async fn forge_happy_path_end_to_end() {
         StatusCode::OK,
     )
     .await;
+    assert_eq!(integration.repo_id, repo_id);
     assert_eq!(
         integration.outcome,
         api_types::WorkUnitIntegrationOutcome::Success
@@ -522,6 +525,95 @@ async fn forge_happy_path_end_to_end() {
 }
 
 #[tokio::test]
+async fn multirepo_workspace_single_repo_preserves_legacy_scalar_response() {
+    let repo_dir = TestDir::new("multirepo-single-response-repo");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let workspaces_root = TestDir::new("multirepo-single-response-workspaces");
+    let harness = test_app(workspaces_root.path()).await;
+    let project: ProjectResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"Single repository response regression"}),
+        StatusCode::OK,
+    )
+    .await;
+    let default_branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"]);
+    let repo: RepoResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name":"repo",
+            "local_path":repo_path.to_string_lossy(),
+            "remote_url":repo_path.to_string_lossy(),
+            "default_branch":default_branch
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({"title":"Single repository scalar contract"}),
+        StatusCode::OK,
+    )
+    .await;
+    let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
+    let agent: AgentResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/agents",
+        json!({
+            "name":"single-repository-agent",
+            "executor_type":"shell",
+            "daemon_id":daemon_id
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assign_agent_as_implementer(&harness.state, &task.id, &agent.id).await;
+    let work_unit = common::create_allocated_work_unit(
+        &harness.app,
+        &task.id,
+        "implementer",
+        &agent.id,
+        "Write one repository result",
+        "Write and commit one file in the selected repository",
+        true,
+    )
+    .await;
+    let execution = common::launch_work_unit_execution(
+        &harness.app,
+        &task.id,
+        &work_unit,
+        Some("printf single > single.txt && git add single.txt && git commit -m single"),
+    )
+    .await;
+    poll_until_execution_completed(&harness.state.db, &execution.id).await;
+    let response: ExecutionResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/executions/{}", execution.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(response.status, ExecutionStatus::Completed);
+    assert_eq!(response.repository_results.len(), 1);
+    let result = &response.repository_results[0];
+    assert_eq!(result.repo_id, repo.id);
+    assert_eq!(result.before_sha, response.before_sha);
+    assert_eq!(result.after_sha, response.after_sha);
+    assert_eq!(
+        Some(result.workspace_id.as_str()),
+        response.workspace_id.as_deref()
+    );
+    assert!(response.before_sha.is_some());
+    assert!(response.after_sha.is_some());
+}
+
+#[tokio::test]
 async fn request_changes_report_leaves_lifecycle_to_gate_and_orchestration() {
     let repo_dir = TestDir::new("forge-autonomous-repo");
     let repo_path = setup_git_repo(repo_dir.path()).await;
@@ -635,9 +727,11 @@ async fn request_changes_report_leaves_lifecycle_to_gate_and_orchestration() {
     );
 
     let source_workspace =
-        db::WorkUnitWorkspaceRepo::get_by_work_unit_id(&*harness.state.db, &work_unit.id)
+        db::WorkUnitWorkspaceRepo::list_by_work_unit_id(&*harness.state.db, &work_unit.id)
             .await
             .expect("WorkUnit Workspace lookup succeeds")
+            .into_iter()
+            .next()
             .expect("Execution prepared its exact WorkUnit Workspace");
     let request_changes = submit_human_review(
         &harness.app,

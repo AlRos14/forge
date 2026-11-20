@@ -221,6 +221,59 @@ impl TaskRepo for SqliteDb {
             .collect()
     }
 
+    async fn pin_context_repository_snapshot(
+        &self,
+        input: crate::CreateTaskRepositoryContextSnapshot,
+    ) -> Result<crate::TaskRepositoryContextSnapshot> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(row) = sqlx::query(
+            "SELECT task_id, repo_id, commit_sha, captured_at
+             FROM task_repository_context_snapshot WHERE task_id = ? AND repo_id = ?",
+        )
+        .bind(&input.task_id)
+        .bind(&input.repo_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let snapshot = crate::TaskRepositoryContextSnapshot {
+                task_id: row.try_get("task_id")?,
+                repo_id: row.try_get("repo_id")?,
+                commit_sha: row.try_get("commit_sha")?,
+                captured_at: row.try_get("captured_at")?,
+            };
+            tx.commit().await?;
+            return Ok(snapshot);
+        }
+
+        sqlx::query(
+            "INSERT INTO task_repository_context_snapshot
+                (task_id, repo_id, commit_sha, captured_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&input.task_id)
+        .bind(&input.repo_id)
+        .bind(&input.commit_sha)
+        .bind(&input.captured_at)
+        .execute(&mut *tx)
+        .await?;
+        let row = sqlx::query(
+            "SELECT task_id, repo_id, commit_sha, captured_at
+             FROM task_repository_context_snapshot WHERE task_id = ? AND repo_id = ?",
+        )
+        .bind(&input.task_id)
+        .bind(&input.repo_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let snapshot = crate::TaskRepositoryContextSnapshot {
+            task_id: row.try_get("task_id")?,
+            repo_id: row.try_get("repo_id")?,
+            commit_sha: row.try_get("commit_sha")?,
+            captured_at: row.try_get("captured_at")?,
+        };
+        tx.commit().await?;
+        Ok(snapshot)
+    }
+
     async fn replace_repositories_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,

@@ -83,6 +83,15 @@ export function ExecutionDetailSidebar({
   actions?: SidebarActions
 }) {
   const hasActions = Boolean(actions?.onStop)
+  const repositoryResults = execution?.repository_results ?? []
+  const showRepositoryResults =
+    repositoryResults.length > 1 ||
+    repositoryResults.some(
+      (result) =>
+        result.workspace_id !== execution?.workspace_id ||
+        result.before_sha !== execution?.before_sha ||
+        result.after_sha !== execution?.after_sha,
+    )
 
   return (
     <aside className="flex h-full flex-col">
@@ -152,7 +161,38 @@ export function ExecutionDetailSidebar({
 
             <Separator />
 
-            {(execution.before_sha || execution.after_sha) && (
+            {showRepositoryResults ? (
+              <>
+                <section className="space-y-3">
+                  <div className="flex items-center gap-1.5 text-micro font-medium uppercase tracking-wider text-muted-foreground">
+                    <GitBranch className="h-3 w-3" />
+                    <span>Repository results</span>
+                  </div>
+                  <div className="space-y-3">
+                    {repositoryResults.map((result) => (
+                      <div key={result.repo_id} className="space-y-1 rounded-md border p-2.5">
+                        <p className="break-all text-xs font-medium">{result.repo_id}</p>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div className="space-y-1">
+                            <p className="text-micro text-muted-foreground">Before</p>
+                            <code className="text-xs font-mono text-muted-foreground">
+                              {shortHash(result.before_sha)}
+                            </code>
+                          </div>
+                          <div className="space-y-1">
+                            <p className="text-micro text-muted-foreground">After</p>
+                            <code className="text-xs font-mono text-muted-foreground">
+                              {shortHash(result.after_sha)}
+                            </code>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+                <Separator />
+              </>
+            ) : (execution.before_sha || execution.after_sha) ? (
               <>
                 <section className="space-y-3">
                   <div className="flex items-center gap-1.5 text-micro font-medium uppercase tracking-wider text-muted-foreground">
@@ -172,7 +212,7 @@ export function ExecutionDetailSidebar({
                 </section>
                 <Separator />
               </>
-            )}
+            ) : null}
 
             <section className="space-y-3">
               <div className="flex items-center gap-1.5 text-micro font-medium uppercase tracking-wider text-muted-foreground">

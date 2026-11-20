@@ -13,6 +13,7 @@ export type PublicEventType =
   | 'execution.completed'
   | 'execution.failed'
   | 'execution.cancelled'
+  | 'execution.repository_results_recorded'
   | 'execution.stalled'
   | 'validation_run.started'
   | 'validation_run.completed'

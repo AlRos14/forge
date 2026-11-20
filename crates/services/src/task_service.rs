@@ -168,6 +168,12 @@ impl TaskService {
                           WHERE output.execution_id = execution.id
                             AND output.task_id = execution.task_id
                       )
+                      OR EXISTS (
+                          SELECT 1 FROM execution_repository_result repository_result
+                          WHERE repository_result.execution_id = execution.id
+                            AND repository_result.task_id = execution.task_id
+                            AND repository_result.after_sha IS NOT NULL
+                      )
                   )
             )",
         )
@@ -251,6 +257,9 @@ pub(crate) struct ExecutionWorkingContext {
     pub(crate) path: PathBuf,
     pub(crate) lock_key: String,
     pub(crate) workspace: Option<Workspace>,
+    pub(crate) workspace_group: Option<db::WorkspaceGroup>,
+    pub(crate) workspaces: Vec<Workspace>,
+    pub(crate) has_repository_workspace: bool,
 }
 
 pub(crate) fn execution_domain_event(
@@ -538,7 +547,88 @@ impl TaskService {
                 )?,
                 lock_key: format!("orchestrator-context:{}", execution.id),
                 workspace: None,
+                workspace_group: None,
+                workspaces: Vec::new(),
+                has_repository_workspace: false,
             });
+        }
+        if let Some(work_unit_id) = execution.work_unit_id.as_deref() {
+            let work_unit = WorkUnitRepo::get_by_id(&*self.db, work_unit_id)
+                .await?
+                .filter(|unit| unit.task_id == task.id)
+                .ok_or_else(|| ServiceError::not_found("work_unit", work_unit_id.to_owned()))?;
+            if let Some(group) =
+                WorkspaceRepo::get_group_by_work_unit_id(&*self.db, work_unit_id).await?
+            {
+                if group.task_id != task.id || group.work_unit_id != work_unit.id {
+                    return Err(ServiceError::invalid_operation(
+                        "WorkspaceGroup does not belong to the exact WorkUnit",
+                    ));
+                }
+                let manager = ::workspace::WorkspaceManager::new(self.workspace_root.clone());
+                let expected_root = manager
+                    .work_unit_group_path(&task.id, &work_unit.id, &group.id)
+                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+                if PathBuf::from(&group.root_path) != expected_root || !expected_root.is_dir() {
+                    return Err(ServiceError::invalid_operation(
+                        "WorkspaceGroup root path does not match its exact persisted identity",
+                    ));
+                }
+                let workspaces =
+                    WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, work_unit_id).await?;
+                if workspaces.is_empty() {
+                    return Err(ServiceError::invalid_operation(
+                        "repository WorkUnit WorkspaceGroup has no repository workspaces",
+                    ));
+                }
+                for workspace in &workspaces {
+                    let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &workspace.id)
+                        .await?
+                        .ok_or_else(|| {
+                            ServiceError::not_found("workspace scope", workspace.id.clone())
+                        })?;
+                    let expected_path = manager
+                        .work_unit_group_worktree_path(
+                            &task.id,
+                            &work_unit.id,
+                            &group.id,
+                            &workspace.repo_id,
+                        )
+                        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+                    if workspace.task_id != task.id
+                        || workspace.status != WorkspaceStatus::Ready
+                        || scope.kind != db::WorkspaceScopeKind::WorkUnit
+                        || scope.task_id != task.id
+                        || scope.work_unit_id.as_deref() != Some(work_unit.id.as_str())
+                        || scope.workspace_group_id.as_deref() != Some(group.id.as_str())
+                        || PathBuf::from(&workspace.worktree_path) != expected_path
+                    {
+                        return Err(ServiceError::invalid_operation(
+                            "WorkspaceGroup contains a non-ready or mismatched repository Workspace",
+                        ));
+                    }
+                }
+                self.verify_execution_workspace_authority(execution).await?;
+                let workspace = execution.workspace_id.as_deref().and_then(|id| {
+                    workspaces
+                        .iter()
+                        .find(|workspace| workspace.id == id)
+                        .cloned()
+                });
+                if execution.workspace_id.is_some() && workspace.is_none() {
+                    return Err(ServiceError::invalid_operation(
+                        "Execution primary Workspace is not a member of its exact group",
+                    ));
+                }
+                return Ok(ExecutionWorkingContext {
+                    path: expected_root,
+                    lock_key: format!("work-unit-workspace:{}", work_unit.id),
+                    workspace,
+                    workspace_group: Some(group),
+                    has_repository_workspace: !workspaces.is_empty(),
+                    workspaces,
+                });
+            }
         }
         if let Some(workspace_id) = execution.workspace_id.as_deref() {
             let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
@@ -555,7 +645,10 @@ impl TaskService {
             return Ok(ExecutionWorkingContext {
                 path: PathBuf::from(&workspace.worktree_path),
                 lock_key: workspace.id.clone(),
-                workspace: Some(workspace),
+                workspace: Some(workspace.clone()),
+                workspace_group: None,
+                workspaces: vec![workspace],
+                has_repository_workspace: true,
             });
         }
         let work_unit_id = execution.work_unit_id.as_deref().ok_or_else(|| {
@@ -586,6 +679,9 @@ impl TaskService {
             path,
             lock_key: format!("work-unit-context:{}:{}", task.id, work_unit.id),
             workspace: None,
+            workspace_group: None,
+            workspaces: Vec::new(),
+            has_repository_workspace: false,
         })
     }
 
@@ -762,6 +858,29 @@ impl TaskService {
         .await
     }
 
+    async fn lock_work_unit_execution_workspaces(
+        &self,
+        work_unit_id: &str,
+    ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+        let Some(locks) = self.workspace_exec_locks.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut keys = vec![format!("work-unit-workspace:{work_unit_id}")];
+        keys.extend(
+            WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, work_unit_id)
+                .await?
+                .into_iter()
+                .map(|workspace| workspace.id),
+        );
+        keys.sort();
+        keys.dedup();
+        let mut guards = Vec::with_capacity(keys.len());
+        for key in keys {
+            guards.push(locks.acquire(&key).await);
+        }
+        Ok(guards)
+    }
+
     async fn create_running_work_unit_execution_inner(
         &self,
         work_unit_id: &str,
@@ -853,55 +972,19 @@ impl TaskService {
             }
         }
 
-        // Keep the Workspace lock through the durable admission. The outer
-        // launch paths do not hold this lock, so this single guard covers the
-        // final Workspace read, lease preparation, and transaction commit.
-        let _workspace_guard = match (
-            self.workspace_exec_locks.as_ref(),
-            input.workspace_id.as_deref(),
-        ) {
-            (Some(locks), Some(workspace_id)) => Some(locks.acquire(workspace_id).await),
-            _ => None,
-        };
-
-        let workspace_lease = if work_unit.requires_integration {
-            let workspace_id = input.workspace_id.as_deref().ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "repository WorkUnit Execution requires its exact Workspace",
-                )
-            })?;
-            let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, workspace_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-            if workspace.task_id != task.id
-                || workspace.status != WorkspaceStatus::Ready
-                || scope.task_id != task.id
-                || scope.kind != db::WorkspaceScopeKind::WorkUnit
-                || scope.work_unit_id.as_deref() != Some(work_unit_id)
-            {
-                return Err(ServiceError::invalid_operation(
-                    "Execution Workspace does not belong to its exact WorkUnit",
-                ));
-            }
-            Some(
-                self.prepare_work_unit_workspace_lease(
-                    &admitted_task,
-                    &work_unit,
-                    &workspace,
-                    &input,
-                    actor,
-                )
-                .await?,
-            )
-        } else {
-            if input.workspace_id.is_some() {
-                return Err(ServiceError::invalid_operation(
-                    "non-mutating WorkUnit Execution cannot bind a repository Workspace",
-                ));
-            }
+        // Keep the exact WorkUnit and each child Workspace locked until its
+        // leases and Execution are committed together.
+        let _workspace_guards = self
+            .lock_work_unit_execution_workspaces(work_unit_id)
+            .await?;
+        let workspace_leases = self
+            .prepare_work_unit_workspace_leases(&admitted_task, &work_unit, &input, actor)
+            .await?;
+        if WorkspaceRepo::get_group_by_work_unit_id(&*self.db, work_unit_id)
+            .await?
+            .is_none()
+            && !work_unit.requires_integration
+        {
             self.prepare_non_repository_work_unit_context(
                 &task,
                 &work_unit,
@@ -909,8 +992,7 @@ impl TaskService {
                 input.executor_config_snapshot_json.as_deref(),
             )
             .await?;
-            None
-        };
+        }
 
         let should_publish_unblocked = lifecycle_plan.as_ref().is_some_and(|plan| {
             plan.lifecycle.state == db::TaskLifecycleState::Blocked
@@ -942,7 +1024,7 @@ impl TaskService {
             execution: input,
             work_unit_id: work_unit.id,
             work_unit_version: expected_work_unit_version,
-            workspace_lease,
+            workspace_leases,
         };
         let (execution, task, idempotent_replay) = if let Some(plan) = lifecycle_plan {
             let write = db::WorkUnitExecutionRepo::admit_with_lifecycle_and_artifact_inputs(
@@ -1169,58 +1251,17 @@ impl TaskService {
         };
         let mut admitted_task = task.clone();
         admitted_task.version = admitted_task_version;
-        let _workspace_guard = match (
-            self.workspace_exec_locks.as_ref(),
-            work_unit
-                .requires_integration
-                .then_some(input.workspace_id.as_deref())
-                .flatten(),
-        ) {
-            (Some(locks), Some(workspace_id)) => Some(locks.acquire(workspace_id).await),
-            _ => None,
-        };
-        let workspace_lease = if work_unit.requires_integration {
-            let workspace_id = input.workspace_id.as_deref().ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "repository recovery requires the exact WorkUnit Workspace",
-                )
-            })?;
-            let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-            let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, workspace_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-            if workspace.task_id != task.id
-                || workspace.status != WorkspaceStatus::Ready
-                || scope.task_id != task.id
-                || scope.kind != db::WorkspaceScopeKind::WorkUnit
-                || scope.work_unit_id.as_deref() != Some(work_unit_id)
-            {
-                return Err(ServiceError::invalid_operation(
-                    "recovery Workspace is not ready for the exact WorkUnit",
-                ));
-            }
-            Some(
-                self.prepare_work_unit_workspace_lease(
-                    &admitted_task,
-                    &work_unit,
-                    &workspace,
-                    &input,
-                    actor,
-                )
-                .await?,
-            )
-        } else {
-            if input.workspace_id.is_some()
-                || WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, work_unit_id)
-                    .await?
-                    .is_some()
-            {
-                return Err(ServiceError::invalid_operation(
-                    "non-repository recovery cannot select a WorkUnit Workspace",
-                ));
-            }
+        let _workspace_guards = self
+            .lock_work_unit_execution_workspaces(work_unit_id)
+            .await?;
+        let workspace_leases = self
+            .prepare_work_unit_workspace_leases(&admitted_task, &work_unit, &input, actor)
+            .await?;
+        if WorkspaceRepo::get_group_by_work_unit_id(&*self.db, work_unit_id)
+            .await?
+            .is_none()
+            && !work_unit.requires_integration
+        {
             self.prepare_non_repository_work_unit_context(
                 task,
                 &work_unit,
@@ -1228,8 +1269,7 @@ impl TaskService {
                 input.executor_config_snapshot_json.as_deref(),
             )
             .await?;
-            None
-        };
+        }
 
         let updated_at = now_rfc3339();
         let lifecycle_transition = if transitions_lifecycle {
@@ -1330,7 +1370,7 @@ impl TaskService {
                     execution: input.clone(),
                     work_unit_id: work_unit.id.clone(),
                     work_unit_version: expected_work_unit_version,
-                    workspace_lease,
+                    workspace_leases,
                 },
                 expected_task_version: explicit
                     .as_ref()

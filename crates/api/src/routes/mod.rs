@@ -6,9 +6,10 @@ use api_types::{
     TaskRoleResponse, WorkspaceResponse,
 };
 use db::{
-    ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, Page, PageRequest,
-    Project, Repo, RoleMembership, RoleMembershipRepo, SortBy, SortOrder, Task, TaskLifecycleRepo,
-    TaskLifecycleState as DbTaskLifecycleState, TaskRepo, TaskRoleRepo, Workspace, WorkspaceRepo,
+    ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, ExecutionRepo,
+    Page, PageRequest, Project, Repo, RoleMembership, RoleMembershipRepo, SortBy, SortOrder, Task,
+    TaskLifecycleRepo, TaskLifecycleState as DbTaskLifecycleState, TaskRepo, TaskRoleRepo,
+    Workspace, WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -457,6 +458,7 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
         workspace_id: execution.workspace_id,
         work_unit_id: execution.work_unit_id,
         work_unit_version: execution.work_unit_version,
+        repository_results: Vec::new(),
         usage: None,
         account_usage: None,
         created_at: execution.created_at,
@@ -464,12 +466,31 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
     }
 }
 
+pub async fn execution_response_with_repository_results(
+    db: &db::SqliteDb,
+    execution: Execution,
+) -> ApiResult<ExecutionResponse> {
+    let results = ExecutionRepo::list_repository_results(db, &execution.id).await?;
+    let mut response = execution_response(execution);
+    response.repository_results = results
+        .into_iter()
+        .map(|result| api_types::ExecutionRepositoryResultResponse {
+            repo_id: result.repo_id,
+            workspace_id: result.workspace_id,
+            before_sha: result.before_sha,
+            after_sha: result.after_sha,
+            snapshot_digest: result.snapshot_digest,
+        })
+        .collect();
+    Ok(response)
+}
+
 pub async fn execution_response_with_usage(
     db: &db::SqliteDb,
     execution: Execution,
 ) -> ApiResult<ExecutionResponse> {
     let execution_id = execution.id.clone();
-    let mut response = execution_response(execution);
+    let mut response = execution_response_with_repository_results(db, execution).await?;
     response.account_usage = execution_account_usage(db, &execution_id).await?;
     Ok(response)
 }

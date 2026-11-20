@@ -16,6 +16,10 @@ source version is 0.9.1.
 - Add versioned Task repository replacement, versioned Project primary-repo
   updates for future Tasks, and writable repository selection for WorkUnits in
   REST and MCP.
+- Add grouped WorkUnit workspaces and per-repository Execution results,
+  repository-scoped review subjects and rework bases, and exact-repository
+  validation and integration responses. Existing scalar Execution fields
+  remain populated for a selected primary repository.
 
 ## [0.9.1] - 2026-11-18
 

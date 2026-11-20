@@ -19,7 +19,7 @@ own workspace. Gate evaluation verifies the report against the durable
 review-subject relation and source attempt. A WorkUnit-scoped review Gate
 targets the reviewed WorkUnit, rather than its separate reviewer WorkUnit.
 
-Forge exposes the versioned REST API at `/api/v1`. This reference describes the 0.9.1 public contract through migration V180 for Project, Task, Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and TaskLifecycle records. M1 adds the Task and WorkUnit repository associations from V181.
+Forge exposes the versioned REST API at `/api/v1`. This reference describes the 0.9.1 public contract through migration V182 for Project, Task, Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and TaskLifecycle records. M1 adds Task and WorkUnit repository associations from V181; M2 adds grouped WorkUnit workspaces, exact per-repository Execution results, and repository-scoped review and validation projections from V182.
 
 > The orchestrator owns work. The harness owns cognition.
 
@@ -478,15 +478,21 @@ synthetic Execution.
 
 | Method and path | Contract |
 | --- | --- |
-| `GET /tasks/{id}/executions` | List exact historical Task Executions. |
+| `GET /tasks/{id}/executions` | List exact historical Task Executions, including `repository_results` with each selected `repo_id`, `workspace_id`, `before_sha`, `after_sha`, and `snapshot_digest`. |
 | `POST /tasks/{id}/executions` | Retired. Returns `410 Gone` with code `execution.manual_launch_retired`; use Task dispatch and prepared WorkUnits. |
 | `POST /tasks/{task_id}/executions/{execution_id}/recovery` | Explicitly select one cancelled exact crash-recovery, Agent-timeout, or graceful-shutdown Execution for a fresh child attempt. Supply its exact `work_unit_id`, expected Task, TaskLifecycle, and WorkUnit versions, and an `idempotency_key`; an optional `context` is included in the request identity. The selected Execution's Agent must still be the WorkUnit's current assignee and active role member. The requesting Human must be authorized to mutate the Task and is recorded in the decision receipt. A same-key retry returns the exact admitted child without dispatching it again. Selecting one candidate from an ambiguous aggregate block resolves that block and admits the child in one transaction; remaining WorkUnits keep their own pending Execution history and can be selected afterward. This human selection may explicitly override an Auto candidate when the operator chooses a fresh attempt; dispatcher Auto recovery itself resumes only the parent's exact reusable HarnessSession. |
-| `GET /executions/{id}` | Read one exact Execution, including its Actor, role, WorkUnit, HarnessSession reference, frozen execution configuration, and workspace identity. |
+| `GET /executions/{id}` | Read one exact Execution, including its Actor, role, WorkUnit, HarnessSession reference, frozen execution configuration, scalar workspace identity, and `repository_results` for each exact repository result. |
 | `POST /executions/{id}/follow-up` | Create a child from the exact parent Execution. `idempotency_key`, `message`, and `agent_id` are required. Repeating the same key and request replays the exact child; reusing the key with different request content conflicts. A new authorized follow-up uses a new key. A same-Agent continuation can reuse only the exact compatible HarnessSession; it never substitutes a current role member or latest Execution. |
 | `POST /executions/{id}/cancel` | Cancel the exact Execution. |
 | `GET /executions/{id}/logs`, `GET /executions/{id}/hook-logs` | Read the exact Execution's persisted log output and hook logs. |
 | `GET /executions/{id}/usage`, `GET /tasks/{id}/usage` | Read Execution or aggregate Task usage. |
 | `GET /workspaces/{id}/diff` | Read an exact Workspace diff. |
+
+When the WorkUnit selects the primary repository, scalar `workspace_id`,
+`before_sha`, and `after_sha` retain their legacy meaning. A WorkUnit that does
+not select the primary leaves those scalar fields unset; its `repository_results`
+still expose every selected result. A single-repository WorkUnit returns one
+repository result and preserves its scalar response.
 
 The public Execution projection identifies the participant through `actor_ref`;
 it does not expose a purpose classification or the legacy AgentSession identity.
@@ -503,10 +509,10 @@ table does not authorize a decision or satisfy a Gate.
 | Method and path | Contract |
 | --- | --- |
 | `POST /tasks/{id}/review-executions` | Start a Human Review Execution with `{ "task_role_id": "...", "workspace_id": "..." }`. The exact role must currently grant `formal_review` and contain the caller as an active member. `workspace_id`, when supplied, must name the exact Ready Workspace to review; `null` starts a Workspace-free review and never selects a Task Workspace implicitly. |
-| `GET /tasks/{id}/review-executions` | List exact Executions admitted with `formal_review` and their ReviewReport Artifact outputs. |
-| `GET /review-executions/{id}` | Read one exact formal Review Execution and report. |
+| `GET /tasks/{id}/review-executions` | List exact Executions admitted with `formal_review`, their per-repository results, and ReviewReport Artifact outputs. |
+| `GET /review-executions/{id}` | Read one exact formal Review Execution, its per-repository results, and report. |
 | `POST /review-executions/{id}` | Submit a ReviewReport to that exact reviewer Execution. Optional `reviewed_work_unit_id` and `reviewed_work_unit_version` pin the exact WorkUnit subject; both must be supplied together. |
-| `GET /tasks/{id}/validation-runs`, `GET /validation-runs/{id}` | List or read exact ValidationRuns. |
+| `GET /tasks/{id}/validation-runs`, `GET /validation-runs/{id}` | List or read exact ValidationRuns. Each response includes `repo_id` resolved from its exact Workspace. |
 | `GET /evidence/{id}` | Read exact Evidence and its producer ValidationRun identity. |
 | `GET /tasks/{task_id}/artifacts`, `POST /tasks/{task_id}/artifacts` | List or create generic Artifacts with exact provenance. |
 | `GET /artifacts/{id}` | Read one exact Artifact. |
@@ -527,7 +533,7 @@ Validation definitions are immutable Project catalog versions. A check request m
 | `GET /tasks/{id}/human-decisions/{decision_id}` | Read one exact Task decision. |
 | `POST /tasks/{id}/human-decisions/{decision_id}/answer` | Answer one stored option with expected_version, option_id, optional note, and idempotency_key. The authenticated Human is the answerer. Options with authority_effect=scope or authority require Project owner/admin authority. |
 
-ValidationRunResponse includes run_origin (legacy_command|coordinator_request|after_integration|baseline), definition_digest, catalog_check_id, and check_request_id. Coordination request responses include exact nullable source_subject_kind/id/digest and resumes_request_id fields.
+ValidationRunResponse includes `repo_id` resolved from the exact Workspace, `run_origin` (legacy_command|coordinator_request|after_integration|baseline), `definition_digest`, `catalog_check_id`, and `check_request_id`. A requested catalog check binds `(repo_id, check_key)` to that repository's exact Workspace, commit, and snapshot. Coordination request responses include exact nullable source_subject_kind/id/digest and resumes_request_id fields.
 
 A terminal run in failed, error, or stale state, or a baseline comparison in regression or inconclusive state, can create an exact validation_findings coordinator request. The coordinator may choose correct, recheck, or human. A recheck stays on the pinned check and subject. Passing checks and non-regression comparisons do not wake the coordinator. Answering a resumable decision creates at most one resume request for its original authorization; Project Copilot never answers Human decisions.
 
@@ -570,13 +576,13 @@ The REST and MCP error codes include credential.invalid, credential.purpose_inva
 | Method and path | Contract |
 | --- | --- |
 | `GET /tasks/{task_id}/work-units`, `POST /tasks/{task_id}/work-units` | List or create Task-scoped WorkUnits. Creation accepts `repository_ids` as a subset of the Task's primary/affected repositories; omission or an empty list means all writable Task repositories. Context repositories cannot be selected. It also accepts optional `execution_instructions` passed to the assigned harness instead of the generic Task/WorkUnit prompt, exact `artifact_inputs` IDs to pin on every Execution, and `review_approval: { gate_id, review_line_id }` to require a current satisfied review Gate before admission. |
-| `GET /work-units/{id}`, `PATCH /work-units/{id}` | Read or update an exact WorkUnit. |
+| `GET /work-units/{id}`, `PATCH /work-units/{id}` | Read or update an exact WorkUnit. A formal `review_subject` includes `repository_results`, one exact row for each repo in the reviewed result. |
 | `GET /work-units/{id}/artifact-package` | Read the WorkUnit's exact immutable Artifact input bindings and result manifests, including producer Executions and digests. |
 | `POST /work-units/{id}/allocation`, `POST /work-units/{id}/status` | Allocate a WorkUnit or request its target state transition. |
 | `GET /work-units/{id}/dependencies`, `POST /work-units/{id}/dependencies/{prerequisite_id}`, `DELETE /work-units/{id}/dependencies/{prerequisite_id}` | Read or update exact WorkUnit dependencies. |
 | `GET /work-units/{id}/readiness` | Read deterministic WorkUnit readiness, including `awaiting_acceptance` and `awaiting_review_approval`. |
-| `POST /work-units/{id}/workspace` | Prepare or rebuild the exact repository WorkUnit Workspace before launch. |
-| `POST /work-units/{id}/integrations` | Integrate an explicitly scoped WorkUnit under the existing integration lock. |
+| `POST /work-units/{id}/workspace` | Prepare or rebuild the exact WorkUnit workspace group before launch, with one Workspace per writable repository and pinned read-only Workspaces for selected context repos. |
+| `POST /work-units/{id}/integrations` | Integrate an explicitly scoped WorkUnit under the existing integration lock. The response includes `repo_id` from the exact source Workspace. |
 | `GET /tasks/{task_id}/messages`, `POST /tasks/{task_id}/messages`, `GET /messages/{id}` | Create or read generic collaboration Messages. |
 | `GET /tasks/{task_id}/handoffs`, `POST /tasks/{task_id}/handoffs`, `GET /handoffs/{id}`, `POST /handoffs/{id}/status` | Create, read, or update generic Handoffs. |
 | `GET /tasks/{task_id}/proposals`, `POST /tasks/{task_id}/proposals`, `GET /proposals/{id}`, `POST /proposals/{id}/withdraw` | Create or read generic Proposals. |
@@ -678,7 +684,9 @@ Public durable event types are:
 - `gate.created`, `gate.policy_revised`, and `gate.evaluated` with exact Gate,
   policy revision, outcome, and input digest facts;
 - `execution.started`, `execution.completed`, `execution.failed`,
-  `execution.cancelled`, and `execution.stalled`;
+  `execution.cancelled`, `execution.repository_results_recorded`, and
+  `execution.stalled`. The repository-results event contains only exact repo
+  and Workspace IDs, commit SHAs, and snapshot digests;
 - `validation_run.started`, `validation_run.completed`, `evidence.created`,
   and `artifact.created`;
 - `project.plan_changed` for plan proposals, applies, dependency mutations, and
@@ -772,7 +780,8 @@ The MCP server advertises only registered tools. The current tool names are:
   `forge_list_task_dependencies`. Direct dependency mutations require
   `expected_graph_version` and `idempotency_key` and call the Project DAG
   service. There is no MCP tool for authorizing a Project batch.
-- Executions and roles: `forge_list_executions`, `forge_get_task_dispatch`,
+- Executions and roles: `forge_list_executions` (including exact per-repository
+  results), `forge_get_task_dispatch`,
   `forge_launch_task`, `forge_pause_task`, `forge_resume_task`,
   `forge_cancel_task`, `forge_request_rework`, `forge_follow_up_execution`,
   `forge_list_task_roles`, `forge_create_task_role`, `forge_update_task_role`,

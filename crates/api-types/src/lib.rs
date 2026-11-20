@@ -256,10 +256,12 @@ fn export_typescript() {
     TaskReworkAutomationIntentsResponse::export()
         .expect("export TaskReworkAutomationIntentsResponse");
     ReviewSubjectResponse::export().expect("export ReviewSubjectResponse");
+    ReviewSubjectRepositoryResponse::export().expect("export ReviewSubjectRepositoryResponse");
     FollowUpRequest::export().expect("export FollowUpRequest");
     RecoverWorkUnitExecutionRequest::export().expect("export RecoverWorkUnitExecutionRequest");
     ClaimOverrides::export().expect("export ClaimOverrides");
     ExecutionResponse::export().expect("export ExecutionResponse");
+    ExecutionRepositoryResultResponse::export().expect("export ExecutionRepositoryResultResponse");
     ExecutionUsageResponse::export().expect("export ExecutionUsageResponse");
     TaskUsageSummaryResponse::export().expect("export TaskUsageSummaryResponse");
     ExecutionLogKind::export().expect("export ExecutionLogKind");

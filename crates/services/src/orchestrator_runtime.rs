@@ -2558,9 +2558,9 @@ impl OrchestratorRuntime {
         let page = recent_page(MAX_CONTEXT_ROWS);
         let task_integration_workspace =
             WorkspaceRepo::get_integration_by_task_id(&*self.db, &task.id).await?;
-        let work_unit_workspace = match wake.work_unit_id.as_deref() {
-            Some(id) => WorkUnitWorkspaceRepo::get_by_work_unit_id(&*self.db, id).await?,
-            None => None,
+        let work_unit_workspaces = match wake.work_unit_id.as_deref() {
+            Some(id) => WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, id).await?,
+            None => Vec::new(),
         };
         let mut executions = ExecutionRepo::list_by_task(&*self.db, &task.id, page.clone())
             .await?
@@ -2669,13 +2669,23 @@ impl OrchestratorRuntime {
                     "before_sha": workspace.before_sha,
                     "worktree_path": workspace.worktree_path,
                 })),
-                "work_unit": work_unit_workspace.map(|workspace| json!({
+                "work_unit": work_unit_workspaces.iter().find(|workspace| {
+                    task.repo_id.as_deref() == Some(workspace.repo_id.as_str())
+                }).or_else(|| (work_unit_workspaces.len() == 1).then(|| &work_unit_workspaces[0])).map(|workspace| json!({
                     "workspace_id": workspace.id,
                     "status": format!("{:?}", workspace.status),
                     "branch": workspace.branch,
                     "before_sha": workspace.before_sha,
                     "worktree_path": workspace.worktree_path,
                 })),
+                "work_unit_repositories": work_unit_workspaces.iter().map(|workspace| json!({
+                    "repo_id": workspace.repo_id,
+                    "workspace_id": workspace.id,
+                    "status": format!("{:?}", workspace.status),
+                    "branch": workspace.branch,
+                    "before_sha": workspace.before_sha,
+                    "worktree_path": workspace.worktree_path,
+                })).collect::<Vec<_>>(),
             },
             "executions": executions.iter().map(|execution| json!({
                 "id": execution.id,

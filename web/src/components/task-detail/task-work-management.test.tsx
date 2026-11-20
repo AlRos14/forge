@@ -147,6 +147,7 @@ describe('TaskWorkManagement reviewer setup', () => {
         result_commit_sha: null,
         result_workspace_id: null,
         workspace_snapshot_digest: null,
+        repository_results: [],
       },
     }
     const fetchMock = vi.spyOn(window, 'fetch').mockImplementation(async (input, init) => {
