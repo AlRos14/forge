@@ -1383,3 +1383,11 @@ Desviaciones y límites: una Task con Execution no admite todavía una
 replanificación autorizada de repositorios; el reemplazo responde `409
 task.repositories.replan_required`. No se ejecutaron builds, tests, clippy ni
 comandos pnpm; su resultado es NOT RUN y no constituye aceptación de CI.
+
+### Anexo M1 — cierre CI
+
+`build-local-linux.yml run_checks=true` **PASS** en `feat/multirepo` (run
+44662476947), tras dos vueltas de corrección: clippy (`explicit_counter_loop`,
+`explicit_auto_deref`), `use sqlx::Row` en `task_service/create.rs`, mock del
+editor Markdown en el test de selectores web y comparación del alcance heredado
+por repo/rol/posición. M1 queda **DONE**.
