@@ -71,7 +71,9 @@ impl WorkUnitService {
         report.reviewed_work_unit_version = None;
         report.reviewed_work_unit_id = None;
 
-        if subject.result_execution_id.is_some() {
+        // A replay of an already submitted review finds the WorkUnit completed;
+        // its subject rows and group were frozen and prepared by the first call.
+        if unit.status == WorkUnitStatus::Open && subject.result_execution_id.is_some() {
             let repositories = self
                 .freeze_review_subject_repositories(work_unit_id)
                 .await?;
