@@ -622,8 +622,14 @@ impl TaskService {
                         "Execution primary Workspace is not a member of its exact group",
                     ));
                 }
+                // A group with exactly one repository keeps the 0.9.1 harness
+                // CWD: the repository worktree itself, not the group root.
+                let path = match workspaces.as_slice() {
+                    [only] => std::path::PathBuf::from(&only.worktree_path),
+                    _ => expected_root,
+                };
                 return Ok(ExecutionWorkingContext {
-                    path: expected_root,
+                    path,
                     lock_key: format!("work-unit-workspace:{}", work_unit.id),
                     workspace,
                     workspace_group: Some(group),
