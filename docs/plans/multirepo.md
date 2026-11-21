@@ -1974,3 +1974,17 @@ checks, tests, clippy, pnpm y CI quedan **NOT RUN** por la restricción de esta
 integración; la compilación y el comportamiento de runtime requieren el CI.
 Riesgo residual: la lógica Rust y los fixtures de grupos nuevos solo recibieron
 revisión estática hasta que CI ejecute el workspace completo.
+
+## Anexo M2 — cierre CI
+
+`build-local-linux.yml` con `run_checks=true` en verde: run 44923735519
+(build y rust-checks). Correcciones tras la integración, en orden:
+compilación y clippy; ruta legacy de revisión sin repos y `repo_id` por
+defecto al deserializar; teardown de Project borra explícitamente las filas
+V182 bajo el guard; claim de arranque valida el conjunto completo de leases por
+repo; captura de resultados por repo también en el cierre por API; Gate compara
+`repository_results`; un grupo de un solo repo conserva el CWD 0.9.1 (el
+worktree); la revisión Human congela las filas por repo y prepara el grupo de
+solo lectura antes de admitir, y su replay no lo vuelve a preparar;
+`FORGE_WU_ADMISSION_REVIEW_GROUP_UNAVAILABLE` → 409
+`work_unit_review_group_unavailable`.
