@@ -188,7 +188,10 @@ An assigned Human submits a report through the reviewer WorkUnit's
 `review-report` operation. Forge creates the provenance attempt internally,
 stores the report, and completes the review WorkUnit. Retries reuse the exact
 attempt/report, including recovery after a report was persisted before WorkUnit
-completion. The Human does not select an Execution or a HarnessSession.
+completion. For repository subjects, submission freezes the pending per-repo
+result rows and prepares the exact read-only WorkspaceGroup before admission;
+the Human attempt itself remains workspace-free. The Human does not select an
+Execution or a HarnessSession.
 
 A review WorkUnit may record `work_unit_review_subject`: the exact reviewed
 WorkUnit version and, for each writable repo in its result, the result

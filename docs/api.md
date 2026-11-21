@@ -7,6 +7,9 @@
 returns `SubmitReviewReportResponse`. It requires the exact assigned Human
 reviewer and an available, independent, same-Task result subject. Forge derives
 the technical attempt and frozen subject; request fields cannot replace them.
+For repository subjects, submission freezes each repository result and prepares
+the exact read-only WorkspaceGroup before admitting the Human review attempt.
+The Human attempt remains workspace-free.
 The operation stores the ReviewReport and completes the reviewer WorkUnit;
 `request_changes` completes the review work without approving the delivery.
 An identical retry reuses the same provenance attempt and Artifact.
@@ -591,6 +594,8 @@ The REST and MCP error codes include credential.invalid, credential.purpose_inva
 These are generic domain records. They do not recreate Agent Chat, Charter,
 AgentAction, the historical Project readiness workflow, or Main/Project Agent
 workflows. WorkUnit readiness is a current deterministic projection.
+Execution admission that reaches a formal repository review without its exact
+ready WorkspaceGroup returns `409 work_unit_review_group_unavailable`.
 
 ## Agents, providers, credentials, and daemon transport
 

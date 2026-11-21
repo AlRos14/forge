@@ -82,6 +82,9 @@ pub enum DbError {
     #[error("WorkUnit Workspace is not available for Execution admission")]
     WorkUnitWorkspaceUnavailable,
 
+    #[error("WorkUnit review WorkspaceGroup is not available for Execution admission")]
+    WorkUnitReviewGroupUnavailable,
+
     #[error("Project Copilot already has an active run")]
     ProjectCopilotActiveRun,
 

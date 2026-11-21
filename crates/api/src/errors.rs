@@ -640,6 +640,10 @@ impl From<DbError> for ApiError {
                 "work_unit_workspace_unavailable",
                 "WorkUnit Workspace is not ready for Execution admission",
             ),
+            DbError::WorkUnitReviewGroupUnavailable => Self::conflict_with_code(
+                "work_unit_review_group_unavailable",
+                "The exact read-only review WorkspaceGroup is not ready for Execution admission",
+            ),
             DbError::WorkUnitExecutionAlreadyRunning => Self::conflict_with_code(
                 "work_unit_execution_running",
                 "WorkUnit already has a Running Execution",

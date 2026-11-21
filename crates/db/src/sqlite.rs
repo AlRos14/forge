@@ -350,6 +350,9 @@ pub(super) fn work_unit_execution_admission_error(error: &sqlx::Error) -> Option
             Some(DbError::WorkUnitRoleMembershipInactive)
         }
         "FORGE_WU_ADMISSION_WORKSPACE_UNAVAILABLE" => Some(DbError::WorkUnitWorkspaceUnavailable),
+        "FORGE_WU_ADMISSION_REVIEW_GROUP_UNAVAILABLE" => {
+            Some(DbError::WorkUnitReviewGroupUnavailable)
+        }
         "FORGE_WU_ADMISSION_ALREADY_RUNNING" => Some(DbError::WorkUnitExecutionAlreadyRunning),
         "FORGE_WU_ADMISSION_DEPENDENCY_UNSATISFIED" => Some(DbError::DependencyGate),
         "FORGE_WU_ADMISSION_PROJECT_DEPENDENCY_UNSATISFIED" => {
