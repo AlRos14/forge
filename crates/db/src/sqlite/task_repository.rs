@@ -227,7 +227,7 @@ async fn create_revision_in_tx(
         .ok_or(DbError::NotFound)
 }
 
-async fn pin_work_unit_in_tx(
+pub(super) async fn pin_work_unit_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     work_unit_id: &str,
     task_id: &str,
