@@ -4,9 +4,10 @@ pub(super) async fn insert_pr_metadata_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     input: &CreatePrMetadata,
 ) -> Result<()> {
-    sqlx::query("INSERT INTO pr_metadata (id, task_id, provider_type, provider_pr_id, pr_url, source_branch, target_branch, pr_state, merge_status, task_merge_operation_id, publish_operation_id, last_synced_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO pr_metadata (id, task_id, repo_id, provider_type, provider_pr_id, pr_url, source_branch, target_branch, pr_state, merge_status, task_merge_operation_id, publish_operation_id, last_synced_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&input.id)
         .bind(&input.task_id)
+        .bind(&input.repo_id)
         .bind(&input.provider_type)
         .bind(&input.provider_pr_id)
         .bind(&input.pr_url)
@@ -31,14 +32,25 @@ impl PrMetadataRepo for SqliteDb {
         let mut tx = self.pool.begin().await?;
         insert_pr_metadata_in_tx(&mut tx, &input).await?;
         tx.commit().await?;
-        PrMetadataRepo::get_by_task_id(self, &input.task_id)
+        PrMetadataRepo::get_by_task_repo(self, &input.task_id, &input.repo_id)
             .await?
             .ok_or(DbError::NotFound)
     }
 
-    async fn get_by_task_id(&self, task_id: &str) -> Result<Option<PrMetadata>> {
-        sqlx::query("SELECT * FROM pr_metadata WHERE task_id = ?")
+    async fn list_by_task(&self, task_id: &str) -> Result<Vec<PrMetadata>> {
+        let rows = sqlx::query(
+            "SELECT * FROM pr_metadata WHERE task_id = ? ORDER BY repo_id, created_at, id",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(map_pr_metadata).collect()
+    }
+
+    async fn get_by_task_repo(&self, task_id: &str, repo_id: &str) -> Result<Option<PrMetadata>> {
+        sqlx::query("SELECT * FROM pr_metadata WHERE task_id = ? AND repo_id = ?")
             .bind(task_id)
+            .bind(repo_id)
             .fetch_optional(&self.pool)
             .await?
             .map(map_pr_metadata)

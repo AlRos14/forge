@@ -50,7 +50,15 @@ vi.mock('@tanstack/react-router', () => ({
   ),
 }))
 
-const task = { id: 'task-1', project_id: 'project-1' } as unknown as Task
+const task = {
+  id: 'task-1',
+  project_id: 'project-1',
+  repo_id: null,
+  repositories: [],
+  repository_set_revision: 0,
+  repository_set_digest: null,
+  repository_merge_batches: [],
+} as unknown as Task
 
 describe('TaskPrFeedbackPanel', () => {
   beforeEach(() => {

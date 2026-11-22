@@ -1,6 +1,6 @@
 use super::*;
 use db::{TaskRepositoryRole, TaskRepositoryWrite};
-use sqlx::{Sqlite, Transaction};
+use sqlx::Transaction;
 use std::collections::HashSet;
 
 pub(super) fn validate_task_repository_writes(rows: &[TaskRepositoryWrite]) -> Result<()> {
@@ -50,6 +50,9 @@ impl TaskService {
     ) -> Result<Task> {
         validate_task_repository_writes(&repositories)?;
         let now = now_rfc3339();
+        let current_repository_set = TaskRepositorySetRepo::get_current(&*self.db, task_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("Task repository set", task_id.to_owned()))?;
         let mut transaction = self.db.pool().begin_with("BEGIN IMMEDIATE").await?;
         let task = TaskRepo::get_by_id_in_tx(&*self.db, &mut transaction, task_id, false)
             .await?
@@ -101,6 +104,23 @@ impl TaskService {
             expected_version,
             &repositories,
             &now,
+        )
+        .await?;
+        TaskRepositorySetRepo::create_revision_in_tx(
+            &*self.db,
+            &mut transaction,
+            db::CreateTaskRepositorySetRevision {
+                task_id: task_id.to_owned(),
+                expected_current_revision: current_repository_set.revision,
+                expected_current_digest: current_repository_set.digest,
+                repositories: repositories.clone(),
+                source_kind: "task_repository_patch".to_owned(),
+                source_ref: None,
+                decision_id: None,
+                human_decision_request_id: None,
+                force_new_revision: false,
+                created_at: now.clone(),
+            },
         )
         .await?;
         transaction.commit().await?;

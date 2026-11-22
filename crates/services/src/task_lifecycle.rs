@@ -5,9 +5,10 @@ use std::{collections::HashSet, sync::Arc};
 use api_types::{Actor, SystemComponent};
 use db::{
     new_uuid_v4, now_rfc3339, AgentRepo, CreateDomainEvent, DomainEventRepo, ExecutionRepo,
-    GateEvaluationOutcome, GateRepo, PrReworkRepo, SqliteDb, Task, TaskDispatch,
-    TaskDispatchOperation, TaskDispatchState, TaskDispatchWrite, TaskIntegrationOperationRepo,
-    TaskLifecycle, TaskLifecycleRepo, TaskLifecycleState, TaskLifecycleTransitionWrite, TaskRepo,
+    GateEvaluationOutcome, GateRepo, PrMetadataRepo, PrReworkRepo, RepoRepo, SqliteDb, Task,
+    TaskDispatch, TaskDispatchOperation, TaskDispatchState, TaskDispatchWrite,
+    TaskIntegrationOperationRepo, TaskLifecycle, TaskLifecycleRepo, TaskLifecycleState,
+    TaskLifecycleTransitionWrite, TaskRepo, TaskRepositoryMergeBatchRepo, TaskRepositorySetRepo,
     TransitionTaskDispatch, ValidationRunRepo, WorkUnitIntegrationOutcome, WorkUnitRepo,
     WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
 };
@@ -1233,6 +1234,110 @@ impl TaskLifecycleService {
                 "GateEvaluation is stale or does not authorize this exact merge lifecycle edge",
             ));
         }
+        if from_state == TaskLifecycleState::Active
+            && to_state == TaskLifecycleState::ReadyToMerge
+            && evaluation.outcome == GateEvaluationOutcome::Satisfied
+            && reason_ref == Some(evaluation_id)
+        {
+            self.validate_repository_batch_ready(task_id, evaluation_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn validate_repository_batch_ready(
+        &self,
+        task_id: &str,
+        evaluation_id: &str,
+    ) -> Result<()> {
+        let repository_set = TaskRepositorySetRepo::get_current(&*self.db, task_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "merge readiness requires a current Task repository set",
+                )
+            })?;
+        let writable_repository_count = repository_set
+            .repositories
+            .iter()
+            .filter(|repository| {
+                matches!(
+                    repository.role,
+                    db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                )
+            })
+            .count();
+        let batches = TaskRepositoryMergeBatchRepo::list_by_task(&*self.db, task_id).await?;
+        let mut matching = batches
+            .iter()
+            .filter(|batch| batch.gate_evaluation_id == evaluation_id);
+        let Some(batch) = matching.next() else {
+            if writable_repository_count == 1 {
+                // Preserve the 0.9.1 single-repository path. Multi-repository
+                // Tasks need their exact candidate batch before readiness.
+                return Ok(());
+            }
+            return Err(ServiceError::invalid_operation(
+                "multi-repository merge batch must be prepared before ReadyToMerge",
+            ));
+        };
+        if matching.next().is_some() {
+            return Err(ServiceError::invalid_operation(
+                "GateEvaluation has more than one repository merge batch",
+            ));
+        }
+        if batch.repository_set_revision != repository_set.revision
+            || !matches!(
+                batch.state,
+                db::TaskRepositoryMergeBatchState::Open
+                    | db::TaskRepositoryMergeBatchState::Completed
+            )
+        {
+            return Err(ServiceError::invalid_operation(
+                "repository merge batch is stale or not ready",
+            ));
+        }
+        let rows = TaskRepositoryMergeBatchRepo::list_repositories(&*self.db, &batch.id).await?;
+        if rows.is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "repository merge batch has no changed repository rows",
+            ));
+        }
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        for row in &rows {
+            let repository_is_writable = repository_set.repositories.iter().any(|repository| {
+                repository.revision == batch.repository_set_revision
+                    && repository.repo_id == row.repo_id
+                    && matches!(
+                        repository.role,
+                        db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                    )
+            });
+            if !repository_is_writable
+                || row.repository_set_revision != batch.repository_set_revision
+            {
+                return Err(ServiceError::invalid_operation(
+                    "repository merge batch contains a repository outside its exact writable set",
+                ));
+            }
+            let repo = RepoRepo::get_by_id(&*self.db, &row.repo_id)
+                .await?
+                .filter(|repo| repo.project_id == task.project_id)
+                .ok_or_else(|| ServiceError::not_found("repo", row.repo_id.clone()))?;
+            let metadata = if repo.work_mode == db::WorkMode::PullRequest {
+                PrMetadataRepo::get_by_task_repo(&*self.db, task_id, &row.repo_id).await?
+            } else {
+                None
+            };
+            if !repository_merge_row_ready(task_id, row, &repo, metadata.as_ref()) {
+                return Err(ServiceError::invalid_operation(format!(
+                    "repository merge batch is not ready for repository {}",
+                    row.repo_id
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1412,6 +1517,47 @@ fn fact_cause(kind: &str, id: String) -> CauseFields {
     }
 }
 
+fn repository_merge_row_ready(
+    task_id: &str,
+    row: &db::TaskRepositoryMergeBatchRepoRow,
+    repo: &db::Repo,
+    metadata: Option<&db::PrMetadata>,
+) -> bool {
+    if row.task_id != task_id
+        || row.repo_id != repo.id
+        || row.work_unit_repository_integration_id.is_none()
+        || row.task_merge_operation_id.is_none()
+        || row.before_sha.as_deref().is_none_or(str::is_empty)
+        || row.after_sha.as_deref().is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    match &repo.work_mode {
+        db::WorkMode::PullRequest => {
+            row.state == db::TaskRepositoryMergeBatchRepoState::Open
+                && row.pr_metadata_id.as_deref().is_some_and(|metadata_id| {
+                    metadata.is_some_and(|metadata| {
+                        metadata.id == metadata_id
+                            && metadata.task_id == row.task_id
+                            && metadata.repo_id.as_deref() == Some(repo.id.as_str())
+                            && metadata.pr_state.eq_ignore_ascii_case("open")
+                            && metadata.admission_status == "open"
+                            && metadata.task_merge_operation_id.as_deref()
+                                == row.task_merge_operation_id.as_deref()
+                            && metadata.publish_operation_id.is_some()
+                    })
+                })
+        }
+        db::WorkMode::DirectMerge => {
+            row.state == db::TaskRepositoryMergeBatchRepoState::Integrated
+                && row
+                    .after_sha
+                    .as_deref()
+                    .is_some_and(|sha| !sha.trim().is_empty())
+        }
+    }
+}
+
 fn allowed_transition(from: TaskLifecycleState, to: TaskLifecycleState) -> bool {
     use TaskLifecycleState as S;
     matches!(
@@ -1448,6 +1594,98 @@ mod tests {
     };
     use serde_json::Value;
     use sha2::Digest;
+
+    #[test]
+    fn multirepo_lifecycle_all_repository_prs_required_for_ready_to_merge() {
+        let now = now_rfc3339();
+        let repo = |id: &str| db::Repo {
+            id: id.to_owned(),
+            project_id: "project".to_owned(),
+            name: id.to_owned(),
+            remote_url: "https://example.invalid/repo.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::PullRequest,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let row = |repo_id: &str, state| db::TaskRepositoryMergeBatchRepoRow {
+            batch_id: "batch".to_owned(),
+            task_id: "task".to_owned(),
+            repository_set_revision: 1,
+            repo_id: repo_id.to_owned(),
+            position: 0,
+            state,
+            work_unit_repository_integration_id: Some(format!("integration-{repo_id}")),
+            task_merge_operation_id: Some(format!("merge-{repo_id}")),
+            pr_metadata_id: Some(format!("metadata-{repo_id}")),
+            before_sha: Some("before".to_owned()),
+            after_sha: Some("after".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let metadata = |repo_id: &str| db::PrMetadata {
+            id: format!("metadata-{repo_id}"),
+            task_id: "task".to_owned(),
+            repo_id: Some(repo_id.to_owned()),
+            provider_type: "github".to_owned(),
+            provider_pr_id: Some(format!("pr-{repo_id}")),
+            pr_url: Some(format!("https://example.invalid/{repo_id}/pull/1")),
+            source_branch: "task/change".to_owned(),
+            target_branch: "main".to_owned(),
+            pr_state: "open".to_owned(),
+            merge_status: "pending".to_owned(),
+            admission_status: "open".to_owned(),
+            task_merge_operation_id: Some(format!("merge-{repo_id}")),
+            publish_operation_id: Some(format!("publish-{repo_id}")),
+            last_synced_at: Some(now.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let primary_repo = repo("primary");
+        let affected_repo = repo("affected");
+        let primary_row = row("primary", db::TaskRepositoryMergeBatchRepoState::Open);
+        let affected_pending = row("affected", db::TaskRepositoryMergeBatchRepoState::Pending);
+        let primary_metadata = metadata("primary");
+
+        assert!(repository_merge_row_ready(
+            "task",
+            &primary_row,
+            &primary_repo,
+            Some(&primary_metadata)
+        ));
+        assert!(!repository_merge_row_ready(
+            "task",
+            &affected_pending,
+            &affected_repo,
+            None
+        ));
+
+        let affected_row = row("affected", db::TaskRepositoryMergeBatchRepoState::Open);
+        let affected_metadata = metadata("affected");
+        assert!(repository_merge_row_ready(
+            "task",
+            &affected_row,
+            &affected_repo,
+            Some(&affected_metadata)
+        ));
+        let mut unadmitted = affected_metadata;
+        unadmitted.admission_status = "admitted".to_owned();
+        assert!(!repository_merge_row_ready(
+            "task",
+            &affected_row,
+            &affected_repo,
+            Some(&unadmitted)
+        ));
+        let mut rebound = metadata("affected");
+        rebound.task_merge_operation_id = Some("merge-other-repository".to_owned());
+        assert!(!repository_merge_row_ready(
+            "task",
+            &affected_row,
+            &affected_repo,
+            Some(&rebound)
+        ));
+    }
 
     async fn seeded_task(
         lifecycle_state: TaskLifecycleState,

@@ -463,6 +463,9 @@ fn task_response(
     let task_id = id.clone();
     TaskResponse {
         repositories: Vec::new(),
+        repository_set_revision: 1,
+        repository_set_digest: None,
+        repository_merge_batches: Vec::new(),
         id,
         project_id,
         repo_id: None,

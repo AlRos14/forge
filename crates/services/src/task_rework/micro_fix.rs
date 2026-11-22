@@ -507,14 +507,18 @@ impl TaskReworkService {
                 "micro-fix correction Execution has no repository results",
             ));
         }
-        let task = db::TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let primary_result = task
-            .repo_id
-            .as_deref()
-            .and_then(|repo_id| repository_results.iter().find(|row| row.repo_id == repo_id))
-            .or_else(|| repository_results.first())
+        let primary_repo_id = crate::task_rework::work_unit_primary_repo_id(
+            &self.db,
+            work_unit_id,
+            &execution.task_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            ServiceError::invalid_operation("micro-fix WorkUnit has no primary repository")
+        })?;
+        let primary_result = repository_results
+            .iter()
+            .find(|row| row.repo_id == primary_repo_id)
             .ok_or_else(|| {
                 ServiceError::invalid_operation("micro-fix correction has no exact repo result")
             })?;
@@ -722,7 +726,7 @@ impl TaskReworkService {
                     &advanced,
                     &execution,
                     &repository_results,
-                    task.repo_id.as_deref(),
+                    Some(primary_repo_id.as_str()),
                 )
                 .await?;
             }

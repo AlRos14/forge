@@ -37,6 +37,12 @@ WorkUnit work: for example, reproducing a failure, investigating its cause, or
 interpreting scanner output. That is distinct from the deterministic
 ValidationRun and may itself produce an Artifact or Evidence.
 
+For a multi-repository Task, review and validation continue to name the exact
+repository Workspace and commit. Only changed writable repositories become
+subjects of merge-readiness checks; each result stays bound to its `repo_id`
+instead of satisfying a check for another repository. A single-repository
+Task retains its existing scalar candidate and Gate behavior.
+
 ### Catalog checks
 
 A Project owner or admin may publish versioned **catalog checks**

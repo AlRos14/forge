@@ -203,8 +203,15 @@ impl TaskReworkService {
             ));
         }
         let unit: (String, i64, Option<String>) = sqlx::query_as(
-            "SELECT work_unit.role, work_unit.requires_integration, task.repo_id
-             FROM work_unit JOIN task ON task.id=work_unit.task_id
+            "SELECT work_unit.role, work_unit.requires_integration, primary_repository.repo_id
+             FROM work_unit
+             LEFT JOIN work_unit_repository_set_revision repository_pin
+               ON repository_pin.work_unit_id = work_unit.id
+              AND repository_pin.task_id = work_unit.task_id
+             LEFT JOIN task_repository_set_revision_repo primary_repository
+               ON primary_repository.task_id = repository_pin.task_id
+              AND primary_repository.revision = repository_pin.revision
+              AND primary_repository.role = 'primary'
              WHERE work_unit.id=? AND work_unit.task_id=?",
         )
         .bind(&subject_id)
@@ -264,6 +271,11 @@ impl TaskReworkService {
         if result_rows.is_empty() {
             return Err(crate::task_coordination::output_not_permitted(
                 "correct requires repository results for the exact checked WorkUnit",
+            ));
+        }
+        if unit.2.is_none() {
+            return Err(ServiceError::invalid_operation(
+                "checked repository results have no pinned primary repository",
             ));
         }
         self.consume_validation_round(tx, task_id).await?;

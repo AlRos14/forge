@@ -20,6 +20,12 @@ source version is 0.9.1.
   repository-scoped review subjects and rework bases, and exact-repository
   validation and integration responses. Existing scalar Execution fields
   remain populated for a selected primary repository.
+- Add durable per-repository integration/merge batches, PR identity and state,
+  exact repository-aware Task dependency handoffs, revision/digest-bound
+  coordinator replan checks, and partial progress/retry projections in REST,
+  MCP, SSE, and the web Task view. Human approval remains required for PR merge.
+- Open one PR per changed writable repository; unchanged repositories open no PR
+  and require no repository-scoped checks.
 
 ## [0.9.1] - 2026-11-18
 

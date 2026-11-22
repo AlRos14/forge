@@ -53,6 +53,17 @@ eligible; one phase authorization can therefore progress through a dependency
 chain. Pausing prevents new admission; revocation removes the batch grant.
 These batch projections do not replace TaskLifecycle or Task dispatch state.
 
+Repository-aware handoffs require the predecessor Task to be `done` and its
+latest completed repository merge batch to include every changed repository
+that the successor selects as `affected` or `context`. Direct-merge rows must
+be integrated; pull-request rows must be exactly admitted and provider-observed
+as merged. Forge pins each result commit into the successor context and checks
+that its repository Workspace base includes that commit. Any unresolved,
+unknown, or conflicting repository result blocks the successor. A Task whose
+repository scope changes after an Execution requires the coordinator replan
+path; a scope or authority change waits for the exact Human decision before
+materialization.
+
 An untouched TaskCoordination manual default may have a stale placeholder team
 snapshot after Project defaults were copied into TaskRoles. Batch authorization
 refreshes only that unconfigured default using the exact configured coordinator

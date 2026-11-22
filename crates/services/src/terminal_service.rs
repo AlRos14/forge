@@ -24,8 +24,8 @@ use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use config::TerminalConfig;
 use db::{
     new_uuid_v4, now_rfc3339, AgentRepo, CreateTerminalSession, ExecutionRepo, ProjectRepo,
-    SqliteDb, Task, TaskLifecycleRepo, TaskLifecycleState, TaskRepo, TerminalSession,
-    TerminalSessionRepo, TerminalSessionStatus as DbTerminalSessionStatus,
+    SqliteDb, Task, TaskLifecycleRepo, TaskLifecycleState, TaskRepo, TaskRepositorySetRepo,
+    TerminalSession, TerminalSessionRepo, TerminalSessionStatus as DbTerminalSessionStatus,
     UpdateTerminalSessionStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo,
     WorkspaceRepo, WorkspaceScopeKind, WorkspaceStatus,
 };
@@ -217,8 +217,7 @@ impl TerminalService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let Some(workspace) = WorkspaceRepo::get_integration_by_task_id(&*self.db, task_id).await?
-        else {
+        let Some(workspace) = self.primary_integration_workspace(task_id).await? else {
             availability.reason = Some(api_types::TERMINAL_WORKSPACE_NOT_READY.to_owned());
             return Ok(availability);
         };
@@ -790,7 +789,8 @@ impl TerminalService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let workspace = WorkspaceRepo::get_integration_by_task_id(&*self.db, task_id)
+        let workspace = self
+            .primary_integration_workspace(task_id)
             .await?
             .ok_or(ServiceError::TerminalWorkspaceNotReady)?;
         let scope = WorkUnitWorkspaceRepo::get_scope_by_id(&*self.db, &workspace.id)
@@ -806,6 +806,28 @@ impl TerminalService {
             .reconcile_stale(task_id)
             .await?;
         Ok((task, workspace))
+    }
+
+    async fn primary_integration_workspace(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<Workspace>, ServiceError> {
+        let Some(repository_set) = TaskRepositorySetRepo::get_current(&*self.db, task_id).await?
+        else {
+            return Ok(None);
+        };
+        let Some(primary_repo_id) = repository_set
+            .repositories
+            .iter()
+            .find(|repository| repository.role == db::TaskRepositoryRole::Primary)
+            .map(|repository| repository.repo_id.as_str())
+        else {
+            return Ok(None);
+        };
+        Ok(
+            WorkspaceRepo::get_integration_by_task_repo(&*self.db, task_id, primary_repo_id)
+                .await?,
+        )
     }
 
     async fn workspace_ready_for_terminal(

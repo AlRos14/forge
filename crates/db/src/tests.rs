@@ -9679,6 +9679,7 @@ async fn stale_interrupted_allocation_does_not_reserve_fresh_admission() {
     .expect("fresh exact allocation is no longer blocked by stale recovery");
 }
 
+mod multirepo_m3;
 mod v171_v174;
 mod v173;
 mod v175;

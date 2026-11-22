@@ -724,9 +724,14 @@ pub trait WorkspaceRepo: Send + Sync {
         -> Result<Option<WorkspaceGroup>>;
     async fn get_task_id(&self, id: &str) -> Result<Option<String>>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Workspace>>;
-    /// Resolve the Task's explicitly scoped integration Workspace. WorkUnit
-    /// workspaces must be addressed by exact WorkUnit or Workspace identity.
-    async fn get_integration_by_task_id(&self, task_id: &str) -> Result<Option<Workspace>>;
+    /// Resolve the integration Workspace for one exact repository.
+    async fn get_integration_by_task_repo(
+        &self,
+        task_id: &str,
+        repo_id: &str,
+    ) -> Result<Option<Workspace>>;
+    /// List integration Workspaces in repository order for a Task.
+    async fn list_integrations_by_task(&self, task_id: &str) -> Result<Vec<Workspace>>;
     async fn set_cleanup_after(
         &self,
         id: &str,
@@ -908,6 +913,104 @@ pub trait WorkUnitRepo: Send + Sync {
         input: RecordWorkUnitIntegration,
         event: CreateDomainEvent,
     ) -> Result<CollaborationWrite<WorkUnitIntegration>>;
+}
+
+#[async_trait]
+pub trait TaskRepositorySetRepo: Send + Sync {
+    async fn get_current(&self, task_id: &str) -> Result<Option<TaskRepositorySetRevision>>;
+    async fn create_revision(
+        &self,
+        input: CreateTaskRepositorySetRevision,
+    ) -> Result<TaskRepositorySetRevision>;
+    async fn create_revision_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateTaskRepositorySetRevision,
+    ) -> Result<TaskRepositorySetRevision>;
+    async fn get_revision(
+        &self,
+        task_id: &str,
+        revision: i64,
+    ) -> Result<Option<TaskRepositorySetRevision>>;
+    async fn pin_work_unit(&self, work_unit_id: &str, task_id: &str, revision: i64) -> Result<()>;
+    async fn pin_work_unit_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        work_unit_id: &str,
+        task_id: &str,
+        revision: i64,
+    ) -> Result<()>;
+    /// Resolve the immutable revision pinned when this WorkUnit was created.
+    /// This supplemental reader is needed by integration/review consumers;
+    /// the freeze listed the pin writer but omitted its paired reader.
+    async fn get_for_work_unit(
+        &self,
+        work_unit_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TaskRepositorySetRevision>>;
+}
+
+#[async_trait]
+pub trait WorkUnitRepositoryIntegrationRepo: Send + Sync {
+    async fn create(
+        &self,
+        input: CreateWorkUnitRepositoryIntegration,
+    ) -> Result<WorkUnitRepositoryIntegration>;
+    async fn get_by_id(&self, id: &str) -> Result<Option<WorkUnitRepositoryIntegration>>;
+    async fn get_by_parent_and_repo(
+        &self,
+        work_unit_integration_id: &str,
+        repo_id: &str,
+    ) -> Result<Option<WorkUnitRepositoryIntegration>>;
+    async fn list_by_work_unit(
+        &self,
+        work_unit_id: &str,
+    ) -> Result<Vec<WorkUnitRepositoryIntegration>>;
+    async fn transition(
+        &self,
+        id: &str,
+        expected_version: i64,
+        outcome: WorkUnitRepositoryIntegrationOutcome,
+        target_after_sha: Option<&str>,
+        conflict_metadata_json: Option<&str>,
+        finished_at: Option<&str>,
+        updated_at: &str,
+    ) -> Result<WorkUnitRepositoryIntegration>;
+}
+
+#[async_trait]
+pub trait TaskRepositoryMergeBatchRepo: Send + Sync {
+    async fn create(
+        &self,
+        batch: &TaskRepositoryMergeBatch,
+        repos: &[TaskRepositoryMergeBatchRepoRow],
+    ) -> Result<TaskRepositoryMergeBatch>;
+    async fn get_by_id(&self, batch_id: &str) -> Result<Option<TaskRepositoryMergeBatch>>;
+    async fn list_by_task(&self, task_id: &str) -> Result<Vec<TaskRepositoryMergeBatch>>;
+    async fn list_repositories(
+        &self,
+        batch_id: &str,
+    ) -> Result<Vec<TaskRepositoryMergeBatchRepoRow>>;
+    async fn transition_batch(
+        &self,
+        batch_id: &str,
+        expected_version: i64,
+        state: TaskRepositoryMergeBatchState,
+        updated_at: &str,
+    ) -> Result<TaskRepositoryMergeBatch>;
+    #[allow(clippy::too_many_arguments)]
+    async fn transition_repo(
+        &self,
+        batch_id: &str,
+        repo_id: &str,
+        expected_version: i64,
+        state: TaskRepositoryMergeBatchRepoState,
+        work_unit_repository_integration_id: Option<&str>,
+        task_merge_operation_id: Option<&str>,
+        pr_metadata_id: Option<&str>,
+        before_sha: Option<&str>,
+        after_sha: Option<&str>,
+    ) -> Result<TaskRepositoryMergeBatchRepoRow>;
 }
 
 /// Durable, Task-wide exclusive authority for operations that read or mutate
@@ -1784,7 +1887,8 @@ pub trait PrProviderConfigRepo: Send + Sync {
 #[async_trait]
 pub trait PrMetadataRepo: Send + Sync {
     async fn create(&self, input: CreatePrMetadata) -> Result<PrMetadata>;
-    async fn get_by_task_id(&self, task_id: &str) -> Result<Option<PrMetadata>>;
+    async fn list_by_task(&self, task_id: &str) -> Result<Vec<PrMetadata>>;
+    async fn get_by_task_repo(&self, task_id: &str, repo_id: &str) -> Result<Option<PrMetadata>>;
     async fn update(&self, input: UpdatePrMetadata) -> Result<PrMetadata>;
     async fn delete(&self, id: &str) -> Result<()>;
 }
@@ -1980,6 +2084,7 @@ pub struct UpdatePrProviderConfig {
 pub struct CreatePrMetadata {
     pub id: String,
     pub task_id: String,
+    pub repo_id: String,
     pub provider_type: String,
     pub provider_pr_id: Option<String>,
     pub pr_url: Option<String>,
@@ -2000,6 +2105,7 @@ pub struct CreateRemotePrAdmission {
     pub publish_operation_id: String,
     pub metadata_id: String,
     pub task_id: String,
+    pub repo_id: String,
     pub provider_config_id: String,
     pub provider_type: String,
     pub provider_config_revision: String,
@@ -2229,6 +2335,8 @@ pub struct CreateWorkUnitReviewSubject {
 pub struct CreateTaskIntegrationOperation {
     pub id: String,
     pub task_id: String,
+    pub repo_id: Option<String>,
+    pub repository_merge_batch_id: Option<String>,
     pub kind: TaskIntegrationOperationKind,
     pub owner_id: String,
     pub gate_evaluation_id: Option<String>,
@@ -2421,6 +2529,26 @@ pub struct CreateWorkUnitIntegration {
     pub operation_idempotency_key: String,
     pub started_at: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkUnitRepositoryIntegration {
+    pub id: String,
+    pub work_unit_integration_id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub execution_id: String,
+    pub repository_set_revision: i64,
+    pub repo_id: String,
+    pub source_workspace_id: String,
+    pub source_branch: String,
+    pub source_sha: String,
+    pub target_workspace_id: String,
+    pub target_branch: String,
+    pub target_before_sha: String,
+    pub started_at: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

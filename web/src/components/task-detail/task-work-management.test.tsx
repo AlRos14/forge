@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { TaskCreateDialog } from '@/components/task-create-dialog'
-import type { Task, WorkUnitResponse } from '@/types/generated'
+import type { Execution, Task, WorkUnitResponse } from '@/types/generated'
 import { TaskWorkManagement } from './task-work-management'
 
 const { createTaskMutation } = vi.hoisted(() => ({ createTaskMutation: vi.fn() }))
@@ -113,6 +113,7 @@ function sourceUnit(): WorkUnitResponse {
     created_at: '',
     updated_at: '',
     review_subject: null,
+    integrations: [],
     readiness: {
       runnable: false,
       ready_for_allocation: false,
@@ -176,6 +177,11 @@ describe('TaskWorkManagement reviewer setup', () => {
     const task = {
       id: 'task-1',
       project_id: 'project-1',
+      repo_id: null,
+      repositories: [],
+      repository_set_revision: 0,
+      repository_set_digest: null,
+      repository_merge_batches: [],
       task_roles: [role('role-implementer', 'implementer'), role('role-reviewer', 'reviewer')],
     } as unknown as Task
 
@@ -286,6 +292,10 @@ describe('TaskWorkManagement reviewer setup', () => {
     const task = {
       id: 'task-1',
       project_id: 'project-1',
+      repo_id: 'repo-ui',
+      repository_set_revision: 3,
+      repository_set_digest: null,
+      repository_merge_batches: [],
       repositories: [
         { repo_id: 'repo-ui', role: 'primary', position: 0 },
         { repo_id: 'repo-api', role: 'affected', position: 1 },
@@ -322,6 +332,146 @@ describe('TaskWorkManagement reviewer setup', () => {
     expect(JSON.parse(String(workUnitRequest?.[1]?.body))).toMatchObject({
       repository_ids: ['repo-api'],
     })
+    queryClient.clear()
+  })
+
+  it('multirepo_lifecycle_partial_batches_visible_and_retryable', async () => {
+    const unit = {
+      ...sourceUnit(),
+      requires_integration: true,
+      integrations: [
+        {
+          integration_id: 'integration-primary',
+          parent_integration_id: 'parent-integration',
+          task_id: 'task-1',
+          work_unit_id: 'unit-implementation',
+          execution_id: 'execution-1',
+          repository_set_revision: 2,
+          repo_id: 'repo-primary',
+          source_workspace_id: 'source-primary',
+          source_branch: 'agent/task-1',
+          source_sha: 'a'.repeat(40),
+          target_workspace_id: 'target-primary',
+          target_branch: 'main',
+          target_before_sha: 'b'.repeat(40),
+          target_after_sha: null,
+          outcome: 'conflict' as const,
+          version: 1,
+          started_at: '',
+          finished_at: '',
+        },
+        {
+          integration_id: 'integration-affected',
+          parent_integration_id: 'parent-integration',
+          task_id: 'task-1',
+          work_unit_id: 'unit-implementation',
+          execution_id: 'execution-1',
+          repository_set_revision: 2,
+          repo_id: 'repo-affected',
+          source_workspace_id: 'source-affected',
+          source_branch: 'agent/task-1',
+          source_sha: 'c'.repeat(40),
+          target_workspace_id: 'target-affected',
+          target_branch: 'main',
+          target_before_sha: 'd'.repeat(40),
+          target_after_sha: 'e'.repeat(40),
+          outcome: 'success' as const,
+          version: 1,
+          started_at: '',
+          finished_at: '',
+        },
+      ],
+    }
+    const partialResponse = {
+      id: 'parent-integration',
+      repositories: [
+        { integration_id: 'integration-primary', outcome: 'conflict', repo_id: 'repo-primary' },
+        { integration_id: 'integration-affected', outcome: 'success', repo_id: 'repo-affected' },
+      ],
+    }
+    const fetchMock = vi.spyOn(window, 'fetch').mockImplementation(async (input) => {
+      const path = new URL(input.toString()).pathname
+      if (path.endsWith('/integrations')) {
+        return new Response(JSON.stringify(partialResponse), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      if (path.endsWith('/dependencies')) return new Response('[]', { status: 200 })
+      if (path === '/api/v1/task-role-capabilities') {
+        return new Response(
+          JSON.stringify({ schema_version: 1, capabilities: [], templates: [] }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      return new Response('[]', { status: 200 })
+    })
+    const task = {
+      id: 'task-1',
+      project_id: 'project-1',
+      repo_id: null,
+      repositories: [],
+      repository_set_revision: 0,
+      repository_set_digest: null,
+      repository_merge_batches: [],
+      task_roles: [role('role-implementer', 'implementer')],
+    } as unknown as Task
+    const execution = {
+      id: 'execution-1',
+      status: 'completed',
+      role: 'implementer',
+      actor_ref: null,
+    } as unknown as Execution
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <TaskWorkManagement
+          task={task}
+          workUnits={[unit]}
+          executions={[execution]}
+          onChanged={vi.fn().mockResolvedValue(undefined)}
+        />
+      </QueryClientProvider>,
+    )
+
+    expect(screen.getByText(/repo-primary · conflict/)).toBeInTheDocument()
+    expect(screen.getByText(/repo-affected · success/)).toBeInTheDocument()
+    const retry = screen.getByRole('button', {
+      name: 'Retry pending repository integrations',
+    })
+    fireEvent.click(retry)
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([input]) =>
+          new URL(input.toString()).pathname.endsWith('/integrations'),
+        ),
+      ).toHaveLength(1),
+    )
+    fireEvent.click(retry)
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([input]) =>
+          new URL(input.toString()).pathname.endsWith('/integrations'),
+        ),
+      ).toHaveLength(2),
+    )
+    const requestBodies = fetchMock.mock.calls
+      .filter(([input]) => new URL(input.toString()).pathname.endsWith('/integrations'))
+      .map(
+        ([, init]) =>
+          JSON.parse(String(init?.body)) as { execution_id: string; idempotency_key: string },
+      )
+    expect(requestBodies).toEqual([
+      {
+        execution_id: 'execution-1',
+        idempotency_key: 'work-unit-integration:unit-implementation:execution-1',
+      },
+      {
+        execution_id: 'execution-1',
+        idempotency_key: 'work-unit-integration:unit-implementation:execution-1',
+      },
+    ])
     queryClient.clear()
   })
 })

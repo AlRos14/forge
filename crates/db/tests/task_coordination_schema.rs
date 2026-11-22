@@ -2,7 +2,7 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AuthorizeTaskCoordinationInput,
     CreateDomainEvent, CreateProject, CreateRepo, CreateTask, ProjectRepo, RepoRepo,
     RoleMembershipRepo, SqliteDb, TaskCoordinationMode, TaskCoordinationOperation,
-    TaskCoordinationRepo, TaskRepo, WorkMode, WorkUnitRepo,
+    TaskCoordinationRepo, TaskRepo, TaskRepositorySetRepo, WorkMode, WorkUnitRepo,
 };
 use sha2::Digest;
 
@@ -435,6 +435,10 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
     let second_reviewer_work_unit_id = new_uuid_v4();
     let pending_parent_work_unit_id = new_uuid_v4();
     let pending_child_work_unit_id = new_uuid_v4();
+    let repository_set = TaskRepositorySetRepo::get_current(&db, &task_id)
+        .await
+        .expect("repository-set lookup")
+        .expect("current repository set");
     let materialization_input = db::MaterializeTaskCoordinationPlanInput {
         receipt_id: new_uuid_v4(),
         task_id: task_id.clone(),
@@ -446,6 +450,10 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
         expected_plan_version: 1,
         task_version_before: task.version,
         expected_request_version: 1,
+        expected_repository_set_revision: repository_set.revision,
+        expected_repository_set_digest: repository_set.digest.clone(),
+        repository_set_revision_change: None,
+        coordinator_replan_decision: None,
         work_units: vec![
             db::MaterializedWorkUnit {
                 id: pending_parent_work_unit_id.clone(),
@@ -649,6 +657,10 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
             expected_plan_version: 1,
             task_version_before: task.version,
             expected_request_version: 1,
+            expected_repository_set_revision: repository_set.revision,
+            expected_repository_set_digest: repository_set.digest.clone(),
+            repository_set_revision_change: None,
+            coordinator_replan_decision: None,
             work_units: vec![],
             receipt_digest: hex::encode(sha2::Sha256::digest(b"other")),
             created_by: owner_id.clone(),

@@ -111,7 +111,11 @@ fn export_typescript() {
     TaskRepositoryRole::export().expect("export TaskRepositoryRole");
     TaskRepositoryInput::export().expect("export TaskRepositoryInput");
     TaskRepositoryMergeState::export().expect("export TaskRepositoryMergeState");
+    TaskRepositoryChangeState::export().expect("export TaskRepositoryChangeState");
+    TaskRepositoryIntegrationResponse::export().expect("export TaskRepositoryIntegrationResponse");
+    TaskRepositoryMergeBatchState::export().expect("export TaskRepositoryMergeBatchState");
     TaskRepositoryMergeResponse::export().expect("export TaskRepositoryMergeResponse");
+    TaskRepositoryMergeBatchResponse::export().expect("export TaskRepositoryMergeBatchResponse");
     TaskRepositoryPullRequestResponse::export().expect("export TaskRepositoryPullRequestResponse");
     TaskRepositoryResponse::export().expect("export TaskRepositoryResponse");
     ProjectResponse::export().expect("export ProjectResponse");
@@ -376,6 +380,8 @@ fn export_typescript() {
     WorkUnitResponse::export().expect("export WorkUnitResponse");
     WorkUnitIntegrationRequest::export().expect("export WorkUnitIntegrationRequest");
     WorkUnitIntegrationResponse::export().expect("export WorkUnitIntegrationResponse");
+    WorkUnitRepositoryIntegrationResponse::export()
+        .expect("export WorkUnitRepositoryIntegrationResponse");
     WorkUnitIntegrationOutcome::export().expect("export WorkUnitIntegrationOutcome");
     WorkUnitProvenance::export().expect("export WorkUnitProvenance");
     WorkUnitStatus::export().expect("export WorkUnitStatus");

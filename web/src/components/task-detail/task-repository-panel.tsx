@@ -5,6 +5,7 @@ export function TaskRepositoryPanel({ task }: { task: Task }) {
   const repositories = [...(task.repositories ?? [])].sort(
     (left, right) => left.position - right.position,
   )
+  const mergeBatches = task.repository_merge_batches ?? []
 
   return (
     <section
@@ -13,10 +14,11 @@ export function TaskRepositoryPanel({ task }: { task: Task }) {
     >
       <div>
         <h2 id="task-repositories-title" className="font-semibold">
-          Task repositories
+          Task repositories · revision {task.repository_set_revision ?? 0}
         </h2>
         <p className="mt-1 text-xs text-muted-foreground">
-          Repository roles and available integration or pull request status for this Task.
+          Repository roles, per repository change state, integration progress and pull request
+          status.
         </p>
       </div>
       {repositories.length ? (
@@ -36,11 +38,20 @@ export function TaskRepositoryPanel({ task }: { task: Task }) {
                   <Badge variant="outline" className="capitalize">
                     {repository.role}
                   </Badge>
+                  <Badge variant={repository.change_state === 'pending' ? 'secondary' : 'outline'}>
+                    {repository.change_state.replaceAll('_', ' ')}
+                  </Badge>
                   {!writable ? <span className="text-muted-foreground">Read only</span> : null}
-                  {repository.merge ? (
+                  {repository.integration ? (
                     <span>
-                      Integration: {repository.merge.state.replaceAll('_', ' ')}
+                      Integration: {repository.integration.outcome.replaceAll('_', ' ')}
+                      {repository.integration.after_sha
+                        ? ` · ${repository.integration.after_sha.slice(0, 12)}`
+                        : ''}
                     </span>
+                  ) : null}
+                  {repository.merge ? (
+                    <span>Merge: {repository.merge.state.replaceAll('_', ' ')}</span>
                   ) : null}
                   {repository.pull_request ? (
                     repository.pull_request.pr_url ? (
@@ -62,7 +73,9 @@ export function TaskRepositoryPanel({ task }: { task: Task }) {
                   ) : null}
                   {writable && !repository.merge && !repository.pull_request ? (
                     <span className="text-muted-foreground">
-                      No integration or pull request status recorded.
+                      {repository.change_state === 'unchanged'
+                        ? 'No net changes in the completed repository batch.'
+                        : 'Waiting for integration and merge admission.'}
                     </span>
                   ) : null}
                 </div>
@@ -75,6 +88,30 @@ export function TaskRepositoryPanel({ task }: { task: Task }) {
           No repositories are associated with this Task.
         </p>
       )}
+      {mergeBatches.length ? (
+        <div className="space-y-2 border-t pt-3">
+          <h3 className="text-sm font-medium">Repository merge batches</h3>
+          <ul className="space-y-2">
+            {mergeBatches.map((batch) => (
+              <li key={batch.id} className="rounded-md border p-3 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant="outline">{batch.state.replaceAll('_', ' ')}</Badge>
+                  <span>Revision {batch.repository_set_revision}</span>
+                  <span>Version {batch.version}</span>
+                </div>
+                <ul className="mt-2 space-y-1">
+                  {batch.repositories.map((repository) => (
+                    <li key={`${batch.id}:${repository.repo_id}`} className="break-all">
+                      {repository.repo_id}: {repository.state.replaceAll('_', ' ')}
+                      {repository.after_sha ? ` · ${repository.after_sha.slice(0, 12)}` : ''}
+                    </li>
+                  ))}
+                </ul>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
     </section>
   )
 }

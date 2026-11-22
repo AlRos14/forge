@@ -38,6 +38,14 @@ completion is not integration.
 
 Gate policy schema version 2 may include required_checks. Each entry pins an exact check_key and definition_digest with required_outcome=passed. Evaluation resolves the run against the exact candidate Workspace, commit, and snapshot. Missing, stale, failed, ambiguous, or differently pinned runs do not satisfy the requirement; Gate never substitutes a latest run. Schema version 1 keeps its existing behavior and does not accept required_checks.
 
+For M3, repository-scoped required checks bind `(repo_id, check_key,
+definition_digest, workspace_id, commit_sha)` for every changed repository.
+Unchanged and context-only repositories do not create merge checks. Merge
+readiness requires the exact satisfied Gate and complete per-repository
+admission; Task `done` requires the Human merge decision and success for every
+required repository. A partial batch remains visible as progress and cannot
+advance lifecycle by itself.
+
 ## Review policy
 
 The bounded reviewer policy supports one acceptable reviewer, all required

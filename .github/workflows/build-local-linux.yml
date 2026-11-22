@@ -34,13 +34,13 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
       - name: Check web
-        if: inputs.run_checks
+        if: ${{ inputs.run_checks && !cancelled() }}
         working-directory: web
         run: |
           pnpm lint
           pnpm test
       - name: Browser smoke
-        if: inputs.run_checks
+        if: ${{ inputs.run_checks && !cancelled() }}
         working-directory: web
         run: |
           pnpm exec playwright install --with-deps chromium
@@ -246,3 +246,37 @@ jobs:
         run: cargo test --locked -p api --test work_unit_reviews multirepo_result_
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p mcp-server --lib multirepo_result_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p db --lib multirepo_integration_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p db --lib multirepo_pr_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p db --lib multirepo_lifecycle_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib multirepo_integration_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib multirepo_pr_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --lib multirepo_lifecycle_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --lib multirepo_lifecycle_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test work_units multirepo_integration_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test work_units multirepo_lifecycle_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test repos_endpoints multirepo_lifecycle_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test coordinator_verification_pr_loop multirepo_pr_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test project_plan multirepo_lifecycle_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test pr12_public_surface multirepo_pr_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p api --test happy_path multirepo_lifecycle_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib multirepo_integration_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib multirepo_pr_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p mcp-server --lib multirepo_lifecycle_

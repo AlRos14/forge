@@ -8,10 +8,11 @@ use crate::{
     CreateProjectMediaAsset, CreateRemotePrAdmission, CreateRepo, CreateReviewExecutionSubject,
     CreateRuntime, CreateSkill, CreateTask, CreateTaskComment, CreateTaskExternalLink,
     CreateTaskIntegrationOperation, CreateTaskMedia, CreateTerminalSession, CreateValidationRun,
-    CreateWorkUnit, CreateWorkUnitExecution, CreateWorkUnitIntegration, CreateWorkUnitWorkspace,
-    CreateWorkspace, CreateWorkspaceLease, Daemon, DaemonRepo, DbError, DomainEvent,
-    DomainEventRepo, EventConsumerCursor, Evidence, Execution, ExecutionEvidenceInput,
-    ExecutionRepo, ExecutionStatus, ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo,
+    CreateWorkUnit, CreateWorkUnitExecution, CreateWorkUnitIntegration,
+    CreateWorkUnitRepositoryIntegration, CreateWorkUnitWorkspace, CreateWorkspace,
+    CreateWorkspaceLease, Daemon, DaemonRepo, DbError, DomainEvent, DomainEventRepo,
+    EventConsumerCursor, Evidence, Execution, ExecutionEvidenceInput, ExecutionRepo,
+    ExecutionStatus, ExecutionUsage, ExecutionUsageRepo, ExternalLinkRepo,
     FinishTaskIntegrationOperation, FinishValidationRun, HarnessSession, HarnessSessionRepo,
     HarnessSessionStatus, IntegrationRepo, MediaAsset, Notification, NotificationListQuery,
     NotificationRepo, Page, PageRequest, PrMetadata, PrMetadataRepo, PrProviderConfig,
@@ -25,7 +26,10 @@ use crate::{
     TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskExternalLink, TaskIntegrationOperation,
     TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskIntegrationOperationStatus,
     TaskLifecycleState, TaskLifecycleTransitionIdentity, TaskListQuery, TaskMedia, TaskMediaRepo,
-    TaskRepo, TaskUsageSummary, TerminalSession, TerminalSessionRepo, TerminalSessionStatus,
+    TaskRepo, TaskRepositoryMergeBatch, TaskRepositoryMergeBatchRepo,
+    TaskRepositoryMergeBatchRepoRow, TaskRepositoryMergeBatchState, TaskRepositorySetRepo,
+    TaskRepositorySetRevision, TaskRepositorySetRevisionRepo, TaskRepositorySetRevisionState,
+    TaskUsageSummary, TerminalSession, TerminalSessionRepo, TerminalSessionStatus,
     TransitionTaskLifecycle, TransitionWorkUnit, UpdateAgent, UpdateDaemonReport, UpdateExecution,
     UpdateHarnessSession, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
     UpdateProjectHookRun, UpdateProjectIntegration, UpdateRepo, UpdateSkill, UpdateTask,
@@ -33,8 +37,9 @@ use crate::{
     ValidationRunCompletionWrite, ValidationRunRepo, ValidationRunStartWrite, ValidationRunStatus,
     WorkUnit, WorkUnitDependency, WorkUnitExecutionLifecycleWrite, WorkUnitExecutionRepo,
     WorkUnitIntegration, WorkUnitIntegrationOutcome, WorkUnitProvenance, WorkUnitRepo,
-    WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceLease, WorkspaceLeaseRepo,
-    WorkspaceRepo, WorkspaceScope, WorkspaceStatus,
+    WorkUnitRepositoryIntegration, WorkUnitRepositoryIntegrationOutcome,
+    WorkUnitRepositoryIntegrationRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace,
+    WorkspaceLease, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceScope, WorkspaceStatus,
 };
 use crate::{
     AuthorizeTaskCoordinationInput, CompleteTaskCoordinationTurnInput,
@@ -102,11 +107,14 @@ mod task_coordination;
 mod task_dependency;
 mod task_integration_operation;
 mod task_media;
+mod task_repository;
+mod task_repository_merge_batch;
 mod task_terminal_session;
 mod user_auth;
 mod validation_catalog;
 mod validation_run;
 mod work_unit;
+mod work_unit_repository_integration;
 mod workspace;
 mod workspace_lease;
 
@@ -442,6 +450,7 @@ fn map_pr_metadata(row: SqliteRow) -> Result<PrMetadata> {
     Ok(PrMetadata {
         id: row.try_get("id")?,
         task_id: row.try_get("task_id")?,
+        repo_id: row.try_get("repo_id")?,
         provider_type: row.try_get("provider_type")?,
         provider_pr_id: row.try_get("provider_pr_id")?,
         pr_url: row.try_get("pr_url")?,

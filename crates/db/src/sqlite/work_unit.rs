@@ -374,8 +374,10 @@ async fn validate_work_unit_execution_leases_in_tx(
               AND group_row.work_unit_id = scope.work_unit_id
              JOIN workspace workspace
                ON workspace.id = scope.workspace_id AND workspace.task_id = scope.task_id
-             JOIN task_repository repository
-               ON repository.task_id = workspace.task_id
+             JOIN work_unit_repository_set_revision pin
+               ON pin.work_unit_id = scope.work_unit_id AND pin.task_id = scope.task_id
+             JOIN task_repository_set_revision_repo repository
+               ON repository.task_id = pin.task_id AND repository.revision = pin.revision
               AND repository.repo_id = workspace.repo_id
               AND repository.role IN ('primary', 'affected')
              JOIN repo repo ON repo.id = workspace.repo_id
@@ -418,9 +420,13 @@ async fn validate_work_unit_execution_leases_in_tx(
          FROM workspace_scope scope
          JOIN workspace workspace
            ON workspace.id = scope.workspace_id AND workspace.task_id = scope.task_id
-         JOIN task task ON task.id = scope.task_id
+         JOIN work_unit_repository_set_revision pin
+           ON pin.work_unit_id = scope.work_unit_id AND pin.task_id = scope.task_id
+         JOIN task_repository_set_revision_repo repository
+           ON repository.task_id = pin.task_id AND repository.revision = pin.revision
+          AND repository.role = 'primary'
          WHERE scope.work_unit_id = ? AND scope.task_id = ?
-           AND scope.scope_kind = 'work_unit' AND workspace.repo_id = task.repo_id",
+           AND scope.scope_kind = 'work_unit' AND workspace.repo_id = repository.repo_id",
     )
     .bind(&admission.work_unit_id)
     .bind(&admission.execution.task_id)
@@ -601,7 +607,10 @@ async fn create_work_unit_row(
     let created_kind = input.created_by.kind().to_string();
     let created_id = input.created_by.id().to_owned();
     let now = input.created_at.clone();
-    let mut tx = db.pool.begin().await?;
+    let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let revision =
+        super::task_repository::ensure_initial_current_revision_in_tx(&mut tx, &input.task_id)
+            .await?;
     sqlx::query(
         "INSERT INTO work_unit (
                 id, task_id, parent_work_unit_id, title, scope, status, role,
@@ -630,6 +639,16 @@ async fn create_work_unit_row(
     .bind(&created_id)
     .bind(&now)
     .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .map_err(work_unit_write_error)?;
+    sqlx::query(
+        "INSERT INTO work_unit_repository_set_revision (work_unit_id, task_id, revision)
+         VALUES (?, ?, ?)",
+    )
+    .bind(&input.id)
+    .bind(&input.task_id)
+    .bind(revision.revision)
     .execute(&mut *tx)
     .await
     .map_err(work_unit_write_error)?;
@@ -912,8 +931,11 @@ impl WorkUnitRepo for SqliteDb {
         Ok(sqlx::query_scalar(
             "SELECT scope.repo_id
              FROM work_unit_repository scope
-             JOIN task_repository repository
-               ON repository.task_id = scope.task_id AND repository.repo_id = scope.repo_id
+             JOIN work_unit_repository_set_revision pin
+               ON pin.work_unit_id = scope.work_unit_id AND pin.task_id = scope.task_id
+             JOIN task_repository_set_revision_repo repository
+               ON repository.task_id = pin.task_id AND repository.revision = pin.revision
+              AND repository.repo_id = scope.repo_id
              WHERE scope.work_unit_id = ?
              ORDER BY repository.position, scope.repo_id",
         )
@@ -929,8 +951,12 @@ impl WorkUnitRepo for SqliteDb {
         sqlx::query(
             "SELECT subject.*
              FROM work_unit_review_subject_repository subject
-             LEFT JOIN task_repository repository
-               ON repository.task_id = subject.task_id AND repository.repo_id = subject.repo_id
+             JOIN work_unit_repository_set_revision pin
+               ON pin.work_unit_id = subject.reviewed_work_unit_id
+              AND pin.task_id = subject.task_id
+             LEFT JOIN task_repository_set_revision_repo repository
+               ON repository.task_id = pin.task_id AND repository.revision = pin.revision
+              AND repository.repo_id = subject.repo_id
              WHERE subject.review_work_unit_id = ?
              ORDER BY repository.position, subject.repo_id",
         )
@@ -1041,8 +1067,11 @@ impl WorkUnitRepo for SqliteDb {
         sqlx::query(
             "SELECT requirement.*
              FROM work_unit_result_requirement_repository requirement
-             LEFT JOIN task_repository repository
-               ON repository.task_id = requirement.task_id
+             JOIN work_unit_repository_set_revision pin
+               ON pin.work_unit_id = requirement.source_work_unit_id
+              AND pin.task_id = requirement.task_id
+             LEFT JOIN task_repository_set_revision_repo repository
+               ON repository.task_id = pin.task_id AND repository.revision = pin.revision
               AND repository.repo_id = requirement.repo_id
              WHERE requirement.work_unit_id = ?
              ORDER BY repository.position, requirement.repo_id",
@@ -2648,6 +2677,7 @@ impl WorkUnitWorkspaceRepo for SqliteDb {
             Ok(WorkspaceScope {
                 workspace_id: row.try_get("workspace_id")?,
                 task_id: row.try_get("task_id")?,
+                repo_id: row.try_get("repo_id")?,
                 kind: parse_enum(row.try_get::<String, _>("scope_kind")?)?,
                 work_unit_id: row.try_get("work_unit_id")?,
                 workspace_group_id: row.try_get("workspace_group_id")?,
@@ -2661,10 +2691,13 @@ impl WorkUnitWorkspaceRepo for SqliteDb {
         sqlx::query(
             "SELECT w.* FROM workspace w
              JOIN workspace_scope s ON s.workspace_id = w.id AND s.task_id = w.task_id
-             LEFT JOIN task_repository repository
-               ON repository.task_id = w.task_id AND repository.repo_id = w.repo_id
+             LEFT JOIN work_unit_repository_set_revision pin
+               ON pin.work_unit_id = s.work_unit_id AND pin.task_id = s.task_id
+             LEFT JOIN task_repository_set_revision_repo repository
+               ON repository.task_id = pin.task_id
+              AND repository.revision = pin.revision AND repository.repo_id = s.repo_id
              WHERE s.work_unit_id = ? AND s.scope_kind = 'work_unit'
-             ORDER BY repository.position, w.repo_id, w.id",
+             ORDER BY repository.position, s.repo_id, w.id",
         )
         .bind(work_unit_id)
         .fetch_all(&self.pool)
@@ -2696,11 +2729,13 @@ impl WorkUnitWorkspaceRepo for SqliteDb {
         .map_err(work_unit_write_error)?;
         sqlx::query(
             "INSERT INTO workspace_scope (
-                workspace_id, task_id, scope_kind, work_unit_id, workspace_group_id, created_at
-             ) VALUES (?, ?, 'work_unit', ?, ?, ?)",
+                workspace_id, task_id, repo_id, scope_kind, work_unit_id,
+                workspace_group_id, created_at
+             ) VALUES (?, ?, ?, 'work_unit', ?, ?, ?)",
         )
         .bind(&ws.id)
         .bind(&ws.task_id)
+        .bind(&ws.repo_id)
         .bind(&input.work_unit_id)
         .bind(&input.workspace_group_id)
         .bind(&ws.created_at)

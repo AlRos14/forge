@@ -4,6 +4,12 @@ Forge links remote pull request feedback to the Task and exact repository
 admission that produced the PR. This is an evidence and rework path; it does not
 create a merge action.
 
+Each changed repository has its own PR metadata and admission. Task PR feedback,
+external-action, and rework responses carry the exact `repo_id` and
+`admission_id`, so a Task with several PRs never infers repository identity from
+a scalar Task field. Human action approval remains bound to that exact
+admission, and merging each PR remains a Human operation.
+
 ## Connect GitHub and configure a repository
 
 A Project owner or admin connects a GitHub SCM credential through POST

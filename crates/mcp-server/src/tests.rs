@@ -5,9 +5,9 @@ use db::{
     CreateAgent, CreateExecution, CreateProject, CreateProjectMember, CreateRepo,
     CreateRoleMembership, CreateTask, CreateTaskRole, CreateWorkspace, DaemonRepo, DaemonStatus,
     ExecutionRepo, ExecutionStatus, ProjectMemberRepo, ProjectRepo, RepoRepo, RoleMembershipRepo,
-    RoleMembershipStatus, SqliteDb, Task, TaskRepo, TaskRoleRepo, UpdateDaemonReport,
-    UpdateProject, UpdateTask, UpsertDaemon, User, UserRepo, ValidationRunRepo, WorkspaceRepo,
-    WorkspaceStatus,
+    RoleMembershipStatus, SqliteDb, Task, TaskRepo, TaskRepositoryRole, TaskRepositoryWrite,
+    TaskRoleRepo, UpdateDaemonReport, UpdateProject, UpdateTask, UpsertDaemon, User, UserRepo,
+    ValidationRunRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use events::EventBus;
 use serde_json::{json, Value};
@@ -968,6 +968,59 @@ fn mcp_pr_feedback_tools_return_empty_task_scoped_pages() {
             assert_eq!(result["items"].as_array().map(Vec::len), Some(0));
             assert!(result["next_cursor"].is_null());
         }
+    });
+}
+
+#[test]
+fn multirepo_pr_mcp_task_projection_exposes_exact_repository_ids() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, primary_repo_id) = seed_project_repo(&state).await;
+        let task = seed_task_in_project(&state, project_id.clone()).await;
+        let now = now_rfc3339();
+        let affected = RepoRepo::create(
+            &*state.db,
+            CreateRepo {
+                id: new_uuid_v4(),
+                project_id,
+                name: "api".to_owned(),
+                local_path: None,
+                remote_url: "https://example.com/api.git".to_owned(),
+                work_mode: db::WorkMode::PullRequest,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("affected repository creates");
+        state
+            .task_service
+            .replace_task_repositories(
+                &task.id,
+                task.version,
+                vec![
+                    TaskRepositoryWrite {
+                        repo_id: primary_repo_id.clone(),
+                        role: TaskRepositoryRole::Primary,
+                    },
+                    TaskRepositoryWrite {
+                        repo_id: affected.id.clone(),
+                        role: TaskRepositoryRole::Affected,
+                    },
+                ],
+            )
+            .await
+            .expect("Task repository scope updates");
+
+        let result = call_tool(&state, "forge_get_task", json!({"task_id":task.id})).await;
+        let repositories = result["repositories"]
+            .as_array()
+            .expect("MCP Task projection includes repositories");
+        assert_eq!(repositories.len(), 2);
+        assert_eq!(repositories[0]["repo_id"], primary_repo_id);
+        assert_eq!(repositories[1]["repo_id"], affected.id);
+        assert_eq!(repositories[1]["role"], "affected");
     });
 }
 
@@ -3853,5 +3906,28 @@ fn multirepo_result_reader_tools_expose_repo_results() {
         assert!(repository_results
             .iter()
             .all(|result| result.get("worktree_path").is_none()));
+
+        let public_task = call_tool(&state, "forge_get_task", json!({"task_id":task.id})).await;
+        let repositories = public_task["repositories"]
+            .as_array()
+            .expect("MCP Task includes per-repository state");
+        assert!(repositories
+            .iter()
+            .any(|repository| repository["repo_id"] == primary_repo_id));
+        assert!(repositories
+            .iter()
+            .any(|repository| repository["repo_id"] == affected.id));
+        assert_eq!(public_task["repository_set_revision"], 1);
+        assert!(public_task["repository_merge_batches"].as_array().is_some());
+
+        let public_work_unit = call_tool(
+            &state,
+            "forge_get_work_unit",
+            json!({"work_unit_id":work_unit_id}),
+        )
+        .await;
+        assert!(public_work_unit["integrations"]
+            .as_array()
+            .is_some_and(|integrations| integrations.is_empty()));
     });
 }

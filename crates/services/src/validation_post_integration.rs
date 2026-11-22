@@ -26,6 +26,7 @@ pub(crate) async fn enqueue_after_integration(
     db: &SqliteDb,
     event_bus: &EventBus,
     task_id: &str,
+    repo_id: &str,
 ) -> Result<usize> {
     let Some(coordination) = TaskCoordinationRepo::get_task_coordination(db, task_id)
         .await?
@@ -52,9 +53,6 @@ pub(crate) async fn enqueue_after_integration(
     let Some(task) = TaskRepo::get_by_id(db, task_id, false).await? else {
         return Ok(0);
     };
-    let Some(repo_id) = task.repo_id.clone() else {
-        return Ok(0);
-    };
     let mut enqueued = 0;
     for pin in pins {
         let outcome = enqueue_check_request(
@@ -62,7 +60,7 @@ pub(crate) async fn enqueue_after_integration(
             event_bus,
             EnqueueCheckRequest {
                 task_id: task.id.clone(),
-                repo_id: repo_id.clone(),
+                repo_id: repo_id.to_owned(),
                 check_key: pin.check_key.clone(),
                 trigger: ValidationCheckRequestTrigger::AfterIntegration,
                 subject_kind: ValidationCheckSubjectKind::TaskIntegration,
@@ -79,6 +77,7 @@ pub(crate) async fn enqueue_after_integration(
             Ok(_) => enqueued += 1,
             Err(error) => tracing::warn!(
                 task_id = %task.id,
+                repo_id,
                 check_key = %pin.check_key,
                 %error,
                 "after-integration validation check was not enqueued"

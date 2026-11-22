@@ -15,8 +15,9 @@ use db::{
     Execution, ExecutionRepo, ExecutionStatus, ExecutionUsageRepo, HarnessSession,
     HarnessSessionRepo, HarnessSessionStatus, PageRequest, ProjectRepo, RepoRepo, SoftDeleteTask,
     SortBy, SortOrder, SqliteDb, Task, TaskComment, TaskCommentRepo, TaskMetadata, TaskRepo,
-    TaskRoleRepo, UpsertExecutionUsage, WorkUnit, WorkUnitProvenance, WorkUnitRepo, WorkUnitStatus,
-    WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    TaskRepositorySetRepo, TaskRoleRepo, UpsertExecutionUsage, WorkUnit, WorkUnitProvenance,
+    WorkUnitRepo, WorkUnitStatus, WorkUnitWorkspaceRepo, Workspace, WorkspaceLeaseRepo,
+    WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{

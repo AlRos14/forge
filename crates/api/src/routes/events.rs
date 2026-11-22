@@ -123,6 +123,48 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 serde_json::from_value(projected).ok()?;
             serde_json::to_value(payload).ok()?
         }
+        "work_unit.repository_integration_changed" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "work_unit_id",
+                "repo_id",
+                "repository_revision",
+                "parent_integration_id",
+                "integration_id",
+                "outcome",
+                "version",
+            ],
+        ),
+        "task.repository_merge_batch_changed" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "repo_id",
+                "repository_revision",
+                "repository_merge_batch_id",
+                "integration_id",
+                "admission_id",
+                "state",
+                "batch_state",
+                "version",
+            ],
+        ),
+        "task.repository_pr_status_changed" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "repo_id",
+                "repository_revision",
+                "repository_merge_batch_id",
+                "admission_id",
+                "pr_metadata_id",
+                "state",
+                "admission_status",
+                "pr_state",
+                "version",
+            ],
+        ),
         "project.plan_proposed"
         | "project.plan_applied"
         | "project.plan_dependencies_changed"
@@ -301,6 +343,7 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "task_id",
                 "feedback_item_id",
                 "admission_id",
+                "repo_id",
                 "body_digest",
                 "trust_class",
                 "head_state",
@@ -308,7 +351,14 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
         ),
         "task.pr_feedback_triaged" => project_fields(
             &source,
-            &["task_id", "request_id", "admission_id", "set_digest"],
+            &[
+                "task_id",
+                "request_id",
+                "admission_id",
+                "repo_id",
+                "repository_merge_batch_id",
+                "set_digest",
+            ],
         ),
         "task.work_unit_fallback" => project_fields(
             &source,
@@ -360,6 +410,9 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "supersession_id",
                 "request_id",
                 "task_merge_operation_id",
+                "admission_id",
+                "repo_id",
+                "repository_merge_batch_id",
                 "provider_pr_id",
                 "superseded_head_sha",
                 "triage_set_digest",
@@ -371,13 +424,24 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "task_id",
                 "supersession_id",
                 "request_id",
+                "admission_id",
+                "repo_id",
+                "repository_merge_batch_id",
                 "state",
                 "readmission_merge_operation_id",
             ],
         ),
         "task.pr_rework_converged" => project_fields(
             &source,
-            &["task_id", "supersession_id", "outcome", "decision_id"],
+            &[
+                "task_id",
+                "supersession_id",
+                "admission_id",
+                "repo_id",
+                "repository_merge_batch_id",
+                "outcome",
+                "decision_id",
+            ],
         ),
         "task.pr_followup_proposed" => project_fields(
             &source,
@@ -386,22 +450,40 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 "disposition_id",
                 "human_decision_id",
                 "followup_task_id",
+                "admission_id",
+                "repo_id",
                 "state",
             ],
         ),
         "pr.external_action_created"
         | "pr.external_action_approved"
         | "pr.external_action_running"
-        | "pr.external_action_outcome_unknown" => {
-            project_fields(&source, &["task_id", "action_id", "admission_id", "state"])
-        }
+        | "pr.external_action_outcome_unknown" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "action_id",
+                "admission_id",
+                "repo_id",
+                "repository_merge_batch_id",
+                "state",
+            ],
+        ),
         "pr.external_action_rejected"
         | "pr.external_action_succeeded"
         | "pr.external_action_failed"
         | "pr.external_action_reconciliation_required"
-        | "pr.external_action_abandoned" => {
-            project_fields(&source, &["task_id", "action_id", "admission_id", "state"])
-        }
+        | "pr.external_action_abandoned" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "action_id",
+                "admission_id",
+                "repo_id",
+                "repository_merge_batch_id",
+                "state",
+            ],
+        ),
         // In particular, legacy Review-row events are not current Review
         // authority and never enter the public stream.
         _ => return None,
@@ -462,6 +544,11 @@ fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
     Some(match event_type {
         "task.lifecycle_changed" => PublicEventType::TaskLifecycleChanged,
         "task.repositories_changed" => PublicEventType::TaskRepositoriesChanged,
+        "work_unit.repository_integration_changed" => {
+            PublicEventType::WorkUnitRepositoryIntegrationChanged
+        }
+        "task.repository_merge_batch_changed" => PublicEventType::TaskRepositoryMergeBatchChanged,
+        "task.repository_pr_status_changed" => PublicEventType::TaskRepositoryPrStatusChanged,
         "gate.created" => PublicEventType::GateCreated,
         "gate.policy_revised" => PublicEventType::GatePolicyRevised,
         "gate.evaluated" => PublicEventType::GateEvaluated,
@@ -792,6 +879,79 @@ mod tests {
     }
 
     #[test]
+    fn multirepo_lifecycle_single_repo_task_response_and_sse_regression() {
+        let legacy_repository: api_types::TaskRepositoryResponse = serde_json::from_value(json!({
+            "repo_id": "repo-legacy",
+            "role": "primary",
+            "position": 0,
+            "merge": null,
+            "pull_request": null
+        }))
+        .expect("legacy single-repo payload remains readable");
+        assert_eq!(
+            legacy_repository.change_state,
+            api_types::TaskRepositoryChangeState::Pending
+        );
+        assert!(legacy_repository.integration.is_none());
+
+        let repositories_changed = domain_event(
+            "task.repositories_changed",
+            r#"{"task_id":"task-legacy","task_version":2,"repositories":[{"repo_id":"repo-legacy","role":"primary"}],"token":"secret"}"#,
+        );
+        let projected = project_domain_event(&repositories_changed)
+            .expect("legacy repository-scope event remains public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::TaskRepositoriesChanged
+        );
+        let payload = projected.payload.expect("repository-scope payload");
+        assert_eq!(payload["repositories"][0]["repo_id"], "repo-legacy");
+        assert!(payload.get("token").is_none());
+
+        let event = domain_event(
+            "work_unit.repository_integration_changed",
+            r#"{"task_id":"task-1","work_unit_id":"wu-1","repo_id":"repo-1","repository_revision":2,"parent_integration_id":"parent-1","integration_id":"child-1","outcome":"success","version":2,"token":"secret","worktree_path":"private"}"#,
+        );
+        let projected = project_domain_event(&event).expect("repo integration event is public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::WorkUnitRepositoryIntegrationChanged
+        );
+        let payload = projected.payload.expect("payload");
+        assert_eq!(payload["repo_id"], "repo-1");
+        assert_eq!(payload["integration_id"], "child-1");
+        assert!(payload.get("token").is_none());
+        assert!(payload.get("worktree_path").is_none());
+
+        let batch = domain_event(
+            "task.repository_merge_batch_changed",
+            r#"{"task_id":"task-1","repo_id":"repo-2","repository_revision":3,"repository_merge_batch_id":"batch-1","state":"open","version":2,"token":"secret"}"#,
+        );
+        let projected = project_domain_event(&batch).expect("repository batch event is public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::TaskRepositoryMergeBatchChanged
+        );
+        let payload = projected.payload.expect("batch payload");
+        assert_eq!(payload["repo_id"], "repo-2");
+        assert_eq!(payload["repository_merge_batch_id"], "batch-1");
+        assert!(payload.get("token").is_none());
+
+        let pr = domain_event(
+            "task.repository_pr_status_changed",
+            r#"{"task_id":"task-1","repo_id":"repo-2","repository_revision":3,"repository_merge_batch_id":"batch-1","admission_id":"admission-2","pr_metadata_id":"metadata-2","state":"open","version":1}"#,
+        );
+        let projected = project_domain_event(&pr).expect("repository PR status event is public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::TaskRepositoryPrStatusChanged
+        );
+        let payload = projected.payload.expect("PR status payload");
+        assert_eq!(payload["repo_id"], "repo-2");
+        assert_eq!(payload["admission_id"], "admission-2");
+    }
+
+    #[test]
     fn coordination_plan_event_projection_excludes_content_and_prompts() {
         let event = domain_event(
             "task.coordination_plan_proposed",
@@ -812,24 +972,28 @@ mod tests {
     fn pr_feedback_and_action_events_project_only_safe_facts() {
         let action = domain_event(
             "pr.external_action_created",
-            r#"{"task_id":"task-1","action_id":"action-1","admission_id":"admission-1","state":"proposed","body":"provider text","token":"secret"}"#,
+            r#"{"task_id":"task-1","action_id":"action-1","admission_id":"admission-1","repo_id":"repo-1","repository_merge_batch_id":"batch-1","state":"proposed","body":"provider text","token":"secret"}"#,
         );
         let projected = project_domain_event(&action).expect("PR action event is public");
         assert_eq!(projected.event_type, PublicEventType::TaskPrActionRequested);
         let payload = projected.payload.expect("action payload");
         assert_eq!(payload["action_id"], "action-1");
+        assert_eq!(payload["repo_id"], "repo-1");
+        assert_eq!(payload["repository_merge_batch_id"], "batch-1");
         assert_eq!(payload["state"], "proposed");
         assert!(payload.get("body").is_none());
         assert!(payload.get("token").is_none());
 
         let triage = domain_event(
             "task.pr_feedback_triaged",
-            r#"{"task_id":"task-1","request_id":"request-1","admission_id":"admission-1","set_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","rationale":"private rationale","body":"provider text"}"#,
+            r#"{"task_id":"task-1","request_id":"request-1","admission_id":"admission-1","repo_id":"repo-1","repository_merge_batch_id":"batch-1","set_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","rationale":"private rationale","body":"provider text"}"#,
         );
         let projected = project_domain_event(&triage).expect("PR triage event is public");
         assert_eq!(projected.event_type, PublicEventType::TaskPrFeedbackTriaged);
         let payload = projected.payload.expect("triage payload");
         assert_eq!(payload["set_digest"], json!("a".repeat(64)));
+        assert_eq!(payload["repo_id"], "repo-1");
+        assert_eq!(payload["repository_merge_batch_id"], "batch-1");
         assert!(payload.get("rationale").is_none());
         assert!(payload.get("body").is_none());
     }

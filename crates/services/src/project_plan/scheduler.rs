@@ -267,6 +267,43 @@ impl ProjectPlanService {
         Ok(requested)
     }
 
+    /// Resolve every changed repository shared by a completed predecessor and
+    /// the successor's current affected/context scope.
+    pub async fn verify_handoffs_by_repository(
+        &self,
+        predecessor_task_id: &str,
+        successor_task_id: &str,
+    ) -> Result<Vec<crate::task_coordination::ProjectPlanRepositoryHandoff>> {
+        let mut tx = self.db.pool().begin().await?;
+        let mut handoffs =
+            repository_handoffs_in_tx(&mut tx, predecessor_task_id, successor_task_id, false)
+                .await?;
+        tx.commit().await?;
+        for handoff in &mut handoffs {
+            let Some(commit_sha) = handoff.predecessor_commit_sha.as_deref() else {
+                continue;
+            };
+            let Some(workspace) = db::WorkspaceRepo::get_integration_by_task_repo(
+                &*self.db,
+                successor_task_id,
+                &handoff.repo_id,
+            )
+            .await?
+            else {
+                continue;
+            };
+            let Some(base_sha) = workspace.before_sha.as_deref() else {
+                continue;
+            };
+            handoff.successor_base_sha = Some(base_sha.to_owned());
+            handoff.ancestry_verified = matches!(
+                git::is_ancestor(Path::new(&workspace.worktree_path), commit_sha, base_sha).await,
+                Ok(true)
+            );
+        }
+        Ok(handoffs)
+    }
+
     /// Verify that a repository successor Workspace includes every exact
     /// integrated predecessor commit pinned by this batch's handoff.
     pub async fn verify_handoff_workspace_base(
@@ -385,6 +422,59 @@ impl ProjectPlanService {
             };
             let mut mismatch = None;
             for predecessor in predecessors {
+                if let Some(repository_handoffs) = predecessor
+                    .get("repository_handoffs")
+                    .and_then(Value::as_array)
+                {
+                    for handoff in repository_handoffs {
+                        let Some(repo_id) = handoff.get("repo_id").and_then(Value::as_str) else {
+                            mismatch = Some("handoff:repository_identity_missing".to_owned());
+                            break;
+                        };
+                        if repo_id != workspace.repo_id {
+                            continue;
+                        }
+                        let Some(commit_sha) = handoff
+                            .get("predecessor_commit_sha")
+                            .and_then(Value::as_str)
+                        else {
+                            mismatch =
+                                Some(format!("handoff:integration_commit_missing:{repo_id}"));
+                            break;
+                        };
+                        let Some(base_sha) = workspace.before_sha.as_deref() else {
+                            mismatch = Some(format!(
+                                "handoff:workspace_base_missing:{repo_id}:{commit_sha}"
+                            ));
+                            break;
+                        };
+                        match git::is_ancestor(
+                            Path::new(&workspace.worktree_path),
+                            commit_sha,
+                            base_sha,
+                        )
+                        .await
+                        {
+                            Ok(true) => (),
+                            Ok(false) => {
+                                mismatch = Some(format!(
+                                    "handoff:workspace_base_missing_commit:{repo_id}:{commit_sha}"
+                                ));
+                                break;
+                            }
+                            Err(_) => {
+                                mismatch = Some(format!(
+                                    "handoff:workspace_ancestry_unverified:{repo_id}:{commit_sha}"
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    if mismatch.is_some() {
+                        break;
+                    }
+                    continue;
+                }
                 let Some(work_units) = predecessor.get("work_units").and_then(Value::as_array)
                 else {
                     mismatch = Some("handoff:pinned_context_schema_invalid".to_owned());
@@ -1305,6 +1395,7 @@ async fn build_and_pin_handoffs_in_tx(
             tx,
             &batch.project_id,
             &predecessor_id,
+            task_id,
             batch.graph_version,
         )
         .await?;
@@ -1337,6 +1428,12 @@ fn handoff_blocker_code(message: &str) -> String {
         "prerequisite_not_accepted"
     } else if message.contains("not fully integrated") {
         "prerequisite_not_integrated"
+    } else if message.contains("pull request is not exactly merged") {
+        "pr_not_merged"
+    } else if message.contains("incomplete or unknown merge result") {
+        "repository_merge_unknown"
+    } else if message.contains("context repo") && message.contains("different predecessor commit") {
+        "context_snapshot_conflict"
     } else if message.contains("unaccepted WorkUnit") {
         "work_unit_unaccepted"
     } else if message.contains("no exact completed Execution result") {
@@ -1355,10 +1452,32 @@ fn handoff_blocker_code(message: &str) -> String {
     format!("handoff:{code}")
 }
 
+fn repository_pr_is_exactly_merged(
+    repository_state: &str,
+    has_pr_metadata: bool,
+    has_task_merge_operation: bool,
+    admission_state: Option<&str>,
+    admission_status: Option<&str>,
+    merge_status: Option<&str>,
+    pr_state: Option<&str>,
+) -> bool {
+    if has_pr_metadata {
+        has_task_merge_operation
+            && repository_state == "merged"
+            && admission_state == Some("merged")
+            && admission_status == Some("merged")
+            && merge_status == Some("merged")
+            && matches!(pr_state, Some("closed" | "merged"))
+    } else {
+        repository_state == "integrated"
+    }
+}
+
 async fn accepted_task_context_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     project_id: &str,
     task_id: &str,
+    successor_task_id: &str,
     graph_version: i64,
 ) -> Result<Value> {
     let task=sqlx::query("SELECT t.title,l.state FROM task t JOIN task_lifecycle l ON l.task_id=t.id WHERE t.id=? AND t.project_id=? AND t.deleted_at IS NULL")
@@ -1378,6 +1497,8 @@ async fn accepted_task_context_in_tx(
             "prerequisite Task {task_id} is not fully integrated"
         )));
     }
+    let repository_handoffs =
+        repository_handoffs_in_tx(tx, task_id, successor_task_id, true).await?;
     let work_units=sqlx::query("SELECT id,version,title,status,requires_integration,provenance_kind,provenance_id FROM work_unit WHERE task_id=? ORDER BY created_at,id")
         .bind(task_id).fetch_all(&mut **tx).await?;
     let mut result_units = Vec::new();
@@ -1445,7 +1566,205 @@ async fn accepted_task_context_in_tx(
             .transpose()?;
         result_units.push(json!({"work_unit_id":work_unit_id,"version":version,"status":status,"requires_integration":requires_integration!=0,"provenance":{"kind":provenance_kind,"id":provenance_id},"execution":execution_json,"artifacts":artifacts,"integration":integration,"review":review}));
     }
-    Ok(
-        json!({"task_id":task_id,"title":title,"lifecycle_state":lifecycle,"accepted_at_graph_version":graph_version,"work_units":result_units}),
+    let mut accepted_context = json!({
+        "task_id": task_id,
+        "title": title,
+        "lifecycle_state": lifecycle,
+        "accepted_at_graph_version": graph_version,
+        "work_units": result_units,
+    });
+    if !repository_handoffs.is_empty() {
+        accepted_context["repository_handoffs"] = json!(repository_handoffs);
+    }
+    Ok(accepted_context)
+}
+
+async fn repository_handoffs_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    predecessor_task_id: &str,
+    successor_task_id: &str,
+    pin_context_snapshot: bool,
+) -> Result<Vec<crate::task_coordination::ProjectPlanRepositoryHandoff>> {
+    let rows = sqlx::query(
+        "SELECT batch_repo.repo_id,batch_repo.state,batch_repo.after_sha,
+                batch_repo.pr_metadata_id,batch_repo.task_merge_operation_id,
+                successor_repo.role,
+                admission.state AS admission_state,
+                metadata.pr_state,metadata.merge_status,metadata.admission_status
+         FROM task_repository_merge_batch_repo batch_repo
+         JOIN task_repository_merge_batch batch
+           ON batch.id=batch_repo.batch_id AND batch.task_id=batch_repo.task_id
+         JOIN task_lifecycle predecessor_lifecycle
+           ON predecessor_lifecycle.task_id=batch.task_id
+          AND predecessor_lifecycle.state='done'
+         JOIN task_repository_set_revision predecessor_revision
+           ON predecessor_revision.task_id=batch.task_id
+          AND predecessor_revision.revision=batch.repository_set_revision
+          AND predecessor_revision.state='current'
+         JOIN task_repository_set_revision successor_revision
+           ON successor_revision.task_id=? AND successor_revision.state='current'
+         JOIN task_repository_set_revision_repo successor_repo
+           ON successor_repo.task_id=successor_revision.task_id
+          AND successor_repo.revision=successor_revision.revision
+          AND successor_repo.repo_id=batch_repo.repo_id
+          AND successor_repo.role IN ('affected','context')
+         LEFT JOIN pr_metadata metadata
+           ON metadata.id=batch_repo.pr_metadata_id
+          AND metadata.task_id=batch_repo.task_id
+          AND metadata.repo_id=batch_repo.repo_id
+         LEFT JOIN remote_pr_admission admission
+           ON admission.metadata_id=metadata.id
+          AND admission.task_id=batch_repo.task_id
+          AND admission.repo_id=batch_repo.repo_id
+          AND admission.task_merge_operation_id=batch_repo.task_merge_operation_id
+         WHERE batch.task_id=? AND batch.state='completed'
+           AND batch.id=(
+               SELECT latest.id FROM task_repository_merge_batch latest
+               WHERE latest.task_id=batch.task_id
+                 AND latest.repository_set_revision=batch.repository_set_revision
+                 AND latest.state='completed'
+               ORDER BY latest.updated_at DESC,latest.id DESC LIMIT 1
+           )
+         ORDER BY batch.created_at,batch.id,batch_repo.position,batch_repo.repo_id",
     )
+    .bind(successor_task_id)
+    .bind(predecessor_task_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut handoffs =
+        BTreeMap::<String, crate::task_coordination::ProjectPlanRepositoryHandoff>::new();
+    let mut context_repositories = BTreeSet::new();
+    for row in rows {
+        let repo_id: String = row.try_get("repo_id")?;
+        let state: String = row.try_get("state")?;
+        let after_sha: Option<String> = row.try_get("after_sha")?;
+        let role: String = row.try_get("role")?;
+        let pr_metadata_id: Option<String> = row.try_get("pr_metadata_id")?;
+        let task_merge_operation_id: Option<String> = row.try_get("task_merge_operation_id")?;
+        if role == "context" {
+            context_repositories.insert(repo_id.clone());
+        }
+        let admission_state: Option<String> = row.try_get("admission_state")?;
+        let pr_state: Option<String> = row.try_get("pr_state")?;
+        let merge_status: Option<String> = row.try_get("merge_status")?;
+        let admission_status: Option<String> = row.try_get("admission_status")?;
+        if !repository_pr_is_exactly_merged(
+            &state,
+            pr_metadata_id.is_some(),
+            task_merge_operation_id.is_some(),
+            admission_state.as_deref(),
+            admission_status.as_deref(),
+            merge_status.as_deref(),
+            pr_state.as_deref(),
+        ) {
+            let message = if pr_metadata_id.is_some() {
+                format!("predecessor repo {repo_id} pull request is not exactly merged")
+            } else {
+                format!("predecessor repo {repo_id} has an incomplete or unknown merge result")
+            };
+            return Err(ServiceError::Conflict(message));
+        }
+        let commit_sha = after_sha
+            .filter(|sha| !sha.trim().is_empty())
+            .ok_or_else(|| {
+                ServiceError::Conflict(format!(
+                    "predecessor repo {repo_id} has no exact result commit"
+                ))
+            })?;
+        handoffs.insert(
+            repo_id.clone(),
+            crate::task_coordination::ProjectPlanRepositoryHandoff {
+                repo_id,
+                predecessor_commit_sha: Some(commit_sha),
+                successor_base_sha: None,
+                ancestry_verified: false,
+            },
+        );
+    }
+
+    if pin_context_snapshot {
+        let captured_at = db::now_rfc3339();
+        for repo_id in context_repositories {
+            let Some(commit_sha) = handoffs
+                .get(&repo_id)
+                .and_then(|handoff| handoff.predecessor_commit_sha.as_deref())
+            else {
+                continue;
+            };
+            sqlx::query(
+                "INSERT OR IGNORE INTO task_repository_context_snapshot
+                    (task_id,repo_id,commit_sha,captured_at) VALUES(?,?,?,?)",
+            )
+            .bind(successor_task_id)
+            .bind(&repo_id)
+            .bind(commit_sha)
+            .bind(&captured_at)
+            .execute(&mut **tx)
+            .await?;
+            let pinned: String = sqlx::query_scalar(
+                "SELECT commit_sha FROM task_repository_context_snapshot
+                 WHERE task_id=? AND repo_id=?",
+            )
+            .bind(successor_task_id)
+            .bind(&repo_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            if pinned != commit_sha {
+                return Err(ServiceError::Conflict(format!(
+                    "successor context repo {repo_id} is pinned to a different predecessor commit"
+                )));
+            }
+        }
+    }
+
+    Ok(handoffs.into_values().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repository_pr_is_exactly_merged;
+
+    #[test]
+    fn multirepo_lifecycle_successor_waits_for_every_relevant_predecessor_pr() {
+        let relevant_prs = [
+            ("repo-primary", "closed", "merged"),
+            ("repo-affected", "open", "unmerged"),
+        ];
+        assert!(!relevant_prs.iter().all(|(_, pr_state, merge_status)| {
+            repository_pr_is_exactly_merged(
+                "merged",
+                true,
+                true,
+                Some("merged"),
+                Some("merged"),
+                Some(merge_status),
+                Some(pr_state),
+            )
+        }));
+
+        let all_merged = [
+            ("repo-primary", "closed", "merged"),
+            ("repo-affected", "merged", "merged"),
+        ];
+        assert!(all_merged.iter().all(|(_, pr_state, merge_status)| {
+            repository_pr_is_exactly_merged(
+                "merged",
+                true,
+                true,
+                Some("merged"),
+                Some("merged"),
+                Some(merge_status),
+                Some(pr_state),
+            )
+        }));
+        assert!(!repository_pr_is_exactly_merged(
+            "merged",
+            true,
+            true,
+            Some("merged"),
+            Some("merged"),
+            Some("merged"),
+            Some("unknown"),
+        ));
+    }
 }

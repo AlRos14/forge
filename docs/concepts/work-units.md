@@ -56,6 +56,13 @@ to context. After an Execution exists, Task scope changes require an authorized
 replan. An empty selection continues to mean all writable repositories in the
 current Task scope until its first Execution.
 
+WorkUnit integration runs in `primary` then `affected.position` order. Each
+repository records its own source and target Workspaces, commits, and outcome
+under the existing idempotent parent integration. A conflict or uncertain
+result does not undo successful repository rows. The WorkUnit response keeps
+all child results visible, and retrying the same Execution resumes only pending
+repositories with the same idempotency key.
+
 ## Allocation
 
 `RoleMembership` says which Actors may participate in a TaskRole. WorkUnit

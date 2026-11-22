@@ -14,8 +14,8 @@ use db::{
     OrchestratorWakeExecution, OrchestratorWakeRepo, OrchestratorWakeState, PageRequest,
     ProposalTarget, ProposalTargetKind, RoleMembership, RoleMembershipRepo, RoleMembershipStatus,
     SortBy, SortOrder, TaskCoordinationRepo, TaskCoordinationRequestState, TaskLifecycleRepo,
-    TaskRepo, TaskRole, TaskRoleRepo, WorkUnit, WorkUnitRepo, WorkUnitStatus,
-    WorkUnitWorkspaceRepo, WorkspaceRepo,
+    TaskRepo, TaskRepositorySetRepo, TaskRole, TaskRoleRepo, WorkUnit, WorkUnitRepo,
+    WorkUnitStatus, WorkUnitWorkspaceRepo, WorkspaceRepo,
 };
 use events::{EventBus, ForgeEvent};
 use serde_json::{json, Value};
@@ -2556,8 +2556,23 @@ impl OrchestratorRuntime {
             }));
         }
         let page = recent_page(MAX_CONTEXT_ROWS);
-        let task_integration_workspace =
-            WorkspaceRepo::get_integration_by_task_id(&*self.db, &task.id).await?;
+        let task_integration_workspace = if let Some(repository_set) =
+            TaskRepositorySetRepo::get_current(&*self.db, &task.id).await?
+        {
+            if let Some(primary_repo_id) = repository_set
+                .repositories
+                .iter()
+                .find(|repository| repository.role == db::TaskRepositoryRole::Primary)
+                .map(|repository| repository.repo_id.as_str())
+            {
+                WorkspaceRepo::get_integration_by_task_repo(&*self.db, &task.id, primary_repo_id)
+                    .await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let work_unit_workspaces = match wake.work_unit_id.as_deref() {
             Some(id) => WorkUnitWorkspaceRepo::list_by_work_unit_id(&*self.db, id).await?,
             None => Vec::new(),

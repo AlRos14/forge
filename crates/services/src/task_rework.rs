@@ -1217,7 +1217,25 @@ impl TaskReworkService {
         let correction_id = new_uuid_v4();
         let review_id = new_uuid_v4();
         let receipt_id = new_uuid_v4();
-        let primary_result = task.repo_id.as_deref().and_then(|repo_id| {
+        let reviewed_repository_set =
+            db::TaskRepositorySetRepo::get_for_work_unit(&*self.db, &reviewed.id, &task.id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "reviewed WorkUnit has no pinned repository-set revision",
+                    )
+                })?;
+        let primary_repo_id = reviewed_repository_set
+            .repositories
+            .iter()
+            .find(|repository| repository.role == db::TaskRepositoryRole::Primary)
+            .map(|repository| repository.repo_id.as_str());
+        if !result_repository_results.is_empty() && primary_repo_id.is_none() {
+            return Err(ServiceError::invalid_operation(
+                "reviewed repository results have no pinned primary repository",
+            ));
+        }
+        let primary_result = primary_repo_id.and_then(|repo_id| {
             result_repository_results
                 .iter()
                 .find(|result| result.repo_id == repo_id)
@@ -1229,7 +1247,7 @@ impl TaskReworkService {
                     Some(result.workspace_id.as_str()),
                     result.snapshot_digest.as_deref(),
                 ),
-                None if result_repository_results.is_empty() && task.repo_id.is_some() => (
+                None if result_repository_results.is_empty() && primary_repo_id.is_some() => (
                     producer_subject.result_commit_sha.as_deref(),
                     producer_subject.result_workspace_id.as_deref(),
                     producer_subject.workspace_snapshot_digest.as_deref(),
@@ -1967,10 +1985,10 @@ async fn insert_work_unit_in_tx(
     };
     let (provenance_kind, provenance_id, provenance_actor_kind) =
         provenance.unwrap_or(("external", "", None));
-    let provenance_id = if provenance_kind == "external" {
-        None
+    let (provenance_kind, provenance_id) = if provenance_kind == "external" {
+        (None, None)
     } else {
-        Some(provenance_id)
+        (Some(provenance_kind), Some(provenance_id))
     };
     sqlx::query(
         "INSERT INTO work_unit (
@@ -1997,7 +2015,43 @@ async fn insert_work_unit_in_tx(
     .bind(now)
     .execute(&mut **tx)
     .await?;
+    let current_revision: i64 = sqlx::query_scalar(
+        "SELECT revision FROM task_repository_set_revision
+         WHERE task_id = ? AND state = 'current'",
+    )
+    .bind(task_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| {
+        ServiceError::invalid_operation("Task has no current repository-set revision")
+    })?;
+    sqlx::query(
+        "INSERT INTO work_unit_repository_set_revision (work_unit_id, task_id, revision)
+         VALUES (?, ?, ?)",
+    )
+    .bind(id)
+    .bind(task_id)
+    .bind(current_revision)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
+}
+
+pub(crate) async fn work_unit_primary_repo_id(
+    db: &SqliteDb,
+    work_unit_id: &str,
+    task_id: &str,
+) -> Result<Option<String>> {
+    let repository_set = db::TaskRepositorySetRepo::get_for_work_unit(db, work_unit_id, task_id)
+        .await?
+        .ok_or_else(|| {
+            ServiceError::invalid_operation("WorkUnit has no pinned repository-set revision")
+        })?;
+    Ok(repository_set
+        .repositories
+        .iter()
+        .find(|repository| repository.role == db::TaskRepositoryRole::Primary)
+        .map(|repository| repository.repo_id.clone()))
 }
 
 pub(crate) async fn latest_completed_work_unit_execution(
@@ -2312,10 +2366,25 @@ pub async fn populate_review_subject_result(
         return Ok(());
     };
     let repository_results = ExecutionRepo::list_repository_results(db, &execution.id).await?;
-    let task = TaskRepo::get_by_id(db, task_id, false)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-    let primary_result = task.repo_id.as_deref().and_then(|repo_id| {
+    let repository_set =
+        db::TaskRepositorySetRepo::get_for_work_unit(db, completed_work_unit_id, task_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "completed WorkUnit has no pinned repository-set revision",
+                )
+            })?;
+    let primary_repo_id = repository_set
+        .repositories
+        .iter()
+        .find(|repository| repository.role == db::TaskRepositoryRole::Primary)
+        .map(|repository| repository.repo_id.as_str());
+    if !repository_results.is_empty() && primary_repo_id.is_none() {
+        return Err(ServiceError::invalid_operation(
+            "completed repository results have no pinned primary repository",
+        ));
+    }
+    let primary_result = primary_repo_id.and_then(|repo_id| {
         repository_results
             .iter()
             .find(|result| result.repo_id == repo_id)
@@ -2323,7 +2392,7 @@ pub async fn populate_review_subject_result(
     let mut legacy_primary_snapshot_digest = None;
     if repository_results.is_empty() {
         if let (Some(primary_repo_id), Some(workspace_id)) =
-            (task.repo_id.as_deref(), execution.workspace_id.as_deref())
+            (primary_repo_id, execution.workspace_id.as_deref())
         {
             let workspace = db::WorkspaceRepo::get_by_id(db, workspace_id)
                 .await?
@@ -2370,7 +2439,7 @@ pub async fn populate_review_subject_result(
             Some(result.workspace_id.as_str()),
             result.snapshot_digest.as_deref(),
         ),
-        None if repository_results.is_empty() && task.repo_id.is_some() => (
+        None if repository_results.is_empty() && primary_repo_id.is_some() => (
             execution.after_sha.as_deref(),
             execution.workspace_id.as_deref(),
             legacy_primary_snapshot_digest.as_deref(),

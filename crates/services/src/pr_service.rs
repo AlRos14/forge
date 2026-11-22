@@ -6,10 +6,11 @@ use crate::{DomainEventService, Result, ServiceError};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use db::{
-    now_rfc3339, DbError, GateEvaluationOutcome, GateRepo, PrMetadata, PrMetadataRepo,
-    PrReworkRepo, PrReworkState, RemotePrAdmission, Repo, SqliteDb, Task,
+    now_rfc3339, CreateDomainEvent, DbError, GateEvaluationOutcome, GateRepo, PrMetadata,
+    PrMetadataRepo, PrReworkRepo, PrReworkState, RemotePrAdmission, Repo, SqliteDb, Task,
     TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskLifecycleRepo,
-    TaskLifecycleState, TaskMetadata, TaskRepo, TransitionPrReworkSupersession,
+    TaskLifecycleState, TaskMetadata, TaskRepo, TaskRepositoryMergeBatchRepo,
+    TaskRepositoryMergeBatchRepoState, TransitionPrReworkSupersession,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -133,6 +134,56 @@ pub struct PublishedPr {
     pub pr_url: Option<String>,
 }
 
+/// Exact, durable identity used at every provider boundary. The admission ID
+/// is the TaskMerge operation ID, but provider work also verifies the Task
+/// and repository so a stale projection cannot redirect it to another PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePrAdmissionKey {
+    pub admission_id: String,
+    pub task_id: String,
+    pub repo_id: String,
+}
+
+/// Task-wide read projection that retains the repository identity of each PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRepositoryPrStatus {
+    pub repo_id: String,
+    pub admission_id: Option<String>,
+    pub pr_metadata_id: String,
+    pub provider_type: String,
+    pub provider_pr_id: Option<String>,
+    pub pr_url: Option<String>,
+    pub pr_state: String,
+    pub merge_status: String,
+    pub admission_status: String,
+}
+
+impl RemotePrAdmissionKey {
+    pub(crate) fn from_admission(admission: &RemotePrAdmission) -> Result<Self> {
+        let repo_id = admission
+            .repo_id
+            .as_deref()
+            .filter(|repo_id| !repo_id.trim().is_empty())
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "remote PR admission has no exact Task and repository identity",
+                )
+            })?;
+        if admission.task_id.trim().is_empty()
+            || admission.task_merge_operation_id.trim().is_empty()
+        {
+            return Err(ServiceError::invalid_operation(
+                "remote PR admission has no exact Task and repository identity",
+            ));
+        }
+        Ok(Self {
+            admission_id: admission.task_merge_operation_id.clone(),
+            task_id: admission.task_id.clone(),
+            repo_id: repo_id.to_owned(),
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct PrService {
     db: Arc<SqliteDb>,
@@ -150,6 +201,7 @@ pub struct TaskPrFeedbackItem {
     pub id: String,
     pub task_id: String,
     pub admission_id: String,
+    pub repo_id: String,
     pub provider_item_id: String,
     pub kind: String,
     pub author_login: String,
@@ -191,6 +243,35 @@ impl PrService {
         }
     }
 
+    /// List current PR metadata without collapsing a multi-repository Task to
+    /// one row. Legacy rows without a repository cannot authorize provider
+    /// work and are reported as invalid rather than assigned to a guessed repo.
+    pub async fn list_task_prs(&self, task_id: &str) -> Result<Vec<TaskRepositoryPrStatus>> {
+        let metadata = PrMetadataRepo::list_by_task(&*self.db, task_id).await?;
+        let mut statuses = Vec::with_capacity(metadata.len());
+        for item in metadata {
+            let repo_id = item
+                .repo_id
+                .as_deref()
+                .filter(|repo_id| !repo_id.trim().is_empty())
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation("PR metadata has no exact repository identity")
+                })?;
+            statuses.push(TaskRepositoryPrStatus {
+                repo_id: repo_id.to_owned(),
+                admission_id: item.task_merge_operation_id,
+                pr_metadata_id: item.id,
+                provider_type: item.provider_type,
+                provider_pr_id: item.provider_pr_id,
+                pr_url: item.pr_url,
+                pr_state: item.pr_state,
+                merge_status: item.merge_status,
+                admission_status: item.admission_status,
+            });
+        }
+        Ok(statuses)
+    }
+
     /// List all provider feedback for a Task across its PR admissions. This
     /// read accessor is needed because the durable feedback repository is
     /// intentionally scoped to one admission at a time.
@@ -215,13 +296,18 @@ impl PrService {
             None => None,
         };
         let limit = requested_limit.clamp(1, 100);
-        let query = "SELECT i.id, i.task_id, i.admission_id, i.provider_item_id, i.kind,
+        let query = "SELECT i.id, i.task_id, i.admission_id, admission.repo_id,
+                    i.provider_item_id, i.kind,
                     i.author_login, i.author_association, i.review_state, i.path, i.line,
                     i.commit_sha, i.body, i.body_truncated, i.body_digest, i.provider_url,
                     i.trust_class, i.head_state, i.ingested_at,
                     d.disposition, d.dismiss_reason, d.scope_classification,
                     d.human_decision_id, d.followup_task_id
              FROM external_feedback_item i
+             JOIN remote_pr_admission admission
+               ON admission.task_merge_operation_id = i.admission_id
+              AND admission.task_id = i.task_id
+              AND admission.repo_id IS NOT NULL
              LEFT JOIN task_external_feedback_disposition d ON d.id = (
                  SELECT latest.id FROM task_external_feedback_disposition latest
                  WHERE latest.feedback_item_id = i.id
@@ -257,6 +343,7 @@ impl PrService {
                     id: row.try_get("id").map_err(DbError::from)?,
                     task_id: row.try_get("task_id").map_err(DbError::from)?,
                     admission_id: row.try_get("admission_id").map_err(DbError::from)?,
+                    repo_id: row.try_get("repo_id").map_err(DbError::from)?,
                     provider_item_id: row.try_get("provider_item_id").map_err(DbError::from)?,
                     kind: row.try_get("kind").map_err(DbError::from)?,
                     author_login: row.try_get("author_login").map_err(DbError::from)?,
@@ -325,7 +412,7 @@ impl PrService {
     pub(crate) async fn publish_pr(
         &self,
         task: &Task,
-        _repo: &Repo,
+        repo: &Repo,
         source_branch: &str,
         target_branch: &str,
     ) -> Result<PublishedPr> {
@@ -346,10 +433,22 @@ impl PrService {
         let admission = TaskIntegrationOperationRepo::get_remote_pr_admission(&*self.db, merge_id)
             .await?
             .ok_or_else(|| ServiceError::invalid_operation("remote PR admission is missing"))?;
-        let metadata = PrMetadataRepo::get_by_task_id(&*self.db, &task.id)
+        let key = RemotePrAdmissionKey::from_admission(&admission)?;
+        if key.task_id != task.id || key.repo_id != repo.id {
+            return Err(ServiceError::invalid_operation(
+                "PR publication does not match the exact Task and repository admission",
+            ));
+        }
+        validate_credential_free_remote_identity(&repo.remote_url)?;
+        if admission.remote_repo_identity != repo.remote_url {
+            return Err(ServiceError::invalid_operation(
+                "PR admission repository identity differs from the configured repository",
+            ));
+        }
+        let metadata = PrMetadataRepo::get_by_task_repo(&*self.db, &key.task_id, &key.repo_id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("PR metadata", task.id.clone()))?;
-        self.validate_admission(task, &admission, &metadata, &publication.id)
+            .ok_or_else(|| ServiceError::not_found("PR metadata", key.admission_id.clone()))?;
+        self.validate_admission(task, &admission, &key, &metadata, &publication.id)
             .await?;
         if admission.source_branch != source_branch || admission.target_branch != target_branch {
             return Err(ServiceError::invalid_operation(
@@ -377,9 +476,12 @@ impl PrService {
         match record {
             Ok(record) => {
                 self.apply_record(&admission, &metadata, record).await?;
-                let metadata = PrMetadataRepo::get_by_task_id(&*self.db, &task.id)
-                    .await?
-                    .ok_or_else(|| ServiceError::not_found("PR metadata", task.id.clone()))?;
+                let metadata =
+                    PrMetadataRepo::get_by_task_repo(&*self.db, &key.task_id, &key.repo_id)
+                        .await?
+                        .ok_or_else(|| {
+                            ServiceError::not_found("PR metadata", key.admission_id.clone())
+                        })?;
                 let status = metadata.pr_state.as_str();
                 if status == "open" || metadata.admission_status == "reconciliation_required" {
                     set_task_awaiting_human_best_effort(&self.db, task, true).await;
@@ -564,9 +666,10 @@ impl PrService {
                 }
             }
         }
-        let metadata = PrMetadataRepo::get_by_task_id(&*self.db, &task.id)
+        let key = RemotePrAdmissionKey::from_admission(admission)?;
+        let metadata = PrMetadataRepo::get_by_task_repo(&*self.db, &key.task_id, &key.repo_id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("PR metadata", task.id.clone()))?;
+            .ok_or_else(|| ServiceError::not_found("PR metadata", key.admission_id.clone()))?;
         set_task_awaiting_human_best_effort(&self.db, task, true).await;
         Ok(PublishedPr {
             pr_url: metadata.pr_url.clone(),
@@ -613,10 +716,11 @@ impl PrService {
                 admission.task_merge_operation_id.clone(),
             )
         })?;
+        let key = RemotePrAdmissionKey::from_admission(&fresh)?;
         if matches!(fresh.state.as_str(), "admitted" | "reconciliation_required") {
-            let metadata = PrMetadataRepo::get_by_task_id(&*self.db, &fresh.task_id)
+            let metadata = PrMetadataRepo::get_by_task_repo(&*self.db, &key.task_id, &key.repo_id)
                 .await?
-                .ok_or_else(|| ServiceError::not_found("PR metadata", fresh.task_id.clone()))?;
+                .ok_or_else(|| ServiceError::not_found("PR metadata", key.admission_id.clone()))?;
             self.persist_outcome(db::RecordRemotePrOutcome {
                 expected_task_id: fresh.task_id.clone(),
                 task_merge_operation_id: fresh.task_merge_operation_id.clone(),
@@ -662,6 +766,7 @@ impl PrService {
         &self,
         task: &Task,
         admission: &RemotePrAdmission,
+        key: &RemotePrAdmissionKey,
         metadata: &PrMetadata,
         publish_operation_id: &str,
     ) -> Result<()> {
@@ -687,7 +792,11 @@ impl PrService {
             .await?
             .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
         if admission.task_id != task.id
+            || key.task_id != task.id
+            || key.admission_id != admission.task_merge_operation_id
+            || admission.repo_id.as_deref() != Some(key.repo_id.as_str())
             || metadata.task_id != task.id
+            || metadata.repo_id.as_deref() != Some(key.repo_id.as_str())
             || metadata.id != admission.metadata_id
             || metadata.task_merge_operation_id.as_deref()
                 != Some(admission.task_merge_operation_id.as_str())
@@ -695,15 +804,20 @@ impl PrService {
                 != Some(admission.publish_operation_id.as_str())
             || publish_operation_id != admission.publish_operation_id
             || merge.task_id != task.id
+            || merge.repo_id.as_deref() != Some(key.repo_id.as_str())
+            || merge.repository_merge_batch_id.is_none()
             || merge.kind != TaskIntegrationOperationKind::TaskMerge
             || !merge.remote_waiting
             || merge.status != db::TaskIntegrationOperationStatus::Running
             || publish.task_id != task.id
+            || publish.repo_id.as_deref() != Some(key.repo_id.as_str())
+            || publish.repository_merge_batch_id != merge.repository_merge_batch_id
             || publish.kind != TaskIntegrationOperationKind::PublishPr
             || publish.parent_operation_id.as_deref() != Some(merge.id.as_str())
             || publish.gate_evaluation_id != merge.gate_evaluation_id
             || lifecycle.state != TaskLifecycleState::Merging
-            || lifecycle.reason_ref.as_deref() != Some(merge.id.as_str())
+            || lifecycle.reason_kind.as_deref() != Some("task_repository_merge_batch")
+            || lifecycle.reason_ref != merge.repository_merge_batch_id
         {
             return Err(ServiceError::invalid_operation(
                 "PR publication does not match its exact durable remote admission",
@@ -726,6 +840,11 @@ impl PrService {
         {
             return Err(ServiceError::invalid_operation(
                 "remote PR admission has invalid exact Gate provenance",
+            ));
+        }
+        if lifecycle.reason_ref.as_deref() != merge.repository_merge_batch_id.as_deref() {
+            return Err(ServiceError::invalid_operation(
+                "remote PR admission does not belong to the current repository merge batch",
             ));
         }
         Ok(())
@@ -891,6 +1010,7 @@ impl PrService {
             input.status.as_str(),
             "merged" | "closed" | "publication_failed"
         );
+        let admission_id = input.task_merge_operation_id.clone();
         let event =
             TaskIntegrationOperationRepo::record_remote_pr_outcome(&*self.db, input).await?;
         if let Some(event) = event.as_ref() {
@@ -912,6 +1032,111 @@ impl PrService {
                 }
             }
         }
+        self.emit_repository_pr_status(&admission_id).await?;
+        Ok(())
+    }
+
+    async fn emit_repository_pr_status(&self, admission_id: &str) -> Result<()> {
+        let Some(admission) =
+            TaskIntegrationOperationRepo::get_remote_pr_admission(&*self.db, admission_id).await?
+        else {
+            return Ok(());
+        };
+        let Some(repo_id) = admission.repo_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(operation) =
+            TaskIntegrationOperationRepo::get_by_id(&*self.db, admission_id).await?
+        else {
+            return Ok(());
+        };
+        let Some(batch_id) = operation.repository_merge_batch_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(mut batch) = TaskRepositoryMergeBatchRepo::get_by_id(&*self.db, batch_id).await?
+        else {
+            return Ok(());
+        };
+        let metadata =
+            PrMetadataRepo::get_by_task_repo(&*self.db, &admission.task_id, repo_id).await?;
+        let rows = TaskRepositoryMergeBatchRepo::list_repositories(&*self.db, batch_id).await?;
+        if let Some(row) = rows.iter().find(|row| row.repo_id == repo_id) {
+            if admission.rework_outcome.is_none() {
+                let state = match admission.state.as_str() {
+                    "open" => TaskRepositoryMergeBatchRepoState::Open,
+                    "merged" => TaskRepositoryMergeBatchRepoState::Merged,
+                    "closed" => TaskRepositoryMergeBatchRepoState::Closed,
+                    "failed" | "head_mismatch" | "publication_failed" => {
+                        TaskRepositoryMergeBatchRepoState::Failed
+                    }
+                    _ => TaskRepositoryMergeBatchRepoState::Publishing,
+                };
+                let current_state = if row.state == TaskRepositoryMergeBatchRepoState::Open
+                    && state == TaskRepositoryMergeBatchRepoState::Publishing
+                {
+                    row.state
+                } else {
+                    state
+                };
+                TaskRepositoryMergeBatchRepo::transition_repo(
+                    &*self.db,
+                    batch_id,
+                    repo_id,
+                    batch.version,
+                    current_state,
+                    row.work_unit_repository_integration_id.as_deref(),
+                    Some(admission_id),
+                    Some(&admission.metadata_id),
+                    row.before_sha.as_deref(),
+                    row.after_sha
+                        .as_deref()
+                        .or(Some(admission.admitted_source_sha.as_str())),
+                )
+                .await?;
+                batch = crate::merge_service::refresh_merge_batch_state(&self.db, &batch).await?;
+                crate::merge_service::emit_repository_merge_batch_events(
+                    &self.db,
+                    &self.event_bus,
+                    batch_id,
+                )
+                .await?;
+            }
+        }
+        let state = admission.state.as_str();
+        let dedupe_key = format!(
+            "task-repository-pr-status:{}:{}:{}",
+            admission_id, admission.updated_at, state
+        );
+        DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+            .append(CreateDomainEvent {
+                id: db::new_uuid_v4(),
+                event_type: "task.repository_pr_status_changed".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: admission.task_id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "task".to_owned(),
+                scope_id: admission.task_id.clone(),
+                correlation_id: batch.id.clone(),
+                causation_id: Some(admission_id.to_owned()),
+                causation_depth: 1,
+                dedupe_key: Some(dedupe_key),
+                payload_json: json!({
+                    "task_id": admission.task_id,
+                    "repo_id": repo_id,
+                    "repository_revision": batch.repository_set_revision,
+                    "repository_merge_batch_id": batch.id,
+                    "admission_id": admission_id,
+                    "pr_metadata_id": admission.metadata_id,
+                    "state": state,
+                    "admission_status": metadata.as_ref().map(|metadata| metadata.admission_status.as_str()),
+                    "pr_state": metadata.as_ref().map(|metadata| metadata.pr_state.as_str()),
+                    "version": batch.version,
+                })
+                .to_string(),
+                created_at: admission.updated_at,
+            })
+            .await?;
         Ok(())
     }
 
@@ -1056,9 +1281,10 @@ impl PrReconciler {
         else {
             return Ok(());
         };
-        let metadata = PrMetadataRepo::get_by_task_id(&*self.db, &admission.task_id)
+        let key = RemotePrAdmissionKey::from_admission(&admission)?;
+        let metadata = PrMetadataRepo::get_by_task_repo(&*self.db, &key.task_id, &key.repo_id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("PR metadata", admission.task_id.clone()))?;
+            .ok_or_else(|| ServiceError::not_found("PR metadata", key.admission_id.clone()))?;
         let admission = TaskIntegrationOperationRepo::get_remote_pr_admission(
             &*self.db,
             &admission.task_merge_operation_id,
@@ -1109,8 +1335,17 @@ impl PrReconciler {
                         admission.publish_operation_id.clone(),
                     )
                 })?;
+        let key = RemotePrAdmissionKey::from_admission(&admission)?;
+        if metadata.repo_id.as_deref() != Some(key.repo_id.as_str())
+            || metadata.task_id != key.task_id
+            || metadata.id != admission.metadata_id
+        {
+            return Err(ServiceError::invalid_operation(
+                "PR reconciliation did not resolve the exact Task, repository and metadata admission",
+            ));
+        }
         self.service()
-            .validate_admission(&task, &admission, &metadata, &publish_operation.id)
+            .validate_admission(&task, &admission, &key, &metadata, &publish_operation.id)
             .await?;
 
         let provider = match self.provider_for(&admission).await {
@@ -1258,6 +1493,8 @@ pub(crate) async fn acquire_admission_secret(
     admission: &RemotePrAdmission,
 ) -> std::result::Result<crate::credential_service::Secret, PrProviderError> {
     let unavailable = |reason: &str| PrProviderError::Unavailable(reason.to_owned());
+    let key = RemotePrAdmissionKey::from_admission(admission)
+        .map_err(|_| unavailable("remote PR admission has no exact repository identity"))?;
     let (Some(handle_id), Some(owner_id)) = (
         admission
             .credential_handle_id
@@ -1280,12 +1517,24 @@ pub(crate) async fn acquire_admission_secret(
         "SELECT EXISTS(
              SELECT 1 FROM remote_pr_admission admission
              JOIN task ON task.id = admission.task_id
+             JOIN task_integration_operation merge_op
+               ON merge_op.id = admission.task_merge_operation_id
+              AND merge_op.task_id = admission.task_id
+              AND merge_op.repo_id = admission.repo_id
+             JOIN pr_metadata metadata
+               ON metadata.id = admission.metadata_id
+              AND metadata.task_id = admission.task_id
+              AND metadata.repo_id = admission.repo_id
              JOIN project_member member ON member.project_id = task.project_id
              WHERE admission.task_merge_operation_id = ?
+               AND admission.task_id = ? AND admission.repo_id = ?
+               AND merge_op.repository_merge_batch_id IS NOT NULL
                AND member.user_id = ?
                AND member.role IN ('owner', 'admin'))",
     )
-    .bind(&admission.task_merge_operation_id)
+    .bind(&key.admission_id)
+    .bind(&key.task_id)
+    .bind(&key.repo_id)
     .bind(owner_id)
     .fetch_one(db.pool())
     .await
@@ -1296,12 +1545,92 @@ pub(crate) async fn acquire_admission_secret(
     Ok(secret)
 }
 
+pub(crate) fn validate_credential_free_remote_identity(identity: &str) -> Result<()> {
+    if identity.trim().is_empty() {
+        return Err(ServiceError::invalid_operation(
+            "PR repository identity is empty",
+        ));
+    }
+    if identity.contains('?') || identity.contains('#') {
+        return Err(ServiceError::invalid_operation(
+            "PR repository identity must not contain query parameters or fragments",
+        ));
+    }
+    let parsed = match url::Url::parse(identity) {
+        Ok(parsed) => parsed,
+        Err(_) if identity.contains("://") => {
+            return Err(ServiceError::invalid_operation(
+                "PR repository identity is malformed",
+            ));
+        }
+        Err(_) => {
+            if identity
+                .split_once('@')
+                .is_some_and(|(username, _)| username != "git")
+            {
+                return Err(ServiceError::invalid_operation(
+                    "PR repository identity must not contain credentials",
+                ));
+            }
+            return Ok(());
+        }
+    };
+    let ssh_identity = matches!(parsed.scheme(), "ssh" | "git+ssh");
+    if (!parsed.username().is_empty() && (!ssh_identity || parsed.username() != "git"))
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ServiceError::invalid_operation(
+            "PR repository identity must not contain credentials, query parameters, or fragments",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod multirepo_identity_tests {
+    use super::*;
+
+    #[test]
+    fn multirepo_pr_remote_identity_rejects_embedded_credentials() {
+        assert!(
+            validate_credential_free_remote_identity("https://github.com/acme/widgets.git").is_ok()
+        );
+        assert!(
+            validate_credential_free_remote_identity("git@github.com:acme/widgets.git").is_ok()
+        );
+        assert!(
+            validate_credential_free_remote_identity("ssh://git@github.com/acme/widgets.git")
+                .is_ok()
+        );
+        for identity in [
+            "https://token@github.com/acme/widgets.git",
+            "https://git:token@github.com/acme/widgets.git",
+            "ssh://token@github.com/acme/widgets.git",
+            "token@github.com:acme/widgets.git",
+            "https://github.com/acme/widgets.git?access_token=secret",
+            "https://github.com/acme/widgets.git#token",
+        ] {
+            assert!(
+                validate_credential_free_remote_identity(identity).is_err(),
+                "credential-bearing repository identity must be rejected"
+            );
+        }
+    }
+}
+
 pub(crate) async fn provider_for_admission(
     db: &SqliteDb,
     credentials: Option<&CredentialService>,
     factory: &dyn PrProviderFactory,
     admission: &RemotePrAdmission,
 ) -> std::result::Result<Arc<dyn PrProvider>, PrProviderError> {
+    RemotePrAdmissionKey::from_admission(admission).map_err(|_| {
+        PrProviderError::Unavailable(
+            "remote PR admission has no exact repository identity".to_owned(),
+        )
+    })?;
     let secret = acquire_admission_secret(db, credentials, admission).await?;
     factory
         .build(
@@ -1323,6 +1652,7 @@ async fn pending_remote_pr_admissions(
          JOIN task_integration_operation publish_op
            ON publish_op.id = admission.publish_operation_id
          WHERE admission.state IN ('admitted', 'reconciliation_required', 'open')
+           AND admission.repo_id IS NOT NULL
            AND admission.rework_outcome IS NULL
            AND merge_op.kind = 'task_merge' AND merge_op.status = 'running'
            AND merge_op.remote_waiting = 1
@@ -1337,15 +1667,32 @@ async fn pending_remote_pr_admissions(
         let admission = TaskIntegrationOperationRepo::get_remote_pr_admission(db, &merge_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("remote PR admission", merge_id.clone()))?;
-        let metadata = PrMetadataRepo::get_by_task_id(db, &admission.task_id)
+        let key = RemotePrAdmissionKey::from_admission(&admission)?;
+        let metadata = PrMetadataRepo::get_by_task_repo(db, &key.task_id, &key.repo_id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("PR metadata", admission.task_id.clone()))?;
+            .ok_or_else(|| ServiceError::not_found("PR metadata", key.admission_id.clone()))?;
         pending.push((metadata, admission));
     }
     Ok(pending)
 }
 
 async fn set_task_awaiting_human_best_effort(db: &SqliteDb, task: &Task, awaiting_human: bool) {
+    let awaiting_human = if awaiting_human {
+        true
+    } else {
+        match PrMetadataRepo::list_by_task(db, &task.id).await {
+            Ok(metadata) => metadata.iter().any(|item| {
+                matches!(
+                    item.admission_status.as_str(),
+                    "admitted" | "reconciliation_required" | "open"
+                )
+            }),
+            Err(error) => {
+                tracing::warn!(task_id = %task.id, %error, "could not verify remaining Task PR admissions");
+                return;
+            }
+        }
+    };
     if let Err(error) = set_task_awaiting_human(db, task, awaiting_human).await {
         tracing::warn!(task_id = %task.id, %error, "could not update legacy awaiting-human projection for PR");
     }

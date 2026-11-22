@@ -180,6 +180,8 @@ pub struct WorkUnitResponse {
     pub review_subject: Option<crate::ReviewSubjectResponse>,
     #[serde(default)]
     pub repository_ids: Vec<String>,
+    #[serde(default)]
+    pub integrations: Vec<WorkUnitRepositoryIntegrationResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -196,6 +198,7 @@ pub struct WorkUnitIntegrationRequest {
 pub enum WorkUnitIntegrationOutcome {
     Running,
     Success,
+    Unchanged,
     Conflict,
     Failed,
     Rejected,
@@ -213,6 +216,34 @@ pub struct WorkUnitIntegrationResponse {
     pub source_workspace_id: String,
     pub source_sha: String,
     pub target_workspace_id: String,
+    pub target_before_sha: String,
+    pub target_after_sha: Option<String>,
+    pub outcome: WorkUnitIntegrationOutcome,
+    #[ts(type = "number")]
+    pub version: i64,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    #[serde(default)]
+    pub repositories: Vec<WorkUnitRepositoryIntegrationResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct WorkUnitRepositoryIntegrationResponse {
+    pub integration_id: String,
+    pub parent_integration_id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub execution_id: String,
+    #[ts(type = "number")]
+    pub repository_set_revision: i64,
+    pub repo_id: String,
+    pub source_workspace_id: String,
+    pub source_branch: String,
+    pub source_sha: String,
+    pub target_workspace_id: String,
+    pub target_branch: String,
     pub target_before_sha: String,
     pub target_after_sha: Option<String>,
     pub outcome: WorkUnitIntegrationOutcome,

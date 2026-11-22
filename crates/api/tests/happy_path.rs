@@ -190,10 +190,11 @@ async fn forge_happy_path_end_to_end() {
     );
     assert!(integration.target_after_sha.is_some());
 
-    let workspace = WorkspaceRepo::get_integration_by_task_id(&*harness.state.db, &task_id)
-        .await
-        .expect("Task Workspace lookup succeeds")
-        .expect("WorkUnit integration created the Task integration Workspace");
+    let workspace =
+        WorkspaceRepo::get_integration_by_task_repo(&*harness.state.db, &task_id, &repo_id)
+            .await
+            .expect("primary repository Workspace lookup succeeds")
+            .expect("WorkUnit integration created the Task integration Workspace");
     let worktree_path = PathBuf::from(&workspace.worktree_path);
     assert!(worktree_path.join("greeting.txt").exists());
     let validation = services::ValidationService::new(
@@ -1586,17 +1587,31 @@ async fn multirepo_task_create_request_omission_and_explicit_repositories() {
     )
     .await;
     assert_eq!(explicit.repositories.len(), 3);
+    assert_eq!(explicit.repository_set_revision, 1);
+    assert!(explicit.repository_set_digest.is_some());
     assert_eq!(
         explicit.repositories[0].role,
         api_types::TaskRepositoryRole::Primary
+    );
+    assert_eq!(explicit.repositories[0].repo_id, primary_repo_id);
+    assert_eq!(explicit.repositories[0].position, 0);
+    assert_eq!(
+        explicit.repositories[0].change_state,
+        api_types::TaskRepositoryChangeState::Pending
     );
     assert_eq!(
         explicit.repositories[1].role,
         api_types::TaskRepositoryRole::Affected
     );
+    assert_eq!(explicit.repositories[1].repo_id, affected_repo.id);
     assert_eq!(
         explicit.repositories[2].role,
         api_types::TaskRepositoryRole::Context
+    );
+    assert_eq!(explicit.repositories[2].repo_id, context_repo.id);
+    assert_eq!(
+        explicit.repositories[2].change_state,
+        api_types::TaskRepositoryChangeState::Unchanged
     );
 
     let repo_less: TaskResponse = json_request(
@@ -1627,5 +1642,174 @@ async fn multirepo_task_create_request_omission_and_explicit_repositories() {
     .await;
     assert_eq!(updated.repo_id.as_deref(), Some(primary_repo_id.as_str()));
     assert_eq!(updated.repositories.len(), 2);
+    assert_eq!(
+        updated.repository_set_revision,
+        repo_less.repository_set_revision + 1
+    );
+    assert!(updated.repository_set_digest.is_some());
     assert!(updated.version > repo_less.version);
+}
+
+#[tokio::test]
+async fn multirepo_lifecycle_direct_repository_patch_keeps_typed_409() {
+    let repo_dir = TestDir::new("multirepo-replan-patch-primary");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let workspaces_root = TestDir::new("multirepo-replan-patch-workspaces");
+    let harness = test_app(workspaces_root.path()).await;
+    let project: ProjectResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"Direct repository patch regression"}),
+        StatusCode::OK,
+    )
+    .await;
+    let primary_repo: RepoResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name":"primary",
+            "local_path":repo_path.to_string_lossy(),
+            "remote_url":repo_path.to_string_lossy(),
+            "default_branch":run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"])
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({"title":"Repository scope stays pinned after execution"}),
+        StatusCode::OK,
+    )
+    .await;
+    let (agent_id, _) = common::create_shell_agents(
+        &harness.app,
+        workspaces_root.path(),
+        "multirepo-replan-patch",
+    )
+    .await;
+    assign_test_user_as_reviewer(&harness.state, &task.id).await;
+    assign_agent_as_implementer(&harness.state, &task.id, &agent_id).await;
+    let work_unit = common::create_allocated_work_unit(
+        &harness.app,
+        &task.id,
+        "implementer",
+        &agent_id,
+        "Create a result",
+        "Write and commit the requested result file",
+        true,
+    )
+    .await;
+    let execution = common::launch_work_unit_execution(
+        &harness.app,
+        &task.id,
+        &work_unit,
+        Some("echo result > result.txt && git add . && git commit -m result"),
+    )
+    .await;
+    poll_until_execution_completed(&harness.state.db, &execution.id).await;
+
+    let affected_dir = TestDir::new("multirepo-replan-patch-affected");
+    let affected_path = setup_git_repo(affected_dir.path()).await;
+    let affected_repo: RepoResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name":"affected",
+            "local_path":affected_path.to_string_lossy(),
+            "remote_url":affected_path.to_string_lossy(),
+            "default_branch":run_git(&affected_path, &["symbolic-ref", "--short", "HEAD"])
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let current_task: TaskResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    let response = raw_json_request(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/tasks/{}/repositories", task.id),
+        json!({
+            "expected_version": current_task.version,
+            "repositories": [
+                {"repo_id":primary_repo.id,"role":"primary"},
+                {"repo_id":affected_repo.id,"role":"affected"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body reads"),
+    )
+    .expect("error response is JSON");
+    assert_eq!(error["code"], "task.repositories.replan_required");
+}
+
+#[tokio::test]
+async fn multirepo_lifecycle_single_repo_task_response_projection() {
+    let repo_dir = TestDir::new("single-repo-response-primary");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let workspaces_root = TestDir::new("single-repo-response-workspaces");
+    let harness = test_app(workspaces_root.path()).await;
+    let project: ProjectResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"Single repository response regression"}),
+        StatusCode::OK,
+    )
+    .await;
+    let repository: RepoResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name":"primary",
+            "local_path":repo_path.to_string_lossy(),
+            "remote_url":repo_path.to_string_lossy(),
+            "default_branch":run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"])
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let created: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({"title":"Keep the 0.9.1 single-repository projection"}),
+        StatusCode::OK,
+    )
+    .await;
+    let task: TaskResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", created.id),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(task.repo_id.as_deref(), Some(repository.id.as_str()));
+    assert_eq!(task.repositories.len(), 1);
+    assert_eq!(task.repositories[0].repo_id, repository.id);
+    assert_eq!(task.repositories[0].position, 0);
+    assert!(task.repositories[0].merge.is_none());
+    assert!(task.repositories[0].pull_request.is_none());
+    assert!(task.repositories[0].integration.is_none());
+    assert!(task.repository_merge_batches.is_empty());
+    assert_eq!(
+        task.repositories[0].change_state,
+        api_types::TaskRepositoryChangeState::Pending
+    );
 }

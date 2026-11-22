@@ -6,6 +6,9 @@
 export type PublicEventType =
   | 'task.lifecycle_changed'
   | 'task.repositories_changed'
+  | 'work_unit.repository_integration_changed'
+  | 'task.repository_merge_batch_changed'
+  | 'task.repository_pr_status_changed'
   | 'gate.created'
   | 'gate.policy_revised'
   | 'gate.evaluated'

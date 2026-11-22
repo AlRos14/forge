@@ -57,6 +57,8 @@ pub struct ExternalFeedbackItemResponse {
     pub id: String,
     pub task_id: String,
     pub admission_id: String,
+    #[serde(default)]
+    pub repo_id: String,
     pub provider_item_id: String,
     pub kind: String,
     pub author_login: String,
@@ -92,6 +94,10 @@ pub struct ExternalFeedbackItemListResponse {
 pub struct PrReworkSupersessionResponse {
     pub id: String,
     pub task_id: String,
+    #[serde(default)]
+    pub repo_id: String,
+    #[serde(default)]
+    pub admission_id: String,
     pub task_merge_operation_id: String,
     pub publish_operation_id: String,
     pub metadata_id: String,
@@ -121,6 +127,8 @@ pub struct PrExternalActionResponse {
     pub id: String,
     pub task_id: String,
     pub admission_id: String,
+    #[serde(default)]
+    pub repo_id: String,
     pub kind: String,
     pub state: String,
     pub authorization_mode: String,

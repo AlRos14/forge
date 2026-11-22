@@ -25,7 +25,7 @@ use crate::credential_service::CredentialService;
 use crate::pr_github_client::{
     DefaultPrProviderFactory, GitHubClient, GitHubRepoRef, PrProviderFactory,
 };
-use crate::pr_service::acquire_admission_secret;
+use crate::pr_service::{acquire_admission_secret, RemotePrAdmissionKey};
 use crate::{Result, ServiceError};
 use db::{
     new_uuid_v4, now_rfc3339, CreateExternalFeedbackItem, ExternalFeedbackHeadState,
@@ -185,8 +185,11 @@ impl PrFeedbackIngestor {
             "SELECT admission.task_merge_operation_id AS id,
                     COALESCE(config.polling_interval_seconds, 60) AS interval_seconds
              FROM remote_pr_admission admission
-             LEFT JOIN pr_provider_config config ON config.id = admission.provider_config_id
+             LEFT JOIN pr_provider_config config
+               ON config.id = admission.provider_config_id
+              AND config.repo_id = admission.repo_id
              WHERE admission.state = 'open'
+               AND admission.repo_id IS NOT NULL
                AND admission.rework_outcome IS NULL
                AND admission.feedback_policy_json IS NOT NULL
                AND json_extract(admission.feedback_policy_json, '$.ingest') = 1",
@@ -270,7 +273,8 @@ impl PrFeedbackIngestor {
         admission: &RemotePrAdmission,
         stats: &mut PrFeedbackIngestStats,
     ) -> Result<()> {
-        let id = admission.task_merge_operation_id.as_str();
+        let key = RemotePrAdmissionKey::from_admission(admission)?;
+        let id = key.admission_id.as_str();
         let policy =
             PrFeedbackPolicy::from_json(admission.feedback_policy_json.as_deref().ok_or_else(
                 || ServiceError::invalid_operation("admission has no frozen policy"),
@@ -279,9 +283,16 @@ impl PrFeedbackIngestor {
         if !policy.ingest {
             return Ok(());
         }
-        let metadata = PrMetadataRepo::get_by_task_id(&*self.db, &admission.task_id)
+        let metadata = PrMetadataRepo::get_by_task_repo(&*self.db, &key.task_id, &key.repo_id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("PR metadata", admission.task_id.clone()))?;
+            .ok_or_else(|| ServiceError::not_found("PR metadata", key.admission_id.clone()))?;
+        if metadata.id != admission.metadata_id
+            || metadata.task_merge_operation_id.as_deref() != Some(key.admission_id.as_str())
+        {
+            return Err(ServiceError::invalid_operation(
+                "feedback polling did not resolve the exact PR metadata admission",
+            ));
+        }
         let number = metadata
             .provider_pr_id
             .as_deref()

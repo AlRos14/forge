@@ -37,6 +37,7 @@ import type {
   TransitionWorkUnitRequest,
   WorkUnitDependencyResponse,
   WorkUnitIntegrationRequest,
+  WorkUnitIntegrationResponse,
   WorkUnitReadinessResponse,
   WorkUnitResponse,
   WorkUnitStatus,
@@ -54,7 +55,12 @@ type RoleDraft = {
   policy: string
   configuration: TaskRoleConfiguration
 }
-type UnitDraft = { title: string; scope: string; executionInstructions: string; requiresIntegration: boolean }
+type UnitDraft = {
+  title: string
+  scope: string
+  executionInstructions: string
+  requiresIntegration: boolean
+}
 
 const COORDINATION_MODES: CoordinationMode[] = ['partitioned', 'collaborative', 'independent']
 const MEMBERSHIP_STATUSES: RoleMembershipStatus[] = ['active', 'suspended', 'ended']
@@ -225,9 +231,7 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
 
   const createRole = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    const template = capabilityCatalog.data?.templates.find(
-      (item) => item.id === newRoleTemplate,
-    )
+    const template = capabilityCatalog.data?.templates.find((item) => item.id === newRoleTemplate)
     const body: CreateTaskRoleRequest = {
       role: newRole.trim(),
       coordination_mode: newRoleMode,
@@ -365,16 +369,22 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
       assigned_actor: parseActorKey(creation.assignedActor),
       requires_integration: creation.requiresIntegration,
       provenance,
-      artifact_inputs: [...new Set(creation.artifactInputIds.split(/[\n,]/).map((id) => id.trim()).filter(Boolean))],
-      review_approval: creation.approvalGateId && creation.approvalLineId
-        ? { gate_id: creation.approvalGateId, review_line_id: creation.approvalLineId }
-        : null,
+      artifact_inputs: [
+        ...new Set(
+          creation.artifactInputIds
+            .split(/[\n,]/)
+            .map((id) => id.trim())
+            .filter(Boolean),
+        ),
+      ],
+      review_approval:
+        creation.approvalGateId && creation.approvalLineId
+          ? { gate_id: creation.approvalGateId, review_line_id: creation.approvalLineId }
+          : null,
       ...(formalReviewRole
         ? { review_subject: { reviewed_work_unit_id: creation.reviewedWorkUnitId } }
         : {}),
-      ...(creation.repositoryIds.length
-        ? { repository_ids: creation.repositoryIds }
-        : {}),
+      ...(creation.repositoryIds.length ? { repository_ids: creation.repositoryIds } : {}),
     }
     try {
       await postOrPatch<WorkUnitResponse>(`/tasks/${task.id}/work-units`, 'POST', body)
@@ -499,14 +509,24 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
     }
   }
 
-  const integrateWorkUnit = async (unit: WorkUnitResponse, executionId: string) => {    if (!executionId) return
+  const integrateWorkUnit = async (unit: WorkUnitResponse, executionId: string) => {
+    if (!executionId) return
     const body: WorkUnitIntegrationRequest = {
       execution_id: executionId,
-      idempotency_key: crypto.randomUUID(),
+      idempotency_key: `work-unit-integration:${unit.id}:${executionId}`,
     }
     try {
-      await postOrPatch(`/work-units/${unit.id}/integrations`, 'POST', body)
-      toast.success('WorkUnit integration requested')
+      const result = await postOrPatch<WorkUnitIntegrationResponse>(
+        `/work-units/${unit.id}/integrations`,
+        'POST',
+        body,
+      )
+      const partial = result.repositories.some((repository) => repository.outcome !== 'success')
+      toast.success(
+        partial
+          ? `Repository integration is partial (${result.repositories.length} repository results). Retry with the same Execution to continue pending repositories.`
+          : 'WorkUnit integration completed for every selected repository',
+      )
       await onChanged()
     } catch (error) {
       toast.error(getApiErrorMessage(error, 'Could not integrate WorkUnit'))
@@ -570,16 +590,21 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
             onChange={(event) => {
               const templateId = event.target.value
               setNewRoleTemplate(templateId)
-              const template = capabilityCatalog.data?.templates.find((item) => item.id === templateId)
+              const template = capabilityCatalog.data?.templates.find(
+                (item) => item.id === templateId,
+              )
               if (template?.default_role) setNewRole(template.default_role)
             }}
           >
             {(capabilityCatalog.data?.templates ?? []).map((template) => (
-              <option key={template.id} value={template.id}>{template.label}</option>
+              <option key={template.id} value={template.id}>
+                {template.label}
+              </option>
             ))}
           </select>
           <span className="block text-muted-foreground">
-            Templates only prefill editable configuration. Capabilities never follow from the role name.
+            Templates only prefill editable configuration. Capabilities never follow from the role
+            name.
           </span>
         </label>
         <Input
@@ -762,9 +787,9 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
       <div className="space-y-3 border-t pt-4">
         <h3 className="font-medium">Create a WorkUnit</h3>
         <p className="max-w-3xl text-xs leading-relaxed text-muted-foreground">
-          Forge WorkUnits are executable scopes for this Task. Enable a repository Workspace when the
-          Agent needs to read this Task&apos;s repository. Forge prepares an isolated Workspace when
-          the WorkUnit is prepared for launch; integrating its result into the Task branch is a
+          Forge WorkUnits are executable scopes for this Task. Enable a repository Workspace when
+          the Agent needs to read this Task&apos;s repository. Forge prepares an isolated Workspace
+          when the WorkUnit is prepared for launch; integrating its result into the Task branch is a
           separate explicit action. Optional execution instructions are passed to the assigned
           harness; they are not a second Task or Execution lifecycle.
         </p>
@@ -786,11 +811,13 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
             <select
               className="h-9 rounded-md border bg-background px-2 text-sm"
               value={creation.role || task.task_roles[0]?.role || ''}
-              onChange={(event) => setCreation((current) => ({
-                ...current,
-                role: event.target.value,
-                reviewedWorkUnitId: '',
-              }))}
+              onChange={(event) =>
+                setCreation((current) => ({
+                  ...current,
+                  role: event.target.value,
+                  reviewedWorkUnitId: '',
+                }))
+              }
             >
               <option value="">Create a TaskRole first</option>
               {task.task_roles.map((role) => (
@@ -801,7 +828,9 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
             </select>
           </label>
           {hasFormalReview(
-            task.task_roles.find((role) => role.role === (creation.role || task.task_roles[0]?.role)),
+            task.task_roles.find(
+              (role) => role.role === (creation.role || task.task_roles[0]?.role),
+            ),
           ) ? (
             <label className="space-y-1 text-xs md:col-span-2">
               <span>Exact WorkUnit to review</span>
@@ -810,10 +839,12 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
                 required
                 className="h-9 w-full rounded-md border bg-background px-2 text-sm"
                 value={creation.reviewedWorkUnitId}
-                onChange={(event) => setCreation((current) => ({
-                  ...current,
-                  reviewedWorkUnitId: event.target.value,
-                }))}
+                onChange={(event) =>
+                  setCreation((current) => ({
+                    ...current,
+                    reviewedWorkUnitId: event.target.value,
+                  }))
+                }
               >
                 <option value="">Choose the WorkUnit under review</option>
                 {workUnits
@@ -830,7 +861,8 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
                   ))}
               </select>
               <span className="block text-muted-foreground">
-                Forge freezes the subject to that WorkUnit&apos;s exact result before review can run.
+                Forge freezes the subject to that WorkUnit&apos;s exact result before review can
+                run.
               </span>
             </label>
           ) : null}
@@ -895,7 +927,7 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
               onChange={(event) =>
                 setCreation((current) => ({ ...current, artifactInputIds: event.target.value }))
               }
-              placeholder="Copy Artifact IDs from this Task&apos;s Artifacts tab"
+              placeholder="Copy Artifact IDs from this Task's Artifacts tab"
             />
             <span className="block text-muted-foreground">
               Forge pins each selected Artifact, digest, and producer Execution. The WorkUnit&apos;s
@@ -908,14 +940,18 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
               <select
                 className="h-9 w-full rounded-md border bg-background px-2 text-sm"
                 value={creation.approvalGateId}
-                onChange={(event) => setCreation((current) => ({
-                  ...current,
-                  approvalGateId: event.target.value,
-                }))}
+                onChange={(event) =>
+                  setCreation((current) => ({
+                    ...current,
+                    approvalGateId: event.target.value,
+                  }))
+                }
               >
                 <option value="">No review approval requirement</option>
                 {(gatesQuery.data ?? []).map((gate) => (
-                  <option key={gate.gate.id} value={gate.gate.id}>{gate.gate.gate_kind} · {gate.gate.id}</option>
+                  <option key={gate.gate.id} value={gate.gate.id}>
+                    {gate.gate.gate_kind} · {gate.gate.id}
+                  </option>
                 ))}
               </select>
             </label>
@@ -924,22 +960,26 @@ export function TaskWorkManagement({ task, workUnits, executions, onChanged }: P
               <select
                 className="h-9 w-full rounded-md border bg-background px-2 text-sm"
                 value={creation.approvalLineId}
-                onChange={(event) => setCreation((current) => ({
-                  ...current,
-                  approvalLineId: event.target.value,
-                }))}
+                onChange={(event) =>
+                  setCreation((current) => ({
+                    ...current,
+                    approvalLineId: event.target.value,
+                  }))
+                }
               >
                 <option value="">Choose the exact review line</option>
                 {(reviewLinesQuery.data ?? []).map((line) => (
                   <option key={line.id} value={line.id}>
-                    {workUnits.find((unit) => unit.id === line.current_work_unit_id)?.title ?? line.current_work_unit_id} · {line.latest_verdict ?? 'pending'} · r{String(line.revision)}
+                    {workUnits.find((unit) => unit.id === line.current_work_unit_id)?.title ??
+                      line.current_work_unit_id}{' '}
+                    · {line.latest_verdict ?? 'pending'} · r{String(line.revision)}
                   </option>
                 ))}
               </select>
             </label>
             <p className="text-xs text-muted-foreground md:col-span-2">
-              The selected Gate&apos;s active review policy must name this exact line. A new correction
-              advances the line and makes an older Gate evaluation unusable.
+              The selected Gate&apos;s active review policy must name this exact line. A new
+              correction advances the line and makes an older Gate evaluation unusable.
             </p>
           </div>
           <label className="space-y-1 text-xs">
@@ -1185,7 +1225,9 @@ function WorkUnitCard(props: WorkUnitCardProps) {
               </span>
             </>
           ) : (
-            <span>No exact subject is attached. Create a new reviewer WorkUnit and select its subject.</span>
+            <span>
+              No exact subject is attached. Create a new reviewer WorkUnit and select its subject.
+            </span>
           )}
         </div>
       ) : null}
@@ -1236,7 +1278,7 @@ function WorkUnitCard(props: WorkUnitCardProps) {
               props.onDraftChange({ ...props.draft, requiresIntegration: event.target.checked })
             }
           />{' '}
-            Use repository Workspace (integration stays explicit)
+          Use repository Workspace (integration stays explicit)
         </label>
         <div>
           <Button size="sm" variant="outline" onClick={props.onSave}>
@@ -1256,9 +1298,7 @@ function WorkUnitCard(props: WorkUnitCardProps) {
               <option
                 key={role.id}
                 value={role.role}
-                disabled={
-                  reviewSubject ? !hasFormalReview(role) : hasFormalReview(role)
-                }
+                disabled={reviewSubject ? !hasFormalReview(role) : hasFormalReview(role)}
               >
                 {taskRoleLabel(role)}
               </option>
@@ -1377,43 +1417,86 @@ function WorkUnitCard(props: WorkUnitCardProps) {
         </div>
       </div>
       {unit.requires_integration ? (
-        <div className="flex flex-wrap items-end gap-2 rounded bg-muted/20 p-3">
-          <label className="min-w-56 flex-1 space-y-1 text-xs">
-            <span>Completed Execution to integrate</span>
-            <select
-              key={unit.version}
-              aria-label={`Execution to integrate ${unit.title}`}
-              className="h-9 w-full rounded-md border bg-background px-2 text-sm"
-              defaultValue=""
-              onChange={(event) => {
-                if (event.target.value) props.onIntegrate(event.target.value)
-              }}
+        <>
+          {(() => {
+            const retryExecutionId = unit.integrations?.find((integration) =>
+              ['conflict', 'failed', 'rejected'].includes(integration.outcome),
+            )?.execution_id
+            return retryExecutionId ? (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => props.onIntegrate(retryExecutionId)}
+              >
+                Retry pending repository integrations
+              </Button>
+            ) : null
+          })()}
+          {unit.integrations?.length ? (
+            <section
+              className="space-y-2 rounded-md border p-3 text-xs"
+              aria-label="Repository integration progress"
             >
-              <option value="">Select exact completed Execution</option>
-              {completedExecutions.map((execution) => (
-                <option key={execution.id} value={execution.id}>
-                  {execution.role} · {execution.actor_ref?.kind}:
-                  {execution.actor_ref?.id} · {execution.id}
-                </option>
-              ))}
-            </select>
-          </label>
-          <p className="text-xs text-muted-foreground">
-            The API validates that the selected Execution produced this WorkUnit&apos;s current
-            result.
-          </p>
-        </div>
+              <h4 className="font-medium">Repository integration progress</h4>
+              <ul className="space-y-1">
+                {unit.integrations.map((integration) => (
+                  <li key={integration.integration_id} className="break-all">
+                    {integration.repo_id} · {integration.outcome.replaceAll('_', ' ')}
+                    {integration.target_after_sha
+                      ? ` · ${integration.target_after_sha.slice(0, 12)}`
+                      : ''}
+                  </li>
+                ))}
+              </ul>
+              <p className="text-muted-foreground">
+                Repository results remain visible after a partial conflict. Select the same
+                completed Execution again to retry pending repositories.
+              </p>
+            </section>
+          ) : null}
+          <div className="flex flex-wrap items-end gap-2 rounded bg-muted/20 p-3">
+            <label className="min-w-56 flex-1 space-y-1 text-xs">
+              <span>Completed Execution to integrate</span>
+              <select
+                key={unit.version}
+                aria-label={`Execution to integrate ${unit.title}`}
+                className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+                defaultValue=""
+                onChange={(event) => {
+                  if (event.target.value) props.onIntegrate(event.target.value)
+                }}
+              >
+                <option value="">Select exact completed Execution</option>
+                {completedExecutions.map((execution) => (
+                  <option key={execution.id} value={execution.id}>
+                    {execution.role} · {execution.actor_ref?.kind}:{execution.actor_ref?.id} ·{' '}
+                    {execution.id}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <p className="text-xs text-muted-foreground">
+              The API validates that the selected Execution produced this WorkUnit&apos;s current
+              result.
+            </p>
+          </div>
+        </>
       ) : null}
       {artifactPackageQuery.data &&
-      (artifactPackageQuery.data.inputs.length > 0 || artifactPackageQuery.data.manifests.length > 0) ? (
-        <section className="space-y-2 rounded-md border p-3 text-xs" aria-label="WorkUnit Artifact package">
+      (artifactPackageQuery.data.inputs.length > 0 ||
+        artifactPackageQuery.data.manifests.length > 0) ? (
+        <section
+          className="space-y-2 rounded-md border p-3 text-xs"
+          aria-label="WorkUnit Artifact package"
+        >
           <h4 className="font-medium">Exact Artifact bindings and result manifests</h4>
           {artifactPackageQuery.data.inputs.length ? (
             <div className="space-y-1">
               <strong>Inputs</strong>
               {artifactPackageQuery.data.inputs.map((input) => (
                 <p key={input.artifact_id} className="break-all">
-                  Artifact {input.artifact_id} · digest {input.digest} · producer {input.producer_execution_id}
+                  Artifact {input.artifact_id} · digest {input.digest} · producer{' '}
+                  {input.producer_execution_id}
                 </p>
               ))}
             </div>
@@ -1421,9 +1504,12 @@ function WorkUnitCard(props: WorkUnitCardProps) {
           {artifactPackageQuery.data.manifests.map((manifest) => (
             <details key={manifest.id} className="rounded bg-muted/30 p-2">
               <summary className="cursor-pointer break-all">
-                Result {manifest.result_execution_id} · delivery {manifest.delivery_artifact_id} · manifest {manifest.manifest_digest}
+                Result {manifest.result_execution_id} · delivery {manifest.delivery_artifact_id} ·
+                manifest {manifest.manifest_digest}
               </summary>
-              <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-all">{JSON.stringify(manifest.manifest, null, 2)}</pre>
+              <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-all">
+                {JSON.stringify(manifest.manifest, null, 2)}
+              </pre>
             </details>
           ))}
         </section>
@@ -1431,7 +1517,11 @@ function WorkUnitCard(props: WorkUnitCardProps) {
       {artifactPackageQuery.isError ? (
         <p role="alert" className="text-xs text-destructive">
           Artifact bindings could not be loaded.{' '}
-          <button type="button" className="underline" onClick={() => void artifactPackageQuery.refetch()}>
+          <button
+            type="button"
+            className="underline"
+            onClick={() => void artifactPackageQuery.refetch()}
+          >
             Retry
           </button>
         </p>

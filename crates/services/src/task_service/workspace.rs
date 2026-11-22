@@ -15,12 +15,45 @@ pub(crate) async fn prepare_integration_workspace_for_work_unit(
     let task_repo_id = task.repo_id.as_deref().ok_or_else(|| {
         ServiceError::invalid_operation("WorkUnit Task has no repository binding")
     })?;
-    if let Some(workspace) = WorkspaceRepo::get_integration_by_task_id(db, &task.id).await? {
-        if workspace.repo_id != task_repo_id {
-            return Err(ServiceError::invalid_operation(
-                "Task integration Workspace repository does not match its Task",
-            ));
-        }
+    prepare_integration_workspace_for_repository(
+        db,
+        workspace_root,
+        task,
+        task_repo_id,
+        repo_cache_locks,
+    )
+    .await
+}
+
+/// Prepare the integration workspace for one exact repository in a Task's
+/// immutable repository set. The single-repository wrapper above preserves
+/// the 0.9.1 primary-repository call path.
+pub(crate) async fn prepare_integration_workspace_for_repository(
+    db: &SqliteDb,
+    workspace_root: &std::path::Path,
+    task: &Task,
+    repo_id: &str,
+    repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+) -> Result<Workspace> {
+    let Some(workspace) =
+        WorkspaceRepo::get_integration_by_task_repo(db, &task.id, repo_id).await?
+    else {
+        return create_fresh_workspace(
+            db,
+            workspace_root,
+            task,
+            &task.id,
+            repo_id,
+            repo_cache_locks,
+        )
+        .await;
+    };
+    if workspace.repo_id != repo_id {
+        return Err(ServiceError::invalid_operation(
+            "Task integration Workspace repository does not match its requested repository",
+        ));
+    }
+    {
         let repo = RepoRepo::get_by_id(db, &workspace.repo_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
@@ -56,6 +89,7 @@ pub(crate) async fn prepare_integration_workspace_for_work_unit(
                     workspace_root,
                     task,
                     &task.id,
+                    repo_id,
                     workspace,
                     repo_cache_locks,
                 )
@@ -63,7 +97,6 @@ pub(crate) async fn prepare_integration_workspace_for_work_unit(
             }
         };
     }
-    create_fresh_workspace(db, workspace_root, task, &task.id, repo_cache_locks).await
 }
 
 async fn recover_missing_worktree(
@@ -71,6 +104,7 @@ async fn recover_missing_worktree(
     workspace_root: &std::path::Path,
     task: &Task,
     task_id: &str,
+    repo_id: &str,
     workspace: Workspace,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
 ) -> Result<Workspace> {
@@ -83,10 +117,6 @@ async fn recover_missing_worktree(
         "workspace worktree path missing or unusable, attempting recovery"
     );
 
-    let repo_id = task
-        .repo_id
-        .as_deref()
-        .ok_or_else(|| ServiceError::invalid_operation("task has no associated repo"))?;
     let repo = RepoRepo::get_by_id(db, repo_id)
         .await?
         .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
@@ -255,12 +285,9 @@ async fn create_fresh_workspace(
     workspace_root: &std::path::Path,
     task: &Task,
     task_id: &str,
+    repo_id: &str,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
 ) -> Result<Workspace> {
-    let repo_id = task
-        .repo_id
-        .as_deref()
-        .ok_or_else(|| ServiceError::invalid_operation("task has no associated repo"))?;
     let repo = RepoRepo::get_by_id(db, repo_id)
         .await?
         .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
@@ -311,7 +338,7 @@ async fn create_fresh_workspace(
             // A concurrent creator may have won the Task-unique workspace
             // row after this call observed no row.  Never remove its
             // worktree when our INSERT loses that race.
-            if WorkspaceRepo::get_integration_by_task_id(db, task_id)
+            if WorkspaceRepo::get_integration_by_task_repo(db, task_id, repo_id)
                 .await
                 .ok()
                 .flatten()

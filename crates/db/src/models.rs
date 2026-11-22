@@ -365,6 +365,9 @@ pub struct PrProviderConfig {
 pub struct PrMetadata {
     pub id: String,
     pub task_id: String,
+    /// Exact repository associated with this PR. NULL is retained only for
+    /// legacy metadata on repo-less Tasks.
+    pub repo_id: Option<String>,
     pub provider_type: String,
     pub provider_pr_id: Option<String>,
     pub pr_url: Option<String>,
@@ -389,6 +392,9 @@ pub struct RemotePrAdmission {
     pub publish_operation_id: String,
     pub metadata_id: String,
     pub task_id: String,
+    /// Repository identity captured by this admission. SQLite keeps this
+    /// nullable for the additive migration, though current writes require it.
+    pub repo_id: Option<String>,
     pub provider_config_id: String,
     pub provider_type: String,
     pub provider_config_revision: String,
@@ -879,6 +885,8 @@ impl FromStr for TaskIntegrationOperationStatus {
 pub struct TaskIntegrationOperation {
     pub id: String,
     pub task_id: String,
+    pub repo_id: Option<String>,
+    pub repository_merge_batch_id: Option<String>,
     pub kind: TaskIntegrationOperationKind,
     pub owner_id: String,
     pub status: TaskIntegrationOperationStatus,
@@ -907,6 +915,73 @@ pub struct WorkUnitIntegration {
     pub target_after_sha: Option<String>,
     pub operation_idempotency_key: String,
     pub outcome: WorkUnitIntegrationOutcome,
+    pub conflict_metadata_json: Option<String>,
+    pub version: i64,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkUnitRepositoryIntegrationOutcome {
+    Running,
+    Success,
+    Unchanged,
+    Conflict,
+    Failed,
+    Rejected,
+}
+
+impl fmt::Display for WorkUnitRepositoryIntegrationOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Running => "running",
+            Self::Success => "success",
+            Self::Unchanged => "unchanged",
+            Self::Conflict => "conflict",
+            Self::Failed => "failed",
+            Self::Rejected => "rejected",
+        })
+    }
+}
+
+impl FromStr for WorkUnitRepositoryIntegrationOutcome {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "running" => Ok(Self::Running),
+            "success" => Ok(Self::Success),
+            "unchanged" => Ok(Self::Unchanged),
+            "conflict" => Ok(Self::Conflict),
+            "failed" => Ok(Self::Failed),
+            "rejected" => Ok(Self::Rejected),
+            other => Err(format!(
+                "unknown WorkUnit repository integration outcome: {other}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkUnitRepositoryIntegration {
+    pub id: String,
+    pub work_unit_integration_id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub execution_id: String,
+    pub repository_set_revision: i64,
+    pub repo_id: String,
+    pub source_workspace_id: String,
+    pub source_branch: String,
+    pub source_sha: String,
+    pub target_workspace_id: String,
+    pub target_branch: String,
+    pub target_before_sha: String,
+    pub target_after_sha: Option<String>,
+    pub outcome: WorkUnitRepositoryIntegrationOutcome,
     pub conflict_metadata_json: Option<String>,
     pub version: i64,
     pub started_at: String,
@@ -947,6 +1022,7 @@ impl FromStr for WorkspaceScopeKind {
 pub struct WorkspaceScope {
     pub workspace_id: String,
     pub task_id: String,
+    pub repo_id: String,
     pub kind: WorkspaceScopeKind,
     pub work_unit_id: Option<String>,
     pub workspace_group_id: Option<String>,
@@ -1109,6 +1185,215 @@ pub struct TaskRepository {
     pub role: TaskRepositoryRole,
     pub position: i64,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRepositorySetRevisionState {
+    Building,
+    Current,
+    Superseded,
+}
+
+impl fmt::Display for TaskRepositorySetRevisionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Building => "building",
+            Self::Current => "current",
+            Self::Superseded => "superseded",
+        })
+    }
+}
+
+impl FromStr for TaskRepositorySetRevisionState {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "building" => Ok(Self::Building),
+            "current" => Ok(Self::Current),
+            "superseded" => Ok(Self::Superseded),
+            other => Err(format!(
+                "unknown Task repository set revision state: {other}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRepositorySetRevision {
+    pub task_id: String,
+    pub revision: i64,
+    /// NULL is retained only for a revision backfilled by V183.
+    pub digest: Option<String>,
+    pub state: TaskRepositorySetRevisionState,
+    pub created_at: String,
+    pub source_kind: String,
+    pub source_ref: Option<String>,
+    /// A generic collaboration decision, when one backed the revision.
+    pub decision_id: Option<String>,
+    /// Exact structured HumanDecisionRequest used by coordinator replan.
+    pub human_decision_request_id: Option<String>,
+    pub repositories: Vec<TaskRepositorySetRevisionRepo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTaskRepositorySetRevision {
+    pub task_id: String,
+    pub expected_current_revision: i64,
+    pub expected_current_digest: Option<String>,
+    pub repositories: Vec<TaskRepositoryWrite>,
+    pub source_kind: String,
+    pub source_ref: Option<String>,
+    pub decision_id: Option<String>,
+    pub human_decision_request_id: Option<String>,
+    /// Approved coordinator replans create a new immutable subject even when
+    /// the selected repository identities are unchanged.
+    pub force_new_revision: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatorReplanDecisionProof {
+    pub replan_id: String,
+    pub decision_id: String,
+    pub request_id: String,
+    pub plan_artifact_id: String,
+    pub plan_digest: String,
+    pub authorization_version: i64,
+    pub approved_by_user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRepositorySetRevisionRepo {
+    pub task_id: String,
+    pub revision: i64,
+    pub repo_id: String,
+    pub role: TaskRepositoryRole,
+    pub position: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRepositoryMergeBatchState {
+    Integrating,
+    Publishing,
+    Open,
+    Completed,
+    Blocked,
+    Failed,
+}
+
+impl fmt::Display for TaskRepositoryMergeBatchState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Integrating => "integrating",
+            Self::Publishing => "publishing",
+            Self::Open => "open",
+            Self::Completed => "completed",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+impl FromStr for TaskRepositoryMergeBatchState {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "integrating" => Ok(Self::Integrating),
+            "publishing" => Ok(Self::Publishing),
+            "open" => Ok(Self::Open),
+            "completed" => Ok(Self::Completed),
+            "blocked" => Ok(Self::Blocked),
+            "failed" => Ok(Self::Failed),
+            other => Err(format!(
+                "unknown Task repository merge batch state: {other}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRepositoryMergeBatch {
+    pub id: String,
+    pub task_id: String,
+    pub gate_evaluation_id: String,
+    pub repository_set_revision: i64,
+    pub repository_set_digest: Option<String>,
+    pub state: TaskRepositoryMergeBatchState,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRepositoryMergeBatchRepoState {
+    Pending,
+    Integrating,
+    Integrated,
+    Publishing,
+    Open,
+    Merged,
+    Conflict,
+    Closed,
+    Failed,
+}
+
+impl fmt::Display for TaskRepositoryMergeBatchRepoState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::Integrating => "integrating",
+            Self::Integrated => "integrated",
+            Self::Publishing => "publishing",
+            Self::Open => "open",
+            Self::Merged => "merged",
+            Self::Conflict => "conflict",
+            Self::Closed => "closed",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+impl FromStr for TaskRepositoryMergeBatchRepoState {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "integrating" => Ok(Self::Integrating),
+            "integrated" => Ok(Self::Integrated),
+            "publishing" => Ok(Self::Publishing),
+            "open" => Ok(Self::Open),
+            "merged" => Ok(Self::Merged),
+            "conflict" => Ok(Self::Conflict),
+            "closed" => Ok(Self::Closed),
+            "failed" => Ok(Self::Failed),
+            other => Err(format!(
+                "unknown Task repository merge batch repo state: {other}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRepositoryMergeBatchRepoRow {
+    pub batch_id: String,
+    pub task_id: String,
+    pub repository_set_revision: i64,
+    pub repo_id: String,
+    pub position: i64,
+    pub state: TaskRepositoryMergeBatchRepoState,
+    pub work_unit_repository_integration_id: Option<String>,
+    pub task_merge_operation_id: Option<String>,
+    pub pr_metadata_id: Option<String>,
+    pub before_sha: Option<String>,
+    pub after_sha: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3169,6 +3454,10 @@ pub struct MaterializeTaskCoordinationPlanInput {
     pub expected_plan_version: i64,
     pub task_version_before: i64,
     pub expected_request_version: i64,
+    pub expected_repository_set_revision: i64,
+    pub expected_repository_set_digest: Option<String>,
+    pub repository_set_revision_change: Option<CreateTaskRepositorySetRevision>,
+    pub coordinator_replan_decision: Option<CoordinatorReplanDecisionProof>,
     pub work_units: Vec<MaterializedWorkUnit>,
     pub receipt_digest: String,
     pub created_by: String,

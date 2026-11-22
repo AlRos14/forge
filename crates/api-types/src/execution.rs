@@ -34,6 +34,13 @@ pub struct TaskResponse {
     pub repo_id: Option<String>,
     #[serde(default)]
     pub repositories: Vec<TaskRepositoryResponse>,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub repository_set_revision: i64,
+    #[serde(default)]
+    pub repository_set_digest: Option<String>,
+    #[serde(default)]
+    pub repository_merge_batches: Vec<crate::TaskRepositoryMergeBatchResponse>,
     pub parent_task_id: Option<String>,
     pub title: String,
     pub description: Option<String>,

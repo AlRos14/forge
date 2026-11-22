@@ -12,6 +12,15 @@ pub enum PublicEventType {
     #[serde(rename = "task.repositories_changed")]
     #[ts(rename = "task.repositories_changed")]
     TaskRepositoriesChanged,
+    #[serde(rename = "work_unit.repository_integration_changed")]
+    #[ts(rename = "work_unit.repository_integration_changed")]
+    WorkUnitRepositoryIntegrationChanged,
+    #[serde(rename = "task.repository_merge_batch_changed")]
+    #[ts(rename = "task.repository_merge_batch_changed")]
+    TaskRepositoryMergeBatchChanged,
+    #[serde(rename = "task.repository_pr_status_changed")]
+    #[ts(rename = "task.repository_pr_status_changed")]
+    TaskRepositoryPrStatusChanged,
     #[serde(rename = "gate.created")]
     #[ts(rename = "gate.created")]
     GateCreated,
@@ -211,6 +220,11 @@ impl PublicEventType {
         match self {
             Self::TaskLifecycleChanged => "task.lifecycle_changed",
             Self::TaskRepositoriesChanged => "task.repositories_changed",
+            Self::WorkUnitRepositoryIntegrationChanged => {
+                "work_unit.repository_integration_changed"
+            }
+            Self::TaskRepositoryMergeBatchChanged => "task.repository_merge_batch_changed",
+            Self::TaskRepositoryPrStatusChanged => "task.repository_pr_status_changed",
             Self::GateCreated => "gate.created",
             Self::GatePolicyRevised => "gate.policy_revised",
             Self::GateEvaluated => "gate.evaluated",

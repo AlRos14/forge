@@ -93,6 +93,13 @@ replan versionado. Antes de una Execution, un cambio no puede quitar un
 repositorio seleccionado explícitamente por un WorkUnit ni convertirlo en
 context.
 
+Después de una Execution, el cambio de repositorios sigue el replan del
+coordinador. Forge compara la revisión y el digest originales con el conjunto
+actual; si cambia el alcance o la autoridad, solo la decisión Human exacta de
+ese plan permite materializarlo. La integración parcial y el estado de PR por
+repositorio siguen visibles mientras TaskLifecycle espera todos los resultados
+requeridos.
+
 ## Arranque y coordinación
 
 Un turno de coordinación debe poder admitirse desde Task + equipo + autorización,

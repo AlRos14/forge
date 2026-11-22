@@ -5,6 +5,8 @@ fn map_operation(row: SqliteRow) -> Result<TaskIntegrationOperation> {
     Ok(TaskIntegrationOperation {
         id: row.try_get("id")?,
         task_id: row.try_get("task_id")?,
+        repo_id: row.try_get("repo_id")?,
+        repository_merge_batch_id: row.try_get("repository_merge_batch_id")?,
         kind: parse_enum(row.try_get::<String, _>("kind")?)?,
         owner_id: row.try_get("owner_id")?,
         status: parse_enum(row.try_get::<String, _>("status")?)?,
@@ -25,6 +27,7 @@ fn map_remote_pr_admission(row: SqliteRow) -> Result<RemotePrAdmission> {
         publish_operation_id: row.try_get("publish_operation_id")?,
         metadata_id: row.try_get("metadata_id")?,
         task_id: row.try_get("task_id")?,
+        repo_id: row.try_get("repo_id")?,
         provider_config_id: row.try_get("provider_config_id")?,
         provider_type: row.try_get("provider_type")?,
         provider_config_revision: row.try_get("provider_config_revision")?,
@@ -248,11 +251,34 @@ async fn admit_merge_lifecycle_in_tx(
     db: &SqliteDb,
     tx: &mut Transaction<'_, Sqlite>,
     input: &CreateTaskIntegrationOperation,
-) -> Result<DomainEvent> {
+) -> Result<Option<DomainEvent>> {
     let gate_evaluation_id = input
         .gate_evaluation_id
         .as_deref()
         .ok_or(DbError::InvalidTransition)?;
+    let repo_id = input.repo_id.as_deref().ok_or(DbError::InvalidTransition)?;
+    let batch_id = input
+        .repository_merge_batch_id
+        .as_deref()
+        .ok_or(DbError::InvalidTransition)?;
+    let batch_is_exact: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM task_repository_merge_batch batch
+             JOIN task_repository_merge_batch_repo repo
+               ON repo.batch_id = batch.id AND repo.task_id = batch.task_id
+             WHERE batch.id = ? AND batch.task_id = ?
+               AND batch.gate_evaluation_id = ? AND repo.repo_id = ?
+         )",
+    )
+    .bind(batch_id)
+    .bind(&input.task_id)
+    .bind(gate_evaluation_id)
+    .bind(repo_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !batch_is_exact {
+        return Err(DbError::InvalidTransition);
+    }
     let task_version: i64 =
         sqlx::query_scalar("SELECT version FROM task WHERE id = ? AND deleted_at IS NULL")
             .bind(&input.task_id)
@@ -268,7 +294,50 @@ async fn admit_merge_lifecycle_in_tx(
     .await?
     .ok_or(DbError::NotFound)?;
     let lifecycle = super::gate_lifecycle::map_task_lifecycle(&row)?;
-    if lifecycle.state != TaskLifecycleState::ReadyToMerge {
+    if lifecycle.state == TaskLifecycleState::Merging
+        && lifecycle.reason_kind.as_deref() == Some("task_repository_merge_batch")
+        && lifecycle.reason_ref.as_deref() == Some(batch_id)
+    {
+        return Ok(None);
+    }
+    let batch_revision: i64 = sqlx::query_scalar(
+        "SELECT repository_set_revision FROM task_repository_merge_batch
+         WHERE id = ? AND task_id = ? AND gate_evaluation_id = ?",
+    )
+    .bind(batch_id)
+    .bind(&input.task_id)
+    .bind(gate_evaluation_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(DbError::InvalidTransition)?;
+    let writable_repository_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_repository_set_revision_repo
+         WHERE task_id = ? AND revision = ? AND role IN ('primary', 'affected')",
+    )
+    .bind(&input.task_id)
+    .bind(batch_revision)
+    .fetch_one(&mut **tx)
+    .await?;
+    let active_gate_is_current: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM gate_evaluation evaluation
+            JOIN gate ON gate.id = evaluation.gate_id
+            WHERE evaluation.id = ? AND evaluation.task_id = ?
+              AND evaluation.outcome = 'satisfied'
+              AND gate.gate_kind = 'merge_readiness'
+              AND gate.scope_kind = 'task' AND gate.scope_id = evaluation.task_id
+              AND gate.active_policy_revision = evaluation.policy_revision
+        )",
+    )
+    .bind(gate_evaluation_id)
+    .bind(&input.task_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let lifecycle_admission_allowed = lifecycle.state == TaskLifecycleState::ReadyToMerge
+        || (lifecycle.state == TaskLifecycleState::Active
+            && writable_repository_count > 1
+            && active_gate_is_current);
+    if !lifecycle_admission_allowed {
         return Err(DbError::InvalidTransition);
     }
     let key = format!("task-merge-admission:{}", input.id);
@@ -293,6 +362,7 @@ async fn admit_merge_lifecycle_in_tx(
             "cause_ref": input.id,
             "gate_evaluation_id": gate_evaluation_id,
             "task_merge_operation_id": input.id,
+            "repository_merge_batch_id": batch_id,
         })
         .to_string(),
         created_at: input.created_at.clone(),
@@ -309,8 +379,8 @@ async fn admit_merge_lifecycle_in_tx(
             to_state: TaskLifecycleState::Merging,
             cause_kind: "merge_operation".to_owned(),
             cause_ref: Some(input.id.clone()),
-            reason_kind: Some("task_merge_admitted".to_owned()),
-            reason_ref: Some(input.id.clone()),
+            reason_kind: Some("task_repository_merge_batch".to_owned()),
+            reason_ref: Some(batch_id.to_owned()),
             gate_evaluation_id: Some(gate_evaluation_id.to_owned()),
             idempotency_key: key,
             updated_at: input.created_at.clone(),
@@ -332,7 +402,7 @@ async fn admit_merge_lifecycle_in_tx(
     if changed != 1 {
         return Err(DbError::VersionConflict);
     }
-    Ok(event)
+    Ok(Some(event))
 }
 
 async fn finish_merge_lifecycle_in_tx(
@@ -392,8 +462,22 @@ async fn finish_merge_lifecycle_in_tx(
     .await?
     .ok_or(DbError::NotFound)?;
     let lifecycle = super::gate_lifecycle::map_task_lifecycle(&row)?;
-    if lifecycle.state != TaskLifecycleState::Merging {
+    if lifecycle.state != TaskLifecycleState::Merging
+        || lifecycle.reason_kind.as_deref() != Some("task_repository_merge_batch")
+        || lifecycle.reason_ref != lifecycle_operation.repository_merge_batch_id
+    {
         return Err(DbError::InvalidTransition);
+    }
+    if lifecycle_operation.status == TaskIntegrationOperationStatus::Succeeded
+        && !repository_merge_batch_complete_in_tx(
+            tx,
+            lifecycle_operation.repository_merge_batch_id.as_deref(),
+        )
+        .await?
+    {
+        // A successful repository operation is only one child result. Keep
+        // TaskLifecycle in Merging until every changed repository succeeds.
+        return Ok(None);
     }
     let task_version: i64 =
         sqlx::query_scalar("SELECT version FROM task WHERE id = ? AND deleted_at IS NULL")
@@ -510,6 +594,45 @@ async fn finish_merge_lifecycle_in_tx(
     Ok(Some(transition_event))
 }
 
+async fn repository_merge_batch_complete_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    batch_id: Option<&str>,
+) -> Result<bool> {
+    let Some(batch_id) = batch_id else {
+        return Ok(true);
+    };
+    let row_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_repository_merge_batch_repo WHERE batch_id = ?",
+    )
+    .bind(batch_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if row_count == 0 {
+        return Ok(false);
+    }
+    let incomplete_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM task_repository_merge_batch_repo row
+         JOIN repo ON repo.id = row.repo_id
+         LEFT JOIN task_integration_operation operation
+           ON operation.id = row.task_merge_operation_id
+         LEFT JOIN remote_pr_admission admission
+           ON admission.task_merge_operation_id = operation.id
+         WHERE row.batch_id = ?
+           AND NOT (
+             (repo.work_mode = 'direct_merge'
+              AND (row.state = 'integrated'
+                   OR operation.status = 'succeeded'))
+             OR (repo.work_mode = 'pull_request'
+                 AND (row.state = 'merged' OR admission.state = 'merged'))
+           )",
+    )
+    .bind(batch_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(incomplete_count == 0)
+}
+
 async fn reset_pr_metadata_for_new_pr(
     tx: &mut Transaction<'_, Sqlite>,
     metadata: &CreatePrMetadata,
@@ -542,12 +665,15 @@ async fn insert_operation(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO task_integration_operation (
-                id, task_id, kind, owner_id, status, version, created_at, updated_at, finished_at,
-            gate_evaluation_id, remote_waiting, parent_operation_id, result_event_id
-         ) VALUES (?, ?, ?, ?, 'running', 1, ?, ?, NULL, ?, ?, ?, NULL)",
+                id, task_id, repo_id, repository_merge_batch_id, kind, owner_id,
+                status, version, created_at, updated_at, finished_at,
+                gate_evaluation_id, remote_waiting, parent_operation_id, result_event_id
+         ) VALUES (?, ?, ?, ?, ?, ?, 'running', 1, ?, ?, NULL, ?, ?, ?, NULL)",
     )
     .bind(&input.id)
     .bind(&input.task_id)
+    .bind(input.repo_id.as_deref())
+    .bind(input.repository_merge_batch_id.as_deref())
     .bind(input.kind.to_string())
     .bind(&input.owner_id)
     .bind(&input.created_at)
@@ -662,14 +788,19 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         mut remote_admission: CreateRemotePrAdmission,
     ) -> Result<(TaskIntegrationOperation, TaskIntegrationOperation)> {
         if merge.kind != TaskIntegrationOperationKind::TaskMerge
+            || merge.repo_id.is_none()
+            || merge.repository_merge_batch_id.is_none()
             || !merge.remote_waiting
             || merge.parent_operation_id.is_some()
             || publish.kind != TaskIntegrationOperationKind::PublishPr
             || publish.remote_waiting
             || publish.parent_operation_id.as_deref() != Some(merge.id.as_str())
             || publish.task_id != merge.task_id
+            || publish.repo_id != merge.repo_id
+            || publish.repository_merge_batch_id != merge.repository_merge_batch_id
             || publish.gate_evaluation_id != merge.gate_evaluation_id
             || metadata.task_id != merge.task_id
+            || metadata.repo_id.as_deref() != merge.repo_id.as_deref()
             || metadata.task_merge_operation_id != merge.id
             || metadata.publish_operation_id != publish.id
             || metadata.provider_pr_id.is_some()
@@ -677,6 +808,7 @@ impl TaskIntegrationOperationRepo for SqliteDb {
             || remote_admission.task_merge_operation_id != merge.id
             || remote_admission.publish_operation_id != publish.id
             || remote_admission.task_id != merge.task_id
+            || remote_admission.repo_id != merge.repo_id.as_deref().unwrap_or_default()
             || remote_admission.metadata_id != metadata.id
             || remote_admission.provider_type != metadata.provider_type
             || remote_admission.source_branch != metadata.source_branch
@@ -691,9 +823,10 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         let existing_pr = sqlx::query(
             "SELECT id, merge_status, admission_status, task_merge_operation_id,
                     publish_operation_id
-             FROM pr_metadata WHERE task_id = ?",
+             FROM pr_metadata WHERE task_id = ? AND repo_id = ?",
         )
         .bind(&metadata.task_id)
+        .bind(&metadata.repo_id)
         .fetch_optional(&mut *tx)
         .await?;
         let metadata_id = if let Some(existing_pr) = existing_pr {
@@ -875,6 +1008,7 @@ impl TaskIntegrationOperationRepo for SqliteDb {
             "publish_operation_id",
             "metadata_id",
             "task_id",
+            "repo_id",
             "provider_config_id",
             "provider_type",
             "provider_config_revision",
@@ -915,6 +1049,7 @@ impl TaskIntegrationOperationRepo for SqliteDb {
             .bind(&remote_admission.publish_operation_id)
             .bind(&remote_admission.metadata_id)
             .bind(&remote_admission.task_id)
+            .bind(&remote_admission.repo_id)
             .bind(&remote_admission.provider_config_id)
             .bind(&remote_admission.provider_type)
             .bind(&remote_admission.provider_config_revision)
@@ -1720,6 +1855,8 @@ mod tests {
             CreateTaskIntegrationOperation {
                 id: new_uuid_v4(),
                 task_id: task_id.clone(),
+                repo_id: None,
+                repository_merge_batch_id: None,
                 kind: TaskIntegrationOperationKind::WorkUnitCreate,
                 owner_id: new_uuid_v4(),
                 gate_evaluation_id: None,

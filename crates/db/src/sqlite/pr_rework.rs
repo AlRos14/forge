@@ -109,11 +109,6 @@ async fn supersede_in_tx(
     .await?
     .ok_or(DbError::NotFound)?;
     let lifecycle = super::gate_lifecycle::map_task_lifecycle(&lifecycle_row)?;
-    if lifecycle.state != TaskLifecycleState::Merging
-        || lifecycle.reason_ref.as_deref() != Some(input.task_merge_operation_id.as_str())
-    {
-        return Err(DbError::PrReworkNotAuthorized);
-    }
     let task_version: i64 =
         sqlx::query_scalar("SELECT version FROM task WHERE id = ? AND deleted_at IS NULL")
             .bind(&task_id)
@@ -121,7 +116,8 @@ async fn supersede_in_tx(
             .await?
             .ok_or(DbError::NotFound)?;
     let operation = sqlx::query(
-        "SELECT kind, status, remote_waiting, version FROM task_integration_operation
+        "SELECT kind, status, remote_waiting, version, repository_merge_batch_id
+         FROM task_integration_operation
          WHERE id = ? AND task_id = ?",
     )
     .bind(&input.task_merge_operation_id)
@@ -133,7 +129,15 @@ async fn supersede_in_tx(
     let operation_status: String = operation.try_get("status")?;
     let operation_remote: i64 = operation.try_get("remote_waiting")?;
     let operation_version: i64 = operation.try_get("version")?;
+    let repository_merge_batch_id: Option<String> =
+        operation.try_get("repository_merge_batch_id")?;
     if operation_kind != "task_merge" || operation_status != "running" || operation_remote != 1 {
+        return Err(DbError::PrReworkNotAuthorized);
+    }
+    if lifecycle.state != TaskLifecycleState::Merging
+        || lifecycle.reason_kind.as_deref() != Some("task_repository_merge_batch")
+        || lifecycle.reason_ref != repository_merge_batch_id
+    {
         return Err(DbError::PrReworkNotAuthorized);
     }
 

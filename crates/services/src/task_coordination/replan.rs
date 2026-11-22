@@ -8,7 +8,7 @@ use crate::{
 };
 use db::{
     CoordinatorReplanClassification, CoordinatorReplanState, CreateCoordinatorReplan,
-    DomainEventRepo, HumanDecisionSourceKind, TaskCoordinatorReplanRepo,
+    DomainEventRepo, HumanDecisionRepo, HumanDecisionSourceKind, TaskCoordinatorReplanRepo,
     TransitionCoordinatorReplan, WorkUnitRepo,
 };
 
@@ -61,7 +61,71 @@ fn parse_replan_context(
     Ok(Some((id.to_owned(), original)))
 }
 
+fn validate_exact_replan_decision(
+    decision: &db::HumanDecisionRequest,
+    task_id: &str,
+    replan_id: &str,
+    authorization_version: i64,
+    request_id: &str,
+    artifact_id: &str,
+    plan_digest: &str,
+    user_id: &str,
+) -> Result<()> {
+    if decision.task_id != task_id
+        || decision.source_kind != HumanDecisionSourceKind::CoordinatorReplan
+        || decision.source_id != replan_id
+        || decision.authorization_version != Some(authorization_version)
+        || decision.state != db::HumanDecisionState::Answered
+        || decision.answered_option_id.as_deref() != Some("approve_replan")
+        || decision.answered_by_user_id.as_deref() != Some(user_id)
+    {
+        return Err(invalid_plan(
+            "the exact Human replan decision is not approved",
+        ));
+    }
+    let binding: ResumeBinding = serde_json::from_str(&decision.resume_binding_json)
+        .map_err(|_| invalid_plan("the Human decision resume binding is invalid"))?;
+    if binding.request_id != request_id
+        || binding.request_kind != TaskCoordinationRequestKind::WorkUnitPlan
+        || binding.authorization_version != authorization_version
+        || binding
+            .source_subject
+            .get("coordinator_replan_id")
+            .and_then(Value::as_str)
+            != Some(replan_id)
+        || binding
+            .source_subject
+            .get("plan_request_id")
+            .and_then(Value::as_str)
+            != Some(request_id)
+        || binding
+            .source_subject
+            .get("plan_artifact_id")
+            .and_then(Value::as_str)
+            != Some(artifact_id)
+        || binding
+            .source_subject
+            .get("plan_digest")
+            .and_then(Value::as_str)
+            != Some(plan_digest)
+    {
+        return Err(invalid_plan(
+            "the Human decision does not bind this exact replan artifact",
+        ));
+    }
+    Ok(())
+}
+
 impl TaskCoordinationService {
+    async fn repository_set_snapshot(&self, task_id: &str) -> Result<(i64, Option<String>)> {
+        let revision = db::TaskRepositorySetRepo::get_current(&*self.db, task_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("Task repository-set revision", task_id.to_owned())
+            })?;
+        Ok((revision.revision, revision.digest))
+    }
+
     pub(super) async fn apply_propose_replan(
         &self,
         source: &TaskCoordinationRequest,
@@ -134,6 +198,8 @@ impl TaskCoordinationService {
             .ok_or_else(|| ServiceError::not_found("task", source.task_id.clone()))?;
         let team = self.current_team(&source.task_id).await?;
         let work_units = WorkUnitRepo::list_by_task(&*self.db, &source.task_id).await?;
+        let (repository_set_revision, repository_set_digest) =
+            self.repository_set_snapshot(&task.id).await?;
         let original = ReplanOriginalScope {
             objective_digest: super::external_feedback::task_objective_digest(
                 &task.title,
@@ -166,6 +232,10 @@ impl TaskCoordinationService {
                 .filter(|unit| unit.status != db::WorkUnitStatus::Cancelled)
                 .map(|unit| unit.scope)
                 .collect(),
+            repository_set_revision,
+            repository_set_digest: repository_set_digest.clone(),
+            current_repository_set_revision: repository_set_revision,
+            current_repository_set_digest: repository_set_digest,
             repo_id: task.repo_id.clone(),
             current_repo_id: task.repo_id.clone(),
         };
@@ -405,6 +475,8 @@ impl TaskCoordinationService {
             .ok_or_else(|| ServiceError::not_found("task", row.task_id.clone()))?;
         let team = self.current_team(&row.task_id).await?;
         let work_units = WorkUnitRepo::list_by_task(&*self.db, &row.task_id).await?;
+        let (repository_set_revision, repository_set_digest) =
+            self.repository_set_snapshot(&task.id).await?;
         let scope = ReplanOriginalScope {
             objective_digest: super::external_feedback::task_objective_digest(
                 &task.title,
@@ -437,6 +509,10 @@ impl TaskCoordinationService {
                 .filter(|unit| unit.status != db::WorkUnitStatus::Cancelled)
                 .map(|unit| unit.scope)
                 .collect(),
+            repository_set_revision,
+            repository_set_digest: repository_set_digest.clone(),
+            current_repository_set_revision: repository_set_revision,
+            current_repository_set_digest: repository_set_digest,
             repo_id: task.repo_id.clone(),
             current_repo_id: task.repo_id,
         };
@@ -444,7 +520,7 @@ impl TaskCoordinationService {
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))
     }
 
-    pub(super) fn replan_classification(
+    pub(super) async fn replan_classification(
         &self,
         request: &TaskCoordinationRequest,
         plan: &WorkUnitPlan,
@@ -460,7 +536,74 @@ impl TaskCoordinationService {
             task.description.as_deref(),
         );
         original.current_repo_id = task.repo_id.clone();
+        let (revision, digest) = self.repository_set_snapshot(&task.id).await?;
+        original.current_repository_set_revision = revision;
+        original.current_repository_set_digest = digest;
         Ok(Some((id, classify_replan(plan, envelope, &original))))
+    }
+
+    pub(super) async fn validate_replan_materialization_decision(
+        &self,
+        request: &TaskCoordinationRequest,
+        artifact_id: &str,
+        plan_digest: &str,
+        user_id: &str,
+    ) -> Result<Option<db::CoordinatorReplanDecisionProof>> {
+        let Some((replan_id, original)) = self.replan_context_for_request(request)? else {
+            return Ok(None);
+        };
+        let (current_revision, current_digest) =
+            self.repository_set_snapshot(&request.task_id).await?;
+        if original.repository_set_revision > 0
+            && (original.repository_set_revision != current_revision
+                || original.repository_set_digest != current_digest)
+        {
+            return Err(coordination_error(
+                "coordination.authorization_stale",
+                "the repository-set revision changed after this replan was proposed",
+            ));
+        }
+        let replan = TaskCoordinatorReplanRepo::get_coordinator_replan(&*self.db, &replan_id)
+            .await?
+            .filter(|row| {
+                row.task_id == request.task_id
+                    && row.plan_request_id.as_deref() == Some(request.id.as_str())
+            })
+            .ok_or_else(|| ServiceError::not_found("coordinator replan", replan_id.clone()))?;
+        if replan.classification == Some(CoordinatorReplanClassification::ScopeOrAuthorityChange) {
+            if replan.state != CoordinatorReplanState::Approved {
+                return Err(invalid_plan(
+                    "repository or authority changes require an approved exact Human decision",
+                ));
+            }
+            let decision_id = replan
+                .human_decision_id
+                .as_deref()
+                .ok_or_else(|| invalid_plan("approved replan has no exact Human decision"))?;
+            let decision = HumanDecisionRepo::get_human_decision_request(&*self.db, decision_id)
+                .await?
+                .ok_or_else(|| invalid_plan("the exact Human replan decision is not approved"))?;
+            validate_exact_replan_decision(
+                &decision,
+                &request.task_id,
+                &replan_id,
+                request.authorization_version,
+                &request.id,
+                artifact_id,
+                plan_digest,
+                user_id,
+            )?;
+            return Ok(Some(db::CoordinatorReplanDecisionProof {
+                replan_id,
+                decision_id: decision.id,
+                request_id: request.id.clone(),
+                plan_artifact_id: artifact_id.to_owned(),
+                plan_digest: plan_digest.to_owned(),
+                authorization_version: request.authorization_version,
+                approved_by_user_id: user_id.to_owned(),
+            }));
+        }
+        Ok(None)
     }
 
     pub(super) fn replan_context_for_request(
@@ -566,8 +709,9 @@ impl TaskCoordinationService {
         let task = TaskRepo::get_by_id(&*self.db, &request.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", request.task_id.clone()))?;
-        let Some((_, classification)) =
-            self.replan_classification(request, &parsed, &envelope, &task)?
+        let Some((_, classification)) = self
+            .replan_classification(request, &parsed, &envelope, &task)
+            .await?
         else {
             return Err(invalid_plan("replan plan request lost its exact origin"));
         };
@@ -807,6 +951,124 @@ impl TaskCoordinationService {
                 .await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_exact_replan_decision;
+    use crate::human_decision_service::ResumeBinding;
+
+    fn approved_decision() -> db::HumanDecisionRequest {
+        db::HumanDecisionRequest {
+            id: "decision-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            source_kind: db::HumanDecisionSourceKind::CoordinatorReplan,
+            source_id: "replan-1".to_owned(),
+            raised_by_execution_id: Some("execution-1".to_owned()),
+            authorization_version: Some(4),
+            question: "Approve this exact replan?".to_owned(),
+            options_json: "[]".to_owned(),
+            recommended_option_id: None,
+            recommendation_rationale: None,
+            evidence_links_json: "[]".to_owned(),
+            max_authority_effect: db::AuthorityEffect::Scope,
+            state: db::HumanDecisionState::Answered,
+            answered_by_user_id: Some("user-1".to_owned()),
+            answered_option_id: Some("approve_replan".to_owned()),
+            answer_note: None,
+            answered_at: Some("2026-11-21T00:00:00Z".to_owned()),
+            resume_request_id: Some("resume-request-1".to_owned()),
+            resume_binding_json: serde_json::to_string(&ResumeBinding {
+                request_id: "request-1".to_owned(),
+                request_kind: TaskCoordinationRequestKind::WorkUnitPlan,
+                authorization_version: 4,
+                source_subject: serde_json::json!({
+                    "coordinator_replan_id": "replan-1",
+                    "plan_request_id": "request-1",
+                    "plan_artifact_id": "artifact-1",
+                    "plan_digest": "digest-1",
+                }),
+            })
+            .expect("resume binding serializes"),
+            version: 2,
+            created_at: "2026-11-21T00:00:00Z".to_owned(),
+            updated_at: "2026-11-21T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn multirepo_lifecycle_replan_after_execution_requires_exact_human_decision() {
+        let decision = approved_decision();
+        validate_exact_replan_decision(
+            &decision,
+            "task-1",
+            "replan-1",
+            4,
+            "request-1",
+            "artifact-1",
+            "digest-1",
+            "user-1",
+        )
+        .expect("the exact approving Human may materialize the bound plan");
+
+        assert!(validate_exact_replan_decision(
+            &decision,
+            "task-1",
+            "other-replan",
+            4,
+            "request-1",
+            "artifact-1",
+            "digest-1",
+            "user-1",
+        )
+        .is_err());
+        assert!(validate_exact_replan_decision(
+            &decision,
+            "task-1",
+            "replan-1",
+            5,
+            "request-1",
+            "artifact-1",
+            "digest-1",
+            "user-1",
+        )
+        .is_err());
+        assert!(validate_exact_replan_decision(
+            &decision,
+            "task-1",
+            "replan-1",
+            4,
+            "request-1",
+            "other-artifact",
+            "digest-1",
+            "user-1",
+        )
+        .is_err());
+        let mut rejected = decision.clone();
+        rejected.answered_option_id = Some("reject".to_owned());
+        assert!(validate_exact_replan_decision(
+            &rejected,
+            "task-1",
+            "replan-1",
+            4,
+            "request-1",
+            "artifact-1",
+            "digest-1",
+            "user-1",
+        )
+        .is_err());
+        assert!(validate_exact_replan_decision(
+            &decision,
+            "task-1",
+            "replan-1",
+            4,
+            "request-1",
+            "artifact-1",
+            "digest-1",
+            "different-user",
+        )
+        .is_err());
     }
 }
 

@@ -1437,7 +1437,7 @@ se congelan una vez desde el Execution exacto.
 |---|---|---|
 | M1 | `TaskRepository { task_id: String, repo_id: String, role: TaskRepositoryRole, position: i64, created_at: String }`; `TaskRepositoryWrite { repo_id: String, role: TaskRepositoryRole }`; `WorkUnitRepositoryScope { work_unit_id: String, task_id: String, repo_id: String, created_at: String }`. `TaskRepo::list_repositories(&self, task_id: &str) -> db::Result<Vec<TaskRepository>>`; `replace_repositories_in_tx(&self, tx: &mut Transaction<'_, Sqlite>, task_id: &str, expected_version: i64, rows: &[TaskRepositoryWrite], updated_at: &str) -> db::Result<Task>`. `WorkUnitRepo::list_repository_ids(&self, work_unit_id: &str) -> db::Result<Vec<String>>`; `CreateTask.repositories: Vec<TaskRepositoryWrite>` y `CreateWorkUnit.repository_ids: Vec<String>` se materializan en las transacciones existentes. `TaskService::create_task_with_repositories(&self, project_id: impl Into<String>, title: impl Into<String>, description: Option<String>, parent_task_id: Option<String>, priority: Option<i64>, repositories: Option<Vec<TaskRepositoryWrite>>, initial_lifecycle_state: Option<TaskLifecycleState>, merge_config: Option<Value>) -> services::Result<Task>`; `replace_task_repositories(&self, task_id: &str, expected_version: i64, repositories: Vec<TaskRepositoryWrite>) -> services::Result<Task>` (409 tras Execution, salvo replan autorizado). `UpdateProject.primary_repo_id: Option<Option<String>>`; `ProjectRepositoryService::update_primary_repo(&self, project_id: &str, expected_version: i64, primary_repo_id: Option<String>, caller_user_id: &str) -> services::Result<Project>`; mantiene `ProjectRepo::update_at_version`. | `crates/db/src/models.rs`, `crates/db/src/repository.rs`, `crates/db/src/sqlite/task.rs`, `crates/db/src/sqlite/project.rs`, `crates/db/src/sqlite/work_unit.rs`, `crates/services/src/task_service/create.rs`, nuevo `crates/services/src/task_service/repositories.rs`, `crates/services/src/task_service.rs`, nuevo `crates/services/src/project_repository_service.rs`, `crates/services/src/lib.rs`, `crates/services/src/work_unit_service.rs`. |
 | M2 | `WorkspaceGroup { id, task_id, work_unit_id, root_path, created_at }`; `WorkspaceScope.workspace_group_id: Option<String>`; `TaskRepositoryContextSnapshot { task_id, repo_id, commit_sha, captured_at }`; `ExecutionRepositoryResult { execution_id, task_id, repo_id, workspace_id, before_sha: Option<String>, after_sha: Option<String>, snapshot_digest: Option<String>, created_at }`; `CreateWorkUnitWorkspace.workspace_group_id: String`; `CreateWorkUnitExecution.workspace_leases: Vec<CreateWorkspaceLease>` (sustituye el actual `Option` singular). `WorkspaceRepo::create_group_for_work_unit(&self, input: CreateWorkspaceGroup) -> db::Result<WorkspaceGroup>` y `get_group_by_work_unit_id(&self, work_unit_id: &str) -> db::Result<Option<WorkspaceGroup>>`; `WorkUnitWorkspaceRepo::list_by_work_unit_id(&self, work_unit_id: &str) -> db::Result<Vec<Workspace>>`; `WorkspaceLeaseRepo::list_active_for_work_unit(&self, work_unit_id: &str) -> db::Result<Vec<WorkspaceLease>>` y `get_active_for_execution_workspace(&self, execution_id: &str, workspace_id: &str) -> db::Result<Option<WorkspaceLease>>`; `TaskRepo::pin_context_repository_snapshot(&self, input: CreateTaskRepositoryContextSnapshot) -> db::Result<TaskRepositoryContextSnapshot>` (insert-or-return del primer pin); `ExecutionRepo::record_repository_results(&self, execution_id: &str, rows: &[ExecutionRepositoryResult]) -> db::Result<Vec<ExecutionRepositoryResult>>` y `list_repository_results(&self, execution_id: &str) -> db::Result<Vec<ExecutionRepositoryResult>>`; `WorkUnitRepo::create_with_review_subject_repositories(&self, input: CreateWorkUnit, subject: CreateWorkUnitReviewSubject, repositories: &[WorkUnitReviewSubjectRepository], event: CreateDomainEvent) -> db::Result<CollaborationWrite<WorkUnit>>`, `list_review_subject_repositories(&self, work_unit_id: &str) -> db::Result<Vec<WorkUnitReviewSubjectRepository>>`, `freeze_review_subject_repositories(&self, review_work_unit_id: &str, rows: &[WorkUnitReviewSubjectRepository]) -> db::Result<Vec<WorkUnitReviewSubjectRepository>>`, `list_result_requirement_repositories(&self, work_unit_id: &str) -> db::Result<Vec<WorkUnitResultRequirementRepository>>` y `insert_result_requirement_repositories_in_tx(&self, tx: &mut Transaction<'_, Sqlite>, rows: &[WorkUnitResultRequirementRepository]) -> db::Result<()>`. `WorkUnitService::prepare_workspace_group(&self, source: CollaborationActorSource, work_unit_id: &str) -> services::Result<WorkspaceGroup>`; `TaskService::record_execution_repository_results(&self, execution_id: &str) -> services::Result<Vec<ExecutionRepositoryResult>>`; `ValidationService::run_for_repository(&self, task_id: &str, repo_id: &str, check_key: &str, workspace_id: &str, commit_sha: &str) -> services::Result<ValidationRun>`. `EnqueueCheckRequest.repo_id: String` y `ValidationSubject.repo_id: String` seleccionan el miembro exacto de `(repo_id, check_key)`; `ValidationRunResponse` añade `repo_id: String` resuelto del Workspace exacto. | `crates/db/migrations/V182__multirepo_workspaces_results.sql`, `crates/db/src/models.rs`, `crates/db/src/repository.rs`, `crates/db/src/sqlite/task.rs`, `crates/db/src/sqlite/workspace.rs`, `crates/db/src/sqlite/work_unit.rs`, `crates/db/src/sqlite/workspace_lease.rs`, `crates/db/src/sqlite/execution.rs`, `crates/db/src/tests.rs`, `crates/services/src/task_service/workspace.rs`, `crates/services/src/task_service/execution/runner.rs`, `crates/services/src/work_unit_service.rs`, `crates/services/src/validation_service.rs`, `crates/services/src/validation_check_runner.rs`, `crates/services/src/task_coordination/turn_outputs.rs`, `crates/services/src/validation_post_integration.rs`, `crates/services/src/coordinator_outputs/validation_request.rs`, `crates/services/src/coordinator_outputs/tests.rs`, `crates/services/src/collaboration_service.rs`, `crates/api-types/src/execution.rs`, `crates/api-types/src/work_unit.rs`, `crates/api-types/src/task_dispatch.rs`, `crates/api-types/src/review_validation.rs`, `crates/api/src/routes/work_units.rs`, `crates/api/src/routes/work_unit_reviews.rs`, `crates/api/src/routes/reviews.rs`. |
-| M3 | `TaskRepositoryMergeBatch { id: String, task_id: String, gate_evaluation_id: String, repository_set_digest: Option<String>, state: TaskRepositoryMergeBatchState, version: i64, created_at: String, updated_at: String }`; `TaskRepositoryMergeBatchRepoRow { batch_id: String, task_id: String, repo_id: String, position: i64, state: TaskRepositoryMergeBatchRepoState, work_unit_integration_id: Option<String>, task_merge_operation_id: Option<String>, pr_metadata_id: Option<String>, before_sha: Option<String>, after_sha: Option<String>, created_at: String, updated_at: String }`. `TaskIntegrationOperation` gains `repo_id: Option<String>` y `repository_merge_batch_id: Option<String>`; `PrMetadata.repo_id: Option<String>` (NULL solo para metadata histórica no admitida); `RemotePrAdmission.repo_id: String` (todo histórico se asocia en V183; los inserts nuevos no admiten NULL). `TaskRepositoryMergeBatchRepo::create(&self, batch: &TaskRepositoryMergeBatch, repos: &[TaskRepositoryMergeBatchRepoRow]) -> db::Result<TaskRepositoryMergeBatch>`; `transition_repo(&self, batch_id: &str, repo_id: &str, expected_version: i64, state: TaskRepositoryMergeBatchRepoState, work_unit_integration_id: Option<&str>, task_merge_operation_id: Option<&str>, pr_metadata_id: Option<&str>, before_sha: Option<&str>, after_sha: Option<&str>) -> db::Result<TaskRepositoryMergeBatchRepoRow>`. `PrMetadataRepo::list_by_task(&self, task_id: &str) -> db::Result<Vec<PrMetadata>>`; `get_by_task_repo(&self, task_id: &str, repo_id: &str) -> db::Result<Option<PrMetadata>>`; retires ambiguous `get_by_task_id`. `TaskIntegrationOperationManager::integrate_repositories(&self, task_id: &str, gate_evaluation_id: &str, ordered_repo_ids: &[String], idempotency_key: &str) -> services::Result<Vec<TaskRepositoryIntegrationResult>>`; `PrService::list_task_prs(&self, task_id: &str) -> services::Result<Vec<TaskRepositoryPrStatus>>`; `GateEngine::evaluate_required_checks_by_repo(&self, task_id: &str, repository_results: &[ExecutionRepositoryResult]) -> services::Result<GateEvaluation>`; `ProjectPlanService::verify_handoffs_by_repository(&self, predecessor_task_id: &str, successor_task_id: &str) -> services::Result<Vec<ProjectPlanRepositoryHandoff>>`. TaskLifecycle Merging fija `reason_kind = "task_repository_merge_batch"`, `reason_ref = batch.id`; no cambia su autoridad. | `crates/db/src/models.rs`, `crates/db/src/repository.rs`, `crates/db/src/sqlite.rs` (registro de módulo), nuevo `crates/db/src/sqlite/task_repository_merge_batch.rs`, `crates/db/src/sqlite/task_integration_operation.rs`, `crates/db/src/sqlite/pr_metadata.rs`, `crates/services/src/task_integration_operation.rs`, `crates/services/src/merge_service.rs`, `crates/services/src/pr_service.rs`, `crates/services/src/pr_feedback.rs`, `crates/services/src/gate_engine.rs`, `crates/services/src/validation_service.rs`, `crates/services/src/project_plan.rs`, `crates/services/src/task_coordination/replan.rs`, `crates/services/src/replan_classifier.rs`, `crates/services/src/task_lifecycle.rs`, `crates/api-types/src/task_repositories.rs`, `crates/api-types/src/integration.rs`, `crates/api-types/src/pr_feedback.rs`, `crates/api-types/src/public_events.rs`, `crates/api/src/routes/tasks/gates.rs`, `crates/api/src/routes/pr_feedback.rs`, `crates/api/src/routes/events.rs`. |
+| M3 | `TaskRepositoryMergeBatch { id: String, task_id: String, gate_evaluation_id: String, repository_set_revision: i64, repository_set_digest: Option<String>, state: TaskRepositoryMergeBatchState, version: i64, created_at: String, updated_at: String }`; `TaskRepositoryMergeBatchRepoRow { batch_id: String, task_id: String, repository_set_revision: i64, repo_id: String, position: i64, state: TaskRepositoryMergeBatchRepoState, work_unit_integration_id: Option<String>, task_merge_operation_id: Option<String>, pr_metadata_id: Option<String>, before_sha: Option<String>, after_sha: Option<String>, created_at: String, updated_at: String }`. `TaskIntegrationOperation` gains `repo_id: Option<String>` y `repository_merge_batch_id: Option<String>`; `PrMetadata.repo_id: Option<String>` (NULL solo para metadata histórica no admitida); `RemotePrAdmission.repo_id: Option<String>` (NULL solo se conserva para admisiones históricas sin identidad verificable; los inserts nuevos requieren repo_id). `TaskRepositoryMergeBatchRepo::create(&self, batch: &TaskRepositoryMergeBatch, repos: &[TaskRepositoryMergeBatchRepoRow]) -> db::Result<TaskRepositoryMergeBatch>`; `transition_repo(&self, batch_id: &str, repo_id: &str, expected_version: i64, state: TaskRepositoryMergeBatchRepoState, work_unit_integration_id: Option<&str>, task_merge_operation_id: Option<&str>, pr_metadata_id: Option<&str>, before_sha: Option<&str>, after_sha: Option<&str>) -> db::Result<TaskRepositoryMergeBatchRepoRow>`. `PrMetadataRepo::list_by_task(&self, task_id: &str) -> db::Result<Vec<PrMetadata>>`; `get_by_task_repo(&self, task_id: &str, repo_id: &str) -> db::Result<Option<PrMetadata>>`; retires ambiguous `get_by_task_id`. `TaskIntegrationOperationManager::integrate_repositories(&self, task_id: &str, gate_evaluation_id: &str, ordered_repo_ids: &[String], idempotency_key: &str) -> services::Result<Vec<TaskRepositoryIntegrationResult>>`; `PrService::list_task_prs(&self, task_id: &str) -> services::Result<Vec<TaskRepositoryPrStatus>>`; `GateEngine::evaluate_required_checks_by_repo(&self, task_id: &str, repository_results: &[ExecutionRepositoryResult]) -> services::Result<GateEvaluation>`; `ProjectPlanService::verify_handoffs_by_repository(&self, predecessor_task_id: &str, successor_task_id: &str) -> services::Result<Vec<ProjectPlanRepositoryHandoff>>`. TaskLifecycle Merging fija `reason_kind = "task_repository_merge_batch"`, `reason_ref = batch.id`; no cambia su autoridad. | `crates/db/src/models.rs`, `crates/db/src/repository.rs`, `crates/db/src/sqlite.rs` (registro de módulo), nuevo `crates/db/src/sqlite/task_repository_merge_batch.rs`, `crates/db/src/sqlite/task_integration_operation.rs`, `crates/db/src/sqlite/pr_metadata.rs`, `crates/services/src/task_integration_operation.rs`, `crates/services/src/merge_service.rs`, `crates/services/src/pr_service.rs`, `crates/services/src/pr_feedback.rs`, `crates/services/src/gate_engine.rs`, `crates/services/src/validation_service.rs`, `crates/services/src/project_plan.rs`, `crates/services/src/task_coordination/replan.rs`, `crates/services/src/replan_classifier.rs`, `crates/services/src/task_lifecycle.rs`, `crates/api-types/src/task_repositories.rs`, `crates/api-types/src/integration.rs`, `crates/api-types/src/pr_feedback.rs`, `crates/api-types/src/public_events.rs`, `crates/api/src/routes/tasks/gates.rs`, `crates/api/src/routes/pr_feedback.rs`, `crates/api/src/routes/events.rs`. |
 
 Tipos de retorno M3 definidos en sus módulos de servicio: `TaskRepositoryIntegrationResult { repo_id: String, state: TaskRepositoryMergeBatchRepoState, work_unit_integration_id: Option<String>, before_sha: Option<String>, after_sha: Option<String> }`; `TaskRepositoryPrStatus { repo_id: String, pr_metadata_id: String, provider_pr_id: Option<String>, pr_url: Option<String>, pr_state: String, merge_status: String, admission_status: String }`; `ProjectPlanRepositoryHandoff { repo_id: String, predecessor_commit_sha: Option<String>, successor_base_sha: Option<String>, ancestry_verified: bool }`.
 
@@ -1479,14 +1479,18 @@ Requests nuevos/modificados en `crates/api-types` mantienen
   TaskRepositoryRole }` deriva los mismos traits con
   `#[serde(deny_unknown_fields)]` y `#[ts(export)]`. Responses:
   `TaskRepositoryResponse { repo_id: String, role: TaskRepositoryRole,
-  position: i64, merge: Option<TaskRepositoryMergeResponse>, pull_request:
-  Option<TaskRepositoryPullRequestResponse> }`; merge lleva
-  `{ batch_id: String, state: TaskRepositoryMergeState,
+  position: i64, change_state: TaskRepositoryChangeState,
+  integration: Option<TaskRepositoryIntegrationResponse>,
+  merge: Option<TaskRepositoryMergeResponse>,
+  pull_request: Option<TaskRepositoryPullRequestResponse> }`; integration lleva
+  `{ repo_id: String, integration_id: Option<String>, outcome: String,
+  before_sha: Option<String>, after_sha: Option<String> }`; merge lleva
+  `{ batch_id: String, repo_id: String, state: TaskRepositoryMergeState,
   integration_id: Option<String>, task_merge_operation_id: Option<String>,
   pr_metadata_id: Option<String>, before_sha: Option<String>,
   after_sha: Option<String> }`;
-  `TaskRepositoryPullRequestResponse { pr_metadata_id: String,
-  provider_type: String, provider_pr_id: Option<String>, pr_url: Option<String>,
+  `TaskRepositoryPullRequestResponse { repo_id: String, admission_id: Option<String>,
+  pr_metadata_id: String, provider_type: String, provider_pr_id: Option<String>, pr_url: Option<String>,
   pr_state: String, merge_status: String, admission_status: String }`.
   `position` lleva `#[ts(type = "number")]`; responses derivan
   `Serialize, Deserialize, TS` + `#[ts(export)]`. Ninguno incluye credential
@@ -1495,20 +1499,20 @@ Requests nuevos/modificados en `crates/api-types` mantienen
   valores `pending|integrating|integrated|publishing|open|merged|conflict|
   closed|failed`; `TaskRepositoryMergeBatchState` usa
   `integrating|publishing|open|completed|blocked|failed`.
-  `MergeAfterGateResponse` en `gates.rs` añade
-  `repository_merge_batch: Option<TaskRepositoryMergeBatchResponse>` con
-  `#[serde(default)]`, `#[ts(optional = nullable)]`; el batch es
-  `{ id: String, task_id: String, gate_evaluation_id: String,
-  repository_set_digest: Option<String>, state: TaskRepositoryMergeBatchState,
-  version: i64, repositories: Vec<TaskRepositoryMergeRepoResponse> }`. Cada repo
-  expone `{ repo_id: String, position: i64, state: TaskRepositoryMergeState,
-  work_unit_integration_id: Option<String>, task_merge_operation_id:
-  Option<String>, pr_metadata_id: Option<String>, before_sha: Option<String>,
-  after_sha: Option<String> }`; positions/version son TS number y los arrays
-  responses llevan `#[serde(default)]`.
+  `MergeAfterGateResponse` en `gates.rs` conserva sus campos escalares y añade
+  `repository_merge_batch_id: Option<String>` y
+  `repositories: Vec<TaskRepositoryMergeResponse>`; ambos tienen
+  `#[serde(default)]`. El batch completo se proyecta en `TaskResponse` con
+  `TaskRepositoryMergeBatchResponse { id, task_id, gate_evaluation_id,
+  repository_set_revision, state, version, repositories, created_at, updated_at }`;
+  cada fila incluye `batch_id`, `repo_id`, estado, integración, operación, metadata
+  PR y SHA anterior/posterior. Los campos escalares de la respuesta de merge
+  siguen representando el repo primary.
 - `TaskResponse.repositories: Vec<TaskRepositoryResponse>` en
-  `execution.rs`, con `#[serde(default)]`; `repo_id: Option<String>` sigue
-  siendo el espejo primary. `CreateWorkUnitRequest.repository_ids:
+  `execution.rs`, con `#[serde(default)]`; `repository_set_revision: i64`,
+  `repository_set_digest: Option<String>` y el historial
+  `repository_merge_batches` se exponen; `repo_id: Option<String>` sigue siendo
+  el espejo primary. `CreateWorkUnitRequest.repository_ids:
   Option<Vec<String>>` en `work_unit.rs`, `#[serde(default)]` y
   `#[ts(optional = nullable)]`; vacío/omitido significa todos los repos
   escribibles. `WorkUnitResponse.repository_ids: Vec<String>` lleva
@@ -1582,8 +1586,11 @@ autoridad nueva.
 `execution.repository_results_recorded` ({task_id, execution_id,
 repository_results}), `work_unit.repository_integration_changed`
 ({task_id, work_unit_id, repo_id, integration_id, outcome, version}) y
-`task.repository_pr_status_changed` ({task_id, repo_id, pr_metadata_id,
-task_merge_operation_id, state, merge_status}). Añadir repo_id a eventos
+`task.repository_merge_batch_changed` ({task_id, repo_id, repository_revision,
+repository_merge_batch_id, integration_id, admission_id, state, batch_state,
+version}) y `task.repository_pr_status_changed` ({task_id, repo_id,
+repository_revision, repository_merge_batch_id, admission_id, pr_metadata_id,
+state, admission_status, pr_state, version}). Añadir repo_id a eventos
 existentes de integración, feedback/rework y external action. No publicar body
 de feedback, secretos, rutas ni texto provider no confiable.
 
@@ -2742,7 +2749,7 @@ RepositoryIntegrationResult {
 MergeService::merge_after_gate(
     task_id: &str,
     gate_evaluation_id: &str,
-) -> services::Result<TaskRepositoryMergeBatch>;
+) -> services::Result<MergeAfterGateResult>; // batch + primary legacy outcome
 PrService::list_task_prs(task_id: &str) -> services::Result<Vec<TaskRepositoryPrStatus>>;
 // Every provider mutation/query takes or resolves this exact durable key.
 RemotePrAdmissionKey { admission_id: String, task_id: String, repo_id: String };
@@ -2771,10 +2778,12 @@ por repo y escribe un transition usando la GateEvaluation/batch exactos. Una
 replan aprobada materializa revisión nueva y WUs nuevos en la misma transacción;
 el PATCH directo conserva `409 task.repositories.replan_required`.
 
-### Filtros CI que se incorporan en `build-local-linux.yml`
+### Filtros CI requeridos (incorporados en la integración)
 
-Agregar estos filtros junto a los filtros M1/M2 (actualmente líneas 222–248).
-Son criterios para el futuro cambio; no se ejecutaron en este freeze.
+Los grupos siguientes están incorporados en `build-local-linux.yml`, junto a
+los filtros M1/M2. El workflow también cubre el regresivo API de lifecycle y
+deja los tests web nombrados bajo su paso `pnpm test`; ningún filtro se ejecutó
+en esta integración.
 
 ```yaml
 - if: ${{ !cancelled() }}
@@ -2811,11 +2820,10 @@ Son criterios para el futuro cambio; no se ejecutaron en este freeze.
   run: cargo test --locked -p mcp-server --lib multirepo_lifecycle_
 ```
 
-Los workflow steps reales deben retener el guard local vigente
-`if: ${{ !cancelled() }}` y formato `run:`; web añade los tests de componentes
-al `pnpm test`/e2e existente, no un lockfile ni un package manager nuevo.
+Los workflow steps conservan el guard `if: ${{ !cancelled() }}` y formato
+`run:`; los tests web nombrados quedan bajo `pnpm test`/e2e existente.
 
-### Cierre del freeze
+### Cierre del freeze M0 (estado anterior a M3)
 
 - **PASS**: contratos M0 de M3 contrastados con modelos, repositorios, rutas,
   servicios y ownership M1/M2; discrepancias y firmas congeladas arriba.
@@ -2827,3 +2835,35 @@ al `pnpm test`/e2e existente, no un lockfile ni un package manager nuevo.
 - **NO-GO para implementar desde el borrador M0**: usar la definición SQL V183
   corregida de esta sección y respetar el ownership/test naming antes de abrir
   las lanes.
+
+### Anexo M3 — integración
+
+- **Integrado**: V183 y los repositorios DB; integración WorkUnit por repo,
+  checks/Gate por los repositorios cambiados, batch de merge y admisiones PR
+  exactas por repo, feedback/rework/acciones asociadas a su repo, dependencias
+  entre Tasks, replan aprobado con prueba Human exacta, REST/MCP/SSE/web y sus
+  contratos generados. Los eventos de batch y estado PR incluyen los IDs de
+  Task, repo, revisión, batch y admisión cuando ya existe la admisión.
+- **Writer de revisión**: `TaskRepositorySetRepo::create_revision` y
+  `create_revision_in_tx` generan la siguiente revisión bajo la comparación de
+  revisión/digest esperada. PATCH y replan comparten ese writer; en replan se
+  valida la decisión Human dentro de la misma transacción que crea la revisión
+  y fija los WorkUnits.
+- **Orden de lifecycle**: el camino de un repo conserva el recibo
+  `ReadyToMerge` anterior a la operación. Para varios repos, primero se crea el
+  batch exacto desde `Active`; las operaciones hijas enlazan el lifecycle a
+  `Merging` con `reason_ref = batch.id`. La preparación del batch deja fuera los
+  repositorios sin cambios; se representan como `unchanged`, sin PR ni checks.
+  Los conflictos directos siguen devolviendo `details` y `files` en la respuesta
+  escalar compatible.
+- **Desviación**: el formato actual del plan de WorkUnits no expresa un nuevo
+  conjunto de repositorios. Una replan aprobada que cambia alcance/autoridad
+  crea atómicamente una nueva revisión del conjunto actual, prueba la decisión
+  Human contra el Artifact/digest/request exactos y fija allí los WorkUnits
+  materializados. La edición del conjunto sigue pasando por PATCH directo antes
+  de Execution o requerirá una extensión explícita del formato de plan.
+- **Riesgos residuales**: Cargo, pnpm y CI quedan pendientes para CI, conforme a
+  la instrucción de esta integración; los flujos provider multi-repo requieren
+  la validación de CI para cerrar la evidencia de publicación parcial,
+  reconciliación y reintento. El estado local de estos cambios es fuente
+  integrada sin commit.

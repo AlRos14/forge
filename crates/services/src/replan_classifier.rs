@@ -22,8 +22,21 @@ pub struct ReplanOriginalScope {
     pub team_actors: BTreeSet<String>,
     pub existing_work_units: usize,
     pub original_work_unit_scopes: Vec<String>,
+    /// Exact immutable repository-set revision captured when this replan was proposed.
+    #[serde(default)]
+    pub repository_set_revision: i64,
+    #[serde(default)]
+    pub repository_set_digest: Option<String>,
+    /// Re-read before classification and materialization; never inferred from Task.repo_id.
+    #[serde(default)]
+    pub current_repository_set_revision: i64,
+    #[serde(default)]
+    pub current_repository_set_digest: Option<String>,
+    /// Legacy scalar fields remain readable for persisted pre-M3 replan briefs.
+    #[serde(default)]
     pub repo_id: Option<String>,
     /// Repository identity measured again when the plan is classified.
+    #[serde(default)]
     pub current_repo_id: Option<String>,
 }
 
@@ -41,6 +54,7 @@ pub struct ReplanClassificationFacts {
     pub work_units_within_limit: bool,
     pub work_units_total: usize,
     pub max_work_units: usize,
+    pub repository_set_unchanged: bool,
     pub repositories_within_original: bool,
     pub paths_within_original: bool,
     pub no_new_envelope_flags: bool,
@@ -89,7 +103,15 @@ pub fn classify_replan(
         .iter()
         .flat_map(|item| path_tokens(&item.scope))
         .all(|path| path_within(&path, &original_paths));
-    let repositories_within_original = original.current_repo_id == original.repo_id
+    let repository_set_unchanged = if original.repository_set_revision == 0 {
+        // Persisted pre-M3 replan snapshots only had the legacy primary ID.
+        original.repo_id == original.current_repo_id
+    } else {
+        original.repository_set_revision == original.current_repository_set_revision
+            && original.repository_set_digest == original.current_repository_set_digest
+    };
+    let repositories_within_original = repository_set_unchanged
+        && original.current_repo_id == original.repo_id
         && items
             .iter()
             .all(|item| !item.requires_integration || original.repo_id.is_some());
@@ -102,6 +124,7 @@ pub fn classify_replan(
             && envelope.max_work_units <= original.original_envelope.max_work_units,
         work_units_total,
         max_work_units: envelope.max_work_units,
+        repository_set_unchanged,
         repositories_within_original,
         paths_within_original,
         no_new_envelope_flags,
@@ -224,6 +247,10 @@ mod tests {
             team_actors: ["agent:a".to_owned()].into_iter().collect(),
             existing_work_units: 1,
             original_work_unit_scopes: vec!["src/".to_owned()],
+            repository_set_revision: 1,
+            repository_set_digest: Some("revision-one-digest".to_owned()),
+            current_repository_set_revision: 1,
+            current_repository_set_digest: Some("revision-one-digest".to_owned()),
             repo_id: Some("repo".to_owned()),
             current_repo_id: Some("repo".to_owned()),
         }
@@ -270,7 +297,7 @@ mod tests {
         assert_eq!(result.classification, ReplanClassification::WithinEnvelope);
         assert_eq!(
             result.classification_facts_json(),
-            r#"{"objective_digest_unchanged":true,"roles_within_team":true,"actors_within_team":true,"work_units_within_limit":true,"work_units_total":2,"max_work_units":2,"repositories_within_original":true,"paths_within_original":true,"no_new_envelope_flags":true,"plan_items":1}"#
+            r#"{"objective_digest_unchanged":true,"roles_within_team":true,"actors_within_team":true,"work_units_within_limit":true,"work_units_total":2,"max_work_units":2,"repository_set_unchanged":true,"repositories_within_original":true,"paths_within_original":true,"no_new_envelope_flags":true,"plan_items":1}"#
         );
     }
 
@@ -357,6 +384,24 @@ mod tests {
             result.classification,
             ReplanClassification::ScopeOrAuthorityChange
         );
+    }
+
+    #[test]
+    fn multirepo_replan_classifier_detects_repository_revision_changes() {
+        let mut original = original();
+        original.current_repository_set_revision = 2;
+        original.current_repository_set_digest = Some("revision-two-digest".to_owned());
+        let result = classify_replan(
+            &plan("src/module.rs", "implementer", None),
+            &base_envelope(),
+            &original,
+        );
+        assert_eq!(
+            result.classification,
+            ReplanClassification::ScopeOrAuthorityChange
+        );
+        assert!(!result.facts.repository_set_unchanged);
+        assert!(!result.facts.repositories_within_original);
     }
 
     #[test]

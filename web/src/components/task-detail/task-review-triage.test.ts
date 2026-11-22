@@ -8,21 +8,19 @@ import type {
 } from '@/types/generated'
 import { deriveReviewFindingsProjection } from './task-review-triage'
 
-function overview(
-  {
-    triages = [],
-    dispatchState = 'idle',
-    lifecycleState = 'active',
-    revokedAt = null,
-    batchState = null,
-  }: {
-    triages?: TaskReviewTriageResponse[]
-    dispatchState?: 'idle' | 'paused' | 'cancelled'
-    lifecycleState?: TaskCoordinationOverviewResponse['lifecycle']['state']
-    revokedAt?: string | null
-    batchState?: string | null
-  } = {},
-): TaskCoordinationOverviewResponse {
+function overview({
+  triages = [],
+  dispatchState = 'idle',
+  lifecycleState = 'active',
+  revokedAt = null,
+  batchState = null,
+}: {
+  triages?: TaskReviewTriageResponse[]
+  dispatchState?: 'idle' | 'paused' | 'cancelled'
+  lifecycleState?: TaskCoordinationOverviewResponse['lifecycle']['state']
+  revokedAt?: string | null
+  batchState?: string | null
+} = {}): TaskCoordinationOverviewResponse {
   return {
     task_id: 'task-1',
     task_version: 4,
@@ -92,7 +90,12 @@ function request(
     authorization_version: 3,
     objective_digest: 'objective-digest',
     request_digest: 'request-digest',
-    brief: { objective: 'Review exact findings', constraints: null, acceptance_criteria: [], context: null },
+    brief: {
+      objective: 'Review exact findings',
+      constraints: null,
+      acceptance_criteria: [],
+      context: null,
+    },
     wake_id: 'wake-1',
     execution_id: overrides.execution_id ?? null,
     plan_artifact_id: null,
@@ -133,14 +136,12 @@ function triage(
   }
 }
 
-function workUnit(
-  id: string,
-  overrides: Partial<WorkUnitResponse> = {},
-): WorkUnitResponse {
+function workUnit(id: string, overrides: Partial<WorkUnitResponse> = {}): WorkUnitResponse {
   return {
     id,
     task_id: 'task-1',
     repository_ids: [],
+    integrations: [],
     parent_work_unit_id: null,
     title: 'Recheck exact result',
     scope: 'Same frozen result',
@@ -202,7 +203,9 @@ describe('review findings continuation projection', () => {
     expect(projection?.reportId).toBe('review-report-1')
     expect(projection?.producerExecutionId).toBe('reviewer-execution-1')
     expect(projection?.action.owner).toBe('Coordinator Agent')
-    expect(projection?.action.detail).toMatch(/No disposition, correction, or Gate result is inferred/)
+    expect(projection?.action.detail).toMatch(
+      /No disposition, correction, or Gate result is inferred/,
+    )
   })
 
   it('fails closed when the triaged request does not match the coordinator execution receipt', () => {

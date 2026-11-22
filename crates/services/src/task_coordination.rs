@@ -13,8 +13,9 @@ use db::{
     TaskCoordinationRequest, TaskCoordinationRequestKind, TaskCoordinationRequestState,
     TaskCoordinationWrite, TaskIntervention, TaskInterventionKind, TaskInterventionState,
     TaskLifecycleRepo, TaskLifecycleState, TaskQualityCategory, TaskQualityRequest,
-    TaskQualityState, TaskQualityTargetKind, TaskRepo, TaskRoleRepo, UserRepo,
-    MAX_MICRO_FIX_CHANGED_LINES, MAX_MICRO_FIX_FILES, MAX_MICRO_FIX_PER_TASK,
+    TaskQualityState, TaskQualityTargetKind, TaskRepo, TaskRepositoryRole, TaskRepositorySetRepo,
+    TaskRepositoryWrite, TaskRoleRepo, UserRepo, MAX_MICRO_FIX_CHANGED_LINES, MAX_MICRO_FIX_FILES,
+    MAX_MICRO_FIX_PER_TASK,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -732,6 +733,15 @@ pub struct MaterializeOutcome {
     pub replayed: bool,
     pub launch_intent_accepted: bool,
     pub launch_blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPlanRepositoryHandoff {
+    pub repo_id: String,
+    pub predecessor_commit_sha: Option<String>,
+    pub successor_base_sha: Option<String>,
+    pub ancestry_verified: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2348,6 +2358,41 @@ impl TaskCoordinationService {
             true,
         )
         .await?;
+        let coordinator_replan_decision = self
+            .validate_replan_materialization_decision(
+                &request,
+                artifact_id,
+                &plan.plan_digest,
+                user_id,
+            )
+            .await?;
+        let current_repository_set = TaskRepositorySetRepo::get_current(&*self.db, &task.id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("Task has no current repository-set revision")
+            })?;
+        let repository_set_revision_change =
+            coordinator_replan_decision
+                .as_ref()
+                .map(|proof| db::CreateTaskRepositorySetRevision {
+                    task_id: task.id.clone(),
+                    expected_current_revision: current_repository_set.revision,
+                    expected_current_digest: current_repository_set.digest.clone(),
+                    repositories: current_repository_set
+                        .repositories
+                        .iter()
+                        .map(|repository| TaskRepositoryWrite {
+                            repo_id: repository.repo_id.clone(),
+                            role: repository.role,
+                        })
+                        .collect(),
+                    source_kind: "coordinator_replan".to_owned(),
+                    source_ref: Some(proof.replan_id.clone()),
+                    decision_id: None,
+                    human_decision_request_id: Some(proof.decision_id.clone()),
+                    force_new_revision: true,
+                    created_at: now_rfc3339(),
+                });
         if task.version != input.expected_task_version || parsed.task_version != task.version {
             return Err(db::DbError::TaskVersionConflict {
                 expected: input.expected_task_version,
@@ -2463,6 +2508,10 @@ impl TaskCoordinationService {
                 expected_plan_version: plan.version,
                 task_version_before: task.version,
                 expected_request_version: request.version,
+                expected_repository_set_revision: current_repository_set.revision,
+                expected_repository_set_digest: current_repository_set.digest.clone(),
+                repository_set_revision_change,
+                coordinator_replan_decision,
                 work_units,
                 receipt_digest,
                 created_by: user_id.to_owned(),
@@ -2754,8 +2803,9 @@ impl TaskCoordinationService {
             false,
         )
         .await?;
-        let replan_classification =
-            self.replan_classification(request, &parsed, &envelope, &task)?;
+        let replan_classification = self
+            .replan_classification(request, &parsed, &envelope, &task)
+            .await?;
         let within_envelope = self.is_within_envelope(&envelope, &parsed);
         let plan_digest = sha256_hex(output.as_bytes());
         let artifact_id = new_uuid_v4();

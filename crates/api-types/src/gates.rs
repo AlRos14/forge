@@ -176,4 +176,8 @@ pub struct MergeAfterGateResponse {
     pub target_branch: Option<String>,
     pub details: Option<String>,
     pub files: Vec<String>,
+    #[serde(default)]
+    pub repository_merge_batch_id: Option<String>,
+    #[serde(default)]
+    pub repositories: Vec<crate::TaskRepositoryMergeResponse>,
 }

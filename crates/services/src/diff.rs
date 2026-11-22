@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::Path, process::Stdio, sync::Arc};
 
 use api_types::{DiffFileStatus, DiffResponse, DiffStats, FileDiffSummary};
-use db::{RepoRepo, SqliteDb, Workspace, WorkspaceRepo, WorkspaceStatus};
+use db::{RepoRepo, SqliteDb, TaskRepositorySetRepo, Workspace, WorkspaceRepo, WorkspaceStatus};
 use tokio::process::Command;
 
 use crate::{Result, ServiceError};
@@ -17,9 +17,19 @@ impl DiffService {
     }
 
     pub async fn task_diff(&self, task_id: &str) -> Result<DiffResponse> {
-        let workspace = WorkspaceRepo::get_integration_by_task_id(&*self.db, task_id)
+        let repository_set = TaskRepositorySetRepo::get_current(&*self.db, task_id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("workspace", task_id.to_owned()))?;
+            .ok_or_else(|| ServiceError::not_found("task repository-set revision", task_id))?;
+        let primary_repo_id = repository_set
+            .repositories
+            .iter()
+            .find(|repository| repository.role == db::TaskRepositoryRole::Primary)
+            .map(|repository| repository.repo_id.as_str())
+            .ok_or_else(|| ServiceError::not_found("primary repository", task_id.to_owned()))?;
+        let workspace =
+            WorkspaceRepo::get_integration_by_task_repo(&*self.db, task_id, primary_repo_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", task_id.to_owned()))?;
         self.workspace_diff(&workspace.id).await
     }
 

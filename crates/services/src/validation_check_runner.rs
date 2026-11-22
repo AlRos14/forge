@@ -177,9 +177,7 @@ async fn resolve_subject(
                     "the Task version no longer matches the requested subject",
                 ));
             }
-            WorkspaceRepo::get_integration_by_task_id(db, &task.id)
-                .await?
-                .filter(|workspace| workspace.repo_id == repo_id)
+            WorkspaceRepo::get_integration_by_task_repo(db, &task.id, repo_id).await?
         }
     }
     .filter(|workspace| {
@@ -1387,6 +1385,7 @@ mod tests {
             &fixture.seed.db,
             &EventBus::new(8),
             &fixture.task.id,
+            &fixture.seed.repo_id,
         )
         .await
         .expect("hook");
@@ -1397,6 +1396,7 @@ mod tests {
                 &fixture.seed.db,
                 &EventBus::new(8),
                 &fixture.task.id,
+                &fixture.seed.repo_id,
             )
             .await
             .expect("replay"),
@@ -1422,6 +1422,7 @@ mod tests {
                 &on_request_only.seed.db,
                 &EventBus::new(8),
                 &on_request_only.task.id,
+                &on_request_only.seed.repo_id,
             )
             .await
             .expect("hook"),

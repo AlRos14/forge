@@ -50,7 +50,10 @@ import { ActorIdentity } from '@/features/task-roles/ActorIdentity'
 import { CopyReferenceButton } from '@/components/ui/copy-reference-button'
 import { TaskCoordinationPanel } from '@/components/task-detail/task-coordination-panel'
 import { TaskPhaseThreePanel } from '@/components/task-detail/task-phase-three-panel'
-import { readRequiredChecks, validationRepositoryLabel } from '@/components/task-detail/task-verification'
+import {
+  readRequiredChecks,
+  validationRepositoryLabel,
+} from '@/components/task-detail/task-verification'
 import { TaskJourneyPanel } from '@/components/task-detail/task-journey-panel'
 import type {
   GateEvaluationResponse,
@@ -308,7 +311,14 @@ export function TaskDetailPage({
         method: 'POST',
         body: JSON.stringify({ gate_evaluation_id: evaluation.id }),
       })
-      toast.success(`Merge admission completed: ${result.outcome}`)
+      const repositoryFailures = result.repositories.filter((repository) =>
+        ['conflict', 'closed', 'failed'].includes(repository.state),
+      ).length
+      toast.success(
+        repositoryFailures
+          ? `Merge admission is partial: ${repositoryFailures} repository results need recovery`
+          : `Merge admission completed: ${result.outcome} · ${result.repositories.length} repository results`,
+      )
       await taskQuery.refetch()
     } catch (error) {
       toast.error(getApiErrorMessage(error, 'Merge admission failed'))
@@ -918,9 +928,14 @@ export function TaskDetailPage({
                         <p className="font-medium text-foreground">Required checks</p>
                         <ul className="mt-1 list-disc space-y-1 pl-5">
                           {readRequiredChecks(policy?.policy).map((check) => (
-                            <li key={`${check.check_key}:${check.definition_digest}`} className="break-all">
+                            <li
+                              key={`${check.check_key}:${check.definition_digest}`}
+                              className="break-all"
+                            >
                               {check.check_key} must have {check.required_outcome}
-                              {check.definition_digest ? ` (digest ${check.definition_digest})` : ''}
+                              {check.definition_digest
+                                ? ` (digest ${check.definition_digest})`
+                                : ''}
                             </li>
                           ))}
                         </ul>
@@ -1327,8 +1342,8 @@ export function TaskDetailPage({
                   </summary>
                   <div className="mt-1 space-y-1 break-all">
                     <p>
-                      ValidationRun {run.id} · {validationRepositoryLabel(run)} · Workspace {run.workspace_id} · commit{' '}
-                      {run.commit_sha}
+                      ValidationRun {run.id} · {validationRepositoryLabel(run)} · Workspace{' '}
+                      {run.workspace_id} · commit {run.commit_sha}
                     </p>
                     <p>Snapshot {run.workspace_snapshot_digest}</p>
                     <p>

@@ -1359,6 +1359,76 @@ fn check_error(error: sqlx::Error) -> DbError {
     DbError::Sqlx(error)
 }
 
+async fn validate_replan_decision_proof_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    input: &MaterializeTaskCoordinationPlanInput,
+    proof: &CoordinatorReplanDecisionProof,
+) -> Result<()> {
+    if proof.approved_by_user_id != input.created_by
+        || proof.request_id != input.request_id
+        || proof.plan_artifact_id != input.plan_artifact_id
+        || proof.plan_digest != input.plan_digest
+        || proof.authorization_version != input.authorization_version
+    {
+        return Err(DbError::InvalidTransition);
+    }
+    let exact: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM task_coordinator_replan replan
+            JOIN task_coordination_request request
+              ON request.id = replan.plan_request_id AND request.task_id = replan.task_id
+            JOIN task_coordination_plan plan
+              ON plan.artifact_id = request.plan_artifact_id AND plan.task_id = request.task_id
+            JOIN human_decision_request decision
+              ON decision.id = replan.human_decision_id AND decision.task_id = replan.task_id
+            WHERE replan.id = ? AND replan.task_id = ?
+              AND replan.plan_request_id = ?
+              AND replan.authorization_version = ?
+              AND replan.classification = 'scope_or_authority_change'
+              AND replan.state = 'approved'
+              AND replan.human_decision_id = ?
+              AND request.kind = 'work_unit_plan'
+              AND request.authorization_version = ?
+              AND request.plan_artifact_id = ?
+              AND request.state != 'cancelled'
+              AND plan.artifact_id = ? AND plan.request_id = ?
+              AND plan.plan_digest = ? AND plan.state = 'approved'
+              AND decision.source_kind = 'coordinator_replan'
+              AND decision.source_id = replan.id
+              AND decision.authorization_version = replan.authorization_version
+              AND decision.state = 'answered'
+              AND decision.answered_option_id = 'approve_replan'
+              AND decision.answered_by_user_id = ?
+              AND decision.resume_request_id = request.id
+              AND json_extract(decision.resume_binding_json, '$.request_id') = request.id
+              AND json_extract(decision.resume_binding_json, '$.request_kind') = 'work_unit_plan'
+              AND json_extract(decision.resume_binding_json, '$.authorization_version') = request.authorization_version
+              AND json_extract(decision.resume_binding_json, '$.source_subject.coordinator_replan_id') = replan.id
+              AND json_extract(decision.resume_binding_json, '$.source_subject.plan_request_id') = request.id
+              AND json_extract(decision.resume_binding_json, '$.source_subject.plan_artifact_id') = plan.artifact_id
+              AND json_extract(decision.resume_binding_json, '$.source_subject.plan_digest') = plan.plan_digest
+        )",
+    )
+    .bind(&proof.replan_id)
+    .bind(&input.task_id)
+    .bind(&proof.request_id)
+    .bind(proof.authorization_version)
+    .bind(&proof.decision_id)
+    .bind(proof.authorization_version)
+    .bind(&proof.plan_artifact_id)
+    .bind(&proof.plan_artifact_id)
+    .bind(&proof.request_id)
+    .bind(&proof.plan_digest)
+    .bind(&proof.approved_by_user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !exact {
+        return Err(DbError::InvalidTransition);
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl TaskCoordinationRepo for SqliteDb {
     async fn get_task_coordination(&self, task_id: &str) -> Result<Option<TaskCoordination>> {
@@ -2116,6 +2186,81 @@ impl TaskCoordinationRepo for SqliteDb {
                 actual: task_version,
             });
         }
+        let current_repository_set =
+            super::task_repository::ensure_initial_current_revision_in_tx(&mut tx, &input.task_id)
+                .await?;
+        if current_repository_set.revision != input.expected_repository_set_revision
+            || current_repository_set.digest != input.expected_repository_set_digest
+        {
+            return Err(DbError::VersionConflict);
+        }
+        let replan_classification: Option<(Option<String>, String, Option<String>)> =
+            sqlx::query_as(
+                "SELECT classification, state, human_decision_id
+             FROM task_coordinator_replan
+             WHERE task_id = ? AND plan_request_id = ?",
+            )
+            .bind(&input.task_id)
+            .bind(&input.request_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let scope_change_requires_proof =
+            replan_classification
+                .as_ref()
+                .is_some_and(|(classification, _, _)| {
+                    classification.as_deref() == Some("scope_or_authority_change")
+                });
+        if scope_change_requires_proof {
+            let proof = input
+                .coordinator_replan_decision
+                .as_ref()
+                .ok_or(DbError::InvalidTransition)?;
+            let revision_change = input
+                .repository_set_revision_change
+                .as_ref()
+                .ok_or(DbError::InvalidTransition)?;
+            if revision_change.task_id != input.task_id
+                || revision_change.expected_current_revision != current_repository_set.revision
+                || revision_change.expected_current_digest != current_repository_set.digest
+                || revision_change.source_kind != "coordinator_replan"
+                || revision_change.source_ref.as_deref() != Some(proof.replan_id.as_str())
+                || revision_change.decision_id.is_some()
+                || revision_change.human_decision_request_id.as_deref()
+                    != Some(proof.decision_id.as_str())
+                || !revision_change.force_new_revision
+            {
+                return Err(DbError::InvalidTransition);
+            }
+            validate_replan_decision_proof_in_tx(&mut tx, &input, proof).await?;
+        } else if input.coordinator_replan_decision.is_some()
+            || input.repository_set_revision_change.is_some()
+        {
+            return Err(DbError::InvalidTransition);
+        }
+        let repository_revision_to_pin =
+            if let Some(revision_change) = input.repository_set_revision_change.clone() {
+                let revision =
+                    TaskRepositorySetRepo::create_revision_in_tx(self, &mut tx, revision_change)
+                        .await?;
+                let mut old_members = current_repository_set
+                    .repositories
+                    .iter()
+                    .map(|member| (member.repo_id.clone(), member.role, member.position))
+                    .collect::<Vec<_>>();
+                let mut new_members = revision
+                    .repositories
+                    .iter()
+                    .map(|member| (member.repo_id.clone(), member.role, member.position))
+                    .collect::<Vec<_>>();
+                old_members.sort_by_key(|member| (member.2, member.0.clone()));
+                new_members.sort_by_key(|member| (member.2, member.0.clone()));
+                if old_members != new_members {
+                    return Err(DbError::InvalidTransition);
+                }
+                revision.revision
+            } else {
+                current_repository_set.revision
+            };
         // Revalidate the authorization that protects this exact effect. The
         // service preflight is not sufficient: another consumer may revoke,
         // re-authorize, or mutate the team between that read and this
@@ -2274,6 +2419,14 @@ impl TaskCoordinationRepo for SqliteDb {
                     unit,
                     review_gate_id,
                     review_line_id,
+                )
+                .await?;
+                TaskRepositorySetRepo::pin_work_unit_in_tx(
+                    self,
+                    &mut tx,
+                    &unit.id,
+                    &input.task_id,
+                    repository_revision_to_pin,
                 )
                 .await?;
                 inserted.insert(unit.id.clone());

@@ -13,6 +13,11 @@ function task(): Task {
   return {
     id: 'task-1',
     project_id: 'project-1',
+    repo_id: null,
+    repositories: [],
+    repository_set_revision: 0,
+    repository_set_digest: null,
+    repository_merge_batches: [],
     task_roles: [
       {
         id: 'role-reviewer',
@@ -51,6 +56,7 @@ function reviewUnit(): WorkUnitResponse {
     id: 'unit-review',
     task_id: 'task-1',
     repository_ids: [],
+    integrations: [],
     parent_work_unit_id: null,
     title: 'Review implementation',
     scope: 'Check the implementation against the exact result.',
@@ -111,13 +117,7 @@ function reviewUnit(): WorkUnitResponse {
 
 describe('Human WorkUnit review report', () => {
   it('multirepo_result_review_panel_lists_subject_repos', () => {
-    render(
-      <WorkUnitHumanReviewPanel
-        task={task()}
-        unit={reviewUnit()}
-        currentUserId="user-1"
-      />,
-    )
+    render(<WorkUnitHumanReviewPanel task={task()} unit={reviewUnit()} currentUserId="user-1" />)
 
     const repositories = screen.getByLabelText('Reviewed repository results')
     expect(repositories.textContent).toContain('repo-api · commit abc123')
@@ -130,13 +130,7 @@ describe('Human WorkUnit review report', () => {
       report: { id: 'report-1' },
     })
 
-    render(
-      <WorkUnitHumanReviewPanel
-        task={task()}
-        unit={reviewUnit()}
-        currentUserId="user-1"
-      />,
-    )
+    render(<WorkUnitHumanReviewPanel task={task()} unit={reviewUnit()} currentUserId="user-1" />)
 
     expect(screen.getByText(/WorkUnit unit-implementation v2/)).toBeTruthy()
     fireEvent.change(screen.getByLabelText('Human review verdict'), {

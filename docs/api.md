@@ -22,7 +22,7 @@ own workspace. Gate evaluation verifies the report against the durable
 review-subject relation and source attempt. A WorkUnit-scoped review Gate
 targets the reviewed WorkUnit, rather than its separate reviewer WorkUnit.
 
-Forge exposes the versioned REST API at `/api/v1`. This reference describes the 0.9.1 public contract through migration V182 for Project, Task, Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and TaskLifecycle records. M1 adds Task and WorkUnit repository associations from V181; M2 adds grouped WorkUnit workspaces, exact per-repository Execution results, and repository-scoped review and validation projections from V182.
+Forge exposes the versioned REST API at `/api/v1`. This reference describes the 0.9.1 public contract through migration V183 for Project, Task, Actor, TaskRole, RoleMembership, Execution, HarnessSession, WorkUnit, Workspace, collaboration, Artifact, Review, Validation, Evidence, Gate, and TaskLifecycle records. M1 adds Task and WorkUnit repository associations from V181; M2 adds grouped WorkUnit workspaces, exact per-repository Execution results, and repository-scoped review and validation projections from V182; M3 adds per-repository integration/PR batches, repository-aware dependency handoffs, and repository-set replan projections from V183.
 
 > The orchestrator owns work. The harness owns cognition.
 
@@ -207,20 +207,21 @@ provenance and active defaults use an exact `default_implementer` ActorRef.
 | --- | --- |
 | `POST /projects/{project_id}/tasks` | Create a Task. Supported fields include `title`, `description`, `parent_task_id`, `priority`, and optional `repositories: [{repo_id, role}]`, where role is `primary`, `affected`, or `context`. Omission inherits the parent scope or Project primary; `repositories: []` creates a repo-less Task. Project task-role defaults are copied atomically. |
 | `PATCH /tasks/{id}/repositories` | Replace the repository scope with `{expected_version, repositories}`. A non-empty set has exactly one primary; all repositories must belong to the Task Project. After an Execution, an authorized replan is required. Before an Execution, the update cannot remove or make read-only a repository explicitly selected by an existing WorkUnit. |
+| `GET /tasks/{id}` and Task list responses | Include the active `repository_set_revision` and `repository_set_digest`, repository rows with `change_state` (`pending`, `changed`, or `unchanged`) and exact integration/merge/PR identity, plus the full `repository_merge_batches` history. Context repositories remain read-only. |
 | `GET /projects/{project_id}/tasks` | List Tasks. Filter with `lifecycle_state`, `priority`, and `q`; order with the supported Task sort fields. Task classification is not a filter. `status`, `include_cancelled`, and `include_archived` are rejected. |
 | `GET /tasks/{id}`, `PATCH /tasks/{id}`, `DELETE /tasks/{id}` | Read, update, or delete a Task. Updates require the Task `version`. |
 | `POST /tasks/{id}/subtasks/reorder` | Reorder exact child Task IDs. |
 | `GET /tasks/{id}/dependencies`, `GET /tasks/{id}/dependents` | Read same-Project Task dependencies. |
 | `POST /tasks/{id}/dependencies` | Add a same-Project dependency using `{ depends_on_id, expected_graph_version, idempotency_key }`. Writes pass through the Project DAG service. |
 | `DELETE /tasks/{id}/dependencies/{dep_id}` | Remove a dependency using JSON body `{ expected_graph_version, idempotency_key }`. Writes pass through the Project DAG service. |
-| `GET /tasks/{id}/workspace`, `GET /tasks/{id}/diff` | Read the Task integration workspace or inspect its current diff. Workspace mutation and recovery require an exact WorkUnit and Workspace identity. |
+| `GET /tasks/{id}/workspace`, `GET /tasks/{id}/diff` | Read the primary repository's Task integration workspace or inspect its current diff. The scalar workspace route keeps its single-repository projection; WorkUnit integration results identify each repository. Workspace mutation and recovery require an exact WorkUnit and Workspace identity. |
 | `GET /tasks/{id}/lifecycle` | Read the authoritative aggregate TaskLifecycle and its version. |
 | `POST /tasks/{id}/lifecycle` | Request a deterministic TaskLifecycle edge with `to_state`, `expected_lifecycle_version`, and `idempotency_key`; use `gate_evaluation_id` for an edge admitted by that exact evaluation. `reason_kind` and `reason_ref` must be supplied together, with non-empty values, or both omitted. |
 | `GET /tasks/{id}/lifecycle/transitions` | Read exact durable transition receipts and facts. |
 | `GET /tasks/{id}/gates`, `POST /tasks/{id}/gates` | List or create Task-scoped Gates. |
 | `GET /gates/{id}`, `PUT /gates/{id}/policy`, `POST /gates/{id}/evaluate` | Read a Gate, revise its policy against the expected revision, or evaluate its exact current inputs. |
 | `GET /gate-evaluations/{id}` | Read one immutable GateEvaluation and its frozen input facts. |
-| `POST /tasks/{id}/merge` | Request merge admission using the exact satisfied GateEvaluation. The service rechecks its current policy and input identities under the Task integration lock. |
+| `POST /tasks/{id}/merge` | Request merge admission using the exact satisfied GateEvaluation. The response retains the 0.9.1 scalar fields and adds `repository_merge_batch_id` and per-repository results. The service rechecks its current policy and input identities under the Task integration lock; merge remains a Human action. |
 | `GET /task-role-capabilities` | Read the closed capability catalog and editable role templates. The web client uses this response instead of maintaining its own catalog. |
 | `GET /tasks/{id}/task-roles`, `POST /tasks/{id}/task-roles`, `PATCH /tasks/{id}/task-roles/{role}` | Read or update TaskRole definitions, including versioned `configuration` with `display_label`, `capabilities`, and optional `rework` route. Capability and orchestration policy changes require Project owner/admin authority and exact TaskRole version. |
 | `GET /projects/{id}/task-role-defaults`, `PUT /projects/{id}/task-role-defaults` | Read or replace Project TaskRole templates. Defaults store route references by role name and resolve them to Task-local IDs on Task creation. Updates require Project owner/admin authority and the expected defaults version. |
@@ -572,7 +573,7 @@ The policy schema is version 1. Its defaults are ingest=false, trusted_author_as
 
 Connect GitHub with `POST /providers` using the `provider`, `label`, and `credential` request fields. The secret is accepted for connection and is never returned. `GET /providers?purpose=scm` lists SCM handles; the ordinary provider list excludes them. Set `pr_provider_config.credential_id` when creating `POST /projects/{id}/repos` or updating `PATCH /repos/{id}`. Both Project administration and credential ownership are checked. Responses expose `has_credential`, `credential_handle_id`, and `credential_label`, never the secret. The retired `token` and `token_secret_ref` PR configuration fields return `repo.pr_provider_token_retired`.
 
-The REST and MCP error codes include credential.invalid, credential.purpose_invalid, credential.owner_not_authorized, repo.pr_provider_forbidden, repo.pr_provider_credential_invalid, repo.pr_provider_token_retired, pr_feedback.policy_invalid, pr_feedback.policy_forbidden, pr_rework.not_authorized, pr_action.not_authorized, and pr_action.version_conflict. See the [PR feedback loop](concepts/pr-feedback-loop.md) for the lifecycle and policy boundaries.
+The REST and MCP error codes include credential.invalid, credential.purpose_invalid, credential.owner_not_authorized, repo.pr_provider_forbidden, repo.pr_provider_credential_invalid, repo.pr_provider_token_retired, pr_feedback.policy_invalid, pr_feedback.policy_forbidden, pr_rework.not_authorized, pr_action.not_authorized, and pr_action.version_conflict. PR feedback, actions, and rework records identify both `repo_id` and the exact `admission_id`. See the [PR feedback loop](concepts/pr-feedback-loop.md) for the lifecycle and policy boundaries.
 
 ## WorkUnits and generic collaboration
 
@@ -585,7 +586,7 @@ The REST and MCP error codes include credential.invalid, credential.purpose_inva
 | `GET /work-units/{id}/dependencies`, `POST /work-units/{id}/dependencies/{prerequisite_id}`, `DELETE /work-units/{id}/dependencies/{prerequisite_id}` | Read or update exact WorkUnit dependencies. |
 | `GET /work-units/{id}/readiness` | Read deterministic WorkUnit readiness, including `awaiting_acceptance` and `awaiting_review_approval`. |
 | `POST /work-units/{id}/workspace` | Prepare or rebuild the exact WorkUnit workspace group before launch, with one Workspace per writable repository and pinned read-only Workspaces for selected context repos. |
-| `POST /work-units/{id}/integrations` | Integrate an explicitly scoped WorkUnit under the existing integration lock. The response includes `repo_id` from the exact source Workspace. |
+| `POST /work-units/{id}/integrations` | Integrate an explicitly scoped WorkUnit under the existing integration lock. The response retains its primary-repository scalar fields and adds ordered `repositories` results. A partial result preserves successful repositories; retry the same completed Execution with the same idempotency key to continue pending repositories. `GET` WorkUnit responses expose all child integration records after a timeout or partial result. |
 | `GET /tasks/{task_id}/messages`, `POST /tasks/{task_id}/messages`, `GET /messages/{id}` | Create or read generic collaboration Messages. |
 | `GET /tasks/{task_id}/handoffs`, `POST /tasks/{task_id}/handoffs`, `GET /handoffs/{id}`, `POST /handoffs/{id}/status` | Create, read, or update generic Handoffs. |
 | `GET /tasks/{task_id}/proposals`, `POST /tasks/{task_id}/proposals`, `GET /proposals/{id}`, `POST /proposals/{id}/withdraw` | Create or read generic Proposals. |
@@ -692,6 +693,13 @@ Public durable event types are:
   `execution.cancelled`, `execution.repository_results_recorded`, and
   `execution.stalled`. The repository-results event contains only exact repo
   and Workspace IDs, commit SHAs, and snapshot digests;
+- `work_unit.repository_integration_changed`,
+  `task.repository_merge_batch_changed`, and
+  `task.repository_pr_status_changed` expose allowlisted Task, repository,
+  revision, batch, integration, admission, and PR metadata IDs, along with the
+  relevant repository and batch states and versions, so clients can refresh
+  partial progress. PR status events include the provider admission status and
+  PR state. An individual event never advances TaskLifecycle;
 - `validation_run.started`, `validation_run.completed`, `evidence.created`,
   and `artifact.created`;
 - `project.plan_changed` for plan proposals, applies, dependency mutations, and
