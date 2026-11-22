@@ -27,6 +27,12 @@ source version is 0.9.1.
 - Open one PR per changed writable repository; unchanged repositories open no PR
   and require no repository-scoped checks.
 
+### Fixed
+
+- Preserve 0.9.1 single-repository TaskMerge, PublishPr, and PR admission when
+  the new repository identity and batch columns are omitted; multi-repository
+  Tasks still require exact repository and batch bindings.
+
 ## [0.9.1] - 2026-11-18
 
 Packaging fix for 0.9.0. No runtime, API, or schema changes.

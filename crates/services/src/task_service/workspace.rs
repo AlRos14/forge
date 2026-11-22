@@ -3,31 +3,8 @@ use ::workspace::WorkspaceManager;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-/// Prepare the Task's own integration workspace for a WorkUnit operation.
-/// This is the integration target; executable WorkUnit workspaces are stored
-/// and resolved by exact WorkUnit identity.
-pub(crate) async fn prepare_integration_workspace_for_work_unit(
-    db: &SqliteDb,
-    workspace_root: &std::path::Path,
-    task: &Task,
-    repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
-) -> Result<Workspace> {
-    let task_repo_id = task.repo_id.as_deref().ok_or_else(|| {
-        ServiceError::invalid_operation("WorkUnit Task has no repository binding")
-    })?;
-    prepare_integration_workspace_for_repository(
-        db,
-        workspace_root,
-        task,
-        task_repo_id,
-        repo_cache_locks,
-    )
-    .await
-}
-
 /// Prepare the integration workspace for one exact repository in a Task's
-/// immutable repository set. The single-repository wrapper above preserves
-/// the 0.9.1 primary-repository call path.
+/// immutable repository set.
 pub(crate) async fn prepare_integration_workspace_for_repository(
     db: &SqliteDb,
     workspace_root: &std::path::Path,

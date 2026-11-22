@@ -226,6 +226,18 @@ impl TaskRepo for SqliteDb {
         input: crate::CreateTaskRepositoryContextSnapshot,
     ) -> Result<crate::TaskRepositoryContextSnapshot> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let has_repository_revisions: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'task_repository_set_revision'
+             )",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_repository_revisions {
+            super::task_repository::ensure_initial_current_revision_in_tx(&mut tx, &input.task_id)
+                .await?;
+        }
         if let Some(row) = sqlx::query(
             "SELECT task_id, repo_id, commit_sha, captured_at
              FROM task_repository_context_snapshot WHERE task_id = ? AND repo_id = ?",

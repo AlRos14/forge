@@ -1263,12 +1263,14 @@ PRAGMA foreign_keys = ON;
 > eliminarse. La sección `## M3 — planning/freeze` al final fija el catálogo,
 > el rebuild rename/swap y las invariantes vigentes.
 
-V183 crea `task_repository_merge_batch` como el único reason_ref Task-wide de
-Merging y `task_repository_merge_batch_repo` como conjunto ordenado de repos
+V183 crea `task_repository_merge_batch` para agregar el estado de merge de Tasks
+multirepo y `task_repository_merge_batch_repo` como conjunto ordenado de repos
 que sí cambiaron; repos sin cambios no generan fila. Un batch nuevo lleva
 digest de 64 chars; el NULL de un batch histórico preserva el estado previo sin
-inventar digest. Cada TaskMerge/PublishPr lleva
-`repository_merge_batch_id`; los eventos por repo no reemplazan TaskLifecycle.
+inventar digest. TaskMerge y PublishPr de un Task multirepo llevan el
+`repository_merge_batch_id` exacto; una operación histórica single-repo puede
+seguir sin batch y conserva `TaskMerge.id` como `Merging.reason_ref`. Los
+eventos por repo no reemplazan TaskLifecycle.
 El batch llega a `completed` cuando cada fila está integrada localmente o su
 PR está mergeada; `ready_to_merge` exige PRs abiertas y admitidas. Un
 conflict/closed bloquea el Task y la recuperación opera solo sobre filas
@@ -1279,8 +1281,10 @@ V183 copia todas las filas y las 15 columnas actuales de `pr_metadata`:
 target_branch, pr_state, merge_status, last_synced_at, created_at, updated_at,
 task_merge_operation_id, publish_operation_id, admission_status`; añade
 `repo_id` desde `task.repo_id` y reemplaza solo `task_id UNIQUE` por
-`UNIQUE(task_id, repo_id)`. Repo NULL histórico permanece NULL; triggers de
-INSERT rechazan metadata nueva sin repo y exigen asociación primary/affected.
+`UNIQUE(task_id, repo_id)`. Repo NULL histórico permanece NULL; el flujo
+multirepo exige repo exacto y asociación primary/affected. La ruta legacy
+single-repo sin batch puede omitir `repo_id`, que se resuelve desde `task.repo_id`
+para sus checks de autoridad.
 Los índices anteriores de `pr_metadata` eran PK y autoíndice de
 `task_id UNIQUE`; se conserva PK, sustituye la unicidad por el compuesto y se
 añade `idx_pr_metadata_task_repo`.
@@ -1304,7 +1308,8 @@ admitted SHA no vacíos. Mantiene FKs de TaskMerge, PublishPr, metadata, Task y
 result event (provider config no tiene FK), PK `task_merge_operation_id`,
 `publish_operation_id UNIQUE`, `idx_remote_pr_admission_reconcile` y
 autoíndices. El guard de backfill aborta si alguna admisión histórica no puede
-asociarse a un repo.
+asociarse a un repo. La escritura legacy single-repo sin batch también puede
+omitir `repo_id`; el guard la limita a `task.repo_id` y rechaza Tasks multirepo.
 
 Antes del DROP se eliminan temporalmente los nueve triggers cuyo SQL referencia
 `pr_metadata` (tres attached y seis de otras tablas), y V183 los recrea con el
@@ -1329,8 +1334,10 @@ de lifecycle: `task_integration_operation_remote_admission_guard` y
 dos autoíndices vigentes: PK `id` y `UNIQUE(task_id)`; V183 los cambia a PK
 `id` y `UNIQUE(task_id, repo_id)`, añade `idx_pr_metadata_task_repo` y no hay
 otros índices explícitos ni triggers attached que se omitan. Añade
-`pr_metadata_repo_insert_guard` (repo no NULL, mismo Project, role
-primary/affected) y `pr_metadata_repo_immutable`.
+`pr_metadata_repo_insert_guard` (repo exacto del mismo Project y role
+primary/affected para multirepo; la escritura legacy single-repo sin batch
+puede dejar repo NULL y resolverlo desde `task.repo_id`) y
+`pr_metadata_repo_immutable`.
 
 `remote_pr_admission` conserva sus seis triggers attached:
 `remote_pr_admission_delete_guard`,
@@ -1350,20 +1357,23 @@ añaden igualdad de repo al enlace metadata/admission/operación/evento. En
 particular, insert/update de metadata exigen
 `NEW.repo_id = merge_op.repo_id = publish_op.repo_id`; status exige
 `admission.repo_id = NEW.repo_id`; historial legado/remoto exige el repo exacto
-de metadata/admisión; rework exige metadata y admisión del mismo repo y
-`lifecycle.reason_ref = merge_op.repository_merge_batch_id`; resultado del
-proveedor y cierre exigen `metadata.repo_id = operation.repo_id` y el batch
-como `Merging.reason_ref`. El insert guard de admisión conserva sus checks V175
+de metadata/admisión; rework exige metadata y admisión del mismo repo y la
+causa exacta de Merging (`batch.id` con batch y `merge_op.id` para la ruta
+single-repo legacy sin batch); resultado del proveedor y cierre exigen
+`metadata.repo_id = operation.repo_id` y esa misma causa exacta. El insert
+guard de admisión conserva sus checks V175
 de TaskMerge/PublishPr, metadata, remote identity, config, credential/policy
 snapshots y rework; exige además `NEW.repo_id = merge_op.repo_id =
 publish_op.repo_id = metadata.repo_id = config.repo_id`, asociación
-primary/affected y `lifecycle.reason_ref = merge_op.repository_merge_batch_id`.
+primary/affected y la causa de Merging que corresponde a la operación.
 
-Los tres guards adicionales se reemplazan así: la inserción TaskMerge exige
-`repo_id` primary/affected y crea la operación dentro del batch; PublishPr
-exige mismo `repo_id` y `repository_merge_batch_id` que su parent, Gate
-satisfecho exacto y `Merging.reason_ref = batch.id`; feedback rework conserva
-las transiciones D3' y enlaza la admisión al repo/batch exacto. `repo_id` y
+Los tres guards adicionales se reemplazan así: una TaskMerge multirepo exige
+`repo_id` primary/affected y su fila de batch; la ruta single-repo legacy puede
+omitir batch y resolver el repo primario de Task. PublishPr exige el mismo
+`repo_id` y `repository_merge_batch_id` que su parent (ambos nulos en la ruta
+single-repo legacy), Gate satisfecho exacto y la causa Merging correspondiente;
+feedback rework conserva las transiciones D3' y enlaza la admisión al repo/batch
+exacto. `repo_id` y
 `repository_merge_batch_id` de operaciones, `remote_pr_admission.repo_id` y
 `pr_metadata.repo_id` son inmutables tras INSERT. Los estados por repo se
 agregan en el batch antes de escribir TaskLifecycle; no se añade una segunda
@@ -1437,7 +1447,7 @@ se congelan una vez desde el Execution exacto.
 |---|---|---|
 | M1 | `TaskRepository { task_id: String, repo_id: String, role: TaskRepositoryRole, position: i64, created_at: String }`; `TaskRepositoryWrite { repo_id: String, role: TaskRepositoryRole }`; `WorkUnitRepositoryScope { work_unit_id: String, task_id: String, repo_id: String, created_at: String }`. `TaskRepo::list_repositories(&self, task_id: &str) -> db::Result<Vec<TaskRepository>>`; `replace_repositories_in_tx(&self, tx: &mut Transaction<'_, Sqlite>, task_id: &str, expected_version: i64, rows: &[TaskRepositoryWrite], updated_at: &str) -> db::Result<Task>`. `WorkUnitRepo::list_repository_ids(&self, work_unit_id: &str) -> db::Result<Vec<String>>`; `CreateTask.repositories: Vec<TaskRepositoryWrite>` y `CreateWorkUnit.repository_ids: Vec<String>` se materializan en las transacciones existentes. `TaskService::create_task_with_repositories(&self, project_id: impl Into<String>, title: impl Into<String>, description: Option<String>, parent_task_id: Option<String>, priority: Option<i64>, repositories: Option<Vec<TaskRepositoryWrite>>, initial_lifecycle_state: Option<TaskLifecycleState>, merge_config: Option<Value>) -> services::Result<Task>`; `replace_task_repositories(&self, task_id: &str, expected_version: i64, repositories: Vec<TaskRepositoryWrite>) -> services::Result<Task>` (409 tras Execution, salvo replan autorizado). `UpdateProject.primary_repo_id: Option<Option<String>>`; `ProjectRepositoryService::update_primary_repo(&self, project_id: &str, expected_version: i64, primary_repo_id: Option<String>, caller_user_id: &str) -> services::Result<Project>`; mantiene `ProjectRepo::update_at_version`. | `crates/db/src/models.rs`, `crates/db/src/repository.rs`, `crates/db/src/sqlite/task.rs`, `crates/db/src/sqlite/project.rs`, `crates/db/src/sqlite/work_unit.rs`, `crates/services/src/task_service/create.rs`, nuevo `crates/services/src/task_service/repositories.rs`, `crates/services/src/task_service.rs`, nuevo `crates/services/src/project_repository_service.rs`, `crates/services/src/lib.rs`, `crates/services/src/work_unit_service.rs`. |
 | M2 | `WorkspaceGroup { id, task_id, work_unit_id, root_path, created_at }`; `WorkspaceScope.workspace_group_id: Option<String>`; `TaskRepositoryContextSnapshot { task_id, repo_id, commit_sha, captured_at }`; `ExecutionRepositoryResult { execution_id, task_id, repo_id, workspace_id, before_sha: Option<String>, after_sha: Option<String>, snapshot_digest: Option<String>, created_at }`; `CreateWorkUnitWorkspace.workspace_group_id: String`; `CreateWorkUnitExecution.workspace_leases: Vec<CreateWorkspaceLease>` (sustituye el actual `Option` singular). `WorkspaceRepo::create_group_for_work_unit(&self, input: CreateWorkspaceGroup) -> db::Result<WorkspaceGroup>` y `get_group_by_work_unit_id(&self, work_unit_id: &str) -> db::Result<Option<WorkspaceGroup>>`; `WorkUnitWorkspaceRepo::list_by_work_unit_id(&self, work_unit_id: &str) -> db::Result<Vec<Workspace>>`; `WorkspaceLeaseRepo::list_active_for_work_unit(&self, work_unit_id: &str) -> db::Result<Vec<WorkspaceLease>>` y `get_active_for_execution_workspace(&self, execution_id: &str, workspace_id: &str) -> db::Result<Option<WorkspaceLease>>`; `TaskRepo::pin_context_repository_snapshot(&self, input: CreateTaskRepositoryContextSnapshot) -> db::Result<TaskRepositoryContextSnapshot>` (insert-or-return del primer pin); `ExecutionRepo::record_repository_results(&self, execution_id: &str, rows: &[ExecutionRepositoryResult]) -> db::Result<Vec<ExecutionRepositoryResult>>` y `list_repository_results(&self, execution_id: &str) -> db::Result<Vec<ExecutionRepositoryResult>>`; `WorkUnitRepo::create_with_review_subject_repositories(&self, input: CreateWorkUnit, subject: CreateWorkUnitReviewSubject, repositories: &[WorkUnitReviewSubjectRepository], event: CreateDomainEvent) -> db::Result<CollaborationWrite<WorkUnit>>`, `list_review_subject_repositories(&self, work_unit_id: &str) -> db::Result<Vec<WorkUnitReviewSubjectRepository>>`, `freeze_review_subject_repositories(&self, review_work_unit_id: &str, rows: &[WorkUnitReviewSubjectRepository]) -> db::Result<Vec<WorkUnitReviewSubjectRepository>>`, `list_result_requirement_repositories(&self, work_unit_id: &str) -> db::Result<Vec<WorkUnitResultRequirementRepository>>` y `insert_result_requirement_repositories_in_tx(&self, tx: &mut Transaction<'_, Sqlite>, rows: &[WorkUnitResultRequirementRepository]) -> db::Result<()>`. `WorkUnitService::prepare_workspace_group(&self, source: CollaborationActorSource, work_unit_id: &str) -> services::Result<WorkspaceGroup>`; `TaskService::record_execution_repository_results(&self, execution_id: &str) -> services::Result<Vec<ExecutionRepositoryResult>>`; `ValidationService::run_for_repository(&self, task_id: &str, repo_id: &str, check_key: &str, workspace_id: &str, commit_sha: &str) -> services::Result<ValidationRun>`. `EnqueueCheckRequest.repo_id: String` y `ValidationSubject.repo_id: String` seleccionan el miembro exacto de `(repo_id, check_key)`; `ValidationRunResponse` añade `repo_id: String` resuelto del Workspace exacto. | `crates/db/migrations/V182__multirepo_workspaces_results.sql`, `crates/db/src/models.rs`, `crates/db/src/repository.rs`, `crates/db/src/sqlite/task.rs`, `crates/db/src/sqlite/workspace.rs`, `crates/db/src/sqlite/work_unit.rs`, `crates/db/src/sqlite/workspace_lease.rs`, `crates/db/src/sqlite/execution.rs`, `crates/db/src/tests.rs`, `crates/services/src/task_service/workspace.rs`, `crates/services/src/task_service/execution/runner.rs`, `crates/services/src/work_unit_service.rs`, `crates/services/src/validation_service.rs`, `crates/services/src/validation_check_runner.rs`, `crates/services/src/task_coordination/turn_outputs.rs`, `crates/services/src/validation_post_integration.rs`, `crates/services/src/coordinator_outputs/validation_request.rs`, `crates/services/src/coordinator_outputs/tests.rs`, `crates/services/src/collaboration_service.rs`, `crates/api-types/src/execution.rs`, `crates/api-types/src/work_unit.rs`, `crates/api-types/src/task_dispatch.rs`, `crates/api-types/src/review_validation.rs`, `crates/api/src/routes/work_units.rs`, `crates/api/src/routes/work_unit_reviews.rs`, `crates/api/src/routes/reviews.rs`. |
-| M3 | `TaskRepositoryMergeBatch { id: String, task_id: String, gate_evaluation_id: String, repository_set_revision: i64, repository_set_digest: Option<String>, state: TaskRepositoryMergeBatchState, version: i64, created_at: String, updated_at: String }`; `TaskRepositoryMergeBatchRepoRow { batch_id: String, task_id: String, repository_set_revision: i64, repo_id: String, position: i64, state: TaskRepositoryMergeBatchRepoState, work_unit_integration_id: Option<String>, task_merge_operation_id: Option<String>, pr_metadata_id: Option<String>, before_sha: Option<String>, after_sha: Option<String>, created_at: String, updated_at: String }`. `TaskIntegrationOperation` gains `repo_id: Option<String>` y `repository_merge_batch_id: Option<String>`; `PrMetadata.repo_id: Option<String>` (NULL solo para metadata histórica no admitida); `RemotePrAdmission.repo_id: Option<String>` (NULL solo se conserva para admisiones históricas sin identidad verificable; los inserts nuevos requieren repo_id). `TaskRepositoryMergeBatchRepo::create(&self, batch: &TaskRepositoryMergeBatch, repos: &[TaskRepositoryMergeBatchRepoRow]) -> db::Result<TaskRepositoryMergeBatch>`; `transition_repo(&self, batch_id: &str, repo_id: &str, expected_version: i64, state: TaskRepositoryMergeBatchRepoState, work_unit_integration_id: Option<&str>, task_merge_operation_id: Option<&str>, pr_metadata_id: Option<&str>, before_sha: Option<&str>, after_sha: Option<&str>) -> db::Result<TaskRepositoryMergeBatchRepoRow>`. `PrMetadataRepo::list_by_task(&self, task_id: &str) -> db::Result<Vec<PrMetadata>>`; `get_by_task_repo(&self, task_id: &str, repo_id: &str) -> db::Result<Option<PrMetadata>>`; retires ambiguous `get_by_task_id`. `TaskIntegrationOperationManager::integrate_repositories(&self, task_id: &str, gate_evaluation_id: &str, ordered_repo_ids: &[String], idempotency_key: &str) -> services::Result<Vec<TaskRepositoryIntegrationResult>>`; `PrService::list_task_prs(&self, task_id: &str) -> services::Result<Vec<TaskRepositoryPrStatus>>`; `GateEngine::evaluate_required_checks_by_repo(&self, task_id: &str, repository_results: &[ExecutionRepositoryResult]) -> services::Result<GateEvaluation>`; `ProjectPlanService::verify_handoffs_by_repository(&self, predecessor_task_id: &str, successor_task_id: &str) -> services::Result<Vec<ProjectPlanRepositoryHandoff>>`. TaskLifecycle Merging fija `reason_kind = "task_repository_merge_batch"`, `reason_ref = batch.id`; no cambia su autoridad. | `crates/db/src/models.rs`, `crates/db/src/repository.rs`, `crates/db/src/sqlite.rs` (registro de módulo), nuevo `crates/db/src/sqlite/task_repository_merge_batch.rs`, `crates/db/src/sqlite/task_integration_operation.rs`, `crates/db/src/sqlite/pr_metadata.rs`, `crates/services/src/task_integration_operation.rs`, `crates/services/src/merge_service.rs`, `crates/services/src/pr_service.rs`, `crates/services/src/pr_feedback.rs`, `crates/services/src/gate_engine.rs`, `crates/services/src/validation_service.rs`, `crates/services/src/project_plan.rs`, `crates/services/src/task_coordination/replan.rs`, `crates/services/src/replan_classifier.rs`, `crates/services/src/task_lifecycle.rs`, `crates/api-types/src/task_repositories.rs`, `crates/api-types/src/integration.rs`, `crates/api-types/src/pr_feedback.rs`, `crates/api-types/src/public_events.rs`, `crates/api/src/routes/tasks/gates.rs`, `crates/api/src/routes/pr_feedback.rs`, `crates/api/src/routes/events.rs`. |
+| M3 | `TaskRepositoryMergeBatch { id: String, task_id: String, gate_evaluation_id: String, repository_set_revision: i64, repository_set_digest: Option<String>, state: TaskRepositoryMergeBatchState, version: i64, created_at: String, updated_at: String }`; `TaskRepositoryMergeBatchRepoRow { batch_id: String, task_id: String, repository_set_revision: i64, repo_id: String, position: i64, state: TaskRepositoryMergeBatchRepoState, work_unit_integration_id: Option<String>, task_merge_operation_id: Option<String>, pr_metadata_id: Option<String>, before_sha: Option<String>, after_sha: Option<String>, created_at: String, updated_at: String }`. `TaskIntegrationOperation` gains `repo_id: Option<String>` y `repository_merge_batch_id: Option<String>`; `PrMetadata.repo_id: Option<String>` y `RemotePrAdmission.repo_id: Option<String>` (NULL para datos históricos y escrituras legacy single-repo sin batch, que resuelven el repo primario desde la Task; el flujo multirepo requiere repo y batch exactos). `TaskRepositoryMergeBatchRepo::create(&self, batch: &TaskRepositoryMergeBatch, repos: &[TaskRepositoryMergeBatchRepoRow]) -> db::Result<TaskRepositoryMergeBatch>`; `transition_repo(&self, batch_id: &str, repo_id: &str, expected_version: i64, state: TaskRepositoryMergeBatchRepoState, work_unit_integration_id: Option<&str>, task_merge_operation_id: Option<&str>, pr_metadata_id: Option<&str>, before_sha: Option<&str>, after_sha: Option<&str>) -> db::Result<TaskRepositoryMergeBatchRepoRow>`. `PrMetadataRepo::list_by_task(&self, task_id: &str) -> db::Result<Vec<PrMetadata>>`; `get_by_task_repo(&self, task_id: &str, repo_id: &str) -> db::Result<Option<PrMetadata>>`; retires ambiguous `get_by_task_id`. `TaskIntegrationOperationManager::integrate_repositories(&self, task_id: &str, gate_evaluation_id: &str, ordered_repo_ids: &[String], idempotency_key: &str) -> services::Result<Vec<TaskRepositoryIntegrationResult>>`; `PrService::list_task_prs(&self, task_id: &str) -> services::Result<Vec<TaskRepositoryPrStatus>>`; `GateEngine::evaluate_required_checks_by_repo(&self, task_id: &str, repository_results: &[ExecutionRepositoryResult]) -> services::Result<GateEvaluation>`; `ProjectPlanService::verify_handoffs_by_repository(&self, predecessor_task_id: &str, successor_task_id: &str) -> services::Result<Vec<ProjectPlanRepositoryHandoff>>`. En multirepo, TaskLifecycle Merging fija `reason_kind = "task_repository_merge_batch"`, `reason_ref = batch.id`; la ruta legacy single-repo sin batch conserva `TaskMerge.id` como `reason_ref`. | `crates/db/src/models.rs`, `crates/db/src/repository.rs`, `crates/db/src/sqlite.rs` (registro de módulo), nuevo `crates/db/src/sqlite/task_repository_merge_batch.rs`, `crates/db/src/sqlite/task_integration_operation.rs`, `crates/db/src/sqlite/pr_metadata.rs`, `crates/services/src/task_integration_operation.rs`, `crates/services/src/merge_service.rs`, `crates/services/src/pr_service.rs`, `crates/services/src/pr_feedback.rs`, `crates/services/src/gate_engine.rs`, `crates/services/src/validation_service.rs`, `crates/services/src/project_plan.rs`, `crates/services/src/task_coordination/replan.rs`, `crates/services/src/replan_classifier.rs`, `crates/services/src/task_lifecycle.rs`, `crates/api-types/src/task_repositories.rs`, `crates/api-types/src/integration.rs`, `crates/api-types/src/pr_feedback.rs`, `crates/api-types/src/public_events.rs`, `crates/api/src/routes/tasks/gates.rs`, `crates/api/src/routes/pr_feedback.rs`, `crates/api/src/routes/events.rs`. |
 
 Tipos de retorno M3 definidos en sus módulos de servicio: `TaskRepositoryIntegrationResult { repo_id: String, state: TaskRepositoryMergeBatchRepoState, work_unit_integration_id: Option<String>, before_sha: Option<String>, after_sha: Option<String> }`; `TaskRepositoryPrStatus { repo_id: String, pr_metadata_id: String, provider_pr_id: Option<String>, pr_url: Option<String>, pr_state: String, merge_status: String, admission_status: String }`; `ProjectPlanRepositoryHandoff { repo_id: String, predecessor_commit_sha: Option<String>, successor_base_sha: Option<String>, ancestry_verified: bool }`.
 
@@ -2048,8 +2058,7 @@ por ello el encabezado completo de V183 debe ser `PRAGMA foreign_keys=OFF;`
 `PRAGMA legacy_alter_table=ON; BEGIN IMMEDIATE;` y su cierre `COMMIT; PRAGMA
 foreign_keys=ON; PRAGMA legacy_alter_table=OFF;`. La copia toma primero la
 identidad repo del TaskMerge/admission histórico y cae a `task.repo_id` para el
-PR legacy sin admission. `repo_id` sigue nullable exclusivamente para
-mantener un PR legacy de una Task sin repo; un insert nuevo no admite NULL. Se
+PR legacy sin admission. `repo_id` sigue nullable para los datos históricos y para las escrituras 0.9.1 single-repo sin batch; sus guards resuelven la identidad desde `task.repo_id`. En multirepo se exige el repo exacto. Se
 reemplaza únicamente la unicidad por Task por unicidad `(task_id, repo_id)`.
 
 ```sql
@@ -2285,10 +2294,10 @@ inspección de SQL de todas las migraciones V001–V182:
 | Trigger attached | `pr_metadata_admission_status_guard` | V113 | Se elimina implícitamente; se recrea arriba y añade igualdad de `repo_id`. |
 | Trigger attached | `pr_metadata_merge_admission_guard_update` | V175 (reemplazó V116/V109) | Se elimina implícitamente; se recrea arriba preservando terminal history/rework y fija el repo en admission y operation. |
 | Cross-table | `legacy_pr_history_insert_guard` en `legacy_pr_history` | V114 | No se elimina: su propietario sobrevive al rebuild; su lookup usa `legacy_metadata_id` exacto. Se verifica que el nombre/SQL sigan instalados. |
-| Cross-table | `pr_rework_supersession_insert_guard` en `pr_rework_supersession` | V175 | Sobrevive al rebuild sin cambios por el rename/swap. V183 la reemplaza después, conservando los checks V175 y exigiendo repo igual en admission/metadata/operation y `lifecycle.reason_ref = repository_merge_batch_id`. |
-| Cross-table | `remote_pr_admission_insert_guard` en `remote_pr_admission` | V175 | Sobrevive al rebuild sin cambios por el rename/swap. V183 la reemplaza después, conservando los checks V175, resolviendo `pr_provider_config` desde `merge_op.repo_id`, igualando los cinco `repo_id` y comparando lifecycle contra el batch. |
-| Cross-table | `remote_pr_history_insert_guard` en `remote_pr_history` | V116 | Sobrevive al rebuild. V183 la reemplaza después, conservando sus checks y exigiendo igualdad de repo entre admission y metadata exactos. |
-| Cross-table | `task_integration_operation_provider_result_guard` en `task_integration_operation` | V175 | Sobrevive al rebuild sin cambios. V183 la reemplaza después, conservando sus checks y exigiendo repo igual entre operación, admission y metadata. |
+| Cross-table | `pr_rework_supersession_insert_guard` en `pr_rework_supersession` | V175 | Sobrevive al rebuild sin cambios por el rename/swap. V183 la reemplaza después, conservando los checks V175 y exigiendo repo igual en admission/metadata/operation; valida `reason_ref = batch.id` en multirepo y `reason_ref = merge_op.id` en single-repo legacy sin batch. |
+| Cross-table | `remote_pr_admission_insert_guard` en `remote_pr_admission` | V175 | Sobrevive al rebuild sin cambios por el rename/swap. V183 la reemplaza después, conservando los checks V175, resolviendo `pr_provider_config` desde el repo de la operación (o `task.repo_id` en legacy), igualando los repos y validando el recibo de lifecycle correspondiente a batch o a TaskMerge legacy. |
+| Cross-table | `remote_pr_history_insert_guard` en `remote_pr_history` | V116 | Sobrevive al rebuild. V183 la reemplaza después, conservando sus checks y exigiendo igualdad de repo entre admission y metadata; cuando la identidad legacy es NULL, la compara con `task.repo_id`. |
+| Cross-table | `task_integration_operation_provider_result_guard` en `task_integration_operation` | V175 | Sobrevive al rebuild sin cambios. V183 la reemplaza después, conservando sus checks y exigiendo repo igual entre operación, admission y metadata; permite que los tres sigan NULL en la ruta legacy single-repo. |
 | Cross-table | `task_merge_closed_provider_transition_guard` en `task_lifecycle_transition` | V109 | No se elimina: enlaza operation, evento y metadata por IDs exactos; preservar. |
 | View | Cualquier view que mencione `pr_metadata` | — | **Ninguna** en V001–V182. |
 | FK entrante | `remote_pr_admission.metadata_id → pr_metadata.id ON DELETE CASCADE` | V112 | La tabla no se reconstruye; FK conserva el nombre destino. `foreign_key_check` requerido tras restaurar `foreign_keys=ON`. |
@@ -2343,8 +2352,7 @@ guards relacionados (`task_integration_operation_remote_admission_guard`,
 `task_publish_pr_gate_admission_guard`, `task_lifecycle_pr_feedback_rework_guard`)
 sin recrear sus cuerpos. Eso queda retirado. Los dos guards de admisión de
 operation sí requieren reemplazo en V183: conservan los checks existentes,
-resuelven `work_mode` con `NEW.repo_id`, atan parent/child al mismo repo y
-batch, y comprueban `Merging.reason_ref = batch.id`. El guard de transición de
+resuelven `work_mode` con el repo exacto, atan parent/child al mismo repo y batch en multirepo, permiten la ruta single-repo sin batch y validan el `reason_ref` correspondiente a la autoridad usada. El guard de transición de
 feedback/rework V179 permanece porque su `reason_ref` es el recibo de
 supersession, no el id de TaskMergeBatch.
 
@@ -2771,12 +2779,14 @@ ProjectPlanService::verify_handoffs_by_repository(
 ) -> services::Result<Vec<ProjectPlanRepositoryHandoff>>;
 ```
 
-`TaskLifecycle::Merging.reason_kind = "task_repository_merge_batch"` y
-`reason_ref = batch.id` son el único lifecycle receipt del merge batch. La lane
-PR no escribe lifecycle por repo; la lane Gate/lifecycle agrega filas/decisiones
-por repo y escribe un transition usando la GateEvaluation/batch exactos. Una
-replan aprobada materializa revisión nueva y WUs nuevos en la misma transacción;
-el PATCH directo conserva `409 task.repositories.replan_required`.
+Para el flujo multirepo, `TaskLifecycle::Merging.reason_kind =
+"task_repository_merge_batch"` y `reason_ref = batch.id` son el único lifecycle
+receipt del merge batch. La operación legacy single-repo sin batch conserva
+`TaskMerge.id` como `reason_ref`. La lane PR no escribe lifecycle por repo; la
+lane Gate/lifecycle agrega filas/decisiones por repo y escribe una transition
+usando la GateEvaluation/batch exactos. Una replan aprobada materializa revisión
+nueva y WUs nuevos en la misma transacción; el PATCH directo conserva `409
+task.repositories.replan_required`.
 
 ### Filtros CI requeridos (incorporados en la integración)
 

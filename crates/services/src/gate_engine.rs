@@ -933,7 +933,7 @@ impl GateEngine {
         let mut inputs = Vec::new();
         let mut required_checks: Vec<RequiredCheck> = Vec::new();
         let mut required_checks_v3: Vec<RequiredCheckV3> = Vec::new();
-        let (outcome, policy) = if !matches!(policy_revision.schema_version, 1 | 2 | 3) {
+        let (outcome, policy) = if !matches!(policy_revision.schema_version, 1..=3) {
             issues.push("unknown_policy_schema".to_owned());
             (GateEvaluationOutcome::Indeterminate, None)
         } else if sha256(policy_revision.policy_json.as_bytes()) != policy_revision.policy_digest {

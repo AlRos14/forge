@@ -1556,22 +1556,21 @@ async fn task_public_value(state: &AppState, task: Task) -> Result<Value, McpToo
                 })
                 .collect::<Vec<_>>();
             let merge = merge_rows.last().map(|row| (*row).clone());
+            let inferred_integration = (current_revision_has_batch
+                && repository.role != db::TaskRepositoryRole::Context)
+                .then(|| {
+                    json!({
+                        "repo_id": repository.repo_id.clone(),
+                        "integration_id": null,
+                        "outcome": "unchanged",
+                        "before_sha": null,
+                        "after_sha": null,
+                    })
+                });
             let integration = integrations
                 .get(&repository.repo_id)
                 .map(|(_, integration)| integration)
-                .or_else(|| {
-                    (current_revision_has_batch
-                        && repository.role != db::TaskRepositoryRole::Context)
-                        .then(|| {
-                            json!({
-                                "repo_id": repository.repo_id.clone(),
-                                "integration_id": null,
-                                "outcome": "unchanged",
-                                "before_sha": null,
-                                "after_sha": null,
-                            })
-                        })
-                });
+                .or(inferred_integration.as_ref());
             let change_state = if merge.is_some() {
                 "changed"
             } else if repository.role == db::TaskRepositoryRole::Context

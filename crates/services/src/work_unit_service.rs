@@ -2537,7 +2537,7 @@ impl WorkUnitService {
                         "success"
                     };
                     items.push(legacy_parent_repository_result(
-                        &previous,
+                        previous,
                         &prepared[0].repo_id,
                         outcome,
                     ));
@@ -2860,7 +2860,7 @@ impl WorkUnitService {
             WorkUnitRepositoryIntegrationOutcome::Success
                 | WorkUnitRepositoryIntegrationOutcome::Unchanged
         ) {
-            return Ok(repository_integration_result(&record, item).await?);
+            return repository_integration_result(&record, item).await;
         }
         let target_path = Path::new(&item.target_workspace.worktree_path);
         if matches!(
@@ -2872,7 +2872,7 @@ impl WorkUnitService {
             // Only rows without a terminal result are retried. A repository
             // conflict remains durable while a later call continues with
             // other rows that were still pending.
-            return Ok(repository_integration_result(&record, item).await?);
+            return repository_integration_result(&record, item).await;
         }
         if record.outcome == WorkUnitRepositoryIntegrationOutcome::Running {
             match classify_repository_integration_recovery(target_path, &record).await? {
@@ -2897,7 +2897,7 @@ impl WorkUnitService {
                             None,
                         )
                         .await?;
-                    return Ok(repository_integration_result(&record, item).await?);
+                    return repository_integration_result(&record, item).await;
                 }
                 IntegrationRecovery::Mismatch(kind) => {
                     record = self
@@ -2911,7 +2911,7 @@ impl WorkUnitService {
                             Some(&serde_json::json!({ "kind": kind }).to_string()),
                         )
                         .await?;
-                    return Ok(repository_integration_result(&record, item).await?);
+                    return repository_integration_result(&record, item).await;
                 }
                 IntegrationRecovery::Retry => {}
             }
@@ -2928,7 +2928,7 @@ impl WorkUnitService {
                     Some(r#"{"kind":"target_worktree_dirty"}"#),
                 )
                 .await?;
-            return Ok(repository_integration_result(&record, item).await?);
+            return repository_integration_result(&record, item).await;
         }
         match git::merge(target_path, &record.source_sha).await {
             Ok(()) => {
@@ -3007,7 +3007,7 @@ impl WorkUnitService {
                     .await?;
             }
         }
-        Ok(repository_integration_result(&record, item).await?)
+        repository_integration_result(&record, item).await
     }
 
     #[allow(clippy::too_many_arguments)]

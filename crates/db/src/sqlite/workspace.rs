@@ -14,8 +14,25 @@ fn map_workspace_group(row: SqliteRow) -> Result<crate::WorkspaceGroup> {
 impl WorkspaceRepo for SqliteDb {
     async fn create(&self, input: CreateWorkspace) -> Result<Workspace> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        super::task_repository::ensure_initial_current_revision_in_tx(&mut tx, &input.task_id)
-            .await?;
+        let has_repository_revisions: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'task_repository_set_revision'
+             )",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_repository_revisions {
+            super::task_repository::ensure_initial_current_revision_in_tx(&mut tx, &input.task_id)
+                .await?;
+        }
+        let scope_has_repo_id: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('workspace_scope') WHERE name = 'repo_id'
+             )",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         sqlx::query("INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, before_sha, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&input.id)
             .bind(&input.task_id)
@@ -28,17 +45,30 @@ impl WorkspaceRepo for SqliteDb {
             .bind(&input.updated_at)
             .execute(&mut *tx)
             .await?;
-        sqlx::query(
-            "INSERT INTO workspace_scope (
-                 workspace_id, task_id, repo_id, scope_kind, work_unit_id, created_at
-             ) VALUES (?, ?, ?, 'integration', NULL, ?)",
-        )
-        .bind(&input.id)
-        .bind(&input.task_id)
-        .bind(&input.repo_id)
-        .bind(&input.created_at)
-        .execute(&mut *tx)
-        .await?;
+        if scope_has_repo_id {
+            sqlx::query(
+                "INSERT INTO workspace_scope (
+                     workspace_id, task_id, repo_id, scope_kind, work_unit_id, created_at
+                 ) VALUES (?, ?, ?, 'integration', NULL, ?)",
+            )
+            .bind(&input.id)
+            .bind(&input.task_id)
+            .bind(&input.repo_id)
+            .bind(&input.created_at)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "INSERT INTO workspace_scope (
+                     workspace_id, task_id, scope_kind, work_unit_id, created_at
+                 ) VALUES (?, ?, 'integration', NULL, ?)",
+            )
+            .bind(&input.id)
+            .bind(&input.task_id)
+            .bind(&input.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
         let row = sqlx::query("SELECT * FROM workspace WHERE id = ?")
             .bind(&input.id)
             .fetch_one(&mut *tx)
@@ -138,7 +168,7 @@ impl WorkspaceRepo for SqliteDb {
         sqlx::query(
             "SELECT w.* FROM workspace w
              JOIN workspace_scope s ON s.workspace_id = w.id AND s.task_id = w.task_id
-             WHERE s.task_id = ? AND s.repo_id = ? AND s.scope_kind = 'integration'",
+             WHERE w.task_id = ? AND w.repo_id = ? AND s.scope_kind = 'integration'",
         )
         .bind(task_id)
         .bind(repo_id)
@@ -149,7 +179,15 @@ impl WorkspaceRepo for SqliteDb {
     }
 
     async fn list_integrations_by_task(&self, task_id: &str) -> Result<Vec<Workspace>> {
-        sqlx::query(
+        let has_repository_revisions: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'task_repository_set_revision'
+             )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let query = if has_repository_revisions {
             "SELECT w.* FROM workspace w
              JOIN workspace_scope s ON s.workspace_id = w.id AND s.task_id = w.task_id
              LEFT JOIN task_repository_set_revision current_revision
@@ -157,16 +195,22 @@ impl WorkspaceRepo for SqliteDb {
              LEFT JOIN task_repository_set_revision_repo repository
                ON repository.task_id = current_revision.task_id
               AND repository.revision = current_revision.revision
-              AND repository.repo_id = s.repo_id
+              AND repository.repo_id = w.repo_id
              WHERE s.task_id = ? AND s.scope_kind = 'integration'
-             ORDER BY repository.position, s.repo_id, w.id",
-        )
-        .bind(task_id)
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(map_workspace)
-        .collect()
+             ORDER BY repository.position, w.repo_id, w.id"
+        } else {
+            "SELECT w.* FROM workspace w
+             JOIN workspace_scope s ON s.workspace_id = w.id AND s.task_id = w.task_id
+             WHERE s.task_id = ? AND s.scope_kind = 'integration'
+             ORDER BY w.repo_id, w.id"
+        };
+        sqlx::query(query)
+            .bind(task_id)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(map_workspace)
+            .collect()
     }
 
     async fn set_cleanup_after(

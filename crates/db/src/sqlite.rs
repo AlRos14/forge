@@ -332,6 +332,12 @@ fn check_error(error: sqlx::Error) -> DbError {
         {
             return DbError::Check(database_error.message().to_owned());
         }
+        if database_error
+            .message()
+            .contains("repository merge batch state/version transition")
+        {
+            return DbError::Check(database_error.message().to_owned());
+        }
     }
     error.into()
 }

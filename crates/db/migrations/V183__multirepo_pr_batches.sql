@@ -143,6 +143,21 @@ SELECT task_id, 1, repo_id, role, position FROM task_repository;
 UPDATE task_repository_set_revision SET state = 'current'
 WHERE revision = 1 AND state = 'building';
 
+CREATE VIEW task_requires_repository_merge_batch AS
+SELECT task_id
+FROM task_repository
+WHERE role IN ('primary', 'affected')
+GROUP BY task_id
+HAVING COUNT(*) > 1
+UNION
+SELECT revision.task_id
+FROM task_repository_set_revision revision
+JOIN task_repository_set_revision_repo repository
+  ON repository.task_id = revision.task_id AND repository.revision = revision.revision
+WHERE revision.state = 'current' AND repository.role IN ('primary', 'affected')
+GROUP BY revision.task_id, revision.revision
+HAVING COUNT(*) > 1;
+
 CREATE TABLE work_unit_repository_set_revision (
     work_unit_id TEXT NOT NULL,
     task_id      TEXT NOT NULL,
@@ -200,10 +215,11 @@ BEGIN
 END;
 DROP INDEX IF EXISTS idx_workspace_scope_integration;
 DROP INDEX IF EXISTS idx_workspace_scope_work_unit;
-CREATE UNIQUE INDEX idx_workspace_scope_integration_repo
+CREATE UNIQUE INDEX idx_workspace_scope_integration
     ON workspace_scope(task_id, repo_id) WHERE scope_kind = 'integration';
-CREATE UNIQUE INDEX idx_workspace_scope_work_unit_repo
-    ON workspace_scope(work_unit_id, repo_id) WHERE scope_kind = 'work_unit';
+CREATE INDEX idx_workspace_scope_work_unit
+    ON workspace_scope(work_unit_id, workspace_id, repo_id)
+    WHERE scope_kind = 'work_unit';
 
 CREATE TABLE work_unit_repository_integration (
     id                         TEXT PRIMARY KEY,
@@ -485,23 +501,29 @@ CREATE TRIGGER pr_metadata_merge_admission_guard_insert
 BEFORE INSERT ON pr_metadata
 WHEN NEW.task_merge_operation_id IS NULL
   OR NEW.publish_operation_id IS NULL
-  OR NEW.repo_id IS NULL
   OR NOT EXISTS (
       SELECT 1
       FROM task_integration_operation AS merge_op
+      JOIN task ON task.id = merge_op.task_id
       JOIN task_integration_operation AS publish_op
         ON publish_op.id = NEW.publish_operation_id
        AND publish_op.parent_operation_id = merge_op.id
        AND publish_op.task_id = merge_op.task_id
       WHERE merge_op.id = NEW.task_merge_operation_id
         AND merge_op.task_id = NEW.task_id
-        AND merge_op.repo_id = NEW.repo_id
+        AND COALESCE(merge_op.repo_id,
+                     task.repo_id) = COALESCE(NEW.repo_id, task.repo_id)
+        AND (NEW.repo_id IS NOT NULL OR (
+            merge_op.repository_merge_batch_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM task_requires_repository_merge_batch r
+                            WHERE r.task_id = merge_op.task_id)
+        ))
         AND merge_op.kind = 'task_merge'
         AND merge_op.status = 'running'
         AND merge_op.remote_waiting = 1
         AND publish_op.kind = 'publish_pr'
-        AND publish_op.repo_id = NEW.repo_id
-        AND publish_op.repository_merge_batch_id = merge_op.repository_merge_batch_id
+        AND COALESCE(publish_op.repo_id, task.repo_id) = COALESCE(NEW.repo_id, task.repo_id)
+        AND publish_op.repository_merge_batch_id IS merge_op.repository_merge_batch_id
         AND publish_op.gate_evaluation_id = merge_op.gate_evaluation_id
   )
 BEGIN
@@ -515,7 +537,6 @@ WHEN (NEW.task_merge_operation_id IS NOT OLD.task_merge_operation_id
  AND (
     NEW.task_merge_operation_id IS NULL
     OR NEW.publish_operation_id IS NULL
-    OR NEW.repo_id IS NULL
     OR (OLD.task_merge_operation_id IS NOT NULL AND NOT EXISTS (
         SELECT 1
         FROM remote_pr_admission AS paused_admission
@@ -525,7 +546,7 @@ WHEN (NEW.task_merge_operation_id IS NOT OLD.task_merge_operation_id
           AND paused_admission.publish_operation_id = OLD.publish_operation_id
           AND paused_admission.metadata_id = OLD.id
           AND paused_admission.task_id = OLD.task_id
-          AND paused_admission.repo_id = OLD.repo_id
+          AND paused_admission.repo_id IS OLD.repo_id
           AND paused_admission.rework_outcome = 'superseded_for_rework'
           AND paused.task_id = OLD.task_id
           AND paused.state IN ('open', 'remote_closed')
@@ -540,7 +561,7 @@ WHEN (NEW.task_merge_operation_id IS NOT OLD.task_merge_operation_id
           AND old_admission.publish_operation_id = OLD.publish_operation_id
           AND old_admission.metadata_id = OLD.id
           AND old_admission.task_id = OLD.task_id
-          AND old_admission.repo_id = OLD.repo_id
+          AND old_admission.repo_id IS OLD.repo_id
           AND old_admission.state IN ('merged', 'closed', 'head_mismatch', 'publication_failed')
           AND history.provider_type = OLD.provider_type
           AND history.provider_pr_id IS OLD.provider_pr_id
@@ -557,17 +578,24 @@ WHEN (NEW.task_merge_operation_id IS NOT OLD.task_merge_operation_id
         JOIN task_integration_operation AS publish_op
           ON publish_op.parent_operation_id = merge_op.id
          AND publish_op.task_id = merge_op.task_id
+        JOIN task ON task.id = merge_op.task_id
         WHERE merge_op.id = NEW.task_merge_operation_id
           AND merge_op.task_id = NEW.task_id
-          AND merge_op.repo_id = NEW.repo_id
+          AND COALESCE(merge_op.repo_id,
+                       task.repo_id) = COALESCE(NEW.repo_id, task.repo_id)
+          AND (NEW.repo_id IS NOT NULL OR (
+              merge_op.repository_merge_batch_id IS NULL
+              AND NOT EXISTS (SELECT 1 FROM task_requires_repository_merge_batch r
+                              WHERE r.task_id = merge_op.task_id)
+          ))
           AND merge_op.kind = 'task_merge'
           AND merge_op.status = 'running'
           AND merge_op.remote_waiting = 1
           AND publish_op.id = NEW.publish_operation_id
           AND publish_op.kind = 'publish_pr'
           AND publish_op.status = 'running'
-          AND publish_op.repo_id = NEW.repo_id
-          AND publish_op.repository_merge_batch_id = merge_op.repository_merge_batch_id
+          AND COALESCE(publish_op.repo_id, task.repo_id) = COALESCE(NEW.repo_id, task.repo_id)
+          AND publish_op.repository_merge_batch_id IS merge_op.repository_merge_batch_id
           AND publish_op.gate_evaluation_id = merge_op.gate_evaluation_id
     )
  )
@@ -583,7 +611,7 @@ WHEN NEW.admission_status IS NOT OLD.admission_status
      SELECT 1 FROM remote_pr_admission AS admission
      WHERE admission.metadata_id = NEW.id
        AND admission.task_id = NEW.task_id
-       AND admission.repo_id = NEW.repo_id
+       AND admission.repo_id IS NEW.repo_id
        AND admission.task_merge_operation_id = NEW.task_merge_operation_id
        AND admission.publish_operation_id = NEW.publish_operation_id
        AND (
@@ -603,20 +631,29 @@ END;
 
 CREATE TRIGGER pr_metadata_repo_insert_guard
 BEFORE INSERT ON pr_metadata
-WHEN NEW.repo_id IS NULL OR NOT EXISTS (
+WHEN NOT EXISTS (
     SELECT 1
     FROM task AS t
-    JOIN repo AS r ON r.id = NEW.repo_id AND r.project_id = t.project_id
+    JOIN repo AS r ON r.id = COALESCE(NEW.repo_id, t.repo_id) AND r.project_id = t.project_id
     JOIN task_integration_operation AS merge_op
       ON merge_op.id = NEW.task_merge_operation_id
-     AND merge_op.task_id = t.id AND merge_op.repo_id = NEW.repo_id
-    JOIN task_repository_merge_batch_repo AS batch_repo
-      ON batch_repo.batch_id = merge_op.repository_merge_batch_id
-     AND batch_repo.task_id = t.id AND batch_repo.repo_id = NEW.repo_id
+     AND merge_op.task_id = t.id
     WHERE t.id = NEW.task_id
+      AND COALESCE(merge_op.repo_id, t.repo_id) = COALESCE(NEW.repo_id, t.repo_id)
+      AND (
+          (merge_op.repository_merge_batch_id IS NOT NULL AND NEW.repo_id IS NOT NULL AND EXISTS (
+              SELECT 1 FROM task_repository_merge_batch_repo batch_repo
+              WHERE batch_repo.batch_id = merge_op.repository_merge_batch_id
+                AND batch_repo.task_id = t.id AND batch_repo.repo_id = NEW.repo_id
+          ))
+          OR (merge_op.repository_merge_batch_id IS NULL
+              AND (NEW.repo_id IS NULL OR NEW.repo_id = t.repo_id)
+              AND NOT EXISTS (SELECT 1 FROM task_requires_repository_merge_batch r
+                              WHERE r.task_id = t.id))
+      )
 )
 BEGIN
-    SELECT RAISE(ABORT, 'new PR metadata requires its exact writable repo in the Task batch');
+    SELECT RAISE(ABORT, 'new PR metadata requires its exact writable repository authority');
 END;
 
 CREATE TRIGGER pr_metadata_repo_immutable
@@ -1508,20 +1545,56 @@ END;
 DROP TRIGGER task_integration_operation_remote_admission_guard;
 CREATE TRIGGER task_integration_operation_remote_admission_guard
 BEFORE INSERT ON task_integration_operation
-WHEN (NEW.kind = 'task_merge' AND (NEW.repo_id IS NULL OR NEW.repository_merge_batch_id IS NULL
-      OR NOT EXISTS (SELECT 1 FROM task_repository_merge_batch_repo row
-                     WHERE row.batch_id = NEW.repository_merge_batch_id
-                       AND row.task_id = NEW.task_id AND row.repo_id = NEW.repo_id)))
+WHEN (NEW.kind = 'task_merge' AND (
+        (NEW.repository_merge_batch_id IS NOT NULL AND (
+            NEW.repo_id IS NULL OR NOT EXISTS (
+            SELECT 1 FROM task_repository_merge_batch_repo row
+            WHERE row.batch_id = NEW.repository_merge_batch_id
+              AND row.task_id = NEW.task_id AND row.repo_id = NEW.repo_id
+            )
+        ))
+        OR (NEW.repository_merge_batch_id IS NULL AND (
+            EXISTS (
+                SELECT 1 FROM task_repository first_repo
+                JOIN task_repository second_repo
+                  ON second_repo.task_id = first_repo.task_id
+                 AND second_repo.repo_id != first_repo.repo_id
+                WHERE first_repo.task_id = NEW.task_id
+                  AND first_repo.role IN ('primary', 'affected')
+                  AND second_repo.role IN ('primary', 'affected')
+            )
+            OR EXISTS (
+                SELECT 1 FROM task_repository_set_revision revision
+                JOIN task_repository_set_revision_repo first_repo
+                  ON first_repo.task_id = revision.task_id
+                 AND first_repo.revision = revision.revision
+                JOIN task_repository_set_revision_repo second_repo
+                  ON second_repo.task_id = first_repo.task_id
+                 AND second_repo.revision = first_repo.revision
+                 AND second_repo.repo_id != first_repo.repo_id
+                WHERE revision.task_id = NEW.task_id AND revision.state = 'current'
+                  AND first_repo.role IN ('primary', 'affected')
+                  AND second_repo.role IN ('primary', 'affected')
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM task t
+                WHERE t.id = NEW.task_id AND t.repo_id IS NOT NULL
+                  AND (NEW.repo_id IS NULL OR NEW.repo_id = t.repo_id)
+            )
+        ))
+    ))
   OR (NEW.remote_waiting = 1 AND (
         NEW.kind != 'task_merge'
         OR NEW.parent_operation_id IS NOT NULL
         OR NOT EXISTS (
-            SELECT 1 FROM task t JOIN repo r ON r.id = NEW.repo_id AND r.project_id = t.project_id
+            SELECT 1 FROM task t JOIN repo r
+              ON r.id = COALESCE(NEW.repo_id, t.repo_id) AND r.project_id = t.project_id
             WHERE t.id = NEW.task_id AND r.work_mode = 'pull_request'
         )
      ))
   OR (NEW.kind = 'task_merge' AND NEW.remote_waiting = 0 AND EXISTS (
-        SELECT 1 FROM task t JOIN repo r ON r.id = NEW.repo_id AND r.project_id = t.project_id
+        SELECT 1 FROM task t JOIN repo r
+          ON r.id = COALESCE(NEW.repo_id, t.repo_id) AND r.project_id = t.project_id
         WHERE t.id = NEW.task_id AND r.work_mode = 'pull_request'
      ))
   OR (NEW.kind = 'publish_pr' AND (
@@ -1536,9 +1609,12 @@ WHEN (NEW.kind = 'task_merge' AND (NEW.repo_id IS NULL OR NEW.repository_merge_b
               AND merge_op.remote_waiting = 1
               AND merge_op.gate_evaluation_id = NEW.gate_evaluation_id
               AND lifecycle.state = 'merging'
-              AND lifecycle.reason_ref = merge_op.repository_merge_batch_id
-              AND merge_op.repo_id = NEW.repo_id
-              AND merge_op.repository_merge_batch_id = NEW.repository_merge_batch_id
+              AND ((merge_op.repository_merge_batch_id IS NULL
+                    AND lifecycle.reason_ref IS merge_op.id)
+                   OR (merge_op.repository_merge_batch_id IS NOT NULL
+                       AND lifecycle.reason_ref IS merge_op.repository_merge_batch_id))
+              AND merge_op.repo_id IS NEW.repo_id
+              AND merge_op.repository_merge_batch_id IS NEW.repository_merge_batch_id
         )
      ))
   OR (NEW.kind != 'publish_pr' AND NEW.parent_operation_id IS NOT NULL)
@@ -1580,9 +1656,12 @@ WHEN NEW.kind = 'publish_pr' AND (
           AND gate.gate_kind = 'merge_readiness'
           AND gate.scope_kind = 'task' AND gate.scope_id = NEW.task_id
           AND lifecycle.state = 'merging'
-          AND lifecycle.reason_ref = merge_op.repository_merge_batch_id
-          AND merge_op.repo_id = NEW.repo_id
-          AND merge_op.repository_merge_batch_id = NEW.repository_merge_batch_id
+          AND ((merge_op.repository_merge_batch_id IS NULL
+                AND lifecycle.reason_ref IS merge_op.id)
+               OR (merge_op.repository_merge_batch_id IS NOT NULL
+                   AND lifecycle.reason_ref IS merge_op.repository_merge_batch_id))
+          AND merge_op.repo_id IS NEW.repo_id
+          AND merge_op.repository_merge_batch_id IS NEW.repository_merge_batch_id
     )
 )
 BEGIN
@@ -1591,31 +1670,87 @@ END;
 
 CREATE TRIGGER task_integration_operation_repo_batch_insert_guard
 BEFORE INSERT ON task_integration_operation
-WHEN (NEW.kind = 'task_merge' AND NOT EXISTS (
-        SELECT 1 FROM task_repository_merge_batch batch
-        JOIN task_repository_merge_batch_repo row
-          ON row.batch_id = batch.id AND row.task_id = batch.task_id
-        JOIN task_repository_set_revision_repo repository
-          ON repository.task_id = batch.task_id
-         AND repository.revision = batch.repository_set_revision
-         AND repository.repo_id = row.repo_id
-         AND repository.role IN ('primary', 'affected')
-        WHERE batch.id = NEW.repository_merge_batch_id
-          AND batch.task_id = NEW.task_id
-          AND row.repo_id = NEW.repo_id
-          AND (row.task_merge_operation_id IS NULL OR row.task_merge_operation_id = NEW.id)
+WHEN (NEW.kind = 'task_merge' AND (
+        (NEW.repository_merge_batch_id IS NULL AND (
+            EXISTS (
+                SELECT 1 FROM task_repository first_repo
+                JOIN task_repository second_repo
+                  ON second_repo.task_id = first_repo.task_id
+                 AND second_repo.repo_id != first_repo.repo_id
+                WHERE first_repo.task_id = NEW.task_id
+                  AND first_repo.role IN ('primary', 'affected')
+                  AND second_repo.role IN ('primary', 'affected')
+            )
+            OR EXISTS (
+                SELECT 1 FROM task_repository_set_revision revision
+                JOIN task_repository_set_revision_repo first_repo
+                  ON first_repo.task_id = revision.task_id
+                 AND first_repo.revision = revision.revision
+                JOIN task_repository_set_revision_repo second_repo
+                  ON second_repo.task_id = first_repo.task_id
+                 AND second_repo.revision = first_repo.revision
+                 AND second_repo.repo_id != first_repo.repo_id
+                WHERE revision.task_id = NEW.task_id AND revision.state = 'current'
+                  AND first_repo.role IN ('primary', 'affected')
+                  AND second_repo.role IN ('primary', 'affected')
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM task t
+                WHERE t.id = NEW.task_id AND t.repo_id IS NOT NULL
+                  AND (NEW.repo_id IS NULL OR NEW.repo_id = t.repo_id)
+            )
+        ))
+        OR (NEW.repository_merge_batch_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM task_repository_merge_batch batch
+            JOIN task_repository_merge_batch_repo row
+              ON row.batch_id = batch.id AND row.task_id = batch.task_id
+            JOIN task_repository_set_revision_repo repository
+              ON repository.task_id = batch.task_id
+             AND repository.revision = batch.repository_set_revision
+             AND repository.repo_id = row.repo_id
+             AND repository.role IN ('primary', 'affected')
+            WHERE batch.id = NEW.repository_merge_batch_id
+              AND batch.task_id = NEW.task_id
+              AND row.repo_id = NEW.repo_id
+              AND (row.task_merge_operation_id IS NULL OR row.task_merge_operation_id = NEW.id)
+        ))
      ))
   OR (NEW.kind = 'publish_pr' AND NOT EXISTS (
         SELECT 1 FROM task_integration_operation merge_op
-        JOIN task_repository_merge_batch_repo row
-          ON row.batch_id = merge_op.repository_merge_batch_id
-         AND row.task_id = merge_op.task_id AND row.repo_id = merge_op.repo_id
         WHERE merge_op.id = NEW.parent_operation_id
           AND merge_op.task_id = NEW.task_id AND merge_op.kind = 'task_merge'
           AND merge_op.status = 'running'
-          AND merge_op.repo_id = NEW.repo_id
-          AND merge_op.repository_merge_batch_id = NEW.repository_merge_batch_id
-          AND row.task_merge_operation_id = merge_op.id
+          AND merge_op.repo_id IS NEW.repo_id
+          AND merge_op.repository_merge_batch_id IS NEW.repository_merge_batch_id
+          AND (
+              (NEW.repository_merge_batch_id IS NULL AND NOT EXISTS (
+                  SELECT 1 FROM task_repository first_repo
+                  JOIN task_repository second_repo
+                    ON second_repo.task_id = first_repo.task_id
+                   AND second_repo.repo_id != first_repo.repo_id
+                  WHERE first_repo.task_id = NEW.task_id
+                    AND first_repo.role IN ('primary', 'affected')
+                    AND second_repo.role IN ('primary', 'affected')
+              ) AND NOT EXISTS (
+                  SELECT 1 FROM task_repository_set_revision revision
+                  JOIN task_repository_set_revision_repo first_repo
+                    ON first_repo.task_id = revision.task_id
+                   AND first_repo.revision = revision.revision
+                  JOIN task_repository_set_revision_repo second_repo
+                    ON second_repo.task_id = first_repo.task_id
+                   AND second_repo.revision = first_repo.revision
+                   AND second_repo.repo_id != first_repo.repo_id
+                  WHERE revision.task_id = NEW.task_id AND revision.state = 'current'
+                    AND first_repo.role IN ('primary', 'affected')
+                    AND second_repo.role IN ('primary', 'affected')
+              ))
+              OR (NEW.repository_merge_batch_id IS NOT NULL AND EXISTS (
+                  SELECT 1 FROM task_repository_merge_batch_repo row
+                  WHERE row.batch_id = NEW.repository_merge_batch_id
+                    AND row.task_id = NEW.task_id AND row.repo_id = NEW.repo_id
+                    AND row.task_merge_operation_id = merge_op.id
+              ))
+          )
      ))
 BEGIN
     SELECT RAISE(ABORT, 'TaskMerge and PublishPr require their exact repository merge batch row');
@@ -1641,31 +1776,32 @@ WHEN NOT EXISTS (
     JOIN pr_metadata metadata
       ON metadata.id = NEW.metadata_id AND metadata.task_id = merge_op.task_id
     JOIN task t ON t.id = merge_op.task_id
-    JOIN repo r ON r.id = merge_op.repo_id AND r.project_id = t.project_id
+    JOIN repo r ON r.id = COALESCE(merge_op.repo_id, t.repo_id)
+                AND r.project_id = t.project_id
     JOIN pr_provider_config config
       ON config.id = NEW.provider_config_id AND config.repo_id = r.id
-    JOIN task_repository_merge_batch batch
+    LEFT JOIN task_repository_merge_batch batch
       ON batch.id = merge_op.repository_merge_batch_id AND batch.task_id = merge_op.task_id
-    JOIN task_repository_merge_batch_repo batch_repo
+    LEFT JOIN task_repository_merge_batch_repo batch_repo
       ON batch_repo.batch_id = batch.id AND batch_repo.task_id = batch.task_id
      AND batch_repo.repo_id = NEW.repo_id
-    JOIN task_repository_set_revision_repo revision_repo
+    LEFT JOIN task_repository_set_revision_repo revision_repo
       ON revision_repo.task_id = batch.task_id
      AND revision_repo.revision = batch.repository_set_revision
-     AND revision_repo.repo_id = NEW.repo_id
+     AND revision_repo.repo_id = COALESCE(NEW.repo_id, t.repo_id)
      AND revision_repo.role IN ('primary', 'affected')
     JOIN task_lifecycle lifecycle ON lifecycle.task_id = merge_op.task_id
     WHERE merge_op.id = NEW.task_merge_operation_id
       AND merge_op.task_id = NEW.task_id
-      AND merge_op.repo_id = NEW.repo_id
-      AND merge_op.repository_merge_batch_id = batch.id
+      AND COALESCE(merge_op.repo_id, t.repo_id) = COALESCE(NEW.repo_id, t.repo_id)
+      AND merge_op.repository_merge_batch_id IS batch.id
       AND merge_op.kind = 'task_merge' AND merge_op.status = 'running'
       AND merge_op.remote_waiting = 1
       AND publish_op.kind = 'publish_pr' AND publish_op.status = 'running'
       AND publish_op.gate_evaluation_id = merge_op.gate_evaluation_id
-      AND publish_op.repo_id = NEW.repo_id
-      AND publish_op.repository_merge_batch_id = batch.id
-      AND metadata.repo_id = NEW.repo_id
+      AND COALESCE(publish_op.repo_id, t.repo_id) = COALESCE(NEW.repo_id, t.repo_id)
+      AND publish_op.repository_merge_batch_id IS merge_op.repository_merge_batch_id
+      AND COALESCE(metadata.repo_id, t.repo_id) = COALESCE(NEW.repo_id, t.repo_id)
       AND metadata.task_merge_operation_id = merge_op.id
       AND metadata.publish_operation_id = publish_op.id
       AND metadata.provider_type = NEW.provider_type
@@ -1680,7 +1816,23 @@ WHEN NOT EXISTS (
       AND config.credential_owner_user_id IS NEW.credential_owner_user_id
       AND config.feedback_policy_json IS NEW.feedback_policy_json
       AND (NEW.feedback_policy_json IS NULL) = (NEW.feedback_policy_digest IS NULL)
-      AND lifecycle.state = 'merging' AND lifecycle.reason_ref = batch.id
+      AND lifecycle.state = 'merging'
+      AND ((merge_op.repository_merge_batch_id IS NULL
+            AND lifecycle.reason_ref IS merge_op.id)
+           OR (merge_op.repository_merge_batch_id IS NOT NULL
+               AND lifecycle.reason_ref IS merge_op.repository_merge_batch_id))
+      AND (
+          (merge_op.repository_merge_batch_id IS NULL
+           AND publish_op.repository_merge_batch_id IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM task_requires_repository_merge_batch required
+               WHERE required.task_id = merge_op.task_id
+           ))
+          OR (merge_op.repository_merge_batch_id IS NOT NULL
+              AND batch.id = merge_op.repository_merge_batch_id
+              AND batch_repo.batch_id = batch.id
+              AND revision_repo.repo_id = NEW.repo_id)
+      )
       -- V175: a remotely merged paused PR is not re-admitted until abandoned;
       -- an open pause must be re-admitted exactly (same PR identity); no open
       -- pause means a fresh admission.
@@ -1743,14 +1895,35 @@ WHEN NEW.version != 1 OR NEW.state != 'open'
         AND m.task_merge_operation_id = a.task_merge_operation_id
         AND merge_op.task_id = NEW.task_id AND merge_op.kind = 'task_merge'
         AND merge_op.status = 'running' AND merge_op.remote_waiting = 1
-        AND l.state = 'merging' AND l.reason_ref = merge_op.repository_merge_batch_id
-        AND merge_op.repo_id = a.repo_id AND merge_op.repository_merge_batch_id IS NOT NULL
-        AND m.repo_id = a.repo_id
+        AND l.state = 'merging'
+        AND ((merge_op.repository_merge_batch_id IS NULL AND l.reason_ref IS merge_op.id)
+             OR (merge_op.repository_merge_batch_id IS NOT NULL
+                 AND l.reason_ref IS merge_op.repository_merge_batch_id))
+        AND COALESCE(merge_op.repo_id,
+                     (SELECT task.repo_id FROM task WHERE task.id = merge_op.task_id))
+            = COALESCE(a.repo_id,
+                       (SELECT task.repo_id FROM task WHERE task.id = a.task_id))
+        AND (
+            (merge_op.repository_merge_batch_id IS NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM task_requires_repository_merge_batch required
+                 WHERE required.task_id = merge_op.task_id
+             ))
+            OR (merge_op.repository_merge_batch_id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM task_repository_merge_batch_repo batch_repo
+                WHERE batch_repo.batch_id = merge_op.repository_merge_batch_id
+                  AND batch_repo.task_id = merge_op.task_id
+                  AND batch_repo.repo_id = COALESCE(merge_op.repo_id,
+                      (SELECT task.repo_id FROM task WHERE task.id = merge_op.task_id))
+                  AND batch_repo.task_merge_operation_id = merge_op.id
+            ))
+        )
+        AND m.repo_id IS a.repo_id
         AND e.event_type = 'pr.admission_superseded' AND e.entity_type = 'pr_metadata'
         AND e.entity_id = m.id AND e.scope_type = 'task' AND e.scope_id = NEW.task_id
         AND json_valid(e.payload_json)
         AND json_extract(e.payload_json, '$.task_id') = NEW.task_id
-        AND json_extract(e.payload_json, '$.repo_id') = m.repo_id
+        AND json_extract(e.payload_json, '$.repo_id') IS m.repo_id
         AND json_extract(e.payload_json, '$.pr_metadata_id') = m.id
         AND json_extract(e.payload_json, '$.task_merge_operation_id') = merge_op.id
         AND json_extract(e.payload_json, '$.publish_operation_id') = NEW.publish_operation_id
@@ -1775,6 +1948,7 @@ WHEN NEW.history_origin NOT IN ('v116_backfill', 'terminal_snapshot')
         ON publish_op.id = admission.publish_operation_id
        AND publish_op.task_id = admission.task_id
        AND publish_op.parent_operation_id = merge_op.id
+      JOIN task ON task.id = merge_op.task_id
       JOIN domain_event event ON event.id = admission.result_event_id
       WHERE admission.task_merge_operation_id = NEW.task_merge_operation_id
         AND admission.publish_operation_id = NEW.publish_operation_id
@@ -1801,7 +1975,8 @@ WHEN NEW.history_origin NOT IN ('v116_backfill', 'terminal_snapshot')
         AND event.created_at = NEW.result_created_at
         AND admission.state IN ('merged', 'closed', 'head_mismatch', 'publication_failed')
         AND merge_op.kind = 'task_merge'
-        AND merge_op.repo_id = admission.repo_id
+        AND COALESCE(merge_op.repo_id, task.repo_id) =
+            COALESCE(admission.repo_id, task.repo_id)
         AND merge_op.remote_waiting = 1
         AND merge_op.result_event_id = event.id
         AND publish_op.kind = 'publish_pr'
@@ -1825,7 +2000,7 @@ WHEN NEW.history_origin NOT IN ('v116_backfill', 'terminal_snapshot')
         AND event.scope_id = admission.task_id
         AND json_valid(event.payload_json)
         AND json_extract(event.payload_json, '$.task_id') = admission.task_id
-        AND json_extract(event.payload_json, '$.repo_id') = admission.repo_id
+        AND json_extract(event.payload_json, '$.repo_id') IS admission.repo_id
         AND json_extract(event.payload_json, '$.pr_metadata_id') = admission.metadata_id
         AND json_extract(event.payload_json, '$.task_merge_operation_id') = admission.task_merge_operation_id
         AND json_extract(event.payload_json, '$.publish_operation_id') = admission.publish_operation_id
@@ -1886,7 +2061,7 @@ WHEN NEW.history_origin NOT IN ('v116_backfill', 'terminal_snapshot')
                 SELECT 1 FROM pr_metadata metadata
                 WHERE metadata.id = admission.metadata_id
                   AND metadata.task_id = admission.task_id
-                  AND metadata.repo_id = admission.repo_id
+                  AND metadata.repo_id IS admission.repo_id
                   AND metadata.task_merge_operation_id = admission.task_merge_operation_id
                   AND metadata.publish_operation_id = admission.publish_operation_id
                   AND metadata.provider_type = admission.provider_type
@@ -1923,9 +2098,9 @@ WHEN (
           AND admission.publish_operation_id =
               CASE WHEN NEW.kind = 'publish_pr' THEN NEW.id ELSE metadata.publish_operation_id END
           AND admission.task_id = NEW.task_id
-          AND admission.repo_id = NEW.repo_id
+          AND admission.repo_id IS NEW.repo_id
           AND metadata.task_id = NEW.task_id
-          AND metadata.repo_id = admission.repo_id
+          AND metadata.repo_id IS admission.repo_id
           AND metadata.task_merge_operation_id = admission.task_merge_operation_id
           AND metadata.publish_operation_id = admission.publish_operation_id
           AND event.event_type = 'pr.status_changed'
@@ -1935,7 +2110,7 @@ WHEN (
           AND event.scope_id = NEW.task_id
           AND json_valid(event.payload_json)
           AND json_extract(event.payload_json, '$.task_id') = NEW.task_id
-          AND json_extract(event.payload_json, '$.repo_id') = metadata.repo_id
+          AND json_extract(event.payload_json, '$.repo_id') IS metadata.repo_id
           AND json_extract(event.payload_json, '$.pr_metadata_id') = metadata.id
           AND json_extract(event.payload_json, '$.task_merge_operation_id') =
               admission.task_merge_operation_id
@@ -2020,7 +2195,7 @@ WHEN (
           AND OLD.status = 'running' AND NEW.status = 'abandoned'
           AND admission.task_merge_operation_id = NEW.id
           AND admission.task_id = NEW.task_id
-          AND admission.repo_id = NEW.repo_id
+          AND admission.repo_id IS NEW.repo_id
           AND admission.state = 'open'
           AND admission.rework_outcome = 'superseded_for_rework'
           AND s.task_id = NEW.task_id
@@ -2029,7 +2204,7 @@ WHEN (
           AND s.metadata_id = admission.metadata_id
           AND s.state = 'open'
           AND metadata.task_id = NEW.task_id
-          AND metadata.repo_id = admission.repo_id
+          AND metadata.repo_id IS admission.repo_id
           AND metadata.task_merge_operation_id = NEW.id
           AND event.id = s.result_event_id
           AND event.event_type = 'pr.admission_superseded'
@@ -2039,7 +2214,7 @@ WHEN (
           AND event.scope_id = NEW.task_id
           AND json_valid(event.payload_json)
           AND json_extract(event.payload_json, '$.task_id') = NEW.task_id
-          AND json_extract(event.payload_json, '$.repo_id') = metadata.repo_id
+          AND json_extract(event.payload_json, '$.repo_id') IS metadata.repo_id
           AND json_extract(event.payload_json, '$.pr_metadata_id') = metadata.id
           AND json_extract(event.payload_json, '$.task_merge_operation_id') = NEW.id
           AND json_extract(event.payload_json, '$.publish_operation_id') =

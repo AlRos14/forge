@@ -2709,7 +2709,27 @@ impl WorkUnitWorkspaceRepo for SqliteDb {
 
     async fn create_for_work_unit(&self, input: CreateWorkUnitWorkspace) -> Result<Workspace> {
         let ws = input.workspace;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let pinned_revision: Option<i64> = sqlx::query_scalar(
+            "SELECT revision FROM work_unit_repository_set_revision
+             WHERE work_unit_id = ? AND task_id = ?",
+        )
+        .bind(&input.work_unit_id)
+        .bind(&ws.task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if pinned_revision.is_none() {
+            let current_revision =
+                super::task_repository::ensure_initial_current_revision_in_tx(&mut tx, &ws.task_id)
+                    .await?;
+            super::task_repository::pin_work_unit_in_tx(
+                &mut tx,
+                &input.work_unit_id,
+                &ws.task_id,
+                current_revision.revision,
+            )
+            .await?;
+        }
         sqlx::query(
             "INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status,
                                     before_sha, created_at, updated_at)

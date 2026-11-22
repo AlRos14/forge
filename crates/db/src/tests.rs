@@ -13,12 +13,13 @@ use crate::{
     OrchestratorWakeRepo, PageRequest, ProjectMemberRepo, ProjectRepo, ProviderAuthorizationRepo,
     RepoRepo, ReserveOrchestratorAction, RoleMembershipRepo, RoleMembershipStatus,
     SelectAgentProfile, SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskDependencyRepo,
-    TaskLifecycleRepo, TaskListQuery, TaskRepo, TaskRepositoryRole, TaskRepositoryWrite,
-    TaskRoleRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent, UpdateDaemonReport,
-    UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo,
-    UpdateRoleMembership, UpdateSkill, UpdateTask, UpdateTaskRole, UpdateTerminalSessionStatus,
-    UpsertDaemon, ValidationRunRepo, ValidationRunStatus, WorkMode, WorkUnitExecutionRepo,
-    WorkUnitWorkspaceRepo, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    TaskLifecycleRepo, TaskListQuery, TaskRepo, TaskRepositoryRole, TaskRepositorySetRepo,
+    TaskRepositoryWrite, TaskRoleRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
+    UpdateDaemonReport, UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation,
+    UpdateRepo, UpdateRoleMembership, UpdateSkill, UpdateTask, UpdateTaskRole,
+    UpdateTerminalSessionStatus, UpsertDaemon, ValidationRunRepo, ValidationRunStatus, WorkMode,
+    WorkUnitExecutionRepo, WorkUnitWorkspaceRepo, WorkspaceLeaseRepo, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use sha2::Digest as _;
@@ -905,6 +906,13 @@ async fn insert_test_work_unit(
     .execute(db.pool())
     .await
     .expect("WorkUnit fixture inserts");
+    let repository_set = TaskRepositorySetRepo::get_current(db, task_id)
+        .await
+        .expect("Task repository revision initializes")
+        .expect("Task exists");
+    TaskRepositorySetRepo::pin_work_unit(db, &work_unit_id, task_id, repository_set.revision)
+        .await
+        .expect("WorkUnit pins the current Task repository revision");
     work_unit_id
 }
 

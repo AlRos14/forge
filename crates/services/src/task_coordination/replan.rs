@@ -61,23 +61,27 @@ fn parse_replan_context(
     Ok(Some((id.to_owned(), original)))
 }
 
+struct ExactReplanDecisionBinding<'a> {
+    task_id: &'a str,
+    replan_id: &'a str,
+    authorization_version: i64,
+    request_id: &'a str,
+    artifact_id: &'a str,
+    plan_digest: &'a str,
+    user_id: &'a str,
+}
+
 fn validate_exact_replan_decision(
     decision: &db::HumanDecisionRequest,
-    task_id: &str,
-    replan_id: &str,
-    authorization_version: i64,
-    request_id: &str,
-    artifact_id: &str,
-    plan_digest: &str,
-    user_id: &str,
+    expected: ExactReplanDecisionBinding<'_>,
 ) -> Result<()> {
-    if decision.task_id != task_id
+    if decision.task_id != expected.task_id
         || decision.source_kind != HumanDecisionSourceKind::CoordinatorReplan
-        || decision.source_id != replan_id
-        || decision.authorization_version != Some(authorization_version)
+        || decision.source_id != expected.replan_id
+        || decision.authorization_version != Some(expected.authorization_version)
         || decision.state != db::HumanDecisionState::Answered
         || decision.answered_option_id.as_deref() != Some("approve_replan")
-        || decision.answered_by_user_id.as_deref() != Some(user_id)
+        || decision.answered_by_user_id.as_deref() != Some(expected.user_id)
     {
         return Err(invalid_plan(
             "the exact Human replan decision is not approved",
@@ -85,29 +89,29 @@ fn validate_exact_replan_decision(
     }
     let binding: ResumeBinding = serde_json::from_str(&decision.resume_binding_json)
         .map_err(|_| invalid_plan("the Human decision resume binding is invalid"))?;
-    if binding.request_id != request_id
+    if binding.request_id != expected.request_id
         || binding.request_kind != TaskCoordinationRequestKind::WorkUnitPlan
-        || binding.authorization_version != authorization_version
+        || binding.authorization_version != expected.authorization_version
         || binding
             .source_subject
             .get("coordinator_replan_id")
             .and_then(Value::as_str)
-            != Some(replan_id)
+            != Some(expected.replan_id)
         || binding
             .source_subject
             .get("plan_request_id")
             .and_then(Value::as_str)
-            != Some(request_id)
+            != Some(expected.request_id)
         || binding
             .source_subject
             .get("plan_artifact_id")
             .and_then(Value::as_str)
-            != Some(artifact_id)
+            != Some(expected.artifact_id)
         || binding
             .source_subject
             .get("plan_digest")
             .and_then(Value::as_str)
-            != Some(plan_digest)
+            != Some(expected.plan_digest)
     {
         return Err(invalid_plan(
             "the Human decision does not bind this exact replan artifact",
@@ -585,13 +589,15 @@ impl TaskCoordinationService {
                 .ok_or_else(|| invalid_plan("the exact Human replan decision is not approved"))?;
             validate_exact_replan_decision(
                 &decision,
-                &request.task_id,
-                &replan_id,
-                request.authorization_version,
-                &request.id,
-                artifact_id,
-                plan_digest,
-                user_id,
+                ExactReplanDecisionBinding {
+                    task_id: &request.task_id,
+                    replan_id: &replan_id,
+                    authorization_version: request.authorization_version,
+                    request_id: &request.id,
+                    artifact_id,
+                    plan_digest,
+                    user_id,
+                },
             )?;
             return Ok(Some(db::CoordinatorReplanDecisionProof {
                 replan_id,
@@ -956,8 +962,27 @@ impl TaskCoordinationService {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_exact_replan_decision;
+    use super::{
+        validate_exact_replan_decision, ExactReplanDecisionBinding, TaskCoordinationRequestKind,
+    };
     use crate::human_decision_service::ResumeBinding;
+
+    fn expected_binding<'a>(
+        replan_id: &'a str,
+        authorization_version: i64,
+        artifact_id: &'a str,
+        user_id: &'a str,
+    ) -> ExactReplanDecisionBinding<'a> {
+        ExactReplanDecisionBinding {
+            task_id: "task-1",
+            replan_id,
+            authorization_version,
+            request_id: "request-1",
+            artifact_id,
+            plan_digest: "digest-1",
+            user_id,
+        }
+    }
 
     fn approved_decision() -> db::HumanDecisionRequest {
         db::HumanDecisionRequest {
@@ -1002,71 +1027,35 @@ mod tests {
         let decision = approved_decision();
         validate_exact_replan_decision(
             &decision,
-            "task-1",
-            "replan-1",
-            4,
-            "request-1",
-            "artifact-1",
-            "digest-1",
-            "user-1",
+            expected_binding("replan-1", 4, "artifact-1", "user-1"),
         )
         .expect("the exact approving Human may materialize the bound plan");
 
         assert!(validate_exact_replan_decision(
             &decision,
-            "task-1",
-            "other-replan",
-            4,
-            "request-1",
-            "artifact-1",
-            "digest-1",
-            "user-1",
+            expected_binding("other-replan", 4, "artifact-1", "user-1"),
         )
         .is_err());
         assert!(validate_exact_replan_decision(
             &decision,
-            "task-1",
-            "replan-1",
-            5,
-            "request-1",
-            "artifact-1",
-            "digest-1",
-            "user-1",
+            expected_binding("replan-1", 5, "artifact-1", "user-1"),
         )
         .is_err());
         assert!(validate_exact_replan_decision(
             &decision,
-            "task-1",
-            "replan-1",
-            4,
-            "request-1",
-            "other-artifact",
-            "digest-1",
-            "user-1",
+            expected_binding("replan-1", 4, "other-artifact", "user-1"),
         )
         .is_err());
         let mut rejected = decision.clone();
         rejected.answered_option_id = Some("reject".to_owned());
         assert!(validate_exact_replan_decision(
             &rejected,
-            "task-1",
-            "replan-1",
-            4,
-            "request-1",
-            "artifact-1",
-            "digest-1",
-            "user-1",
+            expected_binding("replan-1", 4, "artifact-1", "user-1"),
         )
         .is_err());
         assert!(validate_exact_replan_decision(
             &decision,
-            "task-1",
-            "replan-1",
-            4,
-            "request-1",
-            "artifact-1",
-            "digest-1",
-            "different-user",
+            expected_binding("replan-1", 4, "artifact-1", "different-user"),
         )
         .is_err());
     }
