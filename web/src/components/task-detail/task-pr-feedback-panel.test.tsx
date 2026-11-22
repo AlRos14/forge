@@ -84,6 +84,7 @@ describe('TaskPrFeedbackPanel', () => {
             {
               id: 'feedback-1',
               task_id: 'task-1',
+              repo_id: 'repo-1',
               admission_id: 'admission-1',
               provider_item_id: 'review-1',
               kind: 'review_comment',
@@ -119,6 +120,8 @@ describe('TaskPrFeedbackPanel', () => {
             {
               id: 'rework-1',
               task_id: 'task-1',
+              repo_id: 'repo-1',
+              admission_id: 'admission-1',
               task_merge_operation_id: 'merge-1',
               publish_operation_id: 'publish-1',
               metadata_id: 'metadata-1',

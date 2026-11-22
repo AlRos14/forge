@@ -44,6 +44,7 @@ function actionResponse(): PrExternalActionListResponse {
       {
         id: 'action-1',
         task_id: 'task-1',
+        repo_id: 'repo-1',
         admission_id: 'admission-1',
         kind: 'push_update',
         state: 'proposed',

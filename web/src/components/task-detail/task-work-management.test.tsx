@@ -435,8 +435,8 @@ describe('TaskWorkManagement reviewer setup', () => {
       </QueryClientProvider>,
     )
 
-    expect(screen.getByText(/repo-primary · conflict/)).toBeInTheDocument()
-    expect(screen.getByText(/repo-affected · success/)).toBeInTheDocument()
+    expect(screen.getByText(/repo-primary · conflict/)).toBeTruthy()
+    expect(screen.getByText(/repo-affected · success/)).toBeTruthy()
     const retry = screen.getByRole('button', {
       name: 'Retry pending repository integrations',
     })

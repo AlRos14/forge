@@ -1242,7 +1242,7 @@ pub struct CreateTaskRepositorySetRevision {
     pub task_id: String,
     pub expected_current_revision: i64,
     pub expected_current_digest: Option<String>,
-    pub repositories: Vec<TaskRepositoryWrite>,
+    pub repositories: Vec<crate::TaskRepositoryWrite>,
     pub source_kind: String,
     pub source_ref: Option<String>,
     pub decision_id: Option<String>,

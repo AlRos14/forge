@@ -800,7 +800,7 @@ impl TaskIntegrationOperationRepo for SqliteDb {
             || publish.repository_merge_batch_id != merge.repository_merge_batch_id
             || publish.gate_evaluation_id != merge.gate_evaluation_id
             || metadata.task_id != merge.task_id
-            || metadata.repo_id.as_deref() != merge.repo_id.as_deref()
+            || Some(metadata.repo_id.as_str()) != merge.repo_id.as_deref()
             || metadata.task_merge_operation_id != merge.id
             || metadata.publish_operation_id != publish.id
             || metadata.provider_pr_id.is_some()

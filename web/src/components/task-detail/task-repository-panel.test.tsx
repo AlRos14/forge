@@ -100,11 +100,10 @@ describe('TaskRepositoryPanel', () => {
 
     render(<TaskRepositoryPanel task={task} />)
 
-    expect(screen.getByText('Task repositories · revision 3')).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: /Pull request · open · unmerged/ })).toHaveAttribute(
-      'href',
-      'https://example.test/org/repo-affected/pull/42',
-    )
-    expect(screen.getByText('repo-affected: open · dddddddddddd')).toBeInTheDocument()
+    expect(screen.getByText('Task repositories · revision 3')).toBeTruthy()
+    expect(
+      screen.getByRole('link', { name: /Pull request · open · unmerged/ }).getAttribute('href'),
+    ).toBe('https://example.test/org/repo-affected/pull/42')
+    expect(screen.getByText('repo-affected: open · dddddddddddd')).toBeTruthy()
   })
 })
