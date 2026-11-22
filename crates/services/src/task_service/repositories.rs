@@ -1,6 +1,6 @@
 use super::*;
 use db::{TaskRepositoryRole, TaskRepositoryWrite};
-use sqlx::Transaction;
+use sqlx::{Sqlite, Transaction};
 use std::collections::HashSet;
 
 pub(super) fn validate_task_repository_writes(rows: &[TaskRepositoryWrite]) -> Result<()> {

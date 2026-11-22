@@ -966,6 +966,7 @@ pub trait WorkUnitRepositoryIntegrationRepo: Send + Sync {
         &self,
         work_unit_id: &str,
     ) -> Result<Vec<WorkUnitRepositoryIntegration>>;
+    #[allow(clippy::too_many_arguments)]
     async fn transition(
         &self,
         id: &str,

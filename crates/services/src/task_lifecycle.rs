@@ -1589,8 +1589,10 @@ mod tests {
         CreateTaskIntegrationOperation, CreateValidationRun, CreateWorkspace,
         FinishTaskIntegrationOperation, FinishValidationRun, GateScopeKind, ProjectRepo, RepoRepo,
         TaskIntegrationOperationKind, TaskIntegrationOperationRepo, TaskIntegrationOperationStatus,
-        TaskLifecycleRepo, ValidationRunRepo, ValidationRunStatus, WorkMode, WorkspaceRepo,
-        WorkspaceStatus,
+        TaskLifecycleRepo, TaskRepositoryMergeBatch, TaskRepositoryMergeBatchRepo,
+        TaskRepositoryMergeBatchRepoRow, TaskRepositoryMergeBatchRepoState,
+        TaskRepositoryMergeBatchState, TaskRepositorySetRepo, ValidationRunRepo,
+        ValidationRunStatus, WorkMode, WorkspaceRepo, WorkspaceStatus,
     };
     use serde_json::Value;
     use sha2::Digest;
@@ -1860,6 +1862,8 @@ mod tests {
             CreateTaskIntegrationOperation {
                 id: new_uuid_v4(),
                 task_id: task.id.clone(),
+                repo_id: None,
+                repository_merge_batch_id: None,
                 kind: TaskIntegrationOperationKind::TaskMerge,
                 owner_id: "no-gate-admission".to_owned(),
                 gate_evaluation_id: None,
@@ -2427,12 +2431,65 @@ mod tests {
             Err(ServiceError::InvalidOperation { .. })
         ));
 
+        let repository_set = TaskRepositorySetRepo::get_current(&*db, &task.id)
+            .await
+            .expect("current repository-set lookup")
+            .expect("Task repository set");
+        let repo_id = task.repo_id.clone().expect("Task primary repository");
+        let repository = repository_set
+            .repositories
+            .iter()
+            .find(|repository| repository.repo_id == repo_id)
+            .expect("primary repository is in the current set");
+        let merge_batch_id = new_uuid_v4();
+        let batch_now = now_rfc3339();
+        let merge_batch = TaskRepositoryMergeBatch {
+            id: merge_batch_id.clone(),
+            task_id: task.id.clone(),
+            gate_evaluation_id: exact_evaluation_id.clone(),
+            repository_set_revision: repository_set.revision,
+            repository_set_digest: Some(
+                repository_set
+                    .digest
+                    .clone()
+                    .expect("current repository-set digest"),
+            ),
+            state: TaskRepositoryMergeBatchState::Integrating,
+            version: 1,
+            created_at: batch_now.clone(),
+            updated_at: batch_now.clone(),
+        };
+        let merge_batch_repo = TaskRepositoryMergeBatchRepoRow {
+            batch_id: merge_batch_id.clone(),
+            task_id: task.id.clone(),
+            repository_set_revision: repository_set.revision,
+            repo_id: repo_id.clone(),
+            position: repository.position,
+            state: TaskRepositoryMergeBatchRepoState::Pending,
+            work_unit_repository_integration_id: None,
+            task_merge_operation_id: None,
+            pr_metadata_id: None,
+            before_sha: None,
+            after_sha: None,
+            created_at: batch_now.clone(),
+            updated_at: batch_now,
+        };
+        TaskRepositoryMergeBatchRepo::create(
+            &*db,
+            &merge_batch,
+            std::slice::from_ref(&merge_batch_repo),
+        )
+        .await
+        .expect("exact repository merge batch");
+
         let merge_operation_id = new_uuid_v4();
         let merge_operation = TaskIntegrationOperationRepo::begin(
             &*db,
             CreateTaskIntegrationOperation {
                 id: merge_operation_id.clone(),
                 task_id: task.id.clone(),
+                repo_id: Some(repo_id),
+                repository_merge_batch_id: Some(merge_batch_id),
                 kind: TaskIntegrationOperationKind::TaskMerge,
                 owner_id: "gate-scope-test".to_owned(),
                 gate_evaluation_id: Some(exact_evaluation_id.clone()),

@@ -13,8 +13,8 @@ use db::{
     TaskCoordinationRequest, TaskCoordinationRequestKind, TaskCoordinationRequestState,
     TaskCoordinationWrite, TaskIntervention, TaskInterventionKind, TaskInterventionState,
     TaskLifecycleRepo, TaskLifecycleState, TaskQualityCategory, TaskQualityRequest,
-    TaskQualityState, TaskQualityTargetKind, TaskRepo, TaskRepositoryRole, TaskRepositorySetRepo,
-    TaskRepositoryWrite, TaskRoleRepo, UserRepo, MAX_MICRO_FIX_CHANGED_LINES, MAX_MICRO_FIX_FILES,
+    TaskQualityState, TaskQualityTargetKind, TaskRepo, TaskRepositorySetRepo, TaskRepositoryWrite,
+    TaskRoleRepo, UserRepo, MAX_MICRO_FIX_CHANGED_LINES, MAX_MICRO_FIX_FILES,
     MAX_MICRO_FIX_PER_TASK,
 };
 use events::EventBus;

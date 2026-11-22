@@ -3405,9 +3405,9 @@ mod tests {
             .evaluate_required_checks_by_repo(
                 &task_id,
                 &[RepositoryValidationSubject {
-                    repo_id: primary_repo_id,
-                    workspace_id: primary_workspace_id,
-                    commit_sha: primary_commit,
+                    repo_id: primary_repo_id.clone(),
+                    workspace_id: primary_workspace_id.clone(),
+                    commit_sha: primary_commit.clone(),
                 }],
             )
             .await

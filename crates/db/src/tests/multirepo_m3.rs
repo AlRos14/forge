@@ -451,7 +451,7 @@ async fn multirepo_lifecycle_batch_state_is_monotonic() {
         created_at: now.clone(),
         updated_at: now,
     };
-    TaskRepositoryMergeBatchRepo::create(&db, &batch, &[repo_row.clone()])
+    TaskRepositoryMergeBatchRepo::create(&db, &batch, std::slice::from_ref(&repo_row))
         .await
         .expect("valid exact-revision batch creates");
     TaskRepositoryMergeBatchRepo::transition_repo(

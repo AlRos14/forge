@@ -384,7 +384,7 @@ pub async fn merge_after_gate(
     require_task_mutable(&state, &task_id, &user).await?;
     let merge_result = state
         .merge_service
-        .merge_after_gate(task_id, &request.gate_evaluation_id)
+        .merge_after_gate(task_id.clone(), &request.gate_evaluation_id)
         .await
         .map_err(ApiError::from)?;
     let batch = merge_result.batch;
@@ -487,15 +487,19 @@ pub async fn merge_after_gate(
     };
     Ok(Json(MergeAfterGateResponse {
         outcome: outcome.to_owned(),
-        before_sha: (!is_pr_batch)
-            .then(|| primary_row.and_then(|row| row.before_sha.clone()))
-            .flatten(),
-        after_sha: (!is_pr_batch)
-            .then(|| primary_row.and_then(|row| row.after_sha.clone()))
-            .flatten(),
+        before_sha: if is_pr_batch {
+            None
+        } else {
+            primary_row.and_then(|row| row.before_sha.clone())
+        },
+        after_sha: if is_pr_batch {
+            None
+        } else {
+            primary_row.and_then(|row| row.after_sha.clone())
+        },
         branch,
         pr_url: primary_pr.and_then(|metadata| metadata.pr_url),
-        target_branch: is_pr_batch.then_some(target_branch).flatten(),
+        target_branch: if is_pr_batch { target_branch } else { None },
         details,
         files,
         repository_merge_batch_id: Some(batch.id),

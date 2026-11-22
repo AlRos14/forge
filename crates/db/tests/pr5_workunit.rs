@@ -548,10 +548,11 @@ async fn integration_lookup_stays_exact_with_multiple_work_unit_workspaces() {
     .await
     .expect("second WorkUnit Workspace");
 
-    let selected_integration = WorkspaceRepo::get_integration_by_task_id(&db, &fixture.task_id)
-        .await
-        .expect("integration scope lookup")
-        .expect("canonical integration Workspace");
+    let selected_integration =
+        WorkspaceRepo::get_integration_by_task_repo(&db, &fixture.task_id, &fixture.repo_id)
+            .await
+            .expect("integration scope lookup")
+            .expect("canonical integration Workspace");
     assert_eq!(selected_integration.id, integration_workspace.id);
 
     let first_unit_workspace =
@@ -1126,6 +1127,8 @@ async fn active_task_operation_blocks_work_unit_cleanup_claim() {
         db::CreateTaskIntegrationOperation {
             id: new_uuid_v4(),
             task_id: fixture.task_id.clone(),
+            repo_id: None,
+            repository_merge_batch_id: None,
             kind: db::TaskIntegrationOperationKind::WorkUnitWorkspacePrepare,
             owner_id: fixture.work_unit_id.clone(),
             gate_evaluation_id: None,
@@ -2480,6 +2483,8 @@ async fn work_unit_dag_is_same_task_acyclic_versioned_and_teardown_safe() {
         db::CreateTaskIntegrationOperation {
             id: new_uuid_v4(),
             task_id: task_id.clone(),
+            repo_id: None,
+            repository_merge_batch_id: None,
             kind: db::TaskIntegrationOperationKind::IntegrationWorkspaceCleanup,
             owner_id: "project-teardown-guard".into(),
             gate_evaluation_id: None,

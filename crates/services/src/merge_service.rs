@@ -29,6 +29,7 @@ pub struct MergeService {
     integration_operations: TaskIntegrationOperationManager,
 }
 
+#[derive(Debug, Clone)]
 struct TaskMergeSource {
     workspace: db::Workspace,
     branch: String,
@@ -774,7 +775,7 @@ impl MergeService {
                 latest.version,
                 final_row_state,
                 Some(&candidate.integration_id),
-                Some(operation.id()),
+                Some(&operation_id),
                 None,
                 Some(&candidate.before_sha),
                 Some(&candidate.after_sha),

@@ -8,8 +8,8 @@ use crate::{
 };
 use db::{
     CoordinatorReplanClassification, CoordinatorReplanState, CreateCoordinatorReplan,
-    DomainEventRepo, HumanDecisionRepo, HumanDecisionSourceKind, TaskCoordinatorReplanRepo,
-    TransitionCoordinatorReplan, WorkUnitRepo,
+    DomainEventRepo, HumanDecisionRepo, HumanDecisionSourceKind, TaskCoordinationRequestKind,
+    TaskCoordinatorReplanRepo, TransitionCoordinatorReplan, WorkUnitRepo,
 };
 
 pub(super) struct RaiseReplanScopeDecisionInput<'a> {

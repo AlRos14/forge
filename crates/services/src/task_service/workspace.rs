@@ -38,15 +38,8 @@ pub(crate) async fn prepare_integration_workspace_for_repository(
     let Some(workspace) =
         WorkspaceRepo::get_integration_by_task_repo(db, &task.id, repo_id).await?
     else {
-        return create_fresh_workspace(
-            db,
-            workspace_root,
-            task,
-            &task.id,
-            repo_id,
-            repo_cache_locks,
-        )
-        .await;
+        return create_fresh_workspace(db, workspace_root, &task.id, repo_id, repo_cache_locks)
+            .await;
     };
     if workspace.repo_id != repo_id {
         return Err(ServiceError::invalid_operation(
@@ -87,7 +80,6 @@ pub(crate) async fn prepare_integration_workspace_for_repository(
                 recover_missing_worktree(
                     db,
                     workspace_root,
-                    task,
                     &task.id,
                     repo_id,
                     workspace,
@@ -102,7 +94,6 @@ pub(crate) async fn prepare_integration_workspace_for_repository(
 async fn recover_missing_worktree(
     db: &SqliteDb,
     workspace_root: &std::path::Path,
-    task: &Task,
     task_id: &str,
     repo_id: &str,
     workspace: Workspace,
@@ -283,7 +274,6 @@ async fn move_unusable_worktree_aside(worktree_path: &Path) -> Result<()> {
 async fn create_fresh_workspace(
     db: &SqliteDb,
     workspace_root: &std::path::Path,
-    task: &Task,
     task_id: &str,
     repo_id: &str,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
