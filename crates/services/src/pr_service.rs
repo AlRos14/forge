@@ -826,12 +826,23 @@ impl PrService {
         let lifecycle = TaskLifecycleRepo::get_task_lifecycle(&*self.db, &task.id)
             .await?
             .ok_or_else(|| ServiceError::not_found("task lifecycle", task.id.clone()))?;
+        let operation_repo_matches = |repo_id: Option<&str>| {
+            if merge.repository_merge_batch_id.is_some() {
+                repo_id == Some(key.repo_id.as_str())
+            } else {
+                // 0.9.1 batchless TaskMerge/PublishPr rows may have no repo_id.
+                // Their exact repository is the current single primary repo;
+                // any persisted repo_id must still agree with that identity.
+                task.repo_id.as_deref() == Some(key.repo_id.as_str())
+                    && repo_id.map_or(true, |repo_id| repo_id == key.repo_id.as_str())
+            }
+        };
         if admission.task_id != task.id
             || key.task_id != task.id
             || key.admission_id != admission.task_merge_operation_id
-            || admission.repo_id.as_deref() != Some(key.repo_id.as_str())
+            || !operation_repo_matches(admission.repo_id.as_deref())
             || metadata.task_id != task.id
-            || metadata.repo_id.as_deref() != Some(key.repo_id.as_str())
+            || !operation_repo_matches(metadata.repo_id.as_deref())
             || metadata.id != admission.metadata_id
             || metadata.task_merge_operation_id.as_deref()
                 != Some(admission.task_merge_operation_id.as_str())
@@ -839,12 +850,12 @@ impl PrService {
                 != Some(admission.publish_operation_id.as_str())
             || publish_operation_id != admission.publish_operation_id
             || merge.task_id != task.id
-            || merge.repo_id.as_deref() != Some(key.repo_id.as_str())
+            || !operation_repo_matches(merge.repo_id.as_deref())
             || merge.kind != TaskIntegrationOperationKind::TaskMerge
             || !merge.remote_waiting
             || merge.status != db::TaskIntegrationOperationStatus::Running
             || publish.task_id != task.id
-            || publish.repo_id.as_deref() != Some(key.repo_id.as_str())
+            || !operation_repo_matches(publish.repo_id.as_deref())
             || publish.repository_merge_batch_id != merge.repository_merge_batch_id
             || publish.kind != TaskIntegrationOperationKind::PublishPr
             || publish.parent_operation_id.as_deref() != Some(merge.id.as_str())

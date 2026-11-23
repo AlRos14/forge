@@ -1250,6 +1250,19 @@ impl TaskLifecycleService {
         task_id: &str,
         evaluation_id: &str,
     ) -> Result<()> {
+        let has_repository_set_revision: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'task_repository_set_revision'
+             )",
+        )
+        .fetch_one(self.db.pool())
+        .await?;
+        if has_repository_set_revision == 0 {
+            // Before V183, a Task had one repository on task.repo_id and
+            // ReadyToMerge did not require a repository merge batch.
+            return Ok(());
+        }
         let repository_set = TaskRepositorySetRepo::get_current(&*self.db, task_id)
             .await?
             .ok_or_else(|| {

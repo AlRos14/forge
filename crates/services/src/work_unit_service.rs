@@ -5789,12 +5789,17 @@ mod tests {
         .await
         .expect("missing-branch cleanup claim commits")
         .expect("completed WorkUnit has no active execution or lease");
+        let missing_branch_group =
+            WorkspaceRepo::get_group_by_work_unit_id(&*db, &missing_branch_unit.id)
+                .await
+                .expect("WorkspaceGroup lookup")
+                .expect("single-repository WorkUnit has its persisted WorkspaceGroup");
         manager
-            .cleanup_work_unit_worktree(
+            .cleanup_group_worktree(
                 &repository_path.to_string_lossy(),
                 &task_id,
                 &missing_branch_unit.id,
-                &missing_branch_workspace.id,
+                &missing_branch_group.id,
                 &repo_id,
             )
             .await

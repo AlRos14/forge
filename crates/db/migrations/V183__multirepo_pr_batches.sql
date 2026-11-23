@@ -1626,6 +1626,11 @@ WHEN (NEW.kind = 'task_merge' AND (
         SELECT 1 FROM task_integration_operation merge_op
         WHERE merge_op.task_id = NEW.task_id AND merge_op.kind = 'task_merge'
           AND merge_op.status = 'running' AND merge_op.remote_waiting = 1
+          -- Keep the 0.9.1 task-wide fence when either admission is batchless;
+          -- within a batch, a different exact repository may keep its own PR admission.
+          AND (merge_op.repo_id IS NEW.repo_id
+               OR merge_op.repository_merge_batch_id IS NULL
+               OR NEW.repository_merge_batch_id IS NULL)
           AND NOT (NEW.kind = 'publish_pr' AND NEW.parent_operation_id = merge_op.id)
      ))
 BEGIN

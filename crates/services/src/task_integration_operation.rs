@@ -6052,7 +6052,8 @@ pub(crate) mod tests {
             rows.iter()
                 .find(|row| row.repo_id == fixture.repo_id)
                 .map(|row| row.state),
-            Some(db::TaskRepositoryMergeBatchRepoState::Publishing)
+            Some(db::TaskRepositoryMergeBatchRepoState::Open),
+            "reconciliation found the existing provider-open PR and records that state"
         );
         assert_eq!(
             rows.iter()

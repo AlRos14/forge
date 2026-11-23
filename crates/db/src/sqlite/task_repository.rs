@@ -364,6 +364,21 @@ pub(super) async fn ensure_initial_current_revision_in_tx(
 impl TaskRepositorySetRepo for SqliteDb {
     async fn get_current(&self, task_id: &str) -> Result<Option<TaskRepositorySetRevision>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let has_repository_set_schema: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'task_repository_set_revision'
+             ) AND EXISTS (
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'task_repository_set_revision_repo'
+             )",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_repository_set_schema == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
         let task_exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id = ?)")
                 .bind(task_id)
