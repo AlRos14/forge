@@ -5904,7 +5904,7 @@ pub(crate) mod tests {
             .admit_pull_request_publication_with_lock(
                 &fixture.task_id,
                 &affected_repo_id,
-                &batch_id,
+                Some(batch_id.as_str()),
                 &new_uuid_v4(),
                 &evaluation.id,
                 &secondary_config,
@@ -6070,7 +6070,7 @@ pub(crate) mod tests {
             .expect("TaskMerge exists");
         let repo_id = operation.repo_id.clone().expect("TaskMerge repo id");
         assert!(operation.repository_merge_batch_id.is_none());
-        let admission =
+        let _admission =
             TaskIntegrationOperationRepo::get_remote_pr_admission(&*world.db, &operation.id)
                 .await
                 .expect("admission lookup")

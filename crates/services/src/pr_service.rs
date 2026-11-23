@@ -1149,10 +1149,7 @@ impl PrService {
             (
                 revision.revision,
                 admission_id.to_owned(),
-                metadata
-                    .as_ref()
-                    .map(|metadata| metadata.version)
-                    .unwrap_or(operation.version),
+                operation.version,
             )
         };
         let state = admission.state.as_str();
