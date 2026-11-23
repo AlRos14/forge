@@ -834,7 +834,7 @@ impl PrService {
                 // Their exact repository is the current single primary repo;
                 // any persisted repo_id must still agree with that identity.
                 task.repo_id.as_deref() == Some(key.repo_id.as_str())
-                    && repo_id.map_or(true, |repo_id| repo_id == key.repo_id.as_str())
+                    && repo_id.is_none_or(|repo_id| repo_id == key.repo_id.as_str())
             }
         };
         if admission.task_id != task.id
