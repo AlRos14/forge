@@ -12,6 +12,9 @@ pub enum PublicEventType {
     #[serde(rename = "task.repositories_changed")]
     #[ts(rename = "task.repositories_changed")]
     TaskRepositoriesChanged,
+    #[serde(rename = "task.repository_set_replanned")]
+    #[ts(rename = "task.repository_set_replanned")]
+    TaskRepositorySetReplanned,
     #[serde(rename = "work_unit.repository_integration_changed")]
     #[ts(rename = "work_unit.repository_integration_changed")]
     WorkUnitRepositoryIntegrationChanged,
@@ -220,6 +223,7 @@ impl PublicEventType {
         match self {
             Self::TaskLifecycleChanged => "task.lifecycle_changed",
             Self::TaskRepositoriesChanged => "task.repositories_changed",
+            Self::TaskRepositorySetReplanned => "task.repository_set_replanned",
             Self::WorkUnitRepositoryIntegrationChanged => {
                 "work_unit.repository_integration_changed"
             }

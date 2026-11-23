@@ -147,6 +147,7 @@ export function routeSsePayload(
 
   if (
     eventType.startsWith('task.coordination_') ||
+    eventType === 'task.repository_set_replanned' ||
     eventType === 'task.review_triaged' ||
     eventType === 'task.autonomy_limits_changed'
   ) {
@@ -388,6 +389,7 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
             'task.work_unit_fallback',
             'task.micro_fix_bounds_exceeded',
             'task.coordinator_replan_proposed',
+            'task.repository_set_replanned',
             'project.created',
             'project.updated',
             'project.deleted',

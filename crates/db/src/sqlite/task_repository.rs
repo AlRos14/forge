@@ -1,6 +1,130 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+async fn sync_legacy_task_repository_catalog_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    repositories: &[TaskRepositorySetRevisionRepo],
+    created_at: &str,
+) -> Result<()> {
+    let task_repo_id: Option<String> = sqlx::query_scalar("SELECT repo_id FROM task WHERE id = ?")
+        .bind(task_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    let requested_primary = repositories
+        .iter()
+        .find(|repository| repository.role == TaskRepositoryRole::Primary)
+        .map(|repository| repository.repo_id.as_str());
+    if task_repo_id.as_deref() != requested_primary {
+        return Err(DbError::TaskRepositoryReplanPrimaryImmutable);
+    }
+
+    let existing: Vec<String> = sqlx::query_scalar(
+        "SELECT repo_id FROM task_repository WHERE task_id = ? ORDER BY repo_id",
+    )
+    .bind(task_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let max_position: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(position), 0) FROM task_repository WHERE task_id = ?",
+    )
+    .bind(task_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let catalog_count = i64::try_from(existing.len())
+        .map_err(|_| DbError::Check("Task repository catalog is too large".to_owned()))?;
+    let requested_count = i64::try_from(repositories.len())
+        .map_err(|_| DbError::Check("Task repository revision is too large".to_owned()))?;
+    let offset = max_position
+        .checked_add(catalog_count)
+        .and_then(|value| value.checked_add(requested_count))
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| DbError::Check("Task repository position overflow".to_owned()))?;
+    sqlx::query(
+        "UPDATE task_repository SET position = position + ?
+         WHERE task_id = ? AND role != 'primary'",
+    )
+    .bind(offset)
+    .bind(task_id)
+    .execute(&mut **tx)
+    .await?;
+
+    let mut temporary_position = max_position
+        .checked_add(offset)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| DbError::Check("Task repository position overflow".to_owned()))?;
+    for repository in repositories {
+        if !existing
+            .iter()
+            .any(|repo_id| repo_id == &repository.repo_id)
+        {
+            sqlx::query(
+                "INSERT INTO task_repository (task_id, repo_id, role, position, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(task_id)
+            .bind(&repository.repo_id)
+            .bind(repository.role.to_string())
+            .bind(temporary_position)
+            .bind(created_at)
+            .execute(&mut **tx)
+            .await?;
+            temporary_position = temporary_position
+                .checked_add(1)
+                .ok_or_else(|| DbError::Check("Task repository position overflow".to_owned()))?;
+        }
+    }
+
+    for repository in repositories {
+        sqlx::query(
+            "UPDATE task_repository SET role = ?, position = ?
+             WHERE task_id = ? AND repo_id = ?",
+        )
+        .bind(repository.role.to_string())
+        .bind(repository.position)
+        .bind(task_id)
+        .bind(&repository.repo_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    let retained = repositories
+        .iter()
+        .map(|repository| repository.repo_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut retired = existing
+        .into_iter()
+        .filter(|repo_id| !retained.contains(repo_id.as_str()))
+        .collect::<Vec<_>>();
+    retired.sort();
+    let active_non_primary = i64::try_from(
+        repositories
+            .iter()
+            .filter(|repository| repository.role != TaskRepositoryRole::Primary)
+            .count(),
+    )
+    .map_err(|_| DbError::Check("Task repository revision is too large".to_owned()))?;
+    let mut position = active_non_primary
+        .checked_add(1)
+        .ok_or_else(|| DbError::Check("Task repository position overflow".to_owned()))?;
+    for repo_id in retired {
+        sqlx::query(
+            "UPDATE task_repository SET role = 'context', position = ?
+             WHERE task_id = ? AND repo_id = ?",
+        )
+        .bind(position)
+        .bind(task_id)
+        .bind(repo_id)
+        .execute(&mut **tx)
+        .await?;
+        position = position
+            .checked_add(1)
+            .ok_or_else(|| DbError::Check("Task repository position overflow".to_owned()))?;
+    }
+    Ok(())
+}
+
 fn map_revision_member(row: SqliteRow) -> Result<TaskRepositorySetRevisionRepo> {
     Ok(TaskRepositorySetRevisionRepo {
         task_id: row.try_get("task_id")?,
@@ -55,6 +179,69 @@ async fn load_revision_in_tx(
         .map(map_revision_member)
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(header))
+}
+
+pub(super) async fn list_current_repositories_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+) -> Result<Vec<TaskRepository>> {
+    let has_revision_schema: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'task_repository_set_revision'
+         ) AND EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'task_repository_set_revision_repo'
+         )",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if !has_revision_schema {
+        return sqlx::query(
+            "SELECT task_id, repo_id, role, position, created_at
+             FROM task_repository WHERE task_id = ? ORDER BY position, repo_id",
+        )
+        .bind(task_id)
+        .fetch_all(&mut **tx)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(TaskRepository {
+                task_id: row.try_get("task_id")?,
+                repo_id: row.try_get("repo_id")?,
+                role: parse_enum(row.try_get::<String, _>("role")?)?,
+                position: row.try_get("position")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect();
+    }
+    ensure_initial_current_revision_in_tx(tx, task_id).await?;
+    let rows = sqlx::query(
+        "SELECT member.task_id, member.repo_id, member.role, member.position,
+                COALESCE(catalog.created_at, revision.created_at) AS created_at
+         FROM task_repository_set_revision revision
+         JOIN task_repository_set_revision_repo member
+           ON member.task_id = revision.task_id AND member.revision = revision.revision
+         LEFT JOIN task_repository catalog
+           ON catalog.task_id = member.task_id AND catalog.repo_id = member.repo_id
+         WHERE revision.task_id = ? AND revision.state = 'current'
+         ORDER BY member.position, member.repo_id",
+    )
+    .bind(task_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(TaskRepository {
+                task_id: row.try_get("task_id")?,
+                repo_id: row.try_get("repo_id")?,
+                role: parse_enum(row.try_get::<String, _>("role")?)?,
+                position: row.try_get("position")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect()
 }
 
 fn repository_set_digest(rows: &[TaskRepositorySetRevisionRepo]) -> Result<String> {
@@ -159,6 +346,8 @@ async fn create_revision_in_tx(
             ));
         }
     }
+    sync_legacy_task_repository_catalog_in_tx(tx, &input.task_id, &members, &input.created_at)
+        .await?;
     let revision = sqlx::query_scalar::<_, i64>(
         "SELECT COALESCE(MAX(revision), 0) + 1
          FROM task_repository_set_revision WHERE task_id = ?",

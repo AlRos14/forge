@@ -2098,7 +2098,7 @@ fn coordination_request_value(request: &db::TaskCoordinationRequest) -> Value {
     })
 }
 fn coordination_plan_value(plan: &services::task_coordination::PlanView) -> Value {
-    json!({
+    let mut value = json!({
         "artifact_id": plan.plan.artifact_id,
         "task_id": plan.plan.task_id,
         "request_id": plan.plan.request_id,
@@ -2125,7 +2125,11 @@ fn coordination_plan_value(plan: &services::task_coordination::PlanView) -> Valu
         "version": plan.plan.version,
         "created_at": plan.plan.created_at,
         "updated_at": plan.plan.updated_at,
-    })
+    });
+    if let Some(repository_set) = plan.parsed.repository_set.as_ref() {
+        value["repository_set"] = json!(repository_set);
+    }
+    value
 }
 async fn coordination_overview_value(
     state: &AppState,

@@ -393,8 +393,16 @@ impl ExecutionRepo for SqliteDb {
                     result.workspace_id, result.before_sha, result.after_sha,
                     result.snapshot_digest, result.created_at
              FROM execution_repository_result result
-             LEFT JOIN task_repository repository
-               ON repository.task_id = result.task_id AND repository.repo_id = result.repo_id
+             LEFT JOIN execution execution_row
+               ON execution_row.id = result.execution_id
+              AND execution_row.task_id = result.task_id
+             LEFT JOIN work_unit_repository_set_revision pin
+               ON pin.work_unit_id = execution_row.work_unit_id
+              AND pin.task_id = result.task_id
+             LEFT JOIN task_repository_set_revision_repo repository
+               ON repository.task_id = pin.task_id
+              AND repository.revision = pin.revision
+              AND repository.repo_id = result.repo_id
              WHERE result.execution_id = ?
              ORDER BY repository.position, result.repo_id",
         )
@@ -1802,8 +1810,11 @@ impl ExecutionRepo for SqliteDb {
                            COALESCE(workspace.before_sha, repo.default_branch) AS base_ref
                     FROM work_unit unit
                     JOIN task ON task.id = unit.task_id
-                    JOIN task_repository repository
-                      ON repository.task_id = task.id
+                    JOIN work_unit_repository_set_revision pin
+                      ON pin.work_unit_id = unit.id AND pin.task_id = unit.task_id
+                    JOIN task_repository_set_revision_repo repository
+                      ON repository.task_id = pin.task_id
+                     AND repository.revision = pin.revision
                      AND repository.role IN ('primary', 'affected')
                     JOIN repo ON repo.id = repository.repo_id
                     LEFT JOIN workspace ON workspace.task_id = task.id

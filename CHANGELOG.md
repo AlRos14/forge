@@ -24,6 +24,9 @@ source version is 0.9.1.
   exact repository-aware Task dependency handoffs, revision/digest-bound
   coordinator replan checks, and partial progress/retry projections in REST,
   MCP, SSE, and the web Task view. Human approval remains required for PR merge.
+- Allow an approved coordinator replan to replace the Task repository set with
+  an exact-Human-approved immutable revision, while preserving historical pins
+  and failing closed when a removed repository still has in-flight work.
 - Open one PR per changed writable repository; unchanged repositories open no PR
   and require no repository-scoped checks.
 

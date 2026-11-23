@@ -1218,7 +1218,7 @@ async fn multirepo_task_create_defaults_to_primary_and_inherits_subtask_scope() 
 }
 
 #[tokio::test]
-async fn multirepo_task_repository_replace_conflicts_after_execution_or_stale_version() {
+async fn multirepo_lifecycle_replan_direct_patch_after_execution_stays_409() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let (project_id, primary_repo_id, _) = seed_project_repo(&db).await;

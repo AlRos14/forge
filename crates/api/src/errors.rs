@@ -326,6 +326,13 @@ impl From<ServiceError> for ApiError {
                 "task.repositories.replan_required",
                 "Task repository scope cannot change after an Execution or invalidate an explicit WorkUnit repository selection without an authorized replan",
             ),
+            ServiceError::TaskRepositoryReplanRemovalBlocked { repo_id } => {
+                Self::conflict_with_code_and_details(
+                    "task.repositories.replan_removal_blocked",
+                    format!("repository {repo_id} still has in-flight work"),
+                    json!({ "repo_id": repo_id }),
+                )
+            }
             ServiceError::WorkUnitRepositoriesInvalid => Self::unprocessable(
                 "work_unit.repositories.invalid",
                 "WorkUnit repository IDs must be writable repositories of its Task",

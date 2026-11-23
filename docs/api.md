@@ -67,7 +67,11 @@ or repeated primary and duplicate repository IDs, `task.repositories.repo_not_in
 WorkUnit repository selection, `work_unit.repositories.invalid`
 (`422`) for duplicate or non-writable WorkUnit repository IDs, and
 `project.primary_repo_not_in_project` (`422`) for a primary repository outside
-its Project. Stale Task or Project versions return `409 version_conflict`.
+its Project. Coordinator replans return
+`task.repositories.replan_primary_immutable` (`409`) for a primary change and
+`task.repositories.replan_removal_blocked` (`409`, with `repo_id`) when a
+removed repository may still have in-flight work. Stale Task or Project
+versions return `409 version_conflict`.
 
 If a provider Start may have taken effect but its response is uncertain, Forge
 does not send another Start. A launch response can admit an Execution without
@@ -305,9 +309,9 @@ are in [the PR0 contract](plans/pr0-task-coordination-contract.md).
 | `POST /tasks/{id}/coordination/revoke` | Revoke the authorization, advance its version, and preserve existing WorkUnits, plans, and history. Running Executions are not silently stopped. |
 | `POST /tasks/{id}/coordination/requests` | Request one bounded turn. Body: expected Task/coordination versions, `objective`, optional `constraints`/`context`, `acceptance_criteria`, idempotency key. A Human coordinator returns `422 coordination.human_turn_unsupported`; use manual editing. Replays return the same request. A version minted by a Project batch is scoped to that batch and returns `409 project_plan_batch_inactive` through this generic route, even after batch revocation or completion; create a fresh explicit TaskCoordination authorization to restore the standalone request flow. |
 | `GET /tasks/{id}/coordination/requests/{request_id}` | Read the exact turn state, wake, Execution, failure reason, plan Artifact, and brief. |
-| `GET /tasks/{id}/coordination/plans/{artifact_id}` | Read the inspectable plan and its parsed WorkUnits, roles, Actors, dependencies, review subjects, proposal/decision, and materialization receipt. |
+| `GET /tasks/{id}/coordination/plans/{artifact_id}` | Read the inspectable plan and its parsed WorkUnits, roles, Actors, dependencies, review subjects, optional complete `repository_set` proposal, proposal/decision, and materialization receipt. When the plan omits `repository_set`, the response omits it and uses the current Task set. |
 | `POST /tasks/{id}/coordination/plans/{artifact_id}/approve` | Approve or reject one exact plan by digest. Approval records a `Decision` on the exact open Proposal; a changed digest or Proposal version returns a typed conflict. |
-| `POST /tasks/{id}/coordination/plans/{artifact_id}/materialize` | Atomically create WorkUnits, dependencies, review subjects, and Artifact input pins from one approved plan, with a deterministic replay receipt. The operation also records the normal launch intent; dispatch still revalidates every worker assignment, capability, and lease. A paused Task returns `409 coordination.paused`. |
+| `POST /tasks/{id}/coordination/plans/{artifact_id}/materialize` | Atomically create WorkUnits, dependencies, review subjects, and Artifact input pins from one approved plan, with a deterministic replay receipt. An approved coordinator replan may also materialize its complete `repository_set`; the exact Human decision and base revision are revalidated in the same transaction, and new WorkUnits pin the new immutable revision. Removing a repository or downgrading a writable repository to `context` while open WorkUnits, running Executions, active leases/batches, or nonterminal PR/admission state may depend on it returns `409 task.repositories.replan_removal_blocked`. Primary changes return `409 task.repositories.replan_primary_immutable`. The operation also records the normal launch intent; dispatch still revalidates every worker assignment, capability, and lease. A paused Task returns `409 coordination.paused`. |
 | `GET/POST /tasks/{id}/coordination/quality-requests` | List or create structured quality requests. Categories are `delivery_correction`, `plan_revision`, `specialist`, and `human_decision`; targets are `implementation`, `orchestrator`, `specialist`, or `human`. Creation records routing facts and consumes the Task-global and exact-route budgets atomically; a deterministic Handoff is informational. An optional `source_execution_id` attributes a ReviewReport-sourced request to the exact reviewer Execution instead of the calling Human. The durable consumer creates or links a correction/specialist WorkUnit or opens a plan-revision turn. Responses include `work_unit_id`, `coordination_request_id`, exact resolution evidence, and `quality_route` with stable `id`, `round`, `limit`, and source TaskRole. Review reports on the same review line share a route even when category or destination role changes. |
 | `POST /tasks/{id}/coordination/quality-requests/{request_id}/resolve` | Resolve, cancel, or escalate one exact request using its version. |
 | `GET/POST /tasks/{id}/coordination/interventions` | Read or create one versioned Human/Copilot intervention. Kinds are `instruction`, `decision`, `pause`, `resume`, `cancel`, `revoke_authorization`, and `request_replan`. Project Copilot may record an instruction through this same circuit; it cannot request a replan, pause, cancel, revoke, approve, or decide. |
@@ -337,6 +341,21 @@ TaskRole action. Its plan is classified against the captured Task objective,
 team, WorkUnit budget, repository/path scope, and envelope; a scope or authority
 change requires an exact Human decision before materialization. The V172 ledger
 limits coordinator replans to two per Task.
+
+A replan `WorkUnitPlan` may carry `repository_set: [{repo_id, role}]` as a
+complete replacement. Its roles are `primary`, `affected`, and `context`; the
+primary must remain the Task's current primary, and the input order determines
+positions after it. Omitting the field preserves the existing plan wire shape
+and repository set. Rust classifies any membership, role, or ordering change as
+`scope_or_authority_change`, which requires the exact Human approval. Resume
+rechecks the captured revision/digest and decision inside materialization,
+creates the immutable revision, and pins only new WorkUnits to it. Removal or
+downgrading a writable repository to `context` is rejected while any open
+WorkUnit, running Execution, active lease/batch, or nonterminal PR/admission
+may still depend on that repository. Old revisions
+and their pins remain immutable; removed catalog rows stay as `context` for
+historical references. Direct repository PATCH still returns
+`409 task.repositories.replan_required` after the first Execution.
 
 The coordination overview returns the authorized `fallback_agents` chain and
 optional `micro_fix_reviewer`; each grant includes its `cost_class`, which the
@@ -389,7 +408,9 @@ Public SSE events are `task.coordination_authorized`,
 `task.validation_comparison_recorded`, `task.human_decision_requested`,
 `task.human_decision_answered`, `task.human_decision_closed`, and
 `task.work_unit_fallback`, `task.micro_fix_bounds_exceeded`, and
-`task.coordinator_replan_proposed`. Fallback events carry the WorkUnit and origin
+`task.coordinator_replan_proposed`, and `task.repository_set_replanned`. The
+repository-set event carries only Task/revision/digest, plan Artifact, and
+HumanDecision IDs. Fallback events carry the WorkUnit and origin
 Execution IDs, receipt and TaskRole IDs when reassigned, source and destination
 Agent IDs, chain index, cost class, authorization version, envelope and route
 attempt digests, and outcome/reason state. An exhausted or no-longer-authorized

@@ -195,6 +195,9 @@ pub enum ServiceError {
     #[error("Task repository scope cannot change after an Execution or invalidate an explicit WorkUnit repository selection")]
     TaskRepositoryReplanRequired,
 
+    #[error("Task repository {repo_id} still has in-flight work and cannot be removed by replan")]
+    TaskRepositoryReplanRemovalBlocked { repo_id: String },
+
     #[error("WorkUnit repository scope is invalid")]
     WorkUnitRepositoriesInvalid,
 
@@ -304,6 +307,18 @@ impl From<db::DbError> for ServiceError {
                 code: "validation.workspace_leased",
                 message: error.to_string(),
             },
+            db::DbError::TaskRepositoryReplanBaseStale => Self::Coordination {
+                code: "coordination.authorization_stale",
+                message: "the repository-set revision changed after this replan was proposed"
+                    .to_owned(),
+            },
+            db::DbError::TaskRepositoryReplanPrimaryImmutable => Self::Coordination {
+                code: "task.repositories.replan_primary_immutable",
+                message: "coordinator replan cannot change the Task primary repository".to_owned(),
+            },
+            db::DbError::TaskRepositoryReplanRemovalBlocked { repo_id } => {
+                Self::TaskRepositoryReplanRemovalBlocked { repo_id }
+            }
             error => Self::Db(error),
         }
     }

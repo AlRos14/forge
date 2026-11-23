@@ -11,6 +11,11 @@ pub trait TaskRepo: Send + Sync {
         input: CreateTask,
     ) -> Result<Task>;
     async fn list_repositories(&self, task_id: &str) -> Result<Vec<TaskRepository>>;
+    async fn list_repositories_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+    ) -> Result<Vec<TaskRepository>>;
     async fn pin_context_repository_snapshot(
         &self,
         input: CreateTaskRepositoryContextSnapshot,

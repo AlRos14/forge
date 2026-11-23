@@ -51,10 +51,7 @@ import {
   isTurnBudgetExhausted,
   readableCoordinationCode,
 } from './task-coordination-status'
-import {
-  deriveReviewFindingsProjection,
-  isReviewFindingsRequest,
-} from './task-review-triage'
+import { deriveReviewFindingsProjection, isReviewFindingsRequest } from './task-review-triage'
 import { TaskInterventionsPanel } from './task-interventions-panel'
 import { TaskAutonomyLimitsPanel } from './task-autonomy-limits'
 import { TaskQualityRequestsPanel } from './task-quality-requests-panel'
@@ -1193,7 +1190,9 @@ export function TaskCoordinationPanel({
                     Reviewer producer Execution:{' '}
                     {reviewFindingsProjection.producerExecutionId ?? 'unavailable'}
                   </p>
-                  {request.execution_id ? <p>Coordinator Execution: {request.execution_id}</p> : null}
+                  {request.execution_id ? (
+                    <p>Coordinator Execution: {request.execution_id}</p>
+                  ) : null}
                   <div className="flex flex-wrap gap-2">
                     {reviewFindingsProjection.reportId ? (
                       <CopyReferenceButton
@@ -1293,6 +1292,25 @@ export function TaskCoordinationPanel({
               {planStateLabels[plan.state]}
             </Badge>
           </div>
+          {plan.repository_set ? (
+            <section
+              className="space-y-2 rounded-md border p-3"
+              aria-label="Proposed repository set"
+            >
+              <h4 className="text-sm font-medium">Proposed repository set</h4>
+              <ul className="space-y-1 text-sm">
+                {plan.repository_set.map((repository) => (
+                  <li key={repository.repo_id} className="flex flex-wrap items-center gap-2">
+                    <Badge variant="outline">{repository.role.replaceAll('_', ' ')}</Badge>
+                    <code className="break-all">{repository.repo_id}</code>
+                  </li>
+                ))}
+              </ul>
+              <p className="text-xs text-muted-foreground">
+                A changed set requires the exact Human decision before materialization.
+              </p>
+            </section>
+          ) : null}
           {plan.work_units.length ? (
             <ol className="grid min-w-0 gap-3 lg:grid-cols-2">
               {plan.work_units.map((unit) => {

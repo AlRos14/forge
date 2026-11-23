@@ -592,6 +592,10 @@ pub struct WorkUnitPlan {
     pub envelope_digest: String,
     pub objective_digest: String,
     pub work_units: Vec<PlanWorkUnit>,
+    /// Optional complete Task repository set proposed by a coordinator replan.
+    /// Omission preserves the existing plan wire representation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_set: Option<Vec<api_types::TaskRepositoryInput>>,
     #[serde(default)]
     pub delivery: Option<Value>,
     #[serde(default)]
@@ -2366,6 +2370,9 @@ impl TaskCoordinationService {
                 user_id,
             )
             .await?;
+        let proposed_repository_set = self
+            .validate_replan_repository_set(&request, &task, &parsed)
+            .await?;
         let current_repository_set = TaskRepositorySetRepo::get_current(&*self.db, &task.id)
             .await?
             .ok_or_else(|| {
@@ -2378,14 +2385,16 @@ impl TaskCoordinationService {
                     task_id: task.id.clone(),
                     expected_current_revision: current_repository_set.revision,
                     expected_current_digest: current_repository_set.digest.clone(),
-                    repositories: current_repository_set
-                        .repositories
-                        .iter()
-                        .map(|repository| TaskRepositoryWrite {
-                            repo_id: repository.repo_id.clone(),
-                            role: repository.role,
-                        })
-                        .collect(),
+                    repositories: proposed_repository_set.clone().unwrap_or_else(|| {
+                        current_repository_set
+                            .repositories
+                            .iter()
+                            .map(|repository| TaskRepositoryWrite {
+                                repo_id: repository.repo_id.clone(),
+                                role: repository.role,
+                            })
+                            .collect()
+                    }),
                     source_kind: "coordinator_replan".to_owned(),
                     source_ref: Some(proof.replan_id.clone()),
                     decision_id: None,
@@ -3512,6 +3521,7 @@ Task context: {context}"#,
             "You are the selected Task coordinator for one bounded preparation turn. This execution is read-only and must not modify repository files, create WorkUnits, call provider APIs, or grant authority.\n\
 Return exactly one JSON object and no markdown fences. The object must match this schema:\n\
 {{\"schema_version\":1,\"request_id\":{request_id},\"task_id\":{task_id},\"task_version\":{task_version},\"authorization_version\":{authorization_version},\"team_digest\":{team_digest},\"envelope_digest\":{envelope_digest},\"objective_digest\":{objective_digest},\"work_units\":[{{\"key\":\"stable-key\",\"title\":\"...\",\"scope\":\"...\",\"role\":\"exact existing TaskRole role name\",\"assigned_actor\":{{\"kind\":\"agent|human\",\"id\":\"exact eligible member id\"}}|null,\"parent_key\":null,\"depends_on\":[],\"requires_integration\":false,\"execution_instructions\":null,\"review_subject_key\":null,\"acceptance\":[],\"artifact_inputs\":[]}}],\"delivery\":null,\"review\":null,\"limits\":null}}\n\
+Optional `repository_set` has shape `[{{\"repo_id\":\"exact Project repo id\",\"role\":\"primary|affected|context\"}}]`. Include it only for a coordinator replan that proposes a repository change; it replaces the complete set, must preserve the primary repository, and requires the exact Human decision before materialization. Omit it when unchanged.\n\
 Create at most {max_work_units} WorkUnits. Use only TaskRole names and active members listed in the team. A formal review WorkUnit must use a TaskRole with the `formal_review` capability, set review_subject_key to another planned key, and must use a fresh role-isolated native session; the same Agent profile is allowed, but a Human contributor cannot review their own result. The review role must also appear in the envelope's allowed_review_roles by its exact role name. Do not create, rename, or grant TaskRoles, memberships, or capabilities. Do not request external actions or merge. A plan outside the envelope will wait for Human approval.\n\
 Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {acceptance}\nContext: {context}\nEnvelope: {envelope_json}\nTeam: {team}\nCurrent Task context: {task_context}",
             request_id = serde_json::to_string(&request.id).unwrap(),
@@ -4845,6 +4855,8 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         plan: &WorkUnitPlan,
         materializing: bool,
     ) -> Result<()> {
+        self.validate_replan_repository_set(request, task, plan)
+            .await?;
         if plan.task_id != task.id
             || plan.request_id != request.id
             || plan.authorization_version != coordination.authorization_version
@@ -5582,6 +5594,7 @@ mod tests {
                     artifact_inputs: Vec::new(),
                 })
                 .collect(),
+            repository_set: None,
             delivery: None,
             review: None,
             limits: None,

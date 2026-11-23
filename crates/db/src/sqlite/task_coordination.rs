@@ -1380,8 +1380,12 @@ async fn validate_replan_decision_proof_in_tx(
               ON request.id = replan.plan_request_id AND request.task_id = replan.task_id
             JOIN task_coordination_plan plan
               ON plan.artifact_id = request.plan_artifact_id AND plan.task_id = request.task_id
+            JOIN artifact artifact
+              ON artifact.id = plan.artifact_id AND artifact.task_id = plan.task_id
             JOIN human_decision_request decision
               ON decision.id = replan.human_decision_id AND decision.task_id = replan.task_id
+            JOIN task_coordination_request resume
+              ON resume.id = decision.resume_request_id AND resume.task_id = decision.task_id
             WHERE replan.id = ? AND replan.task_id = ?
               AND replan.plan_request_id = ?
               AND replan.authorization_version = ?
@@ -1394,13 +1398,19 @@ async fn validate_replan_decision_proof_in_tx(
               AND request.state != 'cancelled'
               AND plan.artifact_id = ? AND plan.request_id = ?
               AND plan.plan_digest = ? AND plan.state = 'approved'
+              AND artifact.kind = 'work_unit_plan' AND artifact.digest = plan.plan_digest
               AND decision.source_kind = 'coordinator_replan'
               AND decision.source_id = replan.id
               AND decision.authorization_version = replan.authorization_version
               AND decision.state = 'answered'
               AND decision.answered_option_id = 'approve_replan'
               AND decision.answered_by_user_id = ?
-              AND decision.resume_request_id = request.id
+              AND resume.kind = 'human_decision_resume'
+              AND resume.source_subject_kind = 'human_decision'
+              AND resume.source_subject_id = decision.id
+              AND resume.resumes_request_id = request.id
+              AND resume.authorization_version = request.authorization_version
+              AND resume.state != 'cancelled'
               AND json_extract(decision.resume_binding_json, '$.request_id') = request.id
               AND json_extract(decision.resume_binding_json, '$.request_kind') = 'work_unit_plan'
               AND json_extract(decision.resume_binding_json, '$.authorization_version') = request.authorization_version
@@ -1425,6 +1435,127 @@ async fn validate_replan_decision_proof_in_tx(
     .await?;
     if !exact {
         return Err(DbError::InvalidTransition);
+    }
+    Ok(())
+}
+
+fn validate_replan_repository_set_base(
+    proof: &CoordinatorReplanDecisionProof,
+    current: &crate::TaskRepositorySetRevision,
+) -> Result<()> {
+    if proof.base_repository_set_revision > 0 {
+        if proof.base_repository_set_revision != current.revision
+            || proof.base_repository_set_digest != current.digest
+        {
+            return Err(DbError::TaskRepositoryReplanBaseStale);
+        }
+    } else {
+        let current_primary = current
+            .repositories
+            .iter()
+            .find(|repository| repository.role == crate::TaskRepositoryRole::Primary)
+            .map(|repository| repository.repo_id.as_str());
+        if proof.base_repo_id.as_deref() != current_primary {
+            return Err(DbError::TaskRepositoryReplanBaseStale);
+        }
+    }
+    Ok(())
+}
+
+async fn validate_repository_removals_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    current: &crate::TaskRepositorySetRevision,
+    requested: &[crate::TaskRepositoryWrite],
+) -> Result<()> {
+    let requested_ids = requested
+        .iter()
+        .map(|repository| repository.repo_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for previous in &current.repositories {
+        let requested_role = requested
+            .iter()
+            .find(|repository| repository.repo_id == previous.repo_id)
+            .map(|repository| repository.role);
+        let loses_writable_scope = previous.role == crate::TaskRepositoryRole::Affected
+            && requested_role == Some(crate::TaskRepositoryRole::Context);
+        if requested_ids.contains(previous.repo_id.as_str()) && !loses_writable_scope {
+            continue;
+        }
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT
+               EXISTS (
+                   SELECT 1
+                   FROM work_unit_repository_set_revision pin
+                   JOIN task_repository_set_revision_repo member
+                     ON member.task_id = pin.task_id AND member.revision = pin.revision
+                   JOIN work_unit unit ON unit.id = pin.work_unit_id AND unit.task_id = pin.task_id
+                   WHERE pin.task_id = ? AND member.repo_id = ? AND unit.status = 'open'
+               )
+               OR EXISTS (
+                   SELECT 1
+                   FROM execution execution
+                   JOIN work_unit unit
+                     ON unit.id = execution.work_unit_id AND unit.task_id = execution.task_id
+                   JOIN work_unit_repository_set_revision pin
+                     ON pin.work_unit_id = unit.id AND pin.task_id = unit.task_id
+                   JOIN task_repository_set_revision_repo member
+                     ON member.task_id = pin.task_id AND member.revision = pin.revision
+                   WHERE execution.task_id = ? AND execution.status = 'running'
+                     AND member.repo_id = ?
+               )
+               OR EXISTS (
+                   SELECT 1
+                   FROM workspace_lease lease
+                   JOIN work_unit unit
+                     ON unit.id = lease.work_unit_id AND unit.task_id = lease.task_id
+                   JOIN work_unit_repository_set_revision pin
+                     ON pin.work_unit_id = unit.id AND pin.task_id = unit.task_id
+                   JOIN task_repository_set_revision_repo member
+                     ON member.task_id = pin.task_id AND member.revision = pin.revision
+                   WHERE lease.task_id = ? AND lease.status = 'active'
+                     AND member.repo_id = ?
+               )
+               OR EXISTS (
+                   SELECT 1
+                   FROM task_repository_merge_batch batch
+                   JOIN task_repository_set_revision_repo member
+                     ON member.task_id = batch.task_id
+                    AND member.revision = batch.repository_set_revision
+                   WHERE batch.task_id = ? AND member.repo_id = ?
+                     AND batch.state IN ('integrating', 'publishing', 'open', 'blocked')
+               )
+               OR EXISTS (
+                   SELECT 1 FROM pr_metadata metadata
+                   WHERE metadata.task_id = ? AND metadata.repo_id = ?
+                     AND (metadata.pr_state NOT IN ('closed', 'merged')
+                          OR metadata.admission_status NOT IN ('closed', 'merged', 'failed'))
+               )
+               OR EXISTS (
+                   SELECT 1 FROM remote_pr_admission admission
+                   WHERE admission.task_id = ? AND admission.repo_id = ?
+                     AND admission.state NOT IN ('merged', 'closed', 'head_mismatch', 'publication_failed')
+               )",
+        )
+        .bind(task_id)
+        .bind(&previous.repo_id)
+        .bind(task_id)
+        .bind(&previous.repo_id)
+        .bind(task_id)
+        .bind(&previous.repo_id)
+        .bind(task_id)
+        .bind(&previous.repo_id)
+        .bind(task_id)
+        .bind(&previous.repo_id)
+        .bind(task_id)
+        .bind(&previous.repo_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if blocked {
+            return Err(DbError::TaskRepositoryReplanRemovalBlocked {
+                repo_id: previous.repo_id.clone(),
+            });
+        }
     }
     Ok(())
 }
@@ -2231,14 +2362,36 @@ impl TaskCoordinationRepo for SqliteDb {
             {
                 return Err(DbError::InvalidTransition);
             }
+            validate_replan_repository_set_base(proof, &current_repository_set)?;
             validate_replan_decision_proof_in_tx(&mut tx, &input, proof).await?;
         } else if input.coordinator_replan_decision.is_some()
             || input.repository_set_revision_change.is_some()
         {
             return Err(DbError::InvalidTransition);
         }
+        let mut repository_set_replanned = None;
         let repository_revision_to_pin =
             if let Some(revision_change) = input.repository_set_revision_change.clone() {
+                let previous_primary = current_repository_set
+                    .repositories
+                    .iter()
+                    .find(|repository| repository.role == crate::TaskRepositoryRole::Primary)
+                    .map(|repository| repository.repo_id.as_str());
+                let requested_primary = revision_change
+                    .repositories
+                    .iter()
+                    .find(|repository| repository.role == crate::TaskRepositoryRole::Primary)
+                    .map(|repository| repository.repo_id.as_str());
+                if previous_primary != requested_primary {
+                    return Err(DbError::TaskRepositoryReplanPrimaryImmutable);
+                }
+                validate_repository_removals_in_tx(
+                    &mut tx,
+                    &input.task_id,
+                    &current_repository_set,
+                    &revision_change.repositories,
+                )
+                .await?;
                 let revision =
                     TaskRepositorySetRepo::create_revision_in_tx(self, &mut tx, revision_change)
                         .await?;
@@ -2255,7 +2408,7 @@ impl TaskCoordinationRepo for SqliteDb {
                 old_members.sort_by_key(|member| (member.2, member.0.clone()));
                 new_members.sort_by_key(|member| (member.2, member.0.clone()));
                 if old_members != new_members {
-                    return Err(DbError::InvalidTransition);
+                    repository_set_replanned = Some(revision.clone());
                 }
                 revision.revision
             } else {
@@ -2543,6 +2696,45 @@ impl TaskCoordinationRepo for SqliteDb {
         }
         for event in &input.events {
             DomainEventRepo::append_event_in_tx(self, &mut tx, event).await?;
+        }
+        if let (Some(revision), Some(proof)) = (
+            repository_set_replanned,
+            input.coordinator_replan_decision.as_ref(),
+        ) {
+            let correlation_id = input
+                .events
+                .iter()
+                .find(|event| event.event_type == "task.coordination_plan_materialized")
+                .map(|event| event.correlation_id.clone())
+                .unwrap_or_else(crate::new_uuid_v4);
+            let event = CreateDomainEvent {
+                id: crate::new_uuid_v4(),
+                event_type: "task.repository_set_replanned".to_owned(),
+                entity_type: "task_repository_set_revision".to_owned(),
+                entity_id: format!("{}:{}", input.task_id, revision.revision),
+                actor_type: "human".to_owned(),
+                actor_id: Some(proof.approved_by_user_id.clone()),
+                scope_type: "task".to_owned(),
+                scope_id: input.task_id.clone(),
+                correlation_id,
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!(
+                    "task.repository_set_replanned:{}:{}",
+                    input.task_id, revision.revision
+                )),
+                payload_json: serde_json::json!({
+                    "task_id": input.task_id,
+                    "previous_revision": current_repository_set.revision,
+                    "repository_set_revision": revision.revision,
+                    "repository_set_digest": revision.digest,
+                    "plan_artifact_id": input.plan_artifact_id,
+                    "human_decision_request_id": proof.decision_id,
+                })
+                .to_string(),
+                created_at: input.created_at.clone(),
+            };
+            DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
         }
         let receipt = sqlx::query(
             "SELECT * FROM task_coordination_materialization WHERE plan_artifact_id = ?",
@@ -3414,5 +3606,226 @@ impl TaskCoordinatorReplanRepo for SqliteDb {
             |item| item.ordinal.to_string(),
             |item| item.id.clone(),
         )
+    }
+}
+
+#[cfg(test)]
+mod multirepo_lifecycle_replan_tests {
+    use super::{validate_replan_repository_set_base, validate_repository_removals_in_tx};
+    use crate::{
+        create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateProject, CreateRepo,
+        CreateTask, CreateTaskRole, DbError, ProjectRepo, RepoRepo, SqliteDb, TaskLifecycleState,
+        TaskRepo, TaskRepositoryRole, TaskRepositorySetRepo, TaskRepositorySetRevision,
+        TaskRepositorySetRevisionRepo as RevisionMember, TaskRepositorySetRevisionState,
+        TaskRepositoryWrite, User, UserRepo, WorkMode,
+    };
+
+    #[test]
+    fn multirepo_lifecycle_replan_stale_base_revision_is_rejected() {
+        let proof = crate::CoordinatorReplanDecisionProof {
+            replan_id: "replan".to_owned(),
+            decision_id: "decision".to_owned(),
+            request_id: "request".to_owned(),
+            plan_artifact_id: "artifact".to_owned(),
+            plan_digest: "plan-digest".to_owned(),
+            authorization_version: 3,
+            approved_by_user_id: "user".to_owned(),
+            base_repository_set_revision: 1,
+            base_repository_set_digest: Some("old-digest".to_owned()),
+            base_repo_id: Some("primary".to_owned()),
+        };
+        let current = TaskRepositorySetRevision {
+            task_id: "task".to_owned(),
+            revision: 2,
+            digest: Some("new-digest".to_owned()),
+            state: TaskRepositorySetRevisionState::Current,
+            created_at: "2026-11-23T00:00:00Z".to_owned(),
+            source_kind: "test".to_owned(),
+            source_ref: None,
+            decision_id: None,
+            human_decision_request_id: None,
+            repositories: vec![RevisionMember {
+                task_id: "task".to_owned(),
+                revision: 2,
+                repo_id: "primary".to_owned(),
+                role: TaskRepositoryRole::Primary,
+                position: 0,
+            }],
+        };
+        assert!(matches!(
+            validate_replan_repository_set_base(&proof, &current),
+            Err(DbError::TaskRepositoryReplanBaseStale)
+        ));
+    }
+
+    #[tokio::test]
+    async fn multirepo_lifecycle_replan_removal_with_open_pinned_work_is_rejected() {
+        let pool = create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        run_migrations(&pool).await.expect("migrations run");
+        let db = SqliteDb::new(pool);
+        let now = now_rfc3339();
+        let user_id = new_uuid_v4();
+        UserRepo::create_user(
+            &db,
+            &User {
+                id: user_id.clone(),
+                email: format!("{user_id}@example.invalid"),
+                password_hash: "unused".to_owned(),
+                display_name: Some("Replan fixture".to_owned()),
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("user creates");
+        let project_id = new_uuid_v4();
+        ProjectRepo::create(
+            &db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "Replan removal fixture".to_owned(),
+                settings: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: Some(user_id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Project creates");
+        let make_repo = |name: &str| CreateRepo {
+            id: new_uuid_v4(),
+            project_id: project_id.clone(),
+            name: name.to_owned(),
+            remote_url: format!("https://example.invalid/{name}.git"),
+            local_path: None,
+            work_mode: WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let primary_repo = make_repo("primary");
+        let removed_repo = make_repo("removed");
+        RepoRepo::create(&db, primary_repo.clone())
+            .await
+            .expect("primary repo creates");
+        RepoRepo::create(&db, removed_repo.clone())
+            .await
+            .expect("affected repo creates");
+        let task_id = new_uuid_v4();
+        TaskRepo::create(
+            &db,
+            CreateTask {
+                id: task_id.clone(),
+                project_id,
+                repo_id: Some(primary_repo.id.clone()),
+                repositories: vec![
+                    TaskRepositoryWrite {
+                        repo_id: primary_repo.id.clone(),
+                        role: TaskRepositoryRole::Primary,
+                    },
+                    TaskRepositoryWrite {
+                        repo_id: removed_repo.id.clone(),
+                        role: TaskRepositoryRole::Affected,
+                    },
+                ],
+                parent_task_id: None,
+                title: "Replan removal fixture".to_owned(),
+                description: None,
+                lifecycle_state: TaskLifecycleState::Ready,
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                merge_config: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Task creates");
+        crate::TaskRoleRepo::create(
+            &db,
+            CreateTaskRole {
+                id: new_uuid_v4(),
+                task_id: task_id.clone(),
+                role: "implementer".to_owned(),
+                coordination_mode: None,
+                policy_json: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("TaskRole creates");
+        let repository_set = TaskRepositorySetRepo::get_current(&db, &task_id)
+            .await
+            .expect("current revision loads")
+            .expect("Task has repository revision");
+        let work_unit_id = new_uuid_v4();
+        sqlx::query(
+            "INSERT INTO work_unit (
+                id, task_id, title, scope, status, role, requires_integration,
+                created_by_kind, created_by_id, version, created_at, updated_at
+             ) VALUES (?, ?, 'Open work', 'Still in flight', 'open', 'implementer',
+                       0, 'human', ?, 1, ?, ?)",
+        )
+        .bind(&work_unit_id)
+        .bind(&task_id)
+        .bind(&user_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("open WorkUnit inserts");
+        TaskRepositorySetRepo::pin_work_unit(&db, &work_unit_id, &task_id, repository_set.revision)
+            .await
+            .expect("WorkUnit pins current repository revision");
+
+        let mut tx = db
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("transaction begins");
+        let error = validate_repository_removals_in_tx(
+            &mut tx,
+            &task_id,
+            &repository_set,
+            &[TaskRepositoryWrite {
+                repo_id: primary_repo.id.clone(),
+                role: TaskRepositoryRole::Primary,
+            }],
+        )
+        .await
+        .expect_err("an open pinned WorkUnit blocks removal");
+        assert!(matches!(
+            error,
+            DbError::TaskRepositoryReplanRemovalBlocked { repo_id }
+                if repo_id == removed_repo.id
+        ));
+        let downgrade_error = validate_repository_removals_in_tx(
+            &mut tx,
+            &task_id,
+            &repository_set,
+            &[
+                TaskRepositoryWrite {
+                    repo_id: primary_repo.id.clone(),
+                    role: TaskRepositoryRole::Primary,
+                },
+                TaskRepositoryWrite {
+                    repo_id: removed_repo.id.clone(),
+                    role: TaskRepositoryRole::Context,
+                },
+            ],
+        )
+        .await
+        .expect_err("downgrading a writable repository with open pinned work is blocked");
+        assert!(matches!(
+            downgrade_error,
+            DbError::TaskRepositoryReplanRemovalBlocked { repo_id }
+                if repo_id == removed_repo.id
+        ));
     }
 }

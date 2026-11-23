@@ -22,6 +22,10 @@ pub struct ReplanOriginalScope {
     pub team_actors: BTreeSet<String>,
     pub existing_work_units: usize,
     pub original_work_unit_scopes: Vec<String>,
+    /// Ordered role membership for multi-repository sets. Single-primary and
+    /// repo-less sets reconstruct from legacy fields to preserve snapshot JSON.
+    #[serde(default, skip_serializing_if = "omit_legacy_repository_set_snapshot")]
+    pub original_repository_set: Vec<ReplanRepositoryMember>,
     /// Exact immutable repository-set revision captured when this replan was proposed.
     #[serde(default)]
     pub repository_set_revision: i64,
@@ -38,6 +42,22 @@ pub struct ReplanOriginalScope {
     /// Repository identity measured again when the plan is classified.
     #[serde(default)]
     pub current_repo_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplanRepositoryMember {
+    pub repo_id: String,
+    pub role: api_types::TaskRepositoryRole,
+    pub position: i64,
+}
+
+#[allow(clippy::ptr_arg)] // serde's skip predicate receives the field by reference.
+fn omit_legacy_repository_set_snapshot(members: &Vec<ReplanRepositoryMember>) -> bool {
+    members.is_empty()
+        || (members.len() == 1
+            && members[0].role == api_types::TaskRepositoryRole::Primary
+            && members[0].position == 0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +130,27 @@ pub fn classify_replan(
         original.repository_set_revision == original.current_repository_set_revision
             && original.repository_set_digest == original.current_repository_set_digest
     };
+    let original_repository_set = if original.original_repository_set.is_empty() {
+        original
+            .repo_id
+            .as_ref()
+            .map(|repo_id| {
+                vec![ReplanRepositoryMember {
+                    repo_id: repo_id.clone(),
+                    role: api_types::TaskRepositoryRole::Primary,
+                    position: 0,
+                }]
+            })
+            .unwrap_or_default()
+    } else {
+        original.original_repository_set.clone()
+    };
+    let proposed_repository_set_unchanged = plan.repository_set.as_ref().is_none_or(|proposed| {
+        let normalized = normalize_repository_set(proposed);
+        normalized == original_repository_set
+    });
     let repositories_within_original = repository_set_unchanged
+        && proposed_repository_set_unchanged
         && original.current_repo_id == original.repo_id
         && items
             .iter()
@@ -145,6 +185,29 @@ pub fn classify_replan(
         },
         facts,
     }
+}
+
+fn normalize_repository_set(
+    repositories: &[api_types::TaskRepositoryInput],
+) -> Vec<ReplanRepositoryMember> {
+    let mut position = 1_i64;
+    let mut members = Vec::with_capacity(repositories.len());
+    for repository in repositories {
+        let row_position = if repository.role == api_types::TaskRepositoryRole::Primary {
+            0
+        } else {
+            let current = position;
+            position = position.saturating_add(1);
+            current
+        };
+        members.push(ReplanRepositoryMember {
+            repo_id: repository.repo_id.clone(),
+            role: repository.role,
+            position: row_position,
+        });
+    }
+    members.sort_by_key(|member| (member.position, member.repo_id.clone()));
+    members
 }
 
 fn plan_actor_key(actor: &ApiActorRef) -> String {
@@ -247,6 +310,11 @@ mod tests {
             team_actors: ["agent:a".to_owned()].into_iter().collect(),
             existing_work_units: 1,
             original_work_unit_scopes: vec!["src/".to_owned()],
+            original_repository_set: vec![ReplanRepositoryMember {
+                repo_id: "repo".to_owned(),
+                role: api_types::TaskRepositoryRole::Primary,
+                position: 0,
+            }],
             repository_set_revision: 1,
             repository_set_digest: Some("revision-one-digest".to_owned()),
             current_repository_set_revision: 1,
@@ -280,6 +348,7 @@ mod tests {
                 acceptance: vec![],
                 artifact_inputs: vec![],
             }],
+            repository_set: None,
             delivery: None,
             review: None,
             limits: None,
@@ -402,6 +471,69 @@ mod tests {
         );
         assert!(!result.facts.repository_set_unchanged);
         assert!(!result.facts.repositories_within_original);
+    }
+
+    #[test]
+    fn multirepo_lifecycle_replan_repository_set_change_requires_human_decision() {
+        let mut plan = plan("src/module.rs", "implementer", None);
+        plan.repository_set = Some(vec![
+            api_types::TaskRepositoryInput {
+                repo_id: "repo".to_owned(),
+                role: api_types::TaskRepositoryRole::Primary,
+            },
+            api_types::TaskRepositoryInput {
+                repo_id: "repo-context".to_owned(),
+                role: api_types::TaskRepositoryRole::Context,
+            },
+        ]);
+        let result = classify_replan(&plan, &base_envelope(), &original());
+        assert_eq!(
+            result.classification,
+            ReplanClassification::ScopeOrAuthorityChange
+        );
+        assert!(result.facts.repository_set_unchanged);
+        assert!(!result.facts.repositories_within_original);
+    }
+
+    #[test]
+    fn multirepo_lifecycle_replan_without_repository_set_preserves_plan_wire_shape() {
+        let serialized = serde_json::to_string(&WorkUnitPlan {
+            work_units: Vec::new(),
+            ..plan("src/module.rs", "implementer", None)
+        })
+        .expect("plan serializes");
+        assert_eq!(
+            serialized,
+            r#"{"schema_version":1,"request_id":"request","task_id":"task","task_version":1,"authorization_version":1,"team_digest":"team","envelope_digest":"envelope","objective_digest":"new-request-objective","work_units":[],"delivery":null,"review":null,"limits":null}"#
+        );
+    }
+
+    #[test]
+    fn multirepo_lifecycle_replan_without_repository_change_stays_within_envelope() {
+        let result = classify_replan(
+            &plan("src/module.rs", "implementer", None),
+            &base_envelope(),
+            &original(),
+        );
+        assert_eq!(result.classification, ReplanClassification::WithinEnvelope);
+        assert!(result.facts.repository_set_unchanged);
+        assert!(result.facts.repositories_within_original);
+    }
+
+    #[test]
+    fn multirepo_lifecycle_replan_single_repo_snapshot_keeps_legacy_wire_shape() {
+        let original = original();
+        let serialized = serde_json::to_string(&original).expect("snapshot serializes");
+        assert!(!serialized.contains("original_repository_set"));
+        let restored: ReplanOriginalScope =
+            serde_json::from_str(&serialized).expect("legacy-shaped snapshot restores");
+        let mut plan = plan("src/module.rs", "implementer", None);
+        plan.repository_set = Some(vec![api_types::TaskRepositoryInput {
+            repo_id: "repo".to_owned(),
+            role: api_types::TaskRepositoryRole::Primary,
+        }]);
+        let result = classify_replan(&plan, &base_envelope(), &restored);
+        assert_eq!(result.classification, ReplanClassification::WithinEnvelope);
     }
 
     #[test]

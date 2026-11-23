@@ -9934,6 +9934,115 @@ async fn multirepo_task_primary_mirror_tracks_association_changes() {
 }
 
 #[tokio::test]
+async fn multirepo_lifecycle_replan_revision_and_new_pins_preserve_history() {
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "M3b replan revisions", None).await;
+    let primary_repo_id = multirepo_seed_repo(&db, &project_id, "replan-primary").await;
+    let removed_repo_id = multirepo_seed_repo(&db, &project_id, "replan-removed").await;
+    let added_repo_id = multirepo_seed_repo(&db, &project_id, "replan-added").await;
+    let task_id = multirepo_seed_task(
+        &db,
+        &project_id,
+        &primary_repo_id,
+        vec![
+            crate::TaskRepositoryWrite {
+                repo_id: primary_repo_id.clone(),
+                role: crate::TaskRepositoryRole::Primary,
+            },
+            crate::TaskRepositoryWrite {
+                repo_id: removed_repo_id.clone(),
+                role: crate::TaskRepositoryRole::Affected,
+            },
+        ],
+    )
+    .await;
+    let base = TaskRepositorySetRepo::get_current(&db, &task_id)
+        .await
+        .expect("base repository revision loads")
+        .expect("Task has a repository revision");
+    let agent_id = seed_agent(&db, "M3b pin fixture", "global", None).await;
+    let old_work_unit_id =
+        insert_test_work_unit(&db, &task_id, &agent_id, "implementer", false, None).await;
+    sqlx::query("UPDATE work_unit SET status = 'completed' WHERE id = ?")
+        .bind(&old_work_unit_id)
+        .execute(db.pool())
+        .await
+        .expect("historical WorkUnit completes before the replan");
+
+    let revision = TaskRepositorySetRepo::create_revision(
+        &db,
+        crate::CreateTaskRepositorySetRevision {
+            task_id: task_id.clone(),
+            expected_current_revision: base.revision,
+            expected_current_digest: base.digest.clone(),
+            repositories: vec![
+                crate::TaskRepositoryWrite {
+                    repo_id: primary_repo_id.clone(),
+                    role: crate::TaskRepositoryRole::Primary,
+                },
+                crate::TaskRepositoryWrite {
+                    repo_id: added_repo_id.clone(),
+                    role: crate::TaskRepositoryRole::Affected,
+                },
+            ],
+            source_kind: "coordinator_replan".to_owned(),
+            source_ref: Some("replan-1".to_owned()),
+            decision_id: None,
+            human_decision_request_id: None,
+            force_new_revision: true,
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("new repository revision is written");
+    assert_eq!(revision.revision, base.revision + 1);
+    assert_eq!(revision.repositories.len(), 2);
+
+    let new_work_unit_id =
+        insert_test_work_unit(&db, &task_id, &agent_id, "implementer", false, None).await;
+    let old_pin: i64 = sqlx::query_scalar(
+        "SELECT revision FROM work_unit_repository_set_revision WHERE work_unit_id = ?",
+    )
+    .bind(&old_work_unit_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("historical WorkUnit pin remains");
+    let new_pin: i64 = sqlx::query_scalar(
+        "SELECT revision FROM work_unit_repository_set_revision WHERE work_unit_id = ?",
+    )
+    .bind(&new_work_unit_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("new WorkUnit pins current revision");
+    assert_eq!(old_pin, base.revision);
+    assert_eq!(new_pin, revision.revision);
+
+    let historical = TaskRepositorySetRepo::get_revision(&db, &task_id, base.revision)
+        .await
+        .expect("historical revision loads")
+        .expect("historical revision remains");
+    assert_eq!(historical.digest, base.digest);
+    assert_eq!(historical.repositories, base.repositories);
+    assert_eq!(
+        TaskRepo::list_repositories(&db, &task_id)
+            .await
+            .expect("current repository scope loads")
+            .iter()
+            .map(|repository| repository.repo_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![primary_repo_id.as_str(), added_repo_id.as_str()]
+    );
+    let retired_role: String =
+        sqlx::query_scalar("SELECT role FROM task_repository WHERE task_id = ? AND repo_id = ?")
+            .bind(&task_id)
+            .bind(&removed_repo_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("catalog row for historical references remains");
+    assert_eq!(retired_role, "context");
+}
+
+#[tokio::test]
 async fn multirepo_task_rejects_cross_project_and_duplicate_repository_roles() {
     let db = sqlite_db().await;
     let project_id = seed_project(&db, "M1 repository owner", None).await;

@@ -3,5 +3,6 @@ import type { TaskCoordinationMaterializationResponse } from "./TaskCoordination
 import type { TaskCoordinationMode } from "./TaskCoordinationMode";
 import type { TaskCoordinationPlanState } from "./TaskCoordinationPlanState";
 import type { TaskCoordinationPlanWorkUnitResponse } from "./TaskCoordinationPlanWorkUnitResponse";
+import type { TaskRepositoryInput } from "./TaskRepositoryInput";
 
-export type TaskCoordinationPlanResponse = { artifact_id: string, task_id: string, request_id: string, mode: TaskCoordinationMode, state: TaskCoordinationPlanState, authorization_version: number, task_version: number, digest: string, team_digest: string, envelope_digest: string, objective_digest: string, work_units: Array<TaskCoordinationPlanWorkUnitResponse>, proposal_id: string | null, decision_id: string | null, materialization: TaskCoordinationMaterializationResponse | null, version: number, created_at: string, updated_at: string, };
+export type TaskCoordinationPlanResponse = { artifact_id: string, task_id: string, request_id: string, mode: TaskCoordinationMode, state: TaskCoordinationPlanState, authorization_version: number, task_version: number, digest: string, team_digest: string, envelope_digest: string, objective_digest: string, work_units: Array<TaskCoordinationPlanWorkUnitResponse>, repository_set?: Array<TaskRepositoryInput>, proposal_id: string | null, decision_id: string | null, materialization: TaskCoordinationMaterializationResponse | null, version: number, created_at: string, updated_at: string, };

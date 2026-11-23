@@ -43,6 +43,15 @@ pub enum DbError {
     #[error("a Task integration operation is already active")]
     TaskIntegrationOperationBusy,
 
+    #[error("the coordinator replan repository-set base is stale")]
+    TaskRepositoryReplanBaseStale,
+
+    #[error("coordinator replan cannot change the Task primary repository")]
+    TaskRepositoryReplanPrimaryImmutable,
+
+    #[error("repository {repo_id} still has in-flight Task work")]
+    TaskRepositoryReplanRemovalBlocked { repo_id: String },
+
     #[error("task version conflict: expected {expected}, actual {actual}")]
     TaskVersionConflict { expected: i64, actual: i64 },
 

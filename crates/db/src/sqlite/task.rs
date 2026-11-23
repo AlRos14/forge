@@ -200,25 +200,19 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn list_repositories(&self, task_id: &str) -> Result<Vec<crate::TaskRepository>> {
-        let rows = sqlx::query(
-            "SELECT task_id, repo_id, role, position, created_at
-             FROM task_repository WHERE task_id = ? ORDER BY position, repo_id",
-        )
-        .bind(task_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| {
-                let role: String = row.try_get("role")?;
-                Ok(crate::TaskRepository {
-                    task_id: row.try_get("task_id")?,
-                    repo_id: row.try_get("repo_id")?,
-                    role: role.parse().map_err(DbError::Check)?,
-                    position: row.try_get("position")?,
-                    created_at: row.try_get("created_at")?,
-                })
-            })
-            .collect()
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let repositories =
+            super::task_repository::list_current_repositories_in_tx(&mut tx, task_id).await?;
+        tx.commit().await?;
+        Ok(repositories)
+    }
+
+    async fn list_repositories_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+    ) -> Result<Vec<crate::TaskRepository>> {
+        super::task_repository::list_current_repositories_in_tx(transaction, task_id).await
     }
 
     async fn pin_context_repository_snapshot(

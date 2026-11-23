@@ -2897,3 +2897,38 @@ sin batch; el claim concurrente vuelve a mapear busy/locked a
 el SHA base original y registra el conflicto como en 0.9.1; el merge
 single-repo con Gate obsoleto vuelve a responder 409. Una Task multi-repo
 permanece `active` hasta admitir su batch y pasa directamente a `merging`.
+
+## M3b — replan del conjunto de repos
+
+**Contrato congelado para implementación.** `WorkUnitPlan` admite el campo
+opcional `repository_set: [{repo_id, role}]`, con roles `primary`, `affected` y
+`context`; el orden del array fija `position` después del primary. Si se omite,
+la serialización conserva exactamente el formato actual. REST y MCP muestran el
+campo en el plan de coordinación, y el schema del tool de coordinación lo
+describe. Solo se acepta en un coordinator replan. El conjunto debe tener IDs
+únicos, exactamente un primary cuando no está vacío y todas las repos deben
+pertenecer al Project. Cambiar el primary se rechaza con
+`task.repositories.replan_primary_immutable`: el espejo `task.repo_id`, los
+guards V181 y las referencias históricas requieren una operación de cambio de
+primary aparte.
+
+Rust compara roles, miembros y orden propuestos con la revisión/digest base; un
+cambio es `scope_or_authority_change` y exige la decisión Human exacta. En
+resume, `BEGIN IMMEDIATE` revalida revisión/digest, Artifact, request y decisión;
+comprueba que cada repo retirada, y cada repo writable degradada a `context`,
+no tenga WorkUnit no terminal fijado a ella, Execution en curso, lease activo,
+batch activo ni PR/admission no terminal;
+si no es demostrablemente seguro, falla con
+`task.repositories.replan_removal_blocked`. Luego sincroniza el catálogo
+`task_repository` según guards V183, escribe la revisión con el writer existente
+y fija allí los WorkUnits nuevos. Filas de catálogo referenciadas por historia
+se conservan como `context`; pins, Executions, resultados, reviews, batches y
+PRs anteriores no se alteran. PATCH directo conserva su 409.
+
+La materialización publica `task.repository_set_replanned` con Task,
+revisiones anterior/nueva, digest nueva, Artifact y HumanDecision; no incluye
+texto provider. Tests requeridos: `multirepo_lifecycle_replan_` para propuesta
+que requiere decisión exacta, resume aprobado con revisión/WU nuevos y pins
+anteriores intactos, base obsoleta, retirada insegura, replan sin cambio y PATCH
+directo tras Execution. Añadir casos DB para la sincronización y guards, y caso
+API si cabe; CI es el único validador de ejecución.

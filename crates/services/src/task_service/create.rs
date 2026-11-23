@@ -1,5 +1,4 @@
 use super::*;
-use sqlx::Row;
 
 impl TaskService {
     #[allow(clippy::too_many_arguments)]
@@ -151,25 +150,14 @@ impl TaskService {
             let inherited = if let Some(repositories) = repositories {
                 repositories
             } else {
-                let rows = sqlx::query(
-                    "SELECT repo_id, role FROM task_repository WHERE task_id = ? ORDER BY position",
-                )
-                .bind(parent_id)
-                .fetch_all(&mut *transaction)
-                .await?;
-                let mut inherited = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let repo_id: String = row.try_get("repo_id")?;
-                    let role: String = row.try_get("role")?;
-                    let role = match role.as_str() {
-                        "primary" => db::TaskRepositoryRole::Primary,
-                        "affected" => db::TaskRepositoryRole::Affected,
-                        "context" => db::TaskRepositoryRole::Context,
-                        _ => return Err(ServiceError::TaskRepositoriesInvalid),
-                    };
-                    inherited.push(db::TaskRepositoryWrite { repo_id, role });
-                }
-                inherited
+                db::TaskRepo::list_repositories_in_tx(&*self.db, &mut transaction, parent_id)
+                    .await?
+                    .into_iter()
+                    .map(|repository| db::TaskRepositoryWrite {
+                        repo_id: repository.repo_id,
+                        role: repository.role,
+                    })
+                    .collect()
             };
             (Some(order), inherited)
         } else {

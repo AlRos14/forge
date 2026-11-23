@@ -123,6 +123,17 @@ fn project_domain_event(event: &DomainEvent) -> Option<PublicEventEnvelope> {
                 serde_json::from_value(projected).ok()?;
             serde_json::to_value(payload).ok()?
         }
+        "task.repository_set_replanned" => project_fields(
+            &source,
+            &[
+                "task_id",
+                "previous_revision",
+                "repository_set_revision",
+                "repository_set_digest",
+                "plan_artifact_id",
+                "human_decision_request_id",
+            ],
+        ),
         "work_unit.repository_integration_changed" => project_fields(
             &source,
             &[
@@ -544,6 +555,7 @@ fn public_domain_event_type(event_type: &str) -> Option<PublicEventType> {
     Some(match event_type {
         "task.lifecycle_changed" => PublicEventType::TaskLifecycleChanged,
         "task.repositories_changed" => PublicEventType::TaskRepositoriesChanged,
+        "task.repository_set_replanned" => PublicEventType::TaskRepositorySetReplanned,
         "work_unit.repository_integration_changed" => {
             PublicEventType::WorkUnitRepositoryIntegrationChanged
         }
@@ -907,6 +919,21 @@ mod tests {
         let payload = projected.payload.expect("repository-scope payload");
         assert_eq!(payload["repositories"][0]["repo_id"], "repo-legacy");
         assert!(payload.get("token").is_none());
+
+        let replanned = domain_event(
+            "task.repository_set_replanned",
+            r#"{"task_id":"task-1","previous_revision":1,"repository_set_revision":2,"repository_set_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","plan_artifact_id":"artifact-1","human_decision_request_id":"decision-1","provider_body":"private"}"#,
+        );
+        let projected =
+            project_domain_event(&replanned).expect("repository replan event is public");
+        assert_eq!(
+            projected.event_type,
+            PublicEventType::TaskRepositorySetReplanned
+        );
+        let payload = projected.payload.expect("repository replan payload");
+        assert_eq!(payload["repository_set_revision"], 2);
+        assert_eq!(payload["human_decision_request_id"], "decision-1");
+        assert!(payload.get("provider_body").is_none());
 
         let event = domain_event(
             "work_unit.repository_integration_changed",

@@ -1262,6 +1262,9 @@ pub struct CoordinatorReplanDecisionProof {
     pub plan_digest: String,
     pub authorization_version: i64,
     pub approved_by_user_id: String,
+    pub base_repository_set_revision: i64,
+    pub base_repository_set_digest: Option<String>,
+    pub base_repo_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

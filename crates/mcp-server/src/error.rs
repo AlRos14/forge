@@ -83,6 +83,14 @@ impl From<ServiceError> for McpToolError {
                 Self::new(-32009, "Task repository scope requires an authorized replan")
                     .with_data(json!({ "code": "task.repositories.replan_required" }))
             }
+            ServiceError::TaskRepositoryReplanRemovalBlocked { repo_id } => Self::new(
+                -32009,
+                format!("repository {repo_id} still has in-flight work"),
+            )
+            .with_data(json!({
+                "code": "task.repositories.replan_removal_blocked",
+                "repo_id": repo_id,
+            })),
             ServiceError::WorkUnitRepositoriesInvalid => {
                 Self::new(-32602, "WorkUnit repositories must be writable repositories of its Task")
                     .with_data(json!({ "code": "work_unit.repositories.invalid" }))
