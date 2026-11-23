@@ -1269,7 +1269,19 @@ impl GateEngine {
         if evaluation.outcome == GateEvaluationOutcome::Satisfied
             && lifecycle.state == TaskLifecycleState::Active
         {
-            let repository_set = TaskRepositorySetRepo::get_current(&*self.db, &task.id).await?;
+            let has_repository_set_revision: i64 = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'task_repository_set_revision'
+                 )",
+            )
+            .fetch_one(self.db.pool())
+            .await?;
+            let repository_set = if has_repository_set_revision != 0 {
+                TaskRepositorySetRepo::get_current(&*self.db, &task.id).await?
+            } else {
+                None
+            };
             if let Some(repository_set) = repository_set {
                 let writable_count = repository_set
                     .repositories

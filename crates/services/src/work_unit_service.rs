@@ -2839,7 +2839,15 @@ impl WorkUnitService {
                 ));
             }
         }
-        let target_before_sha = git::get_current_sha(target_path).await?;
+        // The scalar parent remains the exact 0.9.1 target pin for its primary
+        // repository. Do not replace it with a later HEAD during recovery: an
+        // unrelated target commit between parent admission and child creation
+        // must be recorded as a mismatch, not adopted as the new baseline.
+        let target_before_sha = if task.repo_id.as_deref() == Some(item.repo_id.as_str()) {
+            parent.target_before_sha.clone()
+        } else {
+            git::get_current_sha(target_path).await?
+        };
         let now = now_rfc3339();
         let record = WorkUnitRepositoryIntegrationRepo::create(
             &*self.db,

@@ -2256,14 +2256,29 @@ WHEN NEW.kind = 'task_merge' AND (
                            AND l.reason_ref = NEW.repository_merge_batch_id))
                   AND EXISTS (
                       SELECT 1 FROM task_repository_merge_batch batch
+                      JOIN task_repository_set_revision revision
+                        ON revision.task_id = batch.task_id
+                       AND revision.revision = batch.repository_set_revision
+                       AND revision.state = 'current'
                       JOIN task_repository_merge_batch_repo batch_repo
                         ON batch_repo.batch_id = batch.id
                        AND batch_repo.task_id = batch.task_id
+                       AND batch_repo.repository_set_revision = batch.repository_set_revision
+                      JOIN task_repository_set_revision_repo member
+                        ON member.task_id = revision.task_id
+                       AND member.revision = revision.revision
+                       AND member.repo_id = batch_repo.repo_id
+                       AND member.role IN ('primary', 'affected')
                       WHERE batch.id = NEW.repository_merge_batch_id
                         AND batch.task_id = NEW.task_id
                         AND batch.gate_evaluation_id = e.id
                         AND batch.state IN ('integrating', 'publishing')
                         AND batch_repo.repo_id = NEW.repo_id
+                        AND batch_repo.position = member.position
+                        AND (SELECT COUNT(*) FROM task_repository_set_revision_repo writable
+                             WHERE writable.task_id = revision.task_id
+                               AND writable.revision = revision.revision
+                               AND writable.role IN ('primary', 'affected')) > 1
                   ))
           )
           AND NOT EXISTS (
@@ -2300,6 +2315,210 @@ WHEN NEW.kind = 'task_merge' AND (
 )
 BEGIN
     SELECT RAISE(ABORT, 'TaskMerge admission requires an active satisfied merge-readiness GateEvaluation');
+END;
+
+-- Preserve the V100 ReadyToMerge -> Merging receipt for batchless single-repo
+-- Tasks, and authorize M3's Active -> Merging edge only through its exact
+-- current multi-repository batch.
+DROP TRIGGER task_lifecycle_transition_guard_insert;
+CREATE TRIGGER task_lifecycle_transition_guard_insert
+BEFORE INSERT ON task_lifecycle_transition
+WHEN NOT EXISTS (
+    SELECT 1 FROM task_lifecycle l
+    WHERE l.task_id = NEW.task_id AND l.state = NEW.from_state AND l.version = NEW.from_version
+)
+  OR (NEW.to_state = 'ready_to_merge' AND (
+      NEW.reason_ref IS NOT NEW.gate_evaluation_id
+      OR NOT EXISTS (
+      SELECT 1 FROM gate_evaluation e
+      JOIN gate g ON g.id = e.gate_id AND g.task_id = e.task_id
+      WHERE e.id = NEW.gate_evaluation_id AND e.task_id = NEW.task_id
+        AND e.outcome = 'satisfied' AND g.gate_kind = 'merge_readiness'
+        AND g.scope_kind = 'task' AND g.scope_id = e.task_id
+        AND g.active_policy_revision = e.policy_revision
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation newer
+            WHERE newer.gate_id = e.gate_id AND newer.policy_revision = e.policy_revision
+              AND newer.rowid > e.rowid
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation_input i
+            LEFT JOIN work_unit w ON w.id = i.input_id AND w.task_id = i.task_id
+            WHERE i.evaluation_id = e.id AND i.input_kind = 'work_unit'
+              AND (w.id IS NULL OR w.version != i.input_version)
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation_input i
+            WHERE i.evaluation_id = e.id AND i.input_kind = 'validation_run'
+              AND i.status != 'passed'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation_input i
+            LEFT JOIN decision d ON d.id = i.input_id AND d.task_id = i.task_id
+            LEFT JOIN proposal p ON p.id = d.proposal_id AND p.task_id = d.task_id
+            WHERE i.evaluation_id = e.id AND i.input_kind = 'decision'
+              AND (d.id IS NULL OR p.id IS NULL OR p.content_version != d.proposal_version
+                   OR p.status != 'resolved')
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation_input i
+            LEFT JOIN task_role r ON r.id = i.input_id AND r.task_id = i.task_id
+            WHERE i.evaluation_id = e.id AND i.input_kind = 'task_role_snapshot'
+              AND (r.id IS NULL OR r.version != i.input_version)
+        )
+  )))
+  OR (NEW.cause_kind = 'gate_evaluation' AND NEW.to_state != 'ready_to_merge' AND (
+      NEW.from_state != 'ready_to_merge'
+      OR NEW.to_state != 'active'
+      OR NEW.cause_ref IS NOT NEW.gate_evaluation_id
+      OR NEW.reason_ref IS NOT NEW.gate_evaluation_id
+      OR NOT EXISTS (
+          SELECT 1 FROM gate_evaluation e
+          JOIN gate g ON g.id = e.gate_id AND g.task_id = e.task_id
+          JOIN task_lifecycle l ON l.task_id = e.task_id
+          WHERE e.id = NEW.gate_evaluation_id AND e.task_id = NEW.task_id
+            AND g.gate_kind = 'merge_readiness'
+            AND g.scope_kind = 'task' AND g.scope_id = e.task_id
+            AND g.active_policy_revision = e.policy_revision
+            AND l.state = 'ready_to_merge' AND l.reason_ref IS NOT e.id
+            AND NOT EXISTS (
+                SELECT 1 FROM gate_evaluation newer
+                WHERE newer.gate_id = e.gate_id
+                  AND newer.policy_revision = e.policy_revision
+                  AND newer.rowid > e.rowid
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM gate_evaluation_input i
+                LEFT JOIN work_unit w ON w.id = i.input_id AND w.task_id = i.task_id
+                WHERE i.evaluation_id = e.id AND i.input_kind = 'work_unit'
+                  AND (w.id IS NULL OR w.version != i.input_version OR w.status != i.status)
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM gate_evaluation_input i
+                WHERE i.evaluation_id = e.id AND i.input_kind = 'validation_run'
+                  AND i.status != 'passed'
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM gate_evaluation_input i
+                LEFT JOIN decision d ON d.id = i.input_id AND d.task_id = i.task_id
+                LEFT JOIN proposal p ON p.id = d.proposal_id AND p.task_id = d.task_id
+                WHERE i.evaluation_id = e.id AND i.input_kind = 'decision'
+                  AND (d.id IS NULL OR p.id IS NULL OR p.content_version != d.proposal_version
+                       OR p.status != 'resolved')
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM gate_evaluation_input i
+                LEFT JOIN task_role r ON r.id = i.input_id AND r.task_id = i.task_id
+                WHERE i.evaluation_id = e.id AND i.input_kind = 'task_role_snapshot'
+                  AND (r.id IS NULL OR r.version != i.input_version)
+            )
+      )
+  ))
+  OR (NEW.to_state = 'merging' AND (
+      NEW.cause_kind != 'merge_operation'
+      OR NOT EXISTS (
+          SELECT 1 FROM task_integration_operation op
+          WHERE op.id = NEW.cause_ref AND op.task_id = NEW.task_id
+            AND op.kind = 'task_merge' AND op.status = 'running'
+            AND op.gate_evaluation_id = NEW.gate_evaluation_id
+            AND (
+                (op.repository_merge_batch_id IS NULL
+                 AND NEW.from_state = 'ready_to_merge'
+                 AND NEW.reason_kind = 'task_merge'
+                 AND NEW.reason_ref IS op.id)
+                OR (op.repository_merge_batch_id IS NOT NULL
+                    AND NEW.from_state = 'active'
+                    AND NEW.reason_kind = 'task_repository_merge_batch'
+                    AND NEW.reason_ref IS op.repository_merge_batch_id
+                    AND EXISTS (
+                        SELECT 1 FROM task_repository_merge_batch batch
+                        JOIN task_repository_set_revision revision
+                          ON revision.task_id = batch.task_id
+                         AND revision.revision = batch.repository_set_revision
+                        JOIN task_repository_merge_batch_repo batch_repo
+                          ON batch_repo.batch_id = batch.id
+                         AND batch_repo.task_id = batch.task_id
+                         AND batch_repo.repository_set_revision = batch.repository_set_revision
+                        JOIN task_repository_set_revision_repo repository
+                          ON repository.task_id = revision.task_id
+                         AND repository.revision = revision.revision
+                         AND repository.repo_id = batch_repo.repo_id
+                         AND repository.role IN ('primary', 'affected')
+                        WHERE batch.id = op.repository_merge_batch_id
+                          AND batch.task_id = op.task_id
+                          AND batch.gate_evaluation_id = NEW.gate_evaluation_id
+                          AND batch.state IN ('integrating', 'publishing')
+                          AND revision.state = 'current'
+                          AND batch_repo.repo_id = op.repo_id
+                          AND batch_repo.position = repository.position
+                          AND (SELECT COUNT(*) FROM task_repository_set_revision_repo writable
+                               WHERE writable.task_id = revision.task_id
+                                 AND writable.revision = revision.revision
+                                 AND writable.role IN ('primary', 'affected')) > 1
+                    ))
+          )
+      )
+      OR NOT EXISTS (
+      SELECT 1 FROM gate_evaluation e
+      JOIN gate g ON g.id = e.gate_id AND g.task_id = e.task_id
+      WHERE e.id = NEW.gate_evaluation_id AND e.task_id = NEW.task_id
+        AND e.outcome = 'satisfied' AND g.gate_kind = 'merge_readiness'
+        AND g.scope_kind = 'task' AND g.scope_id = e.task_id
+        AND g.active_policy_revision = e.policy_revision
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation newer
+            WHERE newer.gate_id = e.gate_id AND newer.policy_revision = e.policy_revision
+              AND newer.rowid > e.rowid
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation_input i
+            LEFT JOIN work_unit w ON w.id = i.input_id AND w.task_id = i.task_id
+            WHERE i.evaluation_id = e.id AND i.input_kind = 'work_unit'
+              AND (w.id IS NULL OR w.version != i.input_version)
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation_input i
+            WHERE i.evaluation_id = e.id AND i.input_kind = 'validation_run'
+              AND i.status != 'passed'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation_input i
+            LEFT JOIN decision d ON d.id = i.input_id AND d.task_id = i.task_id
+            LEFT JOIN proposal p ON p.id = d.proposal_id AND p.task_id = d.task_id
+            WHERE i.evaluation_id = e.id AND i.input_kind = 'decision'
+              AND (d.id IS NULL OR p.id IS NULL OR p.content_version != d.proposal_version
+                   OR p.status != 'resolved')
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM gate_evaluation_input i
+            LEFT JOIN task_role r ON r.id = i.input_id AND r.task_id = i.task_id
+            WHERE i.evaluation_id = e.id AND i.input_kind = 'task_role_snapshot'
+              AND (r.id IS NULL OR r.version != i.input_version)
+        )
+      )
+  ))
+  OR (NEW.to_state = 'done' AND NOT EXISTS (
+      SELECT 1 FROM task_integration_operation op
+      WHERE op.id = NEW.cause_ref AND op.task_id = NEW.task_id
+        AND op.kind = 'task_merge' AND op.status = 'succeeded'
+        AND NEW.cause_kind = 'merge_operation'
+  ))
+  OR (NEW.from_state = 'merging' AND NEW.to_state = 'blocked' AND NOT EXISTS (
+      SELECT 1 FROM task_integration_operation op
+      WHERE op.id = NEW.cause_ref AND op.task_id = NEW.task_id
+        AND op.kind = 'task_merge' AND op.status IN ('conflict', 'failed', 'abandoned')
+        AND NEW.cause_kind = 'merge_operation'
+  ))
+  OR NOT (
+      (NEW.from_state = 'backlog' AND NEW.to_state IN ('ready', 'blocked', 'cancelled'))
+      OR (NEW.from_state = 'ready' AND NEW.to_state IN ('active', 'blocked', 'cancelled'))
+      OR (NEW.from_state = 'active' AND NEW.to_state IN ('ready', 'blocked', 'ready_to_merge', 'merging', 'cancelled'))
+      OR (NEW.from_state = 'blocked' AND NEW.to_state IN ('ready', 'active', 'cancelled'))
+      OR (NEW.from_state = 'ready_to_merge' AND NEW.to_state IN ('active', 'merging', 'blocked', 'cancelled'))
+      OR (NEW.from_state = 'merging' AND NEW.to_state IN ('done', 'blocked'))
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'Task lifecycle transition lacks its exact authority or is stale');
 END;
 
 COMMIT;

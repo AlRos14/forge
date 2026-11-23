@@ -468,11 +468,17 @@ impl PrService {
                 "PR publication does not match the exact Task and repository admission",
             ));
         }
-        validate_credential_free_remote_identity(&repo.remote_url)?;
-        if admission.remote_repo_identity != repo.remote_url {
-            return Err(ServiceError::invalid_operation(
-                "PR admission repository identity differs from the configured repository",
-            ));
+        if publication.repository_merge_batch_id.is_some() {
+            // Multirepo admissions are scoped to an exact configured Repo.
+            // Keep the historical batchless path tied to its frozen admission
+            // identity, as it was in 0.9.1; the Repo argument is only used to
+            // resolve the exact single primary repository in that path.
+            validate_credential_free_remote_identity(&repo.remote_url)?;
+            if admission.remote_repo_identity != repo.remote_url {
+                return Err(ServiceError::invalid_operation(
+                    "PR admission repository identity differs from the configured repository",
+                ));
+            }
         }
         let metadata = PrMetadataRepo::get_by_task_repo(&*self.db, &key.task_id, &key.repo_id)
             .await?

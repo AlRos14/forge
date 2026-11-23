@@ -323,9 +323,96 @@ async fn task_pr_reads_are_paged_and_action_decisions_check_version() {
     assert!(actions.items.is_empty());
     assert!(actions.next_cursor.is_none());
 
+    let collaboration = services::collaboration_service::CollaborationService::new(
+        std::sync::Arc::clone(&f.harness.state.db),
+        std::sync::Arc::clone(&f.harness.state.event_bus),
+    );
+    let proposal = collaboration
+        .create_proposal(
+            services::collaboration_service::CollaborationActorSource::Human(
+                "test-user-id".to_owned(),
+            ),
+            services::collaboration_service::CreateProposalInput {
+                task_id: f.task_id.clone(),
+                target: db::ProposalTarget {
+                    kind: db::ProposalTargetKind::Task,
+                    id: f.task_id.clone(),
+                },
+                action: "merge".to_owned(),
+                reason: "Authorize the synthetic route fixture with an exact Gate input".to_owned(),
+                target_version: None,
+                target_digest: None,
+                required_policy_ref: None,
+                required_policy_version: None,
+                required_policy_digest: None,
+                supersedes_proposal_id: None,
+                artifact_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("merge Proposal");
+    let decision = collaboration
+        .record_decision(
+            services::collaboration_service::CreateDecisionInput {
+                task_id: f.task_id.clone(),
+                proposal_id: proposal.id.clone(),
+                proposal_version: proposal.content_version,
+                outcome: db::DecisionOutcome::Approve,
+                rationale: "Approve the synthetic route fixture's exact Proposal".to_owned(),
+                policy_ref: None,
+                policy_version: None,
+                policy_digest: None,
+            },
+            vec![
+                services::collaboration_service::CollaborationActorSource::Human(
+                    "test-user-id".to_owned(),
+                ),
+            ],
+        )
+        .await
+        .expect("exact Human Decision");
+    let gate_engine = services::gate_engine::GateEngine::new(
+        std::sync::Arc::clone(&f.harness.state.db),
+        std::sync::Arc::clone(&f.harness.state.event_bus),
+    );
+    let (merge_gate, _) = gate_engine
+        .create_gate_with_initial_policy(
+            &f.task_id,
+            "merge_readiness",
+            db::GateScopeKind::Task,
+            &f.task_id,
+            services::gate_engine::GatePolicyDocument {
+                schema_version: 1,
+                scope_requirement: None,
+                review: None,
+                validations: Vec::new(),
+                decisions: vec![services::gate_engine::DecisionRequirement {
+                    proposal_id: proposal.id,
+                    proposal_version: decision.proposal_version,
+                    decision_id: decision.id,
+                    outcome: db::DecisionOutcome::Approve,
+                    policy_ref: None,
+                    policy_version: None,
+                    policy_digest: None,
+                    permitted_deciders: vec![db::ActorRef::Human("test-user-id".to_owned())],
+                }],
+                work_units: Vec::new(),
+            },
+        )
+        .await
+        .expect("merge-readiness Gate");
+    let gate_evaluation = gate_engine
+        .evaluate_active(&merge_gate.id)
+        .await
+        .expect("exact merge-readiness evaluation");
+    assert_eq!(
+        gate_evaluation.evaluation.outcome,
+        db::GateEvaluationOutcome::Satisfied
+    );
+
     // The route's stale-version check is intentionally exercised with a
-    // synthetic persisted row. Creating a valid action requires the complete
-    // merge/publish/Gate/Proposal graph, which this API lane does not create.
+    // synthetic persisted row. Its TaskMerge rows still carry a real, current
+    // GateEvaluation so the database's exact-input guard remains enabled.
     sqlx::query("PRAGMA foreign_keys = OFF")
         .execute(f.harness.state.db.pool())
         .await
@@ -397,7 +484,7 @@ async fn task_pr_reads_are_paged_and_action_decisions_check_version() {
                 status, version, created_at, updated_at, finished_at,
                 gate_evaluation_id, remote_waiting, parent_operation_id, result_event_id
              ) VALUES (?, ?, ?, NULL, 'task_merge', 'synthetic-owner',
-                'succeeded', 1, ?, ?, ?, NULL, 1, NULL, NULL)",
+                'succeeded', 1, ?, ?, ?, ?, 1, NULL, NULL)",
         )
         .bind(merge_id)
         .bind(&f.task_id)
@@ -405,6 +492,7 @@ async fn task_pr_reads_are_paged_and_action_decisions_check_version() {
         .bind(&now)
         .bind(&now)
         .bind(&now)
+        .bind(&gate_evaluation.evaluation.id)
         .execute(f.harness.state.db.pool())
         .await
         .expect("synthetic merge operation creates");

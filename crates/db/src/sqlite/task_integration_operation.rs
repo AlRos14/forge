@@ -327,8 +327,15 @@ async fn snapshot_terminal_remote_pr_in_tx(
 fn operation_write_error(error: sqlx::Error) -> DbError {
     if let sqlx::Error::Database(database_error) = &error {
         let message = database_error.message().to_ascii_lowercase();
+        let sqlite_busy_code = database_error
+            .code()
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, 5 | 6));
         if message.contains("task_integration_operation.task_id")
             || message.contains("active terminal session")
+            || message.contains("database is locked")
+            || message.contains("database table is locked")
+            || sqlite_busy_code
         {
             return DbError::TaskIntegrationOperationBusy;
         }
@@ -951,7 +958,11 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         if input.kind == TaskIntegrationOperationKind::TaskMerge && input.remote_waiting {
             return Err(DbError::InvalidTransition);
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(operation_write_error)?;
         insert_operation(&mut tx, &input).await?;
         if input.kind == TaskIntegrationOperationKind::TaskMerge {
             admit_merge_lifecycle_in_tx(self, &mut tx, &input).await?;
@@ -996,7 +1007,11 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         {
             return Err(DbError::InvalidTransition);
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(operation_write_error)?;
         insert_operation(&mut tx, &merge).await?;
         admit_merge_lifecycle_in_tx(self, &mut tx, &merge).await?;
         if let Some(batch_id) = merge.repository_merge_batch_id.as_deref() {
@@ -1854,7 +1869,11 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         if input.kind == TaskIntegrationOperationKind::TaskMerge && input.remote_waiting {
             return Err(DbError::InvalidTransition);
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(operation_write_error)?;
         let abandoned = abandon_running_in_tx(self, &mut tx, &input.task_id, updated_at).await?;
         if abandoned
             .as_ref()
