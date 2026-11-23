@@ -2877,3 +2877,23 @@ Los workflow steps conservan el guard `if: ${{ !cancelled() }}` y formato
   la validación de CI para cerrar la evidencia de publicación parcial,
   reconciliación y reintento. El estado local de estos cambios es fuente
   integrada sin commit.
+
+## Anexo M3 — cierre CI
+
+`build-local-linux.yml` con `run_checks=true` en verde: run 45217368759
+(build y rust-checks). Correcciones tras la integración, en orden:
+compilación y clippy; guards V183 que conservan el camino single-repo sin batch
+(TaskMerge, PublishPr, admission, rework e historial PR terminal resuelven la
+identidad legacy desde la Task y su único repo primario) mientras multi-repo
+exige su fila exacta de batch; los índices de workspace conservan sus nombres
+históricos y las lecturas/escrituras son conscientes de la versión de esquema
+(fallback pre-V183 también en lifecycle y Gate); teardown de Project borra las
+filas V183 en orden de dependencias; la revisión 1 del conjunto de repos se
+crea de forma perezosa y los WorkUnits se fijan a ella; la transición
+`Active → Merging` multi-repo exige la revisión actual y la fila exacta del
+batch; el fence de TaskMerge activo es por repo dentro de un batch y por Task
+sin batch; el claim concurrente vuelve a mapear busy/locked a
+`TaskIntegrationOperationBusy`; la recuperación de merge interrumpido conserva
+el SHA base original y registra el conflicto como en 0.9.1; el merge
+single-repo con Gate obsoleto vuelve a responder 409. Una Task multi-repo
+permanece `active` hasta admitir su batch y pasa directamente a `merging`.
