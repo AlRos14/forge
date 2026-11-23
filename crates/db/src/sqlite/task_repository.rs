@@ -1,4 +1,5 @@
 use super::*;
+use crate::TaskRepository;
 use sha2::{Digest, Sha256};
 
 async fn sync_legacy_task_repository_catalog_in_tx(
