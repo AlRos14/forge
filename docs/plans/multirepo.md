@@ -2932,3 +2932,12 @@ que requiere decisión exacta, resume aprobado con revisión/WU nuevos y pins
 anteriores intactos, base obsoleta, retirada insegura, replan sin cambio y PATCH
 directo tras Execution. Añadir casos DB para la sincronización y guards, y caso
 API si cabe; CI es el único validador de ejecución.
+
+### Anexo M3b — cierre CI
+
+`build-local-linux.yml` con `run_checks=true` en verde: run 45281082483
+(build y rust-checks). Correcciones tras la implementación: import de
+`TaskRepository` en el módulo SQLite; los fixtures DB que añadían repos
+escriben una revisión nueva del conjunto con el writer existente en lugar de
+mutar el catálogo directamente; la sincronización del catálogo conserva como
+`context` las filas retiradas que la historia todavía referencia.
