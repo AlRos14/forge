@@ -765,10 +765,12 @@ async fn add_task_repository(
     )
     .await
     .expect("additional repository creates");
-    let current_repositories = TaskRepo::list_repositories(db, task_id)
+    let current_repository_set = TaskRepositorySetRepo::get_current(db, task_id)
         .await
-        .expect("Task repositories list");
-    let mut repository_writes = current_repositories
+        .expect("current Task repository revision loads")
+        .expect("Task repository revision exists");
+    let mut repository_writes = current_repository_set
+        .repositories
         .into_iter()
         .map(|repository| TaskRepositoryWrite {
             repo_id: repository.repo_id,
@@ -779,29 +781,61 @@ async fn add_task_repository(
         repo_id: repo_id.clone(),
         role,
     });
+    replace_test_task_repositories(db, task_id, &repository_writes).await;
+    repo_id
+}
+
+async fn replace_test_task_repositories(
+    db: &SqliteDb,
+    task_id: &str,
+    repositories: &[TaskRepositoryWrite],
+) -> crate::Task {
+    let current_repository_set = TaskRepositorySetRepo::get_current(db, task_id)
+        .await
+        .expect("current Task repository revision loads")
+        .expect("Task repository revision exists");
     let task = TaskRepo::get_by_id(db, task_id, true)
         .await
         .expect("Task lookup")
         .expect("Task exists");
+    let updated_at = now_rfc3339();
     let mut tx = db
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
-        .expect("Task repository transaction");
-    TaskRepo::replace_repositories_in_tx(
+        .expect("Task repository transaction begins");
+    let task = TaskRepo::replace_repositories_in_tx(
         db,
         &mut tx,
         task_id,
         task.version,
-        &repository_writes,
-        &now,
+        repositories,
+        &updated_at,
     )
     .await
-    .expect("Task repository association updates");
+    .expect("Task repository catalog and primary update");
+    TaskRepositorySetRepo::create_revision_in_tx(
+        db,
+        &mut tx,
+        crate::CreateTaskRepositorySetRevision {
+            task_id: task_id.to_owned(),
+            expected_current_revision: current_repository_set.revision,
+            expected_current_digest: current_repository_set.digest,
+            repositories: repositories.to_vec(),
+            source_kind: "test_fixture_repository_change".to_owned(),
+            source_ref: None,
+            decision_id: None,
+            human_decision_request_id: None,
+            force_new_revision: false,
+            created_at: updated_at,
+        },
+    )
+    .await
+    .expect("current Task repository revision updates");
     tx.commit()
         .await
         .expect("Task repository transaction commits");
-    repo_id
+    task
 }
 
 async fn seed_multirepo_fixture(db: &SqliteDb, with_context: bool) -> MultiRepoFixture {
@@ -9896,13 +9930,7 @@ async fn multirepo_task_primary_mirror_tracks_association_changes() {
             role: crate::TaskRepositoryRole::Context,
         },
     ];
-    let updated_at = now_rfc3339();
-    let mut tx = db.pool().begin().await.expect("transaction begins");
-    let task =
-        TaskRepo::replace_repositories_in_tx(&db, &mut tx, &task_id, 1, &replacement, &updated_at)
-            .await
-            .expect("primary and associations replace atomically");
-    tx.commit().await.expect("replacement commits");
+    let task = replace_test_task_repositories(&db, &task_id, &replacement).await;
     assert_eq!(task.repo_id.as_deref(), Some(affected_repo_id.as_str()));
     assert_eq!(task.version, 2);
 
@@ -9920,17 +9948,23 @@ async fn multirepo_task_primary_mirror_tracks_association_changes() {
     assert_eq!(rows[2].role, crate::TaskRepositoryRole::Context);
     assert_eq!(rows[2].position, 2);
 
-    let updated_at = now_rfc3339();
-    let mut tx = db.pool().begin().await.expect("clear transaction begins");
-    let task = TaskRepo::replace_repositories_in_tx(&db, &mut tx, &task_id, 2, &[], &updated_at)
-        .await
-        .expect("empty repository set replaces atomically");
-    tx.commit().await.expect("clear commits");
+    let task = replace_test_task_repositories(&db, &task_id, &[]).await;
     assert_eq!(task.repo_id, None);
     assert!(TaskRepo::list_repositories(&db, &task_id)
         .await
         .expect("cleared associations load")
         .is_empty());
+    let historical_catalog_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT repo_id, role FROM task_repository WHERE task_id = ? ORDER BY repo_id",
+    )
+    .bind(&task_id)
+    .fetch_all(db.pool())
+    .await
+    .expect("historical repository catalog rows remain");
+    assert_eq!(historical_catalog_rows.len(), 3);
+    assert!(historical_catalog_rows
+        .iter()
+        .all(|(_, role)| role == "context"));
 }
 
 #[tokio::test]

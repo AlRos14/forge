@@ -2,7 +2,7 @@ use super::*;
 use crate::TaskRepository;
 use sha2::{Digest, Sha256};
 
-async fn sync_legacy_task_repository_catalog_in_tx(
+pub(super) async fn sync_legacy_task_repository_catalog_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     task_id: &str,
     repositories: &[TaskRepositorySetRevisionRepo],
@@ -260,7 +260,7 @@ fn repository_set_digest(rows: &[TaskRepositorySetRevisionRepo]) -> Result<Strin
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
-fn requested_revision_members(
+pub(super) fn requested_revision_members(
     task_id: &str,
     repositories: &[TaskRepositoryWrite],
 ) -> Result<Vec<TaskRepositorySetRevisionRepo>> {

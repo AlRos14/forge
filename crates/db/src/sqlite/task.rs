@@ -321,88 +321,14 @@ impl TaskRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
-        if rows.is_empty() {
-            sqlx::query("DELETE FROM task_repository WHERE task_id = ?")
-                .bind(task_id)
-                .execute(&mut **tx)
-                .await?;
-        } else {
-            let mut delete =
-                sqlx::QueryBuilder::<Sqlite>::new("DELETE FROM task_repository WHERE task_id = ");
-            delete.push_bind(task_id).push(" AND repo_id NOT IN (");
-            {
-                let mut separated = delete.separated(", ");
-                for row in rows {
-                    separated.push_bind(&row.repo_id);
-                }
-            }
-            delete.push(")");
-            delete.build().execute(&mut **tx).await?;
-        }
-
-        let max_position: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(position), 0) FROM task_repository WHERE task_id = ?",
+        let requested_members = super::task_repository::requested_revision_members(task_id, rows)?;
+        super::task_repository::sync_legacy_task_repository_catalog_in_tx(
+            tx,
+            task_id,
+            &requested_members,
+            updated_at,
         )
-        .bind(task_id)
-        .fetch_one(&mut **tx)
         .await?;
-        let offset = max_position
-            .saturating_add(rows.len() as i64)
-            .saturating_add(1);
-        sqlx::query(
-            "UPDATE task_repository SET position = position + ?
-             WHERE task_id = ? AND role != 'primary'",
-        )
-        .bind(offset)
-        .bind(task_id)
-        .execute(&mut **tx)
-        .await?;
-
-        let mut temporary_position = max_position.saturating_add(offset).saturating_add(1);
-        for row in rows {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM task_repository WHERE task_id = ? AND repo_id = ?)",
-            )
-            .bind(task_id)
-            .bind(&row.repo_id)
-            .fetch_one(&mut **tx)
-            .await?;
-            if !exists {
-                let position = if row.role == crate::TaskRepositoryRole::Primary {
-                    0
-                } else {
-                    temporary_position += 1;
-                    temporary_position
-                };
-                sqlx::query(
-                    "INSERT INTO task_repository (task_id, repo_id, role, position, created_at)
-                     VALUES (?, ?, ?, ?, ?)",
-                )
-                .bind(task_id)
-                .bind(&row.repo_id)
-                .bind(row.role.to_string())
-                .bind(position)
-                .bind(updated_at)
-                .execute(&mut **tx)
-                .await?;
-            }
-        }
-
-        for (position, row) in (1_i64..).zip(
-            rows.iter()
-                .filter(|row| row.role != crate::TaskRepositoryRole::Primary),
-        ) {
-            sqlx::query(
-                "UPDATE task_repository SET role = ?, position = ?
-                 WHERE task_id = ? AND repo_id = ?",
-            )
-            .bind(row.role.to_string())
-            .bind(position)
-            .bind(task_id)
-            .bind(&row.repo_id)
-            .execute(&mut **tx)
-            .await?;
-        }
 
         TaskRepo::get_by_id_in_tx(self, tx, task_id, false)
             .await?
