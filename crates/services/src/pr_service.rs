@@ -805,7 +805,6 @@ impl PrService {
             || publish_operation_id != admission.publish_operation_id
             || merge.task_id != task.id
             || merge.repo_id.as_deref() != Some(key.repo_id.as_str())
-            || merge.repository_merge_batch_id.is_none()
             || merge.kind != TaskIntegrationOperationKind::TaskMerge
             || !merge.remote_waiting
             || merge.status != db::TaskIntegrationOperationStatus::Running
@@ -816,8 +815,19 @@ impl PrService {
             || publish.parent_operation_id.as_deref() != Some(merge.id.as_str())
             || publish.gate_evaluation_id != merge.gate_evaluation_id
             || lifecycle.state != TaskLifecycleState::Merging
-            || lifecycle.reason_kind.as_deref() != Some("task_repository_merge_batch")
-            || lifecycle.reason_ref != merge.repository_merge_batch_id
+            || lifecycle.reason_kind.as_deref()
+                != Some(if merge.repository_merge_batch_id.is_some() {
+                    "task_repository_merge_batch"
+                } else {
+                    "task_merge"
+                })
+            || lifecycle.reason_ref.as_deref()
+                != Some(
+                    merge
+                        .repository_merge_batch_id
+                        .as_deref()
+                        .unwrap_or(merge.id.as_str()),
+                )
         {
             return Err(ServiceError::invalid_operation(
                 "PR publication does not match its exact durable remote admission",
@@ -842,9 +852,13 @@ impl PrService {
                 "remote PR admission has invalid exact Gate provenance",
             ));
         }
-        if lifecycle.reason_ref.as_deref() != merge.repository_merge_batch_id.as_deref() {
+        let expected_lifecycle_reason = merge
+            .repository_merge_batch_id
+            .as_deref()
+            .unwrap_or(merge.id.as_str());
+        if lifecycle.reason_ref.as_deref() != Some(expected_lifecycle_reason) {
             return Err(ServiceError::invalid_operation(
-                "remote PR admission does not belong to the current repository merge batch",
+                "remote PR admission does not belong to the current TaskMerge lifecycle",
             ));
         }
         Ok(())
@@ -1050,58 +1064,97 @@ impl PrService {
         else {
             return Ok(());
         };
-        let Some(batch_id) = operation.repository_merge_batch_id.as_deref() else {
-            return Ok(());
-        };
-        let Some(mut batch) = TaskRepositoryMergeBatchRepo::get_by_id(&*self.db, batch_id).await?
-        else {
-            return Ok(());
-        };
+        let batch_id = operation.repository_merge_batch_id.as_deref();
         let metadata =
             PrMetadataRepo::get_by_task_repo(&*self.db, &admission.task_id, repo_id).await?;
-        let rows = TaskRepositoryMergeBatchRepo::list_repositories(&*self.db, batch_id).await?;
-        if let Some(row) = rows.iter().find(|row| row.repo_id == repo_id) {
-            if admission.rework_outcome.is_none() {
-                let state = match admission.state.as_str() {
-                    "open" => TaskRepositoryMergeBatchRepoState::Open,
-                    "merged" => TaskRepositoryMergeBatchRepoState::Merged,
-                    "closed" => TaskRepositoryMergeBatchRepoState::Closed,
-                    "failed" | "head_mismatch" | "publication_failed" => {
-                        TaskRepositoryMergeBatchRepoState::Failed
-                    }
-                    _ => TaskRepositoryMergeBatchRepoState::Publishing,
-                };
-                let current_state = if row.state == TaskRepositoryMergeBatchRepoState::Open
-                    && state == TaskRepositoryMergeBatchRepoState::Publishing
-                {
-                    row.state
-                } else {
-                    state
-                };
-                TaskRepositoryMergeBatchRepo::transition_repo(
-                    &*self.db,
-                    batch_id,
-                    repo_id,
-                    batch.version,
-                    current_state,
-                    row.work_unit_repository_integration_id.as_deref(),
-                    Some(admission_id),
-                    Some(&admission.metadata_id),
-                    row.before_sha.as_deref(),
-                    row.after_sha
-                        .as_deref()
-                        .or(Some(admission.admitted_source_sha.as_str())),
-                )
-                .await?;
-                batch = crate::merge_service::refresh_merge_batch_state(&self.db, &batch).await?;
-                crate::merge_service::emit_repository_merge_batch_events(
-                    &self.db,
-                    &self.event_bus,
-                    batch_id,
-                )
-                .await?;
+        let (repository_revision, correlation_id, version) = if let Some(batch_id) = batch_id {
+            let Some(mut batch) =
+                TaskRepositoryMergeBatchRepo::get_by_id(&*self.db, batch_id).await?
+            else {
+                return Ok(());
+            };
+            let rows = TaskRepositoryMergeBatchRepo::list_repositories(&*self.db, batch_id).await?;
+            if let Some(row) = rows.iter().find(|row| row.repo_id == repo_id) {
+                if admission.rework_outcome.is_none() {
+                    let state = match admission.state.as_str() {
+                        "open" => TaskRepositoryMergeBatchRepoState::Open,
+                        "merged" => TaskRepositoryMergeBatchRepoState::Merged,
+                        "closed" => TaskRepositoryMergeBatchRepoState::Closed,
+                        "failed" | "head_mismatch" | "publication_failed" => {
+                            TaskRepositoryMergeBatchRepoState::Failed
+                        }
+                        _ => TaskRepositoryMergeBatchRepoState::Publishing,
+                    };
+                    let current_state = if row.state == TaskRepositoryMergeBatchRepoState::Open
+                        && state == TaskRepositoryMergeBatchRepoState::Publishing
+                    {
+                        row.state
+                    } else {
+                        state
+                    };
+                    TaskRepositoryMergeBatchRepo::transition_repo(
+                        &*self.db,
+                        batch_id,
+                        repo_id,
+                        batch.version,
+                        current_state,
+                        row.work_unit_repository_integration_id.as_deref(),
+                        Some(admission_id),
+                        Some(&admission.metadata_id),
+                        row.before_sha.as_deref(),
+                        row.after_sha
+                            .as_deref()
+                            .or(Some(admission.admitted_source_sha.as_str())),
+                    )
+                    .await?;
+                    batch =
+                        crate::merge_service::refresh_merge_batch_state(&self.db, &batch).await?;
+                    crate::merge_service::emit_repository_merge_batch_events(
+                        &self.db,
+                        &self.event_bus,
+                        batch_id,
+                    )
+                    .await?;
+                }
             }
-        }
+            (
+                batch.repository_set_revision,
+                batch.id.clone(),
+                batch.version,
+            )
+        } else {
+            let revision = db::TaskRepositorySetRepo::get_current(&*self.db, &admission.task_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("Task repository revision", admission.task_id.clone())
+                })?;
+            let writable_repositories = revision
+                .repositories
+                .iter()
+                .filter(|repository| {
+                    matches!(
+                        repository.role,
+                        db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                    )
+                })
+                .collect::<Vec<_>>();
+            let exact_single_primary = writable_repositories.len() == 1
+                && writable_repositories[0].repo_id.as_str() == repo_id
+                && writable_repositories[0].role == db::TaskRepositoryRole::Primary;
+            if !exact_single_primary {
+                return Err(ServiceError::invalid_operation(
+                    "batchless PR status requires the exact single primary repository",
+                ));
+            }
+            (
+                revision.revision,
+                admission_id.to_owned(),
+                metadata
+                    .as_ref()
+                    .map(|metadata| metadata.version)
+                    .unwrap_or(operation.version),
+            )
+        };
         let state = admission.state.as_str();
         let dedupe_key = format!(
             "task-repository-pr-status:{}:{}:{}",
@@ -1117,21 +1170,21 @@ impl PrService {
                 actor_id: None,
                 scope_type: "task".to_owned(),
                 scope_id: admission.task_id.clone(),
-                correlation_id: batch.id.clone(),
+                correlation_id,
                 causation_id: Some(admission_id.to_owned()),
                 causation_depth: 1,
                 dedupe_key: Some(dedupe_key),
                 payload_json: json!({
                     "task_id": admission.task_id,
                     "repo_id": repo_id,
-                    "repository_revision": batch.repository_set_revision,
-                    "repository_merge_batch_id": batch.id,
+                    "repository_revision": repository_revision,
+                    "repository_merge_batch_id": batch_id,
                     "admission_id": admission_id,
                     "pr_metadata_id": admission.metadata_id,
                     "state": state,
                     "admission_status": metadata.as_ref().map(|metadata| metadata.admission_status.as_str()),
                     "pr_state": metadata.as_ref().map(|metadata| metadata.pr_state.as_str()),
-                    "version": batch.version,
+                    "version": version,
                 })
                 .to_string(),
                 created_at: admission.updated_at,
@@ -1528,7 +1581,21 @@ pub(crate) async fn acquire_admission_secret(
              JOIN project_member member ON member.project_id = task.project_id
              WHERE admission.task_merge_operation_id = ?
                AND admission.task_id = ? AND admission.repo_id = ?
-               AND merge_op.repository_merge_batch_id IS NOT NULL
+               AND (merge_op.repository_merge_batch_id IS NOT NULL OR (
+                   merge_op.repo_id = task.repo_id
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_requires_repository_merge_batch required
+                       WHERE required.task_id = task.id
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM task_repository_set_revision revision
+                       JOIN task_repository_set_revision_repo repository
+                         ON repository.task_id = revision.task_id
+                        AND repository.revision = revision.revision
+                       WHERE revision.task_id = task.id AND revision.state = 'current'
+                         AND repository.repo_id = task.repo_id AND repository.role = 'primary'
+                   )
+               ))
                AND member.user_id = ?
                AND member.role IN ('owner', 'admin'))",
     )

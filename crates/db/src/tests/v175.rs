@@ -4,14 +4,13 @@
 
 use super::{copy_migrations_through, seed_user, sqlite_db};
 use crate::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, run_migrations_from,
-    CreateDomainEvent, CreateExternalFeedbackDisposition, CreateExternalFeedbackItem,
-    CreateExternalFeedbackTriage, DbError, DomainEventRepo, ExternalFeedbackDisposition,
-    ExternalFeedbackHeadState, ExternalFeedbackKind, ExternalFeedbackRepo,
-    ExternalFeedbackSetEntry, ExternalFeedbackTrustClass, FeedbackDismissReason,
-    FeedbackItemDisposition, FeedbackScopeClassification, PrReworkRepo, PrReworkState, SqliteDb,
-    SupersedeAdmission, TaskLifecycleRepo, TaskLifecycleState, TransitionPrReworkSupersession,
-    TransitionTaskLifecycle,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations_from, CreateDomainEvent,
+    CreateExternalFeedbackDisposition, CreateExternalFeedbackItem, CreateExternalFeedbackTriage,
+    DbError, DomainEventRepo, ExternalFeedbackDisposition, ExternalFeedbackHeadState,
+    ExternalFeedbackKind, ExternalFeedbackRepo, ExternalFeedbackSetEntry,
+    ExternalFeedbackTrustClass, FeedbackDismissReason, FeedbackItemDisposition,
+    FeedbackScopeClassification, PrReworkRepo, PrReworkState, SqliteDb, SupersedeAdmission,
+    TaskLifecycleRepo, TaskLifecycleState, TransitionPrReworkSupersession, TransitionTaskLifecycle,
 };
 use sha2::Digest as _;
 
@@ -469,7 +468,11 @@ async fn v175_migration_applies_after_v174_and_only_recreates_listed_triggers() 
     }
     let admission_before = table_sql("remote_pr_admission").await;
 
-    run_migrations(&pool).await.expect("V175 applies");
+    let v175_migrations = tempfile::tempdir().expect("V175 migration directory");
+    copy_migrations_through(175, v175_migrations.path());
+    run_migrations_from(&pool, v175_migrations.path())
+        .await
+        .expect("V175 applies without later schema changes");
 
     let after: Vec<String> =
         sqlx::query_scalar("SELECT name FROM sqlite_master ORDER BY type, name")

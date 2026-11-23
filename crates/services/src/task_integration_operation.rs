@@ -101,7 +101,7 @@ impl TaskIntegrationOperationManager {
         &self,
         task_id: &str,
         repo_id: &str,
-        repository_merge_batch_id: &str,
+        repository_merge_batch_id: Option<&str>,
         kind: TaskIntegrationOperationKind,
         owner_id: &str,
         gate_evaluation_id: &str,
@@ -111,7 +111,7 @@ impl TaskIntegrationOperationManager {
             id: new_uuid_v4(),
             task_id: task_id.to_owned(),
             repo_id: Some(repo_id.to_owned()),
-            repository_merge_batch_id: Some(repository_merge_batch_id.to_owned()),
+            repository_merge_batch_id: repository_merge_batch_id.map(str::to_owned),
             kind,
             owner_id: owner_id.to_owned(),
             gate_evaluation_id: Some(gate_evaluation_id.to_owned()),
@@ -145,7 +145,7 @@ impl TaskIntegrationOperationManager {
         &self,
         task_id: &str,
         repo_id: &str,
-        repository_merge_batch_id: &str,
+        repository_merge_batch_id: Option<&str>,
         owner_id: &str,
         gate_evaluation_id: &str,
         provider_config: &db::PrProviderConfig,
@@ -162,7 +162,7 @@ impl TaskIntegrationOperationManager {
             id: merge_id.clone(),
             task_id: task_id.to_owned(),
             repo_id: Some(repo_id.to_owned()),
-            repository_merge_batch_id: Some(repository_merge_batch_id.to_owned()),
+            repository_merge_batch_id: repository_merge_batch_id.map(str::to_owned),
             kind: TaskIntegrationOperationKind::TaskMerge,
             owner_id: owner_id.to_owned(),
             gate_evaluation_id: Some(gate_evaluation_id.to_owned()),
@@ -174,7 +174,7 @@ impl TaskIntegrationOperationManager {
             id: publish_id.clone(),
             task_id: task_id.to_owned(),
             repo_id: Some(repo_id.to_owned()),
-            repository_merge_batch_id: Some(repository_merge_batch_id.to_owned()),
+            repository_merge_batch_id: repository_merge_batch_id.map(str::to_owned),
             kind: TaskIntegrationOperationKind::PublishPr,
             owner_id: owner_id.to_owned(),
             gate_evaluation_id: Some(gate_evaluation_id.to_owned()),
@@ -1340,6 +1340,26 @@ pub(crate) mod tests {
             evaluation.evaluation.outcome,
             db::GateEvaluationOutcome::Satisfied
         );
+        let repository_set = db::TaskRepositorySetRepo::get_current(&*fixture.db, &fixture.task_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("test Task has no repository revision")
+            })?;
+        let writable_repository_count = repository_set
+            .repositories
+            .iter()
+            .filter(|member| {
+                matches!(
+                    member.role,
+                    db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                )
+            })
+            .count();
+        let batch_id = if writable_repository_count > 1 {
+            Some(create_test_merge_batch(fixture, &evaluation.evaluation.id).await?)
+        } else {
+            None
+        };
         let evaluation_event = evaluation
             .event
             .as_ref()
@@ -1352,14 +1372,17 @@ pub(crate) mod tests {
             .await
             .expect("merge-readiness lifecycle lookup")
             .expect("Task lifecycle exists");
-        assert_eq!(lifecycle.state, db::TaskLifecycleState::ReadyToMerge);
-        assert_eq!(
-            lifecycle.reason_ref.as_deref(),
-            Some(evaluation.evaluation.id.as_str())
-        );
+        if writable_repository_count == 1 {
+            assert_eq!(lifecycle.state, db::TaskLifecycleState::ReadyToMerge);
+            assert_eq!(
+                lifecycle.reason_ref.as_deref(),
+                Some(evaluation.evaluation.id.as_str())
+            );
+        } else {
+            assert_eq!(lifecycle.state, db::TaskLifecycleState::Active);
+        }
         let manager =
             TaskIntegrationOperationManager::new(Arc::clone(&fixture.db), root.to_path_buf());
-        let batch_id = create_test_merge_batch(fixture, &evaluation.evaluation.id).await?;
         let lock = manager
             .lock_for_gate_admission(&fixture.task_id)
             .await
@@ -1368,7 +1391,7 @@ pub(crate) mod tests {
             .admit_pull_request_publication_with_lock(
                 &fixture.task_id,
                 &fixture.repo_id,
-                &batch_id,
+                batch_id.as_deref(),
                 &new_uuid_v4(),
                 &evaluation.evaluation.id,
                 &provider_config,
@@ -1610,13 +1633,12 @@ pub(crate) mod tests {
             .ok_or(db::DbError::NotFound)?;
         let manager =
             TaskIntegrationOperationManager::new(Arc::clone(&fixture.db), root.to_path_buf());
-        let batch_id = create_test_merge_batch(fixture, &evaluation.id).await?;
         let lock = manager.lock_for_gate_admission(&fixture.task_id).await?;
         let (merge, publish) = manager
             .admit_pull_request_publication_with_lock(
                 &fixture.task_id,
                 &fixture.repo_id,
-                &batch_id,
+                None,
                 &new_uuid_v4(),
                 &evaluation.id,
                 &provider_config,
@@ -5654,11 +5676,20 @@ pub(crate) mod tests {
             .expect("TaskMerge exists");
         assert_eq!(
             lifecycle.reason_kind.as_deref(),
-            Some("task_repository_merge_batch")
+            Some(if merge.repository_merge_batch_id.is_some() {
+                "task_repository_merge_batch"
+            } else {
+                "task_merge"
+            })
         );
         assert_eq!(
             lifecycle.reason_ref.as_deref(),
-            merge.repository_merge_batch_id.as_deref()
+            Some(
+                merge
+                    .repository_merge_batch_id
+                    .as_deref()
+                    .unwrap_or(merge.id.as_str())
+            )
         );
         assert_eq!(merge.status, TaskIntegrationOperationStatus::Running);
         assert!(merge.remote_waiting);
@@ -6031,61 +6062,19 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn multirepo_pr_rework_preserves_repo_and_batch_authority() {
+    async fn pr_rework_preserves_single_repo_authority_without_batch() {
         let world = crate::pr_rework::tests::world(true).await;
         let operation = TaskIntegrationOperationRepo::get_by_id(&*world.db, &world.merge_id)
             .await
             .expect("TaskMerge lookup")
             .expect("TaskMerge exists");
         let repo_id = operation.repo_id.clone().expect("TaskMerge repo id");
-        let batch_id = operation
-            .repository_merge_batch_id
-            .clone()
-            .expect("TaskMerge batch id");
-        let batch = db::TaskRepositoryMergeBatchRepo::get_by_id(&*world.db, &batch_id)
-            .await
-            .expect("merge batch lookup")
-            .expect("merge batch exists");
-        assert_eq!(batch.task_id, world.task_id);
+        assert!(operation.repository_merge_batch_id.is_none());
         let admission =
             TaskIntegrationOperationRepo::get_remote_pr_admission(&*world.db, &operation.id)
                 .await
                 .expect("admission lookup")
                 .expect("open PR admission exists");
-        bind_test_pr_to_batch(&*world.db, &world.task_id, &repo_id, &world.merge_id)
-            .await
-            .expect("PR admission remains linked to its exact repository row");
-        let current_batch = db::TaskRepositoryMergeBatchRepo::get_by_id(&*world.db, &batch_id)
-            .await
-            .expect("merge batch lookup")
-            .expect("merge batch remains present");
-        db::TaskRepositoryMergeBatchRepo::transition_repo(
-            &*world.db,
-            &batch_id,
-            &repo_id,
-            current_batch.version + 1,
-            db::TaskRepositoryMergeBatchRepoState::Open,
-            None,
-            Some(&operation.id),
-            Some(&admission.metadata_id),
-            None,
-            Some(&admission.admitted_source_sha),
-        )
-        .await
-        .expect("repo row records its open admission");
-        let current_batch = db::TaskRepositoryMergeBatchRepo::get_by_id(&*world.db, &batch_id)
-            .await
-            .expect("merge batch lookup after repo update")
-            .expect("merge batch remains present");
-        db::TaskRepositoryMergeBatchRepo::transition_batch(
-            &*world.db,
-            &batch_id,
-            current_batch.version,
-            db::TaskRepositoryMergeBatchState::Open,
-            &now_rfc3339(),
-        )
-        .await
-        .expect("batch records its open PR");
 
         let outcome = world
             .service
@@ -6109,10 +6098,7 @@ pub(crate) mod tests {
             admission.publish_operation_id,
             supersession.publish_operation_id
         );
-        assert_eq!(
-            operation.repository_merge_batch_id.as_deref(),
-            Some(batch_id.as_str())
-        );
+        assert!(operation.repository_merge_batch_id.is_none());
         let lifecycle = db::TaskLifecycleRepo::get_task_lifecycle(&*world.db, &world.task_id)
             .await
             .expect("lifecycle lookup")
@@ -6140,10 +6126,6 @@ pub(crate) mod tests {
                 .await
                 .expect("legacy single repository PR admission");
         let merge_id = merge.id().to_owned();
-        let batch_id =
-            bind_test_pr_to_batch(&fixture.db, &fixture.task_id, &fixture.repo_id, &merge_id)
-                .await
-                .expect("single-repo admission has its M3 projection");
         let statuses =
             crate::pr_service::PrService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(8)))
                 .list_task_prs(&fixture.task_id)
@@ -6158,16 +6140,6 @@ pub(crate) mod tests {
             .expect("TaskMerge lookup")
             .expect("TaskMerge exists");
         assert_eq!(operation.repo_id.as_deref(), Some(fixture.repo_id.as_str()));
-        assert_eq!(
-            operation.repository_merge_batch_id.as_deref(),
-            Some(batch_id.as_str())
-        );
-        assert_eq!(
-            db::TaskRepositoryMergeBatchRepo::list_repositories(&*fixture.db, &batch_id)
-                .await
-                .expect("single-repo batch projection")
-                .len(),
-            1
-        );
+        assert!(operation.repository_merge_batch_id.is_none());
     }
 }

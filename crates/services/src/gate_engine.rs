@@ -3316,10 +3316,16 @@ mod tests {
                 id: task_id.clone(),
                 project_id,
                 repo_id: Some(primary_repo_id.clone()),
-                repositories: vec![db::TaskRepositoryWrite {
-                    repo_id: affected_repo_id.clone(),
-                    role: db::TaskRepositoryRole::Affected,
-                }],
+                repositories: vec![
+                    db::TaskRepositoryWrite {
+                        repo_id: primary_repo_id.clone(),
+                        role: db::TaskRepositoryRole::Primary,
+                    },
+                    db::TaskRepositoryWrite {
+                        repo_id: affected_repo_id.clone(),
+                        role: db::TaskRepositoryRole::Affected,
+                    },
+                ],
                 parent_task_id: None,
                 title: "Repository-scoped checks".to_owned(),
                 description: None,

@@ -257,26 +257,81 @@ async fn admit_merge_lifecycle_in_tx(
         .as_deref()
         .ok_or(DbError::InvalidTransition)?;
     let repo_id = input.repo_id.as_deref().ok_or(DbError::InvalidTransition)?;
-    let batch_id = input
-        .repository_merge_batch_id
-        .as_deref()
-        .ok_or(DbError::InvalidTransition)?;
-    let batch_is_exact: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM task_repository_merge_batch batch
-             JOIN task_repository_merge_batch_repo repo
-               ON repo.batch_id = batch.id AND repo.task_id = batch.task_id
-             WHERE batch.id = ? AND batch.task_id = ?
-               AND batch.gate_evaluation_id = ? AND repo.repo_id = ?
-         )",
-    )
-    .bind(batch_id)
-    .bind(&input.task_id)
-    .bind(gate_evaluation_id)
-    .bind(repo_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    if !batch_is_exact {
+    let batch_id = input.repository_merge_batch_id.as_deref();
+    let (writable_repository_count, repo_is_writable) = if let Some(batch_id) = batch_id {
+        let revision: Option<i64> = sqlx::query_scalar(
+            "SELECT batch.repository_set_revision
+                 FROM task_repository_merge_batch batch
+                 JOIN task_repository_merge_batch_repo repo
+                   ON repo.batch_id = batch.id AND repo.task_id = batch.task_id
+                 WHERE batch.id = ? AND batch.task_id = ?
+                   AND batch.gate_evaluation_id = ? AND repo.repo_id = ?",
+        )
+        .bind(batch_id)
+        .bind(&input.task_id)
+        .bind(gate_evaluation_id)
+        .bind(repo_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(revision) = revision else {
+            return Err(DbError::InvalidTransition);
+        };
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_repository_set_revision_repo
+                 WHERE task_id = ? AND revision = ? AND role IN ('primary', 'affected')",
+        )
+        .bind(&input.task_id)
+        .bind(revision)
+        .fetch_one(&mut **tx)
+        .await?;
+        let repo_is_writable: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                    SELECT 1 FROM task_repository_merge_batch_repo
+                    WHERE batch_id = ? AND task_id = ? AND repo_id = ?
+                 )",
+        )
+        .bind(batch_id)
+        .bind(&input.task_id)
+        .bind(repo_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        (count, repo_is_writable)
+    } else {
+        let revision: Option<i64> = sqlx::query_scalar(
+            "SELECT revision FROM task_repository_set_revision
+                 WHERE task_id = ? AND state = 'current'",
+        )
+        .bind(&input.task_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(revision) = revision else {
+            return Err(DbError::InvalidTransition);
+        };
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_repository_set_revision_repo
+                 WHERE task_id = ? AND revision = ? AND role IN ('primary', 'affected')",
+        )
+        .bind(&input.task_id)
+        .bind(revision)
+        .fetch_one(&mut **tx)
+        .await?;
+        let repo_is_primary: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                    SELECT 1 FROM task_repository_set_revision_repo
+                    WHERE task_id = ? AND revision = ? AND repo_id = ? AND role = 'primary'
+                 )",
+        )
+        .bind(&input.task_id)
+        .bind(revision)
+        .bind(repo_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if count != 1 || !repo_is_primary {
+            return Err(DbError::InvalidTransition);
+        }
+        (count, repo_is_primary)
+    };
+    if !repo_is_writable || writable_repository_count == 0 {
         return Err(DbError::InvalidTransition);
     }
     let task_version: i64 =
@@ -294,30 +349,18 @@ async fn admit_merge_lifecycle_in_tx(
     .await?
     .ok_or(DbError::NotFound)?;
     let lifecycle = super::gate_lifecycle::map_task_lifecycle(&row)?;
+    let lifecycle_reason_ref = batch_id.unwrap_or(&input.id);
+    let lifecycle_reason_kind = if batch_id.is_some() {
+        "task_repository_merge_batch"
+    } else {
+        "task_merge"
+    };
     if lifecycle.state == TaskLifecycleState::Merging
-        && lifecycle.reason_kind.as_deref() == Some("task_repository_merge_batch")
-        && lifecycle.reason_ref.as_deref() == Some(batch_id)
+        && lifecycle.reason_kind.as_deref() == Some(lifecycle_reason_kind)
+        && lifecycle.reason_ref.as_deref() == Some(lifecycle_reason_ref)
     {
         return Ok(None);
     }
-    let batch_revision: i64 = sqlx::query_scalar(
-        "SELECT repository_set_revision FROM task_repository_merge_batch
-         WHERE id = ? AND task_id = ? AND gate_evaluation_id = ?",
-    )
-    .bind(batch_id)
-    .bind(&input.task_id)
-    .bind(gate_evaluation_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(DbError::InvalidTransition)?;
-    let writable_repository_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM task_repository_set_revision_repo
-         WHERE task_id = ? AND revision = ? AND role IN ('primary', 'affected')",
-    )
-    .bind(&input.task_id)
-    .bind(batch_revision)
-    .fetch_one(&mut **tx)
-    .await?;
     let active_gate_is_current: bool = sqlx::query_scalar(
         "SELECT EXISTS (
             SELECT 1 FROM gate_evaluation evaluation
@@ -334,7 +377,8 @@ async fn admit_merge_lifecycle_in_tx(
     .fetch_one(&mut **tx)
     .await?;
     let lifecycle_admission_allowed = lifecycle.state == TaskLifecycleState::ReadyToMerge
-        || (lifecycle.state == TaskLifecycleState::Active
+        || (batch_id.is_some()
+            && lifecycle.state == TaskLifecycleState::Active
             && writable_repository_count > 1
             && active_gate_is_current);
     if !lifecycle_admission_allowed {
@@ -379,8 +423,8 @@ async fn admit_merge_lifecycle_in_tx(
             to_state: TaskLifecycleState::Merging,
             cause_kind: "merge_operation".to_owned(),
             cause_ref: Some(input.id.clone()),
-            reason_kind: Some("task_repository_merge_batch".to_owned()),
-            reason_ref: Some(batch_id.to_owned()),
+            reason_kind: Some(lifecycle_reason_kind.to_owned()),
+            reason_ref: Some(lifecycle_reason_ref.to_owned()),
             gate_evaluation_id: Some(gate_evaluation_id.to_owned()),
             idempotency_key: key,
             updated_at: input.created_at.clone(),
@@ -462,9 +506,18 @@ async fn finish_merge_lifecycle_in_tx(
     .await?
     .ok_or(DbError::NotFound)?;
     let lifecycle = super::gate_lifecycle::map_task_lifecycle(&row)?;
+    let expected_reason_ref = lifecycle_operation
+        .repository_merge_batch_id
+        .as_deref()
+        .unwrap_or(lifecycle_operation.id.as_str());
+    let expected_reason_kind = if lifecycle_operation.repository_merge_batch_id.is_some() {
+        "task_repository_merge_batch"
+    } else {
+        "task_merge"
+    };
     if lifecycle.state != TaskLifecycleState::Merging
-        || lifecycle.reason_kind.as_deref() != Some("task_repository_merge_batch")
-        || lifecycle.reason_ref != lifecycle_operation.repository_merge_batch_id
+        || lifecycle.reason_kind.as_deref() != Some(expected_reason_kind)
+        || lifecycle.reason_ref.as_deref() != Some(expected_reason_ref)
     {
         return Err(DbError::InvalidTransition);
     }
@@ -789,7 +842,6 @@ impl TaskIntegrationOperationRepo for SqliteDb {
     ) -> Result<(TaskIntegrationOperation, TaskIntegrationOperation)> {
         if merge.kind != TaskIntegrationOperationKind::TaskMerge
             || merge.repo_id.is_none()
-            || merge.repository_merge_batch_id.is_none()
             || !merge.remote_waiting
             || merge.parent_operation_id.is_some()
             || publish.kind != TaskIntegrationOperationKind::PublishPr
@@ -819,6 +871,26 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         let mut tx = self.pool.begin().await?;
         insert_operation(&mut tx, &merge).await?;
         admit_merge_lifecycle_in_tx(self, &mut tx, &merge).await?;
+        if let Some(batch_id) = merge.repository_merge_batch_id.as_deref() {
+            let linked = sqlx::query(
+                "UPDATE task_repository_merge_batch_repo
+                 SET task_merge_operation_id = ?, updated_at = ?
+                 WHERE batch_id = ? AND task_id = ? AND repo_id = ?
+                   AND (task_merge_operation_id IS NULL OR task_merge_operation_id = ?)",
+            )
+            .bind(&merge.id)
+            .bind(&merge.created_at)
+            .bind(batch_id)
+            .bind(&merge.task_id)
+            .bind(merge.repo_id.as_deref())
+            .bind(&merge.id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if linked != 1 {
+                return Err(DbError::InvalidTransition);
+            }
+        }
         insert_operation(&mut tx, &publish).await?;
         let existing_pr = sqlx::query(
             "SELECT id, merge_status, admission_status, task_merge_operation_id,

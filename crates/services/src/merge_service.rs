@@ -78,7 +78,7 @@ pub enum MergeOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeAfterGateResult {
-    pub batch: db::TaskRepositoryMergeBatch,
+    pub batch: Option<db::TaskRepositoryMergeBatch>,
     /// Preserves the legacy scalar outcome (including conflict details/files)
     /// for the primary repository. Repository rows remain the batch authority.
     pub primary_outcome: Option<MergeOutcome>,
@@ -201,7 +201,7 @@ impl MergeService {
         match lifecycle.state {
             TaskLifecycleState::ReadyToMerge
                 if lifecycle.reason_ref.as_deref() == Some(gate_evaluation_id) => {}
-            TaskLifecycleState::Merging => {}
+            TaskLifecycleState::Merging if multi_repository => {}
             TaskLifecycleState::Active if multi_repository => {}
             TaskLifecycleState::ReadyToMerge => {
                 return Err(ServiceError::Conflict(
@@ -234,7 +234,7 @@ impl MergeService {
         self.ensure_current_gate_evaluation(task_id, &evaluation, &revision, &candidates)
             .await?;
         let digest = repository_set_digest(&revision)?;
-        if lifecycle.state == TaskLifecycleState::Merging {
+        if multi_repository && lifecycle.state == TaskLifecycleState::Merging {
             let active_batch_id = lifecycle.reason_ref.as_deref().unwrap_or_default();
             let active_batch =
                 TaskRepositoryMergeBatchRepo::get_by_id(&*self.db, active_batch_id).await?;
@@ -249,6 +249,54 @@ impl MergeService {
                 ));
             }
         }
+        if lifecycle.state == TaskLifecycleState::ReadyToMerge {
+            self.ensure_ready_lifecycle_cause(task_id, gate_evaluation_id)
+                .await?;
+        }
+        if !multi_repository {
+            if candidates.len() != 1 {
+                return Err(ServiceError::invalid_operation(
+                    "single-repository merge requires exactly one changed repository candidate",
+                ));
+            }
+            let candidate = candidates
+                .into_iter()
+                .next()
+                .expect("one candidate checked");
+            let repo = RepoRepo::get_by_id(&*self.db, &candidate.repo_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("repo", candidate.repo_id.clone()))?;
+            let outcome = if repo.work_mode == WorkMode::PullRequest {
+                self.publish_repository_pr(&task, &repo, gate_evaluation_id, None, &candidate)
+                    .await?
+            } else {
+                self.merge_repository_direct(&task, &repo, gate_evaluation_id, None, &candidate)
+                    .await?
+            };
+            drop(_local_task_lock);
+            if matches!(&outcome, MergeOutcome::Done { .. }) {
+                let cleanup_scheduler = self
+                    .cleanup_scheduler
+                    .read()
+                    .ok()
+                    .and_then(|configured| configured.clone());
+                if let Some(cleanup_scheduler) = cleanup_scheduler {
+                    if let Some(workspace) =
+                        WorkspaceRepo::get_integration_by_task_repo(&*self.db, task_id, &repo.id)
+                            .await?
+                    {
+                        if let Err(error) = cleanup_scheduler.cleanup_now(&workspace.id).await {
+                            tracing::warn!(task_id = %task_id, workspace_id = %workspace.id, %error, "post-merge workspace cleanup failed");
+                        }
+                    }
+                }
+            }
+            return Ok(MergeAfterGateResult {
+                batch: None,
+                primary_outcome: Some(outcome),
+            });
+        }
+
         let mut batch = match find_or_create_merge_batch(
             &self.db,
             task_id,
@@ -270,7 +318,7 @@ impl MergeService {
         emit_repository_merge_batch_events(&self.db, &self.event_bus, &batch.id).await?;
         if batch.state == db::TaskRepositoryMergeBatchState::Completed {
             return Ok(MergeAfterGateResult {
-                batch,
+                batch: Some(batch),
                 primary_outcome: None,
             });
         }
@@ -280,10 +328,6 @@ impl MergeService {
             return Err(ServiceError::Conflict(
                 "Task is already merging from a different repository batch".to_owned(),
             ));
-        }
-        if lifecycle.state == TaskLifecycleState::ReadyToMerge {
-            self.ensure_ready_lifecycle_cause(task_id, gate_evaluation_id)
-                .await?;
         }
         let mut candidates_by_repo = candidates
             .into_iter()
@@ -329,11 +373,23 @@ impl MergeService {
                     emit_repository_merge_batch_events(&self.db, &self.event_bus, &batch.id)
                         .await?;
                 }
-                self.publish_repository_pr(&task, &repo, gate_evaluation_id, &batch, &candidate)
-                    .await?;
+                self.publish_repository_pr(
+                    &task,
+                    &repo,
+                    gate_evaluation_id,
+                    Some(&batch),
+                    &candidate,
+                )
+                .await?;
             } else {
                 let outcome = self
-                    .merge_repository_direct(&task, &repo, gate_evaluation_id, &batch, &candidate)
+                    .merge_repository_direct(
+                        &task,
+                        &repo,
+                        gate_evaluation_id,
+                        Some(&batch),
+                        &candidate,
+                    )
                     .await?;
                 if primary_repo_id == Some(repo.id.as_str()) {
                     primary_outcome = Some(outcome.clone());
@@ -354,7 +410,7 @@ impl MergeService {
         batch = refresh_merge_batch_state(&self.db, &batch).await?;
         emit_repository_merge_batch_events(&self.db, &self.event_bus, &batch.id).await?;
         Ok(MergeAfterGateResult {
-            batch,
+            batch: Some(batch),
             primary_outcome,
         })
     }
@@ -528,9 +584,9 @@ impl MergeService {
         task: &db::Task,
         repo: &db::Repo,
         gate_evaluation_id: &str,
-        batch: &db::TaskRepositoryMergeBatch,
+        batch: Option<&db::TaskRepositoryMergeBatch>,
         candidate: &RepositoryMergeCandidate,
-    ) -> Result<()> {
+    ) -> Result<MergeOutcome> {
         crate::pr_service::validate_credential_free_remote_identity(&repo.remote_url)?;
         let source_path = Path::new(&candidate.source.workspace.worktree_path);
         if !git::is_worktree_clean(source_path).await? {
@@ -572,7 +628,7 @@ impl MergeService {
             .admit_pull_request_publication_with_lock(
                 &task.id,
                 &repo.id,
-                &batch.id,
+                batch.map(|batch| batch.id.as_str()),
                 &db::new_uuid_v4(),
                 gate_evaluation_id,
                 &provider_config,
@@ -589,23 +645,27 @@ impl MergeService {
             .await?
             .ok_or_else(|| ServiceError::not_found("PR metadata", merge.id().to_owned()))?;
         let merge_id = merge.id().to_owned();
-        let batch = TaskRepositoryMergeBatchRepo::get_by_id(&*self.db, &batch.id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("repository merge batch", batch.id.clone()))?;
-        TaskRepositoryMergeBatchRepo::transition_repo(
-            &*self.db,
-            &batch.id,
-            &repo.id,
-            batch.version,
-            db::TaskRepositoryMergeBatchRepoState::Publishing,
-            Some(&candidate.integration_id),
-            Some(&merge_id),
-            Some(&metadata.id),
-            Some(&candidate.before_sha),
-            Some(&candidate.after_sha),
-        )
-        .await?;
-        emit_repository_merge_batch_events(&self.db, &self.event_bus, &batch.id).await?;
+        if let Some(batch) = batch {
+            let batch = TaskRepositoryMergeBatchRepo::get_by_id(&*self.db, &batch.id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("repository merge batch", batch.id.clone())
+                })?;
+            TaskRepositoryMergeBatchRepo::transition_repo(
+                &*self.db,
+                &batch.id,
+                &repo.id,
+                batch.version,
+                db::TaskRepositoryMergeBatchRepoState::Publishing,
+                Some(&candidate.integration_id),
+                Some(&merge_id),
+                Some(&metadata.id),
+                Some(&candidate.before_sha),
+                Some(&candidate.after_sha),
+            )
+            .await?;
+            emit_repository_merge_batch_events(&self.db, &self.event_bus, &batch.id).await?;
+        }
         let mut pr_service =
             crate::pr_service::PrService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
         if let Some(credentials) = self
@@ -622,41 +682,51 @@ impl MergeService {
         drop(publication);
         drop(merge);
         if result.is_ok() {
-            let fresh_batch = TaskRepositoryMergeBatchRepo::get_by_id(&*self.db, &batch.id)
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::not_found("repository merge batch", batch.id.clone())
-                })?;
             let fresh_metadata = PrMetadataRepo::get_by_task_repo(&*self.db, &task.id, &repo.id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("PR metadata", metadata.id.clone()))?;
-            let row_state = match fresh_metadata.admission_status.as_str() {
-                "open" => db::TaskRepositoryMergeBatchRepoState::Open,
-                "merged" => db::TaskRepositoryMergeBatchRepoState::Merged,
-                "closed" => db::TaskRepositoryMergeBatchRepoState::Closed,
-                "failed" => db::TaskRepositoryMergeBatchRepoState::Failed,
-                _ => db::TaskRepositoryMergeBatchRepoState::Publishing,
-            };
-            TaskRepositoryMergeBatchRepo::transition_repo(
-                &*self.db,
-                &fresh_batch.id,
-                &repo.id,
-                fresh_batch.version,
-                row_state,
-                Some(&candidate.integration_id),
-                Some(&merge_id),
-                Some(&metadata.id),
-                Some(&candidate.before_sha),
-                Some(&candidate.after_sha),
-            )
-            .await?;
-            emit_repository_merge_batch_events(&self.db, &self.event_bus, &fresh_batch.id).await?;
+            if let Some(batch) = batch {
+                let fresh_batch = TaskRepositoryMergeBatchRepo::get_by_id(&*self.db, &batch.id)
+                    .await?
+                    .ok_or_else(|| {
+                        ServiceError::not_found("repository merge batch", batch.id.clone())
+                    })?;
+                let row_state = match fresh_metadata.admission_status.as_str() {
+                    "open" => db::TaskRepositoryMergeBatchRepoState::Open,
+                    "merged" => db::TaskRepositoryMergeBatchRepoState::Merged,
+                    "closed" => db::TaskRepositoryMergeBatchRepoState::Closed,
+                    "failed" => db::TaskRepositoryMergeBatchRepoState::Failed,
+                    _ => db::TaskRepositoryMergeBatchRepoState::Publishing,
+                };
+                TaskRepositoryMergeBatchRepo::transition_repo(
+                    &*self.db,
+                    &fresh_batch.id,
+                    &repo.id,
+                    fresh_batch.version,
+                    row_state,
+                    Some(&candidate.integration_id),
+                    Some(&merge_id),
+                    Some(&metadata.id),
+                    Some(&candidate.before_sha),
+                    Some(&candidate.after_sha),
+                )
+                .await?;
+                emit_repository_merge_batch_events(&self.db, &self.event_bus, &fresh_batch.id)
+                    .await?;
+            }
         } else {
             // An unknown or unavailable provider result remains attached to this
             // admission for reconciliation; never create a replacement PR here.
             tracing::warn!(task_id = %task.id, repo_id = %repo.id, "repository PR admission remains in reconciliation");
         }
-        Ok(())
+        let fresh_metadata = PrMetadataRepo::get_by_task_repo(&*self.db, &task.id, &repo.id)
+            .await?
+            .unwrap_or(metadata);
+        Ok(MergeOutcome::PullRequest {
+            pr_url: fresh_metadata.pr_url,
+            branch: candidate.source.branch.clone(),
+            target_branch: target,
+        })
     }
 
     async fn merge_repository_direct(
@@ -664,7 +734,7 @@ impl MergeService {
         task: &db::Task,
         repo: &db::Repo,
         gate_evaluation_id: &str,
-        batch: &db::TaskRepositoryMergeBatch,
+        batch: Option<&db::TaskRepositoryMergeBatch>,
         candidate: &RepositoryMergeCandidate,
     ) -> Result<MergeOutcome> {
         let _workspace_guard = self
@@ -680,30 +750,34 @@ impl MergeService {
             .acquire_kind_after_gate_with_lock(
                 &task.id,
                 &repo.id,
-                &batch.id,
+                batch.map(|batch| batch.id.as_str()),
                 db::TaskIntegrationOperationKind::TaskMerge,
                 &db::new_uuid_v4(),
                 gate_evaluation_id,
                 lock,
             )
             .await?;
-        let fresh_batch = TaskRepositoryMergeBatchRepo::get_by_id(&*self.db, &batch.id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("repository merge batch", batch.id.clone()))?;
-        TaskRepositoryMergeBatchRepo::transition_repo(
-            &*self.db,
-            &batch.id,
-            &repo.id,
-            fresh_batch.version,
-            db::TaskRepositoryMergeBatchRepoState::Integrating,
-            Some(&candidate.integration_id),
-            Some(operation.id()),
-            None,
-            Some(&candidate.before_sha),
-            Some(&candidate.after_sha),
-        )
-        .await?;
-        emit_repository_merge_batch_events(&self.db, &self.event_bus, &batch.id).await?;
+        if let Some(batch) = batch {
+            let fresh_batch = TaskRepositoryMergeBatchRepo::get_by_id(&*self.db, &batch.id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("repository merge batch", batch.id.clone())
+                })?;
+            TaskRepositoryMergeBatchRepo::transition_repo(
+                &*self.db,
+                &batch.id,
+                &repo.id,
+                fresh_batch.version,
+                db::TaskRepositoryMergeBatchRepoState::Integrating,
+                Some(&candidate.integration_id),
+                Some(operation.id()),
+                None,
+                Some(&candidate.before_sha),
+                Some(&candidate.after_sha),
+            )
+            .await?;
+            emit_repository_merge_batch_events(&self.db, &self.event_bus, &batch.id).await?;
+        }
         self.publish_domain_event_by_dedupe(&format!("task-merge-admission:{}", operation.id()))
             .await;
         let result = async {
@@ -762,7 +836,7 @@ impl MergeService {
                 ));
             }
         };
-        {
+        if let Some(batch) = batch {
             let latest = TaskRepositoryMergeBatchRepo::get_by_id(&*self.db, &batch.id)
                 .await?
                 .ok_or_else(|| {

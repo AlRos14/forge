@@ -906,13 +906,24 @@ async fn insert_test_work_unit(
     .execute(db.pool())
     .await
     .expect("WorkUnit fixture inserts");
-    let repository_set = TaskRepositorySetRepo::get_current(db, task_id)
-        .await
-        .expect("Task repository revision initializes")
-        .expect("Task exists");
-    TaskRepositorySetRepo::pin_work_unit(db, &work_unit_id, task_id, repository_set.revision)
-        .await
-        .expect("WorkUnit pins the current Task repository revision");
+    let has_repository_revision_table: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'task_repository_set_revision'
+         )",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("repository revision schema lookup");
+    if has_repository_revision_table {
+        let repository_set = TaskRepositorySetRepo::get_current(db, task_id)
+            .await
+            .expect("Task repository revision initializes")
+            .expect("Task exists");
+        TaskRepositorySetRepo::pin_work_unit(db, &work_unit_id, task_id, repository_set.revision)
+            .await
+            .expect("WorkUnit pins the current Task repository revision");
+    }
     work_unit_id
 }
 

@@ -2813,10 +2813,31 @@ impl WorkUnitService {
         }
         let target_path = Path::new(&item.target_workspace.worktree_path);
         if !git::is_worktree_clean(target_path).await? {
-            return Err(invalid(format!(
-                "Task integration workspace for repository {} has uncommitted changes",
-                item.repo_id
-            )));
+            let exact_legacy_interrupted_merge = task.repo_id.as_deref()
+                == Some(item.repo_id.as_str())
+                && item.target_workspace.id == parent.target_workspace_id
+                && item.source_sha == parent.source_sha
+                && git::get_merge_head(target_path).await?.as_deref()
+                    == Some(item.source_sha.as_str())
+                && git::get_current_sha(target_path).await? == parent.target_before_sha;
+            if !exact_legacy_interrupted_merge {
+                return Err(invalid(format!(
+                    "Task integration workspace for repository {} has uncommitted changes",
+                    item.repo_id
+                )));
+            }
+            git::abort_merge(target_path).await.map_err(|error| {
+                invalid(format!(
+                    "interrupted legacy Task integration could not be aborted safely: {error}"
+                ))
+            })?;
+            if git::get_current_sha(target_path).await? != parent.target_before_sha
+                || !git::is_worktree_clean(target_path).await?
+            {
+                return Err(invalid(
+                    "interrupted legacy Task integration did not restore its exact clean target",
+                ));
+            }
         }
         let target_before_sha = git::get_current_sha(target_path).await?;
         let now = now_rfc3339();

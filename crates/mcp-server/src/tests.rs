@@ -3917,7 +3917,7 @@ fn multirepo_result_reader_tools_expose_repo_results() {
         assert!(repositories
             .iter()
             .any(|repository| repository["repo_id"] == affected.id));
-        assert_eq!(public_task["repository_set_revision"], 1);
+        assert_eq!(public_task["repository_set_revision"], 2);
         assert!(public_task["repository_merge_batches"].as_array().is_some());
 
         let public_work_unit = call_tool(
