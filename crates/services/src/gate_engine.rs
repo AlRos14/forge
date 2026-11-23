@@ -3430,7 +3430,7 @@ mod tests {
                         commit_sha: primary_commit,
                     },
                     RepositoryValidationSubject {
-                        repo_id: affected_repo_id,
+                        repo_id: affected_repo_id.clone(),
                         workspace_id: affected_workspace_id,
                         commit_sha: affected_commit,
                     },
@@ -3441,10 +3441,13 @@ mod tests {
         assert_eq!(both_changed.outcome, GateEvaluationOutcome::Unsatisfied);
         let result: GateEvaluationResult =
             serde_json::from_str(&both_changed.result_json).expect("Gate result JSON");
-        assert!(result
-            .missing_inputs
-            .iter()
-            .any(|missing| missing == "required_check:affected:affected-tests"));
+        assert!(
+            result
+                .missing_inputs
+                .iter()
+                .any(|missing| missing
+                    == &format!("required_check:{affected_repo_id}:affected-tests"))
+        );
     }
 
     #[tokio::test]

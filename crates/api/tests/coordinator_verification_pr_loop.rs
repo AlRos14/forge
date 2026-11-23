@@ -346,6 +346,92 @@ async fn task_pr_reads_are_paged_and_action_decisions_check_version() {
         .execute(f.harness.state.db.pool())
         .await
         .expect("disable feedback guard for synthetic route fixture");
+    sqlx::query("DROP TRIGGER IF EXISTS remote_pr_admission_insert_guard")
+        .execute(f.harness.state.db.pool())
+        .await
+        .expect("disable admission guard for synthetic route fixture");
+    sqlx::query("DROP TRIGGER IF EXISTS task_merge_gate_admission_guard")
+        .execute(f.harness.state.db.pool())
+        .await
+        .expect("disable Gate guard for synthetic route fixture");
+    sqlx::query("DROP TRIGGER IF EXISTS task_integration_operation_remote_admission_guard")
+        .execute(f.harness.state.db.pool())
+        .await
+        .expect("disable merge scope guard for synthetic route fixture");
+    for (merge_id, publish_id, metadata_id) in [
+        (
+            "feedback-admission-newest",
+            "publish-feedback-newest",
+            "metadata-feedback-newest",
+        ),
+        (
+            "feedback-admission-oldest",
+            "publish-feedback-oldest",
+            "metadata-feedback-oldest",
+        ),
+        (
+            "merge-newest",
+            "publish-merge-newest",
+            "metadata-merge-newest",
+        ),
+        (
+            "merge-oldest",
+            "publish-merge-oldest",
+            "metadata-merge-oldest",
+        ),
+        (
+            "synthetic-admission",
+            "publish-synthetic",
+            "metadata-synthetic",
+        ),
+        (
+            "synthetic-admission-terminal",
+            "publish-synthetic-terminal",
+            "metadata-synthetic-terminal",
+        ),
+    ] {
+        let now = db::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO task_integration_operation (
+                id, task_id, repo_id, repository_merge_batch_id, kind, owner_id,
+                status, version, created_at, updated_at, finished_at,
+                gate_evaluation_id, remote_waiting, parent_operation_id, result_event_id
+             ) VALUES (?, ?, ?, NULL, 'task_merge', 'synthetic-owner',
+                'succeeded', 1, ?, ?, ?, NULL, 1, NULL, NULL)",
+        )
+        .bind(merge_id)
+        .bind(&f.task_id)
+        .bind(&f.repo_id)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(f.harness.state.db.pool())
+        .await
+        .expect("synthetic merge operation creates");
+        sqlx::query(
+            "INSERT INTO remote_pr_admission (
+                task_merge_operation_id, publish_operation_id, metadata_id, task_id,
+                repo_id, provider_config_id, provider_type, provider_config_revision,
+                provider_config_digest, remote_repo_identity, source_branch, target_branch,
+                admitted_source_sha, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, 'github', ?, ?, ?, 'task/test', 'main', ?, ?, ?)",
+        )
+        .bind(merge_id)
+        .bind(publish_id)
+        .bind(metadata_id)
+        .bind(&f.task_id)
+        .bind(&f.repo_id)
+        .bind(format!("config-{merge_id}"))
+        .bind(&now)
+        .bind("a".repeat(64))
+        .bind("https://example.invalid/synthetic.git")
+        .bind("synthetic-source-sha")
+        .bind(&now)
+        .bind(&now)
+        .execute(f.harness.state.db.pool())
+        .await
+        .expect("synthetic route admission creates");
+    }
     let newest = "2026-01-02T00:00:00Z";
     let oldest = "2026-01-01T00:00:00Z";
     for (id, admission, item, digest, ingested_at) in [

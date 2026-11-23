@@ -1060,12 +1060,3 @@ mod tests {
         .is_err());
     }
 }
-
-#[allow(dead_code)]
-fn _plan_evidence(kind: EvidenceKind, id: &str, digest: Option<&str>) -> EvidenceLink {
-    EvidenceLink {
-        kind,
-        id: id.to_owned(),
-        digest: digest.map(str::to_owned),
-    }
-}

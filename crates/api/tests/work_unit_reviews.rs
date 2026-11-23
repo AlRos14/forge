@@ -394,6 +394,16 @@ async fn multirepo_result_review_response_lists_each_repo() {
     let primary_path = setup_git_repo(primary_dir.path());
     let affected_dir = TestDir::new("multirepo-review-response-affected");
     let affected_path = setup_git_repo(affected_dir.path());
+    let branch_rename = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&affected_path)
+        .args(["branch", "-M", "main"])
+        .output()
+        .expect("git branch rename runs");
+    assert!(
+        branch_rename.status.success(),
+        "affected repo branch becomes main"
+    );
     let workspace = TestDir::new("multirepo-review-response-workspaces");
     let harness = test_app(workspace.path(), "multirepo-review-response").await;
     let (project_id, primary_repo_id) =

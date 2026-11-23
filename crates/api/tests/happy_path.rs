@@ -1714,19 +1714,23 @@ async fn multirepo_lifecycle_direct_repository_patch_keeps_typed_409() {
 
     let affected_dir = TestDir::new("multirepo-replan-patch-affected");
     let affected_path = setup_git_repo(affected_dir.path()).await;
-    let affected_repo: RepoResponse = json_request(
-        &harness.app,
-        Method::POST,
-        &format!("/api/v1/projects/{}/repos", project.id),
-        json!({
-            "name":"affected",
-            "local_path":affected_path.to_string_lossy(),
-            "remote_url":affected_path.to_string_lossy(),
-            "default_branch":run_git(&affected_path, &["symbolic-ref", "--short", "HEAD"])
-        }),
-        StatusCode::OK,
+    let now = db::now_rfc3339();
+    let affected_repo = db::RepoRepo::create(
+        &*harness.state.db,
+        db::CreateRepo {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project.id.clone(),
+            name: "affected".to_owned(),
+            local_path: Some(affected_path.to_string_lossy().into_owned()),
+            remote_url: affected_path.to_string_lossy().into_owned(),
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: run_git(&affected_path, &["symbolic-ref", "--short", "HEAD"]),
+            created_at: now.clone(),
+            updated_at: now,
+        },
     )
-    .await;
+    .await
+    .expect("non-primary affected repository creates");
     let current_task: TaskResponse = empty_request(
         &harness.app,
         Method::GET,

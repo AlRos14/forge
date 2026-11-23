@@ -437,6 +437,15 @@ pub(crate) fn try_get_v173_text(row: &SqliteRow, column: &str) -> Result<Option<
     }
 }
 
+/// Reads a text column that may be absent in a historical schema fixture.
+pub(crate) fn try_get_optional_text(row: &SqliteRow, column: &str) -> Result<Option<String>> {
+    match row.try_get::<Option<String>, _>(column) {
+        Ok(value) => Ok(value),
+        Err(sqlx::Error::ColumnNotFound(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn map_pr_provider_config(row: SqliteRow) -> Result<PrProviderConfig> {
     Ok(PrProviderConfig {
         id: row.try_get("id")?,
@@ -458,7 +467,8 @@ fn map_pr_metadata(row: SqliteRow) -> Result<PrMetadata> {
     Ok(PrMetadata {
         id: row.try_get("id")?,
         task_id: row.try_get("task_id")?,
-        repo_id: row.try_get("repo_id")?,
+        repo_id: try_get_optional_text(&row, "repo_id")?
+            .or(try_get_optional_text(&row, "resolved_repo_id")?),
         provider_type: row.try_get("provider_type")?,
         provider_pr_id: row.try_get("provider_pr_id")?,
         pr_url: row.try_get("pr_url")?,
@@ -466,7 +476,8 @@ fn map_pr_metadata(row: SqliteRow) -> Result<PrMetadata> {
         target_branch: row.try_get("target_branch")?,
         pr_state: row.try_get("pr_state")?,
         merge_status: row.try_get("merge_status")?,
-        admission_status: row.try_get("admission_status")?,
+        admission_status: try_get_optional_text(&row, "admission_status")?
+            .unwrap_or_else(|| "legacy_unadmitted".to_owned()),
         task_merge_operation_id: row.try_get("task_merge_operation_id")?,
         publish_operation_id: row.try_get("publish_operation_id")?,
         last_synced_at: row.try_get("last_synced_at")?,

@@ -226,13 +226,21 @@ impl MergeService {
         let candidates = self
             .repository_merge_candidates(task_id, &evaluation, &revision)
             .await?;
+        // Keep the 0.9.1 single-repository conflict ordering: stale Gate
+        // evidence is reported before an empty candidate set.
+        if !multi_repository {
+            self.ensure_current_gate_evaluation(task_id, &evaluation, &revision, &candidates)
+                .await?;
+        }
         if candidates.is_empty() {
             return Err(ServiceError::invalid_operation(
                 "Task has no changed writable repositories eligible for merge",
             ));
         }
-        self.ensure_current_gate_evaluation(task_id, &evaluation, &revision, &candidates)
-            .await?;
+        if multi_repository {
+            self.ensure_current_gate_evaluation(task_id, &evaluation, &revision, &candidates)
+                .await?;
+        }
         let digest = repository_set_digest(&revision)?;
         if multi_repository && lifecycle.state == TaskLifecycleState::Merging {
             let active_batch_id = lifecycle.reason_ref.as_deref().unwrap_or_default();
@@ -479,6 +487,30 @@ impl MergeService {
             return Err(ServiceError::invalid_operation(
                 "Task repository revision has no exact primary writable repository",
             ));
+        }
+        if members_len(revision) == 1 {
+            if let Some(member) = members.first() {
+                if let Some(workspace) =
+                    WorkspaceRepo::get_integration_by_task_repo(&*self.db, task_id, &member.repo_id)
+                        .await?
+                {
+                    if workspace.status != db::WorkspaceStatus::Ready {
+                        return Err(ServiceError::Conflict(format!(
+                            "repository {} integration Workspace is not ready",
+                            member.repo_id
+                        )));
+                    }
+                    self.validate_gate_candidate(
+                        task_id,
+                        evaluation,
+                        &TaskMergeSource {
+                            branch: workspace.branch.clone(),
+                            workspace,
+                        },
+                    )
+                    .await?;
+                }
+            }
         }
         let mut candidates = Vec::new();
         for member in members {

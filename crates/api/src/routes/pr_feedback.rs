@@ -225,13 +225,45 @@ pub async fn list_task_rework(
     tasks::require_task_visible(&state, &task_id, &user).await?;
     let cursor = decode_keyset_cursor(query.cursor)?;
     let limit = page_limit(query.limit);
-    let mut sql = "SELECT supersession.*, admission.repo_id AS repo_id
+    let mut sql = "SELECT supersession.*,
+                          COALESCE(admission.repo_id, merge_op.repo_id, task.repo_id) AS repo_id
                    FROM pr_rework_supersession supersession
                    JOIN remote_pr_admission admission
                      ON admission.task_merge_operation_id = supersession.task_merge_operation_id
                     AND admission.task_id = supersession.task_id
-                   WHERE supersession.task_id = ?"
-        .to_owned();
+                   JOIN task_integration_operation merge_op
+                     ON merge_op.id = admission.task_merge_operation_id
+                    AND merge_op.task_id = admission.task_id
+                    AND merge_op.kind = 'task_merge'
+                   JOIN task ON task.id = admission.task_id
+                   WHERE supersession.task_id = ?
+                     AND (
+                         (merge_op.repository_merge_batch_id IS NOT NULL
+                          AND admission.repo_id = merge_op.repo_id)
+                         OR (merge_op.repository_merge_batch_id IS NULL
+                             AND (admission.repo_id IS NULL OR admission.repo_id = task.repo_id)
+                             AND (merge_op.repo_id IS NULL OR merge_op.repo_id = task.repo_id)
+                             AND task.repo_id IS NOT NULL
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM task_requires_repository_merge_batch required
+                                 WHERE required.task_id = task.id
+                             )
+                             AND EXISTS (
+                                 SELECT 1 FROM task_repository_set_revision revision
+                                 JOIN task_repository_set_revision_repo repository
+                                   ON repository.task_id = revision.task_id
+                                  AND repository.revision = revision.revision
+                                 WHERE revision.task_id = task.id AND revision.state = 'current'
+                                   AND repository.repo_id = task.repo_id
+                                   AND repository.role = 'primary'
+                                   AND (SELECT COUNT(*)
+                                        FROM task_repository_set_revision_repo writable
+                                        WHERE writable.task_id = revision.task_id
+                                          AND writable.revision = revision.revision
+                                          AND writable.role IN ('primary', 'affected')) = 1
+                             ))
+                     )"
+    .to_owned();
     if cursor.is_some() {
         sql.push_str(" AND (supersession.created_at < ? OR (supersession.created_at = ? AND supersession.id < ?))");
     }
@@ -276,13 +308,45 @@ pub async fn list_task_actions(
     let state_filter = action_state(query.state.as_deref())?.map(|state| state.to_string());
     let cursor = decode_keyset_cursor(query.cursor)?;
     let limit = page_limit(query.limit);
-    let mut sql = "SELECT action.*, admission.repo_id AS repo_id
+    let mut sql = "SELECT action.*,
+                          COALESCE(admission.repo_id, merge_op.repo_id, task.repo_id) AS repo_id
                    FROM pr_external_action action
                    JOIN remote_pr_admission admission
                      ON admission.task_merge_operation_id = action.admission_id
                     AND admission.task_id = action.task_id
-                   WHERE action.task_id = ?"
-        .to_owned();
+                   JOIN task_integration_operation merge_op
+                     ON merge_op.id = admission.task_merge_operation_id
+                    AND merge_op.task_id = admission.task_id
+                    AND merge_op.kind = 'task_merge'
+                   JOIN task ON task.id = admission.task_id
+                   WHERE action.task_id = ?
+                     AND (
+                         (merge_op.repository_merge_batch_id IS NOT NULL
+                          AND admission.repo_id = merge_op.repo_id)
+                         OR (merge_op.repository_merge_batch_id IS NULL
+                             AND (admission.repo_id IS NULL OR admission.repo_id = task.repo_id)
+                             AND (merge_op.repo_id IS NULL OR merge_op.repo_id = task.repo_id)
+                             AND task.repo_id IS NOT NULL
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM task_requires_repository_merge_batch required
+                                 WHERE required.task_id = task.id
+                             )
+                             AND EXISTS (
+                                 SELECT 1 FROM task_repository_set_revision revision
+                                 JOIN task_repository_set_revision_repo repository
+                                   ON repository.task_id = revision.task_id
+                                  AND repository.revision = revision.revision
+                                 WHERE revision.task_id = task.id AND revision.state = 'current'
+                                   AND repository.repo_id = task.repo_id
+                                   AND repository.role = 'primary'
+                                   AND (SELECT COUNT(*)
+                                        FROM task_repository_set_revision_repo writable
+                                        WHERE writable.task_id = revision.task_id
+                                          AND writable.revision = revision.revision
+                                          AND writable.role IN ('primary', 'affected')) = 1
+                             ))
+                     )"
+    .to_owned();
     if state_filter.is_some() {
         sql.push_str(" AND action.state = ?");
     }

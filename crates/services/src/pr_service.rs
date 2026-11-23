@@ -296,7 +296,8 @@ impl PrService {
             None => None,
         };
         let limit = requested_limit.clamp(1, 100);
-        let query = "SELECT i.id, i.task_id, i.admission_id, admission.repo_id,
+        let query = "SELECT i.id, i.task_id, i.admission_id,
+                    COALESCE(admission.repo_id, merge_op.repo_id, task.repo_id) AS repo_id,
                     i.provider_item_id, i.kind,
                     i.author_login, i.author_association, i.review_state, i.path, i.line,
                     i.commit_sha, i.body, i.body_truncated, i.body_digest, i.provider_url,
@@ -307,13 +308,41 @@ impl PrService {
              JOIN remote_pr_admission admission
                ON admission.task_merge_operation_id = i.admission_id
               AND admission.task_id = i.task_id
-              AND admission.repo_id IS NOT NULL
+             JOIN task_integration_operation merge_op
+               ON merge_op.id = admission.task_merge_operation_id
+              AND merge_op.task_id = admission.task_id AND merge_op.kind = 'task_merge'
+             JOIN task ON task.id = admission.task_id
              LEFT JOIN task_external_feedback_disposition d ON d.id = (
                  SELECT latest.id FROM task_external_feedback_disposition latest
                  WHERE latest.feedback_item_id = i.id
                  ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
              )
-             WHERE i.task_id = ?";
+             WHERE i.task_id = ?
+               AND (
+                   (merge_op.repository_merge_batch_id IS NOT NULL
+                    AND admission.repo_id = merge_op.repo_id)
+                   OR (merge_op.repository_merge_batch_id IS NULL
+                       AND (admission.repo_id IS NULL OR admission.repo_id = task.repo_id)
+                       AND (merge_op.repo_id IS NULL OR merge_op.repo_id = task.repo_id)
+                       AND task.repo_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM task_requires_repository_merge_batch required
+                           WHERE required.task_id = task.id
+                       )
+                       AND EXISTS (
+                           SELECT 1 FROM task_repository_set_revision revision
+                           JOIN task_repository_set_revision_repo repository
+                             ON repository.task_id = revision.task_id
+                            AND repository.revision = revision.revision
+                           WHERE revision.task_id = task.id AND revision.state = 'current'
+                             AND repository.repo_id = task.repo_id
+                             AND repository.role = 'primary'
+                             AND (SELECT COUNT(*) FROM task_repository_set_revision_repo writable
+                                  WHERE writable.task_id = revision.task_id
+                                    AND writable.revision = revision.revision
+                                    AND writable.role IN ('primary', 'affected')) = 1
+                       ))
+               )";
         let sql = if after.is_some() {
             format!(
                 "{query} AND (i.ingested_at < ? OR (i.ingested_at = ? AND i.id < ?))
@@ -1570,34 +1599,46 @@ pub(crate) async fn acquire_admission_secret(
              JOIN task_integration_operation merge_op
                ON merge_op.id = admission.task_merge_operation_id
               AND merge_op.task_id = admission.task_id
-              AND merge_op.repo_id = admission.repo_id
              JOIN pr_metadata metadata
                ON metadata.id = admission.metadata_id
               AND metadata.task_id = admission.task_id
-              AND metadata.repo_id = admission.repo_id
              JOIN project_member member ON member.project_id = task.project_id
              WHERE admission.task_merge_operation_id = ?
-               AND admission.task_id = ? AND admission.repo_id = ?
-               AND (merge_op.repository_merge_batch_id IS NOT NULL OR (
-                   merge_op.repo_id = task.repo_id
-                   AND NOT EXISTS (
-                       SELECT 1 FROM task_requires_repository_merge_batch required
-                       WHERE required.task_id = task.id
-                   )
-                   AND EXISTS (
-                       SELECT 1 FROM task_repository_set_revision revision
-                       JOIN task_repository_set_revision_repo repository
-                         ON repository.task_id = revision.task_id
-                        AND repository.revision = revision.revision
-                       WHERE revision.task_id = task.id AND revision.state = 'current'
-                         AND repository.repo_id = task.repo_id AND repository.role = 'primary'
-                   )
-               ))
+               AND admission.task_id = ?
+               AND COALESCE(admission.repo_id, merge_op.repo_id, task.repo_id) = ?
+               AND COALESCE(metadata.repo_id, admission.repo_id, merge_op.repo_id, task.repo_id) = ?
+               AND (
+                   (merge_op.repository_merge_batch_id IS NOT NULL
+                    AND admission.repo_id = merge_op.repo_id
+                    AND metadata.repo_id = admission.repo_id)
+                   OR (merge_op.repository_merge_batch_id IS NULL
+                       AND (admission.repo_id IS NULL OR admission.repo_id = task.repo_id)
+                       AND (merge_op.repo_id IS NULL OR merge_op.repo_id = task.repo_id)
+                       AND task.repo_id = ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM task_requires_repository_merge_batch required
+                           WHERE required.task_id = task.id
+                       )
+                       AND EXISTS (
+                           SELECT 1 FROM task_repository_set_revision revision
+                           JOIN task_repository_set_revision_repo repository
+                             ON repository.task_id = revision.task_id
+                            AND repository.revision = revision.revision
+                           WHERE revision.task_id = task.id AND revision.state = 'current'
+                             AND repository.repo_id = task.repo_id AND repository.role = 'primary'
+                             AND (SELECT COUNT(*) FROM task_repository_set_revision_repo writable
+                                  WHERE writable.task_id = revision.task_id
+                                    AND writable.revision = revision.revision
+                                    AND writable.role IN ('primary', 'affected')) = 1
+                       ))
+               )
                AND member.user_id = ?
                AND member.role IN ('owner', 'admin'))",
     )
     .bind(&key.admission_id)
     .bind(&key.task_id)
+    .bind(&key.repo_id)
+    .bind(&key.repo_id)
     .bind(&key.repo_id)
     .bind(owner_id)
     .fetch_one(db.pool())
@@ -1652,38 +1693,6 @@ pub(crate) fn validate_credential_free_remote_identity(identity: &str) -> Result
     Ok(())
 }
 
-#[cfg(test)]
-mod multirepo_identity_tests {
-    use super::*;
-
-    #[test]
-    fn multirepo_pr_remote_identity_rejects_embedded_credentials() {
-        assert!(
-            validate_credential_free_remote_identity("https://github.com/acme/widgets.git").is_ok()
-        );
-        assert!(
-            validate_credential_free_remote_identity("git@github.com:acme/widgets.git").is_ok()
-        );
-        assert!(
-            validate_credential_free_remote_identity("ssh://git@github.com/acme/widgets.git")
-                .is_ok()
-        );
-        for identity in [
-            "https://token@github.com/acme/widgets.git",
-            "https://git:token@github.com/acme/widgets.git",
-            "ssh://token@github.com/acme/widgets.git",
-            "token@github.com:acme/widgets.git",
-            "https://github.com/acme/widgets.git?access_token=secret",
-            "https://github.com/acme/widgets.git#token",
-        ] {
-            assert!(
-                validate_credential_free_remote_identity(identity).is_err(),
-                "credential-bearing repository identity must be rejected"
-            );
-        }
-    }
-}
-
 pub(crate) async fn provider_for_admission(
     db: &SqliteDb,
     credentials: Option<&CredentialService>,
@@ -1715,13 +1724,37 @@ async fn pending_remote_pr_admissions(
            ON merge_op.id = admission.task_merge_operation_id
          JOIN task_integration_operation publish_op
            ON publish_op.id = admission.publish_operation_id
+         JOIN task task ON task.id = admission.task_id
          WHERE admission.state IN ('admitted', 'reconciliation_required', 'open')
-           AND admission.repo_id IS NOT NULL
            AND admission.rework_outcome IS NULL
            AND merge_op.kind = 'task_merge' AND merge_op.status = 'running'
            AND merge_op.remote_waiting = 1
            AND publish_op.kind = 'publish_pr'
-           AND publish_op.status IN ('running', 'succeeded')",
+           AND publish_op.status IN ('running', 'succeeded')
+           AND (
+               (merge_op.repository_merge_batch_id IS NOT NULL
+                AND admission.repo_id = merge_op.repo_id)
+               OR (merge_op.repository_merge_batch_id IS NULL
+                   AND (admission.repo_id IS NULL OR admission.repo_id = task.repo_id)
+                   AND (merge_op.repo_id IS NULL OR merge_op.repo_id = task.repo_id)
+                   AND task.repo_id IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_requires_repository_merge_batch required
+                       WHERE required.task_id = task.id
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM task_repository_set_revision revision
+                       JOIN task_repository_set_revision_repo repository
+                         ON repository.task_id = revision.task_id
+                        AND repository.revision = revision.revision
+                       WHERE revision.task_id = task.id AND revision.state = 'current'
+                         AND repository.repo_id = task.repo_id AND repository.role = 'primary'
+                         AND (SELECT COUNT(*) FROM task_repository_set_revision_repo writable
+                              WHERE writable.task_id = revision.task_id
+                                AND writable.revision = revision.revision
+                                AND writable.role IN ('primary', 'affected')) = 1
+                   ))
+           )",
     )
     .fetch_all(db.pool())
     .await?;
@@ -1779,4 +1812,36 @@ async fn set_task_awaiting_human(db: &SqliteDb, task: &Task, awaiting_human: boo
     }
     TaskRepo::set_metadata_json(db, &task.id, metadata.to_json(), &now_rfc3339()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod multirepo_identity_tests {
+    use super::*;
+
+    #[test]
+    fn multirepo_pr_remote_identity_rejects_embedded_credentials() {
+        assert!(
+            validate_credential_free_remote_identity("https://github.com/acme/widgets.git").is_ok()
+        );
+        assert!(
+            validate_credential_free_remote_identity("git@github.com:acme/widgets.git").is_ok()
+        );
+        assert!(
+            validate_credential_free_remote_identity("ssh://git@github.com/acme/widgets.git")
+                .is_ok()
+        );
+        for identity in [
+            "https://token@github.com/acme/widgets.git",
+            "https://git:token@github.com/acme/widgets.git",
+            "ssh://token@github.com/acme/widgets.git",
+            "token@github.com:acme/widgets.git",
+            "https://github.com/acme/widgets.git?access_token=secret",
+            "https://github.com/acme/widgets.git#token",
+        ] {
+            assert!(
+                validate_credential_free_remote_identity(identity).is_err(),
+                "credential-bearing repository identity must be rejected"
+            );
+        }
+    }
 }

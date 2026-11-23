@@ -1340,21 +1340,34 @@ pub(crate) mod tests {
             evaluation.evaluation.outcome,
             db::GateEvaluationOutcome::Satisfied
         );
-        let repository_set = db::TaskRepositorySetRepo::get_current(&*fixture.db, &fixture.task_id)
-            .await?
-            .ok_or_else(|| {
-                ServiceError::invalid_operation("test Task has no repository revision")
-            })?;
-        let writable_repository_count = repository_set
-            .repositories
-            .iter()
-            .filter(|member| {
-                matches!(
-                    member.role,
-                    db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
-                )
-            })
-            .count();
+        let has_repository_revisions: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'task_repository_set_revision'
+             )",
+        )
+        .fetch_one(fixture.db.pool())
+        .await?;
+        let writable_repository_count = if has_repository_revisions != 0 {
+            let repository_set =
+                db::TaskRepositorySetRepo::get_current(&*fixture.db, &fixture.task_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation("test Task has no repository revision")
+                    })?;
+            repository_set
+                .repositories
+                .iter()
+                .filter(|member| {
+                    matches!(
+                        member.role,
+                        db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                    )
+                })
+                .count()
+        } else {
+            1
+        };
         let batch_id = if writable_repository_count > 1 {
             Some(create_test_merge_batch(fixture, &evaluation.evaluation.id).await?)
         } else {

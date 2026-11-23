@@ -8,7 +8,7 @@ use api_types::{
 use db::{
     ActorKind, Agent, CoordinationMode as DbCoordinationMode, Daemon, Execution, ExecutionRepo,
     Page, PageRequest, PrMetadataRepo, Project, Repo, RoleMembership, RoleMembershipRepo, SortBy,
-    SortOrder, Task, TaskLifecycleRepo, TaskLifecycleState as DbTaskLifecycleState, TaskRepo,
+    SortOrder, Task, TaskLifecycleRepo, TaskLifecycleState as DbTaskLifecycleState,
     TaskRepositoryMergeBatchRepo, TaskRepositorySetRepo, TaskRoleRepo, WorkUnitRepo,
     WorkUnitRepositoryIntegrationRepo, Workspace, WorkspaceRepo,
 };
