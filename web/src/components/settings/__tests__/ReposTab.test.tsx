@@ -177,7 +177,9 @@ describe('ReposTab repositories', () => {
 
     expect(screen.getByText('Primary', { exact: true })).toBeTruthy()
     expect(screen.getByText('Primary app', { selector: 'p' })).toBeTruthy()
-    expect(screen.getByText('Shared library')).toBeTruthy()
+    expect(
+      screen.getAllByText('Shared library').some((element) => element.tagName !== 'OPTION'),
+    ).toBe(true)
     expect(screen.getByText(secondaryRepo.remote_url)).toBeTruthy()
     expect(screen.getByText(secondaryRepo.local_path as string)).toBeTruthy()
     expect(screen.getAllByText('Pull request').length).toBeGreaterThan(0)

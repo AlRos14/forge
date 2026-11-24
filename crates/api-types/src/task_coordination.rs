@@ -259,7 +259,7 @@ pub struct TaskCoordinationPlanWorkUnitResponse {
     pub acceptance: Vec<String>,
     pub artifact_inputs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[ts(optional)]
+    #[ts(as = "Option<Vec<String>>", optional)]
     pub repository_ids: Vec<String>,
 }
 
