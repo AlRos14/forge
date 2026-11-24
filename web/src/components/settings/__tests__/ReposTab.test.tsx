@@ -176,7 +176,7 @@ describe('ReposTab repositories', () => {
     renderReposTab()
 
     expect(screen.getByText('Primary', { exact: true })).toBeTruthy()
-    expect(screen.getByText('Primary app')).toBeTruthy()
+    expect(screen.getByText('Primary app', { selector: 'p' })).toBeTruthy()
     expect(screen.getByText('Shared library')).toBeTruthy()
     expect(screen.getByText(secondaryRepo.remote_url)).toBeTruthy()
     expect(screen.getByText(secondaryRepo.local_path as string)).toBeTruthy()
@@ -194,8 +194,10 @@ describe('ReposTab repositories', () => {
     fireEvent.click(editButtons[1] as HTMLButtonElement)
 
     expect(screen.getByRole('heading', { name: 'Edit Repository' })).toBeTruthy()
-    expect(screen.getByLabelText('Remote URL').getAttribute('value')).toBe(secondaryRepo.remote_url)
-    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Shared library edited' } })
+    expect(screen.getByLabelText(/^Remote URL/).getAttribute('value')).toBe(
+      secondaryRepo.remote_url,
+    )
+    fireEvent.change(screen.getByLabelText(/^Name/), { target: { value: 'Shared library edited' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     await waitFor(() => expect(state.updateMutation.mutateAsync).toHaveBeenCalled())
@@ -219,7 +221,7 @@ describe('ReposTab repositories', () => {
     fireEvent.click(screen.getByRole('option', { name: 'Pull request' }))
     await waitFor(() => expect(state.scmCredentials.list).toHaveBeenCalled())
     fireEvent.click(screen.getByLabelText('GitHub SCM credential'))
-    fireEvent.click(screen.getByRole('option', { name: 'Forge SCM' }))
+    fireEvent.click(await screen.findByRole('option', { name: 'Forge SCM' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     await waitFor(() => expect(state.createMutation.mutateAsync).toHaveBeenCalled())
