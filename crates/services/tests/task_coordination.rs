@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use db::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ActorKind, AgentRepo,
-    AgentStatus, CoordinationMode, CreateAgentIdentity, CreateAgentProfile, CreateDomainEvent,
-    CreateOrchestratorWake, CreateProjectMember, CreateRoleMembership, CreateTask, CreateTaskRole,
-    CreateWorkUnit, DomainEventRepo, OrchestratorWakeRepo, ProjectMemberRepo, ProjectRepo,
-    ProjectTaskRoleDefault, ProjectTaskRoleDefaultsRepo, RoleMembershipRepo, SqliteDb,
-    TaskCoordinationMode, TaskRepo, TaskRoleRepo, UserRepo, WorkUnitProvenance, WorkUnitRepo,
-    WorkUnitStatus,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, ActorKind, AgentProfileRepo,
+    AgentRepo, AgentStatus, CoordinationMode, CreateAgentIdentity, CreateAgentProfile,
+    CreateDomainEvent, CreateOrchestratorWake, CreateProjectMember, CreateRoleMembership,
+    CreateTask, CreateTaskRole, CreateWorkUnit, DomainEventRepo, OrchestratorWakeRepo,
+    ProjectMemberRepo, ProjectRepo, ProjectTaskRoleDefault, ProjectTaskRoleDefaultsRepo,
+    RoleMembershipRepo, SelectAgentProfile, SqliteDb, TaskCoordinationMode, TaskRepo, TaskRoleRepo,
+    UserRepo, WorkUnitProvenance, WorkUnitRepo, WorkUnitStatus,
 };
 use events::EventBus;
 use services::{
@@ -22,6 +22,48 @@ struct Fixture {
     user_id: String,
     role_id: String,
     task_version: i64,
+}
+
+async fn select_agent_executor(db: &SqliteDb, agent_id: &str, executor_type: &str) {
+    let agent = AgentRepo::get_by_id(db, agent_id)
+        .await
+        .expect("Agent loads")
+        .expect("Agent exists");
+    let current_profile = AgentProfileRepo::get_profile(db, &agent.profile_id)
+        .await
+        .expect("selected profile loads")
+        .expect("selected profile exists");
+    let profile_id = new_uuid_v4();
+    let now = now_rfc3339();
+    AgentProfileRepo::create_and_select_profile(
+        db,
+        CreateAgentProfile {
+            id: profile_id.clone(),
+            identity_id: agent_id.to_owned(),
+            backend_kind: current_profile.backend_kind,
+            executor_type: executor_type.to_owned(),
+            provider: current_profile.provider,
+            model: current_profile.model,
+            reasoning_effort: current_profile.reasoning_effort,
+            permission_policy: current_profile.permission_policy,
+            prompt_template: current_profile.prompt_template,
+            capabilities_json: current_profile.capabilities_json,
+            tool_policy_json: current_profile.tool_policy_json,
+            config_json: current_profile.config_json,
+            credential_ref: current_profile.credential_ref,
+            daemon_id: current_profile.daemon_id,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        SelectAgentProfile {
+            identity_id: agent_id.to_owned(),
+            profile_id,
+            expected_version: agent.version,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("new immutable profile is selected");
 }
 
 async fn fixture(suffix: &str) -> Fixture {
@@ -85,7 +127,7 @@ async fn fixture(suffix: &str) -> Fixture {
         CreateAgentProfile {
             id: format!("{agent_id}-profile"),
             identity_id: agent_id.clone(),
-            backend_kind: "native".to_owned(),
+            backend_kind: "cli".to_owned(),
             executor_type: "codex".to_owned(),
             provider: Some("test".to_owned()),
             model: Some("test".to_owned()),
@@ -203,6 +245,40 @@ async fn fixture(suffix: &str) -> Fixture {
         role_id,
         task_version,
     }
+}
+
+#[tokio::test]
+async fn multirepo_lifecycle_plan_authorize_rejects_unsupported_coordinator_harness() {
+    let fixture = fixture("unsupported-coordinator").await;
+    select_agent_executor(
+        &fixture.db,
+        "quality-agent-unsupported-coordinator",
+        "claude_code",
+    )
+    .await;
+
+    let error = fixture
+        .service
+        .authorize(
+            &fixture.task_id,
+            &fixture.user_id,
+            services::AuthorizationInput {
+                expected_task_version: fixture.task_version,
+                expected_coordination_version: 2,
+                mode: TaskCoordinationMode::Proposal,
+                coordinator_task_role_id: Some(fixture.role_id.clone()),
+                coordinator_actor: Some(db::ActorRef::Agent(
+                    "quality-agent-unsupported-coordinator".to_owned(),
+                )),
+                envelope: None,
+                idempotency_key: "reject-unsupported-coordinator".to_owned(),
+            },
+        )
+        .await
+        .expect_err("Claude Code cannot be selected for automatic coordination");
+    assert!(error
+        .to_string()
+        .contains("coordination.coordinator_harness_unsupported"));
 }
 
 async fn add_quality_role(fixture: &Fixture, role_id: &str, role_label: &str) {

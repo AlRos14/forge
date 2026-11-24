@@ -253,11 +253,15 @@ jobs:
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p db --lib multirepo_lifecycle_
       - if: ${{ !cancelled() }}
+        run: cargo test --locked -p db --test task_coordination_schema multirepo_lifecycle_
+      - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib multirepo_integration_
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib multirepo_pr_
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p services --lib multirepo_lifecycle_
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked -p services --test task_coordination multirepo_lifecycle_
       - if: ${{ !cancelled() }}
         run: cargo test --locked -p api --lib multirepo_lifecycle_
       - if: ${{ !cancelled() }}

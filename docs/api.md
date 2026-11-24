@@ -73,6 +73,12 @@ its Project. Coordinator replans return
 removed repository may still have in-flight work. Stale Task or Project
 versions return `409 version_conflict`.
 
+Automatic Task coordination accepts only a Codex CLI coordinator supported by
+the PR6 dispatcher. Authorization rejects other harnesses with
+`coordination.coordinator_harness_unsupported` (`422`). If the selected Agent
+becomes unsupported before the wake starts an attempt, the exact coordination
+request transitions to `failed` with the same failure code and message.
+
 If a provider Start may have taken effect but its response is uncertain, Forge
 does not send another Start. A launch response can admit an Execution without
 listing it in `started_execution_ids`; read that exact Execution and its
@@ -305,13 +311,13 @@ are in [the PR0 contract](plans/pr0-task-coordination-contract.md).
 | `GET /tasks/{id}/fallback-receipts` | Read Task-visible fallback receipts with the replaced and selected Actor, TaskRole, failure class, chain index, cost class, and exact authorization/envelope/route-attempt digests. |
 | `GET /tasks/{id}/micro-fixes` | Read bounded micro-fix receipts, declared findings and paths, diff counts, bounds outcome/violation, reviewer profile cost class, and exact commit references. |
 | `GET /tasks/{id}/coordinator-replans` | Read coordinator replan ordinal, reason, evidence links, deterministic classification and measured facts, state, and any linked Human decision. |
-| `POST /tasks/{id}/coordination/authorize` | Create or replace the versioned authorization. Body: `expected_task_version`, `expected_coordination_version`, `mode`, optional exact `coordinator_task_role_id` and `coordinator_actor`, optional `envelope`, `idempotency_key`. The coordinator TaskRole must currently have `orchestration` capability and the Actor must be an active member. If the current authorization is bound to a running or paused Project batch, the generic route returns `409 project_plan_batch_inactive`. Explicitly revoke the Task authorization or revoke/complete the Project batch before creating a fresh standalone Human authorization. The old batch grant then becomes stale and admits no further work; the new authorization does not revive it. |
+| `POST /tasks/{id}/coordination/authorize` | Create or replace the versioned authorization. Body: `expected_task_version`, `expected_coordination_version`, `mode`, optional exact `coordinator_task_role_id` and `coordinator_actor`, optional `envelope`, `idempotency_key`. The coordinator TaskRole must currently have `orchestration` capability, the Actor must be an active member, and automatic modes require a Codex CLI Agent accepted by the PR6 dispatcher (`422 coordination.coordinator_harness_unsupported` otherwise). If the current authorization is bound to a running or paused Project batch, the generic route returns `409 project_plan_batch_inactive`. Explicitly revoke the Task authorization or revoke/complete the Project batch before creating a fresh standalone Human authorization. The old batch grant then becomes stale and admits no further work; the new authorization does not revive it. |
 | `POST /tasks/{id}/coordination/revoke` | Revoke the authorization, advance its version, and preserve existing WorkUnits, plans, and history. Running Executions are not silently stopped. |
 | `POST /tasks/{id}/coordination/requests` | Request one bounded turn. Body: expected Task/coordination versions, `objective`, optional `constraints`/`context`, `acceptance_criteria`, idempotency key. A Human coordinator returns `422 coordination.human_turn_unsupported`; use manual editing. Replays return the same request. A version minted by a Project batch is scoped to that batch and returns `409 project_plan_batch_inactive` through this generic route, even after batch revocation or completion; create a fresh explicit TaskCoordination authorization to restore the standalone request flow. |
 | `GET /tasks/{id}/coordination/requests/{request_id}` | Read the exact turn state, wake, Execution, failure reason, plan Artifact, and brief. |
-| `GET /tasks/{id}/coordination/plans/{artifact_id}` | Read the inspectable plan and its parsed WorkUnits, roles, Actors, dependencies, review subjects, optional complete `repository_set` proposal, proposal/decision, and materialization receipt. When the plan omits `repository_set`, the response omits it and uses the current Task set. |
+| `GET /tasks/{id}/coordination/plans/{artifact_id}` | Read the inspectable plan and its parsed WorkUnits, roles, Actors, dependencies, review subjects, optional per-WorkUnit `repository_ids`, optional complete `repository_set` proposal, proposal/decision, and materialization receipt. Omitted or empty `repository_ids` means all writable repositories in the effective Task set. When the plan omits `repository_set`, the response omits it and uses the current Task set. |
 | `POST /tasks/{id}/coordination/plans/{artifact_id}/approve` | Approve or reject one exact plan by digest. Approval records a `Decision` on the exact open Proposal; a changed digest or Proposal version returns a typed conflict. |
-| `POST /tasks/{id}/coordination/plans/{artifact_id}/materialize` | Atomically create WorkUnits, dependencies, review subjects, and Artifact input pins from one approved plan, with a deterministic replay receipt. An approved coordinator replan may also materialize its complete `repository_set`; the exact Human decision and base revision are revalidated in the same transaction, and new WorkUnits pin the new immutable revision. Removing a repository or downgrading a writable repository to `context` while open WorkUnits, running Executions, active leases/batches, or nonterminal PR/admission state may depend on it returns `409 task.repositories.replan_removal_blocked`. Primary changes return `409 task.repositories.replan_primary_immutable`. The operation also records the normal launch intent; dispatch still revalidates every worker assignment, capability, and lease. A paused Task returns `409 coordination.paused`. |
+| `POST /tasks/{id}/coordination/plans/{artifact_id}/materialize` | Atomically create WorkUnits, dependencies, review subjects, and Artifact input pins from one approved plan, with a deterministic replay receipt. Every non-empty `repository_ids` list must contain unique writable IDs from the current Task set or proposed `repository_set`; duplicate, unknown, or `context` IDs return `422 coordination.invalid_plan`. The selection and immutable repository-set revision pin are written in this transaction. An approved coordinator replan may also materialize its complete `repository_set`; the exact Human decision and base revision are revalidated in the same transaction, and new WorkUnits pin the new immutable revision. Removing a repository or downgrading a writable repository to `context` while open WorkUnits, running Executions, active leases/batches, or nonterminal PR/admission state may depend on it returns `409 task.repositories.replan_removal_blocked`. Primary changes return `409 task.repositories.replan_primary_immutable`. The operation also records the normal launch intent; dispatch still revalidates every worker assignment, capability, and lease. A paused Task returns `409 coordination.paused`. |
 | `GET/POST /tasks/{id}/coordination/quality-requests` | List or create structured quality requests. Categories are `delivery_correction`, `plan_revision`, `specialist`, and `human_decision`; targets are `implementation`, `orchestrator`, `specialist`, or `human`. Creation records routing facts and consumes the Task-global and exact-route budgets atomically; a deterministic Handoff is informational. An optional `source_execution_id` attributes a ReviewReport-sourced request to the exact reviewer Execution instead of the calling Human. The durable consumer creates or links a correction/specialist WorkUnit or opens a plan-revision turn. Responses include `work_unit_id`, `coordination_request_id`, exact resolution evidence, and `quality_route` with stable `id`, `round`, `limit`, and source TaskRole. Review reports on the same review line share a route even when category or destination role changes. |
 | `POST /tasks/{id}/coordination/quality-requests/{request_id}/resolve` | Resolve, cancel, or escalate one exact request using its version. |
 | `GET/POST /tasks/{id}/coordination/interventions` | Read or create one versioned Human/Copilot intervention. Kinds are `instruction`, `decision`, `pause`, `resume`, `cancel`, `revoke_authorization`, and `request_replan`. Project Copilot may record an instruction through this same circuit; it cannot request a replan, pause, cancel, revoke, approve, or decide. |
@@ -342,12 +348,22 @@ team, WorkUnit budget, repository/path scope, and envelope; a scope or authority
 change requires an exact Human decision before materialization. The V172 ledger
 limits coordinator replans to two per Task.
 
+The coordinator receives the Task's repositories as `{ id, name, role }` entries
+and returns the ordinary `work_unit_plan` JSON shape. Each `work_units[]` entry
+may optionally include `repository_ids: ["repo-id"]`; the IDs must be unique
+`primary`/`affected` members of the effective Task set. A replan validates
+against its proposed `repository_set` when present. Empty or omitted arrays are
+omitted from serialized plans, preserving older plan digests and selecting all
+writable repositories.
+
 A replan `WorkUnitPlan` may carry `repository_set: [{repo_id, role}]` as a
 complete replacement. Its roles are `primary`, `affected`, and `context`; the
 primary must remain the Task's current primary, and the input order determines
 positions after it. Omitting the field preserves the existing plan wire shape
 and repository set. Rust classifies any membership, role, or ordering change as
-`scope_or_authority_change`, which requires the exact Human approval. Resume
+`scope_or_authority_change`, which requires the exact Human approval. A change
+to `repository_ids` on a stable existing WorkUnit key has the same
+classification. Resume
 rechecks the captured revision/digest and decision inside materialization,
 creates the immutable revision, and pins only new WorkUnits to it. Removal or
 downgrading a writable repository to `context` is rejected while any open

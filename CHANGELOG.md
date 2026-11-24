@@ -32,9 +32,18 @@ source version is 0.9.1.
   and failing closed when a removed repository still has in-flight work.
 - Open one PR per changed writable repository; unchanged repositories open no PR
   and require no repository-scoped checks.
+- Allow coordinator `WorkUnitPlan` entries to select an exact writable
+  `repository_ids` subset. Empty or omitted values preserve the legacy plan
+  wire representation and select all writable Task repositories; selections are
+  validated against the effective Task set, shown in REST/MCP plan reads, and
+  persisted with the WorkUnit's immutable repository-set pin.
 
 ### Fixed
 
+- Reject unsupported automatic coordination harnesses during authorization
+  with `coordination.coordinator_harness_unsupported`; a wake that becomes
+  unsupported before an attempt now fails its exact coordination request with
+  the durable request-state event.
 - `PATCH /tasks/{id}/task-roles/{role}/members/{membership_id}` no longer
   fails with `500` (path extractor mismatch); suspending or ending a
   RoleMembership works again.

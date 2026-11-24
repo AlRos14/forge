@@ -2582,6 +2582,37 @@ impl TaskCoordinationRepo for SqliteDb {
                     repository_revision_to_pin,
                 )
                 .await?;
+                for repository_id in &unit.repository_ids {
+                    let writable_in_pinned_revision: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM task_repository_set_revision_repo
+                            WHERE task_id = ? AND revision = ? AND repo_id = ?
+                              AND role IN ('primary', 'affected')
+                        )",
+                    )
+                    .bind(&input.task_id)
+                    .bind(repository_revision_to_pin)
+                    .bind(repository_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if !writable_in_pinned_revision {
+                        return Err(DbError::Check(format!(
+                            "WorkUnit repository scope must be writable in its pinned repository revision: {repository_id}"
+                        )));
+                    }
+                    sqlx::query(
+                        "INSERT INTO work_unit_repository (
+                            work_unit_id, task_id, repo_id, created_at
+                         ) VALUES (?, ?, ?, ?)",
+                    )
+                    .bind(&unit.id)
+                    .bind(&input.task_id)
+                    .bind(repository_id)
+                    .bind(&input.created_at)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(check_error)?;
+                }
                 inserted.insert(unit.id.clone());
                 progress = true;
                 if !created_controls.contains(&unit.id) {

@@ -3435,6 +3435,7 @@ pub struct MaterializedWorkUnit {
     pub depends_on_work_unit_ids: Vec<String>,
     pub requires_integration: bool,
     pub artifact_inputs: Vec<MaterializedArtifactInput>,
+    pub repository_ids: Vec<String>,
     pub review_subject_work_unit_id: Option<String>,
 }
 

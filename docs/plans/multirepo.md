@@ -2036,7 +2036,7 @@ V183 de M0. No convierte un resultado M1/M2 en evidencia M3.
 
 | Contrato | Resultado de la revisión | Decisión M3 |
 |---|---|---|
-| DM1: alcance writable de WorkUnit | M1 persiste `primary`, `affected`, `context`; M2 guarda `workspace_group` y un resultado por repo. | Mantener. `context` es lectura; solo `primary`/`affected` integran, reciben Gate/checks y pueden tener PR. Un WorkUnit sin `repository_ids` conserva el alcance writable completo de su revisión de repos. |
+| DM1: alcance writable de WorkUnit | M1 persiste `primary`, `affected`, `context`; M2 guarda `workspace_group` y un resultado por repo. REST/MCP ya admiten `repository_ids` al crear WorkUnits. | Mantener. `context` es lectura; solo `primary`/`affected` integran, reciben Gate/checks y pueden tener PR. Un WorkUnit sin `repository_ids` conserva el alcance writable completo de su revisión de repos. El plan del coordinador también puede seleccionar un subconjunto mediante `repository_ids`, validado y fijado con la revisión efectiva del Task. |
 | DM2: PR/check por repo modificado | M2 guarda resultados de Execution por repo, pero no demuestra que el repo tenga diff neto frente al target. | Un repo entra al batch si su integración final tiene diff neto no vacío frente al target/base fijado. En modo `pull_request`, crear exactamente una PR por repo modificado. Repo sin cambios no crea PR ni requiere checks. `direct_merge` conserva su flujo actual por repo y la confirmación de merge sigue siendo humana. |
 | DM3: integración primaria primero | `WorkUnitService::integrate` sigue siendo escalar: resuelve el Workspace de integración con `task.repo_id` y guarda un `WorkUnitIntegration`. El supuesto del borrador M0 de añadir `integrate_repositories` a `TaskIntegrationOperationManager` no coincide con el ownership actual. | Extender `WorkUnitService::integrate` para los resultados de ese WorkUnit, en el orden `primary`, luego `affected.position`; cada repo usa su propio Workspace de integración y fila hija durable. `work_unit_integration` sigue siendo la operación/idempotency parent; no se reconstruye ni se rompe su clave single-repo. Al primer conflicto/error, no deshacer éxitos previos; reintentar solo filas pendientes. `TaskIntegrationOperationManager` conserva la exclusión durable del Task. |
 | Un PR por repo | `pr_metadata` tiene `UNIQUE(task_id)` y `PrMetadataRepo::get_by_task_id`; el servicio actual asume un metadata actual por Task. El repo y `work_mode` del PR se obtienen desde `task.repo_id`. | V183 debe hacer `UNIQUE(task_id, repo_id)`; lectura/escritura de proyección exige `(task_id,repo_id)` o lista. Admission, provider config, feedback, rework y acción externa se resuelven por el `admission_id` inmutable y su `repo_id`, nunca por “la PR de la Task”. No se crea PR para repos sin diff. |
@@ -2912,6 +2912,17 @@ pertenecer al Project. Cambiar el primary se rechaza con
 guards V181 y las referencias históricas requieren una operación de cambio de
 primary aparte.
 
+Cada `PlanWorkUnit` también admite `repository_ids: [repo_id]`, como subconjunto
+único de los repos `primary`/`affected` del conjunto efectivo: usa el conjunto
+actual si `repository_set` se omite, y el conjunto propuesto si se incluye. Un
+ID desconocido o `context` produce `coordination.invalid_plan`. Campo ausente o
+array vacío conserva exactamente la serialización/digest previa y significa
+todos los repos writable. El coordinador recibe una lista del conjunto actual
+con `id`, `name` y `role`. En una replan, cambiar `repository_ids` de un
+WorkUnit con la misma clave estable cuenta como cambio de alcance y requiere la
+decisión Human exacta; Rust conserva las selecciones anteriores en el snapshot
+de clasificación y materializa la selección nueva junto al pin de revisión.
+
 Rust compara roles, miembros y orden propuestos con la revisión/digest base; un
 cambio es `scope_or_authority_change` y exige la decisión Human exacta. En
 resume, `BEGIN IMMEDIATE` revalida revisión/digest, Artifact, request y decisión;
@@ -2930,8 +2941,12 @@ revisiones anterior/nueva, digest nueva, Artifact y HumanDecision; no incluye
 texto provider. Tests requeridos: `multirepo_lifecycle_replan_` para propuesta
 que requiere decisión exacta, resume aprobado con revisión/WU nuevos y pins
 anteriores intactos, base obsoleta, retirada insegura, replan sin cambio y PATCH
-directo tras Execution. Añadir casos DB para la sincronización y guards, y caso
-API si cabe; CI es el único validador de ejecución.
+directo tras Execution. Añadir `multirepo_lifecycle_plan_` para selección,
+validación, clasificación de alcance y fallo de wake previo al intento; incluir
+el filtro `cargo test -p services --test task_coordination multirepo_lifecycle_`
+en CI para la elegibilidad de autorización. Añadir casos DB para la
+sincronización y guards, y caso API si cabe; CI es el único validador de
+ejecución.
 
 ### Anexo M3b — cierre CI
 

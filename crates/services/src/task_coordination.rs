@@ -7,7 +7,7 @@ use api_types::{ActorRef as ApiActorRef, TaskRoleCapability, TaskRoleConfigurati
 use db::{
     new_uuid_v4, now_rfc3339, ActorRef, AgentRepo, ArtifactKind, CollaborationRepo,
     CoordinatorReplanState, CostClass, CreateDomainEvent, ProjectPlanBatchAuthorizationBinding,
-    ProjectPlanBatchRequestBinding, ProjectPlanBatchRequestOrigin, RoleMembershipRepo,
+    ProjectPlanBatchRequestBinding, ProjectPlanBatchRequestOrigin, RepoRepo, RoleMembershipRepo,
     RoleMembershipStatus, SqliteDb, Task, TaskCoordination, TaskCoordinationMaterialization,
     TaskCoordinationMode, TaskCoordinationPlan, TaskCoordinationPlanState, TaskCoordinationRepo,
     TaskCoordinationRequest, TaskCoordinationRequestKind, TaskCoordinationRequestState,
@@ -83,6 +83,24 @@ fn canonical_json<T: Serialize>(value: &T) -> Result<String> {
 
 fn bounded(value: &str, max: usize) -> bool {
     !value.trim().is_empty() && value.len() <= max
+}
+
+fn validate_plan_repository_ids(
+    repository_ids: &[String],
+    writable_repository_ids: &HashSet<String>,
+) -> Result<()> {
+    let mut selected = HashSet::with_capacity(repository_ids.len());
+    for repository_id in repository_ids {
+        if repository_id.trim().is_empty()
+            || !selected.insert(repository_id.as_str())
+            || !writable_repository_ids.contains(repository_id)
+        {
+            return Err(invalid_plan(format!(
+                "WorkUnit repository_ids must be unique writable repositories in the effective Task repository set; rejected {repository_id:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn is_false(value: &bool) -> bool {
@@ -627,6 +645,10 @@ pub struct PlanWorkUnit {
     pub acceptance: Vec<String>,
     #[serde(default)]
     pub artifact_inputs: Vec<String>,
+    /// Optional writable repository subset. Empty selects all writable
+    /// repositories in the effective Task repository revision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repository_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1094,6 +1116,22 @@ impl TaskCoordinationService {
                 ))
             }
         };
+        if input.mode != TaskCoordinationMode::Manual {
+            let supported = match coordinator.as_ref() {
+                Some(ActorRef::Agent(agent_id)) => AgentRepo::get_by_id(&*self.db, agent_id)
+                    .await?
+                    .is_some_and(|agent| {
+                        agent.backend_kind != "native" && agent.executor_type == "codex"
+                    }),
+                Some(ActorRef::Human(_)) | None => false,
+            };
+            if !supported {
+                return Err(coordination_error(
+                    "coordination.coordinator_harness_unsupported",
+                    "automatic coordination requires a Codex CLI Agent supported by the PR6 dispatcher",
+                ));
+            }
+        }
         let envelope_json = canonical_json(&envelope)?;
         let envelope_digest = sha256_hex(envelope_json.as_bytes());
         let request_digest = sha256_hex(
@@ -3517,13 +3555,35 @@ Task context: {context}"#,
             .await?
             .map(|task| task.version)
             .unwrap_or(0);
+        let mut task_repositories = Vec::new();
+        if let Some(repository_set) =
+            TaskRepositorySetRepo::get_current(&*self.db, &request.task_id).await?
+        {
+            for repository in repository_set.repositories {
+                let name = RepoRepo::get_by_id(&*self.db, &repository.repo_id)
+                    .await?
+                    .map(|repo| repo.name)
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(format!(
+                            "Task repository {} is missing from its Project",
+                            repository.repo_id
+                        ))
+                    })?;
+                task_repositories.push(json!({
+                    "id": repository.repo_id,
+                    "name": name,
+                    "role": repository.role.to_string(),
+                }));
+            }
+        }
         Ok(format!(
             "You are the selected Task coordinator for one bounded preparation turn. This execution is read-only and must not modify repository files, create WorkUnits, call provider APIs, or grant authority.\n\
 Return exactly one JSON object and no markdown fences. The object must match this schema:\n\
-{{\"schema_version\":1,\"request_id\":{request_id},\"task_id\":{task_id},\"task_version\":{task_version},\"authorization_version\":{authorization_version},\"team_digest\":{team_digest},\"envelope_digest\":{envelope_digest},\"objective_digest\":{objective_digest},\"work_units\":[{{\"key\":\"stable-key\",\"title\":\"...\",\"scope\":\"...\",\"role\":\"exact existing TaskRole role name\",\"assigned_actor\":{{\"kind\":\"agent|human\",\"id\":\"exact eligible member id\"}}|null,\"parent_key\":null,\"depends_on\":[],\"requires_integration\":false,\"execution_instructions\":null,\"review_subject_key\":null,\"acceptance\":[],\"artifact_inputs\":[]}}],\"delivery\":null,\"review\":null,\"limits\":null}}\n\
+Each `work_units` entry may include `repository_ids`, an array of exact writable repository IDs. Omit it or use `[]` to select every writable repository in the effective Task repository set; `context` repositories are read-only and rejected. During a coordinator replan, IDs are validated against the proposed `repository_set` when supplied, otherwise against the current Task set.\n\
+{{\"schema_version\":1,\"request_id\":{request_id},\"task_id\":{task_id},\"task_version\":{task_version},\"authorization_version\":{authorization_version},\"team_digest\":{team_digest},\"envelope_digest\":{envelope_digest},\"objective_digest\":{objective_digest},\"work_units\":[{{\"key\":\"stable-key\",\"title\":\"...\",\"scope\":\"...\",\"role\":\"exact existing TaskRole role name\",\"assigned_actor\":{{\"kind\":\"agent|human\",\"id\":\"exact eligible member id\"}}|null,\"parent_key\":null,\"depends_on\":[],\"requires_integration\":false,\"execution_instructions\":null,\"review_subject_key\":null,\"acceptance\":[],\"artifact_inputs\":[],\"repository_ids\":[]}}],\"delivery\":null,\"review\":null,\"limits\":null}}\n\
 Optional `repository_set` has shape `[{{\"repo_id\":\"exact Project repo id\",\"role\":\"primary|affected|context\"}}]`. Include it only for a coordinator replan that proposes a repository change; it replaces the complete set, must preserve the primary repository, and requires the exact Human decision before materialization. Omit it when unchanged.\n\
 Create at most {max_work_units} WorkUnits. Use only TaskRole names and active members listed in the team. A formal review WorkUnit must use a TaskRole with the `formal_review` capability, set review_subject_key to another planned key, and must use a fresh role-isolated native session; the same Agent profile is allowed, but a Human contributor cannot review their own result. The review role must also appear in the envelope's allowed_review_roles by its exact role name. Do not create, rename, or grant TaskRoles, memberships, or capabilities. Do not request external actions or merge. A plan outside the envelope will wait for Human approval.\n\
-Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {acceptance}\nContext: {context}\nEnvelope: {envelope_json}\nTeam: {team}\nCurrent Task context: {task_context}",
+Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {acceptance}\nContext: {context}\nEnvelope: {envelope_json}\nTeam: {team}\nTask repositories (id, name, role): {task_repositories}\nCurrent Task context: {task_context}",
             request_id = serde_json::to_string(&request.id).unwrap(),
             task_id = serde_json::to_string(&request.task_id).unwrap(),
             task_version = task_version,
@@ -3538,6 +3598,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
             context = brief.context.unwrap_or_else(|| "none".to_owned()),
             envelope_json = serde_json::to_string(&envelope).unwrap_or_default(),
             team = serde_json::to_string(&team_rows).unwrap_or_default(),
+            task_repositories = serde_json::to_string(&task_repositories).unwrap_or_default(),
             task_context = serde_json::to_string(context).unwrap_or_else(|_| "{}".to_owned()),
         ))
     }
@@ -4832,6 +4893,24 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                 actor_ref: None,
             });
         }
+        if let Some(actor) = coordination.coordinator_actor.as_ref() {
+            let supported = match actor {
+                ActorRef::Agent(agent_id) => AgentRepo::get_by_id(&*self.db, agent_id)
+                    .await?
+                    .is_some_and(|agent| {
+                        agent.backend_kind != "native" && agent.executor_type == "codex"
+                    }),
+                ActorRef::Human(_) => false,
+            };
+            if !supported {
+                blockers.push(CoordinationBlocker {
+                    code: "coordination.coordinator_harness_unsupported".to_owned(),
+                    message: "automatic coordination requires a Codex CLI Agent supported by the PR6 dispatcher".to_owned(),
+                    task_role_id: coordination.coordinator_task_role_id.clone(),
+                    actor_ref: Some(actor.clone()),
+                });
+            }
+        }
         if coordination.turn_count >= coordination.max_turns {
             blockers.push(CoordinationBlocker {
                 code: "coordination.budget_exhausted".to_owned(),
@@ -4855,8 +4934,37 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         plan: &WorkUnitPlan,
         materializing: bool,
     ) -> Result<()> {
-        self.validate_replan_repository_set(request, task, plan)
+        let proposed_repository_set = self
+            .validate_replan_repository_set(request, task, plan)
             .await?;
+        let writable_repository_ids = if let Some(repositories) = proposed_repository_set {
+            repositories
+                .into_iter()
+                .filter(|repository| {
+                    matches!(
+                        repository.role,
+                        db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                    )
+                })
+                .map(|repository| repository.repo_id)
+                .collect::<HashSet<_>>()
+        } else {
+            TaskRepositorySetRepo::get_current(&*self.db, &task.id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation("Task has no current repository-set revision")
+                })?
+                .repositories
+                .into_iter()
+                .filter(|repository| {
+                    matches!(
+                        repository.role,
+                        db::TaskRepositoryRole::Primary | db::TaskRepositoryRole::Affected
+                    )
+                })
+                .map(|repository| repository.repo_id)
+                .collect::<HashSet<_>>()
+        };
         if plan.task_id != task.id
             || plan.request_id != request.id
             || plan.authorization_version != coordination.authorization_version
@@ -4883,6 +4991,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         }
         let mut keys = HashSet::new();
         for unit in &plan.work_units {
+            validate_plan_repository_ids(&unit.repository_ids, &writable_repository_ids)?;
             if !bounded(&unit.key, 128) || !keys.insert(unit.key.clone()) {
                 return Err(invalid_plan("WorkUnit keys must be unique and bounded"));
             }
@@ -5119,6 +5228,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
                     .collect(),
                 requires_integration: unit.requires_integration,
                 artifact_inputs,
+                repository_ids: unit.repository_ids.clone(),
                 review_subject_work_unit_id,
             });
         }
@@ -5592,6 +5702,7 @@ mod tests {
                     review_subject_key: None,
                     acceptance: Vec::new(),
                     artifact_inputs: Vec::new(),
+                    repository_ids: Vec::new(),
                 })
                 .collect(),
             repository_set: None,
@@ -5618,6 +5729,27 @@ mod tests {
         let plan = plan_with(&[("a", &["b"]), ("b", &["a"])]);
         let error = validate_dependency_graph(&plan).expect_err("cycle is rejected");
         assert!(error.to_string().contains("cycle"));
+    }
+
+    #[test]
+    fn multirepo_lifecycle_plan_repository_ids_accept_only_unique_writable_ids() {
+        let writable = ["repo-primary".to_owned(), "repo-affected".to_owned()]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert!(validate_plan_repository_ids(&[], &writable).is_ok());
+        assert!(validate_plan_repository_ids(&["repo-affected".to_owned()], &writable).is_ok());
+
+        let context = validate_plan_repository_ids(&["repo-context".to_owned()], &writable)
+            .expect_err("context repositories are read-only");
+        assert!(context.to_string().contains("coordination.invalid_plan"));
+        let unknown = validate_plan_repository_ids(&["repo-missing".to_owned()], &writable)
+            .expect_err("unknown repositories are rejected");
+        assert!(unknown.to_string().contains("coordination.invalid_plan"));
+        assert!(validate_plan_repository_ids(
+            &["repo-primary".to_owned(), "repo-primary".to_owned()],
+            &writable
+        )
+        .is_err());
     }
 
     fn review_role(name: &str, formal_review: bool) -> TeamRoleView {

@@ -280,6 +280,7 @@ impl From<ServiceError> for ApiError {
                             | "validation.subject_not_resolvable"
                             | "human_decision.invalid_options"
                             | "human_decision.evidence_invalid"
+                            | "coordination.coordinator_harness_unsupported"
                             | "pr_feedback.extend_out_of_scope"
                             | "pr_feedback.plan_without_extend"
                     )
@@ -722,6 +723,16 @@ mod tests {
     use axum::http::StatusCode;
     use db::DbError;
     use services::ServiceError;
+
+    #[test]
+    fn multirepo_lifecycle_plan_unsupported_coordinator_harness_is_unprocessable() {
+        let error = ApiError::from(ServiceError::Coordination {
+            code: "coordination.coordinator_harness_unsupported",
+            message: "unsupported coordinator".to_owned(),
+        });
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.code, "coordination.coordinator_harness_unsupported");
+    }
 
     #[test]
     fn project_plan_apply_incomplete_has_a_typed_conflict_code() {

@@ -12,6 +12,7 @@ use db::{
     DomainEventRepo, HumanDecisionRepo, HumanDecisionSourceKind, TaskCoordinationRequestKind,
     TaskCoordinatorReplanRepo, TransitionCoordinatorReplan, WorkUnitRepo,
 };
+use std::collections::BTreeMap;
 
 pub(super) struct RaiseReplanScopeDecisionInput<'a> {
     pub(super) request: &'a TaskCoordinationRequest,
@@ -122,6 +123,96 @@ fn validate_exact_replan_decision(
 }
 
 impl TaskCoordinationService {
+    async fn work_unit_repository_scope_snapshot(
+        &self,
+        work_units: &[db::WorkUnit],
+    ) -> Result<BTreeMap<String, Vec<Vec<String>>>> {
+        let mut scopes = BTreeMap::<String, Vec<Vec<String>>>::new();
+        for work_unit in work_units {
+            let Some(db::WorkUnitProvenance::Artifact(artifact_id)) = work_unit.provenance.as_ref()
+            else {
+                continue;
+            };
+            let Some(plan_record) =
+                TaskCoordinationRepo::get_task_coordination_plan(&*self.db, artifact_id).await?
+            else {
+                continue;
+            };
+            let artifact = CollaborationRepo::get_artifact(&*self.db, artifact_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "plan-backed WorkUnit {} has no source Artifact",
+                        work_unit.id
+                    ))
+                })?;
+            let content = artifact.content.as_deref().ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "plan-backed WorkUnit {} has no inline source plan",
+                    work_unit.id
+                ))
+            })?;
+            let plan = self.parse_plan(content)?;
+            if plan.request_id != plan_record.request_id || plan.task_id != work_unit.task_id {
+                return Err(ServiceError::invalid_operation(format!(
+                    "plan-backed WorkUnit {} has inconsistent source provenance",
+                    work_unit.id
+                )));
+            }
+            let mut found_key = false;
+            for planned_unit in &plan.work_units {
+                if super::deterministic_work_unit_id(&plan.request_id, &planned_unit.key)?
+                    == work_unit.id
+                {
+                    let selected_repository_ids =
+                        WorkUnitRepo::list_repository_ids(&*self.db, &work_unit.id).await?;
+                    let repository_set = match db::TaskRepositorySetRepo::get_for_work_unit(
+                        &*self.db,
+                        &work_unit.id,
+                        &work_unit.task_id,
+                    )
+                    .await?
+                    {
+                        Some(repository_set) => Some(repository_set),
+                        None => {
+                            db::TaskRepositorySetRepo::get_current(&*self.db, &work_unit.task_id)
+                                .await?
+                        }
+                    };
+                    let effective_repository_ids = if selected_repository_ids.is_empty() {
+                        repository_set
+                            .into_iter()
+                            .flat_map(|repository_set| repository_set.repositories)
+                            .filter(|repository| {
+                                matches!(
+                                    repository.role,
+                                    db::TaskRepositoryRole::Primary
+                                        | db::TaskRepositoryRole::Affected
+                                )
+                            })
+                            .map(|repository| repository.repo_id)
+                            .collect()
+                    } else {
+                        selected_repository_ids
+                    };
+                    scopes
+                        .entry(planned_unit.key.clone())
+                        .or_default()
+                        .push(effective_repository_ids);
+                    found_key = true;
+                    break;
+                }
+            }
+            if !found_key {
+                return Err(ServiceError::invalid_operation(format!(
+                    "plan-backed WorkUnit {} has no matching key in its source plan",
+                    work_unit.id
+                )));
+            }
+        }
+        Ok(scopes)
+    }
+
     async fn repository_set_snapshot(
         &self,
         task_id: &str,
@@ -219,6 +310,9 @@ impl TaskCoordinationService {
             .ok_or_else(|| ServiceError::not_found("task", source.task_id.clone()))?;
         let team = self.current_team(&source.task_id).await?;
         let work_units = WorkUnitRepo::list_by_task(&*self.db, &source.task_id).await?;
+        let original_work_unit_repository_ids_by_key = self
+            .work_unit_repository_scope_snapshot(&work_units)
+            .await?;
         let (repository_set_revision, repository_set_digest, original_repository_set) =
             self.repository_set_snapshot(&task.id).await?;
         let original = ReplanOriginalScope {
@@ -249,11 +343,12 @@ impl TaskCoordinationService {
                 .filter(|unit| unit.status != db::WorkUnitStatus::Cancelled)
                 .count(),
             original_work_unit_scopes: work_units
-                .into_iter()
+                .iter()
                 .filter(|unit| unit.status != db::WorkUnitStatus::Cancelled)
-                .map(|unit| unit.scope)
+                .map(|unit| unit.scope.clone())
                 .collect(),
             original_repository_set,
+            original_work_unit_repository_ids_by_key,
             repository_set_revision,
             repository_set_digest: repository_set_digest.clone(),
             current_repository_set_revision: repository_set_revision,
@@ -497,6 +592,9 @@ impl TaskCoordinationService {
             .ok_or_else(|| ServiceError::not_found("task", row.task_id.clone()))?;
         let team = self.current_team(&row.task_id).await?;
         let work_units = WorkUnitRepo::list_by_task(&*self.db, &row.task_id).await?;
+        let original_work_unit_repository_ids_by_key = self
+            .work_unit_repository_scope_snapshot(&work_units)
+            .await?;
         let (repository_set_revision, repository_set_digest, original_repository_set) =
             self.repository_set_snapshot(&task.id).await?;
         let scope = ReplanOriginalScope {
@@ -527,11 +625,12 @@ impl TaskCoordinationService {
                 .filter(|unit| unit.status != db::WorkUnitStatus::Cancelled)
                 .count(),
             original_work_unit_scopes: work_units
-                .into_iter()
+                .iter()
                 .filter(|unit| unit.status != db::WorkUnitStatus::Cancelled)
-                .map(|unit| unit.scope)
+                .map(|unit| unit.scope.clone())
                 .collect(),
             original_repository_set,
+            original_work_unit_repository_ids_by_key,
             repository_set_revision,
             repository_set_digest: repository_set_digest.clone(),
             current_repository_set_revision: repository_set_revision,

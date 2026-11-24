@@ -178,10 +178,14 @@ safe. A coordinator never rewrites a ReviewReport or supplies approval evidence.
 Current team, role policy, wake lease, exact report and authorization are checked
 inside the writer transaction. Revoked, stale, paused or terminal work is rejected.
 
-Codex and Claude Code can coordinate without a repository workspace. Codex uses
-its native read-only sandbox. Claude uses a native Read/Glob/Grep tool allowlist,
-no inherited hooks or MCP servers, and no permission bypass; this is a tool policy,
-not an operating-system sandbox. Formal review uses read-only native tools and
+Automatic Task coordination currently requires a Codex CLI Agent: PR6 rejects
+native backends and every executor other than Codex. Authorization returns
+`422 coordination.coordinator_harness_unsupported` for an unsupported
+coordinator, and a wake that becomes unsupported before an attempt marks the
+exact coordination request failed with that code. Codex coordination runs
+without a repository workspace in its native read-only sandbox. Claude Code can
+run ordinary Agent work through its harness adapter, but it is not eligible to
+coordinate an automatic Task turn. Formal review uses read-only native tools and
 explicit pinned evidence rather than another role's private conversation.
 
 Runtime policy version 2 covers these guided-delivery outputs and read-only
@@ -354,4 +358,4 @@ Coordination envelope v2 may preauthorize up to three fallback Agents per TaskRo
 
 A micro-fix must cite findings and paths from its exact source report. The diff is measured from the reviewed commit and is limited to three files, sixty changed lines, and at most three micro-fixes per Task; undeclared paths, dependency changes, and protected control files fail the bounds check. Every result goes through an independent formal review and a fresh Gate.
 
-A coordinator replan is classified in Rust against the objective, current team, existing and proposed WorkUnits, budget, repository/path scope, and envelope grants. At most two replans are recorded per Task. A `WorkUnitPlan` may supply a complete `repository_set` with `primary`, `affected`, and `context` roles. Membership, role, or order changes count as scope changes and require the exact Human decision before materialization. The primary remains fixed because `Task.repo_id` mirrors it and V181 guards preserve that identity. Resume revalidates the base repository revision/digest and decision in the materialization transaction, then pins new WorkUnits to the new immutable revision. Removal fails closed while an open WorkUnit, running Execution, active lease/batch, or nonterminal PR/admission references the repo; catalog rows needed by old references remain as context. Existing revisions and pins are never rewritten. See [delivery fluency](delivery-fluency.md) and the [coordinator verification and PR loop plan](../plans/coordinator-verification-and-pr-loop.md).
+A coordinator replan is classified in Rust against the objective, current team, existing and proposed WorkUnits, budget, repository/path scope, and envelope grants. At most two replans are recorded per Task. A `WorkUnitPlan` may supply a complete `repository_set` with `primary`, `affected`, and `context` roles. Each planned WorkUnit may also include `repository_ids` to select a writable subset; IDs must be unique and writable in the current set or the proposed set on a replan. A change to `repository_ids` for an existing plan key counts as a scope change and requires the exact Human decision before materialization. Membership, role, or order changes to `repository_set` have the same requirement. The primary remains fixed because `Task.repo_id` mirrors it and V181 guards preserve that identity. Resume revalidates the base repository revision/digest and decision in the materialization transaction, then pins new WorkUnits to the new immutable revision and persists their repository selections. Removal fails closed while an open WorkUnit, running Execution, active lease/batch, or nonterminal PR/admission references the repo; catalog rows needed by old references remain as context. Existing revisions and pins are never rewritten. See [delivery fluency](delivery-fluency.md) and the [coordinator verification and PR loop plan](../plans/coordinator-verification-and-pr-loop.md).

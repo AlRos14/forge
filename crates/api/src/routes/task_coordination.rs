@@ -326,6 +326,7 @@ fn plan_response(view: PlanView) -> ApiResult<TaskCoordinationPlanResponse> {
             review_subject_key: unit.review_subject_key,
             acceptance: unit.acceptance,
             artifact_inputs: unit.artifact_inputs,
+            repository_ids: unit.repository_ids,
         })
         .collect();
     Ok(TaskCoordinationPlanResponse {

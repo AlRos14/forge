@@ -923,6 +923,17 @@ fn multirepo_task_mcp_task_and_work_unit_schemas() {
             "string"
         );
 
+        let get_coordination = tools
+            .iter()
+            .find(|tool| tool["name"] == "forge_get_task_coordination")
+            .expect("coordination tool descriptor exists");
+        let coordination_description = get_coordination["description"]
+            .as_str()
+            .expect("coordination tool description");
+        assert!(coordination_description.contains("repository_ids"));
+        assert!(coordination_description.contains("context repositories are rejected"));
+        assert!(coordination_description.contains("ids, names, and roles"));
+
         let update_repositories = schema("forge_update_task_repositories");
         assert_eq!(update_repositories["additionalProperties"], false);
         assert_eq!(

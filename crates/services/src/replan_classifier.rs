@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use api_types::ActorRef as ApiActorRef;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,10 @@ pub struct ReplanOriginalScope {
     /// repo-less sets reconstruct from legacy fields to preserve snapshot JSON.
     #[serde(default, skip_serializing_if = "omit_legacy_repository_set_snapshot")]
     pub original_repository_set: Vec<ReplanRepositoryMember>,
+    /// Exact selected repository IDs from prior plan-backed WorkUnits, keyed
+    /// by their stable plan key. Empty maps preserve legacy snapshot JSON.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub original_work_unit_repository_ids_by_key: BTreeMap<String, Vec<Vec<String>>>,
     /// Exact immutable repository-set revision captured when this replan was proposed.
     #[serde(default)]
     pub repository_set_revision: i64,
@@ -76,6 +80,7 @@ pub struct ReplanClassificationFacts {
     pub max_work_units: usize,
     pub repository_set_unchanged: bool,
     pub repositories_within_original: bool,
+    pub work_unit_repository_scopes_unchanged: bool,
     pub paths_within_original: bool,
     pub no_new_envelope_flags: bool,
     pub plan_items: usize,
@@ -155,6 +160,50 @@ pub fn classify_replan(
         && items
             .iter()
             .all(|item| !item.requires_integration || original.repo_id.is_some());
+    let effective_writable_repository_ids = plan
+        .repository_set
+        .as_ref()
+        .map(|repositories| {
+            repositories
+                .iter()
+                .filter(|repository| {
+                    matches!(
+                        repository.role,
+                        api_types::TaskRepositoryRole::Primary
+                            | api_types::TaskRepositoryRole::Affected
+                    )
+                })
+                .map(|repository| repository.repo_id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            original_repository_set
+                .iter()
+                .filter(|repository| {
+                    matches!(
+                        repository.role,
+                        api_types::TaskRepositoryRole::Primary
+                            | api_types::TaskRepositoryRole::Affected
+                    )
+                })
+                .map(|repository| repository.repo_id.clone())
+                .collect()
+        });
+    let work_unit_repository_scopes_unchanged = items.iter().all(|item| {
+        let planned_scope = if item.repository_ids.is_empty() {
+            effective_writable_repository_ids.as_slice()
+        } else {
+            item.repository_ids.as_slice()
+        };
+        original
+            .original_work_unit_repository_ids_by_key
+            .get(&item.key)
+            .is_none_or(|previous_scopes| {
+                previous_scopes
+                    .iter()
+                    .all(|previous| same_repository_ids(previous, planned_scope))
+            })
+    });
     let no_new_envelope_flags = no_new_envelope_flags(envelope, &original.original_envelope);
     let facts = ReplanClassificationFacts {
         objective_digest_unchanged: original.objective_digest == original.current_objective_digest,
@@ -166,6 +215,7 @@ pub fn classify_replan(
         max_work_units: envelope.max_work_units,
         repository_set_unchanged,
         repositories_within_original,
+        work_unit_repository_scopes_unchanged,
         paths_within_original,
         no_new_envelope_flags,
         plan_items: items.len(),
@@ -175,6 +225,7 @@ pub fn classify_replan(
         && facts.actors_within_team
         && facts.work_units_within_limit
         && facts.repositories_within_original
+        && facts.work_unit_repository_scopes_unchanged
         && facts.paths_within_original
         && facts.no_new_envelope_flags;
     ReplanClassificationResult {
@@ -185,6 +236,16 @@ pub fn classify_replan(
         },
         facts,
     }
+}
+
+fn same_repository_ids(left: &[String], right: &[String]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort();
+    left.dedup();
+    right.sort();
+    right.dedup();
+    left == right
 }
 
 fn normalize_repository_set(
@@ -310,6 +371,7 @@ mod tests {
             team_actors: ["agent:a".to_owned()].into_iter().collect(),
             existing_work_units: 1,
             original_work_unit_scopes: vec!["src/".to_owned()],
+            original_work_unit_repository_ids_by_key: BTreeMap::new(),
             original_repository_set: vec![ReplanRepositoryMember {
                 repo_id: "repo".to_owned(),
                 role: api_types::TaskRepositoryRole::Primary,
@@ -347,6 +409,7 @@ mod tests {
                 review_subject_key: None,
                 acceptance: vec![],
                 artifact_inputs: vec![],
+                repository_ids: vec![],
             }],
             repository_set: None,
             delivery: None,
@@ -366,7 +429,7 @@ mod tests {
         assert_eq!(result.classification, ReplanClassification::WithinEnvelope);
         assert_eq!(
             result.classification_facts_json(),
-            r#"{"objective_digest_unchanged":true,"roles_within_team":true,"actors_within_team":true,"work_units_within_limit":true,"work_units_total":2,"max_work_units":2,"repository_set_unchanged":true,"repositories_within_original":true,"paths_within_original":true,"no_new_envelope_flags":true,"plan_items":1}"#
+            r#"{"objective_digest_unchanged":true,"roles_within_team":true,"actors_within_team":true,"work_units_within_limit":true,"work_units_total":2,"max_work_units":2,"repository_set_unchanged":true,"repositories_within_original":true,"work_unit_repository_scopes_unchanged":true,"paths_within_original":true,"no_new_envelope_flags":true,"plan_items":1}"#
         );
     }
 
@@ -518,6 +581,46 @@ mod tests {
         assert_eq!(result.classification, ReplanClassification::WithinEnvelope);
         assert!(result.facts.repository_set_unchanged);
         assert!(result.facts.repositories_within_original);
+    }
+
+    #[test]
+    fn multirepo_lifecycle_plan_replan_changed_repository_ids_on_existing_key_requires_decision() {
+        let mut original = original();
+        original
+            .original_work_unit_repository_ids_by_key
+            .insert("one".to_owned(), vec![vec!["repo".to_owned()]]);
+        let mut plan = plan("src/module.rs", "implementer", None);
+        plan.work_units[0].repository_ids = vec!["repo-affected".to_owned()];
+
+        let changed = classify_replan(&plan, &base_envelope(), &original);
+        assert_eq!(
+            changed.classification,
+            ReplanClassification::ScopeOrAuthorityChange
+        );
+        assert!(!changed.facts.work_unit_repository_scopes_unchanged);
+
+        plan.work_units[0].repository_ids = vec!["repo".to_owned()];
+        let unchanged = classify_replan(&plan, &base_envelope(), &original);
+        assert_eq!(
+            unchanged.classification,
+            ReplanClassification::WithinEnvelope
+        );
+        assert!(unchanged.facts.work_unit_repository_scopes_unchanged);
+    }
+
+    #[test]
+    fn multirepo_lifecycle_plan_repository_ids_omit_empty_wire_field() {
+        let plan = plan("src/module.rs", "implementer", None);
+        let serialized = serde_json::to_value(&plan).expect("plan serializes");
+        assert!(serialized["work_units"][0].get("repository_ids").is_none());
+
+        let mut selected = plan;
+        selected.work_units[0].repository_ids = vec!["repo".to_owned()];
+        let serialized = serde_json::to_value(selected).expect("selected plan serializes");
+        assert_eq!(
+            serialized["work_units"][0]["repository_ids"],
+            serde_json::json!(["repo"])
+        );
     }
 
     #[test]

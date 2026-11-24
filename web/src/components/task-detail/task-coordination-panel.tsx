@@ -141,7 +141,7 @@ function getCoordinatorChoices(
       if (
         member.status !== 'active' ||
         member.actor_ref.kind !== 'agent' ||
-        !['codex', 'claude_code'].includes(member.harness?.toLowerCase() ?? '')
+        member.harness?.toLowerCase() !== 'codex'
       ) {
         return []
       }
@@ -258,9 +258,7 @@ export function TaskCoordinationPanel({
       ? displayedCoordinatorAgent.actor_ref.id
       : null
   const coordinatorAvailability = useAgentAvailability(coordinatorAgentId)
-  const supportedCoordinator = ['codex', 'claude_code'].includes(
-    displayedCoordinatorAgent?.harness?.toLowerCase() ?? '',
-  )
+  const supportedCoordinator = displayedCoordinatorAgent?.harness?.toLowerCase() === 'codex'
   const coordinatorAvailable = Boolean(
     supportedCoordinator && coordinatorAvailability.data?.available,
   )
@@ -913,9 +911,9 @@ export function TaskCoordinationPanel({
                 No eligible coordinator is available in this Task team.
               </p>
               <p className="mt-1 text-sm text-muted-foreground">
-                Automatic coordination requires an active Codex or Claude Code Agent in a Task role
-                with orchestration capability. You can change this Task&apos;s roles in Advanced
-                work, or reuse a Project team template so new Tasks start with eligible members.
+                Automatic coordination requires an active Codex CLI Agent in a Task role with
+                orchestration capability. You can change this Task&apos;s roles in Advanced work, or
+                reuse a Project team template so new Tasks start with eligible members.
               </p>
               <div className="mt-3 flex flex-wrap gap-2">
                 <Button size="sm" variant="outline" onClick={onOpenAdvancedWork}>

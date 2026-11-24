@@ -231,7 +231,8 @@ async fn turn_budget_is_global_and_does_not_reset() {
 }
 
 #[tokio::test]
-async fn materialization_is_atomic_and_review_subject_is_exact() {
+async fn multirepo_lifecycle_plan_materialization_is_atomic_scopes_and_pins_work_unit_repositories()
+{
     let db = database().await;
     let (task_id, owner_id) = seed_task(&db).await;
     let task = TaskRepo::get_by_id(&db, &task_id, false)
@@ -439,6 +440,50 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
         .await
         .expect("repository-set lookup")
         .expect("current repository set");
+    let primary_repo_id = task.repo_id.clone().expect("Task primary repository");
+    let additional_repo_id = new_uuid_v4();
+    RepoRepo::create(
+        &db,
+        CreateRepo {
+            id: additional_repo_id.clone(),
+            project_id: task.project_id.clone(),
+            name: "affected-repo".to_owned(),
+            remote_url: "https://example.invalid/affected-repo.git".to_owned(),
+            local_path: None,
+            work_mode: WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("additional repository");
+    let repository_set = TaskRepositorySetRepo::create_revision(
+        &db,
+        db::CreateTaskRepositorySetRevision {
+            task_id: task_id.clone(),
+            expected_current_revision: repository_set.revision,
+            expected_current_digest: repository_set.digest.clone(),
+            repositories: vec![
+                db::TaskRepositoryWrite {
+                    repo_id: primary_repo_id.clone(),
+                    role: db::TaskRepositoryRole::Primary,
+                },
+                db::TaskRepositoryWrite {
+                    repo_id: additional_repo_id.clone(),
+                    role: db::TaskRepositoryRole::Affected,
+                },
+            ],
+            source_kind: "test".to_owned(),
+            source_ref: None,
+            decision_id: None,
+            human_decision_request_id: None,
+            force_new_revision: false,
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("two-repository Task set");
     let materialization_input = db::MaterializeTaskCoordinationPlanInput {
         receipt_id: new_uuid_v4(),
         task_id: task_id.clone(),
@@ -467,6 +512,7 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
                 depends_on_work_unit_ids: vec![reviewer_work_unit_id.clone()],
                 requires_integration: false,
                 artifact_inputs: vec![],
+                repository_ids: vec![],
                 review_subject_work_unit_id: None,
             },
             db::MaterializedWorkUnit {
@@ -481,6 +527,7 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
                 depends_on_work_unit_ids: vec![],
                 requires_integration: false,
                 artifact_inputs: vec![],
+                repository_ids: vec![],
                 review_subject_work_unit_id: None,
             },
             db::MaterializedWorkUnit {
@@ -495,6 +542,7 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
                 depends_on_work_unit_ids: vec![],
                 requires_integration: false,
                 artifact_inputs: vec![],
+                repository_ids: vec![primary_repo_id.clone()],
                 review_subject_work_unit_id: None,
             },
             db::MaterializedWorkUnit {
@@ -509,6 +557,7 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
                 depends_on_work_unit_ids: vec![implementer_work_unit_id.clone()],
                 requires_integration: false,
                 artifact_inputs: vec![],
+                repository_ids: vec![],
                 review_subject_work_unit_id: Some(implementer_work_unit_id.clone()),
             },
             db::MaterializedWorkUnit {
@@ -523,6 +572,7 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
                 depends_on_work_unit_ids: vec![reviewer_work_unit_id.clone()],
                 requires_integration: false,
                 artifact_inputs: vec![],
+                repository_ids: vec![],
                 review_subject_work_unit_id: None,
             },
             db::MaterializedWorkUnit {
@@ -537,6 +587,7 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
                 depends_on_work_unit_ids: vec![consumer_work_unit_id.clone()],
                 requires_integration: false,
                 artifact_inputs: vec![],
+                repository_ids: vec![],
                 review_subject_work_unit_id: Some(consumer_work_unit_id.clone()),
             },
         ],
@@ -576,6 +627,20 @@ async fn materialization_is_atomic_and_review_subject_is_exact() {
         .await
         .expect("work units");
     assert_eq!(units.len(), 6);
+    assert_eq!(
+        WorkUnitRepo::list_repository_ids(&db, &implementer_work_unit_id)
+            .await
+            .expect("explicit WorkUnit repository scope"),
+        vec![primary_repo_id.clone()]
+    );
+    let implementer_pin: i64 = sqlx::query_scalar(
+        "SELECT revision FROM work_unit_repository_set_revision WHERE work_unit_id = ?",
+    )
+    .bind(&implementer_work_unit_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("WorkUnit repository set revision pin");
+    assert_eq!(implementer_pin, repository_set.revision);
     let subject: (String, Option<i64>) = sqlx::query_as(
         "SELECT reviewed_work_unit_id, reviewed_work_unit_version
          FROM work_unit_review_subject WHERE review_work_unit_id = ?",
@@ -1210,6 +1275,7 @@ async fn multirepo_lifecycle_replan_approved_resume_materializes_revision_and_pr
                 depends_on_work_unit_ids: Vec::new(),
                 requires_integration: false,
                 artifact_inputs: Vec::new(),
+                repository_ids: Vec::new(),
                 review_subject_work_unit_id: None,
             }],
             receipt_digest: hex::encode(sha2::Sha256::digest(b"replan-materialization")),
