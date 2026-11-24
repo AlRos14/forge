@@ -13,6 +13,9 @@ source version is 0.9.1.
 - Add durable Task repository scopes with `primary`, `affected`, and `context`
   roles. Task creation inherits the parent Task scope or Project primary unless
   repositories are supplied; an explicit empty list creates a repo-less Task.
+- `POST /projects/{id}/repos` adds further repositories to a Project that
+  already has a primary Repo instead of returning `409
+  project_already_has_primary_repo`; the first Repo still becomes the primary.
 - Add versioned Task repository replacement, versioned Project primary-repo
   updates for future Tasks, and writable repository selection for WorkUnits in
   REST and MCP.

@@ -1856,6 +1856,14 @@ pub trait RepoRepo: Send + Sync {
         input: CreateRepo,
         provider_config: Option<CreatePrProviderConfig>,
     ) -> Result<Repo>;
+    /// Create a Repo and its optional PR provider config atomically. The
+    /// Project's first Repo becomes its primary Repo; later Repos are added as
+    /// non-primary Project repositories for multi-repository Tasks.
+    async fn create_with_pr_provider_config(
+        &self,
+        input: CreateRepo,
+        provider_config: Option<CreatePrProviderConfig>,
+    ) -> Result<Repo>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Repo>>;
     async fn list_by_project(&self, project_id: &str, page: PageRequest) -> Result<Page<Repo>>;
     async fn update(&self, input: UpdateRepo) -> Result<Repo>;

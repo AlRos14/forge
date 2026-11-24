@@ -328,6 +328,59 @@ async fn create_repo_sets_and_returns_primary_repo_id() {
 }
 
 #[tokio::test]
+async fn multirepo_task_project_accepts_additional_repositories() {
+    let (app, db) = test_app_with_db().await;
+    let project: ProjectResponse = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({ "name": "repo-additional" }),
+        StatusCode::OK,
+    )
+    .await;
+    let primary: RepoResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name": "primary-repo",
+            "remote_url": "https://example.com/acme/primary-repo.git",
+            "default_branch": "main"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let affected: RepoResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({
+            "name": "affected-repo",
+            "remote_url": "https://example.com/acme/affected-repo.git",
+            "default_branch": "main"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_ne!(primary.id, affected.id);
+    let stored = ProjectRepo::get_by_id(&*db, &project.id)
+        .await
+        .expect("load project")
+        .expect("project exists");
+    assert_eq!(stored.primary_repo_id.as_deref(), Some(primary.id.as_str()));
+    let listed: Value = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        StatusCode::OK,
+    )
+    .await;
+    let items = listed["items"].as_array().expect("repository list");
+    assert_eq!(items.len(), 2);
+}
+
+#[tokio::test]
 async fn create_task_accepts_primary_repo_without_repo_id() {
     let (app, _db) = test_app_with_db().await;
     let project: ProjectResponse = json_request(
