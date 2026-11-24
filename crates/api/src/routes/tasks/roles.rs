@@ -251,7 +251,7 @@ pub async fn add_task_role_member(
 pub async fn update_task_role_member(
     State(state): State<AppState>,
     user: AuthenticatedUser,
-    Path((id, membership_id)): Path<(String, String)>,
+    Path((id, _role, membership_id)): Path<(String, String, String)>,
     Json(request): Json<UpdateRoleMembershipRequest>,
 ) -> ApiResult<Json<RoleMembershipResponse>> {
     super::require_task_mutable(&state, &id, &user).await?;

@@ -35,6 +35,9 @@ source version is 0.9.1.
 
 ### Fixed
 
+- `PATCH /tasks/{id}/task-roles/{role}/members/{membership_id}` no longer
+  fails with `500` (path extractor mismatch); suspending or ending a
+  RoleMembership works again.
 - Preserve 0.9.1 single-repository TaskMerge, PublishPr, and PR admission when
   the new repository identity and batch columns are omitted; multi-repository
   Tasks still require exact repository and batch bindings.
