@@ -5508,10 +5508,13 @@ mod tests {
             )
             .await
             .expect("coordination request is durable");
-        let wake_id = request
-            .wake_id
-            .clone()
-            .expect("request links to exact wake");
+        let wake_id: String = sqlx::query_scalar(
+            "SELECT id FROM orchestrator_wake WHERE task_id = ? AND state = 'pending'",
+        )
+        .bind(&fixture.task_id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("coordination request enqueues exactly one pending wake");
         select_test_agent_executor(&fixture.database, &fixture.agent_id, "claude_code").await;
         let now = now_rfc3339();
         db::DaemonRepo::update_report(
