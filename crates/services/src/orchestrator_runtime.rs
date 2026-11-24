@@ -5508,13 +5508,40 @@ mod tests {
             )
             .await
             .expect("coordination request is durable");
-        let wake_id: String = sqlx::query_scalar(
-            "SELECT id FROM orchestrator_wake WHERE task_id = ? AND state = 'pending'",
+        let source_event_id: String = sqlx::query_scalar(
+            "SELECT id FROM domain_event
+             WHERE event_type = 'task.coordination_requested' AND entity_id = ?",
         )
+        .bind(&request.id)
+        .fetch_one(fixture.database.pool())
+        .await
+        .expect("coordination request appends its source event");
+        let source_event = DomainEventRepo::get_event(&*fixture.database, &source_event_id)
+            .await
+            .expect("source event loads")
+            .expect("source event exists");
+        let signal = fixture
+            .runtime
+            .classify_event(&source_event)
+            .await
+            .expect("coordination request classifies")
+            .expect("coordination request wakes its coordinator");
+        assert_eq!(
+            fixture
+                .runtime
+                .admit_signal(&source_event, signal)
+                .await
+                .expect("coordination wake admits"),
+            1
+        );
+        let wake_id: String = sqlx::query_scalar(
+            "SELECT id FROM orchestrator_wake WHERE event_id = ? AND task_id = ?",
+        )
+        .bind(&source_event.id)
         .bind(&fixture.task_id)
         .fetch_one(fixture.database.pool())
         .await
-        .expect("coordination request enqueues exactly one pending wake");
+        .expect("coordination request has exactly one wake");
         select_test_agent_executor(&fixture.database, &fixture.agent_id, "claude_code").await;
         let now = now_rfc3339();
         db::DaemonRepo::update_report(
