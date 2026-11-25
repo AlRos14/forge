@@ -547,7 +547,10 @@ impl ClaudeCodeAdapter {
             if let Some(worktrees) = group_worktrees {
                 for worktree in worktrees {
                     if let Err(error) = crate::commit::commit_worktree_changes_for_role(
-                        &ctx.role, &worktree, &subject,
+                        &ctx.role,
+                        &worktree,
+                        &subject,
+                        &ctx.agent_config,
                     )
                     .await
                     {
@@ -569,6 +572,7 @@ impl ClaudeCodeAdapter {
                     &ctx.role,
                     Path::new(&ctx.worktree_path),
                     &subject,
+                    &ctx.agent_config,
                 )
                 .await
                 {

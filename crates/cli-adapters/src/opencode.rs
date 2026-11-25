@@ -648,9 +648,13 @@ impl HarnessAdapter for OpencodeAdapter {
         } else if let Some(worktrees) = group_worktrees.as_ref() {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
             for worktree in worktrees {
-                if let Err(error) =
-                    crate::commit::commit_worktree_changes_for_role(&ctx.role, worktree, &subject)
-                        .await
+                if let Err(error) = crate::commit::commit_worktree_changes_for_role(
+                    &ctx.role,
+                    worktree,
+                    &subject,
+                    &ctx.agent_config,
+                )
+                .await
                 {
                     return Ok(ExecutionResult {
                         status: ExecutionOutcome::Failed,
@@ -671,6 +675,7 @@ impl HarnessAdapter for OpencodeAdapter {
                 &ctx.role,
                 Path::new(&ctx.worktree_path),
                 &subject,
+                &ctx.agent_config,
             )
             .await
             .unwrap_or(None)

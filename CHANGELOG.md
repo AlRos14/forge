@@ -10,6 +10,13 @@ source version is 0.9.1.
 
 ### Added
 
+- Agent Executions in a repository Workspace now commit under a distinct Git
+  identity (`<role> (<agent name>)`, `agent+<role>.<short agent id>@agents.forge.invalid`)
+  injected through the harness process environment, with deterministic
+  `Agent-Role` and `Agent-Run` commit trailers added by a per-Execution
+  `commit-msg` hook. Agent-configured `GIT_*` identity or `GIT_CONFIG_*`
+  entries cannot override it. Forge's own integration and merge commits use the
+  fixed `Forge <forge@agents.forge.invalid>` identity.
 - Add durable Task repository scopes with `primary`, `affected`, and `context`
   roles. Task creation inherits the parent Task scope or Project primary unless
   repositories are supplied; an explicit empty list creates a repo-less Task.
@@ -50,6 +57,18 @@ source version is 0.9.1.
 - Preserve 0.9.1 single-repository TaskMerge, PublishPr, and PR admission when
   the new repository identity and batch columns are omitted; multi-repository
   Tasks still require exact repository and batch bindings.
+
+### Changed
+
+- Suspending or ending a Task RoleMembership no longer makes a current
+  coordination authorization stale. When the change only removes an active
+  member and the coordinator stays active, Forge refreshes the authorization in
+  the same transaction (new `authorization_version`, same mode, envelope and
+  coordinator) and records a system-provenance `task.coordination_authorized`
+  event referencing the previous Human authorization. Requests and plans bound
+  to the old version become unusable. Any widening (new or reactivated member,
+  role or capability change, coordinator removal) still returns
+  `coordination.authorization_stale` until a Human re-authorizes.
 
 ## [0.9.1] - 2026-11-18
 

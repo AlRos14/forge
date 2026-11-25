@@ -3133,6 +3133,23 @@ pub struct TaskCoordinationWrite {
     pub event: Option<DomainEvent>,
 }
 
+/// Pure-narrowing refresh of a Task coordination authorization, applied in the
+/// same `BEGIN IMMEDIATE` transaction as the RoleMembership change that
+/// removes a member from the active team. The repo re-validates every
+/// precondition and skips the refresh (leaving the authorization stale for a
+/// Human) when any of them no longer holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarrowTaskCoordinationInput {
+    pub task_id: String,
+    pub expected_coordination_version: i64,
+    pub expected_team_generation: i64,
+    pub expected_team_digest: String,
+    pub team_snapshot_json: String,
+    pub team_digest: String,
+    pub updated_at: String,
+    pub event: CreateDomainEvent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizeTaskCoordinationInput {
     pub task_id: String,

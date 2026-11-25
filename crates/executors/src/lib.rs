@@ -4,6 +4,7 @@ pub mod adapter;
 pub mod command;
 pub mod config;
 pub mod effective_policy;
+pub mod git_identity;
 pub mod log_reader;
 pub mod log_schema;
 mod log_storage;

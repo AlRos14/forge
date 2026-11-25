@@ -4757,6 +4757,96 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         Ok(sha256_hex(self.team_snapshot_json(team)?.as_bytes()))
     }
 
+    /// Applies a RoleMembership status change. When it only removes an active
+    /// member from the team (Active -> Suspended/Ended) of a currently
+    /// authorized, fresh coordination whose coordinator stays active, the
+    /// authorization is refreshed in the same transaction: new
+    /// `authorization_version`, same mode, envelope and coordinator, with
+    /// system provenance referencing the previous Human authorization. Any
+    /// other change leaves the authorization stale for a Human to re-authorize.
+    pub(crate) async fn update_membership_narrowing_authorization(
+        &self,
+        task_id: &str,
+        membership: &db::RoleMembership,
+        update: db::UpdateRoleMembership,
+    ) -> Result<db::RoleMembership> {
+        let narrowing = self
+            .narrowing_refresh_input(task_id, membership, &update)
+            .await?;
+        let (updated, event) =
+            RoleMembershipRepo::update_with_coordination_narrowing(&*self.db, update, narrowing)
+                .await?;
+        if let Some(event) = event.as_ref() {
+            self.domain_events.publish_committed(event);
+        }
+        Ok(updated)
+    }
+
+    async fn narrowing_refresh_input(
+        &self,
+        task_id: &str,
+        membership: &db::RoleMembership,
+        update: &db::UpdateRoleMembership,
+    ) -> Result<Option<db::NarrowTaskCoordinationInput>> {
+        if membership.status != RoleMembershipStatus::Active
+            || update.status == RoleMembershipStatus::Active
+        {
+            return Ok(None);
+        }
+        let Some(coordination) =
+            TaskCoordinationRepo::get_task_coordination(&*self.db, task_id).await?
+        else {
+            return Ok(None);
+        };
+        if coordination.revoked_at.is_some() || coordination.team_stale {
+            return Ok(None);
+        }
+        let mut team = self.current_team(task_id).await?;
+        if self.team_digest(&team)? != coordination.team_digest {
+            return Ok(None);
+        }
+        for role in &mut team {
+            role.members.retain(|member| member.id != membership.id);
+        }
+        let team_snapshot_json = self.team_snapshot_json(&team)?;
+        let team_digest = sha256_hex(team_snapshot_json.as_bytes());
+        let now = now_rfc3339();
+        let new_version = coordination.authorization_version + 1;
+        let mut event = self.event(
+            "task.coordination_authorized",
+            "task_coordination",
+            task_id,
+            "system",
+            None,
+            task_id,
+            json!({
+                "task_id": task_id,
+                "mode": coordination.mode.to_string(),
+                "authorization_version": new_version,
+                "team_digest": team_digest,
+                "envelope_digest": coordination.envelope_digest,
+                "refresh": "team_narrowing",
+                "previous_authorization_version": coordination.authorization_version,
+                "previous_authorized_by": coordination.requested_by,
+                "removed_role_membership_id": membership.id,
+            }),
+            &now,
+        );
+        event.dedupe_key = Some(format!(
+            "task.coordination_authorized:{task_id}:{new_version}"
+        ));
+        Ok(Some(db::NarrowTaskCoordinationInput {
+            task_id: task_id.to_owned(),
+            expected_coordination_version: coordination.authorization_version,
+            expected_team_generation: coordination.team_generation,
+            expected_team_digest: coordination.team_digest,
+            team_snapshot_json,
+            team_digest,
+            updated_at: now,
+            event,
+        }))
+    }
+
     async fn actor_display(&self, actor: &ActorRef) -> Result<(String, Option<String>)> {
         match actor {
             ActorRef::Human(id) => {

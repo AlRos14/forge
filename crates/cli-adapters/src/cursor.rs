@@ -710,7 +710,9 @@ impl HarnessAdapter for CursorAdapter {
         {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
             for worktree in worktrees {
-                if let Err(error) = crate::commit::commit_worktree_changes(worktree, &subject).await
+                if let Err(error) =
+                    crate::commit::commit_worktree_changes(worktree, &subject, &ctx.agent_config)
+                        .await
                 {
                     return Ok(ExecutionResult {
                         status: ExecutionOutcome::Failed,
@@ -729,9 +731,13 @@ impl HarnessAdapter for CursorAdapter {
             && let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
         {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
-            crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
-                .await
-                .unwrap_or(None)
+            crate::commit::commit_worktree_changes(
+                Path::new(&ctx.worktree_path),
+                &subject,
+                &ctx.agent_config,
+            )
+            .await
+            .unwrap_or(None)
         } else {
             None
         };

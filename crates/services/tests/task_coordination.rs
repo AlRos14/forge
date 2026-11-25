@@ -611,6 +611,144 @@ async fn team_mutation_marks_the_authorization_stale() {
     assert!(error.to_string().contains("authorization_stale"));
 }
 
+async fn membership_of(fixture: &Fixture, role: &str) -> db::RoleMembership {
+    let task_service = TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)));
+    let task_role = task_service
+        .task_role_for_task(&fixture.task_id, role)
+        .await
+        .expect("TaskRole");
+    RoleMembershipRepo::list_by_role(&*fixture.db, &task_role.id, false)
+        .await
+        .expect("memberships")
+        .into_iter()
+        .next()
+        .expect("active membership")
+}
+
+async fn end_membership(fixture: &Fixture, membership: &db::RoleMembership) {
+    TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)))
+        .update_task_role_member(
+            &fixture.task_id,
+            &membership.id,
+            membership.version,
+            db::RoleMembershipStatus::Ended,
+        )
+        .await
+        .expect("membership ends");
+}
+
+async fn request_turn_at(fixture: &Fixture, version: i64, key: &str) -> Result<(), String> {
+    fixture
+        .service
+        .request_turn(
+            &fixture.task_id,
+            &fixture.user_id,
+            TurnRequestInput {
+                expected_task_version: fixture.task_version,
+                expected_coordination_version: version,
+                brief: CoordinationBrief {
+                    objective: "Use the current authorization".to_owned(),
+                    ..CoordinationBrief::default()
+                },
+                idempotency_key: key.to_owned(),
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[tokio::test]
+async fn narrowing_a_team_refreshes_the_authorization_without_a_human() {
+    let fixture = fixture("narrow").await;
+    let before = db::TaskCoordinationRepo::get_task_coordination(&*fixture.db, &fixture.task_id)
+        .await
+        .expect("coordination")
+        .expect("coordination row");
+    let reviewer = membership_of(&fixture, "reviewer").await;
+    end_membership(&fixture, &reviewer).await;
+    let after = db::TaskCoordinationRepo::get_task_coordination(&*fixture.db, &fixture.task_id)
+        .await
+        .expect("coordination")
+        .expect("coordination row");
+    assert!(!after.team_stale);
+    assert_eq!(
+        after.authorization_version,
+        before.authorization_version + 1
+    );
+    assert_eq!(after.mode, before.mode);
+    assert_eq!(after.envelope_json, before.envelope_json);
+    assert_eq!(after.envelope_digest, before.envelope_digest);
+    assert_eq!(after.coordinator_actor, before.coordinator_actor);
+    assert_eq!(
+        after.coordinator_task_role_id,
+        before.coordinator_task_role_id
+    );
+    assert_eq!(after.requested_by, before.requested_by);
+    assert_ne!(after.team_digest, before.team_digest);
+    let event = DomainEventRepo::get_event_by_dedupe(
+        &*fixture.db,
+        &format!(
+            "task.coordination_authorized:{}:{}",
+            fixture.task_id, after.authorization_version
+        ),
+    )
+    .await
+    .expect("event lookup")
+    .expect("refresh event");
+    assert_eq!(event.actor_type, "system");
+    assert!(event
+        .payload_json
+        .contains("previous_authorization_version"));
+    // Work bound to the previous authorization version is unusable.
+    let old = request_turn_at(&fixture, before.authorization_version, "old-version").await;
+    assert!(old.is_err(), "old authorization version must be rejected");
+    let current = request_turn_at(&fixture, after.authorization_version, "new-version").await;
+    assert!(current.is_ok(), "{current:?}");
+}
+
+#[tokio::test]
+async fn widening_a_team_keeps_the_authorization_stale() {
+    let fixture = fixture("widen").await;
+    TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)))
+        .add_task_role_member(
+            &fixture.task_id,
+            "reviewer",
+            api_types::ActorRef::Human(fixture.user_id.clone()),
+        )
+        .await
+        .expect("member is added");
+    let coordination =
+        db::TaskCoordinationRepo::get_task_coordination(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("coordination")
+            .expect("coordination row");
+    assert!(coordination.team_stale);
+    assert_eq!(coordination.authorization_version, 2);
+    let error = request_turn_at(&fixture, 2, "widened")
+        .await
+        .expect_err("widened team requires a Human");
+    assert!(error.contains("authorization_stale"), "{error}");
+}
+
+#[tokio::test]
+async fn removing_the_coordinator_keeps_the_authorization_stale() {
+    let fixture = fixture("coordinator-removed").await;
+    let coordinator = membership_of(&fixture, "planner").await;
+    end_membership(&fixture, &coordinator).await;
+    let coordination =
+        db::TaskCoordinationRepo::get_task_coordination(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("coordination")
+            .expect("coordination row");
+    assert!(coordination.team_stale);
+    assert_eq!(coordination.authorization_version, 2);
+    let error = request_turn_at(&fixture, 2, "no-coordinator")
+        .await
+        .expect_err("coordinator removal requires a Human");
+    assert!(error.contains("authorization_stale"), "{error}");
+}
+
 #[tokio::test]
 async fn coordination_wake_and_request_link_in_one_transaction() {
     let fixture = fixture("wake-link").await;

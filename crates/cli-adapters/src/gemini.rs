@@ -543,7 +543,9 @@ impl HarnessAdapter for GeminiAdapter {
         {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
             for worktree in worktrees {
-                if let Err(error) = crate::commit::commit_worktree_changes(worktree, &subject).await
+                if let Err(error) =
+                    crate::commit::commit_worktree_changes(worktree, &subject, &ctx.agent_config)
+                        .await
                 {
                     return Ok(ExecutionResult {
                         status: ExecutionOutcome::Failed,
@@ -562,8 +564,12 @@ impl HarnessAdapter for GeminiAdapter {
             && group_worktrees.is_none()
         {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
-            match crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
-                .await
+            match crate::commit::commit_worktree_changes(
+                Path::new(&ctx.worktree_path),
+                &subject,
+                &ctx.agent_config,
+            )
+            .await
             {
                 Ok(Some(sha)) => Some(sha),
                 Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))

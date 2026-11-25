@@ -2856,6 +2856,15 @@ pub trait RoleMembershipRepo: Send + Sync {
         &self,
         input: UpdateRoleMembership,
     ) -> std::result::Result<RoleMembership, crate::DbError>;
+    /// Updates a membership and, when `narrowing` still holds inside the same
+    /// `BEGIN IMMEDIATE` transaction, refreshes the Task coordination
+    /// authorization (new version, same mode/envelope/coordinator). Returns the
+    /// refresh event when the refresh was applied.
+    async fn update_with_coordination_narrowing(
+        &self,
+        input: UpdateRoleMembership,
+        narrowing: Option<NarrowTaskCoordinationInput>,
+    ) -> std::result::Result<(RoleMembership, Option<DomainEvent>), crate::DbError>;
 }
 
 #[derive(Debug, Clone)]

@@ -314,8 +314,9 @@ impl TaskExecutor for AdapterExecutor {
             ExecutorError::Other(format!("No adapter registered for executor type: {kind}"))
         })?;
         let config = adapter.normalize_config(&raw_config, &ExecutionOverrides::default())?;
-        let invocation_config =
+        let mut invocation_config =
             crate::config::with_runtime_environment(&config, &ctx.agent_config)?;
+        crate::git_identity::apply_trailer_hooks(&mut invocation_config, &ctx.logs_path)?;
         let capabilities = adapter.capabilities(&config);
         let policy_interpretation = adapter.interpret_execution_policy(&config);
         let effective_policy = crate::effective_policy::from_harness_interpretation(
@@ -758,8 +759,9 @@ impl TaskExecutor for FallbackExecutor {
                     break 'chain None; // fall through to the registry error below
                 };
 
-                let invocation_config =
+                let mut invocation_config =
                     crate::config::with_runtime_environment(&candidate.config, &ctx.agent_config)?;
+                crate::git_identity::apply_trailer_hooks(&mut invocation_config, &ctx.logs_path)?;
                 if matches!(
                     adapter.detect(&invocation_config).status,
                     AvailabilityStatus::NotFound

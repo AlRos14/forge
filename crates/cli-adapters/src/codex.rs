@@ -759,7 +759,8 @@ impl CodexAdapter {
         let after_sha = if let Some(worktrees) = group_worktrees {
             for worktree in worktrees {
                 if let Err(error) =
-                    crate::commit::commit_worktree_changes(&worktree, &subject).await
+                    crate::commit::commit_worktree_changes(&worktree, &subject, &ctx.agent_config)
+                        .await
                 {
                     return Ok(ExecutionResult {
                         status: ExecutionOutcome::Failed,
@@ -775,8 +776,12 @@ impl CodexAdapter {
             }
             None
         } else {
-            match crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
-                .await
+            match crate::commit::commit_worktree_changes(
+                Path::new(&ctx.worktree_path),
+                &subject,
+                &ctx.agent_config,
+            )
+            .await
             {
                 Ok(Some(sha)) => Some(sha),
                 Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))

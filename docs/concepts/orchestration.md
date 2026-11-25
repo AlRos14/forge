@@ -161,6 +161,21 @@ Artifact inputs before creating WorkUnits in one transaction with an idempotent
 receipt. `manual` remains the default. See the
 [PR0 contract](../plans/pr0-task-coordination-contract.md).
 
+Any team change (RoleMembership, TaskRole or capability) marks the authorization
+stale (`coordination.authorization_stale`) until a Human re-authorizes. The one
+exception is a pure narrowing: when a currently authorized, non-stale,
+unrevoked coordination only loses an active member (RoleMembership
+`active` → `suspended`/`ended`) and the coordinator membership stays active,
+Forge refreshes the authorization inside the membership-change
+`BEGIN IMMEDIATE` transaction. The refresh increments `authorization_version`
+and replaces the team snapshot and digest, keeping the same mode, envelope,
+coordinator and `requested_by`; a `task.coordination_authorized` event with
+actor `system` and `refresh: team_narrowing` references the previous version and
+authorization. Requests and plans bound to the old version cannot be approved or
+materialized. Additions, reactivations, role or capability changes, coordinator
+removal, and authorizations that originate from an active Project batch stay
+stale for a Human.
+
 ## Coordinator mediation of review findings
 
 New guided authorizations set `orchestrator_reviews_findings: true`. Previously

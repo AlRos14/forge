@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
-    ActorKind, CoordinationMode, CreateRoleMembership, CreateTaskRole, DbError, RoleMembership,
-    RoleMembershipRepo, RoleMembershipStatus, TaskRole, TaskRoleCapabilityConfiguration,
+    ActorKind, CoordinationMode, CreateRoleMembership, CreateTaskRole, DbError, DomainEvent,
+    DomainEventRepo, NarrowTaskCoordinationInput, RoleMembership, RoleMembershipRepo,
+    RoleMembershipStatus, TaskRole, TaskRoleCapabilityConfiguration,
     TaskRoleCapabilityConfigurationRepo, TaskRoleRepo, UpdateRoleMembership, UpdateTaskRole,
     UpdateTaskRoleWithConfiguration,
 };
@@ -523,5 +524,119 @@ impl RoleMembershipRepo for SqliteDb {
             });
         }
         self.get(&input.id).await?.ok_or(DbError::NotFound)
+    }
+
+    async fn update_with_coordination_narrowing(
+        &self,
+        input: UpdateRoleMembership,
+        narrowing: Option<NarrowTaskCoordinationInput>,
+    ) -> crate::Result<(RoleMembership, Option<DomainEvent>)> {
+        let Some(narrowing) = narrowing else {
+            return Ok((RoleMembershipRepo::update(self, input).await?, None));
+        };
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // The authorization must be current, fresh and unrevoked *before* the
+        // change; the team triggers mark it stale as part of the update below.
+        let eligible: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM role_membership m
+                JOIN task_role r ON r.id=m.task_role_id
+                JOIN task_coordination c ON c.task_id=r.task_id
+                WHERE m.id=? AND m.version=? AND m.status='active' AND r.task_id=?
+                  AND c.authorization_version=? AND c.team_generation=?
+                  AND c.team_stale=0 AND c.revoked_at IS NULL AND c.team_digest=?
+                  AND NOT EXISTS(
+                      SELECT 1 FROM project_plan_batch_coordination_authorization origin
+                      JOIN project_plan_batch batch ON batch.id=origin.batch_id
+                       AND batch.project_id=origin.project_id
+                      WHERE origin.task_id=c.task_id
+                        AND origin.authorization_version=c.authorization_version
+                        AND batch.state IN ('running','paused'))
+            )",
+        )
+        .bind(&input.id)
+        .bind(input.expected_version)
+        .bind(&narrowing.task_id)
+        .bind(narrowing.expected_coordination_version)
+        .bind(narrowing.expected_team_generation)
+        .bind(&narrowing.expected_team_digest)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_role_sqlx_error)?;
+        let ended_at = match input.status {
+            RoleMembershipStatus::Ended => Some(input.ended_at.unwrap_or_else(crate::now_rfc3339)),
+            RoleMembershipStatus::Active | RoleMembershipStatus::Suspended => None,
+        };
+        let result = sqlx::query(
+            "UPDATE role_membership
+             SET status = ?, version = version + 1, updated_at = ?, ended_at = ?
+             WHERE id = ? AND version = ?",
+        )
+        .bind(input.status.to_string())
+        .bind(&input.updated_at)
+        .bind(ended_at)
+        .bind(&input.id)
+        .bind(input.expected_version)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_role_sqlx_error)?;
+        if result.rows_affected() == 0 {
+            let exists: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM role_membership WHERE id = ?")
+                    .bind(&input.id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(map_role_sqlx_error)?;
+            return Err(if exists == 0 {
+                DbError::NotFound
+            } else {
+                DbError::VersionConflict
+            });
+        }
+        // A coordinator that left the active team is never narrowed away: the
+        // coordinator membership must still be active after the change.
+        let coordinator_active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_coordination c
+                WHERE c.task_id=?
+                  AND (c.coordinator_task_role_id IS NULL
+                       OR EXISTS(SELECT 1 FROM role_membership m
+                                 WHERE m.task_role_id=c.coordinator_task_role_id
+                                   AND m.actor_kind=c.coordinator_actor_kind
+                                   AND m.actor_id=c.coordinator_actor_id
+                                   AND m.status='active'))
+            )",
+        )
+        .bind(&narrowing.task_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_role_sqlx_error)?;
+        let mut event = None;
+        if eligible && coordinator_active {
+            let refreshed = sqlx::query(
+                "UPDATE task_coordination
+                 SET authorization_version = authorization_version + 1,
+                     team_snapshot_json = ?, team_digest = ?, team_stale = 0,
+                     updated_at = ?
+                 WHERE task_id = ? AND authorization_version = ?
+                   AND revoked_at IS NULL",
+            )
+            .bind(&narrowing.team_snapshot_json)
+            .bind(&narrowing.team_digest)
+            .bind(&narrowing.updated_at)
+            .bind(&narrowing.task_id)
+            .bind(narrowing.expected_coordination_version)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_role_sqlx_error)?;
+            if refreshed.rows_affected() == 1 {
+                event = Some(
+                    DomainEventRepo::append_event_in_tx(self, &mut tx, &narrowing.event).await?,
+                );
+            }
+        }
+        tx.commit().await?;
+        let membership = self.get(&input.id).await?.ok_or(DbError::NotFound)?;
+        Ok((membership, event))
     }
 }

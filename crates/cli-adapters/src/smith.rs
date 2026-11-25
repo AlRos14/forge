@@ -412,7 +412,7 @@ impl HarnessAdapter for SmithAdapter {
         {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
             for worktree in worktrees {
-                crate::commit::commit_worktree_changes(worktree, &subject)
+                crate::commit::commit_worktree_changes(worktree, &subject, &ctx.agent_config)
                     .await
                     .map_err(|error| {
                         ExecutorError::Other(format!(
@@ -426,11 +426,15 @@ impl HarnessAdapter for SmithAdapter {
             && let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
         {
             let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
-            crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
-                .await
-                .map_err(|err| {
-                    ExecutorError::Other(format!("failed to commit worktree changes: {err}"))
-                })?
+            crate::commit::commit_worktree_changes(
+                Path::new(&ctx.worktree_path),
+                &subject,
+                &ctx.agent_config,
+            )
+            .await
+            .map_err(|err| {
+                ExecutorError::Other(format!("failed to commit worktree changes: {err}"))
+            })?
         } else {
             None
         };

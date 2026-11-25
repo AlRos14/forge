@@ -123,6 +123,35 @@ resume fails explicitly. Start may advance through the configured fallback
 route, and its actual winner's candidate and capability evidence are stored on
 the Execution and any newly established HarnessSession.
 
+## Git attribution
+
+An Agent Execution that has a repository Workspace runs Git as its own author
+and committer, derived from the Agent Actor and the Execution's TaskRole:
+
+- name `<role> (<agent display name>)`;
+- email `agent+<role>.<first 8 agent id characters>@agents.forge.invalid`, a
+  reserved non-routable domain.
+
+Forge injects `GIT_AUTHOR_*` and `GIT_COMMITTER_*` plus `FORGE_AGENT_ROLE` and
+`FORGE_EXECUTION_ID` through the in-memory `runtime_env` of the invocation
+snapshot. `runtime_env` is applied after Agent-configured `env`, so an Agent
+cannot substitute a human identity; Agent-authored `GIT_CONFIG_*` entries are
+dropped. The values are not persisted in the Execution snapshot; they are
+recomputable from the Execution's Agent, role, and id and are visible in the
+resulting commits.
+
+Commits carry the trailers `Agent-Role: <role>` and `Agent-Run: <execution id>`.
+For commits made by the harness, a per-Execution `commit-msg` hook directory
+(next to the Execution log, never inside a repository or worktree) is selected
+with `GIT_CONFIG_COUNT`/`core.hooksPath` process environment and runs
+`git interpret-trailers --if-exists replace`; it chains to the repository's own
+hooks. The user's own repositories and shells are unaffected. Forge's adapter
+auto-commit appends the same trailers and identity directly.
+
+Deterministic Git operations performed by Forge itself (integration and merge
+commits, rebases) use the fixed `Forge <forge@agents.forge.invalid>` identity
+instead of the machine's global Git identity.
+
 ## Recovery
 
 Restart recovery uses the persisted Execution, lease, workspace, and session

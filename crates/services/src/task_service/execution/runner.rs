@@ -4,6 +4,26 @@ use std::path::Path;
 const EXECUTION_LOG_BATCH_MAX_ENTRIES: usize = 50;
 const EXECUTION_LOG_BATCH_MAX_WAIT: Duration = Duration::from_millis(500);
 
+/// Merge the Execution Git identity into `runtime_env`. Existing identity
+/// keys are replaced so Agent-authored configuration cannot supply a human
+/// identity.
+fn merge_agent_git_identity(
+    agent_config: &mut Value,
+    identity: &executors::git_identity::AgentGitIdentity,
+) -> Result<()> {
+    let runtime_env = agent_config
+        .as_object_mut()
+        .map(|snapshot| snapshot.entry("runtime_env").or_insert_with(|| json!({})))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            ServiceError::invalid_operation("executor config snapshot is not injectable")
+        })?;
+    for (key, value) in identity.runtime_env() {
+        runtime_env.insert(key, value);
+    }
+    Ok(())
+}
+
 fn provider_start_receipt_event(execution: &Execution, event_type: &str) -> db::CreateDomainEvent {
     let actor = execution.actor_ref();
     db::CreateDomainEvent {
@@ -436,6 +456,29 @@ impl TaskService {
         }
     }
 
+    /// Attach the Execution's Git attribution to the in-memory invocation
+    /// snapshot. It rides in `runtime_env`, which overrides Agent-configured
+    /// `env` and is never persisted or published.
+    async fn inject_agent_git_identity(
+        &self,
+        execution: &db::Execution,
+        agent_config: &mut Value,
+    ) -> Result<()> {
+        let Some(agent_id) = execution.agent_id.as_deref() else {
+            return Ok(());
+        };
+        let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_identity", agent_id.to_owned()))?;
+        let identity = executors::git_identity::AgentGitIdentity::new(
+            &execution.role,
+            &agent.name,
+            &agent.id,
+            &execution.id,
+        );
+        merge_agent_git_identity(agent_config, &identity)
+    }
+
     pub async fn run_execution(
         &self,
         execution_id: impl Into<String>,
@@ -497,6 +540,10 @@ impl TaskService {
                     )
                 })?
                 .inject_snapshot_credential_env(&mut agent_config)
+                .await?;
+        }
+        if !working_context.workspaces.is_empty() {
+            self.inject_agent_git_identity(&execution, &mut agent_config)
                 .await?;
         }
         let max_turns = self.resolve_max_turns(&task).await?;
@@ -2374,5 +2421,30 @@ mod usage_tests {
         ensure_snapshot_credential_transport(&provider, &uncredentialed)
             .expect("uncredentialed remote execution retains existing transport");
         assert!(outbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn execution_git_identity_overrides_agent_configured_identity() {
+        let mut snapshot = json!({
+            "config": {"env": {"GIT_AUTHOR_EMAIL": "human@example.com"}},
+            "runtime_env": {"GIT_COMMITTER_EMAIL": "human@example.com", "OTHER": "kept"},
+        });
+        let identity = executors::git_identity::AgentGitIdentity::new(
+            "implementer",
+            "Codex",
+            "agent-1234567890",
+            "exec-1",
+        );
+        merge_agent_git_identity(&mut snapshot, &identity).expect("injects");
+        let env = &snapshot["runtime_env"];
+        assert_eq!(env["GIT_AUTHOR_NAME"], "implementer (Codex)");
+        assert_eq!(
+            env["GIT_AUTHOR_EMAIL"],
+            "agent+implementer.agent123@agents.forge.invalid"
+        );
+        assert_eq!(env["GIT_COMMITTER_EMAIL"], env["GIT_AUTHOR_EMAIL"]);
+        assert_eq!(env["FORGE_AGENT_ROLE"], "implementer");
+        assert_eq!(env["FORGE_EXECUTION_ID"], "exec-1");
+        assert_eq!(env["OTHER"], "kept");
     }
 }

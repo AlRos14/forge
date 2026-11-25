@@ -433,8 +433,13 @@ impl TaskService {
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
         let updated_at = now_rfc3339();
         let ended_at = (status == RoleMembershipStatus::Ended).then(|| updated_at.clone());
-        let updated = RoleMembershipRepo::update(
-            &*self.db,
+        let updated = crate::task_coordination::TaskCoordinationService::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+        )
+        .update_membership_narrowing_authorization(
+            task_id,
+            &membership,
             UpdateRoleMembership {
                 id: membership.id.clone(),
                 expected_version,

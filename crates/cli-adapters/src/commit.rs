@@ -8,6 +8,7 @@ const SUBJECT_TEXT_LIMIT: usize = 72;
 pub async fn commit_worktree_changes(
     worktree: &Path,
     message_subject: &str,
+    agent_config: &serde_json::Value,
 ) -> Result<Option<String>, ExecutorError> {
     let status = run_git(worktree, &["status", "--porcelain"]).await?;
     if status.trim().is_empty() {
@@ -15,7 +16,11 @@ pub async fn commit_worktree_changes(
     }
 
     run_git(worktree, &["add", "-A"]).await?;
-    run_git(
+    // Attribute the adapter commit to the Execution's Agent identity and add
+    // the deterministic trailers; both are absent for non-Agent invocations.
+    let message = executors::git_identity::message_with_trailers(message_subject, agent_config);
+    let identity_env = executors::git_identity::commit_environment(agent_config);
+    run_git_with_env(
         worktree,
         &[
             "-c",
@@ -26,8 +31,9 @@ pub async fn commit_worktree_changes(
             "commit.gpgsign=false",
             "commit",
             "-m",
-            message_subject,
+            &message,
         ],
+        &identity_env,
     )
     .await?;
 
@@ -41,11 +47,12 @@ pub async fn commit_worktree_changes_for_role(
     role: &str,
     worktree: &Path,
     message_subject: &str,
+    agent_config: &serde_json::Value,
 ) -> Result<Option<String>, ExecutorError> {
     if role == "project_copilot" {
         return Ok(None);
     }
-    commit_worktree_changes(worktree, message_subject).await
+    commit_worktree_changes(worktree, message_subject, agent_config).await
 }
 
 pub fn build_commit_subject(task_description: Option<&str>, fallback_title: &str) -> String {
@@ -60,10 +67,19 @@ pub fn build_commit_subject(task_description: Option<&str>, fallback_title: &str
 }
 
 async fn run_git(worktree: &Path, args: &[&str]) -> Result<String, ExecutorError> {
+    run_git_with_env(worktree, args, &[]).await
+}
+
+async fn run_git_with_env(
+    worktree: &Path,
+    args: &[&str],
+    env: &[(String, String)],
+) -> Result<String, ExecutorError> {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree)
         .args(args)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -104,7 +120,7 @@ mod tests {
         fs::write(tempdir.path().join("changed.txt"), "changed\n").expect("file writes");
 
         let subject = build_commit_subject(Some("Implement the thing\n\nDetails"), "Fallback");
-        let sha = commit_worktree_changes(tempdir.path(), &subject)
+        let sha = commit_worktree_changes(tempdir.path(), &subject, &serde_json::json!({}))
             .await
             .expect("commit succeeds")
             .expect("dirty worktree creates commit");
@@ -115,11 +131,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adapter_commit_uses_agent_identity_and_trailers() {
+        let tempdir = tempfile::tempdir().expect("tempdir creates");
+        init_repo(tempdir.path()).await;
+        fs::write(tempdir.path().join("changed.txt"), "changed\n").expect("file writes");
+        let config = serde_json::json!({"env": {
+            "GIT_AUTHOR_NAME": "worker (Codex)",
+            "GIT_AUTHOR_EMAIL": "agent+worker.abcd1234@agents.forge.invalid",
+            "GIT_COMMITTER_NAME": "worker (Codex)",
+            "GIT_COMMITTER_EMAIL": "agent+worker.abcd1234@agents.forge.invalid",
+            "FORGE_AGENT_ROLE": "worker",
+            "FORGE_EXECUTION_ID": "exec-9",
+        }});
+
+        commit_worktree_changes(tempdir.path(), "agent: change", &config)
+            .await
+            .expect("commit succeeds")
+            .expect("dirty worktree creates commit");
+
+        let author = git_output(tempdir.path(), &["log", "-1", "--pretty=%an <%ae>"]).await;
+        let committer = git_output(tempdir.path(), &["log", "-1", "--pretty=%cn <%ce>"]).await;
+        let body = git_output(tempdir.path(), &["log", "-1", "--pretty=%B"]).await;
+        assert_eq!(
+            author,
+            "worker (Codex) <agent+worker.abcd1234@agents.forge.invalid>"
+        );
+        assert_eq!(committer, author);
+        assert!(body.contains("Agent-Role: worker"));
+        assert!(body.contains("Agent-Run: exec-9"));
+    }
+
+    #[tokio::test]
     async fn clean_worktree_returns_none() {
         let tempdir = tempfile::tempdir().expect("tempdir creates");
         init_repo(tempdir.path()).await;
 
-        let sha = commit_worktree_changes(tempdir.path(), "agent: noop")
+        let sha = commit_worktree_changes(tempdir.path(), "agent: noop", &serde_json::json!({}))
             .await
             .expect("clean check succeeds");
 
@@ -130,10 +177,14 @@ mod tests {
     async fn project_copilot_context_skips_git_operations_in_empty_directory() {
         let tempdir = tempfile::tempdir().expect("tempdir creates");
 
-        let sha =
-            commit_worktree_changes_for_role("project_copilot", tempdir.path(), "copilot turn")
-                .await
-                .expect("management context does not invoke git");
+        let sha = commit_worktree_changes_for_role(
+            "project_copilot",
+            tempdir.path(),
+            "copilot turn",
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("management context does not invoke git");
 
         assert_eq!(sha, None);
     }
