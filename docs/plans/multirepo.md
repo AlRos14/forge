@@ -2956,3 +2956,33 @@ ejecución.
 escriben una revisión nueva del conjunto con el writer existente en lugar de
 mutar el catálogo directamente; la sincronización del catálogo conserva como
 `context` las filas retiradas que la historia todavía referencia.
+
+## Hallazgos del E2E FP-2026-003
+
+E2E real sobre seis repositorios FirePOS (servidor de pruebas, modo
+`pull_request` real). Cada hallazgo se valida solo en CI.
+
+### Corregidos en 0.9.2
+
+| # | Hallazgo | Corrección |
+|---|---|---|
+| E1 | No se podían añadir repos no primarios por REST (409) | `POST /projects/{id}/repos` crea repos adicionales no primarios |
+| E2 | La UI no listaba ni añadía repos adicionales | Settings → Repos lista todos y permite añadir |
+| E3 | `PATCH` de RoleMembership devolvía 500 | La ruta extrae el segmento del rol |
+| E4 | Los planes del coordinador no acotaban WorkUnits por repo | `repository_ids` por WorkUnit, validado contra el conjunto escribible |
+| E5 | Una petición de coordinación quedaba atascada sin avisar si el wake fallaba antes del intento | La petición pasa a `failed` con código y mensaje |
+| E6 | La documentación decía que Claude Code podía coordinar | Coordinación automática solo con Codex CLI |
+| E7 | Los agentes hacían commit con la identidad global de la máquina | Autor y committer por Agent y rol, trailers `Agent-Role`/`Agent-Run`, identidad fija para los commits de Forge |
+| E8 | Retirar un miembro obligaba a reautorizar la coordinación | El estrechamiento puro refresca la autorización en la misma transacción |
+| E9 | Un plan con `repository_ids` y `requires_integration: false` se aceptaba y habría ejecutado implementadores sin workspace | Validación del plan y plantilla del coordinador que explica el campo |
+
+### Pendientes (0.9.3 o posterior)
+
+| # | Hallazgo | Dirección |
+|---|---|---|
+| P1 | Settings no muestra qué Agents trabajan en un Project | Vista de Agents por Project |
+| P2 | El equipo se monta Task a Task | Equipo por defecto en el Project |
+| P3 | Las decisiones humanas llegan como interrupciones sueltas | Bandeja de decisiones con fichas preparadas |
+| P4 | La autonomía es todo o nada | Nivel de autonomía por Project o Task ligado a la clase de riesgo |
+| P5 | Los agentes comparten la credencial del host con el humano | Identidad nivel 2: cuenta o token propio por Agent |
+| P6 | La decisión humana de alcance del ledger no llega al coordinador como referencia | Pasar el identificador de la decisión en el contexto de coordinación |

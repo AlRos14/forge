@@ -103,6 +103,26 @@ fn validate_plan_repository_ids(
     Ok(())
 }
 
+/// `requires_integration == false` means a non-repository WorkUnit (no
+/// repository Workspace, no lease, result not integrated). Explicit
+/// `repository_ids` on such a unit would run an implementer in an empty
+/// context. Formal review WorkUnits never require integration and are exempt.
+fn validate_plan_repository_integration(unit: &PlanWorkUnit) -> Result<()> {
+    if !unit.repository_ids.is_empty()
+        && !unit.requires_integration
+        && unit.review_subject_key.is_none()
+    {
+        return Err(coordination_error(
+            "coordination.plan_repository_requires_integration",
+            format!(
+                "WorkUnit {:?} lists repository_ids but sets requires_integration to false, which makes it a non-repository WorkUnit with no Workspace and no commits; set requires_integration to true for work that changes repository content, or remove repository_ids for non-repository work",
+                unit.key
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -3580,8 +3600,9 @@ Task context: {context}"#,
             "You are the selected Task coordinator for one bounded preparation turn. This execution is read-only and must not modify repository files, create WorkUnits, call provider APIs, or grant authority.\n\
 Return exactly one JSON object and no markdown fences. The object must match this schema:\n\
 Each `work_units` entry may include `repository_ids`, an array of exact writable repository IDs. Omit it or use `[]` to select every writable repository in the effective Task repository set; `context` repositories are read-only and rejected. During a coordinator replan, IDs are validated against the proposed `repository_set` when supplied, otherwise against the current Task set.\n\
-{{\"schema_version\":1,\"request_id\":{request_id},\"task_id\":{task_id},\"task_version\":{task_version},\"authorization_version\":{authorization_version},\"team_digest\":{team_digest},\"envelope_digest\":{envelope_digest},\"objective_digest\":{objective_digest},\"work_units\":[{{\"key\":\"stable-key\",\"title\":\"...\",\"scope\":\"...\",\"role\":\"exact existing TaskRole role name\",\"assigned_actor\":{{\"kind\":\"agent|human\",\"id\":\"exact eligible member id\"}}|null,\"parent_key\":null,\"depends_on\":[],\"requires_integration\":false,\"execution_instructions\":null,\"review_subject_key\":null,\"acceptance\":[],\"artifact_inputs\":[],\"repository_ids\":[]}}],\"delivery\":null,\"review\":null,\"limits\":null}}\n\
+{{\"schema_version\":1,\"request_id\":{request_id},\"task_id\":{task_id},\"task_version\":{task_version},\"authorization_version\":{authorization_version},\"team_digest\":{team_digest},\"envelope_digest\":{envelope_digest},\"objective_digest\":{objective_digest},\"work_units\":[{{\"key\":\"stable-key\",\"title\":\"...\",\"scope\":\"...\",\"role\":\"exact existing TaskRole role name\",\"assigned_actor\":{{\"kind\":\"agent|human\",\"id\":\"exact eligible member id\"}}|null,\"parent_key\":null,\"depends_on\":[],\"requires_integration\":true,\"execution_instructions\":null,\"review_subject_key\":null,\"acceptance\":[],\"artifact_inputs\":[],\"repository_ids\":[]}}],\"delivery\":null,\"review\":null,\"limits\":null}}\n\
 Optional `repository_set` has shape `[{{\"repo_id\":\"exact Project repo id\",\"role\":\"primary|affected|context\"}}]`. Include it only for a coordinator replan that proposes a repository change; it replaces the complete set, must preserve the primary repository, and requires the exact Human decision before materialization. Omit it when unchanged.\n\
+`requires_integration` must be `true` for every WorkUnit that changes repository content: it receives a repository Workspace, and its exact result must be integrated before dependents run. Use `false` only for non-repository work (research, planning notes), which gets no repository Workspace, no lease, and no integration, and must not list `repository_ids`. A non-review WorkUnit with `repository_ids` and `requires_integration:false` is rejected (`coordination.plan_repository_requires_integration`); formal review WorkUnits are never integrated.\n\
 Create at most {max_work_units} WorkUnits. Use only TaskRole names and active members listed in the team. A formal review WorkUnit must use a TaskRole with the `formal_review` capability, set review_subject_key to another planned key, and must use a fresh role-isolated native session; the same Agent profile is allowed, but a Human contributor cannot review their own result. The review role must also appear in the envelope's allowed_review_roles by its exact role name. Do not create, rename, or grant TaskRoles, memberships, or capabilities. Do not request external actions or merge. A plan outside the envelope will wait for Human approval.\n\
 Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {acceptance}\nContext: {context}\nEnvelope: {envelope_json}\nTeam: {team}\nTask repositories (id, name, role): {task_repositories}\nCurrent Task context: {task_context}",
             request_id = serde_json::to_string(&request.id).unwrap(),
@@ -5088,6 +5109,7 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         let mut keys = HashSet::new();
         for unit in &plan.work_units {
             validate_plan_repository_ids(&unit.repository_ids, &writable_repository_ids)?;
+            validate_plan_repository_integration(unit)?;
             if !bounded(&unit.key, 128) || !keys.insert(unit.key.clone()) {
                 return Err(invalid_plan("WorkUnit keys must be unique and bounded"));
             }
@@ -5846,6 +5868,31 @@ mod tests {
             &writable
         )
         .is_err());
+    }
+
+    fn repo_unit(requires_integration: bool, review: Option<&str>, repos: &[&str]) -> PlanWorkUnit {
+        let mut unit = plan_with(&[("impl", &[])]).work_units.remove(0);
+        unit.requires_integration = requires_integration;
+        unit.review_subject_key = review.map(str::to_owned);
+        unit.repository_ids = repos.iter().map(|id| (*id).to_owned()).collect();
+        unit
+    }
+
+    #[test]
+    fn plan_repository_ids_require_integration_for_non_review_units() {
+        let error = validate_plan_repository_integration(&repo_unit(false, None, &["repo-a"]))
+            .expect_err("repository ids without integration are contradictory");
+        assert!(error
+            .to_string()
+            .contains("coordination.plan_repository_requires_integration"));
+        assert!(validate_plan_repository_integration(&repo_unit(true, None, &["repo-a"])).is_ok());
+        assert!(validate_plan_repository_integration(&repo_unit(false, None, &[])).is_ok());
+        assert!(validate_plan_repository_integration(&repo_unit(true, None, &[])).is_ok());
+        // Formal review WorkUnits can never require integration.
+        assert!(
+            validate_plan_repository_integration(&repo_unit(false, Some("impl"), &["repo-a"]))
+                .is_ok()
+        );
     }
 
     fn review_role(name: &str, formal_review: bool) -> TeamRoleView {

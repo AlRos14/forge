@@ -47,6 +47,12 @@ source version is 0.9.1.
 
 ### Fixed
 
+- Reject coordinator plan WorkUnits that list `repository_ids` with
+  `requires_integration: false` (a non-repository WorkUnit that would run with
+  no Workspace and produce no commits) with
+  `422 coordination.plan_repository_requires_integration`; formal review
+  WorkUnits are exempt. The coordinator prompt now explains
+  `requires_integration` and its example shows `true`.
 - Reject unsupported automatic coordination harnesses during authorization
   with `coordination.coordinator_harness_unsupported`; a wake that becomes
   unsupported before an attempt now fails its exact coordination request with
