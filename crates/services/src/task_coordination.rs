@@ -4807,6 +4807,12 @@ Objective: {objective}\nConstraints: {constraints}\nAcceptance criteria: {accept
         }
         for role in &mut team {
             role.members.retain(|member| member.id != membership.id);
+            // V100 `pr9_task_role_membership_update_fence` bumps the owning
+            // TaskRole version in the same statement as the status change, so
+            // the refreshed snapshot must carry the post-update role version.
+            if role.id == membership.task_role_id {
+                role.version += 1;
+            }
         }
         let team_snapshot_json = self.team_snapshot_json(&team)?;
         let team_digest = sha256_hex(team_snapshot_json.as_bytes());
