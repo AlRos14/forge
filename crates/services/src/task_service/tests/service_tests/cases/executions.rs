@@ -1424,11 +1424,14 @@ async fn create_claimed_review_execution(
             .await
             .unwrap();
     }
+    // Formal review by the contributing Agent needs a fresh HarnessSession
+    // (V162); the source result comes from an independent implementer Agent.
+    let implementer_agent_id = seed_agent(db).await;
     service
         .add_task_role_member(
             &task.id,
             "implementer",
-            ActorRef::Agent(agent_id.to_owned()),
+            ActorRef::Agent(implementer_agent_id.clone()),
         )
         .await
         .unwrap();
@@ -1442,7 +1445,7 @@ async fn create_claimed_review_execution(
                 execution_instructions: None,
                 role: "implementer".to_owned(),
                 parent_work_unit_id: None,
-                assigned_actor: Some(db::ActorRef::Agent(agent_id.to_owned())),
+                assigned_actor: Some(db::ActorRef::Agent(implementer_agent_id.clone())),
                 requires_integration: true,
                 provenance: None,
                 review_subject: None,
@@ -1466,7 +1469,7 @@ async fn create_claimed_review_execution(
         .into_iter()
         .find(|workspace| workspace.repo_id == repo_id)
         .expect("source primary Workspace exists");
-    let agent = AgentRepo::get_by_id(db, agent_id)
+    let agent = AgentRepo::get_by_id(db, &implementer_agent_id)
         .await
         .expect("source Agent loads")
         .expect("source Agent exists");
@@ -1482,8 +1485,8 @@ async fn create_claimed_review_execution(
             db::CreateExecution {
                 id: db::new_uuid_v4(),
                 task_id: task.id.clone(),
-                agent_id: Some(agent_id.to_owned()),
-                actor_ref: Some(db::ActorRef::Agent(agent_id.to_owned())),
+                agent_id: Some(implementer_agent_id.clone()),
+                actor_ref: Some(db::ActorRef::Agent(implementer_agent_id.clone())),
                 harness_session_id: None,
                 role: "implementer".to_owned(),
                 status: ExecutionStatus::Running,
@@ -2582,6 +2585,7 @@ async fn pr8_running_agent_report_reconciles_without_relaunch_after_workspace_ch
         .await
         .expect("Agent ReviewReport commits while Execution remains Running");
     let worktree = std::path::Path::new(&workspace.worktree_path);
+    make_review_tree_writable(worktree);
     std::fs::write(worktree.join("README.md"), "changed after report\n")
         .expect("Workspace changes after the historical report commit");
     run_workspace_git(worktree, &["add", "README.md"]);
@@ -3337,8 +3341,9 @@ async fn run_cursor_execution_does_not_poll_or_persist_usage() {
 async fn run_execution_emits_terminal_execution_event() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;
@@ -3424,8 +3429,9 @@ async fn run_execution_rejects_when_terminal_active_in_workspace() {
 async fn run_execution_batches_execution_log_events() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(128));
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, TaskLifecycleState::Active).await;

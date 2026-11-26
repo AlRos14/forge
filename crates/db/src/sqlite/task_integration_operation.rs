@@ -172,6 +172,31 @@ async fn resolve_batchless_admission_repo(
     Ok(())
 }
 
+/// The repository identity stored on the PR projection. Provider result events
+/// carry exactly this value because the V183 result and history guards compare
+/// it. Pre-V183 schemas have no column, so their events keep the older shape.
+async fn stored_pr_metadata_repo_id(
+    tx: &mut Transaction<'_, Sqlite>,
+    metadata_id: &str,
+) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT * FROM pr_metadata WHERE id = ?")
+        .bind(metadata_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    crate::sqlite::try_get_optional_text(&row, "repo_id")
+}
+
+/// A result event recorded before V183 has no `repo_id`. Replaying it must still
+/// match; an event that does carry the key is compared exactly.
+fn align_legacy_result_payload(prior: &serde_json::Value, incoming: &mut serde_json::Value) {
+    if prior.get("repo_id").is_none() {
+        if let Some(incoming) = incoming.as_object_mut() {
+            incoming.remove("repo_id");
+        }
+    }
+}
+
 async fn load_remote_pr_admission(
     tx: &mut Transaction<'_, Sqlite>,
     task_merge_operation_id: &str,
@@ -1382,6 +1407,7 @@ impl TaskIntegrationOperationRepo for SqliteDb {
         {
             return Err(DbError::InvalidTransition);
         }
+        let metadata_repo_id = stored_pr_metadata_repo_id(&mut tx, &admission.metadata_id).await?;
 
         let terminal_admission = matches!(
             admission.state.as_str(),
@@ -1451,6 +1477,9 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                 incoming_payload["result_classification"] =
                     serde_json::Value::String(classification.to_owned());
             }
+            if let Some(repo_id) = metadata_repo_id.as_deref() {
+                incoming_payload["repo_id"] = serde_json::Value::String(repo_id.to_owned());
+            }
             let prior_event =
                 sqlx::query("SELECT id, payload_json FROM domain_event WHERE dedupe_key = ?")
                     .bind(&dedupe_key)
@@ -1479,6 +1508,7 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                 prior_payload["result_classification"] =
                     serde_json::Value::String("head_mismatch".to_owned());
             }
+            align_legacy_result_payload(&prior_payload, &mut incoming_payload);
             if prior_payload != incoming_payload {
                 return Err(DbError::InvalidTransition);
             }
@@ -1590,6 +1620,9 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                 result_payload["result_classification"] =
                     serde_json::Value::String(classification.to_owned());
             }
+            if let Some(repo_id) = metadata_repo_id.as_deref() {
+                result_payload["repo_id"] = serde_json::Value::String(repo_id.to_owned());
+            }
             let create_event = CreateDomainEvent {
                 id: new_uuid_v4(),
                 event_type: "pr.status_changed".to_owned(),
@@ -1618,7 +1651,7 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                     .map_err(|error| {
                         DbError::Check(format!("invalid stored PR result: {error}"))
                     })?;
-                let incoming_payload: serde_json::Value =
+                let mut incoming_payload: serde_json::Value =
                     serde_json::from_str(&create_event.payload_json).map_err(|error| {
                         DbError::Check(format!("invalid incoming PR result: {error}"))
                     })?;
@@ -1639,6 +1672,7 @@ impl TaskIntegrationOperationRepo for SqliteDb {
                     comparable_prior["result_classification"] =
                         serde_json::Value::String("head_mismatch".to_owned());
                 }
+                align_legacy_result_payload(&comparable_prior, &mut incoming_payload);
                 if comparable_prior != incoming_payload {
                     return Err(DbError::InvalidTransition);
                 }
@@ -2177,7 +2211,7 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_finish_reproduces_busy_snapshot_after_work_unit_commit() {
-        let (_directory, db, concurrent_pool, _task_id, work_unit_id, project_id, operation) =
+        let (_directory, db, concurrent_pool, task_id, work_unit_id, project_id, operation) =
             fixture().await;
         assert!(WorkUnitRepo::get_by_id(&db, &work_unit_id)
             .await
@@ -2216,12 +2250,20 @@ mod tests {
             .await
             .expect("finish task joins")
             .expect_err("deferred snapshot cannot upgrade after a competing commit");
-        let database_error = match error {
-            DbError::Sqlx(sqlx::Error::Database(error)) => error,
-            other => panic!("expected SQLite busy snapshot, got {other:?}"),
-        };
-        assert_eq!(database_error.code().as_deref(), Some("517"));
-        assert!(database_error.message().contains("database is locked"));
+        // The SQLite busy snapshot surfaces as the typed operation contention
+        // error, and the durable claim is left untouched.
+        assert!(
+            matches!(error, DbError::TaskIntegrationOperationBusy),
+            "expected typed busy error for the snapshot conflict, got {error:?}"
+        );
+        assert_eq!(
+            TaskIntegrationOperationRepo::get_active_for_task(&db, &task_id)
+                .await
+                .expect("read operation after finish error")
+                .expect("operation remains active")
+                .status,
+            TaskIntegrationOperationStatus::Running
+        );
         assert!(WorkUnitRepo::get_by_id(&db, &work_unit_id)
             .await
             .expect("read WorkUnit after finish error")
