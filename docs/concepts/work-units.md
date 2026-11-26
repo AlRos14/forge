@@ -249,9 +249,10 @@ The Task has an integration workspace. Each repository-mutating WorkUnit has
 one persisted workspace group rooted outside its repository children. Every
 selected writable repository gets an isolated branch/worktree and exact
 short-lived WorkspaceLease; selected context repositories are exact pinned
-read-only worktrees without leases. The harness starts at the group root and
-receives a `FORGE_WORKSPACE.md` describing each repository ID and whether it is
-writable. Scope text helps coordination but is not a filesystem security
+read-only worktrees without leases. A group with exactly one repository starts
+the harness in that repository worktree; otherwise the harness starts at the
+group root. A `FORGE_WORKSPACE.md` at the group root describes each repository
+ID and whether it is writable. Scope text helps coordination but is not a filesystem security
 boundary. A Task integration branch is written only by an explicit, serialized
 integration operation. Completing a WorkUnit never integrates its changes
 automatically.

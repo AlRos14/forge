@@ -323,19 +323,25 @@ ALTER TABLE task_integration_operation
 ALTER TABLE task_integration_operation
     ADD COLUMN repository_merge_batch_id TEXT
         REFERENCES task_repository_merge_batch(id) ON DELETE RESTRICT;
+-- The V092 binding guard rejects every update of an existing operation that is
+-- not a versioned terminal transition. Lift it only for this one-time backfill
+-- and restore it unchanged inside the same transaction.
+DROP TRIGGER task_integration_operation_binding_immutable;
 UPDATE task_integration_operation
    SET repo_id = (SELECT task.repo_id FROM task WHERE task.id = task_integration_operation.task_id);
-UPDATE task_integration_operation
-   SET repository_merge_batch_id = id
- WHERE kind = 'task_merge' AND status = 'running';
-UPDATE task_integration_operation
-   SET repository_merge_batch_id = (
-       SELECT merge_op.repository_merge_batch_id
-       FROM task_integration_operation merge_op
-       WHERE merge_op.id = task_integration_operation.parent_operation_id
-   )
- WHERE kind = 'publish_pr' AND status = 'running'
-   AND parent_operation_id IS NOT NULL;
+-- An operation already running stays batchless: its Task keeps the 0.9.1
+-- `task_merge` lifecycle receipt (reason_ref = TaskMerge id) until it finishes.
+CREATE TRIGGER task_integration_operation_binding_immutable
+BEFORE UPDATE ON task_integration_operation
+WHEN NEW.id IS NOT OLD.id OR NEW.task_id IS NOT OLD.task_id
+  OR NEW.kind IS NOT OLD.kind OR NEW.owner_id IS NOT OLD.owner_id
+  OR NEW.created_at IS NOT OLD.created_at
+  OR OLD.status != 'running'
+  OR NEW.status NOT IN ('succeeded', 'conflict', 'failed', 'abandoned')
+  OR NEW.version != OLD.version + 1
+BEGIN
+    SELECT RAISE(ABORT, 'Task integration operation identity or terminal result is immutable');
+END;
 CREATE INDEX idx_task_integration_operation_repo
     ON task_integration_operation(task_id, repo_id, created_at, id);
 CREATE INDEX idx_task_integration_operation_merge_batch_repo
@@ -386,57 +392,6 @@ CREATE TABLE task_repository_merge_batch_repo (
 );
 CREATE INDEX idx_task_repository_merge_batch_repo_state
     ON task_repository_merge_batch_repo(batch_id, state, position);
-
--- Keep a Task already in Merging attached to its exact durable reason_ref.
--- The historical batch id equals the running TaskMerge operation id.
-CREATE TEMP TABLE _v183_running_merge_scope_guard (
-    unresolved INTEGER NOT NULL CHECK (unresolved = 0)
-);
-INSERT INTO _v183_running_merge_scope_guard
-SELECT COUNT(*) FROM task_integration_operation op
-WHERE op.kind = 'task_merge' AND op.status = 'running'
-  AND (op.gate_evaluation_id IS NULL OR op.repo_id IS NULL
-       OR NOT EXISTS (
-           SELECT 1 FROM task_repository_set_revision revision
-           WHERE revision.task_id = op.task_id AND revision.state = 'current'
-       ));
-DROP TABLE _v183_running_merge_scope_guard;
-
-INSERT INTO task_repository_merge_batch(
-    id, task_id, gate_evaluation_id, repository_set_revision, repository_set_digest,
-    state, version, created_at, updated_at
-)
-SELECT op.id, op.task_id, op.gate_evaluation_id,
-       COALESCE((SELECT revision.revision FROM task_repository_set_revision revision
-                 WHERE revision.task_id = op.task_id AND revision.state = 'current'), 1),
-       NULL,
-       CASE WHEN admission.state = 'open' THEN 'open'
-            WHEN admission.state = 'closed' THEN 'blocked'
-            WHEN op.remote_waiting = 1 THEN 'publishing'
-            ELSE 'integrating' END,
-       1, op.created_at, op.updated_at
-FROM task_integration_operation op
-LEFT JOIN remote_pr_admission admission
-  ON admission.task_merge_operation_id = op.id
-WHERE op.kind = 'task_merge' AND op.status = 'running';
-
-INSERT INTO task_repository_merge_batch_repo(
-    batch_id, task_id, repository_set_revision, repo_id, position, state,
-    task_merge_operation_id, pr_metadata_id, before_sha, after_sha,
-    created_at, updated_at
-)
-SELECT batch.id, batch.task_id, batch.repository_set_revision, op.repo_id, 0,
-       CASE WHEN admission.state = 'open' THEN 'open'
-            WHEN admission.state = 'merged' THEN 'merged'
-            WHEN admission.state = 'closed' THEN 'closed'
-            WHEN op.remote_waiting = 1 THEN 'publishing'
-            ELSE 'integrating' END,
-       op.id, metadata.id, NULL, NULL, op.created_at, op.updated_at
-FROM task_repository_merge_batch batch
-JOIN task_integration_operation op ON op.id = batch.id
-LEFT JOIN remote_pr_admission admission ON admission.task_merge_operation_id = op.id
-LEFT JOIN pr_metadata metadata ON metadata.task_merge_operation_id = op.id
-WHERE op.kind = 'task_merge' AND op.status = 'running';
 
 
 CREATE TABLE pr_metadata_v183 (
@@ -2004,7 +1959,12 @@ WHEN NEW.history_origin NOT IN ('v116_backfill', 'terminal_snapshot')
         AND event.scope_id = admission.task_id
         AND json_valid(event.payload_json)
         AND json_extract(event.payload_json, '$.task_id') = admission.task_id
-        AND json_extract(event.payload_json, '$.repo_id') IS admission.repo_id
+        -- A result event recorded before V183 has no repository key; it belongs
+        -- to a batchless operation on the Task's primary repository.
+        AND (json_extract(event.payload_json, '$.repo_id') IS admission.repo_id
+             OR (json_type(event.payload_json, '$.repo_id') IS NULL
+                 AND merge_op.repository_merge_batch_id IS NULL
+                 AND admission.repo_id IS task.repo_id))
         AND json_extract(event.payload_json, '$.pr_metadata_id') = admission.metadata_id
         AND json_extract(event.payload_json, '$.task_merge_operation_id') = admission.task_merge_operation_id
         AND json_extract(event.payload_json, '$.publish_operation_id') = admission.publish_operation_id

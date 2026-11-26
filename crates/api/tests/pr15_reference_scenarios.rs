@@ -391,9 +391,21 @@ async fn s01_authenticated_http_shell_flow_persists_across_server_restart() {
         .workspace_id
         .as_deref()
         .expect("Execution pins its WorkUnit workspace");
+    let group = db::WorkspaceRepo::get_group_by_work_unit_id(&*server.db, &created.id)
+        .await
+        .expect("WorkspaceGroup loads")
+        .expect("repository WorkUnit has a WorkspaceGroup");
     let work_unit_path = workspace::WorkspaceManager::new(workspace_root.clone())
-        .work_unit_worktree_path(&task.id, &created.id, source_workspace_id, &repo.id)
+        .work_unit_group_worktree_path(&task.id, &created.id, &group.id, &repo.id)
         .expect("exact WorkUnit worktree path resolves");
+    let source_workspace = db::WorkspaceRepo::get_by_id(&*server.db, source_workspace_id)
+        .await
+        .expect("source Workspace loads")
+        .expect("source Workspace persists");
+    assert_eq!(
+        Path::new(&source_workspace.worktree_path),
+        work_unit_path.as_path()
+    );
     assert!(
         work_unit_path.join("pr15-result.txt").exists(),
         "shell effect is present at {}",

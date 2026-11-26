@@ -796,12 +796,6 @@ pub async fn seed_startable_execution_for_daemon(
     let task_id = uuid::Uuid::new_v4().to_string();
     let agent_id = uuid::Uuid::new_v4().to_string();
     let workspace_id = uuid::Uuid::new_v4().to_string();
-    let workspace_path = state
-        .cleanup_scheduler
-        .workspace_root()
-        .join("execution-start")
-        .join(&task_id);
-    std::fs::create_dir_all(&workspace_path).expect("workspace path creates");
 
     ProjectRepo::create(
         &*state.db,
@@ -887,17 +881,23 @@ pub async fn seed_startable_execution_for_daemon(
     let executor_snapshot = authorized_daemon_execution_snapshot(state, &agent_id, "shell").await;
     let work_unit = create_implementation_work_unit(state, &task, &agent_id, true).await;
     let workspace_group_id = uuid::Uuid::new_v4().to_string();
+    // Group and member paths are derived from their persisted identities.
+    let manager =
+        ::workspace::WorkspaceManager::new(state.cleanup_scheduler.workspace_root().to_path_buf());
+    let group_root = manager
+        .work_unit_group_path(&task_id, &work_unit.id, &workspace_group_id)
+        .expect("WorkspaceGroup path");
+    let workspace_path = manager
+        .work_unit_group_worktree_path(&task_id, &work_unit.id, &workspace_group_id, &repo_id)
+        .expect("repository Workspace path");
+    std::fs::create_dir_all(&workspace_path).expect("workspace path creates");
     WorkspaceRepo::create_group_for_work_unit(
         &*state.db,
         CreateWorkspaceGroup {
             id: workspace_group_id.clone(),
             task_id: task_id.clone(),
             work_unit_id: work_unit.id.clone(),
-            root_path: workspace_path
-                .parent()
-                .unwrap_or(&workspace_path)
-                .to_string_lossy()
-                .into_owned(),
+            root_path: group_root.to_string_lossy().into_owned(),
             created_at: now.clone(),
         },
     )
@@ -969,7 +969,7 @@ pub async fn seed_startable_execution_for_daemon(
                 workspace_id: Some(workspace.id.clone()),
                 task_version: task.version,
                 execution_id: execution_id.clone(),
-                operation_idempotency_key: execution_id.clone(),
+                operation_idempotency_key: format!("{execution_id}:workspace:{repo_id}"),
                 repository_binding_id: repo_id,
                 base_ref: "main".to_owned(),
                 role: "worker".to_owned(),

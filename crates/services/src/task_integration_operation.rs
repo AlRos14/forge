@@ -3726,10 +3726,8 @@ pub(crate) mod tests {
             .await
             .expect("TaskMerge lookup")
             .expect("TaskMerge exists");
-        assert_eq!(
-            lifecycle.reason_ref.as_deref(),
-            merge.repository_merge_batch_id.as_deref()
-        );
+        assert!(merge.repository_merge_batch_id.is_none());
+        assert_eq!(lifecycle.reason_ref.as_deref(), Some(merge_id.as_str()));
         let task_merge_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM task_integration_operation
              WHERE task_id = ? AND kind = 'task_merge'",
@@ -3771,10 +3769,7 @@ pub(crate) mod tests {
             .expect("post-policy-change lifecycle lookup")
             .expect("lifecycle exists");
         assert_eq!(lifecycle.state, db::TaskLifecycleState::Merging);
-        assert_eq!(
-            lifecycle.reason_ref.as_deref(),
-            merge.repository_merge_batch_id.as_deref()
-        );
+        assert_eq!(lifecycle.reason_ref.as_deref(), Some(merge_id.as_str()));
 
         PrMetadataRepo::update(
             &*fixture.db,

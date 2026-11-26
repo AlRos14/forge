@@ -2986,3 +2986,19 @@ E2E real sobre seis repositorios FirePOS (servidor de pruebas, modo
 | P4 | La autonomía es todo o nada | Nivel de autonomía por Project o Task ligado a la clase de riesgo |
 | P5 | Los agentes comparten la credencial del host con el humano | Identidad nivel 2: cuenta o token propio por Agent |
 | P6 | La decisión humana de alcance del ledger no llega al coordinador como referencia | Pasar el identificador de la decisión en el contexto de coordinación |
+
+## Correcciones tras el CI completo de 0.9.2
+
+Sustituyen lo indicado en el SQL congelado de V183:
+
+- El backfill de `task_integration_operation.repo_id` levanta
+  `task_integration_operation_binding_immutable` y lo restaura sin cambios en la
+  misma transacción; sin ello V183 abortaba en cualquier instalación con
+  operaciones de integración.
+- Las operaciones en curso **no** se agrupan en un batch. Una TaskMerge anterior
+  a V183 sigue sin batch, con `reason_kind = task_merge` y
+  `reason_ref = TaskMerge.id`, hasta terminar. Se retiran el guard
+  `_v183_running_merge_scope_guard` y las inserciones de batch.
+- Los eventos `pr.status_changed` incluyen `repo_id`. El guard de historial PR
+  admite su ausencia solo en una operación sin batch sobre el repo primario
+  (eventos anteriores a V183).
