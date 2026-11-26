@@ -98,6 +98,7 @@ mod project_member;
 mod project_task_role_defaults;
 mod provider_authorization;
 mod repo;
+mod review_range;
 mod role;
 mod runtime;
 mod shared_media;

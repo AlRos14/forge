@@ -178,6 +178,9 @@ pub struct WorkUnitResponse {
     pub updated_at: String,
     pub readiness: WorkUnitReadinessResponse,
     pub review_subject: Option<crate::ReviewSubjectResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub review_range: Option<crate::WorkUnitReviewRangeResponse>,
     #[serde(default)]
     pub repository_ids: Vec<String>,
     #[serde(default)]

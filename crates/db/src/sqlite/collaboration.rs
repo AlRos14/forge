@@ -85,6 +85,97 @@ pub(super) async fn pin_execution_artifact_input_in_tx(
     Ok(record)
 }
 
+/// The report's `evidence_considered` must name exactly the pinned input sets.
+pub(super) fn validate_review_report_references(
+    content: &str,
+    evidence_input_ids: &[String],
+    artifact_input_ids: &[String],
+) -> Result<()> {
+    let unique = |ids: &[String]| {
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        ids.iter().all(|id| seen.insert(id.as_str()))
+    };
+    if !unique(evidence_input_ids) || !unique(artifact_input_ids) {
+        return Err(DbError::Check(
+            "Human Review input sets cannot contain duplicate references".to_owned(),
+        ));
+    }
+
+    let value: serde_json::Value = serde_json::from_str(content)
+        .map_err(|error| DbError::Check(format!("invalid ReviewReport JSON: {error}")))?;
+    let references = value
+        .get("evidence_considered")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            DbError::Check("ReviewReport evidence_considered must be an array".to_owned())
+        })?;
+    let mut referenced_evidence = std::collections::HashSet::new();
+    let mut referenced_artifacts = std::collections::HashSet::new();
+    for reference in references {
+        let object = reference.as_object().ok_or_else(|| {
+            DbError::Check("ReviewReport input references must be objects".to_owned())
+        })?;
+        match (
+            object
+                .get("evidence_id")
+                .and_then(serde_json::Value::as_str),
+            object
+                .get("artifact_id")
+                .and_then(serde_json::Value::as_str),
+        ) {
+            (Some(id), None) if referenced_evidence.insert(id.to_owned()) => {}
+            (None, Some(id)) if referenced_artifacts.insert(id.to_owned()) => {}
+            _ => {
+                return Err(DbError::Check(
+                    "ReviewReport inputs must be unique exact Evidence or Artifact references"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    if referenced_evidence.len() != evidence_input_ids.len()
+        || evidence_input_ids
+            .iter()
+            .any(|id| !referenced_evidence.contains(id))
+        || referenced_artifacts.len() != artifact_input_ids.len()
+        || artifact_input_ids
+            .iter()
+            .any(|id| !referenced_artifacts.contains(id))
+    {
+        return Err(DbError::Check(
+            "ReviewReport references must equal the complete requested input sets".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// A commit-range review is recorded only with its ledger, by
+/// `ingest_range_review_report`.
+async fn reject_range_review_execution(
+    tx: &mut Transaction<'_, Sqlite>,
+    execution_id: &str,
+) -> Result<()> {
+    // Pre-V184 schemas (migration fixtures) cannot hold a range review.
+    if !super::review_range::review_schema_present(tx).await? {
+        return Ok(());
+    }
+    let range: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM execution e
+             JOIN work_unit_review_range r ON r.review_work_unit_id = e.work_unit_id
+             WHERE e.id = ?)",
+    )
+    .bind(execution_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if range {
+        return Err(DbError::Check(
+            "a range ReviewReport must be ingested with its review ledger".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Reconstructs the immutable identity recorded at write time. Liveness is
 /// validated by the INSERT guards, not by historical reads.
 fn actor_from_columns(kind: String, id: String) -> Result<ActorRef> {
@@ -679,6 +770,7 @@ impl CollaborationRepo for SqliteDb {
             .fetch_one(&mut *tx)
             .await?;
             if has_existing_output == 0 {
+                reject_range_review_execution(&mut tx, &input.producer_execution_id).await?;
                 let producer = sqlx::query(
                     "SELECT execution.actor_kind, execution.actor_id, execution.status
                      FROM execution
@@ -828,64 +920,10 @@ impl CollaborationRepo for SqliteDb {
                 "Human Review submission requires an inline ReviewReport".to_owned(),
             ));
         }
-        let unique = |ids: &[String]| {
-            let mut seen = std::collections::HashSet::with_capacity(ids.len());
-            ids.iter().all(|id| seen.insert(id))
-        };
-        if !unique(&evidence_input_ids) || !unique(&artifact_input_ids) {
-            return Err(DbError::Check(
-                "Human Review input sets cannot contain duplicate references".to_owned(),
-            ));
-        }
-
         let content = input.content.as_deref().ok_or_else(|| {
             DbError::Check("Human Review submission requires ReviewReport content".to_owned())
         })?;
-        let value: serde_json::Value = serde_json::from_str(content)
-            .map_err(|error| DbError::Check(format!("invalid ReviewReport JSON: {error}")))?;
-        let references = value
-            .get("evidence_considered")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| {
-                DbError::Check("ReviewReport evidence_considered must be an array".to_owned())
-            })?;
-        let mut referenced_evidence = std::collections::HashSet::new();
-        let mut referenced_artifacts = std::collections::HashSet::new();
-        for reference in references {
-            let object = reference.as_object().ok_or_else(|| {
-                DbError::Check("ReviewReport input references must be objects".to_owned())
-            })?;
-            match (
-                object
-                    .get("evidence_id")
-                    .and_then(serde_json::Value::as_str),
-                object
-                    .get("artifact_id")
-                    .and_then(serde_json::Value::as_str),
-            ) {
-                (Some(id), None) if referenced_evidence.insert(id.to_owned()) => {}
-                (None, Some(id)) if referenced_artifacts.insert(id.to_owned()) => {}
-                _ => {
-                    return Err(DbError::Check(
-                        "ReviewReport inputs must be unique exact Evidence or Artifact references"
-                            .to_owned(),
-                    ));
-                }
-            }
-        }
-        if referenced_evidence.len() != evidence_input_ids.len()
-            || evidence_input_ids
-                .iter()
-                .any(|id| !referenced_evidence.contains(id))
-            || referenced_artifacts.len() != artifact_input_ids.len()
-            || artifact_input_ids
-                .iter()
-                .any(|id| !referenced_artifacts.contains(id))
-        {
-            return Err(DbError::Check(
-                "ReviewReport references must equal the complete requested input sets".to_owned(),
-            ));
-        }
+        validate_review_report_references(content, &evidence_input_ids, &artifact_input_ids)?;
 
         let expected = input.clone();
         let mut tx = self.pool.begin().await?;
@@ -925,6 +963,7 @@ impl CollaborationRepo for SqliteDb {
             });
         }
 
+        reject_range_review_execution(&mut tx, &input.producer_execution_id).await?;
         let review_authority: Option<i64> = sqlx::query_scalar(
             "SELECT 1
              FROM execution e

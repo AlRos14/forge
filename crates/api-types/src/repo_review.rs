@@ -78,6 +78,11 @@ pub struct ProjectResponse {
     #[serde(default = "default_project_version")]
     #[ts(type = "number")]
     pub version: i64,
+    /// Review policy copied into Tasks created afterwards. Omitted when the
+    /// Project never configured one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub default_review_policy: Option<crate::ProjectReviewPolicyResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

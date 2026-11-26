@@ -395,6 +395,41 @@ impl ProjectRepo for SqliteDb {
             .await?;
 
         for statement in [
+            "DELETE FROM review_correction_link WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM review_rework_round WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM review_finding_triage WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM review_finding_resolution WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM review_finding_location WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM review_finding WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM review_range_report WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM work_unit_review_range WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM review_range_contributor WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM review_checkpoint_request WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM review_checkpoint WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM review_plan_checkpoint WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM review_range WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM review_commit_attribution WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_review_base WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_review_coverage_state WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM task_review_policy_revision WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM project_review_policy WHERE project_id = ?",
             "DELETE FROM work_unit_fallback_receipt WHERE task_id IN
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM micro_fix_receipt WHERE task_id IN

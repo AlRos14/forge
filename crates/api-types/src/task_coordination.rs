@@ -143,6 +143,8 @@ pub enum TaskReviewDisposition {
     Correct,
     Recheck,
     Human,
+    /// Only for non-blocking (P2/P3) findings of a commit-range review.
+    Defer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -295,6 +297,9 @@ pub struct TaskCoordinationPlanResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub repository_set: Option<Vec<TaskRepositoryInput>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<crate::PlanReviewCheckpoint>>", optional)]
+    pub review_checkpoints: Vec<crate::PlanReviewCheckpoint>,
     pub proposal_id: Option<String>,
     pub decision_id: Option<String>,
     pub materialization: Option<TaskCoordinationMaterializationResponse>,

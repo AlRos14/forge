@@ -152,6 +152,68 @@ fn lifecycle_request_digest(input: &TransitionTaskLifecycle) -> String {
     hex::encode(Sha256::digest(canonical.to_string().as_bytes()))
 }
 
+/// Append the next immutable policy revision of a Gate and activate it, inside a
+/// caller-owned SQLite transaction.
+pub(super) async fn insert_gate_policy_revision_in_tx(
+    db: &SqliteDb,
+    transaction: &mut Transaction<'_, Sqlite>,
+    input: &CreateGatePolicyRevision,
+) -> Result<CollaborationWrite<GatePolicyRevision>> {
+    let expected = input.expected_active_revision.unwrap_or(0);
+    if input.revision != expected + 1 {
+        return Err(DbError::VersionConflict);
+    }
+    let active = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT active_policy_revision FROM gate WHERE id = ?",
+    )
+    .bind(&input.gate_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(DbError::NotFound)?;
+    if active != input.expected_active_revision {
+        return Err(DbError::VersionConflict);
+    }
+    sqlx::query(
+        "INSERT INTO gate_policy_revision
+            (gate_id, revision, schema_version, policy_json, policy_digest, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&input.gate_id)
+    .bind(input.revision)
+    .bind(input.schema_version)
+    .bind(&input.policy_json)
+    .bind(&input.policy_digest)
+    .bind(&input.created_at)
+    .execute(&mut **transaction)
+    .await?;
+    let advanced = sqlx::query(
+        "UPDATE gate SET active_policy_revision = ?
+         WHERE id = ? AND active_policy_revision IS ?",
+    )
+    .bind(input.revision)
+    .bind(&input.gate_id)
+    .bind(input.expected_active_revision)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected();
+    if advanced != 1 {
+        return Err(DbError::VersionConflict);
+    }
+    let event = DomainEventRepo::append_event_in_tx(db, transaction, &input.event).await?;
+    let row = sqlx::query(
+        "SELECT gate_id, revision, schema_version, policy_json, policy_digest, created_at
+         FROM gate_policy_revision WHERE gate_id = ? AND revision = ?",
+    )
+    .bind(&input.gate_id)
+    .bind(input.revision)
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(CollaborationWrite {
+        record: map_policy(&row)?,
+        event,
+    })
+}
+
 /// Record a lifecycle transition inside a caller-owned SQLite transaction.
 /// Callers update the Task's remaining compatibility fields and projection in
 /// the same transaction after this returns.
@@ -964,63 +1026,10 @@ impl GateRepo for SqliteDb {
         &self,
         input: CreateGatePolicyRevision,
     ) -> Result<CollaborationWrite<GatePolicyRevision>> {
-        let expected = input.expected_active_revision.unwrap_or(0);
-        if input.revision != expected + 1 {
-            return Err(DbError::VersionConflict);
-        }
         let mut transaction = self.pool.begin().await?;
-        let active = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT active_policy_revision FROM gate WHERE id = ?",
-        )
-        .bind(&input.gate_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(DbError::NotFound)?;
-        if active != input.expected_active_revision {
-            return Err(DbError::VersionConflict);
-        }
-        sqlx::query(
-            "INSERT INTO gate_policy_revision
-                (gate_id, revision, schema_version, policy_json, policy_digest, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&input.gate_id)
-        .bind(input.revision)
-        .bind(input.schema_version)
-        .bind(&input.policy_json)
-        .bind(&input.policy_digest)
-        .bind(&input.created_at)
-        .execute(&mut *transaction)
-        .await?;
-        let advanced = sqlx::query(
-            "UPDATE gate SET active_policy_revision = ?
-             WHERE id = ? AND active_policy_revision IS ?",
-        )
-        .bind(input.revision)
-        .bind(&input.gate_id)
-        .bind(input.expected_active_revision)
-        .execute(&mut *transaction)
-        .await?
-        .rows_affected();
-        if advanced != 1 {
-            return Err(DbError::VersionConflict);
-        }
-        let event =
-            DomainEventRepo::append_event_in_tx(self, &mut transaction, &input.event).await?;
-        let row = sqlx::query(
-            "SELECT gate_id, revision, schema_version, policy_json, policy_digest, created_at
-             FROM gate_policy_revision WHERE gate_id = ? AND revision = ?",
-        )
-        .bind(&input.gate_id)
-        .bind(input.revision)
-        .fetch_one(&mut *transaction)
-        .await?;
-        let policy = map_policy(&row)?;
+        let write = insert_gate_policy_revision_in_tx(self, &mut transaction, &input).await?;
         transaction.commit().await?;
-        Ok(CollaborationWrite {
-            record: policy,
-            event,
-        })
+        Ok(write)
     }
 
     async fn create_gate_evaluation(

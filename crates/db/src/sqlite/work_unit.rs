@@ -594,23 +594,23 @@ fn work_unit_write_error(error: sqlx::Error) -> DbError {
     check_error(error)
 }
 
-async fn create_work_unit_row(
-    db: &SqliteDb,
-    input: CreateWorkUnit,
-    subject: Option<CreateWorkUnitReviewSubject>,
-    subject_repositories: Option<&[crate::WorkUnitReviewSubjectRepository]>,
-    event_input: CreateDomainEvent,
-) -> Result<CollaborationWrite<WorkUnit>> {
+/// Inserts a new open WorkUnit pinned to the Task's current repository set,
+/// with its repository scope and Artifact inputs, inside the caller's
+/// transaction. The caller appends the domain events.
+pub(super) async fn insert_work_unit_with_current_pin_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    input: &CreateWorkUnit,
+) -> Result<()> {
     let (assigned_kind, assigned_id) = actor_columns(input.assigned_actor.as_ref());
     let (provenance_kind, provenance_id, provenance_actor_kind) =
         provenance_columns(input.provenance.as_ref());
     let created_kind = input.created_by.kind().to_string();
     let created_id = input.created_by.id().to_owned();
-    let now = input.created_at.clone();
-    let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let now = input.created_at.as_str();
     let revision =
-        super::task_repository::ensure_initial_current_revision_in_tx(&mut tx, &input.task_id)
+        super::task_repository::ensure_initial_current_revision_in_tx(transaction, &input.task_id)
             .await?;
+    let tx: &mut sqlx::SqliteConnection = transaction;
     sqlx::query(
         "INSERT INTO work_unit (
                 id, task_id, parent_work_unit_id, title, scope, status, role,
@@ -637,8 +637,8 @@ async fn create_work_unit_row(
     .bind(input.review_approval_line_id.as_deref())
     .bind(&created_kind)
     .bind(&created_id)
-    .bind(&now)
-    .bind(&now)
+    .bind(now)
+    .bind(now)
     .execute(&mut *tx)
     .await
     .map_err(work_unit_write_error)?;
@@ -660,7 +660,7 @@ async fn create_work_unit_row(
         .bind(&input.id)
         .bind(&input.task_id)
         .bind(repo_id)
-        .bind(&now)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(work_unit_write_error)?;
@@ -702,7 +702,7 @@ async fn create_work_unit_row(
         .bind(artifact_id)
         .bind(digest)
         .bind(producer_execution_id)
-        .bind(&now)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(work_unit_write_error)?;
@@ -716,6 +716,73 @@ async fn create_work_unit_row(
             .await
             .map_err(work_unit_write_error)?;
     }
+    Ok(())
+}
+
+/// Adds one dependency to an open WorkUnit and advances its version inside the
+/// caller's transaction. The caller appends the domain events.
+pub(super) async fn add_dependency_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    input: &AddWorkUnitDependency,
+) -> Result<()> {
+    let unit = sqlx::query("SELECT task_id, version, status FROM work_unit WHERE id = ?")
+        .bind(&input.work_unit_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    let task_id: String = unit.try_get("task_id")?;
+    let version: i64 = unit.try_get("version")?;
+    let status: String = unit.try_get("status")?;
+    if version != input.expected_version {
+        return Err(DbError::VersionConflict);
+    }
+    if status != "open" {
+        return Err(DbError::InvalidTransition);
+    }
+    let (creator_kind, creator_id) = actor_columns(Some(&input.created_by));
+    let result = sqlx::query(
+        "INSERT INTO work_unit_dependency (
+             task_id, work_unit_id, depends_on_work_unit_id,
+             created_by_kind, created_by_id, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&task_id)
+    .bind(&input.work_unit_id)
+    .bind(&input.depends_on_work_unit_id)
+    .bind(creator_kind.as_deref())
+    .bind(creator_id.as_deref())
+    .bind(&input.created_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(work_unit_write_error)?;
+    if result.rows_affected() == 0 {
+        return Err(DbError::IdempotencyConflict);
+    }
+    let changed = sqlx::query(
+        "UPDATE work_unit SET version = version + 1, updated_at = ?
+         WHERE id = ? AND version = ? AND status = 'open'",
+    )
+    .bind(&input.created_at)
+    .bind(&input.work_unit_id)
+    .bind(input.expected_version)
+    .execute(&mut **tx)
+    .await?;
+    if changed.rows_affected() == 0 {
+        return Err(DbError::VersionConflict);
+    }
+    Ok(())
+}
+
+async fn create_work_unit_row(
+    db: &SqliteDb,
+    input: CreateWorkUnit,
+    subject: Option<CreateWorkUnitReviewSubject>,
+    subject_repositories: Option<&[crate::WorkUnitReviewSubjectRepository]>,
+    event_input: CreateDomainEvent,
+) -> Result<CollaborationWrite<WorkUnit>> {
+    let now = input.created_at.clone();
+    let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await?;
+    insert_work_unit_with_current_pin_in_tx(&mut tx, &input).await?;
     if let Some(subject) = subject {
         if subject.review_work_unit_id != input.id || subject.task_id != input.task_id {
             return Err(DbError::Check(
@@ -1277,51 +1344,7 @@ impl WorkUnitRepo for SqliteDb {
         event_input: CreateDomainEvent,
     ) -> Result<CollaborationWrite<WorkUnitDependency>> {
         let mut tx = self.pool.begin().await?;
-        let unit = sqlx::query("SELECT task_id, version, status FROM work_unit WHERE id = ?")
-            .bind(&input.work_unit_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        let task_id: String = unit.try_get("task_id")?;
-        let version: i64 = unit.try_get("version")?;
-        let status: String = unit.try_get("status")?;
-        if version != input.expected_version {
-            return Err(DbError::VersionConflict);
-        }
-        if status != "open" {
-            return Err(DbError::InvalidTransition);
-        }
-        let (creator_kind, creator_id) = actor_columns(Some(&input.created_by));
-        let result = sqlx::query(
-            "INSERT INTO work_unit_dependency (
-                 task_id, work_unit_id, depends_on_work_unit_id,
-                 created_by_kind, created_by_id, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&task_id)
-        .bind(&input.work_unit_id)
-        .bind(&input.depends_on_work_unit_id)
-        .bind(creator_kind.as_deref())
-        .bind(creator_id.as_deref())
-        .bind(&input.created_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(work_unit_write_error)?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::IdempotencyConflict);
-        }
-        let changed = sqlx::query(
-            "UPDATE work_unit SET version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ? AND status = 'open'",
-        )
-        .bind(&input.created_at)
-        .bind(&input.work_unit_id)
-        .bind(input.expected_version)
-        .execute(&mut *tx)
-        .await?;
-        if changed.rows_affected() == 0 {
-            return Err(DbError::VersionConflict);
-        }
+        add_dependency_in_tx(&mut tx, &input).await?;
         let event = append_event(self, &mut tx, &event_input).await?;
         let record = map_dependency(
             sqlx::query(

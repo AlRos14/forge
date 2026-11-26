@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::{ArtifactResponse, ExecutionResponse};
+use crate::{ArtifactResponse, ExecutionResponse, ReviewResolutionInput, StructuredReviewFinding};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +44,14 @@ pub struct SubmitReviewReportRequest {
     #[ts(optional = nullable)]
     #[ts(type = "number | null")]
     pub reviewed_work_unit_version: Option<i64>,
+    /// Required (with `resolutions` and empty `findings`) for a commit-range
+    /// review; must be absent for a WorkUnit result review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub structured_findings: Option<Vec<StructuredReviewFinding>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub resolutions: Option<Vec<ReviewResolutionInput>>,
 }
 
 /// Submit the assigned Human's review of a prepared WorkUnit. Forge creates

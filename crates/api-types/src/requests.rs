@@ -191,6 +191,14 @@ pub struct UpdateProjectRequest {
     #[ts(type = "string | null")]
     #[ts(optional)]
     pub primary_repo_id: Option<Option<String>>,
+    /// Absent keeps the Project default, `null` clears it.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_update_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub default_review_policy: Option<Option<crate::ReviewPolicyDocument>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
